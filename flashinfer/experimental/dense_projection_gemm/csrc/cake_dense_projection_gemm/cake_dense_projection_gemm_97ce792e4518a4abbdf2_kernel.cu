@@ -47,43 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_CHUNK_ACC_OFFSET 0
-#define TMEM_SMALL_ACC_OFFSET 384
-#define NUM_TMA_PIPE_STAGES 4
-#define NUM_CHUNK_PIPE_STAGES 3
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_A32_OFF 1024
-#define SMEM_A32_STAGE_BYTES 16384
-#define SMEM_A32_STRIDE 53248
-#define SMEM_A1_OFF 17408
-#define SMEM_A1_STAGE_BYTES 8192
-#define SMEM_A1_STRIDE 53248
-#define SMEM_A2_OFF 25600
-#define SMEM_A2_STAGE_BYTES 8192
-#define SMEM_A2_STRIDE 53248
-#define SMEM_A3_OFF 33792
-#define SMEM_A3_STAGE_BYTES 8192
-#define SMEM_A3_STRIDE 53248
-#define SMEM_B1_OFF 41984
-#define SMEM_B1_STAGE_BYTES 4096
-#define SMEM_B1_STRIDE 53248
-#define SMEM_B2_OFF 46080
-#define SMEM_B2_STAGE_BYTES 4096
-#define SMEM_B2_STRIDE 53248
-#define SMEM_B3_OFF 50176
-#define SMEM_B3_STAGE_BYTES 4096
-#define SMEM_B3_STRIDE 53248
-#define SMEM_BOX_OFF 214016
-#define SMEM_BOX_STAGE_BYTES 16384
-#define SMEM_BOX_STRIDE 16384
-#define SMEM_WORK_RESPONSE_OFF 230400
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 230528
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -275,6 +238,7 @@ kernel_cake_dense_projection_gemm_97ce792e4518a4abbdf2(const __grid_constant__ C
     const int box_addr = smem + 214016;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int work_response_addr = smem + 230400;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
@@ -366,6 +330,7 @@ kernel_cake_dense_projection_gemm_97ce792e4518a4abbdf2(const __grid_constant__ C
             unsigned int _phase_mma_done = 1;
             unsigned int _phase_work_full = 0;
             if (elect_sync()) {
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 unsigned int this_bid = bid;
                 #pragma unroll 1
                 for (unsigned int _unit_iter = 0; _unit_iter < units; _unit_iter++) {
@@ -805,6 +770,7 @@ kernel_cake_dense_projection_gemm_97ce792e4518a4abbdf2(const __grid_constant__ C
     if (warp >= 4 && warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 176;");
         { // epilogue_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int chunk_stage_1 = 0;
             unsigned int work_stage_2 = 0;
             const int epi_warp = warp % 4;

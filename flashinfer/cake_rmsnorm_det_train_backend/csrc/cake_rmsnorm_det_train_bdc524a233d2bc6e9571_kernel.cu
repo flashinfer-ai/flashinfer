@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_PARTIALS_STRIDE 32
-#define SMEM_TOTAL 128
-#define THREADS 128
-#define ROWS_PER_CTA 1
-#define GROUP_THREADS 128
-#define LAUNCH_BOUNDS_THREADS 128
-
 #include <math_constants.h>
 
 
@@ -74,7 +64,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(128) void
 kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, float* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -101,14 +91,14 @@ kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x
 
     // === Task calls (declaration order) ===
     int warp_0 = warp;
-    int group = tid / GROUP_THREADS;
-    int gtid = tid - group * GROUP_THREADS;
+    int group = tid / 128;
+    int gtid = tid - group * 128;
     float h_f = 4096.0f;
     int it = 0;
-    int stride = num_bids * ROWS_PER_CTA;
+    int stride = num_bids * 1;
     unsigned int cur[16];
     unsigned int nxt[16];
-    int first = bid * ROWS_PER_CTA + group;
+    int first = bid * 1 + group;
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         cur[i] = 0;
@@ -119,12 +109,12 @@ kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x
         for (int v = 0; v < 2; v++) {
             {
                 asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-                    : "=r"(cur[v * 8 + 0]), "=r"(cur[v * 8 + 1]), "=r"(cur[v * 8 + 2]), "=r"(cur[v * 8 + 3]), "=r"(cur[v * 8 + 4]), "=r"(cur[v * 8 + 5]), "=r"(cur[v * 8 + 6]), "=r"(cur[v * 8 + 7]) : "l"((const void*)((const char*)(x + (fbase + (long long)(gtid * 16 + v * (GROUP_THREADS * 16))) + 0) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                    : "=r"(cur[v * 8 + 0]), "=r"(cur[v * 8 + 1]), "=r"(cur[v * 8 + 2]), "=r"(cur[v * 8 + 3]), "=r"(cur[v * 8 + 4]), "=r"(cur[v * 8 + 5]), "=r"(cur[v * 8 + 6]), "=r"(cur[v * 8 + 7]) : "l"((const void*)((const char*)(x + (fbase + (long long)(gtid * 16 + v * (128 * 16))) + 0) + 0)), "l"(0x12F0000000000000ULL) : "memory");
             }
         }
     }
     #pragma unroll 1
-    for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
+    for (int row0 = bid * 1; row0 < T; row0 += num_bids * 1) {
         int row = row0 + group;
         int nrow = row + stride;
         if (nrow < T) {
@@ -133,7 +123,7 @@ kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x
             for (int v_1 = 0; v_1 < 2; v_1++) {
                 {
                     asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-                        : "=r"(nxt[v_1 * 8 + 0]), "=r"(nxt[v_1 * 8 + 1]), "=r"(nxt[v_1 * 8 + 2]), "=r"(nxt[v_1 * 8 + 3]), "=r"(nxt[v_1 * 8 + 4]), "=r"(nxt[v_1 * 8 + 5]), "=r"(nxt[v_1 * 8 + 6]), "=r"(nxt[v_1 * 8 + 7]) : "l"((const void*)((const char*)(x + (nbase + (long long)(gtid * 16 + v_1 * (GROUP_THREADS * 16))) + 0) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+                        : "=r"(nxt[v_1 * 8 + 0]), "=r"(nxt[v_1 * 8 + 1]), "=r"(nxt[v_1 * 8 + 2]), "=r"(nxt[v_1 * 8 + 3]), "=r"(nxt[v_1 * 8 + 4]), "=r"(nxt[v_1 * 8 + 5]), "=r"(nxt[v_1 * 8 + 6]), "=r"(nxt[v_1 * 8 + 7]) : "l"((const void*)((const char*)(x + (nbase + (long long)(gtid * 16 + v_1 * (128 * 16))) + 0) + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 }
             }
         }
@@ -190,7 +180,7 @@ kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x
                     unsigned _ldv8_5_6;
                     unsigned _ldv8_5_7;
                     asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_5_0), "=r"(_ldv8_5_1), "=r"(_ldv8_5_2), "=r"(_ldv8_5_3), "=r"(_ldv8_5_4), "=r"(_ldv8_5_5), "=r"(_ldv8_5_6), "=r"(_ldv8_5_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16)) + (0))) : "memory");
+                        : "=r"(_ldv8_5_0), "=r"(_ldv8_5_1), "=r"(_ldv8_5_2), "=r"(_ldv8_5_3), "=r"(_ldv8_5_4), "=r"(_ldv8_5_5), "=r"(_ldv8_5_6), "=r"(_ldv8_5_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (128 * 16)) + (0))) : "memory");
                     wf[0 + 0] = __uint_as_float(_ldv8_5_0);
                     wf[0 + 1] = __uint_as_float(_ldv8_5_1);
                     wf[0 + 2] = __uint_as_float(_ldv8_5_2);
@@ -210,7 +200,7 @@ kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x
                     unsigned _ldv8_6_6;
                     unsigned _ldv8_6_7;
                     asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_6_0), "=r"(_ldv8_6_1), "=r"(_ldv8_6_2), "=r"(_ldv8_6_3), "=r"(_ldv8_6_4), "=r"(_ldv8_6_5), "=r"(_ldv8_6_6), "=r"(_ldv8_6_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16) + 8) + (0))) : "memory");
+                        : "=r"(_ldv8_6_0), "=r"(_ldv8_6_1), "=r"(_ldv8_6_2), "=r"(_ldv8_6_3), "=r"(_ldv8_6_4), "=r"(_ldv8_6_5), "=r"(_ldv8_6_6), "=r"(_ldv8_6_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (128 * 16) + 8) + (0))) : "memory");
                     wf[8 + 0] = __uint_as_float(_ldv8_6_0);
                     wf[8 + 1] = __uint_as_float(_ldv8_6_1);
                     wf[8 + 2] = __uint_as_float(_ldv8_6_2);
@@ -272,7 +262,7 @@ kernel_cake_rmsnorm_det_train_bdc524a233d2bc6e9571(__nv_bfloat16* __restrict__ x
                     const unsigned* _raw_stv8_7 = reinterpret_cast<const unsigned*>(_packed_0);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(y + (obase + (long long)(gtid * 16 + v_2 * (GROUP_THREADS * 16))))), "r"(_raw_stv8_7[0]), "r"(_raw_stv8_7[1]), "r"(_raw_stv8_7[2]), "r"(_raw_stv8_7[3]), "r"(_raw_stv8_7[4]), "r"(_raw_stv8_7[5]), "r"(_raw_stv8_7[6]), "r"(_raw_stv8_7[7]) : "memory");
+                        :: "l"((void*)(y + (obase + (long long)(gtid * 16 + v_2 * (128 * 16))))), "r"(_raw_stv8_7[0]), "r"(_raw_stv8_7[1]), "r"(_raw_stv8_7[2]), "r"(_raw_stv8_7[3]), "r"(_raw_stv8_7[4]), "r"(_raw_stv8_7[5]), "r"(_raw_stv8_7[6]), "r"(_raw_stv8_7[7]) : "memory");
                 }
             }
         }

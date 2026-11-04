@@ -3122,24 +3122,31 @@ def test_cake_context_exact_mask_profile_selects_on_host_scalars(
     )
     assert meta_route == route
     # The switch back to uniform lengths: the host reads the lengths, serves a
-    # uniform batch and keeps a non-uniform one on the generic JIT route.
+    # uniform batch and sends a non-uniform one to the runtime-size program of
+    # its JIT pack.
     monkeypatch.setattr(cake_api, "_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS", True)
     assert cake_api.select_cake_fmha_context_route(query.device, **kwargs) == route
     generic = cake_api.select_cake_fmha_context_route(
         query.device, **{**kwargs, "seq_lens": nonuniform}
     )
+    runtime = cake_api._CONTEXT_BF16_RUNTIME_ROUTES["sm103a"]
+
+    def runtime_program(r):
+        return runtime.get((r.pack_g, r.page_size)) or runtime.get((r.pack_g, None))
+
     assert generic is not None
-    assert generic.exact_profile is None and generic.program is None
+    assert generic.exact_profile is None
+    assert generic.program == runtime_program(generic) is not None
     monkeypatch.setattr(cake_api, "_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS", False)
-    # A query row count off batch x max_q_len (ragged query lengths) keeps the
-    # generic program.
+    # A query row count off batch x max_q_len (ragged query lengths) leaves the
+    # exact program for the runtime-size one.
     ragged = cake_api.select_cake_fmha_context_route(
         query.device,
         **{**kwargs, "query": query[:-1], "out": kwargs["out"][:-1]},
     )
     assert ragged is not None
     assert ragged.exact_profile is None
-    assert ragged.program is None
+    assert ragged.program == runtime_program(ragged) is not None
 
 
 def test_cake_decode_public_entrypoint_forces_cake_backend(monkeypatch) -> None:

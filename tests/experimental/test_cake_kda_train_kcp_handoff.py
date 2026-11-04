@@ -56,6 +56,7 @@ import flashinfer.cake_kda_train_kcp as kcp_api
 from tests.experimental.test_cake_kda_train_kcp_dist import (
     CKPT_ROWS,
     _bound_rank_threads,
+    _init_group,
     _local_slices,
     _partition,
     _poison,
@@ -134,7 +135,7 @@ class _ArenaPoison:
 
 
 def _run_rank_handoff(
-    rank: int, W: int, row, port: int, result_dir: str | None, local_id: int
+    rank: int, W: int, row, rdzv: str | None, result_dir: str | None, local_id: int
 ) -> dict:
     """One rank of a hand-off row (see the module docstring)."""
     from torch.utils.checkpoint import (
@@ -147,9 +148,7 @@ def _run_rank_handoff(
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_context_kcp(part, group, rank, device)
@@ -602,10 +601,12 @@ def _run_rank_handoff(
     return report
 
 
-def _spawn_entry_handoff(rank: int, W: int, row, port: int, result_dir: str) -> None:
+def _spawn_entry_handoff(
+    rank: int, W: int, row, rdzv: str | None, result_dir: str
+) -> None:
     try:
         _bound_rank_threads(W)
-        report = _run_rank_handoff(rank, W, row, port, result_dir, rank)
+        report = _run_rank_handoff(rank, W, row, rdzv, result_dir, rank)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -629,7 +630,7 @@ def test_checkpoint_handoff_rows(row) -> None:
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
-            int(os.environ.get("MASTER_PORT", "29500")),
+            None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
             int(os.environ.get("SLURM_LOCALID", "0")),
         )
@@ -638,7 +639,7 @@ def test_checkpoint_handoff_rows(row) -> None:
     _skip_unless_runnable(W)
     with tempfile.TemporaryDirectory(prefix="cake_kcp_handoff_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        _start_ranks(_spawn_entry_handoff, W, row, result_dir)
+        _start_ranks(_spawn_entry_handoff, W, row, tmp, result_dir)
         with open(os.path.join(result_dir, "handoff-" + _row_id(row) + ".json")) as fh:
             report = json.load(fh)
     assert report["pass"], report

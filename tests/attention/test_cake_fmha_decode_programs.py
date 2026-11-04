@@ -34,12 +34,17 @@ def _loader(family):
 
 
 def _served() -> dict[tuple[str, str], set[str]]:
-    """``(family, identifier)`` -> the targets whose routes name it."""
+    """``(family, identifier)`` -> the targets whose routes name it (a
+    length-aware twin serves its stream-K program's targets on an opt-in
+    call)."""
 
     served: dict[tuple[str, str], set[str]] = {}
     for target, routes in cake_api._DECODE_PROGRAM_ROUTES.items():
         for key, identifier in routes.items():
             served.setdefault((key[0], identifier), set()).add(_TARGET_ARCH[target])
+    for key, twin in cake_api._DECODE_PROGRAM_LENGTH_AWARE.items():
+        if key in served:
+            served.setdefault(twin, set()).update(served[key])
     return served
 
 
@@ -1004,7 +1009,15 @@ def _bits(tensor):
     return tensor.view(dtype)
 
 
-def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
+def _run_decode(
+    case,
+    *,
+    seq_lens=None,
+    out=None,
+    max_seq_len=None,
+    lse=None,
+    length_aware_schedule=False,
+):
     return decode_api.trtllm_batch_decode_with_kv_cache(
         case.query,
         case.kv_cache,
@@ -1024,6 +1037,7 @@ def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
         lse=lse,
+        length_aware_schedule=length_aware_schedule,
     )
 
 
@@ -1281,6 +1295,121 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
     # Two tiles share the partition: 16 splits each.
     route = _select(_row_kwargs("smallm_kv60008_q8_p64", **_TWO_KV_HEADS))
     assert route.program is None and route.num_split == 16, route
+
+
+def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
+    """Driver queries over ``state``: the current stream's handle, its ID, its
+    context's handle, ID and SM count (``contexts`` overrides the ID and SM
+    count per context handle, ``current`` is the thread's current context,
+    ``stream_err`` fails the stream's context query); ``calls`` logs each
+    context read."""
+
+    def context_of(context):
+        return state.get("contexts", {}).get(
+            context, (state["context_id"], state["sms"])
+        )
+
+    def stream_id(stream):
+        return 0, state["stream_id"]
+
+    def stream_context(stream):
+        assert stream == state["stream"]
+        return state.get("stream_err", 0), state["handle"]
+
+    def context_id(context):
+        return 0, context_of(context)[0]
+
+    def context_resource(context, sm_type):
+        key, sms = context_of(context)
+        calls.append(key)
+        return 0, SimpleNamespace(sm=SimpleNamespace(smCount=sms))
+
+    monkeypatch.setattr(
+        torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
+    )
+    monkeypatch.setattr(cake_api, "_STREAM_SM_COUNTS", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_SM_COUNTS", {})
+    monkeypatch.setattr(cake_api, "_CU_STREAMS", {})
+    monkeypatch.setattr(
+        cake_api,
+        "_CONTEXT_QUERIES",
+        (
+            stream_id if stream_ids else None,
+            stream_context,
+            lambda: (0, state.get("current", state["handle"])),
+            context_id,
+            context_resource,
+            "sm",
+            lambda stream: stream,
+        ),
+    )
+
+
+def test_cake_fmha_smallm_partition_sm_count_follows_a_reused_stream_handle(
+    monkeypatch,
+) -> None:
+    """Without stream IDs, a stream handle (and a context handle) reused by a
+    new green context of another size reads the new context's SM count: the
+    count is cached per context ID, which the driver never reuses."""
+
+    state = {"stream": 7, "stream_id": None, "handle": 0x10, "context_id": 1}
+    state["sms"] = 64
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=False)
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1]
+    # The 64-SM context and its stream are destroyed; a 32-SM context reuses
+    # both handles.
+    state.update(context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2]
+
+
+def test_cake_fmha_smallm_partition_sm_count_is_cached_per_stream_id(
+    monkeypatch,
+) -> None:
+    """The SM count is cached per stream ID: a launch on a known stream reads
+    no context, and a reused stream handle with a new ID (a new green context)
+    reads its own context.  The per-thread default stream, whose context is the
+    thread's, is resolved to its context on every launch."""
+
+    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state["sms"] = 64
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    assert cake_api._stream_context_sm_count(0) == 64
+    state["context_id"] = 99  # a hit reads no context
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1]
+    state.update(stream_id=12, context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2]
+    state.update(stream=2, stream_id=None, context_id=3, sms=48)
+    assert cake_api._stream_context_sm_count(0) == 48
+    assert cake_api._stream_context_sm_count(0) == 48
+    assert calls == [1, 2, 3]
+
+
+def test_cake_fmha_smallm_partition_sm_count_of_a_failed_stream_query_is_not_cached(
+    monkeypatch,
+) -> None:
+    """When the stream's context query fails (say, after a recoverable launch
+    error) the launch is planned on the current context's SM count, which is
+    not cached under the stream's ID; once the query answers, the stream's own
+    context is read and cached."""
+
+    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state.update(sms=32, current=0x20, contexts={0x20: (5, 148)}, stream_err=1)
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    assert cake_api._stream_context_sm_count(0) == 148
+    assert cake_api._STREAM_SM_COUNTS == {}
+    state["stream_err"] = 0
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert cake_api._STREAM_SM_COUNTS == {11: 32}
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [5, 1]
 
 
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
@@ -1616,6 +1745,47 @@ module._smallm_partition_child(
 """
 
 
+_RECREATE_ATTEMPTS = 8
+
+
+def _recreated_green_context(sms):
+    """A ``sms``-SM torch green context and its stream, whose handle is the
+    handle of a stream of a destroyed ``2 * sms``-SM green context that the
+    module planned on, and a record of the attempt: create, plan and destroy
+    the larger context, then create the smaller one, up to
+    ``_RECREATE_ATTEMPTS`` times until the driver hands an old handle back
+    (``None`` and a ``skip`` record if it never does)."""
+
+    import gc
+
+    from torch.cuda.green_contexts import GreenContext
+
+    planned, seen, first_sms = set(), [], []
+    for attempt in range(1, _RECREATE_ATTEMPTS + 1):
+        first = GreenContext.create(num_sms=2 * sms, device_id=0)
+        with torch.cuda.stream(first.Stream()):
+            first_sms.append(cake_api._smallm_launch_sm_count(torch.device("cuda")))
+            planned.add(torch.cuda.current_stream().cuda_stream)
+        del first
+        gc.collect()
+        green = GreenContext.create(num_sms=sms, device_id=0)
+        stream = green.Stream()
+        seen.append(stream.cuda_stream)
+        if stream.cuda_stream in planned:
+            return (green, stream), {
+                "first_sms": first_sms,
+                "handle_reused": True,
+                "attempts": attempt,
+                "handles": seen,
+            }
+        del stream, green
+        gc.collect()
+    return None, {
+        "skip": f"no stream handle reused in {_RECREATE_ATTEMPTS} attempts: "
+        f"planned {sorted(planned)}, new {seen}"
+    }
+
+
 def _smallm_partition_child(sms, rows, api, green=None):
     """Run each small-M row on a stream of an ``sms``-SM green context made by
     ``api`` (FlashInfer's green-context helpers, torch's green contexts, or a
@@ -1639,11 +1809,19 @@ def _smallm_partition_child(sms, rows, api, green=None):
         else:
             if isinstance(green, Exception):
                 raise green
-            if green is None:
-                from torch.cuda.green_contexts import GreenContext
+            if api == "torch_recreated":
+                made, record = _recreated_green_context(sms)
+                print(json.dumps(record), flush=True)
+                if made is None:
+                    return
+                green, stream = made
+            else:
+                if green is None:
+                    from torch.cuda.green_contexts import GreenContext
 
-                green = GreenContext.create(num_sms=sms, device_id=0)
-            stream, partition = green.Stream(), sms
+                    green = GreenContext.create(num_sms=sms, device_id=0)
+                stream = green.Stream()
+            partition = sms
     except Exception as error:  # noqa: BLE001 - any failure means no partition
         print(json.dumps({"skip": f"no green context: {error!r}"}), flush=True)
         return
@@ -1686,11 +1864,14 @@ def _smallm_partition_child(sms, rows, api, green=None):
 
 
 @_GPU
-@pytest.mark.parametrize("api", ("flashinfer", "torch", "torch_before_import"))
+@pytest.mark.parametrize(
+    "api", ("flashinfer", "torch", "torch_before_import", "torch_recreated")
+)
 def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     """On a stream of a 32-SM green context (FlashInfer's or torch's, also one
-    created before FlashInfer was imported, with no partition setting) the
-    small-M rows plan at most 32 splits per tile and
+    created before FlashInfer was imported or after a 64-SM one was planned
+    and destroyed, with no partition setting) the small-M rows plan at most 32
+    splits per tile and
     complete (the full device's 65- and 152-way programs
     would wait forever for CTAs the partition cannot hold, and its nine-CTA
     cluster would not launch), matching the FP32 reference."""
@@ -1716,6 +1897,11 @@ def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     if records and "skip" in records[0]:
         pytest.skip(records[0]["skip"])
     assert result.returncode == 0, result.stderr[-4000:]
+    if api == "torch_recreated":
+        first = records.pop(0)
+        print(json.dumps(first))
+        assert first["handle_reused"] is True, first
+        assert set(first["first_sms"]) == {2 * _PARTITION_SMS}, first
     assert [r["row"] for r in records] == list(_PARTITION_ROWS), result.stderr[-4000:]
     device_sms = torch.cuda.get_device_properties(0).multi_processor_count
     for record in records:
@@ -1865,6 +2051,95 @@ def test_cake_fmha_decode_bf16_streamk_program_admission(
     )
     route = _select(short)
     assert route is None or route.program is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_bf16_length_aware_schedule_is_opt_in(
+    decode_target, target, device_scales
+) -> None:
+    """A stream-K B128 launch runs its length-aware twin only when the caller
+    asks for the length-aware schedule (the twin's route runs its program);
+    the default keeps the stream-K program, and a launch the stream-K program
+    does not admit ignores it."""
+
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    twin = identifier.replace("DEC_B128", "DEC_B128_LA")
+    kwargs = _row_kwargs("bf16_b128_s4096", device_scales=device_scales)
+    decode_target(target)
+    assert _select(kwargs).program == ("decode_bf16", identifier)
+    assert _select({**kwargs, "length_aware_schedule": False}).program == (
+        "decode_bf16",
+        identifier,
+    )
+    route = _select({**kwargs, "length_aware_schedule": True})
+    assert route.program == ("decode_bf16", twin)
+    assert cake_api._DECODE_PROGRAMS[("decode_bf16", twin)][1] == "streamk"
+    # the twin's route runs its program (not the compat module)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert (
+        cake_api._decode_program_record(route)
+        == (cake_api._DECODE_PROGRAMS[("decode_bf16", twin)])
+    )
+    decode_target(target, sm_count=260)  # 65 groups: 128 requests not admitted
+    route = _select({**kwargs, "length_aware_schedule": True})
+    assert route is None or route.program is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("kv_len", (300, 512, 640, 1024, 1152))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_b128_short_kv_runs_no_exact_retained_member(
+    decode_target, target, kv_len, device_scales
+) -> None:
+    """No exact B128 q1 32/4 retained-KV member serves a short-KV launch (at
+    most nine 128-token blocks) of that shape; that member gave wrong,
+    run-to-run different outputs on sm_103a.  The registry resolves the
+    generic retained-KV member for the shape, a table the stream-K program
+    reads in place takes DEC_B128 / DEC_B128_DS, and a narrower table takes
+    that program on a padded copy (device scales) or the generic member."""
+
+    from flashinfer.jit import cake_fmha as jit_cake_fmha
+
+    def selector(use_scale_ptr):
+        return jit_cake_fmha._resolve_decode_native_bf16_selector(
+            target,
+            128,
+            1,
+            32,
+            4,
+            has_sink=False,
+            has_window=False,
+            use_scale_ptr=use_scale_ptr,
+            retain_kv_l2=True,
+        )
+
+    decode_target(target)
+    for use_scale_ptr in (False, True):
+        assert "BATCH_SIZE" not in (selector(use_scale_ptr) or {})
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    blocks = -(-kv_len // 128)
+    wide = 8 * max(4, blocks + blocks % 2)
+    for width in (-(-kv_len // 16), wide):
+        kwargs = _row_kwargs(
+            "bf16_b128_s4096",
+            kv_len=kv_len,
+            width=width,
+            device_scales=device_scales,
+        )
+        route = _select(kwargs)
+        assert route is not None and route.retain_kv_l2, route
+        if cake_api._decode_route_runs_program(route):
+            assert route.program == ("decode_bf16", identifier), route
+            continue
+        assert width < wide and not device_scales, route
+        assert route.component == "decode_native_bf16", route
+        assert selector(route.use_scale_ptr) == {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0,
+        }
 
 
 @pytest.mark.parametrize("device_scales", (False, True))
@@ -2148,6 +2423,7 @@ def _run_bf16(case, **kwargs):
         sinks=case.sinks,
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
+        length_aware_schedule=kwargs.get("length_aware_schedule", False),
     )
 
 
@@ -2326,6 +2602,74 @@ def test_cake_decode_bf16_streamk_counters_are_graph_safe(
         if counter:
             assert not case.counter.any()
     assert set(served_programs) == {("decode_bf16", "DEC_B128")}
+
+
+@_GPU
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("lengths", ("uniform", "ragged", "skewed"))
+def test_cake_decode_bf16_length_aware_program(
+    served_programs, lengths, device_scales
+) -> None:
+    """The length-aware twin of the stream-K B128 program (the caller's
+    opt-in) is within the BF16 tolerance of an FP32 reference on every
+    request, the same bits run to run and after a graph replay of new
+    in-place lengths, and, for a batch of equal lengths, the default
+    program's bits (the same cuts)."""
+
+    _require_full_device()
+    batch, kv_len = 128, SHAPE_ROWS["bf16_b128_s4096"][4]
+    ragged = None
+    if lengths == "ragged":
+        ragged = ([kv_len, 1, 2, 129, kv_len - 1, 255, kv_len // 2, 17] * batch)[:batch]
+    elif lengths == "skewed":
+        # a few long requests among short ones: one long request holds the
+        # cuts of several CTA groups
+        ragged = [kv_len] * 4 + [130] * (batch - 4)
+    case = _bf16_gpu_case(
+        "bf16_b128_s4096", seed=20261102, lengths=ragged, device_scales=device_scales
+    )
+    default = _run_bf16(case)
+    got = _run_bf16(case, length_aware_schedule=True)
+    again = _run_bf16(case, length_aware_schedule=True)
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    twin = identifier.replace("DEC_B128", "DEC_B128_LA")
+    assert served_programs == [
+        ("decode_bf16", identifier),
+        ("decode_bf16", twin),
+        ("decode_bf16", twin),
+    ]
+    assert torch.equal(_bits(got), _bits(again))
+    reference = _bf16_reference(case, list(range(batch)))
+    for b in range(batch):
+        torch.testing.assert_close(
+            got[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
+    if lengths == "uniform":
+        assert torch.equal(_bits(got), _bits(default))
+    # A graph captured once replays new in-place lengths bitwise to direct
+    # launches; the split counters read zero after every launch.
+    seq_lens = case.seq_lens.clone()
+    out = torch.empty_like(case.out)
+    _run_bf16(case, seq_lens=seq_lens, out=out, length_aware_schedule=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_bf16(case, seq_lens=seq_lens, out=out, length_aware_schedule=True)
+    generator = torch.Generator(device="cuda").manual_seed(20261104)
+    for _ in range(3):
+        lengths_now = torch.randint(
+            1,
+            case.max_seq_len + 1,
+            (batch,),
+            generator=generator,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_lens.copy_(lengths_now)
+        graph.replay()
+        direct = _run_bf16(case, seq_lens=lengths_now, length_aware_schedule=True)
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(out), _bits(direct))
+        assert not case.counter.any()
 
 
 # --- FP8 boundaries (host-only) ----------------------------------------------

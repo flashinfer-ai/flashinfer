@@ -27,7 +27,11 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
 * every arm (repeat, saved / replay, light / full, autograd / explicit, checkpoint / direct with its kept-tape and
   recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay) within the FP64
   budgets on its own and, against its partner arm, within the same budget constants; ``.backward()`` twice: half the
-  accumulated gradient against the FP64 gradient;
+  accumulated gradient against the FP64 gradient; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where
+  the partition allows it, ring) runs with every package allocation filled with NaN bytes, and its saved set carries
+  ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); the rows plan
+  ``P = 1``, so the same forms run again at the forced ``P = 2`` (``segments=2``, where every rank's fragments take it)
+  against the light form at ``P = 2``, all under NaN-filled allocations;
 * worst case: ``N_REPEAT`` forward + backward runs per row, all recorded, the worst run per tensor gated;
 * semantics (G4): the zero-gradient leak stays exact (``dout`` zero outside one document -> exactly zero gradients on
   the others); independence (the other documents' operands replaced) within the budget constants;
@@ -42,7 +46,9 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   within the same FP64 budgets and their difference within the same budget constants (FP64 is the reference).
 
 ``test_poisoned_workspace_pairs``: one ``WorkspaceKcp`` reused across two rows of different token layouts on one group,
-every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets.  The convolution
+every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets, each also in the
+``save_mode="full"`` / ``save_transfer=False`` form (and its ring form where eligible), at the plan's ``P`` and at the forced
+``P = 2`` where every rank's fragments take it, under NaN-filled allocations.  The convolution
 halo row C7 (``cake_causal_conv1d_kcp`` through this package's context) and the whole-layer checkpoint rows
 (``RecomputeHandleKcp``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
 the plain checkpoint and the direct pass and within the correctness clause of the FP64 layer oracle; the backward's
@@ -50,8 +56,8 @@ collectives are the deterministic layer's) run under Slurm.
 
 Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views writes one packed dQKV row, and
 ``packed_qkv_views_kcp`` hands it to a packed leaf without a concatenation (both within the budgets of the contiguous
-call); plain ``split`` views of the leaf, direct and checkpointed, keep torch's split backward and their hooks and
-``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
+call); plain ``split`` views of the leaf, direct and checkpointed, get three contiguous gradients and keep torch's
+split backward and their hooks and ``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
 partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
 (see the block comment before ``V1_LIBRARIES``).
@@ -1850,16 +1856,39 @@ def _run_rank(
     flags["kept_peak_le_off"] = peaks["on"] <= peaks["off"]
     res_recompute = saved_pass(save_transfer=False)
     arm("no_save_transfer", res_recompute, res, "run0")
+    # save_mode="full" without save_transfer (the ring's only form): at P > 1 the backward's merges read the forward's
+    # M_seg^T plane, which the full backward does not rebuild, so the saved set carries it.  Run under NaN-filled
+    # allocations: a read of a plane no program of the call wrote is non-finite and fails the FP64 budgets.
+    res_full_nt = _nan_allocations_pass(
+        lambda: saved_pass(save_mode="full", save_transfer=False)
+    )
+    arm("full_no_save_transfer", res_full_nt, res_recompute, "no_save_transfer")
+    info["full_no_save_transfer"] = {
+        **_m_seg_rule(res_full_nt["saved"]),
+        "bitwise_vs_light": _bitwise(res_full_nt, res_recompute),
+    }
+    flags["full_no_save_transfer_saves_m_seg"] = info["full_no_save_transfer"]["ok"]
+    del res_full_nt
     ring_eligible = W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
     info["ring_eligible"] = ring_eligible
     if ring_eligible:
-        arm(
-            "ring",
-            saved_pass(exchange="ring", save_transfer=False),
-            res_recompute,
-            "no_save_transfer",
+        res_ring = saved_pass(exchange="ring", save_transfer=False)
+        arm("ring", res_ring, res_recompute, "no_save_transfer")
+        res_ring_full = _nan_allocations_pass(
+            lambda: saved_pass(exchange="ring", save_transfer=False, save_mode="full")
         )
+        arm("ring_full", res_ring_full, res_ring, "ring")
+        info["ring_full"] = {
+            **_m_seg_rule(res_ring_full["saved"]),
+            "bitwise_vs_light": _bitwise(res_ring_full, res_ring),
+        }
+        flags["ring_full_saves_m_seg"] = info["ring_full"]["ok"]
+        del res_ring, res_ring_full
     del res_recompute
+    # these rows plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override)
+    info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
+    if info["p2_eligible"]:
+        _p2_full_arms(saved_pass, arm, info, flags, ring=ring_eligible)
     # reported, as in the deterministic rows: the host group reduce
     arm("host_reduce", saved_pass(group_reduce="host"), res, "run0", gate=False)
     # strided packed-QKV views: zero-copy (layout="tma") and the copy adapter, both against the contiguous call
@@ -1912,6 +1941,10 @@ def _run_rank(
         )
         arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
         flags[f"plain_split_{tag}_hooks_fire"] = hooks_ok
+        # three contiguous gradients (one packed row only for packed_qkv_views_kcp's split)
+        flags[f"plain_split_{tag}_grad_layout_separate"] = (
+            kcp.LAST_CALL["bwd"]["grad_layout"] == "separate"
+        )
         del res_plain
     del _buf, qs, ks, vs
     # gradient accumulation: .backward() twice -> half the accumulated gradient against the FP64 gradient
@@ -2424,6 +2457,83 @@ def _poison(ws) -> dict:
     return {"tensors": len(names), "bytes": nbytes, "names": sorted(names)}
 
 
+def _nan_allocations_pass(fn):
+    """``fn()`` with every tensor the package allocates through ``_alloc`` (``torch.empty``: buffers a program or a
+    collective of the same call writes before any read) filled with NaN bytes (0xFF): a read of a buffer no program
+    of the call wrote is non-finite, so the FP64 budgets fail.  The identity tile is copied after its allocation and
+    the ticket words are zero-filled outside ``_alloc``."""
+    real = kcp._alloc
+
+    def poisoned(shape, dtype, device):
+        t = real(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    kcp._alloc = poisoned
+    try:
+        return fn()
+    finally:
+        kcp._alloc = real
+
+
+def _m_seg_rule(saved) -> dict:
+    """The ``M_seg`` record of a ``save_mode="full"`` saved set: present exactly at ``P > 1`` (the full backward runs no
+    transfer walk, so its merges read the saved ``M_seg^T`` plane), of the plan's ``stage_m`` size."""
+    if saved is None:
+        return {"ok": False, "P": None, "m_seg_bytes": None}
+    m = saved.M_seg
+    ok = (m is not None) == (int(saved.P) > 1) and saved.save_mode == "full"
+    return {
+        "ok": bool(ok),
+        "P": int(saved.P),
+        "m_seg_bytes": None if m is None else int(m.numel() * m.element_size()),
+    }
+
+
+def _bitwise(a: dict, b: dict, names=TENSORS) -> dict[str, bool]:
+    """Per tensor: the two arms hold the same bits (recorded, not gated: the non-deterministic package keeps the
+    budgets, not bitwise equality between forms)."""
+    return {n: bool(torch.equal(a[n], b[n])) for n in names}
+
+
+def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
+    """Every rank's fragments take the segments override ``P = 2`` (the longest fragment of each rank has at least
+    two chunks).  The int1 rows plan ``P = 1``; the forced ``P = 2`` arms put the full form's read of the saved
+    ``M_seg^T`` plane on these rows.  A group decision (MIN over the ranks): every rank runs the same calls."""
+    try:
+        ok = int(ctx.heads(HV, P=2).P) == 2
+    except ValueError:
+        ok = False
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
+    if W > 1:
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
+def _p2_full_arms(saved_pass, arm, info, flags, *, ring: bool, **extra) -> None:
+    """The forced ``P = 2`` forms without ``save_transfer`` under NaN-filled allocations: ``save_mode="full"``
+    first (its backward reads the saved ``M_seg^T`` plane), then the light form it is judged against, and the same
+    pair over the ring when the partition allows it.  Every arm within the FP64 budgets; ``M_seg`` held."""
+    pairs = [("p2_full_no_save_transfer", "p2_no_save_transfer", {})]
+    if ring:
+        pairs.append(("p2_ring_full", "p2_ring", {"exchange": "ring"}))
+    for full_name, light_name, opts in pairs:
+        o = {"segments": 2, "save_transfer": False, **opts, **extra}
+        res_full = _nan_allocations_pass(lambda o=o: saved_pass(save_mode="full", **o))
+        res_light = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+        arm(light_name, res_light)
+        arm(full_name, res_full, res_light, light_name)
+        info[full_name] = {
+            **_m_seg_rule(res_full["saved"]),
+            "bitwise_vs_light": _bitwise(res_full, res_light),
+        }
+        flags[f"{full_name}_saves_m_seg"] = bool(
+            info[full_name]["ok"] and info[full_name]["P"] == 2
+        )
+        del res_full, res_light
+
+
 def _run_rank_poison(
     rank: int,
     W: int,
@@ -2464,27 +2574,78 @@ def _run_rank_poison(
                 ),
             }
             flags["poisoned"] = p_bound["bytes"] > 0
-        out, saved = kcp.chunk_gdn_fwd_kcp(
-            q, k, v, g, beta, ctx, workspace=ws, deterministic=False, backend=backend
-        )
-        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ctx,
-            dout,
-            saved=saved,
-            workspace=ws,
-            deterministic=False,
-            backend=backend,
-        )
-        res = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+
+        def one_pass(**opts) -> dict:
+            out, saved = kcp.chunk_gdn_fwd_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                workspace=ws,
+                deterministic=False,
+                backend=backend,
+                **opts,
+            )
+            dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                dout,
+                saved=saved,
+                workspace=ws,
+                deterministic=False,
+                backend=backend,
+                **opts,
+            )
+            return {
+                "out": out,
+                "dq": dq,
+                "dk": dk,
+                "dv": dv,
+                "dg": dg,
+                "dbeta": dbeta,
+                "saved": saved,
+            }
+
+        tag = f"{'second' if i else 'first'}_{row.name}"
         judge = _Judge(row, ref_mod, _budget_cell(row))
-        judge.fp64(f"{'second' if i else 'first'}_{row.name}", res, refs)
+        res = one_pass()
+        judge.fp64(tag, res, refs)
+        del res
+        # save_mode="full" without save_transfer on the same workspace under NaN-filled allocations (and its ring
+        # form where the partition allows it): at P > 1 its backward reads the saved M_seg^T plane
+        # (+ the forced P = 2 forms where every rank's fragments take it: the pairs' rows plan P = 1)
+        ring_ok = W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
+        forms = [("full_no_save_transfer", {})]
+        if ring_ok:
+            forms.append(("ring_full", {"exchange": "ring"}))
+        p2 = _p2_group_ok(ctx, HV, group, W, device)
+        info[f"{tag}_p2_eligible"] = p2
+        if p2:
+            forms.append(("p2_full_no_save_transfer", {"segments": 2}))
+            if ring_ok:
+                forms.append(("p2_ring_full", {"exchange": "ring", "segments": 2}))
+        for form, extra in forms:
+            res = _nan_allocations_pass(
+                lambda extra=extra: one_pass(
+                    save_mode="full", save_transfer=False, **extra
+                )
+            )
+            judge.fp64(f"{tag}_{form}", res, refs)
+            rule = _m_seg_rule(res["saved"])
+            info[f"{tag}_{form}"] = rule
+            forced = "segments" not in extra or rule["P"] == int(extra["segments"])
+            flags[f"{form}_saves_m_seg"] = (
+                flags.get(f"{form}_saves_m_seg", True) and bool(rule["ok"]) and forced
+            )
+            del res
         verdicts.update(judge.finish(group, W))
-        del res, out, saved, dq, dk, dv, dbeta, dg, ops, refs
+        del ops, refs
     host = _host_map(group, W)
     flags["host_map"] = host["ok"]
     flag_list: list = [None] * W
@@ -3773,7 +3934,19 @@ def _run_rank_l2n(
         T_r == 0 or full["bwd"]["qk_source"] == "qk_apply"
     )
     arm("replay", saved_pass(boundary_mode="replay", **L2N), res, "run0")
-    arm("no_save_transfer", saved_pass(save_transfer=False, **L2N), res, "run0")
+    res_nt = saved_pass(save_transfer=False, **L2N)
+    arm("no_save_transfer", res_nt, res, "run0")
+    # save_mode="full" without save_transfer under NaN-filled allocations (the M_seg^T plane at P > 1, see _run_rank)
+    res_full_nt = _nan_allocations_pass(
+        lambda: saved_pass(save_mode="full", save_transfer=False, **L2N)
+    )
+    arm("full_no_save_transfer", res_full_nt, res_nt, "no_save_transfer")
+    info["full_no_save_transfer"] = {
+        **_m_seg_rule(res_full_nt["saved"]),
+        "bitwise_vs_light": _bitwise(res_full_nt, res_nt),
+    }
+    flags["full_no_save_transfer_saves_m_seg"] = info["full_no_save_transfer"]["ok"]
+    del res_full_nt, res_nt
     res_auto = autograd_pass(False, **L2N)
     arm("autograd", res_auto, res, "run0")
     for name, opts in (
@@ -3797,11 +3970,30 @@ def _run_rank_l2n(
     judge.fp64("backward_twice_half", twice, refs, GRADS, half=True)
     del twice
     if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
-        arm(
-            "ring",
-            saved_pass(exchange="ring", save_transfer=False, **L2N),
-            res,
-            "run0",
+        res_ring = saved_pass(exchange="ring", save_transfer=False, **L2N)
+        arm("ring", res_ring, res, "run0")
+        res_ring_full = _nan_allocations_pass(
+            lambda: saved_pass(
+                exchange="ring", save_transfer=False, save_mode="full", **L2N
+            )
+        )
+        arm("ring_full", res_ring_full, res_ring, "ring")
+        info["ring_full"] = {
+            **_m_seg_rule(res_ring_full["saved"]),
+            "bitwise_vs_light": _bitwise(res_ring_full, res_ring),
+        }
+        flags["ring_full_saves_m_seg"] = info["ring_full"]["ok"]
+        del res_ring, res_ring_full
+    # the forced P = 2 forms (see _run_rank)
+    info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
+    if info["p2_eligible"]:
+        _p2_full_arms(
+            saved_pass,
+            arm,
+            info,
+            flags,
+            ring=W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS,
+            **L2N,
         )
     res_host = saved_pass(group_reduce="host", **L2N)
     arm(
@@ -3977,6 +4169,9 @@ def _run_rank_l2n(
         )
         arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
         flags[f"l2n_plain_split_{tag}_hooks_fire"] = hooks_ok
+        flags[f"l2n_plain_split_{tag}_grad_layout_separate"] = (
+            kcp.LAST_CALL["bwd"]["grad_layout"] == "separate"
+        )
         del res_plain
     del buf, qs, ks, vs, res_auto
 

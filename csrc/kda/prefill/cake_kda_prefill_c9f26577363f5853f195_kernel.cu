@@ -40,183 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_TMEM_STATE_OFFSET 64
-#define TMEM_TMEM_STATE_DECAY_0_OFFSET 64
-#define TMEM_TMEM_STATE_DECAY_1_OFFSET 80
-#define TMEM_TMEM_STATE_DECAY_2_OFFSET 96
-#define TMEM_TMEM_STATE_DECAY_3_OFFSET 112
-#define TMEM_TMEM_STATE_DECAY_4_OFFSET 128
-#define TMEM_TMEM_STATE_DECAY_5_OFFSET 144
-#define TMEM_TMEM_STATE_DECAY_6_OFFSET 160
-#define TMEM_TMEM_STATE_DECAY_7_OFFSET 176
-#define TMEM_TMEM_STATE_INP_OFFSET 0
-#define TMEM_TMEM_STATE_INP_DECAY_0_OFFSET 0
-#define TMEM_TMEM_STATE_INP_DECAY_1_OFFSET 8
-#define TMEM_TMEM_STATE_INP_DECAY_2_OFFSET 16
-#define TMEM_TMEM_STATE_INP_DECAY_3_OFFSET 24
-#define TMEM_TMEM_STATE_INP_DECAY_4_OFFSET 32
-#define TMEM_TMEM_STATE_INP_DECAY_5_OFFSET 40
-#define TMEM_TMEM_STATE_INP_DECAY_6_OFFSET 48
-#define TMEM_TMEM_STATE_INP_DECAY_7_OFFSET 56
-#define TMEM_TMEM_U_ACC_OFFSET 224
-#define TMEM_TMEM_U2_INP_OFFSET 224
-#define TMEM_TMEM_U2_ACC_OFFSET 0
-#define TMEM_TMEM_OUT_OFFSET 192
-#define TMEM_TMEM_STATE_OUT_OFFSET 64
-#define NUM_CHUNK_PIPE_STAGES 5
-#define NUM_OUTPUT_PIPE_STAGES 2
-#define NUM_CHECKPOINT_PIPE_STAGES 2
-#define NUM_SNAPSHOT_PIPE_STAGES 4
-#define SMEM_SMEM_QD_OFF 1024
-#define SMEM_SMEM_QD_STAGE_BYTES 8192
-#define SMEM_SMEM_QD_STRIDE 41984
-#define SMEM_SMEM_G_RAW_OFF 1024
-#define SMEM_SMEM_G_RAW_STAGE_BYTES 8192
-#define SMEM_SMEM_G_RAW_STRIDE 41984
-#define SMEM_SMEM_G_RAW_ALL_OFF 1024
-#define SMEM_SMEM_G_RAW_ALL_STAGE_BYTES 8192
-#define SMEM_SMEM_G_RAW_ALL_STRIDE 41984
-#define SMEM_SMEM_KD_OFF 9216
-#define SMEM_SMEM_KD_STAGE_BYTES 8192
-#define SMEM_SMEM_KD_STRIDE 41984
-#define SMEM_SMEM_Q_RAW_PREFETCH_OFF 17408
-#define SMEM_SMEM_Q_RAW_PREFETCH_STAGE_BYTES 8192
-#define SMEM_SMEM_Q_RAW_PREFETCH_STRIDE 41984
-#define SMEM_SMEM_FINAL_TRANS_OFF 17408
-#define SMEM_SMEM_FINAL_TRANS_STAGE_BYTES 12288
-#define SMEM_SMEM_FINAL_TRANS_STRIDE 41984
-#define SMEM_SMEM_KR_TRANS_OFF 17408
-#define SMEM_SMEM_KR_TRANS_STAGE_BYTES 8192
-#define SMEM_SMEM_KR_TRANS_STRIDE 41984
-#define SMEM_SMEM_MQK_TRANS_OFF 25600
-#define SMEM_SMEM_MQK_TRANS_STAGE_BYTES 2048
-#define SMEM_SMEM_MQK_TRANS_STRIDE 41984
-#define SMEM_SMEM_FINAL_MQK_SLAB_OFF 25600
-#define SMEM_SMEM_FINAL_MQK_SLAB_STAGE_BYTES 4096
-#define SMEM_SMEM_FINAL_MQK_SLAB_STRIDE 41984
-#define SMEM_SMEM_INV_OFF 29696
-#define SMEM_SMEM_INV_STAGE_BYTES 2048
-#define SMEM_SMEM_INV_STRIDE 41984
-#define SMEM_SMEM_V_OFF 32384
-#define SMEM_SMEM_V_STAGE_BYTES 8192
-#define SMEM_SMEM_V_STRIDE 41984
-#define SMEM_SMEM_SHORT_N32_V_OFF 168960
-#define SMEM_SMEM_SHORT_N32_V_STAGE_BYTES 32768
-#define SMEM_SMEM_SHORT_N32_V_STRIDE 32768
-#define SMEM_SMEM_KI_OFF 17408
-#define SMEM_SMEM_KI_STAGE_BYTES 8192
-#define SMEM_SMEM_KI_STRIDE 41984
-#define SMEM_SMEM_GATE_OFF 25600
-#define SMEM_SMEM_GATE_STAGE_BYTES 16384
-#define SMEM_SMEM_GATE_STRIDE 41984
-#define SMEM_SMEM_BETA_RAW_OFF 41984
-#define SMEM_SMEM_BETA_RAW_STAGE_BYTES 512
-#define SMEM_SMEM_BETA_RAW_STRIDE 41984
-#define SMEM_SMEM_BETA_RAW_ALL_OFF 41984
-#define SMEM_SMEM_BETA_RAW_ALL_STAGE_BYTES 512
-#define SMEM_SMEM_BETA_RAW_ALL_STRIDE 41984
-#define SMEM_SMEM_INV_WORK_OFF 32384
-#define SMEM_SMEM_INV_WORK_STAGE_BYTES 4096
-#define SMEM_SMEM_INV_WORK_STRIDE 41984
-#define SMEM_SMEM_OUT_OFF 210944
-#define SMEM_SMEM_OUT_STAGE_BYTES 8192
-#define SMEM_SMEM_OUT_STRIDE 8192
-#define SMEM_SMEM_V18_OFF 210944
-#define SMEM_SMEM_V18_STAGE_BYTES 16384
-#define SMEM_SMEM_V18_STRIDE 16384
-#define SMEM_SMEM_FINAL_STATE_ROWS_OFF 1024
-#define SMEM_SMEM_FINAL_STATE_ROWS_STAGE_BYTES 67584
-#define SMEM_SMEM_FINAL_STATE_ROWS_STRIDE 67584
-#define SMEM_SMEM_CHECKPOINT_OFF 1024
-#define SMEM_SMEM_CHECKPOINT_STAGE_BYTES 32768
-#define SMEM_SMEM_CHECKPOINT_STRIDE 32768
-#define SMEM_SMEM_RESTORE_FACTOR_ALL_OFF 41984
-#define SMEM_SMEM_RESTORE_FACTOR_ALL_STAGE_BYTES 516
-#define SMEM_SMEM_RESTORE_FACTOR_ALL_STRIDE 41984
-#define SMEM_SMEM_V21_OFF 41984
-#define SMEM_SMEM_V21_STAGE_BYTES 512
-#define SMEM_SMEM_V21_STRIDE 41984
-#define SMEM_SMEM_GT_PREFIX_OFF 41472
-#define SMEM_SMEM_GT_PREFIX_STAGE_BYTES 512
-#define SMEM_SMEM_GT_PREFIX_STRIDE 41984
-#define SMEM_SMEM_GT_PREFIX_ALL_OFF 41472
-#define SMEM_SMEM_GT_PREFIX_ALL_STAGE_BYTES 168448
-#define SMEM_SMEM_GT_PREFIX_ALL_STRIDE 168448
-#define SMEM_SMEM_GT_ALL_OFF 31744
-#define SMEM_SMEM_GT_ALL_STAGE_BYTES 512
-#define SMEM_SMEM_GT_ALL_STRIDE 41984
-#define SMEM_SMEM_V25_OFF 227920
-#define SMEM_SMEM_V25_STAGE_BYTES 2560
-#define SMEM_SMEM_V25_STRIDE 2560
-#define SMEM_SMEM_PREP_BETA_ALL_OFF 42500
-#define SMEM_SMEM_PREP_BETA_ALL_STAGE_BYTES 128
-#define SMEM_SMEM_PREP_BETA_ALL_STRIDE 41984
-#define SMEM_SMEM_PREP_BETA_BF16_ALL_OFF 42500
-#define SMEM_SMEM_PREP_BETA_BF16_ALL_STAGE_BYTES 64
-#define SMEM_SMEM_PREP_BETA_BF16_ALL_STRIDE 41984
-#define SMEM_SMEM_PREP_BETA_U32_ALL_OFF 42500
-#define SMEM_SMEM_PREP_BETA_U32_ALL_STAGE_BYTES 64
-#define SMEM_SMEM_PREP_BETA_U32_ALL_STRIDE 41984
-#define SMEM_SMEM_GATE_RATE_ALL_OFF 42628
-#define SMEM_SMEM_GATE_RATE_ALL_STAGE_BYTES 4
-#define SMEM_SMEM_GATE_RATE_ALL_STRIDE 41984
-#define SMEM_SMEM_OH_PACKET_HEAD_OFF 1024
-#define SMEM_SMEM_OH_PACKET_HEAD_STAGE_BYTES 31232
-#define SMEM_SMEM_OH_PACKET_HEAD_STRIDE 41984
-#define SMEM_SMEM_OH_PACKET_TAIL_OFF 42496
-#define SMEM_SMEM_OH_PACKET_TAIL_STAGE_BYTES 144
-#define SMEM_SMEM_OH_PACKET_TAIL_STRIDE 41984
-#define SMEM_SMEM_GATE_BIAS_ALL_OFF 227408
-#define SMEM_SMEM_GATE_BIAS_ALL_STAGE_BYTES 512
-#define SMEM_SMEM_GATE_BIAS_ALL_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_RAW_OFF 1024
-#define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STAGE_BYTES 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STRIDE 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG_0_OFF 1024
-#define SMEM_SMEM_STATE_DECAY_DIAG_0_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_0_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_1_OFF 1536
-#define SMEM_SMEM_STATE_DECAY_DIAG_1_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_1_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_2_OFF 2048
-#define SMEM_SMEM_STATE_DECAY_DIAG_2_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_2_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_3_OFF 2560
-#define SMEM_SMEM_STATE_DECAY_DIAG_3_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_3_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_4_OFF 3072
-#define SMEM_SMEM_STATE_DECAY_DIAG_4_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_4_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_5_OFF 3584
-#define SMEM_SMEM_STATE_DECAY_DIAG_5_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_5_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_6_OFF 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG_6_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_6_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_7_OFF 4608
-#define SMEM_SMEM_STATE_DECAY_DIAG_7_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG_7_STRIDE 512
-#define SMEM_SMEM_V_ALL_OFF 32384
-#define SMEM_SMEM_V_ALL_STAGE_BYTES 8192
-#define SMEM_SMEM_V_ALL_STRIDE 41984
-#define SMEM_SMEM_GATE_ALL_OFF 25600
-#define SMEM_SMEM_GATE_ALL_STAGE_BYTES 16384
-#define SMEM_SMEM_GATE_ALL_STRIDE 41984
-#define SMEM_SMEM_STATE_CHECKPOINT_NEEDED_OFF 227328
-#define SMEM_SMEM_STATE_CHECKPOINT_NEEDED_STAGE_BYTES 80
-#define SMEM_SMEM_STATE_CHECKPOINT_NEEDED_STRIDE 80
-#define SMEM_SMEM_WORK_ITEM_WARP_MAX_OFF 227328
-#define SMEM_SMEM_WORK_ITEM_WARP_MAX_STAGE_BYTES 16
-#define SMEM_SMEM_WORK_ITEM_WARP_MAX_STRIDE 16
-#define SMEM_SMEM_WORK_ITEM_COMPUTE_START_OFF 227344
-#define SMEM_SMEM_WORK_ITEM_COMPUTE_START_STAGE_BYTES 4
-#define SMEM_SMEM_WORK_ITEM_COMPUTE_START_STRIDE 4
-#define SMEM_SMEM_WORK_ITEM_RESOLVED_OFF 227348
-#define SMEM_SMEM_WORK_ITEM_RESOLVED_STAGE_BYTES 4
-#define SMEM_SMEM_WORK_ITEM_RESOLVED_STRIDE 4
-#define SMEM_TOTAL 230528
 #define STORE_BACKWARD_TAPE 0
 #define STORE_E_TAPE 1
 #define SPLIT_WORK_ITEMS 0
@@ -448,7 +271,7 @@ __device__ __forceinline__ void tmem_st_x8_u32(int addr, const uint32_t* src) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -519,7 +342,7 @@ kernel_cake_kda_prefill_c9f26577363f5853f195(__nv_bfloat16* __restrict__ q, cons
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_qd_addr = smem + 1024;
     __nv_bfloat16* smem_g_raw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -619,8 +442,7 @@ kernel_cake_kda_prefill_c9f26577363f5853f195(__nv_bfloat16* __restrict__ q, cons
     unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 227348);
     const int smem_work_item_resolved_addr = smem + 227348;
 
-    // Mbarrier init (25 pipeline groups, 0 ordered-sequence groups, 98 barriers)
-    // Mbarriers at smem_raw[0..784)
+    // Mbarrier init (98 barriers at smem_raw[0..784))
 
     if (warp == 10) {
         // --- pipeline 'chunk_pipe' ---
@@ -699,32 +521,32 @@ kernel_cake_kda_prefill_c9f26577363f5853f195(__nv_bfloat16* __restrict__ q, cons
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_0 = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_1 = taddr + 80;
+    const unsigned int tmem_tmem_state_decay_2 = taddr + 96;
+    const unsigned int tmem_tmem_state_decay_3 = taddr + 112;
+    const unsigned int tmem_tmem_state_decay_4 = taddr + 128;
+    const unsigned int tmem_tmem_state_decay_5 = taddr + 144;
+    const unsigned int tmem_tmem_state_decay_6 = taddr + 160;
+    const unsigned int tmem_tmem_state_decay_7 = taddr + 176;
+    const unsigned int tmem_tmem_state_inp = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_0 = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_1 = taddr + 8;
+    const unsigned int tmem_tmem_state_inp_decay_2 = taddr + 16;
+    const unsigned int tmem_tmem_state_inp_decay_3 = taddr + 24;
+    const unsigned int tmem_tmem_state_inp_decay_4 = taddr + 32;
+    const unsigned int tmem_tmem_state_inp_decay_5 = taddr + 40;
+    const unsigned int tmem_tmem_state_inp_decay_6 = taddr + 48;
+    const unsigned int tmem_tmem_state_inp_decay_7 = taddr + 56;
+    const unsigned int tmem_tmem_u_acc = taddr + 224;
+    const unsigned int tmem_tmem_u2_inp = taddr + 224;
+    const unsigned int tmem_tmem_u2_acc = taddr;
+    const unsigned int tmem_tmem_out = taddr + 192;
+    const unsigned int tmem_tmem_state_out = taddr + 64;
 
     // Kernel post-init ops
-    const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_decay_0 = taddr + 64;
-    const int tmem_tmem_state_decay_1 = taddr + 80;
-    const int tmem_tmem_state_decay_2 = taddr + 96;
-    const int tmem_tmem_state_decay_3 = taddr + 112;
-    const int tmem_tmem_state_decay_4 = taddr + 128;
-    const int tmem_tmem_state_decay_5 = taddr + 144;
-    const int tmem_tmem_state_decay_6 = taddr + 160;
-    const int tmem_tmem_state_decay_7 = taddr + 176;
-    const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_state_inp_decay_0 = taddr;
-    const int tmem_tmem_state_inp_decay_1 = taddr + 8;
-    const int tmem_tmem_state_inp_decay_2 = taddr + 16;
-    const int tmem_tmem_state_inp_decay_3 = taddr + 24;
-    const int tmem_tmem_state_inp_decay_4 = taddr + 32;
-    const int tmem_tmem_state_inp_decay_5 = taddr + 40;
-    const int tmem_tmem_state_inp_decay_6 = taddr + 48;
-    const int tmem_tmem_state_inp_decay_7 = taddr + 56;
-    const int tmem_tmem_u_acc = taddr + 224;
-    const int tmem_tmem_u2_inp = taddr + 224;
-    const int tmem_tmem_u2_acc = taddr;
-    const int tmem_tmem_out = taddr + 192;
-    const int tmem_tmem_state_out = taddr + 64;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -1925,7 +1747,7 @@ kernel_cake_kda_prefill_c9f26577363f5853f195(__nv_bfloat16* __restrict__ q, cons
                             float unbounded_direct_log2;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2) : "f"(1.0f + unbounded_exponential));
                             float unbounded_softplus_log2 = ((unbounded_biased <= 20.0f) ? ((unbounded_biased < -4.0f) ? unbounded_series_log2 : unbounded_direct_log2) : unbounded_biased * 1.442695f);
-                            early_gate0 = (-early_gate_rate) * unbounded_softplus_log2;
+                            early_gate0 = -early_gate_rate * unbounded_softplus_log2;
                         }
                     }
                     int _parity_smem_free = (int)((unsigned int)prep_iter % 2) ^ 1;
@@ -1996,7 +1818,7 @@ kernel_cake_kda_prefill_c9f26577363f5853f195(__nv_bfloat16* __restrict__ q, cons
                             float unbounded_direct_log2_1;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2_1) : "f"(1.0f + unbounded_exponential_1));
                             float unbounded_softplus_log2_1 = ((unbounded_biased_1 <= 20.0f) ? ((unbounded_biased_1 < -4.0f) ? unbounded_series_log2_1 : unbounded_direct_log2_1) : unbounded_biased_1 * 1.442695f);
-                            float first_gate_value = (-gate_rate) * unbounded_softplus_log2_1;
+                            float first_gate_value = -gate_rate * unbounded_softplus_log2_1;
                             first_gate_log2 = ((first_gate_token < eos_0) ? first_gate_value : 0.0f);
                         }
                         unbounded_total_log2 = unbounded_total_log2 + first_gate_log2;
@@ -2049,7 +1871,7 @@ kernel_cake_kda_prefill_c9f26577363f5853f195(__nv_bfloat16* __restrict__ q, cons
                         float unbounded_direct_log2_2;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2_2) : "f"(1.0f + unbounded_exponential_2));
                         float unbounded_softplus_log2_2 = ((unbounded_biased_2 <= 20.0f) ? ((unbounded_biased_2 < -4.0f) ? unbounded_series_log2_2 : unbounded_direct_log2_2) : unbounded_biased_2 * 1.442695f);
-                        float last_gate_value = (-gate_rate) * unbounded_softplus_log2_2;
+                        float last_gate_value = -gate_rate * unbounded_softplus_log2_2;
                         float last_gate_log2 = ((last_gate_token < eos_0) ? last_gate_value : 0.0f);
                         unbounded_total_log2 = unbounded_total_log2 + last_gate_log2;
                         prefix_log2 += max_noftz(last_gate_log2, -15.0f);

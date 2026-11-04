@@ -4314,6 +4314,7 @@ def trtllm_batch_decode_with_kv_cache(
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
     sparse_top_k: int = 0,
+    length_aware_schedule: bool = False,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4556,6 +4557,15 @@ def trtllm_batch_decode_with_kv_cache(
         65535. A sliding window, attention sinks and head dim 512 (MLA's, see
         :func:`trtllm_batch_decode_with_kv_cache_mla`) are not supported. ``0``
         (default) disables it.
+
+    length_aware_schedule : bool = False
+        ``cake`` backend: run the length-aware stream-K program where one serves
+        the call (BF16 Q/KV/O, head dimension 128, 16-token HND pages, 128
+        requests of one query token, 32 query heads over 4 KV heads).  It sizes
+        each request's work by its own ``seq_lens`` entry instead of
+        ``max_seq_len``, which helps a batch whose lengths differ widely; a
+        batch of equal lengths gives the default program's output.  Other calls
+        and backends ignore it.  ``False`` (default) keeps the default program.
 
     Returns
     -------
@@ -5137,6 +5147,7 @@ def trtllm_batch_decode_with_kv_cache(
                 lse=lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 enable_pdl=enable_pdl,
+                length_aware_schedule=length_aware_schedule,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route

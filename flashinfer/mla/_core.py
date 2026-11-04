@@ -1220,9 +1220,9 @@ def _resolve_dsv4_sparse_mla_backend(
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
-    # The SM100 CAKE kernels require SM100/SM103; the prebuilt cubin backend and
-    # CuTe DSL HCA also cover SM107.
-    is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
+    # The SM100 CAKE kernels build for SM100/SM103 and, for the FP8 decode
+    # route, SM107 (run_cake_dsv4 refuses a route SM107 has no program for).
+    is_cake_sm100_family = is_sm100_family
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1248,9 +1248,10 @@ def _resolve_dsv4_sparse_mla_backend(
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):
+    if requested_backend == "cake" and not (is_cake_sm100_family or is_sm120_family):
         raise ValueError(
-            f"backend='cake' requires SM100/SM103 or SM120/SM121, got SM{cc[0]}{cc[1]}"
+            "backend='cake' requires SM100/SM103/SM107 or SM120/SM121, "
+            f"got SM{cc[0]}{cc[1]}"
         )
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
@@ -1933,7 +1934,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     :func:`flashinfer.mla.dsv41_fp4_quantize_pack_sparse_mla_cache`.
 
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
-    kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
+    kernels (``flashinfer.mla.cake_dsv4``); on SM107 the FP8 cache's decode
+    route runs them (the FP8 persistent, M64 and low-head prefill programs),
+    and any other route raises. The metadata may describe fewer
     tokens than ``query`` provides: with dense ``[B, Q, H, D]`` input the
     table rows cover the first ``T <= B * Q`` flattened tokens (padded batch),
     with ragged ``[sum_q, H, D]`` input the first ``T <= sum_q`` rows. Query
@@ -2054,8 +2057,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch. Used by the
-        TRTLLM-GEN path; on SM100/SM103 by ``backend="cake"`` for its FP8
-        persistent and M64 programs (the other BF16 / FP8 programs launch
+        TRTLLM-GEN path; on SM100/SM103/SM107 by ``backend="cake"`` for its
+        FP8 persistent, M64 and low-head prefill programs and, on SM100/SM103,
+        its FP8 H64 cluster program (the other BF16 / FP8 programs launch
         without it); and on SM120/SM121 by ``backend="cake"`` with
         ``kv_cache_format="fp8_dsv41_fp4_ca"`` (its split merge is launched as a
         programmatic dependent of the decode grid). ``None`` follows the device

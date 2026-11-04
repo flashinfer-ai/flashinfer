@@ -57,8 +57,10 @@ checks:
   each) and ``F = 2 max(P, P_k7) + 10`` where it runs ``lpt`` or ``lpt_os``
   (the partials are another partition's; see :func:`_dfn_factor`), the largest
   ratio printed, also with the unit order forced to each of ``"chunk"`` and
-  ``"slab"`` where the device's route holds that order's records (no ``_os``
-  record on sm_107a); run to run, ``dX`` / ``dscale`` / ``dbase`` identical
+  ``"slab"`` where the device's route holds that order's records (the board
+  cells of ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` emptied,
+  so the forced order holds on every board, the 212-SM sm_107a one too); run
+  to run, ``dX`` / ``dscale`` / ``dbase`` identical
   and the ``dfn`` bits that differ counted and printed (never asserted);
 * the two-size schedule at forced geometries (``cake_jit.lpt_chunks`` replaced
   for one token count: one size, one small chunk, several, small chunks past
@@ -67,7 +69,8 @@ checks:
   tokens; at hidden 5120 and 7168, where the device's route holds the size's
   ``lpt`` record, a subset of these and the screen's best geometry at a
   measured token count of the size), in each unit order whose record the
-  device's route holds (no ``lpt_os`` on sm_107a): the ``lpt`` record
+  device's route holds (``lpt_os`` at hidden 4096 on every architecture, at
+  5120 and 7168 on sm_100a alone): the ``lpt`` record
   (``lpt_os`` with the slab-fastest order forced) launches over
   ``min(SMs, H / 64 x P)`` CTAs, ``dX`` / ``dscale`` / ``dbase`` bitwise the
   deterministic package's on two launches (fresh outputs, then a poisoned
@@ -301,23 +304,36 @@ def _require_hidden(hidden: int) -> int:
 
 def _require_lpt(hidden: int, order: str = "chunk") -> int:
     """Skip a case of the two-size column slab at ``hidden`` in the unit order ``order`` where the device's
-    ``bwd_finish`` route of the size holds no such record (``lpt``, or ``lpt_os`` for ``"slab"``): where the size's
-    table has no two-size calibration of the architecture (sm_103a at 5120 and 7168), or for ``"slab"`` where its
-    ``BWD_SLAB_ORDER`` of the size has no ``"slab"`` band (sm_107a); a calibrated size without the record fails."""
+    ``bwd_finish`` route of the size holds no such record (``lpt``, or ``lpt_os`` for ``"slab"``): where neither the
+    size's table nor a board cell of ``BWD_SLAB_LPT_OVERRIDES`` at the size has a two-size calibration of the
+    architecture (sm_103a at 5120 and 7168), or for ``"slab"`` where neither its ``BWD_SLAB_ORDER`` of the size nor a
+    board cell of ``BWD_SLAB_ORDER_OVERRIDES`` at the size has a ``"slab"`` band; a calibrated size without the
+    record fails (every architecture's route holds ``lpt`` and ``lpt_os`` at hidden 4096)."""
     _require_hidden(hidden)
+    arch = _arch()
     name = (LPT_OS if order == "slab" else LPT) + _suffix(hidden)
-    if name not in loader.route_modules(_arch(), hidden, "bwd_finish"):
+    if name not in loader.route_modules(arch, hidden, "bwd_finish"):
         table = (
             loader.BWD_SLAB_LPT
             if hidden == HIDDEN
             else loader.BWD_SLAB_LPT_HIDDEN[hidden]
         )
-        calibrated = table[_arch()] is not None
-        slab_band = any(o == "slab" for _, o in loader.BWD_SLAB_ORDER[hidden][_arch()])
+        entries = [table[arch]] + [
+            cell
+            for (a, _sm, h), cell in loader.BWD_SLAB_LPT_OVERRIDES.items()
+            if (a, h) == (arch, hidden)
+        ]
+        orders = [loader.BWD_SLAB_ORDER[hidden][arch]] + [
+            cell
+            for (a, _sm, h), cell in loader.BWD_SLAB_ORDER_OVERRIDES.items()
+            if (a, h) == (arch, hidden)
+        ]
+        calibrated = any(entry is not None for entry in entries)
+        slab_band = any(o == "slab" for bands in orders for _, o in bands)
         assert not (calibrated and (order == "chunk" or slab_band)), (
-            f"the {_arch()} route of hidden {hidden} holds no {name}"
+            f"the {arch} route of hidden {hidden} holds no {name}"
         )
-        pytest.skip(f"hidden {hidden} has no {name} on {_arch()}")
+        pytest.skip(f"hidden {hidden} has no {name} on {arch}")
     return hidden
 
 
@@ -1256,12 +1272,16 @@ def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
 
 @pytest.fixture
 def forced_order():
-    """``force(hidden, order)``: ``cake_jit.BWD_SLAB_ORDER`` of the device's architecture at ``hidden`` set to
-    ``order`` (``"chunk"`` or ``"slab"``) at every token count, with the package's route-plan caches cleared on entry,
-    after each edit and after the restore (a plan binds the selection of its token count)."""
+    """``force(hidden, order)``: the board cells of ``cake_jit.BWD_SLAB_ORDER_OVERRIDES`` and
+    ``cake_jit.BWD_SLAB_LPT_OVERRIDES`` emptied (a board cell would replace the forced order, as on sm_107a with 212
+    SMs, and its calibration the architecture's) and ``cake_jit.BWD_SLAB_ORDER`` of the device's architecture at
+    ``hidden`` set to ``order`` (``"chunk"`` or ``"slab"``) at every token count, with the package's route-plan caches
+    cleared on entry, after each edit and after the restore (a plan binds the selection of its token count)."""
     with pytest.MonkeyPatch.context() as patch:
 
         def force(hidden: int, order: str) -> None:
+            patch.setattr(loader, "BWD_SLAB_ORDER_OVERRIDES", {})
+            patch.setattr(loader, "BWD_SLAB_LPT_OVERRIDES", {})
             patch.setitem(loader.BWD_SLAB_ORDER[hidden], _arch(), ((None, order),))
             pkg._PLANS.clear()
             pkg._FAST_ROUTES.clear()
@@ -1282,9 +1302,9 @@ def test_matches_the_deterministic_backward_in_each_unit_order(
     forced_order, hidden: int, T: int, order: str
 ) -> None:
     """:func:`test_matches_the_deterministic_backward` with the size's unit order forced to ``order`` at every token
-    count: the chunk-order records (``dynr`` / ``lpt``) and the slab-fastest ones (``dynr_os`` / ``lpt_os``) both run
-    where the device's route holds them, whichever order the table of record picks on this device (skipped where the
-    route holds no record of the order: the ``"slab"`` cases on sm_107a)."""
+    count (the board cells emptied: :func:`forced_order`): the chunk-order records (``dynr`` / ``lpt``) and the
+    slab-fastest ones (``dynr_os`` / ``lpt_os``) both run where the device's route holds them, whichever order the
+    tables of record pick on this device (skipped where the route holds no record of the order)."""
     _require_hidden(hidden)
     forced_order(hidden, order)
     program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)

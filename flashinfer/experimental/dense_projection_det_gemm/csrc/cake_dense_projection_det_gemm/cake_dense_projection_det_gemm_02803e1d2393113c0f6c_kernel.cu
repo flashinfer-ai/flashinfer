@@ -40,23 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 64
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 12
-#define NUM_EPI_PIPE_STAGES 1
-#define SMEM_SMEM_W_OFF 1024
-#define SMEM_SMEM_W_STAGE_BYTES 8192
-#define SMEM_SMEM_W_STRIDE 8192
-#define SMEM_SMEM_A_OFF 99328
-#define SMEM_SMEM_A_STAGE_BYTES 8192
-#define SMEM_SMEM_A_STRIDE 8192
-#define SMEM_STAGING_OFF 197632
-#define SMEM_STAGING_STAGE_BYTES 8192
-#define SMEM_STAGING_STRIDE 8192
-#define SMEM_TOTAL 205824
-#define THREADS 256
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {

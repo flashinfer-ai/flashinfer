@@ -147,7 +147,7 @@ import struct
 import threading
 import types
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from typing import Any, Protocol
 
 import torch
@@ -172,6 +172,11 @@ SAVED_VERSION_TAPE = (
 # no larger than the Aqk / Akk set (2 * S * H * 256 B); shorter packs recompute them in the backward
 SEG_SAVE_MIN_TOKENS_PER_SEG = 384
 SAVE_MODES = ("light", "tape")
+# The in-kernel Q/K L2 norm modes of a plan (:attr:`Plan.l2n`): ``"off"`` (the caller's normalized q / k),
+# ``"fused"`` (``use_qk_l2norm_in_kernel=True``: the first q / k reader of every path normalizes from the raw rows,
+# GLM intra pulls the gradients back) and ``"fallback"`` (the token-local qk_l2norm / qk_apply / qk_pullback stages
+# around the plain readers; reached only through an explicit plan and workspace, a test route).
+L2N_MODES = cake_jit.L2N_MODES
 ALIGN = 256  # every arena sub-buffer and table starts on a 256 B boundary (TMA needs 16 B; 256 B also serves .view)
 # The arena layouts: the forward's, the backward's of the saved-set paths (``bwd``) and of the checkpoint replay
 # (``replay``, which keeps the internal ``akk_int`` rows), each in its light and tape form.
@@ -196,18 +201,29 @@ TABLE_NAMES = (
 # recurrence; the tables only when the saved set carries none).  The two forward paths launch the same stages:
 # their records differ (the saving forward's token-row forms).
 _FWD_STAGES = tuple(s for s in STAGES if s in STAGES_FWD or s == "seg_carry")
+# The token-local stages of the in-kernel Q/K L2 norm's fallback route: a plan carries them (in its records) only in
+# that mode, so a flag-off plan's records, stages and launch counts are the plan without the feature.
+_L2N_FALLBACK_STAGES = ("qk_l2norm", "qk_apply", "qk_pullback")
 _PATH_STAGES: dict[str, tuple[str, ...]] = {
     "fwd": _FWD_STAGES,
     "fwd_nosave": _FWD_STAGES,
     "replay": tuple(
         s
         for s in STAGES
-        if s in STAGES_BWD or s in ("table", "seg_table", "fwd_intra", "seg_carry")
+        if s in STAGES_BWD
+        or s in ("table", "seg_table", "fwd_intra", "seg_carry", "qk_l2norm")
     ),
 }
+# the saved-set paths launch no intra program and read the saved rstd (qk_apply in the fallback route, never
+# qk_l2norm)
 for _path in ("light", "light_states", "tape"):
-    _PATH_STAGES[_path] = tuple(s for s in _PATH_STAGES["replay"] if s != "fwd_intra")
+    _PATH_STAGES[_path] = tuple(
+        s for s in _PATH_STAGES["replay"] if s not in ("fwd_intra", "qk_l2norm")
+    )
 del _path
+# Stages the replay path selects a record for but never launches (:meth:`Plan.stages`): the fallback's
+# ``qk_apply`` reads a saved rstd, which the replay recomputes with ``qk_l2norm`` instead.
+_REPLAY_UNLAUNCHED = ("qk_apply",)
 
 # A launcher takes a record name, the logical argument values, the plan grid and the device index and runs the
 # program (``cake_jit.run_module``).  The workspace holds one so a diagnostic harness can run the same composition
@@ -422,7 +438,13 @@ class Plan:
     activated FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel``): the stages of
     ``cake_jit.GATE_STAGES`` select within that class, every other stage selects the same record in both modes;
     in raw mode ``gate_fused`` is True on every architecture (no raw gate epilogue) and ``param_finalize`` runs
-    once per backward.  The forward layouts do not depend on it.
+    once per backward.  The forward layouts do not depend on it.  ``l2n`` is the in-kernel Q/K L2 norm mode the
+    records serve (:data:`L2N_MODES`: ``"off"``, the caller's normalized q / k; ``"fused"``, the default of
+    ``use_qk_l2norm_in_kernel=True``: the first q / k reader of every path normalizes and GLM intra pulls the
+    gradients back; ``"fallback"``, the token-local ``qk_l2norm`` / ``qk_apply`` / ``qk_pullback`` stages around the
+    plain readers, a test route only): the stages of ``cake_jit.L2N_STAGES`` select within that class; every
+    l2n mode fuses the gate epilogue (``gate_fused`` True on every architecture) and the forward layouts carry the
+    transient ``qn`` / ``kn`` views.
     """
 
     S: int
@@ -443,6 +465,7 @@ class Plan:
     records: dict[str, dict[str, str | None]]
     grids: dict[str, tuple[tuple[int, int, int], ...]]
     gate: str = "g"
+    l2n: str = "off"
 
     def dispatched(self, stage: str, path: str) -> bool:
         """Whether ``path`` launches a record of ``stage``."""
@@ -529,13 +552,18 @@ class Plan:
 
     def stages(self, path: str) -> tuple[str, ...]:
         """The stages ``path`` launches on this plan, in registry order (the tables included; ``seg_carry`` on the
-        segmented route)."""
+        segmented route).  The in-kernel Q/K L2 norm fallback's replay normalizes q / k with ``qk_l2norm`` (it
+        writes the rstd) and launches no ``qk_apply``: the plan keeps that record among the replay path's records (the
+        KCP's local backward plans on that path), but this module does not launch it there."""
         self._records(path)
         return tuple(
             stage
             for stage in _PATH_STAGES[path]
             if (stage == "seg_carry" and self.recur == "seg")
-            or self.dispatched(stage, path)
+            or (
+                self.dispatched(stage, path)
+                and not (path == "replay" and stage in _REPLAY_UNLAUNCHED)
+            )
         )
 
     def launch_count(self, path: str, *, tables: bool = True) -> int:
@@ -567,12 +595,26 @@ class Plan:
         ``*_tape`` forms (``save_mode="tape"``: ``h`` and ``v_new`` live in the saved set); the lean layouts
         (:data:`LEAN_MODES`, :class:`KdaDetArena`) take their ``tail_passes``."""
         return _layout(
-            self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes, self.gate_fused
+            self.R,
+            self.H,
+            self.NC_pad,
+            self.NSEG,
+            mode,
+            tail_passes,
+            self.gate_fused,
+            self.l2n,
         )
 
     def workspace_bytes(self, mode: str = "bwd", tail_passes: int = 1) -> int:
         return _mode_bytes(
-            self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes, self.gate_fused
+            self.R,
+            self.H,
+            self.NC_pad,
+            self.NSEG,
+            mode,
+            tail_passes,
+            self.gate_fused,
+            self.l2n,
         )
 
     def check_arena(self, arena: KdaDetArena, *, backward: bool = True) -> None:
@@ -629,6 +671,7 @@ class Plan:
                 arena=arena,
                 gate_fused=self.gate_fused,
                 fwd_layout=fwd_layout,
+                l2n=self.l2n,
             )
         geometries = (
             [self.batch_bound(arena)]
@@ -649,6 +692,7 @@ class Plan:
                 arena=arena,
                 gate_fused=self.gate_fused,
                 fwd_layout=fwd_layout,
+                l2n=self.l2n,
             )
             for nc_pad, rows, nseg in geometries
         )
@@ -725,7 +769,12 @@ class Plan:
         grids = {
             name: tuple(
                 cake_jit.launch_grid(
-                    name, **scalars, num_segments=nseg, launch=launch, gsize=self.gsize
+                    name,
+                    **scalars,
+                    num_segments=nseg,
+                    launch=launch,
+                    gsize=self.gsize,
+                    num_tokens=batch.S,
                 )
                 for launch in range(cake_jit.launches(name))
             )
@@ -750,6 +799,7 @@ class Plan:
             records=self.records,
             grids=grids,
             gate=self.gate,
+            l2n=self.l2n,
         )
 
     def table_layout(self) -> tuple[tuple[str, int, int], ...]:
@@ -812,6 +862,19 @@ def _select_record(stage: str, gate: str, **scalars: Any) -> str | None:
     return select(stage, gate=gate, **scalars)
 
 
+def _check_l2n(l2n: str) -> str:
+    """``l2n`` when it is an in-kernel Q/K L2 norm mode of :data:`L2N_MODES`, else ``ValueError``."""
+    if l2n not in L2N_MODES:
+        raise ValueError(f"l2n must be one of {L2N_MODES}, got {l2n!r}")
+    return l2n
+
+
+def _l2n_kw(l2n: str) -> dict[str, str]:
+    """The ``l2n`` keyword of ``cake_jit.select_record`` for an in-kernel Q/K L2 norm mode; none for ``"off"``, so
+    the flag-off selection is the call it always was."""
+    return {} if l2n == "off" else {"l2n": l2n}
+
+
 def plan(
     S: int,
     num_docs: int,
@@ -820,6 +883,7 @@ def plan(
     arch: str | None = None,
     *,
     gate: str = "g",
+    l2n: str = "off",
 ) -> Plan:
     """The :class:`Plan` of a packed problem; reads no tensor.
 
@@ -835,19 +899,37 @@ def plan(
     class of the gate-dependent stages (``cake_jit.GATE_STAGES``) for ``use_gate_in_kernel``; every other stage
     selects the same record in both modes.
 
-    The plan is a pure function of ``(S, num_docs, H, sm_count, arch, gate)`` and is cached on them: a repeated
+    ``l2n`` (keyword-only, ``"off"`` by default) is the in-kernel Q/K L2 norm mode (:attr:`Plan.l2n`): ``"fused"``
+    for ``use_qk_l2norm_in_kernel=True``, ``"fallback"`` for the token-local test route; ``ValueError`` when the
+    architecture's records have no class of that mode.
+
+    The plan is a pure function of ``(S, num_docs, H, sm_count, arch, gate, l2n)`` and is cached on them: a repeated
     problem returns the same :class:`Plan` object (its record and grid tables are shared, never modified), so the
     calls of the default entry plan a repeated shape once.
     """
     arch = _plan_arch(arch)
     if arch not in cake_jit.ARCHES:
         raise ValueError(f"plan: arch {arch!r} is not one of {cake_jit.ARCHES}")
-    return _plan(int(S), int(num_docs), int(H), int(sm_count), arch, _check_gate(gate))
+    return _plan(
+        int(S),
+        int(num_docs),
+        int(H),
+        int(sm_count),
+        arch,
+        _check_gate(gate),
+        _check_l2n(l2n),
+    )
 
 
 @functools.lru_cache(maxsize=256)
 def _plan(
-    S: int, num_docs: int, H: int, sm_count: int, arch: str, gate: str = "g"
+    S: int,
+    num_docs: int,
+    H: int,
+    sm_count: int,
+    arch: str,
+    gate: str = "g",
+    l2n: str = "off",
 ) -> Plan:
     """:func:`plan` of the normalized scalars (the cache; a refused problem raises every time)."""
     nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sm_count)
@@ -860,10 +942,17 @@ def _plan(
         "sm_count": sm_count,
     }
     # the saved-state path exists on the segmented route only (the serial route has no segment states)
+    # an in-kernel Q/K L2 norm mode launches no gate epilogue: its GLM intra programs write the gate gradients
+    # themselves on every architecture (:func:`_gate_fused`)
     records = {
         path: {
-            stage: _select_record(stage, gate, **scalars, arch=arch, path=path)
+            stage: None
+            if l2n != "off" and stage == "gate_epilogue"
+            else _select_record(
+                stage, gate, **scalars, arch=arch, path=path, **_l2n_kw(l2n)
+            )
             for stage in _PATH_STAGES[path]
+            if l2n == "fallback" or stage not in _L2N_FALLBACK_STAGES
         }
         for path in PATHS
         if path != "light_states" or recur == "seg"
@@ -879,7 +968,11 @@ def _plan(
     grids = {
         name: tuple(
             cake_jit.launch_grid(
-                name, **scalars, num_segments=num_segments, launch=launch
+                name,
+                **scalars,
+                num_segments=num_segments,
+                launch=launch,
+                num_tokens=S,
             )
             for launch in range(cake_jit.launches(name))
         )
@@ -918,15 +1011,19 @@ def _plan(
         records=records,
         grids=grids,
         gate=gate,
+        l2n=l2n,
     )
 
 
-def _gate_fused(arch: str | None, gate: str = "g") -> bool:
+def _gate_fused(arch: str | None, gate: str = "g", l2n: str = "off") -> bool:
     """Whether ``arch``'s GLM intra program writes the gate gradients itself (no ``gate_epilogue`` record admits
     its rows; the layouts then carry no ``dg_int`` / ``db_int``).  ``arch=None`` (a byte query without an exported
     device at hand) takes the first exported architecture's records, as :func:`plan` does there.  ``gate="raw"``
-    reads the raw class, which has no gate epilogue: True on every architecture."""
+    reads the raw class, which has no gate epilogue: True on every architecture, as is every in-kernel Q/K L2 norm
+    mode (``l2n != "off"``: the l2n GLM intra programs fuse the epilogue)."""
     arch = cake_jit.ARCHES[0] if arch is None else arch
+    if _check_l2n(l2n) != "off":
+        return True
     return (
         _select_record(
             "gate_epilogue",
@@ -1336,13 +1433,12 @@ def _lean_slots(
 
 # The layouts another route registers on this module's arenas (:func:`_register_route_slots`): mode -> its slots at
 # ``(tail_passes, R, H, NC, NSEG, gate_fused)`` (the context-parallel route's lean backward layout,
-# ``cake_kda_det_train_kcp.cake_kcp_plan``).  This module registers none and runs none; a registered mode is never one
+# ``cake_kda_det_train_kcp.cake_kcp_plan``), with ``l2n`` as a seventh argument in an in-kernel Q/K L2 norm mode
+# only, so a route that serves no l2n mode keeps the six-argument form.  This module registers none and runs none; a registered mode is never one
 # of its own (:data:`MODES`, :data:`LEAN_MODES`, :data:`FWD_LAYOUTS`), so their layouts and bytes do not depend on the
 # registry.  A mode keeps the one function it was registered with, so the cached :func:`_layout` of a registered
 # mode never changes (a mode looked up before its registration raised, which is not cached).
-_RouteSlots = Callable[
-    [int, int, int, int, int, bool], tuple[tuple[Occupant, ...], ...]
-]
+_RouteSlots = Callable[..., tuple[tuple[Occupant, ...], ...]]
 _ROUTE_SLOTS: dict[str, _RouteSlots] = {}
 
 
@@ -1414,6 +1510,43 @@ def _kind_bytes(
     return n * _element_size(dtype), shape
 
 
+# The layouts that carry the in-kernel Q/K L2 norm's transient internal rows ``qn_int`` / ``kn_int`` (``l2n !=
+# "off"``, contract v1.1): ``[R, H, 128]`` BF16 at sub-offset 0 of the ``u`` / ``w`` slots, written and read by the
+# fused intra program alone (each CTA its own 64 chunk rows, zeros past ``chunk_len``: no cross-CTA read) at 1,
+# before WY writes u / w (2); the forward layouts and the replay's (whose intra program runs first on the segmented
+# rows up to 256 documents).  The fallback's token-layout forward ``qn`` / ``kn`` (qk_l2norm at 0, the plain intra
+# program at 1) are the first ``S`` rows of the same bytes.  Bytes unchanged.
+_L2N_FWD_LAYOUTS = ("fwd", "fwd_tape", "fwd_kcp", "replay", "replay_tape")
+# the per-pass gradient buffers the fallback route's qk_pullback reads after GLM intra (step 8)
+_L2N_PULLBACK_BUFFERS = ("dq_f", "dk_f")
+
+
+def _l2n_slots(
+    slots: tuple[tuple[Occupant, ...], ...], mode: str, l2n: str
+) -> tuple[tuple[Occupant, ...], ...]:
+    """``slots`` of layout ``mode`` under the in-kernel Q/K L2 norm mode ``l2n``: the forward and replay layouts
+    gain ``qn_int`` / ``kn_int`` on the ``u`` / ``w`` slots (lifetime ``(0, 1)``); in ``"fallback"`` the backward's ``dq_f`` / ``dk_f``
+    live until the pullback (``(6, 8)``).  ``"off"`` returns ``slots`` unchanged."""
+    if l2n == "off":
+        return slots
+    out: list[tuple[Occupant, ...]] = []
+    for slot in slots:
+        names = [o[0] for o in slot]
+        if mode in _L2N_FWD_LAYOUTS and names[0] in ("u", "w"):
+            slot = (
+                ("qn_int" if names[0] == "u" else "kn_int", "B16", 0, (0, 1)),
+            ) + tuple(slot)
+        if l2n == "fallback":
+            slot = tuple(
+                (name, kind, sub, (life[0], 8))
+                if name in _L2N_PULLBACK_BUFFERS
+                else (name, kind, sub, life)
+                for name, kind, sub, life in slot
+            )
+        out.append(tuple(slot))
+    return tuple(out)
+
+
 @functools.cache
 def _layout(
     R: int,
@@ -1423,12 +1556,17 @@ def _layout(
     mode: str,
     tail_passes: int = 1,
     gate_fused: bool = False,
+    l2n: str = "off",
 ) -> tuple[Region, ...]:
     route = _ROUTE_SLOTS.get(mode)
     slots = (
-        _slots_of(mode, tail_passes, R, H, NC, NSEG)
+        _l2n_slots(_slots_of(mode, tail_passes, R, H, NC, NSEG), mode, l2n)
         if route is None
+        # a registered route's function takes the l2n mode as a seventh argument only in an l2n mode (the
+        # flag-off call is the six-argument one it always was)
         else route(tail_passes, R, H, NC, NSEG, gate_fused)
+        if l2n == "off"
+        else route(tail_passes, R, H, NC, NSEG, gate_fused, l2n)
     )
     if gate_fused:  # no gate epilogue: its input buffers leave the layout (an emptied slot leaves too)
         slots = tuple(
@@ -1549,12 +1687,13 @@ def _mode_bytes(
     mode: str,
     tail_passes: int = 1,
     gate_fused: bool = False,
+    l2n: str = "off",
 ) -> int:
     """The bytes of one arena layout (:data:`MODES` or :data:`LEAN_MODES`)."""
     return max(
         (
             r.offset + r.nbytes
-            for r in _layout(R, H, NC_pad, NSEG, mode, tail_passes, gate_fused)
+            for r in _layout(R, H, NC_pad, NSEG, mode, tail_passes, gate_fused, l2n)
         ),
         default=0,
     )
@@ -1571,6 +1710,7 @@ def _arena_bytes(
     arena: KdaDetArena | None = None,
     gate_fused: bool = False,
     fwd_layout: str = "fwd",
+    l2n: str = "off",
 ) -> int:
     """The arena a :class:`KdaDetWorkspace` of the problem allocates: the larger of the saved-set and the replay
     layouts for a backward workspace (both paths run in it), the forward layout otherwise (``fwd_layout``, one of
@@ -1590,7 +1730,7 @@ def _arena_bytes(
         )
     if not backward:
         return _mode_bytes(
-            R, H, NC_pad, NSEG, "fwd_tape" if tape else fwd_layout, 1, gate_fused
+            R, H, NC_pad, NSEG, "fwd_tape" if tape else fwd_layout, 1, gate_fused, l2n
         )
     if arena is not None and arena.lean:
         return _mode_bytes(
@@ -1601,9 +1741,12 @@ def _arena_bytes(
             "bwd_tape_lean" if tape else "bwd_lean",
             arena.tail_passes,
             gate_fused,
+            l2n,
         )
     modes = ("bwd_tape", "replay_tape") if tape else ("bwd", "replay")
-    return max(_mode_bytes(R, H, NC_pad, NSEG, mode, 1, gate_fused) for mode in modes)
+    return max(
+        _mode_bytes(R, H, NC_pad, NSEG, mode, 1, gate_fused, l2n) for mode in modes
+    )
 
 
 def workspace_bytes(
@@ -1619,6 +1762,7 @@ def workspace_bytes(
     doc_lengths: Sequence[int] | None = None,
     fwd_layout: str = "fwd",
     gate: str = "g",
+    l2n: str = "off",
 ) -> int:
     """Arena bytes a :class:`KdaDetWorkspace` of the problem allocates (``backward=False``: the forward's layout only,
     ``fwd_layout`` of :data:`FWD_LAYOUTS`; a backward workspace takes the larger of the saved-set paths' layout and
@@ -1630,16 +1774,19 @@ def workspace_bytes(
     current device's architecture when ``arch`` is ``None``).  ``gate`` is the gate mode (:attr:`Plan.gate`): the
     raw mode's backward layouts carry no ``dg_int`` / ``db_int`` on any architecture (the forward layouts are the
     same in both modes).  The outputs, the saved set and the raw mode's per-call parameter partials are allocated
-    per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`."""
+    per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`.  ``l2n`` is the in-kernel Q/K L2
+    norm mode (:attr:`Plan.l2n`): any mode but ``"off"`` drops ``dg_int`` / ``db_int`` on every architecture and
+    puts the transient ``qn`` / ``kn`` on the forward layout's ``u`` / ``w`` slots (the same bytes)."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"workspace_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
     _check_gate(gate)
+    _check_l2n(l2n)
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
     if arena is not None and (arena.lean or arena.batched):
-        return plan(S, num_docs, H, sms, arch, gate=gate).arena_bytes(
+        return plan(S, num_docs, H, sms, arch, gate=gate, l2n=l2n).arena_bytes(
             backward=backward,
             save_mode=save_mode,
             arena=arena,
@@ -1656,8 +1803,9 @@ def workspace_bytes(
         backward=backward,
         save_mode=save_mode,
         arena=arena,
-        gate_fused=_gate_fused(arch, gate),
+        gate_fused=_gate_fused(arch, gate, l2n),
         fwd_layout=fwd_layout,
+        l2n=l2n,
     )
 
 
@@ -1689,6 +1837,7 @@ def saved_bytes(
     save_mode: str = "light",
     sm_count: int | None = None,
     arch: str | None = None,
+    l2n: str = "off",
 ) -> int:
     """Bytes of the saved set: ``Aqk`` + ``Akk`` BF16 ``[S, H, 64]`` (``256 * S * H``), plus, when ``num_docs``
     is given, the tables and, for ``save_mode="light"`` (version 4), the fold's ``qg`` BF16 ``[R, H, 128]`` (the
@@ -1701,13 +1850,17 @@ def saved_bytes(
     ``w`` / ``u`` BF16 ``[R, H, 128]``.  ``save_mode="tape"`` adds the internal-layout
     ``h`` BF16 ``[NC_pad, H, 128, 128]``, ``v_new`` BF16 ``[R, H, 128]`` and, on the segmented route, the forward's
     segment states FP32 ``[2, NSEG, H, 128, 128]`` whose transfer half is the saved ``seg_m`` (``num_docs``
-    required) instead."""
+    required) instead.  With an in-kernel Q/K L2 norm mode (``l2n != "off"``) every version adds ``qk_rstd`` FP32
+    ``[2, S, H]`` (``8 * S * H``); the raw q / k the backward reads again are the caller's inputs, not saved
+    tensors."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"saved_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
     S, H = int(S), int(H)
     total = 2 * S * H * BT * 2
+    if _check_l2n(l2n) != "off":
+        total += _rstd_bytes(S, H)
     if num_docs is None:
         if save_mode == "tape":
             raise ValueError("saved_bytes: save_mode='tape' needs num_docs")
@@ -1733,12 +1886,86 @@ def saved_bytes(
     return total
 
 
-def output_bytes(S: int, H: int, *, backward: bool, gate: str = "g") -> int:
+def _rstd_bytes(S: int, H: int) -> int:
+    """The in-kernel Q/K L2 norm's ``qk_rstd`` FP32 ``[2, S, H]``."""
+    return 2 * int(S) * int(H) * 4
+
+
+def _l2n_bwd_rows_bytes(S: int, H: int) -> int:
+    """The backward's per-call ``qn`` / ``kn`` BF16 ``[S, H, 128]`` each (in-kernel Q/K L2 norm modes): written by
+    the first q / k reader, dropped after the last GLM intra launch.  The saved-set paths keep them in the arena
+    instead where :func:`_l2n_rows_in_arena` holds (no per-call bytes)."""
+    return 2 * int(S) * int(H) * D * 2
+
+
+# The backward stages that write the token-row gradients dq / dk; they run after every other stage of a path
+# (:func:`_backward_launches`, one tail pass).
+_DQK_WRITER_STAGES = ("glm_intra", "qk_pullback", "gate_epilogue")
+
+
+def _l2n_rows_in_arena(
+    p: Plan, path: str, buffers: Collection[str], tail_passes: int
+) -> bool:
+    """Whether the backward on ``path`` (one whole-problem launch sequence on a layout with the arena ``buffers``)
+    keeps the in-kernel Q/K L2 norm's ``qn`` / ``kn`` without per-call bytes: ``qn`` on the bytes of ``do_int``
+    (the replay prep's copy of ``dout``; no record of a saved-set path binds it), ``kn`` on the bytes of ``dv2``,
+    and ``dv2`` itself on the bytes of the call's ``dq`` / ``dk`` (one BF16 ``[2, S, H, 128]`` tensor, ``2 S >= R``),
+    which only the stages of :data:`_DQK_WRITER_STAGES` write, after the last ``dv2`` read.  It holds on a saved-set
+    path with one tail pass whose layout has both buffers (not the lean ones), where no record of the path binds
+    ``do_int``, no record of those stages binds ``dv2`` and no other record binds ``dq`` / ``dk``; else the
+    backward allocates ``qn`` / ``kn`` per call (:func:`_l2n_bwd_rows_bytes`)."""
+    if p.l2n == "off" or path == "replay" or tail_passes != 1 or 2 * p.S < p.R:
+        return False
+    if "do_int" not in buffers or "dv2" not in buffers:
+        return False
+    for stage, name in p._records(path).items():
+        if name is None:
+            continue
+        names = set(cake_jit.MODULES[name]["logical"].values())
+        late = stage in _DQK_WRITER_STAGES
+        if (
+            "do_int" in names
+            or (late and "dv2" in names)
+            or (not late and names & {"dq", "dk"})
+        ):
+            return False
+    return True
+
+
+# The per-call outputs and raw partials of the backward (:func:`_backward`) that no prep record binds: a whole-problem
+# fused in-kernel Q/K L2 norm backward allocates them after the prep launch (:func:`_l2n_prep_first`).
+_PREP_LATE_NAMES = frozenset(
+    {"dv", "dg", "dbeta", "dg_raw", "dA_part", "db_part", "dA_log", "ddt_bias"}
+)
+
+
+def _l2n_prep_first(p: Plan, path: str, replay: bool) -> bool:
+    """Whether a whole-problem backward on ``path`` of the fused in-kernel Q/K L2 norm (``p.l2n == "fused"``) launches
+    its prep record first (no ``qk_apply`` / ``qk_l2norm`` stage, and not the replay's intra-first order: the replay
+    without a table launch) and that record binds none of :data:`_PREP_LATE_NAMES`: the backward then allocates
+    those after the prep launch, so the first backward kernel is queued before that host work."""
+    if (
+        p.l2n != "fused"
+        or p.dispatched("qk_apply", path)
+        or p.dispatched("qk_l2norm", path)
+    ):
+        return False
+    if replay and not p.dispatched("table", path):
+        return False
+    names = cake_jit.MODULES[p.record("bwd_prep", path)]["logical"].values()
+    return not any(n in _PREP_LATE_NAMES for n in names)
+
+
+def output_bytes(
+    S: int, H: int, *, backward: bool, gate: str = "g", l2n: str = "off"
+) -> int:
     """Bytes of one call's outputs: ``out`` BF16 (forward) or ``dq, dk, dv, dbeta`` BF16 + ``dg`` FP32 (backward);
     with ``gate="raw"`` the backward's ``dg`` is the BF16 gradient of the raw gate, plus ``dA_log`` FP32 ``[H]``
     and ``d dt_bias`` FP32 ``[H * 128]``.  The raw backward's per-call parameter partials (:func:`_raw_partials_bytes`)
-    are transient, not outputs: :func:`memory_report` reports them."""
+    are transient, not outputs: :func:`memory_report` reports them.  ``l2n`` (the in-kernel Q/K L2 norm mode)
+    changes no output: ``dq`` / ``dk`` are the raw rows' BF16 gradients either way."""
     S, H = int(S), int(H)
+    _check_l2n(l2n)
     raw = _check_gate(gate) == "raw"
     if not backward:
         return S * H * D * 2
@@ -1787,6 +2014,7 @@ def lifetime_table(
     plan: Plan | None = None,
     gate_fused: bool | None = None,
     gate: str | None = None,
+    l2n: str | None = None,
 ) -> list[dict[str, Any]]:
     """The layout as rows ``{slot, buffer, kind, unit, ..., first_write, last_read}``: token kinds in bytes per
     internal token-head (a tape entry of 32768 B per chunk-head spreads over the chunk's 64 rows), the segmented
@@ -1796,13 +2024,22 @@ def lifetime_table(
     problem's geometry, so a ``plan`` is required there.  ``gate_fused`` (``None``: the plan's, else whether
     ``gate`` is ``"raw"``) drops the gate epilogue's ``dg_int`` / ``db_int`` (the architectures whose GLM intra
     program fuses it, and the raw gate mode on every architecture).  ``gate`` (``None``: the plan's, else ``"g"``)
-    must match a given plan's."""
+    must match a given plan's.  ``l2n`` (``None``: the plan's, else ``"off"``) is the in-kernel Q/K L2 norm mode
+    (:func:`_l2n_slots`: the forward layouts' ``qn`` / ``kn``, the fallback's ``dq_f`` / ``dk_f`` lifetimes; every
+    mode but ``"off"`` drops ``dg_int`` / ``db_int``); it must match a given plan's."""
     if gate is not None:
         _check_gate(gate)
         if plan is not None and plan.gate != gate:
             raise ValueError(
                 f"lifetime_table: gate={gate!r}, the plan is of gate mode {plan.gate!r}"
             )
+    if l2n is not None:
+        _check_l2n(l2n)
+        if plan is not None and plan.l2n != l2n:
+            raise ValueError(
+                f"lifetime_table: l2n={l2n!r}, the plan is of l2n mode {plan.l2n!r}"
+            )
+    l2n = (plan.l2n if plan is not None else "off") if l2n is None else l2n
     if mode in LEAN_MODES and tail_passes > 1:
         if plan is None:
             raise ValueError(
@@ -1812,12 +2049,14 @@ def lifetime_table(
         slots = _slots_of(mode, tail_passes, plan.R, plan.H, plan.NC_pad, plan.NSEG)
     else:
         slots = _slots_of(mode, tail_passes, 0, 1, 0, 0)
+    slots = _l2n_slots(slots, mode, l2n)
     raw = (plan.gate if plan is not None else gate) == "raw"
     if gate_fused is None:
-        gate_fused = plan.gate_fused if plan is not None else raw
-    elif raw and not gate_fused:
+        gate_fused = plan.gate_fused if plan is not None else (raw or l2n != "off")
+    elif (raw or l2n != "off") and not gate_fused:
         raise ValueError(
-            "lifetime_table: the raw gate mode has no gate epilogue, so gate_fused must be True"
+            "lifetime_table: the raw gate mode and the in-kernel Q/K L2 norm modes have no gate epilogue, so "
+            "gate_fused must be True"
         )
     if gate_fused:
         slots = tuple(
@@ -1874,6 +2113,7 @@ def memory_report(
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
     gate: str = "g",
+    l2n: str = "off",
 ) -> dict[str, Any]:
     """Bytes one problem needs beyond its inputs: the arena (forward-only and full, with the saved-set paths' and
     the replay's backward layouts apart), the saved set, the outputs and the totals of the three boundaries (arena
@@ -1892,18 +2132,24 @@ def memory_report(
     gate mode (:attr:`Plan.gate`): with ``"raw"`` the backward layouts drop ``dg_int`` / ``db_int`` on every
     architecture, ``out_bwd`` is the raw mode's outputs (:func:`output_bytes`) and ``bwd_partials`` the per-call
     parameter partials ``dA_part`` / ``db_part`` (``2 * NC_pad * H * 128 * 8`` bytes, allocated by the backward
-    outside the arena; 0 in ``"g"`` mode), which the backward totals include."""
+    outside the arena; 0 in ``"g"`` mode), which the backward totals include.  ``l2n`` is the in-kernel Q/K L2 norm
+    mode (:attr:`Plan.l2n`): the saved set gains ``qk_rstd`` (``saved_qk_rstd``, ``8 * S * H``), the backward from
+    the saved set allocates the transient ``qn`` / ``kn`` (``bwd_qn_kn``, ``2 * S * H * 256``; dropped after GLM
+    intra) only where they cannot ride in its arena (0 where :func:`_l2n_rows_in_arena` holds for the saved set's
+    path), the replay always (``replay_qn_kn``) together with a transient ``qk_rstd`` (``replay_rstd``), which the
+    totals include; the forward's ``qn`` / ``kn`` ride in the arena's ``u`` / ``w`` slots (no bytes)."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"memory_report: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
     _check_gate(gate)
+    _check_l2n(l2n)
     tape = save_mode == "tape"
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
     arena = KdaDetArena() if arena is None else arena
     p = (
-        plan(S, num_docs, H, sms, arch, gate=gate)
+        plan(S, num_docs, H, sms, arch, gate=gate, l2n=l2n)
         if (arena.lean or arena.batched or doc_lengths is not None)
         else None
     )
@@ -1911,7 +2157,7 @@ def memory_report(
         p.check_arena(arena)
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sms, arch)
-    gf = _gate_fused(arch, gate)
+    gf = _gate_fused(arch, gate, l2n)
     arena_fwd = _arena_bytes(
         rows,
         H,
@@ -1920,12 +2166,13 @@ def memory_report(
         backward=False,
         save_mode=save_mode,
         gate_fused=gf,
+        l2n=l2n,
     )
     arena_saved = _mode_bytes(
-        rows, H, nc_pad, num_segments, "bwd_tape" if tape else "bwd", 1, gf
+        rows, H, nc_pad, num_segments, "bwd_tape" if tape else "bwd", 1, gf, l2n
     )
     arena_replay = _mode_bytes(
-        rows, H, nc_pad, num_segments, "replay_tape" if tape else "replay", 1, gf
+        rows, H, nc_pad, num_segments, "replay_tape" if tape else "replay", 1, gf, l2n
     )
     arena_bwd = max(arena_saved, arena_replay)
     if arena.batched:
@@ -1945,6 +2192,7 @@ def memory_report(
             save_mode=save_mode,
             arena=arena,
             gate_fused=gf,
+            l2n=l2n,
         )
         arena_fwd_conf = arena_fwd
     block = num_segments * H * D * D * 4
@@ -1963,6 +2211,7 @@ def memory_report(
             save_mode=save_mode,
             arena=arena,
             gate_fused=gf,
+            l2n=l2n,
         )
         largest = rows_bar
         if doc_lengths is not None:
@@ -1982,11 +2231,39 @@ def memory_report(
         floor_batched = per_th * rows_min * H + 3 * (
             segments * H * D * D * 4 if recur == "seg" else 0
         )
-    saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch)
-    out_f = output_bytes(S, H, backward=False)
-    out_b = output_bytes(S, H, backward=True, gate=gate)
+    saved = saved_bytes(
+        S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch, l2n=l2n
+    )
+    out_f = output_bytes(S, H, backward=False, l2n=l2n)
+    out_b = output_bytes(S, H, backward=True, gate=gate, l2n=l2n)
     # the raw backward's per-call parameter partials (outside the arena, live from GLM intra to param_finalize)
     partials = _raw_partials_bytes(nc_pad, H) if gate == "raw" else 0
+    # the in-kernel Q/K L2 norm's backward transients: qn / kn of the replay, and of the saved-set backward where they
+    # cannot ride in its arena; the rstd of the replay
+    l2n_on = l2n != "off"
+    replay_rows = _l2n_bwd_rows_bytes(S, H) if l2n_on else 0
+    bwd_rows = replay_rows
+    replay_rstd = _rstd_bytes(S, H) if l2n_on else 0
+    if l2n_on and not arena.batched:
+        p_l2n = p
+        if p_l2n is None:
+            try:
+                p_l2n = plan(S, num_docs, H, sms, arch, gate=gate, l2n=l2n)
+            except ValueError:  # no record serves the mode here (the call would raise)
+                p_l2n = None
+        if p_l2n is not None:
+            mode = arena.mode("bwd_tape" if tape else "bwd")
+            tail = arena.tail_passes if arena.lean else 1
+            path = (
+                "tape"
+                if tape
+                else "light_states"
+                if recur == "seg" and seg_states_saved(S, num_segments)
+                else "light"
+            )
+            names = {r.name for r in p_l2n.layout(mode, tail)}
+            if _l2n_rows_in_arena(p_l2n, path, names, tail):
+                bwd_rows = 0
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
     # seg_m), light three (hseg and the seg_state pair, version 4) when the size rule holds; none on the serial route.
     if recur != "seg":
@@ -2000,6 +2277,7 @@ def memory_report(
         "sm_count": sms,
         "arch": arch,
         "gate": gate,
+        "l2n": l2n,
         "gate_fused": gf,
         "recur": recur,
         "segments": segments,
@@ -2038,6 +2316,10 @@ def memory_report(
         "out_fwd": out_f,
         "out_bwd": out_b,
         "bwd_partials": partials,
+        "saved_qk_rstd": _rstd_bytes(S, H) if l2n_on else 0,
+        "bwd_qn_kn": bwd_rows,
+        "replay_qn_kn": replay_rows,
+        "replay_rstd": replay_rstd,
         "fwd_total_fwd_arena": arena_fwd_conf
         + out_f
         + saved,  # a forward-only workspace
@@ -2046,17 +2328,29 @@ def memory_report(
         + saved,  # the same workspace serving every boundary
         "bwd_total": arena_bwd_conf
         + out_b
-        + partials,  # the saved set exists before the call
+        + partials
+        + bwd_rows,  # the saved set exists before the call
         "replay_total": arena_bwd
         + out_f
         + saved
         + out_b
-        + partials,  # the default arena: lean serves no replay
+        + partials
+        + replay_rows
+        + replay_rstd,  # the default arena: lean serves no replay
     }
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Saved set and workspace
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The element strides of a contiguous tensor of ``shape``."""
+    strides, step = [], 1
+    for n in reversed(shape):
+        strides.append(step)
+        step *= int(n)
+    return tuple(reversed(strides))
 
 
 def _alloc(
@@ -2091,7 +2385,11 @@ class KdaDetChunkSaved:
     ``num_docs`` and ``scale`` identify the problem; ``gate`` (``"g"`` or ``"raw"``) and ``lower_bound`` (the raw
     mode's FP32 lower bound as a host float, ``None`` in ``"g"`` mode) the gate mode of the forward that wrote it:
     the tensors and the version are the same in both modes, and a backward in another mode or with another lower
-    bound is refused.
+    bound is refused.  ``qk_l2norm`` is the in-kernel Q/K L2 norm mode of the forward that wrote the set
+    (``use_qk_l2norm_in_kernel``) and ``qk_rstd`` its FP32 ``[2, S, H]`` reciprocal norms (plane 0 of ``q``, plane
+    1 of ``k``, element ``(p, t, h)`` at ``(p * S + t) * H + h``; ``None`` with the flag off): the backward reads the
+    caller's raw q / k again with them, so no normalized row is retained from the forward to the backward.  Both
+    versions carry it; a backward in the other mode is refused.
     """
 
     version: int
@@ -2117,6 +2415,10 @@ class KdaDetChunkSaved:
     # the gate mode of the forward that wrote the set (metadata: the tensors and their layout are the same in both)
     gate: str = "g"
     lower_bound: float | None = None
+    # use_qk_l2norm_in_kernel=True: the forward's FP32 reciprocal norms [2, S, H] (plane 0 q, plane 1 k)
+    qk_rstd: torch.Tensor | None = None
+    # the in-kernel Q/K L2 norm mode of the forward that wrote the set (metadata, like gate)
+    qk_l2norm: bool = False
 
 
 def _device_index(device: torch.device) -> int:
@@ -2336,7 +2638,9 @@ class KdaDetWorkspace:
     option's; ``views`` takes each of them at its passes (kept per mode in :attr:`layout_passes`).  :attr:`gate` is
     the gate mode of the plan (:attr:`Plan.gate`; ``gate=`` must match it when given): a call in the other mode is
     refused with ``ValueError`` (the raw mode's layouts carry no gate epilogue buffers, the ``"g"`` mode's records
-    read the activated FP32 gate).
+    read the activated FP32 gate).  :attr:`l2n` is the in-kernel Q/K L2 norm mode of the plan (:attr:`Plan.l2n`;
+    ``l2n=`` must match it when given): a call with ``use_qk_l2norm_in_kernel=True`` runs on a ``"fused"`` or
+    ``"fallback"`` workspace (the latter only as an explicit test route), a call without it on an ``"off"`` one.
     """
 
     def __init__(
@@ -2353,6 +2657,7 @@ class KdaDetWorkspace:
         fwd_layout: str = "fwd",
         layouts: Sequence[tuple[str, int]] | None = None,
         gate: str | None = None,
+        l2n: str | None = None,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
@@ -2362,6 +2667,11 @@ class KdaDetWorkspace:
             raise ValueError(
                 f"KdaDetWorkspace: gate={gate!r}, the plan selects the records of gate mode {plan.gate!r} "
                 "(cake_backend.plan(..., gate=...))"
+            )
+        if l2n is not None and _check_l2n(l2n) != plan.l2n:
+            raise ValueError(
+                f"KdaDetWorkspace: l2n={l2n!r}, the plan selects the records of l2n mode {plan.l2n!r} "
+                "(cake_backend.plan(..., l2n=...))"
             )
         if layouts is not None and (
             not layouts
@@ -2434,6 +2744,12 @@ class KdaDetWorkspace:
         self._batch_views: dict[tuple[int, int, int], KdaDetWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
         self._doc_graphs: set[tuple[int, ...]] = set()
+        # the in-kernel Q/K L2 norm backward's host facts of this workspace's plan and arena, pure functions of them
+        # (host time before every such backward's first launch): ("rows", path, layout mode, tail passes) ->
+        # :func:`_l2n_rows_in_arena`; ("prep_first", path, replay) -> :func:`_l2n_prep_first`; ("views", layout mode)
+        # -> the arena's qn / kn row views and the shape / strides of dv2 on the dq / dk bytes.  A view under another
+        # plan (:meth:`_view`) starts its own
+        self._l2n_host_cache: dict[tuple[Any, ...], Any] = {}
 
     def views(self, mode: str) -> types.SimpleNamespace:
         """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it);
@@ -2514,6 +2830,11 @@ class KdaDetWorkspace:
         return self.plan.gate
 
     @property
+    def l2n(self) -> str:
+        """The in-kernel Q/K L2 norm mode this workspace serves (:attr:`Plan.l2n`)."""
+        return self.plan.l2n
+
+    @property
     def fwd(self) -> types.SimpleNamespace:
         return self.views("fwd")
 
@@ -2536,9 +2857,11 @@ class KdaDetWorkspace:
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
         gate: str = "g",
+        l2n: str = "off",
     ) -> KdaDetWorkspace:
         """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device`` in gate mode
-        ``gate`` (``"raw"``: the calls with ``use_gate_in_kernel=True``)."""
+        ``gate`` (``"raw"``: the calls with ``use_gate_in_kernel=True``) and in-kernel Q/K L2 norm mode ``l2n``
+        (``"fused"``: the calls with ``use_qk_l2norm_in_kernel=True``)."""
         index = _device_index(torch.device(device))
         return cls(
             plan(
@@ -2548,6 +2871,7 @@ class KdaDetWorkspace:
                 cake_jit.sm_count(index),
                 cake_jit.device_arch(index),
                 gate=gate,
+                l2n=l2n,
             ),
             device,
             backward=backward,
@@ -2572,11 +2896,12 @@ class KdaDetWorkspace:
         save_mode: str = "light",
         launcher: Launcher | None = None,
         gate: str = "g",
+        l2n: str = "off",
     ) -> KdaDetWorkspace:
         """A workspace of the first arena option whose arena fits ``arena_budget_bytes`` (:func:`arena_for_budget`:
         the default, lean, two tail passes, four, then four passes over document groups halving from half the pack
-        down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits.  ``gate``: the
-        gate mode, as :meth:`for_problem`."""
+        down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits.  ``gate`` /
+        ``l2n``: the modes, as :meth:`for_problem`."""
         index = _device_index(torch.device(device))
         p = plan(
             S,
@@ -2585,6 +2910,7 @@ class KdaDetWorkspace:
             cake_jit.sm_count(index),
             cake_jit.device_arch(index),
             gate=gate,
+            l2n=l2n,
         )
         option = arena_for_budget(
             p,
@@ -2615,6 +2941,7 @@ class KdaDetWorkspace:
         other._batch_views = {}
         other._doc_cache = {}
         other._doc_graphs = set()
+        other._l2n_host_cache = {}  # per plan: never shared with the parent's
         return other
 
     def with_plan(self, plan: Plan) -> KdaDetWorkspace:
@@ -2627,6 +2954,10 @@ class KdaDetWorkspace:
         if plan.gate != self.plan.gate:
             raise ValueError(
                 f"with_plan: the plan is of gate mode {plan.gate!r}, the workspace of {self.plan.gate!r}"
+            )
+        if plan.l2n != self.plan.l2n:
+            raise ValueError(
+                f"with_plan: the plan is of l2n mode {plan.l2n!r}, the workspace of {self.plan.l2n!r}"
             )
         return self._view(plan)
 
@@ -2776,10 +3107,12 @@ def _entry_acquire(
     arena: KdaDetArena | None,
     doc_lengths: Sequence[int] | None,
     gate: str = "g",
+    l2n: str = "off",
 ) -> tuple[KdaDetWorkspace, tuple[Any, ...] | None]:
     """The workspace of one call without a workspace argument, with its arena storage allocated, and its pool key
     (``None``: a workspace of this call alone, under CUDA-graph capture, whose device allocations belong to the
-    graph; a batched arena is refused there, :meth:`KdaDetWorkspace.batches`).  ``gate``: the call's gate mode."""
+    graph; a batched arena is refused there, :meth:`KdaDetWorkspace.batches`).  ``gate`` / ``l2n``: the call's
+    modes."""
     if torch.cuda.is_current_stream_capturing():
         ws = KdaDetWorkspace.for_problem(
             S,
@@ -2791,6 +3124,7 @@ def _entry_acquire(
             arena=arena,
             doc_lengths=doc_lengths,
             gate=gate,
+            l2n=l2n,
         )
         return ws, None
     index = _device_index(device)
@@ -2811,6 +3145,7 @@ def _entry_acquire(
         option,
         lengths,
         gate,
+        l2n,
     )
     with _entry_lock:
         free = _entry_pool.get(key)
@@ -2826,6 +3161,7 @@ def _entry_acquire(
             arena=option,
             doc_lengths=doc_lengths,
             gate=gate,
+            l2n=l2n,
         )
     else:
         if doc_lengths is not None and lengths is None:
@@ -2868,9 +3204,12 @@ def _workspace(
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
     gate: str = "g",
+    l2n: str = "off",
 ) -> Iterator[KdaDetWorkspace]:
-    """The workspace of one call: the caller's (checked against the problem and the gate mode) or, without one,
-    the call's own, whose device memory lives for the call alone (:func:`_entry_acquire`)."""
+    """The workspace of one call: the caller's (checked against the problem and the modes) or, without one, the
+    call's own, whose device memory lives for the call alone (:func:`_entry_acquire`).  ``l2n`` is the call's
+    in-kernel Q/K L2 norm mode: ``"off"`` or ``"fused"`` (``use_qk_l2norm_in_kernel``); a caller's workspace of
+    mode ``"fallback"`` serves a ``"fused"`` call (the explicit test route), every other difference is refused."""
     if workspace is None:
         ws, key = _entry_acquire(
             S,
@@ -2882,6 +3221,7 @@ def _workspace(
             arena=arena,
             doc_lengths=doc_lengths,
             gate=gate,
+            l2n=l2n,
         )
         try:
             yield ws
@@ -2913,6 +3253,13 @@ def _workspace(
             f"(use_gate_in_kernel={workspace.gate == 'raw'}), the call runs gate mode {gate!r} "
             f"(use_gate_in_kernel={gate == 'raw'}); allocate the workspace with "
             f"use_gate_in_kernel={gate == 'raw'} (gate={gate!r})"
+        )
+    if (workspace.l2n == "off") != (l2n == "off"):
+        raise ValueError(
+            f"workspace: allocated for l2n mode {workspace.l2n!r} "
+            f"(use_qk_l2norm_in_kernel={workspace.l2n != 'off'}), the call runs "
+            f"use_qk_l2norm_in_kernel={l2n != 'off'}; allocate the workspace with "
+            f"use_qk_l2norm_in_kernel={l2n != 'off'}"
         )
     yield workspace
 
@@ -3001,6 +3348,181 @@ def _check_raw(x: torch.Tensor, S: int, H: int, device: torch.device) -> torch.T
             "s_t >= (H - 1) * s_h + 128 (S > 1), and the address 16-byte aligned; a strided view is never copied"
         )
     return x
+
+
+def _check_qk_raw(
+    x: torch.Tensor, name: str, S: int, H: int, device: torch.device
+) -> torch.Tensor:
+    """A raw ``q`` / ``k`` operand of ``use_qk_l2norm_in_kernel=True`` (without its batch axis): BF16 ``[S, H, 128]``
+    on ``device``, any view with element strides ``(s_t, 128, 1)`` (the head stride is exactly 128: the programs
+    address a token's heads as one 128-channel run each) with ``s_t % 8 == 0`` (16-byte token rows) and
+    ``s_t >= 128 * H`` (no two token rows overlap) and a 16-byte aligned address: a contiguous tensor, or the ``q`` /
+    ``k`` columns of a packed projection or convolution output ``out[:, c0:c0 + 128 * H].view(S, H, 128)`` with
+    ``c0 % 8 == 0``.  ``ValueError`` otherwise; the host never copies it.  An axis of extent 1 has no stride that
+    matters: it is viewed with the canonical one (the same elements, no copy), so ``H == 1`` takes any head stride
+    and ``S == 1`` any token stride; an empty view (``S == 0``) is checked for shape, dtype and device only."""
+    st = x.stride()
+    if (
+        len(st) == 3
+        and st[2] == 1
+        and st[1] == D
+        and (S > 1 or (S == 1 and st[0] == H * D))
+        and st[0] % 8 == 0
+        and st[0] >= H * D
+        and x.dtype == torch.bfloat16
+        and x.shape == (S, H, D)
+        and x.device == device
+        and x.data_ptr() % 16 == 0
+    ):  # a view the checks below accept and return unchanged (a contiguous tensor, a packed q / k column slice)
+        return x
+    if tuple(x.shape) != (S, H, D):
+        raise ValueError(
+            f"{name}: expected shape {(S, H, D)} (or a leading batch axis of 1), got {tuple(x.shape)}"
+        )
+    if x.dtype != torch.bfloat16:
+        raise ValueError(f"{name}: expected torch.bfloat16, got {x.dtype}")
+    if x.device != device:
+        raise ValueError(f"{name}: on {x.device}, expected {device}")
+    if (
+        x.numel() == 0
+    ):  # no token (the context-parallel route's T_r = 0): nothing is addressed
+        return x
+    s_t, s_h, s_d = (int(s) for s in x.stride())
+    if s_d != 1:
+        raise ValueError(
+            f"{name}: use_qk_l2norm_in_kernel=True needs a unit innermost stride, got strides "
+            f"{tuple(x.stride())}; a strided view is never copied"
+        )
+    if H == 1:
+        s_h = D
+    if S == 1:
+        s_t = H * D
+    if (s_t, s_h) != tuple(int(s) for s in x.stride()[:2]):
+        x = x.as_strided((S, H, D), (s_t, s_h, 1), x.storage_offset())
+    if s_h != D or s_t % 8 or s_t < H * D or x.data_ptr() % 16:
+        raise ValueError(
+            f"{name}: the strides {(s_t, s_h, 1)} (elements) or address are not accepted with "
+            "use_qk_l2norm_in_kernel=True: the head stride must be 128, the token stride a multiple of 8 elements "
+            f"(16 bytes) and at least 128 * H = {D * H} (token rows must not overlap), and the address 16-byte "
+            "aligned; a strided view is never copied"
+        )
+    return x
+
+
+def _l2n_mode(use_qk_l2norm_in_kernel: bool) -> str:
+    """``"fused"`` for ``use_qk_l2norm_in_kernel=True``, ``"off"`` for ``False``; ``ValueError`` for a non-bool.
+    (A ``"fallback"`` call is a ``"fused"`` call on an explicit fallback workspace, :func:`_workspace`.)"""
+    if not isinstance(use_qk_l2norm_in_kernel, bool):
+        raise ValueError(
+            f"use_qk_l2norm_in_kernel must be a bool, got {use_qk_l2norm_in_kernel!r}"
+        )
+    return "fused" if use_qk_l2norm_in_kernel else "off"
+
+
+# The single-rank test hook of the in-kernel Q/K L2 norm (contract C13): when a dict, every call stores clones of
+# its normalized rows and reciprocal norms under "fwd.qn", "fwd.kn", "fwd.qk_rstd" (the forward) and "bwd.qn",
+# "bwd.kn", "bwd.qk_rstd", "bwd.path" (the backward), so tests compare the forward's rows with the backward's
+# bitwise; None (the default) records nothing.  Refused under CUDA-graph capture.
+_l2n_record: dict[str, Any] | None = None
+
+
+def _record_l2n(prefix: str, **tensors: Any) -> None:
+    """Store clones of ``tensors`` in :data:`_l2n_record` under ``"<prefix>.<name>"`` when it is a dict."""
+    record = _l2n_record
+    if record is None:
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "cake_backend._l2n_record is a test hook; it records nothing under CUDA-graph capture (set it to None)"
+        )
+    for name, x in tensors.items():
+        record[f"{prefix}.{name}"] = x.clone() if isinstance(x, torch.Tensor) else x
+
+
+def _internal_to_tokens(
+    rows: torch.Tensor,
+    chunk_bos: torch.Tensor,
+    chunk_len: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Scatter the internal rows ``rows [64 * NC, H, 128]`` (row ``64 c + i`` of chunk ``c``) of the real tokens
+    (``i < chunk_len[c]``) to their token rows ``chunk_bos[c] + i`` of ``out [S, H, 128]`` (a test helper)."""
+    nc = int(chunk_bos.numel())
+    r = torch.arange(nc * BT, device=rows.device)
+    c, i = r // BT, r % BT
+    keep = i < chunk_len.to(torch.int64)[c]
+    out[(chunk_bos.to(torch.int64)[c] + i)[keep]] = rows[: nc * BT][keep]
+
+
+def _l2n_values(
+    q_raw: torch.Tensor,
+    k_raw: torch.Tensor,
+    qn: torch.Tensor,
+    kn: torch.Tensor,
+    qk_rstd: torch.Tensor,
+    *,
+    read_rstd: int,
+    write_rstd: int,
+    write_qkn: int = 1,
+    qn_int: torch.Tensor | None = None,
+    kn_int: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """The logical values of the in-kernel Q/K L2 norm (contract section 3): the raw views and their element strides,
+    the normalized rows (``qn`` / ``kn``, also bound as ``q`` / ``k`` so every plain record reads normalized rows),
+    the reciprocal norms ``qk_rstd`` (one ``[2, S, H]`` tensor), ``num_tokens`` and the first reader's ``read_rstd``
+    / ``write_rstd`` (1 / -: load the given rstd; 0 / 1: compute and store it; 0 / 0: compute only).  ``dq`` /
+    ``dk`` are the contiguous per-call outputs (row stride ``128 * H``).  ``qn_int`` / ``kn_int`` (contract v1.1)
+    are the fused intra program's CTA-private internal rows (the ``u`` / ``w`` slot views; ``qn`` / ``kn`` stand in
+    where the layout has none: no record reading them is launched there) and ``write_qkn`` whether that program also
+    writes the token-layout ``qn`` / ``kn`` (0 on the forward, whose later programs read none; 1 on the replay,
+    whose later readers bind them)."""
+    S, H = int(q_raw.shape[0]), int(q_raw.shape[1])
+    return {
+        "qn_int": qn if qn_int is None else qn_int,
+        "kn_int": kn if kn_int is None else kn_int,
+        "write_qkn": int(write_qkn),
+        "q_raw": q_raw,
+        "k_raw": k_raw,
+        "qn": qn,
+        "kn": kn,
+        "q": qn,
+        "k": kn,
+        "qk_rstd": qk_rstd,
+        "num_tokens": S,
+        "q_raw_row_stride": int(q_raw.stride(0)),
+        "q_raw_head_stride": D,
+        "k_raw_row_stride": int(k_raw.stride(0)),
+        "k_raw_head_stride": D,
+        "dq_row_stride": H * D,
+        "dk_row_stride": H * D,
+        "read_rstd": int(read_rstd),
+        "write_rstd": int(write_rstd),
+    }
+
+
+def _check_saved_l2n(
+    saved: KdaDetChunkSaved, l2n: str, S: int, H: int, device: torch.device
+) -> None:
+    """``ValueError`` when the saved set's in-kernel Q/K L2 norm mode differs from the call's (``l2n != "off"``), or
+    its ``qk_rstd`` is missing with the mode, present without it, or not FP32 ``[2, S, H]`` contiguous on
+    ``device``."""
+    on = l2n != "off"
+    if bool(saved.qk_l2norm) != on:
+        raise ValueError(
+            f"saved: written by a forward with use_qk_l2norm_in_kernel={bool(saved.qk_l2norm)}; this backward runs "
+            f"use_qk_l2norm_in_kernel={on}"
+        )
+    if not on:
+        if saved.qk_rstd is not None:
+            raise ValueError(
+                "saved: carries qk_rstd without the in-kernel Q/K L2 norm mode (qk_l2norm=False)"
+            )
+        return
+    if saved.qk_rstd is None:
+        raise ValueError(
+            "saved: a set written with use_qk_l2norm_in_kernel=True carries the forward's qk_rstd; this one has none"
+        )
+    _check(saved.qk_rstd, "saved.qk_rstd", (2, S, H), torch.float32, device)
 
 
 def _gate_mode(use_gate_in_kernel: bool) -> str:
@@ -3109,9 +3631,11 @@ def _raw_values(g_raw: torch.Tensor, gp: _GateParams) -> dict[str, Any]:
     }
 
 
-def _operands(q, k, v, g, beta, cu_seqlens, *, gate: str = "g"):
+def _operands(q, k, v, g, beta, cu_seqlens, *, gate: str = "g", l2n: str = "off"):
     """The operands without their optional batch axis, the problem scalars and whether the inputs carried a batch
-    axis (the outputs take the same rank).  ``gate="raw"``: ``g`` is the raw gate (:func:`_check_raw`)."""
+    axis (the outputs take the same rank).  ``gate="raw"``: ``g`` is the raw gate (:func:`_check_raw`).
+    ``l2n != "off"`` (``use_qk_l2norm_in_kernel=True``): ``q`` / ``k`` are the raw rows (:func:`_check_qk_raw`:
+    strided views accepted, never copied); otherwise they must be contiguous."""
     v = _squeeze_batch(v, "v", 3)
     S, H = int(v.shape[0]), int(v.shape[1])
     if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
@@ -3124,8 +3648,12 @@ def _operands(q, k, v, g, beta, cu_seqlens, *, gate: str = "g"):
     batched = q.dim() == 4
     q, k, g = (_squeeze_batch(x, n, 3) for x, n in ((q, "q"), (k, "k"), (g, "g")))
     beta = _squeeze_batch(beta, "beta", 2)
-    _check(q, "q", (S, H, D), torch.bfloat16, device)
-    _check(k, "k", (S, H, D), torch.bfloat16, device)
+    if l2n == "off":
+        _check(q, "q", (S, H, D), torch.bfloat16, device)
+        _check(k, "k", (S, H, D), torch.bfloat16, device)
+    else:
+        q = _check_qk_raw(q, "q", S, H, device)
+        k = _check_qk_raw(k, "k", S, H, device)
     _check(v, "v", (S, H, D), torch.bfloat16, device)
     if gate == "raw":
         g = _check_raw(g, S, H, device)
@@ -3457,7 +3985,7 @@ def _tail_passes(
             # like gk's rows; param_finalize runs once after the last range
             pass_values["dA_part"] = values["dA_part"][c0:]
             pass_values["db_part"] = values["db_part"][c0:]
-        for stage in ("dqkg", "glm_intra", "gate_epilogue"):
+        for stage in ("dqkg", "glm_intra", "qk_pullback", "gate_epilogue"):
             if not p.dispatched(stage, path):
                 continue  # the fused GLM intra program writes dg / dbeta itself
             grid = cake_jit.launch_grid(
@@ -3467,6 +3995,7 @@ def _tail_passes(
                 num_heads=p.H,
                 sm_count=p.sm_count,
                 num_segments=p.NSEG,
+                num_tokens=p.S,
             )
             ws.run(stage, pass_values, path=path, grid=grid)
 
@@ -3520,13 +4049,17 @@ def _forward_launches(
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
     gate_values: dict[str, Any] | None = None,
+    l2n_values: dict[str, Any] | None = None,
 ) -> None:
     """The launches of one forward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables and its tape slices; the token tensors always whole): the intra program (the
     GLM prep folded in), WY where the plan dispatches it, the state recurrence.  ``qg`` / ``w`` / ``u`` are the
     light saving forward's per-call tensors (version 4): the same writes as into the arena's slots, another
     destination, and every consumer of the call reads them there.  ``gate_values`` are the raw gate mode's
-    operands (:func:`_raw_values`; ``g`` is then ``None``): the plan's raw intra record reads them."""
+    operands (:func:`_raw_values`; ``g`` is then ``None``): the plan's raw intra record reads them.
+    ``l2n_values`` are the in-kernel Q/K L2 norm's (:func:`_l2n_values`; ``q`` / ``k`` then name the normalized
+    rows): the fused intra record reads the raw rows and writes ``qn`` / ``kn`` (and the rstd per ``write_rstd``),
+    the fallback's plain intra record reads the ``qn`` / ``kn`` its ``qk_l2norm`` launch wrote."""
     p = ws.plan
     values = _values(
         ws,
@@ -3548,6 +4081,8 @@ def _forward_launches(
     )
     if gate_values:
         values.update(gate_values)
+    if l2n_values:
+        values.update(l2n_values)
     _saved_rows(values, p, qg=qg, w=w, u=u)
     _fwd_intra(
         ws,
@@ -3582,6 +4117,7 @@ def chunk_kda_det_fwd(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, KdaDetChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
     ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` (version 4), the
@@ -3628,10 +4164,19 @@ def chunk_kda_det_fwd(
     activates the gate in its prefix pass (``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``), the same
     launches otherwise, and the saved set records the mode and the lower bound.  The workspace must be of the same
     mode (:attr:`KdaDetWorkspace.gate`).  With ``use_gate_in_kernel=False`` the three parameters must be ``None``.
+
+    ``use_qk_l2norm_in_kernel=True`` takes ``q`` / ``k`` as the raw rows (a strided view is accepted under
+    :func:`_check_qk_raw`'s rule, never copied) and normalizes them per token and head inside the first program
+    that reads them (``q_hat = bf16(x * r)``, ``r = 1 / sqrt(sum(x^2) + 1e-6)`` in FP32, the order of the shared
+    reference): the l2n intra record writes ``qn`` / ``kn`` into the arena's ``u`` / ``w`` slots (transient: WY
+    overwrites them) and, with ``save_for_backward``, ``qk_rstd`` FP32 ``[2, S, H]`` into the saved set, which
+    records the mode; no launch is added and no normalized row is kept.  The workspace must be of an l2n mode
+    (:attr:`KdaDetWorkspace.l2n`).
     """
     gate = _gate_mode(use_gate_in_kernel)
+    l2n = _l2n_mode(use_qk_l2norm_in_kernel)
     q, k, v, g, beta, S, N, H, batched = _operands(
-        q, k, v, g, beta, cu_seqlens, gate=gate
+        q, k, v, g, beta, cu_seqlens, gate=gate, l2n=l2n
     )
     gp = _gate_params(gate, A_log, dt_bias, lower_bound, H, v.device)
     with _workspace(
@@ -3645,6 +4190,7 @@ def chunk_kda_det_fwd(
         arena=arena,
         doc_lengths=doc_lengths,
         gate=gate,
+        l2n=l2n,
     ) as ws:
         out, saved = _forward(
             ws,
@@ -3723,6 +4269,72 @@ def _forward(
         u_saved = _alloc((p.R, H, D), torch.bfloat16, ws.device)
     # the groups' views of whole-problem row tensors (the tape, the saved qg / w / u) take the tape geometry
     row_slices = tape or qg_saved is not None or w_saved is not None
+    # the in-kernel Q/K L2 norm (the workspace's mode: "fused", or the explicit "fallback" test route): the saving
+    # forward writes the set's rstd; without a set the fused intra record computes r and stores none (a one-element
+    # placeholder is bound), the fallback's qk_l2norm always stores it (transient)
+    l2n = ws.l2n
+    qk_rstd = None
+    write_rstd = 0
+    if l2n != "off":
+        write_rstd = 1 if (save_for_backward or l2n == "fallback") else 0
+        qk_rstd = _alloc((2, S, H) if write_rstd else (1,), torch.float32, ws.device)
+
+    # Contract v1.1: the fused intra program normalizes into its CTA-private internal rows qn_int / kn_int (the
+    # u / w slots, zeros past chunk_len) and writes no token-layout qn / kn (write_qkn = 0: no later forward program
+    # reads them), so the token-layout pointers it takes are placeholders (the slot views); the fallback's
+    # qk_l2norm writes token-layout qn / kn (the first S rows of the slots, or per-call under a batched arena) and
+    # the plain intra program reads them as q / k.
+    fallback = l2n == "fallback"
+    # the test hook's token-layout rows of the forward's normalization (only when the hook is on): the fused intra
+    # program writes them itself (write_qkn = 1 into qn_tok / kn_tok; a fused program may keep its normalized rows
+    # on chip and write no qn_int / kn_int, so the slots are not read back); q / k stay bound as without the hook
+    hook = _l2n_record is not None and l2n != "off"
+    qn_tok = kn_tok = None
+    fallback_rows: dict[str, torch.Tensor] = {}
+    if hook and not fallback:
+        qn_tok = _alloc((S, H, D), torch.bfloat16, ws.device)
+        kn_tok = _alloc((S, H, D), torch.bfloat16, ws.device)
+
+    def l2n_values(
+        a: types.SimpleNamespace, qn: torch.Tensor | None, kn: torch.Tensor | None
+    ) -> dict[str, Any] | None:
+        """The l2n values of one launch sequence on the views ``a`` (``qn`` / ``kn``: the token-layout rows, the
+        slot views where ``None``)."""
+        if l2n == "off":
+            return None
+        if (
+            qn is None
+        ):  # the slot views: token layout for the fallback, placeholders of the fused program
+            qn = a.qn_int[:S] if fallback else a.qn_int
+            kn = a.kn_int[:S] if fallback else a.kn_int
+        lv = _l2n_values(
+            q,
+            k,
+            qn,
+            kn,
+            qk_rstd,
+            read_rstd=0,
+            write_rstd=write_rstd,
+            write_qkn=0,
+            qn_int=a.qn_int,
+            kn_int=a.kn_int,
+        )
+        if hook and not fallback:
+            lv.update(qn=qn_tok, kn=kn_tok, write_qkn=1)
+        return lv
+
+    def qk_l2norm(lv: dict[str, Any] | None) -> None:
+        """The fallback's token-local normalization of the whole problem, once, before the intra program(s); the
+        hook copies its rows right away (on the slot views, WY overwrites them after the intra program)."""
+        if lv is not None and p.dispatched("qk_l2norm", path):
+            ws.run("qk_l2norm", {**lv, "num_heads": H}, path=path)
+            if hook:
+                fallback_rows["qn"], fallback_rows["kn"] = (
+                    lv["qn"].clone(),
+                    lv["kn"].clone(),
+                )
+
+    qn = kn = None
     seg_state = hseg = seg_m = None
     if save_states:
         seg_state = _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device)
@@ -3749,6 +4361,10 @@ def _forward(
     if packing is None:
         a = ws.views(mode)
         tables = _tables(ws, cu_seqlens, path)
+        lv = l2n_values(a, None, None)
+        if fallback:
+            qn, kn = lv["qn"], lv["kn"]
+        qk_l2norm(lv)
         _forward_launches(
             ws,
             a,
@@ -3765,9 +4381,15 @@ def _forward(
             qg=qg_saved,
             w=w_saved,
             u=u_saved,
+            l2n_values=lv,
             **common,
         )
     else:
+        # the fallback's token-layout qn / kn of the whole problem are per-call tensors (a group's u / w slots are
+        # sized for the group); the fused intra program of each group uses its view's slots
+        if fallback:
+            qn = _alloc((S, H, D), torch.bfloat16, ws.device)
+            kn = _alloc((S, H, D), torch.bfloat16, ws.device)
         views_b = [
             (batch, ws.batch_view(batch, tape=row_slices)) for batch in packing.batches
         ]
@@ -3779,6 +4401,8 @@ def _forward(
         # the whole problem's tables for the saved set, by the saved-set paths' table program (the forward's intra
         # program writes the tables of its own call only: here the groups')
         tables = _tables(ws, cu_seqlens, "light") if save_for_backward else None
+        if fallback:
+            qk_l2norm(l2n_values(views_b[0][1].views(mode), qn, kn))
         # the groups' state blocks go into the whole problem's saved states by chain rank (from doc_lengths on the
         # host, :class:`_Packing`)
         scatter = seg and (save_states or seg_m is not None)
@@ -3818,6 +4442,7 @@ def _forward(
                 qg=None if qg_saved is None else qg_saved[rows_b],
                 w=None if w_saved is None else w_saved[rows_b],
                 u=None if u_saved is None else u_saved[rows_b],
+                l2n_values=l2n_values(a, qn, kn),
                 **common,
             )
             if run is not None:  # one run: contiguous copies of the halves
@@ -3836,6 +4461,13 @@ def _forward(
         if tape:  # the last group's slice ends inside the whole tape: no group writes the v_new pad rows after it
             last, ws_last = views_b[-1]
             v_new[BT * (last.c0 + ws_last.plan.NC_pad) :].zero_()
+    if hook:
+        _record_l2n(
+            "fwd",
+            qn=fallback_rows.get("qn", qn) if fallback else qn_tok,
+            kn=fallback_rows.get("kn", kn) if fallback else kn_tok,
+            **({"qk_rstd": qk_rstd} if write_rstd else {}),
+        )
     saved = None
     if save_for_backward:
         # the gate mode of the set (metadata; "g" sets keep the defaults)
@@ -3844,6 +4476,8 @@ def _forward(
             if gate_params is None
             else {"gate": "raw", "lower_bound": gate_params.lower_bound}
         )
+        if l2n != "off":  # the in-kernel Q/K L2 norm's reciprocal norms and mode
+            mode_fields.update(qk_rstd=qk_rstd, qk_l2norm=True)
         if tape:
             saved = KdaDetChunkSaved(
                 SAVED_VERSION_TAPE,
@@ -3912,6 +4546,8 @@ def _backward_launches(
     u: torch.Tensor | None = None,
     nc_vec: torch.Tensor | None = None,
     gate_values: dict[str, Any] | None = None,
+    l2n_values: dict[str, Any] | None = None,
+    late_values: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """The launches of one backward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u``, its blocks of
@@ -3922,7 +4558,14 @@ def _backward_launches(
     ``seg_state[1]`` (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``).  ``gate_values`` are
     the raw gate mode's operands and outputs (``g`` / ``dg`` are then ``None``): the raw gate view and parameters,
     ``dg_raw``, and the per-chunk partials ``dA_part`` / ``db_part`` as views at the group's first chunk;
-    ``param_finalize`` is never launched here (once per call, by :func:`_backward`)."""
+    ``param_finalize`` is never launched here (once per call, by :func:`_backward`).  ``l2n_values`` are the
+    in-kernel Q/K L2 norm's (:func:`_l2n_values`; ``q`` / ``k`` name the per-call normalized rows): the first q / k
+    reader of the path (the l2n prep record, or the l2n intra record where the replay runs it first) writes them
+    from the raw rows and the rstd, every later reader binds them, and the l2n GLM intra program pulls the
+    gradients back to the raw rows; in the fallback route the GLM intra capture program leaves ``dq_hat`` /
+    ``dk_hat`` in ``dq_f`` / ``dk_f`` and ``qk_pullback`` follows it (per tail range).  ``late_values`` (the fused
+    in-kernel Q/K L2 norm's whole-problem calls, :func:`_l2n_prep_first`) allocates the values the prep record does
+    not bind; they join ``values`` right after the prep launch."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -3954,6 +4597,12 @@ def _backward_launches(
     )
     if gate_values:
         values.update(gate_values)
+    if l2n_values:
+        values.update(l2n_values)
+        if hasattr(
+            b, "qn_int"
+        ):  # the replay's fused intra program's CTA-private rows (contract v1.1)
+            values.update(qn_int=b.qn_int, kn_int=b.kn_int)
     _saved_rows(values, p, qg=qg, w=w, u=u)
 
     # The replay recomputes the internal Aqk / Akk rows with the intra program (write_prep = 0: the prep buffers are
@@ -3978,6 +4627,8 @@ def _backward_launches(
         {**values, "v_new": b.v_new_scratch if tape else v_new},
         path=path,
     )
+    if late_values is not None:
+        values.update(late_values())
     if replay and not intra_first:
         replay_intra()
     if p.dispatched("wy", path):
@@ -3998,6 +4649,10 @@ def _backward_launches(
     if ws.tail_passes == 1:
         ws.run("dqkg", values, path=path)
         ws.run("glm_intra", values, path=path)
+        if p.dispatched(
+            "qk_pullback", path
+        ):  # the fallback route's token-local pullback
+            ws.run("qk_pullback", values, path=path)
         if p.dispatched(
             "gate_epilogue", path
         ):  # not on the fused GLM intra program's architectures
@@ -4024,6 +4679,7 @@ def chunk_kda_det_bwd(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs; with ``use_gate_in_kernel=True``
     fresh ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous,
@@ -4070,11 +4726,21 @@ def chunk_kda_det_bwd(
     count from ``doc_lengths``), so the parameter gradients are bitwise the same under every arena option.  No
     gate epilogue runs.  A saved set of the other mode, or with another ``lower_bound`` (its FP32 value), is
     refused with ``ValueError``, as is a workspace of the other mode.
+
+    In-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``, the forward's raw ``q`` / ``k``): ``dq`` / ``dk`` are
+    the gradients of the raw rows.  The first q / k reader of the path writes the normalized rows into backward-only
+    ``qn`` / ``kn`` (bitwise the forward's: the same raw rows and the saved ``qk_rstd``; the replay computes the rstd
+    again into a per-call tensor): on a saved-set path in the arena's ``do_int`` / ``dv2`` bytes, ``dv2`` then on the
+    bytes of ``dq`` / ``dk`` (two halves of one tensor) until GLM intra writes them (:func:`_l2n_rows_in_arena`), so
+    that backward allocates nothing for them; else per call.  Every later reader binds them, and the l2n GLM intra
+    program applies the pullback ``r * (dq_hat - y * <dq_hat, y>)`` (``y = x * r`` in FP32) before its one BF16
+    store.  A saved set of the other mode is refused.
     """
     gate = _gate_mode(use_gate_in_kernel)
+    l2n = _l2n_mode(use_qk_l2norm_in_kernel)
     raw_batched = g.dim() == 4
     q, k, v, g, beta, S, N, H, batched = _operands(
-        q, k, v, g, beta, cu_seqlens, gate=gate
+        q, k, v, g, beta, cu_seqlens, gate=gate, l2n=l2n
     )
     gp = _gate_params(gate, A_log, dt_bias, lower_bound, H, v.device)
     dout = _squeeze_batch(dout, "dout", 3)
@@ -4110,6 +4776,7 @@ def chunk_kda_det_bwd(
         arena=arena,
         doc_lengths=doc_lengths,
         gate=gate,
+        l2n=l2n,
     ) as ws:
         grads = _backward(
             ws,
@@ -4173,6 +4840,7 @@ def _backward(
                 f"H={H}, num_docs={N}"
             )
         _check_saved_gate(saved, gp)
+        _check_saved_l2n(saved, ws.l2n, S, H, ws.device)
         _check(saved.Aqk, "saved.Aqk", (S, H, BT), torch.bfloat16, ws.device)
         _check(saved.Akk, "saved.Akk", (S, H, BT), torch.bfloat16, ws.device)
         if saved.tables is not None:
@@ -4262,29 +4930,64 @@ def _backward(
     if replay:
         mode = {"bwd": "replay", "bwd_tape": "replay_tape"}[mode]
     packing = ws._packing(doc_lengths)
-    dq = _alloc((S, H, D), torch.bfloat16, ws.device)
-    dk = _alloc((S, H, D), torch.bfloat16, ws.device)
-    dv = _alloc((S, H, D), torch.bfloat16, ws.device)
-    # the gate's gradient: FP32 dg, or in raw mode the raw gate's BF16 gradient (contiguous token rows)
-    dg = _alloc((S, H, D), torch.float32 if gp is None else torch.bfloat16, ws.device)
-    dbeta = _alloc((S, H), torch.bfloat16, ws.device)
+    # the in-kernel Q/K L2 norm's qn / kn in the arena of a saved-set path (:func:`_l2n_rows_in_arena`): dq / dk are
+    # then the two halves of one tensor, whose bytes carry dv2 until GLM intra / the pullback write them
+    l2n = ws.l2n
+    rows_in_arena = False
+    if l2n != "off" and packing is None:
+        key = ("rows", path, mode, ws.tail_passes)
+        rows_in_arena = ws._l2n_host_cache.get(key)
+        if rows_in_arena is None:
+            rows_in_arena = ws._l2n_host_cache[key] = _l2n_rows_in_arena(
+                p, path, vars(ws.views(mode)), ws.tail_passes
+            )
+    # the fused mode's whole-problem calls launch the prep before allocating dv / dg / dbeta (and the raw partials),
+    # which no prep record binds (:func:`_l2n_prep_first`): the first backward kernel is queued earlier
+    late = False
+    if l2n == "fused" and packing is None:
+        prep_key = ("prep_first", path, replay)
+        late = ws._l2n_host_cache.get(prep_key)
+        if late is None:
+            late = ws._l2n_host_cache[prep_key] = _l2n_prep_first(p, path, replay)
+    if rows_in_arena:
+        dqk = _alloc((2, S, H, D), torch.bfloat16, ws.device)
+        dq, dk = dqk.unbind(0)
+    else:
+        dq = _alloc((S, H, D), torch.bfloat16, ws.device)
+        dk = _alloc((S, H, D), torch.bfloat16, ws.device)
+    dv = dg = dbeta = None
     # raw mode: the parameter gradients and their per-chunk (hi, lo) partials, per call and outside the arena (GLM
     # intra writes the partials of the real chunks only; param_finalize reads those alone)
     raw_out: dict[str, torch.Tensor] = {}
-    if gp is not None:
-        raw_out = {
-            "dg_raw": dg,
-            "dA_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
-            "db_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
-            "dA_log": _alloc((H,), torch.float32, ws.device),
-            "ddt_bias": _alloc((H * D,), torch.float32, ws.device),
-        }
+
+    def outputs() -> dict[str, Any]:
+        """Allocate dv, dg (the gate's gradient: FP32 dg, or in raw mode the raw gate's BF16 gradient, contiguous
+        token rows), dbeta and the raw mode's outputs; their entries of the whole problem's launch values."""
+        nonlocal dv, dg, dbeta
+        dv = _alloc((S, H, D), torch.bfloat16, ws.device)
+        dg = _alloc(
+            (S, H, D), torch.float32 if gp is None else torch.bfloat16, ws.device
+        )
+        dbeta = _alloc((S, H), torch.bfloat16, ws.device)
+        if gp is None:
+            return {"dv": dv, "dg": dg, "dbeta": dbeta}
+        raw_out.update(
+            dg_raw=dg,
+            dA_part=_alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
+            db_part=_alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
+            dA_log=_alloc((H,), torch.float32, ws.device),
+            ddt_bias=_alloc((H * D,), torch.float32, ws.device),
+        )
+        return {"dv": dv, "dg": None, "dbeta": dbeta, **gate_values()}
 
     def gate_values(c0: int = 0) -> dict[str, Any] | None:
         """The raw mode's operands and outputs of a launch sequence whose chunks start at the pack's chunk ``c0``
-        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``."""
+        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``; before
+        :func:`outputs` (a late call's prep launch) the operands alone."""
         if gp is None:
             return None
+        if not raw_out:
+            return _raw_values(g, gp)
         return {
             **_raw_values(g, gp),
             **raw_out,
@@ -4292,6 +4995,55 @@ def _backward(
             "db_part": raw_out["db_part"][c0:],
         }
 
+    if not late:
+        outputs()
+    # the in-kernel Q/K L2 norm: backward-only qn / kn written by the path's first q / k reader from the raw rows and
+    # the saved rstd (the replay computes the rstd again into a per-call tensor): on the arena's do_int / dv2 bytes
+    # with dv2 on the dq / dk bytes where rows_in_arena holds, else per call; in the fallback route the token-local
+    # apply / normalize runs once for the whole problem before the groups
+    lv = None
+    if l2n != "off":
+        if rows_in_arena:
+            # qn / kn: views of the arena's do_int / dv2 rows; dv2: the contiguous layout shape on the dq / dk bytes
+            rows = ws._l2n_host_cache.get(("views", mode))
+            if rows is None:
+                b_rows = ws.views(mode)
+                shape = tuple(b_rows.dv2.shape)
+                rows = ws._l2n_host_cache[("views", mode)] = (
+                    b_rows.do_int[:S],
+                    b_rows.dv2[:S],
+                    shape,
+                    _contiguous_strides(shape),
+                )
+            qn, kn, dv2_shape, dv2_strides = rows
+            dv2 = dqk.as_strided(dv2_shape, dv2_strides)
+        else:
+            qn = _alloc((S, H, D), torch.bfloat16, ws.device)
+            kn = _alloc((S, H, D), torch.bfloat16, ws.device)
+        if replay:
+            qk_rstd, read_rstd, write_rstd = (
+                _alloc((2, S, H), torch.float32, ws.device),
+                0,
+                1,
+            )
+        else:
+            qk_rstd, read_rstd, write_rstd = saved.qk_rstd, 1, 0
+        lv = _l2n_values(
+            q,
+            k,
+            qn,
+            kn,
+            qk_rstd,
+            read_rstd=read_rstd,
+            write_rstd=write_rstd,
+            write_qkn=1,
+        )
+        if rows_in_arena:
+            lv["dv2"] = dv2
+        if p.dispatched("qk_apply", path) and not replay:
+            ws.run("qk_apply", {**lv, "num_heads": H}, path=path)
+        elif p.dispatched("qk_l2norm", path):
+            ws.run("qk_l2norm", {**lv, "num_heads": H}, path=path)
     # the version-4 rows the light paths read from the set (the groups of a batched option take their slices)
     light_rows = not (replay or tape)
     qg_saved = saved.qg if light_rows else None
@@ -4346,6 +5098,8 @@ def _backward(
             w=w_saved,
             u=u_saved,
             gate_values=gate_values(),
+            l2n_values=lv,
+            late_values=outputs if late else None,
             **common,
         )
         if gp is not None:
@@ -4362,6 +5116,19 @@ def _backward(
                 mode
             )  # every group's layout fits the arena, or ValueError before any launch
         _assert_doc_lengths(cu_seqlens, packing.lengths)
+        if l2n == "fused" and replay:
+            # the replay's plain intra program (the groups whose plan dispatches the table program) reads 64-row q / k
+            # boxes of the per-call qn / kn at each chunk's absolute chunk_bos and masks the rows past the chunk end
+            # by a zeroed gate factor (0 * NaN = NaN): a group's last chunk reaches up to BT - 1 rows of the next
+            # group, which only that group's prep writes (rows t < chunk_len), after this group ran.  Define them
+            # first; the next group's prep overwrites its real rows before any of its readers.  The fallback's
+            # qk_l2norm has already written every row here.
+            end = 0
+            for batch, ws_b in views_b[:-1]:
+                end += batch.S
+                if ws_b.plan.dispatched("table", path):
+                    lv["qn"][end : end + BT - 1].zero_()
+                    lv["kn"][end : end + BT - 1].zero_()
         # the groups build their own tables; their blocks of the saved states come by chain rank (from doc_lengths
         # on the host, :class:`_Packing`)
         from_saved = seg and not replay and (tape or light_states)
@@ -4405,12 +5172,15 @@ def _backward(
                 u=None if u_saved is None else u_saved[rows_b],
                 nc_vec=packing.tail_counts(i, pb.NC_pad),
                 gate_values=gate_values(batch.c0),
+                l2n_values=lv,
                 **common,
             )
         if gp is not None:
             # once, after the last group: the pack's real chunk count from doc_lengths (one-entry count,
             # num_seqs = 0), over the groups' partials in the pack's chunk order
             _param_finalize(ws, path, raw_out, packing.total_chunks, 0)
+    if lv is not None:
+        _record_l2n("bwd", qn=lv["qn"], kn=lv["kn"], qk_rstd=lv["qk_rstd"], path=path)
     if gp is not None:
         return dq, dk, dv, dbeta, dg, raw_out["dA_log"], raw_out["ddt_bias"]
     return dq, dk, dv, dbeta, dg
@@ -4489,8 +5259,8 @@ def _param_finalize(
 # and the presence mask travels in the context: the version-4 fields are optional independently -- qg where the
 # light prep writes none, the states under the size rule, w / u on their rows).
 _EXTRA_FIELDS = {
-    SAVED_VERSION: ("qg", "hseg", "seg_state", "w", "u"),
-    SAVED_VERSION_TAPE: ("h", "v_new", "seg_m"),
+    SAVED_VERSION: ("qg", "hseg", "seg_state", "w", "u", "qk_rstd"),
+    SAVED_VERSION_TAPE: ("h", "v_new", "seg_m", "qk_rstd"),
 }
 
 
@@ -4515,7 +5285,8 @@ class ChunkKDADetFunction(torch.autograd.Function):
     and the backward then allocates its own (:func:`chunk_kda_det_bwd` without ``workspace``).  In raw gate mode
     (``use_gate_in_kernel``) the node saves the raw gate (the caller's view) and ``A_log`` / ``dt_bias`` in place of
     an FP32 gate, records the mode and ``lower_bound`` and returns the gradients of the raw gate, ``A_log`` and
-    ``dt_bias``."""
+    ``dt_bias``.  With ``use_qk_l2norm_in_kernel`` the node saves the caller's raw ``q`` / ``k`` (as always) and the
+    set's ``qk_rstd`` (the last extra field) and records the mode; ``dq`` / ``dk`` are the raw rows' gradients."""
 
     @staticmethod
     def forward(
@@ -4535,6 +5306,7 @@ class ChunkKDADetFunction(torch.autograd.Function):
         A_log=None,
         dt_bias=None,
         lower_bound=None,
+        use_qk_l2norm_in_kernel=False,
     ):
         out, saved = chunk_kda_det_fwd(
             q,
@@ -4553,6 +5325,7 @@ class ChunkKDADetFunction(torch.autograd.Function):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
         extra, ctx.extra_fields = _saved_extra(saved)
         # raw mode: the gate parameters ride after cu_seqlens (g is the raw gate view)
@@ -4572,6 +5345,7 @@ class ChunkKDADetFunction(torch.autograd.Function):
         )
         # the set's FP32 lower bound (None in g mode): the backward's set and call carry the same bits
         ctx.gate, ctx.lower_bound = saved.gate, saved.lower_bound
+        ctx.qk_l2norm = saved.qk_l2norm
         ctx.scale = scale
         # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
         # checkpointing that would be one arena per layer)
@@ -4609,6 +5383,7 @@ class ChunkKDADetFunction(torch.autograd.Function):
             **dict(zip(ctx.extra_fields, extra, strict=True)),
             gate=ctx.gate,
             lower_bound=ctx.lower_bound,
+            qk_l2norm=ctx.qk_l2norm,
         )
         if not dout.is_contiguous():
             dout = (
@@ -4632,12 +5407,25 @@ class ChunkKDADetFunction(torch.autograd.Function):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=ctx.lower_bound,
+            use_qk_l2norm_in_kernel=ctx.qk_l2norm,
         )
         dq, dk, dv, dbeta, dg = grads[:5]
         dA_log, ddt_bias = grads[5:] if raw else (None, None)
         # (q, k, v, g, beta), (cu_seqlens, scale, workspace, save_mode, arena, doc_lengths), use_gate_in_kernel,
-        # A_log, dt_bias, lower_bound
-        return (dq, dk, dv, dg, dbeta, *(None,) * 6, None, dA_log, ddt_bias, None)
+        # A_log, dt_bias, lower_bound, use_qk_l2norm_in_kernel
+        return (
+            dq,
+            dk,
+            dv,
+            dg,
+            dbeta,
+            *(None,) * 6,
+            None,
+            dA_log,
+            ddt_bias,
+            None,
+            None,
+        )
 
 
 def chunk_kda_det(
@@ -4657,6 +5445,7 @@ def chunk_kda_det(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> torch.Tensor:
     """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta`` (and with ``use_gate_in_kernel=True`` to
     the raw gate ``g``, BF16, and to ``A_log`` / ``dt_bias``, FP32: :func:`chunk_kda_det_fwd` for the raw operands).
@@ -4673,7 +5462,11 @@ def chunk_kda_det(
     ``None``: the workspace's option, off without one) is the lower-memory arena option; the node records it, so
     the backward's own workspace (a per-call or checkpointed forward) takes the same option.  ``doc_lengths``
     (the documents' token counts, host integers) is required under a batched option and recorded by the node.
+    ``use_qk_l2norm_in_kernel=True`` normalizes the raw ``q`` / ``k`` per token and head inside the kernels and
+    returns the raw rows' gradients (:func:`chunk_kda_det_fwd` / :func:`chunk_kda_det_bwd`); under
+    ``torch.utils.checkpoint`` the recompute's rstd and normalized rows are bitwise the first forward's.
     """
+    _l2n_mode(use_qk_l2norm_in_kernel)
     return ChunkKDADetFunction.apply(
         q,
         k,
@@ -4690,6 +5483,7 @@ def chunk_kda_det(
         A_log,
         dt_bias,
         lower_bound,
+        use_qk_l2norm_in_kernel,
     )
 
 
@@ -4730,6 +5524,7 @@ __all__ = [
     "FWD_SLOTS",
     "FWD_TAPE_SLOTS",
     "KIND_SHAPE",
+    "L2N_MODES",
     "LEAN_MODES",
     "MAX_DOCS",
     "MODES",

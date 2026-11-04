@@ -74,7 +74,7 @@ kernel_cake_lm_head_loss_faa8f4d9322bc102406b(int* __restrict__ x, int* __restri
     for (int r = bid; r < num_rows; r += gstride) {
         int _vec_load_0[1];
         {
-            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + ((unsigned long long)r * 2) + 0);
+            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + (unsigned long long)r * 2 + 0);
         }
         int src_u = _vec_load_0[0];
         int src = ((src_u < t_last) ? src_u : t_last);

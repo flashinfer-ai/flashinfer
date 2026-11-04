@@ -14,11 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import base64
+import csv
+import hashlib
+import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -1185,6 +1191,142 @@ def build_sdist(sdist_directory, config_settings=None):
     return orig.build_sdist(sdist_directory, config_settings)
 
 
+# Wheel post-processing (flashinfer-ai/flashinfer#7977).
+#
+# setuptools writes every zip entry at zlib level 6 and has no level knob, and
+# `packages.find` sweeps the vendored 3rdparty Python trees (cutlass/python,
+# cutlass/examples, cccl/python, ...) into the wheel although only the header
+# trees listed in [tool.setuptools.package-data] are meant to ship. Both are
+# corrected on the finished wheel: every kept entry is re-deflated at level 9
+# and the 3rdparty entries outside the header trees are dropped.
+#
+# With FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1 (set by the release
+# workflow for the wheel published to PyPI, not by nightlies or source
+# installs) the experimental packages' generated kernel sources are dropped as
+# well: flashinfer/experimental/<pkg>/csrc/** and flashinfer/data/csrc/experimental/**.
+# Experimental features are JIT-only and intended for main-branch users
+# (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
+# 100 MB. The Python modules, build.json manifests and route catalogs stay, so
+# `import flashinfer` is unchanged and an experimental kernel load fails on
+# first use; the marker file below says why and where the sources are.
+_EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
+_EXPERIMENTAL_SOURCES_MARKER = "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt"
+_EXPERIMENTAL_SOURCES_RE = re.compile(
+    r"^(flashinfer/experimental/[^/]+/csrc/|flashinfer/data/csrc/experimental/)"
+)
+_THIRD_PARTY_ROOTS = (
+    "flashinfer/data/cutlass/",
+    "flashinfer/data/spdlog/",
+    "flashinfer/data/cccl/",
+)
+# Mirrors the package-data globs of flashinfer.data.cutlass / .spdlog / .cccl.
+_THIRD_PARTY_KEEP = (
+    "flashinfer/data/cutlass/include/",
+    "flashinfer/data/cutlass/tools/util/include/",
+    "flashinfer/data/spdlog/include/",
+    "flashinfer/data/cccl/cub/cub/",
+    "flashinfer/data/cccl/libcudacxx/include/",
+    "flashinfer/data/cccl/thrust/thrust/",
+)
+_EXPERIMENTAL_SOURCES_MARKER_TEXT = """\
+This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: the
+generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc
+and csrc/experimental) are not included, so that the release wheel stays under
+PyPI's per-file size limit. Experimental APIs import normally but raise when they
+first try to compile a kernel. To use them, install a nightly wheel from
+https://flashinfer.ai/whl or install from source:
+    pip install git+https://github.com/flashinfer-ai/flashinfer.git@<tag>
+See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
+"""
+
+
+def _wheel_entry_dropped(name: str, exclude_experimental: bool) -> bool:
+    if name.startswith(_THIRD_PARTY_ROOTS):
+        return not name.startswith(_THIRD_PARTY_KEEP)
+    if exclude_experimental and _EXPERIMENTAL_SOURCES_RE.match(name):
+        return True
+    return False
+
+
+def _record_hash(data: bytes) -> str:
+    digest = hashlib.sha256(data).digest()
+    return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _slim_wheel(wheel_path: Path) -> dict[str, int]:
+    """Rewrite ``wheel_path`` in place: drop the entries described above and
+    re-deflate the rest at level 9, regenerating RECORD. Returns counters."""
+    exclude_experimental = _flag(_EXPERIMENTAL_SOURCES_FLAG)
+    before = wheel_path.stat().st_size
+    stats = {"dropped_entries": 0, "dropped_bytes": 0}
+    buf = io.BytesIO()
+    record_name = None
+    with (
+        zipfile.ZipFile(wheel_path) as src,
+        zipfile.ZipFile(
+            buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as dst,
+    ):
+        records: list[tuple[str, str, int]] = []
+
+        def put(info: zipfile.ZipInfo, data: bytes) -> None:
+            out = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            out.compress_type = zipfile.ZIP_DEFLATED
+            out.external_attr = info.external_attr
+            out.create_system = info.create_system
+            dst.writestr(out, data, compresslevel=9)
+            records.append((info.filename, _record_hash(data), len(data)))
+
+        for info in src.infolist():
+            name = info.filename
+            if name.endswith("/"):
+                continue
+            if name.endswith(".dist-info/RECORD") and name.count("/") == 1:
+                record_name = name
+                record_info = info
+                continue
+            if name == _EXPERIMENTAL_SOURCES_MARKER:
+                # Regenerated below when the flag is set; never duplicated.
+                continue
+            if _wheel_entry_dropped(name, exclude_experimental):
+                stats["dropped_entries"] += 1
+                stats["dropped_bytes"] += info.compress_size
+                continue
+            put(info, src.read(info))
+        if record_name is None:
+            raise RuntimeError(f"{wheel_path} has no .dist-info/RECORD")
+        if exclude_experimental:
+            marker = zipfile.ZipInfo(
+                _EXPERIMENTAL_SOURCES_MARKER, date_time=record_info.date_time
+            )
+            marker.external_attr = record_info.external_attr
+            marker.create_system = record_info.create_system
+            put(marker, _EXPERIMENTAL_SOURCES_MARKER_TEXT.encode("utf-8"))
+        text = io.StringIO()
+        writer = csv.writer(text, delimiter=",", quotechar='"', lineterminator="\n")
+        for row in records:
+            writer.writerow(row)
+        writer.writerow((record_name, "", ""))
+        out = zipfile.ZipInfo(record_name, date_time=record_info.date_time)
+        out.compress_type = zipfile.ZIP_DEFLATED
+        out.external_attr = record_info.external_attr
+        out.create_system = record_info.create_system
+        dst.writestr(out, text.getvalue().encode("utf-8"), compresslevel=9)
+    wheel_path.write_bytes(buf.getvalue())
+    after = wheel_path.stat().st_size
+    print(
+        f"[flashinfer build] wheel post-processing: {before:,} -> {after:,} bytes; "
+        f"dropped {stats['dropped_entries']} entries ({stats['dropped_bytes']:,} compressed bytes); "
+        f"experimental kernel sources {'excluded' if exclude_experimental else 'kept'}",
+        file=sys.stderr,
+    )
+    stats["before"] = before
+    stats["after"] = after
+    return stats
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    _slim_wheel(Path(wheel_directory) / name)
+    return name
