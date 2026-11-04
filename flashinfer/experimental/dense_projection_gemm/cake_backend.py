@@ -47,13 +47,17 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out`` is
     zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
     ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the
-    same top-k.
+    same top-k;
+  - the K2 input gradient in the token windows of its rows in :data:`ROUTER_RULES` (:func:`router_simt`): an
+    exact-FP32 program on the CUDA cores, one FFMA per product of the FP32 operands read in place and every element of
+    ``out`` stored once (other bits than the deterministic program's BF16x3 emulation); every other row and token
+    count runs the deterministic program (one split).
 
-  Every other operation -- the K1 forward and input gradient, the K2 input gradient, the BF16x3 split -- runs the
-  deterministic programs in both modes: it has no cross-CTA reduction to relax.  On the convenience path a call of
-  ``deterministic=False`` that runs a deterministic program (the K1 forward and input gradient, the K2 input gradient,
-  a row without a verdict) launches it through a binding of this package (the deterministic package's plan, programs
-  and reduction: the same bits, fewer host operations per call).
+  Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
+  both modes: it has no cross-CTA reduction to relax.  On the convenience path a call of ``deterministic=False`` that
+  runs a deterministic program (the K1 forward and input gradient, a K2 row without a verdict) launches it through a
+  binding of this package (the deterministic package's plan, programs and reduction: the same bits, fewer host
+  operations per call).
 * With ``torch.use_deterministic_algorithms(True)`` an explicit ``deterministic=False`` raises ``RuntimeError``; with
   ``warn_only=True`` it warns and runs the deterministic path (:func:`_resolve_deterministic`).  The default does not
   consult the PyTorch setting: it is deterministic already.
@@ -215,7 +219,7 @@ ROUTES: dict[str, str] = {
     "k1_nk": "det",
     "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count
     "k2_kk": "atomic",  # router forward: no verdict ships (deterministic plan); an explicit split count <= 2 runs it
-    "k2_kn": "det",  # router input gradient: one split
+    "k2_kn": "atomic",  # router input gradient: the SIMT program in its token windows, else one split
     "k2_nn_t": "atomic",  # router weight gradient: stream-K over the token count
     "split": "det",  # the exact BF16x3 split of the router's second operand
 }
@@ -875,28 +879,29 @@ class _VerdictTable(dict):
 
 
 #: Per-row verdicts of the router, ``(arch, layout, hidden, experts) -> rule``: ``layout`` ``"kk"`` (the forward,
-#: ``hidden = K``) or ``"nn_t"`` (the swapped weight gradient, ``hidden`` = the launch's ``M``), ``experts`` = the
-#: launch's ``N``.  A partition spec -- ``"waves"`` (:func:`router_waves`), a head/tail spec ``"H<f>x<k>"`` or
-#: ``"H<f>x<k>p<h>"`` (the weight gradient's head/tail program, :func:`router_partition_of`) or one of
-#: :func:`router_units_of` (``"forward"``, ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this
-#: package's stream-K program, a SIMT spec ``"simt_n<tile_n>m<tile_m>s<slices>"`` the weight gradient's exact-FP32
-#: program on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (its production split
-#: count).  A rule is ``None``, token windows ``((min_tokens,
-#: max_tokens, spec), ...)`` -- the spec of the window that holds the launch's token count (``K`` of the weight
-#: gradient, ``M`` of the forward); every other token count runs the deterministic program -- or a spec alone, at
-#: every token count (the plan a test or a measurement forces; no row ships one).  A window carries a spec only where
-#: that partition was faster than the deterministic package's shipped plan in every measurement run at the token
-#: counts measured in it (one long-lived process and a fresh process per token count): a one-sided paired sign test
-#: (p < 0.05) with a median time ratio below 0.99, in eager launches and in CUDA graph replays, and no more than 3 %
-#: slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream -- in the same launch order, and
-#: also with this partition launched before that kernel against the deterministic plan launched after it.  A window
-#: ends at a measured token count; one that starts at a single token keeps the plan below its smallest measured count
-#: (64 tokens) unmeasured.  A token count outside the windows was not measured or missed, a ``None`` entry is a
-#: measured row that missed, a row without an entry was not measured: all of them run the deterministic program, and
-#: so does every window but a ``"waves"`` one on a device whose SM count is not the measured one,
-#: :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a table for that SM count.  A SIMT window comes first
-#: and may overlap the windows after it: on a device where the table's windows do not hold, the token count takes the
-#: next window that holds it (the ``"waves"`` window of hidden 5120 below 129 tokens, as before the SIMT windows).
+#: ``hidden = K``), ``"nn_t"`` (the swapped weight gradient, ``hidden`` = the launch's ``M``) or ``"kn"`` (the input
+#: gradient, ``hidden`` = the launch's ``N``), ``experts`` = the launch's ``N`` (``K`` of the input gradient).  A
+#: partition spec -- ``"waves"`` (:func:`router_waves`), a head/tail spec ``"H<f>x<k>"`` or ``"H<f>x<k>p<h>"`` (the
+#: weight gradient's head/tail program, :func:`router_partition_of`) or one of :func:`router_units_of` (``"forward"``,
+#: ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's stream-K program, a SIMT spec
+#: ``"simt_n<tile_n>m<tile_m>s<slices>"`` the exact-FP32 program of the row's layout on the CUDA cores (the weight
+#: gradient's or the input gradient's, :func:`router_simt`); ``None`` runs the deterministic program (its production
+#: split count).  A rule is ``None``, token windows ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window
+#: that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
+#: every other token count runs the deterministic program -- or a spec alone, at every token count (the plan a test or a
+#: measurement forces; no row ships one).  A window carries a spec only where that partition was faster than the
+#: deterministic package's shipped plan in every measurement run at the token counts measured in it (one long-lived
+#: process and a fresh process per token count): a one-sided paired sign test (p < 0.05) with a median time ratio below
+#: 0.99, in eager launches and in CUDA graph replays, and no more than 3 % slower than that plan next to a kernel
+#: holding 8, 16 or 32 SMs on another stream -- in the same launch order, and also with this partition launched before
+#: that kernel against the deterministic plan launched after it.  A window ends at a measured token count; one that
+#: starts at a single token keeps the plan below its smallest measured count (64 tokens) unmeasured.  A token count
+#: outside the windows was not measured or missed, a ``None`` entry is a measured row that missed, a row without an
+#: entry was not measured: all of them run the deterministic program, and so does every window but a ``"waves"`` one on
+#: a device whose SM count is not the measured one, :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a
+#: table for that SM count.  A SIMT window comes first and may overlap the windows after it: on a device where the
+#: table's windows do not hold, the token count takes the next window that holds it (the ``"waves"`` window of hidden
+#: 5120 below 129 tokens, as before the SIMT windows).
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -943,6 +948,14 @@ ROUTER_RULES: dict[
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
+    # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 64, 128 and 192 tokens (and 224 and 256 at
+    # hidden 4096): the SIMT program with the 32 x 64 tile in four slices (128 threads, one CTA per 32 tokens and 64
+    # hidden columns) up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144; next to a resident kernel
+    # it was more than 3 % slower than the deterministic program from 192 tokens (from 128 at hidden 6144).  sm_103a and
+    # 216-SM sm_107a parts keep the deterministic program (not measured)
+    ("sm_100a", "kn", 4096, 256): ((1, 128, "simt_n64m32s4"),),
+    ("sm_100a", "kn", 5120, 256): ((1, 128, "simt_n64m32s4"),),
+    ("sm_100a", "kn", 6144, 256): ((1, 64, "simt_n64m32s4"),),
 })
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
@@ -962,6 +975,11 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
 #: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile from 1 to 256 tokens
 #: (measured at 64, 128, 192 and 256 tokens on 212-SM R200 parts; 128, 160 and 192 CTAs of 256 threads, one wave).
+#: A part's table may also hold rows :data:`ROUTER_RULES` has no entry for, measured on that SM count only: on 212 SMs
+#: the input gradient takes the SIMT program with the 32 x 64 tile in eight slices up to 64 tokens and the 64 x 64
+#: tile in four slices from 65 to 128 tokens at hidden 4096 and 5120 (256 threads each; measured at 64, 128 and 192
+#: tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
+#: resident kernel), up to 64 tokens at hidden 6144.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -978,6 +996,9 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
         ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
         ("sm_107a", "nn_t", 6144, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+        ("sm_107a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
+        ("sm_107a", "kn", 5120, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
+        ("sm_107a", "kn", 6144, 256): ((1, 64, "simt_n64m32s8"),),
     }),
 })
 # fmt: on
@@ -1002,12 +1023,14 @@ ROUTER_HEAD_TAIL_TEMPLATES_BY_SM: dict[tuple[str, int], str] = {
     ("sm_107a", 212): "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
-#: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>"``: the weight gradient's exact-FP32 program on the CUDA cores
-#: (template ``router_fp32_gemm_`` + spec), ``out[N, M] = B[K, N].T @ A[K, M]`` of the swapped launch (``A`` the
-#: activations, ``B`` the output gradient) with one CTA per ``tile_n x tile_m`` tile of ``out`` over the whole K range:
-#: ``slices`` slices of the CTA each take every ``slices``-th 16-row K block, one FFMA per product, and add in slice
-#: order.  No BF16 parts, no split of K across CTAs: every element of ``out`` is stored once, its bits fixed by ``K``
-#: and the program.
+#: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>"``: an exact-FP32 program on the CUDA cores with one CTA per
+#: ``tile_n x tile_m`` tile of ``out`` over the whole K range: ``slices`` slices of the CTA each take every
+#: ``slices``-th 16-element K block, one FFMA per product, and add in slice order.  No BF16 parts, no split of K across
+#: CTAs: every element of ``out`` is stored once, its bits fixed by ``K`` and the program.  On a weight-gradient row
+#: (``nn_t``) the program ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>``, ``out[N, M] = B[K, N].T @ A[K, M]``
+#: of the swapped launch (``A`` the activations, ``B`` the output gradient); on an input-gradient row (``kn``) the
+#: program ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>``, ``out[M, N] = A[M, K] @ B[K, N]`` (``A`` the
+#: output gradient, ``B`` the router weight; ``tile_m`` token rows by ``tile_n`` hidden columns).
 _ROUTER_SIMT_SPEC = re.compile(r"simt_n(\d+)m(\d+)s(\d+)")
 #: The K rows of a SIMT program's block (its ``k_iters`` count them).
 ROUTER_SIMT_BLOCK_K = 16
@@ -1107,11 +1130,16 @@ def router_simt_tile(spec: Union[str, int, None]) -> Optional[tuple[int, int, in
     return None
 
 
-def router_simt_template(tile: tuple[int, int, int]) -> str:
-    """The template of the SIMT program of ``(tile_n, tile_m, slices)``:
-    ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>``."""
-    tile_n, tile_m, slices = tile
-    return f"{cake_jit.TEMPLATE_PREFIXES[3]}n{int(tile_n)}m{int(tile_m)}s{int(slices)}"
+def router_simt_template(tile: tuple[int, int, int], layout: str = "nn_t") -> str:
+    """The template of the SIMT program of ``(tile_n, tile_m, slices)`` of the layout class ``layout``: the weight
+    gradient's ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` (``nn_t``), the input gradient's
+    ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` (``kn``)."""
+    tile_n, tile_m, slices = (int(t) for t in tile)
+    if layout == "kn":
+        return f"{cake_jit.TEMPLATE_PREFIXES[4]}m{tile_m}n{tile_n}s{slices}"
+    if layout != "nn_t":
+        raise ValueError(f"router_simt_template: no SIMT program of the {layout!r} class")
+    return f"{cake_jit.TEMPLATE_PREFIXES[3]}n{tile_n}m{tile_m}s{slices}"
 
 
 def router_head_tail_template(arch: str, sm_count: Optional[int] = None) -> str:
@@ -1227,14 +1255,20 @@ def _router_rule_spec(
     layout: str, *, arch: str, sm_count: int, M: int, N: int, K: int
 ) -> Optional[Union[str, int]]:
     """The verdict for the launched GEMM ``[M, N] = [M, K] @ [K, N]`` of the layout class ``layout`` (``kk`` /
-    ``nn_t``) in the router table of a device of ``arch`` with ``sm_count`` SMs (:func:`router_rules`: the table of
-    its own in :data:`ROUTER_RULES_BY_SM`, else :data:`ROUTER_RULES`): the row's spec, or the spec of its token window
-    that holds the token count (``K`` of the weight gradient, ``M`` of the forward; a SIMT window only on a device where
-    the table's windows hold, else the next window that holds it).  ``None``: no verdict -- a launch without a caller's
-    split count runs the deterministic program (:func:`router_partition`)."""
-    hidden, tokens = (K, M) if layout == "kk" else (M, K)
+    ``kn`` / ``nn_t``) in the router table of a device of ``arch`` with ``sm_count`` SMs (:func:`router_rules`: the
+    table of its own in :data:`ROUTER_RULES_BY_SM`, else :data:`ROUTER_RULES`): the row's spec, or the spec of its
+    token window that holds the token count (``K`` of the weight gradient, ``M`` of the forward and of the input
+    gradient; a SIMT window only on a device where the table's windows hold, else the next window that holds it).
+    ``None``: no verdict -- a launch without a caller's split count runs the deterministic program
+    (:func:`router_partition`)."""
+    if layout == "kk":
+        hidden, experts, tokens = K, N, M
+    elif layout == "kn":
+        hidden, experts, tokens = N, K, M
+    else:
+        hidden, experts, tokens = M, N, K
     rules, holds = router_rules(arch, sm_count)
-    rule = rules.get((arch, layout, int(hidden), int(N)))
+    rule = rules.get((arch, layout, int(hidden), int(experts)))
     if isinstance(rule, tuple):  # token windows (min_tokens, max_tokens, spec)
         # a SIMT window only where the table's windows hold; elsewhere the next window that holds the token count
         return next(
@@ -1263,7 +1297,7 @@ def router_partition(
     ``sm_count`` SMs (:func:`router_partition_of`; ``head_spans`` 0: every span alike), or ``None``: the launch runs
     the deterministic program.
 
-    * ``kn`` (input gradient): ``None``.
+    * ``kn`` (input gradient): ``None`` (no stream-K program; its SIMT windows are :func:`router_simt`'s).
     * a caller's ``splits``: ``splits`` units per tile (``1``: every tile stored whole, the deterministic program's
       one-split bits -- the control of a measurement); the forward takes at most
       :data:`ROUTER_FORWARD_MAX_SPLITS`.
@@ -1351,21 +1385,23 @@ def router_simt(
     sm_count: int,
     splits: Optional[int] = None,
 ) -> Optional[tuple[int, int, int]]:
-    """``(tile_n, tile_m, slices)`` of the SIMT program the weight gradient's launch ``[M, N] = [M, K] @ [K, N]`` (the
-    swapped GEMM: ``M`` hidden, ``N`` experts, ``K`` tokens; layout class ``nn_t``) runs on a device of ``sm_count``
-    SMs: the SIMT spec of the row's token window that holds ``K`` (:data:`ROUTER_RULES`, or the table of the device's
-    own SM count in :data:`ROUTER_RULES_BY_SM`; :func:`router_rules`), on a device where the table's windows hold,
-    when the tile divides ``M`` and ``N``.  ``None``: no SIMT window -- another layout class, a caller's ``splits``
-    (the stream-K program), a token or SM count outside the SIMT windows -- and :func:`router_partition` plans the
-    launch."""
-    if layout != "nn_t" or splits is not None:
+    """``(tile_n, tile_m, slices)`` of the SIMT program a launch ``[M, N] = [M, K] @ [K, N]`` runs on a device of
+    ``sm_count`` SMs: the weight gradient's (the swapped GEMM: ``M`` hidden, ``N`` experts, ``K`` tokens; layout class
+    ``nn_t``) when the tile divides ``M`` and ``N``, the input gradient's (``M`` tokens, ``N`` hidden, ``K`` experts;
+    layout class ``kn``) when the tile divides ``N`` (the last row tile takes the rows left).  The SIMT spec of the
+    row's token window that holds the token count (:data:`ROUTER_RULES`, or the table of the device's own SM count in
+    :data:`ROUTER_RULES_BY_SM`; :func:`router_rules`), on a device where the table's windows hold.  ``None``: no SIMT
+    window -- the forward, a caller's ``splits`` (the stream-K program of the weight gradient, the deterministic
+    program of the input gradient), a token or SM count outside the SIMT windows -- and the launch takes the planner
+    of its class (:func:`router_partition`; the input gradient's deterministic program)."""
+    if layout not in ("nn_t", "kn") or splits is not None:
         return None
     if not router_rules(arch, sm_count)[1]:
         return None
     tile = router_simt_tile(
         _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
     )
-    if tile is None or int(M) % tile[1] or int(N) % tile[0]:
+    if tile is None or int(N) % tile[0] or (layout == "nn_t" and int(M) % tile[1]):
         return None
     return tile
 
@@ -1376,10 +1412,12 @@ class AtomicRouterPlan:
     [K, N]``): ``m_tiles / 2 x n_tiles`` tiles of ``256 x 128``, their ``k_iters`` K blocks cut into ``units``
     stream-K spans (``2 * units`` CTAs; the first ``head_spans`` spans share the first ``head_steps`` steps on the
     head/tail program, every span alike when ``head_spans`` is 0); with part tiles the launch zeroes ``out`` before
-    the program.  With ``simt`` (the weight gradient's SIMT program, ``(tile_n, tile_m, slices)``,
-    :func:`router_simt`): one CTA per ``tile_n x tile_m`` tile of the transposed ``out``, ``m_tiles x n_tiles`` CTAs
-    over ``k_iters`` K blocks of :data:`ROUTER_SIMT_BLOCK_K` rows, the activations' and the output gradient's row
-    strides ``lda`` / ``ldb``; ``units`` 0, no part tiles."""
+    the program.  With ``simt`` (a SIMT program, ``(tile_n, tile_m, slices)``, :func:`router_simt`): one CTA per
+    ``tile_n x tile_m`` tile of ``out`` over ``k_iters`` K blocks of :data:`ROUTER_SIMT_BLOCK_K` elements, the
+    operands' row strides ``lda`` / ``ldb``; ``units`` 0, no part tiles.  The weight gradient's (``nn_t``) launches
+    ``m_tiles x n_tiles`` CTAs over the transposed ``out`` (``A`` the activations, ``B`` the output gradient), the
+    input gradient's (``kn``) ``n_tiles x m_tiles`` CTAs, ``m_tiles`` row tiles of ``tile_m`` tokens, the last one
+    partial (``A`` the output gradient, ``B`` the router weight)."""
 
     M: int
     N: int
@@ -1410,6 +1448,8 @@ class AtomicRouterPlan:
     @property
     def grid(self) -> tuple[int, int, int]:
         if self.simt is not None:
+            if self.layout == "kn":
+                return (self.n_tiles, self.m_tiles, 1)
             return (self.m_tiles, self.n_tiles, 1)
         return (2 * self.units, 1, 1)
 
@@ -1463,15 +1503,17 @@ def plan_atomic_router(
     splits: Optional[int] = None,
 ) -> tuple[Optional[AtomicRouterPlan], str]:
     """Plan this package's K2 GEMM ``out[M, N] = A[M, K] @ B[K, N]`` (fp32 views, the deterministic package's view
-    contract and swap rule) of the ``kk`` / ``nn_t`` classes.  Returns ``(plan, reason)``: ``plan`` is ``None`` when
-    the launch runs the deterministic program, and ``reason`` says why -- another layout class, a view the reduce-add
+    contract and swap rule) of the ``kk`` / ``nn_t`` classes, and of the ``kn`` class in its SIMT windows.  Returns
+    ``(plan, reason)``: ``plan`` is ``None`` when the launch runs the deterministic program, and ``reason`` says why --
+    another layout class, a ``kn`` launch outside the SIMT windows, a view the reduce-add
     program cannot address (an ``out`` off a 16-byte boundary or with a row stride not a multiple of 4 elements runs
     the deterministic path, which serves or refuses it as that package does), a template this checkout does not
     register for ``arch``, or the planner (:func:`router_partition`).  An explicit ``splits`` (``1`` included) runs
     this package's program when the view and the registry allow it; a head/tail partition runs the head/tail program
     of the architecture on a device of ``sm_count`` SMs (:func:`router_head_tail_template`); a SIMT window
     (:func:`router_simt`) runs the SIMT program of its tile when the operands' rows are whole rows of a multiple of 4
-    elements (else the deterministic program)."""
+    elements (else the deterministic program): the weight gradient's over the swapped launch, the input gradient's
+    over ``A`` (the output gradient, K-major) and ``B`` (the router weight, N-major) as they are."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -1494,7 +1536,7 @@ def plan_atomic_router(
     if a_mn is None or b_mn is None:
         return None, "an operand without a unit stride"
     layout = _k2_class(a_mn, b_mn)[3:]
-    if layout not in ("kk", "nn_t"):
+    if layout not in ("kk", "kn", "nn_t"):
         return None, f"the {layout} class runs the deterministic program"
     swapped = layout == "nn_t"
     if swapped:
@@ -1519,16 +1561,29 @@ def plan_atomic_router(
         layout, arch=arch, M=M_eff, N=N_eff, K=K, sm_count=sm_count, splits=splits
     )
     if simt is not None:
-        # out[N, M] = B_eff.T @ A_eff.T: the activations' rows (lda) and the output gradient's rows (ldb), K-major
         ldb = int(B_eff.stride(0))
-        if not (swapped and a_eff_mn and b_eff_mn) or lda < M_eff:
-            return None, "the SIMT program reads the activations' rows whole"
-        if ldb % 4 or ldb < N_eff:
-            return (
-                None,
-                "the SIMT program reads the output gradient's rows whole, a multiple of 4 elements",
-            )
-        template = router_simt_template(simt)
+        if swapped:
+            # out[N, M] = B_eff.T @ A_eff.T: the activations' rows (lda) and the output gradient's rows (ldb), K-major
+            if not (a_eff_mn and b_eff_mn) or lda < M_eff:
+                return None, "the SIMT program reads the activations' rows whole"
+            if ldb % 4 or ldb < N_eff:
+                return (
+                    None,
+                    "the SIMT program reads the output gradient's rows whole, a multiple of 4 elements",
+                )
+        else:
+            # out[M, N] = A @ B: the output gradient's rows (lda, K-major) and the router weight's rows (ldb, N-major)
+            if K % 4 or lda < K:
+                return (
+                    None,
+                    "the SIMT program reads the output gradient's rows whole, K a multiple of 4 elements",
+                )
+            if ldb % 4 or ldb < N_eff:
+                return (
+                    None,
+                    "the SIMT program reads the router weight's rows whole, a multiple of 4 elements",
+                )
+        template = router_simt_template(simt, layout)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
         tile_n, tile_m, _ = simt
@@ -1541,7 +1596,7 @@ def plan_atomic_router(
                 b_mn=b_eff_mn,
                 swapped=swapped,
                 layout=layout,
-                m_tiles=M_eff // tile_m,
+                m_tiles=_ceil_div(M_eff, tile_m),
                 n_tiles=N_eff // tile_n,
                 k_iters=_ceil_div(K, ROUTER_SIMT_BLOCK_K),
                 units=0,
@@ -1552,6 +1607,8 @@ def plan_atomic_router(
             ),
             "",
         )
+    if layout == "kn":
+        return None, "the kn class runs the deterministic program outside its SIMT windows"
     template = cake_jit.TEMPLATE_PREFIXES[1] + ("nn_t" if swapped else "kk")
     if template not in cake_jit.KERNELS.get(arch, {}):
         return None, f"{template} is not registered for {arch}"
@@ -1623,10 +1680,12 @@ def _k2_geometry_without_verdict(
     # the planner's operand classes (_router_a_mn / _router_b_mn) from the strides
     a_mn = False if a_st[1] == 1 else (True if a_st[0] == 1 else None)
     b_mn = False if b_st[0] == 1 else (True if b_st[1] == 1 else None)
-    if a_mn is None or a_mn != b_mn:
+    if a_mn is None or b_mn is None or (a_mn and not b_mn):
         return False
     if a_mn:  # nn_t: the swapped launch [N, M] = [N, K] @ [K, M]
         spec = _router_rule_spec("nn_t", arch=arch, sm_count=sm_count, M=N, N=M, K=K)
+    elif b_mn:  # kn: the input gradient
+        spec = _router_rule_spec("kn", arch=arch, sm_count=sm_count, M=M, N=N, K=K)
     else:
         spec = _router_rule_spec("kk", arch=arch, sm_count=sm_count, M=M, N=N, K=K)
     return spec is None
@@ -1636,7 +1695,8 @@ def _k2_row_without_verdict(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, arch: str, sm_count: int
 ) -> bool:
     """Whether :func:`plan_atomic_router` keeps a launch without a caller's split count on the deterministic program
-    for want of a verdict: valid 2-D fp32 views of the ``kk`` / ``nn_t`` class whose row has no spec on a device of
+    for want of a verdict: valid 2-D fp32 views of the ``kk`` / ``kn`` / ``nn_t`` class whose row has no spec on a
+    device of
     ``arch`` with ``sm_count`` SMs (:func:`_router_rule_spec` of the launched GEMM), when no other check of the
     planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
     planner."""
@@ -1789,14 +1849,16 @@ def _simt_values(
     ldo: int,
     enable_pdl: int = 0,
 ) -> dict[str, Any]:
-    """The keyword arguments of a launch of the SIMT program (ordered by the program's argument plan): ``A`` the
-    activations (the streamed operand's span, ``[1, K, M]``), ``B`` the output gradient ``[K, N]`` (the split source
-    of the stream-K programs) and ``out`` the transposed product ``[N, M]``, read in place through their row strides
-    ``lda`` / ``ldb`` / ``ldo``.  The program never launches as a programmatic dependent launch, whatever the call's
-    PDL flag (``enable_pdl`` is accepted and ignored): its CTAs, launched early next to a running predecessor, would be
-    placed only on the SMs that predecessor leaves free, several per SM, and finish later than spread over every SM
-    once it ends (on 152-SM GB200 parts the backward pass, input and weight gradient, at hidden 5120 and 6144 and 192
-    and 256 tokens was 12 to 16 % slower in CUDA graphs than with the program launched after its predecessor)."""
+    """The keyword arguments of a launch of a SIMT program (ordered by the program's argument plan): ``A`` the streamed
+    operand's span and ``B`` the split source of the stream-K programs -- the weight gradient's activations
+    ``[1, K, M]`` and output gradient ``[K, N]``, the input gradient's output gradient ``[1, M, K]`` and router weight
+    ``[K, N]`` -- and ``out`` (the transposed product ``[N, M]``, the product ``[M, N]``), read in place through their
+    row strides ``lda`` / ``ldb`` / ``ldo``.  A SIMT program never launches as a programmatic dependent launch,
+    whatever the call's PDL flag (``enable_pdl`` is accepted and ignored): its CTAs, launched early next to a running
+    predecessor, would be placed only on the SMs that predecessor leaves free, several per SM, and finish later than
+    spread over every SM once it ends (on 152-SM GB200 parts the backward pass, input and weight gradient, at hidden
+    5120 and 6144 and 192 and 256 tokens was 12 to 16 % slower in CUDA graphs than with the weight gradient's program
+    launched after its predecessor; the input gradient's program was not faster as a dependent launch)."""
     del enable_pdl
     return dict(
         A=A,
@@ -2283,11 +2345,12 @@ def _atomic_k2(
     enable_pdl: Optional[bool] = None,
     views: Optional[tuple] = None,
 ) -> Any:
-    """This package's K2 GEMM ``out = A @ B`` (FP32 through the BF16x3 emulation) of the layout classes ``kk`` /
-    ``nn_t``: ``op`` is ``"plan"``, ``"prepare"`` or ``"launch"`` as for :func:`_atomic_k1`.  A plan or a prepared
-    launch :func:`plan_atomic_router` keeps on the deterministic program is the deterministic package's object of
-    ``op`` with the caller's ``splits`` (``None``: its production split count); a launch runs that program through
-    this package's binding (:func:`_launch_cached_atomic_k2`; ``views``: an entry point's own launch views).
+    """This package's K2 GEMM ``out = A @ B`` (FP32 through the BF16x3 emulation, or a SIMT program) of the layout
+    classes ``kk`` / ``kn`` / ``nn_t``: ``op`` is ``"plan"``, ``"prepare"`` or ``"launch"`` as for
+    :func:`_atomic_k1`.  A plan or a prepared launch :func:`plan_atomic_router` keeps on the deterministic program is
+    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: its production split count);
+    a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`; ``views``: an entry
+    point's own launch views).
     ``enable_pdl`` (default: the device supports it) launches the split and the program as programmatic dependent
     launches."""
     if op == "launch":
@@ -2333,9 +2396,10 @@ def _atomic_k2(
 # deterministic program -- a row the planner keeps on it, a call without a split count whose row has no verdict
 # (:func:`_k2_row_without_verdict`, kept per device and view geometry until a router table changes,
 # :func:`_router_memo`; not planned here), a forward without a split count while no router table gives the forward a
-# verdict, the input gradient -- runs it through a binding of this package (:func:`_launch_cached_splitk_k2`, cache
-# ``_K2_SPLITK_CACHE``): the deterministic package's plan, programs and ``torch.sum`` of the split-K partials, so its
-# bits, with this package's arena for the stack and the partials.  A K2 entry binds its argument lists once
+# verdict, the input gradient outside its SIMT windows -- runs it through a binding of this package
+# (:func:`_launch_cached_splitk_k2`, cache ``_K2_SPLITK_CACHE``): the deterministic package's plan, programs and
+# ``torch.sum`` of the split-K partials, so its bits, with this package's arena for the stack and the partials.  A K2
+# entry binds its argument lists once
 # (:class:`_K2Binding`: the plan's values in the program's order, the arena's BF16x3 stack -- and the deterministic
 # program's partials -- carved and converted once per arena growth), so a call passes only the caller's views (an
 # entry point's own tensors when they are the launch views, :func:`_launch_views`; torch tensors, each converted in
@@ -3059,7 +3123,7 @@ def _k2_binding(
     :data:`_K2_CALL_ARGS`)."""
     a_arg, out32_arg, d_arg, src_arg = _K2_CALL_ARGS
     if plan.simt is not None:
-        # the SIMT program: the activations' span, the output gradient (the split source) and out, per call
+        # a SIMT program: the streamed operand's span, the split source and out, per call
         values = _simt_values(
             plan, A=a_arg, B=src_arg, out=d_arg, ldo=out.stride(0), enable_pdl=pdl
         )
@@ -3240,8 +3304,8 @@ def _launch_atomic_k2_binding(
     on the raw ``stream`` of device ``index`` with the call's launch views ``a_view`` / ``split_src``: the split, the
     zero fill of ``out`` (part tiles) and the program back to back under the arena's lock, the stack carved again if
     the arena grew.  ``out`` is converted once for both of its arguments; the other views go to the FFI calls as
-    torch tensors (each converted there, once).  The SIMT program is one kernel over ``a_view``, ``split_src`` (the
-    output gradient) and ``out``."""
+    torch tensors (each converted there, once).  A SIMT program is one kernel over ``a_view``, ``split_src`` (the
+    weight gradient's output gradient, the input gradient's router weight) and ``out``."""
     arena, fn, bound = entry.arena, entry.entry, entry.k2
     assert arena is not None and fn is not None and bound is not None
     split_fn = entry.split_entry
@@ -3555,22 +3619,22 @@ def _plan_k2_entry(
     memo: _RouterMemo,
 ) -> _CachedK2Entry:
     """The :class:`_CachedK2Entry` of a router entry point's call (under ``_ATOMIC_PLAN_LOCK``): the route the entry
-    point's own path takes under the router tables of ``memo`` -- the input gradient, the forward without a split count
-    while no router table gives the forward a verdict, a layout routed ``"det"``, a call without a split count whose
-    row has no verdict (:func:`_k2_runs_without_verdict`) and a row the planner keeps on the deterministic program run
-    the deterministic program, the others this package's program -- and that path's cached launch of the route (looked
-    up in, or planned into, :data:`_K2_SPLITK_CACHE` / :data:`_K2_ATOMIC_CACHE` under the same key).  A launch that is
-    not bound, or whose plan does not take the entry point's tensors as its views, leaves the call to the entry
-    point's own path."""
+    point's own path takes under the router tables of ``memo`` -- the forward without a split count while no router
+    table gives the forward a verdict, a layout routed ``"det"``, a call without a split count whose row has no
+    verdict (:func:`_k2_runs_without_verdict`) and a row the planner keeps on the deterministic program run the
+    deterministic program (the input gradient: one split), the others this package's program -- and that path's
+    cached launch of the route (looked up in, or planned into, :data:`_K2_SPLITK_CACHE` / :data:`_K2_ATOMIC_CACHE`
+    under the same key).  A launch that is not bound, or whose plan does not take the entry point's tensors as its
+    views, leaves the call to the entry point's own path."""
     det = deterministic_backend()
     A, B, flags = _k2_entry_operands(op, P, Q)
     geometry = _k2_geometry(A, B, out)
     key = _k2_key(index, stream, (splits, pdl), A, B, out, geometry, out.data_ptr())
     launch: Optional[Union[_CachedSplitK2, _CachedAtomic]] = None
     atomic = False
-    # the input gradient, and the forward without a split count while no table gives it a verdict, do not read ROUTES
+    # the forward without a split count while no table gives it a verdict does not read ROUTES
     layout = route = None
-    if op != "dgrad" and (splits is not None or op == "wgrad" or memo.forward_verdicts):
+    if splits is not None or op != "fwd" or memo.forward_verdicts:
         layout = _k2_layout(A, B)
         route = _route(layout)
     if (
@@ -4049,8 +4113,9 @@ def plan_router_fp32_gemm(
     deterministic: bool = True,
 ) -> Any:
     """Classify the fp32 views and plan the K2 launch (the deterministic package's ``plan_router_fp32_det_gemm``);
-    ``deterministic=False`` plans this package's stream-K program for the ``kk`` / ``nn_t`` classes
-    (:class:`AtomicRouterPlan`; ``splits`` sets ``splits`` units per tile, see :func:`router_units`)."""
+    ``deterministic=False`` plans this package's stream-K program for the ``kk`` / ``nn_t`` classes and the SIMT
+    programs in their windows (:class:`AtomicRouterPlan`; ``splits`` sets ``splits`` units per tile, see
+    :func:`router_units`)."""
     if _resolve_deterministic(deterministic, "plan_router_fp32_gemm") or (
         _route(_k2_layout(A, B)) == "det"
     ):
@@ -4070,8 +4135,9 @@ def prepare_router_fp32_gemm(
     """Validate one fp32 binding, plan it and prepare its allocation-free launch (the deterministic package's
     ``prepare_router_fp32_det_gemm``); ``deterministic=False`` prepares this package's stream-K program for the
     ``kk`` / ``nn_t`` classes (its launch splits the second operand, zeroes ``out`` on the stream when a segment adds
-    into it, and runs the program: no partial buffers).  ``enable_pdl`` (default: the device supports it) launches
-    the split and the program as programmatic dependent launches."""
+    into it, and runs the program: no partial buffers), and a SIMT program in its windows (the ``nn_t`` and ``kn``
+    classes: one kernel over the fp32 operands).  ``enable_pdl`` (default: the device supports it) launches the split
+    and the stream-K program as programmatic dependent launches."""
     if _resolve_deterministic(deterministic, "prepare_router_fp32_gemm") or (
         _route(_k2_layout(A, B)) == "det"
     ):
@@ -4117,7 +4183,8 @@ def router_fp32_gemm(
     """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the BF16x3 emulation (the cached convenience
     path).  ``deterministic=False`` runs the ``kk`` / ``nn_t`` rows the planner takes (:func:`router_units`) on this
     package's stream-K program, whose part tiles add into ``out`` in the order they finish, instead of the
-    fixed-order split-K sum; every other row runs the deterministic program.  ``enable_pdl`` as for
+    fixed-order split-K sum, and the ``nn_t`` / ``kn`` token counts of a SIMT window on its exact-FP32 program
+    (:func:`router_simt`); every other row runs the deterministic program.  ``enable_pdl`` as for
     :func:`prepare_router_fp32_gemm`."""
     det = _resolve_deterministic(deterministic, "router_fp32_gemm")
     return _router_gemm(A, B, out, splits, det, enable_pdl)
@@ -4162,17 +4229,22 @@ def router_dgrad(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, K] = G[T, N] @ W[N, K]`` in FP32 through the emulation.  The deterministic program in both modes
-    (one split: nothing to reduce); with ``deterministic=False`` through this package's binding of it
-    (:func:`_launch_cached_splitk_k2`: the same plan, program and bits).  ``enable_pdl`` as for
+    """``out[T, K] = G[T, N] @ W[N, K]`` in FP32: the deterministic program (one split: nothing to reduce) through the
+    emulation; with ``deterministic=False`` in the token windows of the row's input-gradient verdict in
+    :data:`ROUTER_RULES` (or, on a part with a table of its own, :data:`ROUTER_RULES_BY_SM`) the exact-FP32 SIMT
+    program (:func:`router_simt`: one FFMA per product of ``G`` and ``W`` read in place, every element of ``out``
+    stored once), and at every other row and token count the deterministic program through this package's binding of
+    it (:func:`_launch_cached_splitk_k2`: the same plan, program and bits).  ``enable_pdl`` as for
     :func:`prepare_router_fp32_gemm`."""
     if _resolve_deterministic(deterministic, "router_dgrad"):
         return _det_entry("router_dgrad")(G, W, out, **_pdl_kw(enable_pdl))
     if out is None:
         out = torch.empty(G.shape[0], W.shape[1], device=G.device, dtype=torch.float32)
-    if _k2_entry("dgrad", G, W, out, 1, enable_pdl) is not None:
+    if _k2_entry("dgrad", G, W, out, None, enable_pdl) is not None:
         return out
-    return _splitk_k2(G, W, out, 1, (G.unsqueeze(0), W, _DGRAD_VIEWS), enable_pdl)
+    return _router_gemm(
+        G, W, out, None, False, enable_pdl, (G.unsqueeze(0), W, _DGRAD_VIEWS)
+    )
 
 
 def router_wgrad(

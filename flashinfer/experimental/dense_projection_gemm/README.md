@@ -32,7 +32,7 @@ deterministic already.*
 | K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles) |
 | K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
 | K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row -- without a split count, while no router table gives the forward a verdict, without the per-call check of the row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
-| K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) |
+| K2 input gradient (`router_dgrad`, `kn`) | the token windows of its `ROUTER_RULES` rows (on 212-SM `sm_107a` parts `ROUTER_RULES_BY_SM`): the exact-FP32 SIMT program `router_fp32_dgrad_simt_*` -- one FFMA per product of the FP32 operands read in place, every element of `out` stored once.  Every other row and token count: deterministic program (one split) |
 | K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
 | BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
 
@@ -47,7 +47,7 @@ deterministic already.*
 | rounding | each output element is rounded once, from its complete FP32 sum |
 | subnormals | kept: K1 adds the partials with IEEE round-to-nearest adds, K2 reduces with the TMA reduce-add; nothing flushes to zero |
 | run-to-run bits, K1 | two splits (every `sm_100a` and `sm_103a` row, `sm_107a` `8192 -> 128`): repeat bit for bit (one add of two values); one split (`sm_107a` rows marked `p = 1` below): repeat bit for bit (whole tiles); three or four splits (the other `sm_107a` rows): vary in the last bits |
-| run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
+| run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); a SIMT window (weight or input gradient): repeats bit for bit (every element stored once, its slices added in a fixed order); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
 | architectures | `sm_100a`, `sm_103a`, `sm_107a`: one `-gencode=arch=compute_<arch>,code=sm_<arch>` build per program, minimum CUDA 12.8 / 12.9 / 13.4 (`build.json`) |
 | streams and threads | planning takes a module lock; the convenience path keeps one workspace arena per (device, stream); prepared launches own their workspace |
 | CUDA graphs | prepared launches allocate nothing on the device and capture into a CUDA graph (K2: the split, the memset of `out`, the program); no host synchronization |
@@ -97,7 +97,7 @@ it.  The measured parts have 148 and 152 SMs (`sm_100a` /
 | `K1_SPLIT_RULE_EXCLUDED_TOKENS` | a key of `K1_SPLIT_RULES` or of a table of `K1_SPLIT_RULES_BY_SM` | `((sm_count, min_tokens, max_tokens), ...)`: the row runs the deterministic program at a token count from `min_tokens` to `max_tokens` (`None`: no upper bound) on a part of at least `sm_count` SMs (`sm_count` at or above the row's SM-count floor) or of exactly `sm_count` SMs (below it); every other token count and part keeps the verdict |
 | `K1_SPLIT_RULES_BY_SM_TOKENS` | -- | `(min_tokens, max_tokens)`: the token counts (`K` of the weight gradient) the tables of `K1_SPLIT_RULES_BY_SM` and `K1_SPLIT_OVERRIDES_BY_SM` hold for, `(16172, 16384)` (where they were measured) |
 | `K1_SPLIT_OVERRIDES_BY_SM` | `(arch, sm_count)` | verdicts (keys and values as in `K1_SPLIT_RULES`) that replace a row's `K1_SPLIT_RULES` verdict on parts of exactly `sm_count` SMs at or above the row's floor, at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; every other token count and SM count keeps the `K1_SPLIT_RULES` verdict (`sm_107a`: 216 SMs, `4096 -> 1024` FP32) |
-| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"`, a unit count (this package's stream-K program) or `"simt_n<tile_n>m<tile_m>s<slices>"` (the weight gradient's exact-FP32 SIMT program, `router_simt`) |
+| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`), `"nn_t"` (weight gradient, `hidden` = the launch's `M`) or `"kn"` (input gradient, `hidden` = the launch's `N`), `experts` = the launch's `N` (`K` of the input gradient) | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward and of the input gradient; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"`, a unit count (this package's stream-K program) or `"simt_n<tile_n>m<tile_m>s<slices>"` (the exact-FP32 SIMT program of the row's layout, `router_simt`; the only spec of an input-gradient row) |
 | `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`; below a SIMT window too) or with a table of its own in `ROUTER_RULES_BY_SM` |
 | `ROUTER_RULES_BY_SM` | `(arch, sm_count)` | the router verdicts of the parts with exactly `sm_count` SMs (keys and values as in `ROUTER_RULES`; `router_rules` picks the table of a device); such a part takes its own table only: a row without an entry, and every token count outside its windows, runs the deterministic program (`sm_107a`: 208 and 212 SMs) |
 
@@ -226,6 +226,19 @@ backward pass, each measured against the plan of the same token count before the
 152 SMs is `"waves"` up to 128 tokens).  The arms of each row were measured interleaved, in paired groups.  The
 128 x 64 tile on 152 SMs was slower than the previous plan in the backward pass and the checkpointed step at hidden
 5120 and 6144 and 256 tokens, so those rows take the 64 x 64 tile.*
+
+On an input-gradient row (`kn`) `"simt_n<tile_n>m<tile_m>s<slices>"` runs the exact-FP32 program
+`router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`: one CTA per `tile_m x tile_n` tile of `out = G @ W` (`tile_m`
+tokens by `tile_n` hidden columns, the last row tile partial) over all experts, `slices` slices of the CTA each taking
+every `slices`-th 16-expert block of `G` and `W` (read in place through their row strides), one FFMA per product, the
+slices added in slice order, every element of `out` stored once.  Like the weight gradient's program it launches after
+its predecessor.  On 152-SM `sm_100a` parts the 32 x 64 tile in four slices (`"simt_n64m32s4"`, 128 threads) runs from
+1 to 128 tokens at hidden 4096 and 5120 and from 1 to 64 at hidden 6144; on 212-SM `sm_107a` parts
+(`ROUTER_RULES_BY_SM`) the 32 x 64 tile in eight slices (`"simt_n64m32s8"`, 256 threads) runs from 1 to 64 tokens and
+the 64 x 64 tile in four slices (`"simt_n64m64s4"`, 256 threads) from 65 to 128 at hidden 4096 and 5120, and
+`"simt_n64m32s8"` from 1 to 64 at hidden 6144.  At more tokens (from 192; from 128 at hidden 6144) the program was more
+than 3 % slower than the deterministic program next to a resident kernel.  `sm_103a` and the other `sm_107a` SM counts
+run the deterministic program (not measured).
 
 `"H<f>x<k>"` (`router_partition_of`, the weight gradient only) runs the head/tail program
 `router_fp32_gemm_atomic_nn_t_ht_c3_nreg` (on `sm_103a` and on 212-SM `sm_107a` parts:
