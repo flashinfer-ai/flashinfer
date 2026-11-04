@@ -390,3 +390,9 @@ run; it does not suppress device memory/synchronization diagnostics. Twenty-one
 upstream NVFP4 head-count, dual-page and prefill-workspace tests also pass.
 A one-launch native NVFP4 racecheck probe reports zero hazards; this is not
 full racecheck coverage and does not resolve the FP8 path's known reports.
+
+The CuTe FP8 admission check also requires each page pitch to equal its row
+pitch times its row count, for both caches. Page-end gaps retain the existing
+implementation; uniformly padded rows are supported. A ninth FP8 integration
+test verifies 544-byte row pitches, strided LSE output, graph replay and
+untouched padding against the contiguous-cache result bitwise.

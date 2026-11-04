@@ -28,6 +28,9 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
   // and requests that explicitly require BF16 QK arithmetic.
   if (mt == ModelType::DSV4_1_INLINE && !m.extra_fp4 &&
       plan.numeric == execution::NumericRoute::FP8 &&
+      m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes &&
+      (!m.extra_topk || m.extra_page_stride_bytes ==
+                           size_t(m.extra_page_size) * m.extra_row_stride_bytes) &&
       m.indices_stride == size_t(m.topk) &&
       (!m.extra_topk || m.extra_indices_stride == size_t(m.extra_topk))) {
     using namespace cute_prefill::integrated;
