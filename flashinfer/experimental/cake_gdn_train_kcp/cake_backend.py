@@ -40,22 +40,24 @@ Launches go through :func:`run_module`: the record maps its kernel
 parameters onto the package's logical vocabulary (``cake_jit.LOGICAL_TENSORS``
 / ``LOGICAL_SCALARS``), the grid comes from the host plan
 (``cake_jit.launch_grid``) and the kernel runs on the current torch stream.
-A launch enters ``tvm_ffi.use_torch_stream()`` itself unless an enclosing
-:func:`launch_scope` (one per package entry: the forward or backward body)
-already bound torch's current stream on this thread; a launch whose current
-stream is not the bound one takes its own context, as without a scope.
+A launch binds torch's current stream as tvm-ffi's environment stream itself
+(:func:`stream_context`: ``tvm_ffi.use_raw_stream`` with the stream's raw handle,
+the stream ``tvm_ffi.use_torch_stream()`` sets, without building a
+``torch.cuda.Stream``) unless an enclosing :func:`launch_scope` (one per package
+entry: the forward or backward body) already bound torch's current stream on
+this thread; a launch whose current stream is not the bound one takes its own
+context, as without a scope.
 Every launch is a plain stream-ordered launch: nothing cooperative, no PDL.
 Nothing here synchronizes, reads device memory or allocates.
 """
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import hashlib
 import json
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,7 @@ __all__ = [
     "run_module",
     "sm_count",
     "specs_for_arch",
+    "stream_context",
     "test_jit_spec",
     "test_library_name",
     "test_manifest",
@@ -297,26 +300,58 @@ def _current_stream() -> tuple[int, int]:
     return index, int(torch.cuda.current_stream(index).cuda_stream)
 
 
-@contextlib.contextmanager
-def launch_scope() -> Iterator[None]:
-    """One ``tvm_ffi.use_torch_stream()`` context for the launches of a package entry.
+@functools.cache
+def _ffi_device(index: int) -> Any:
+    """tvm-ffi's CUDA device ``index`` (built once per index)."""
+    return tvm_ffi.device("cuda", index)
+
+
+def stream_context(stream: tuple[int, int]) -> Any:
+    """The tvm-ffi stream context of ``stream`` = ``(device index, raw handle)`` (:func:`_current_stream`): it sets
+    the environment stream ``tvm_ffi.use_torch_stream()`` sets for that current stream -- the CUDA device ``index``
+    and the raw ``cudaStream_t`` -- through ``tvm_ffi.use_raw_stream``, without building a ``torch.cuda.Stream``, a
+    device string and its parsed device on every entry."""
+    index, raw = stream
+    return tvm_ffi.use_raw_stream(_ffi_device(index), raw)
+
+
+class _LaunchScope:
+    """:func:`launch_scope`'s context manager (a class: entered once per package entry, so it costs no generator)."""
+
+    __slots__ = ("_context", "_outer")
+
+    def __enter__(self) -> _LaunchScope:
+        stream = _current_stream()
+        outer = getattr(_SCOPE, "stream", None)
+        self._outer = outer
+        self._context = None
+        if outer == stream:
+            return self
+        context = stream_context(stream)
+        context.__enter__()
+        self._context = context
+        _SCOPE.stream = stream
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        context = self._context
+        if context is not None:
+            self._context = None
+            try:
+                _SCOPE.stream = self._outer
+            finally:
+                context.__exit__(*exc)
+
+
+def launch_scope() -> _LaunchScope:
+    """One stream binding (:func:`stream_context`) for the launches of a package entry.
 
     It binds torch's current stream as this thread's tvm-ffi environment stream once; :func:`run_module` launches
-    inside the scope skip their own context while torch's current stream is still the bound one, and enter it as
+    inside the scope skip their own context while torch's current stream is still the bound one, and enter one as
     before otherwise (a stream switch inside the scope, a launch outside every scope).  A scope inside a scope of
     the same stream adds nothing; one on another stream (a CUDA graph capture inside the scope) binds its own stream
     until it exits.  The kernels run on the same stream either way."""
-    stream = _current_stream()
-    outer = getattr(_SCOPE, "stream", None)
-    if outer == stream:
-        yield
-        return
-    with tvm_ffi.use_torch_stream():
-        _SCOPE.stream = stream
-        try:
-            yield
-        finally:
-            _SCOPE.stream = outer
+    return _LaunchScope()
 
 
 @functools.cache
@@ -369,9 +404,9 @@ def run_module(
     if module is None:
         module = load(name, device_arch(device_index))
     entry = getattr(module, found["ffi_entry"])
-    bound = getattr(_SCOPE, "stream", None)
-    if bound is not None and bound == _current_stream():
+    stream = _current_stream()
+    if getattr(_SCOPE, "stream", None) == stream:
         entry(*args)  # the enclosing launch scope bound this stream
         return
-    with tvm_ffi.use_torch_stream():
+    with stream_context(stream):
         entry(*args)

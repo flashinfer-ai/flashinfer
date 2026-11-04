@@ -950,24 +950,27 @@ def test_launch_scope_enters_one_stream_context_per_entry_body(
     device, monkeypatch
 ) -> None:
     """The kernels backend's launch path on a caller stream: an autograd forward + backward, direct and under a
-    non-reentrant checkpoint, enters ``tvm_ffi.use_torch_stream()`` once per entry body (the launch scope) instead
-    of once per launch, launches the same records on the same grids as with the scope off (one context per launch),
-    and both arms' results are within the budget of the FP64 reference and of each other."""
+    non-reentrant checkpoint, binds the caller's stream for tvm-ffi (``tvm_ffi.use_raw_stream`` on the stream's
+    device and raw handle) once per entry body (the launch scope) instead of once per launch, every binding is the
+    caller stream, the launches are the same records on the same grids as with the scope off (one context per
+    launch), and both arms' results are within the budget of the FP64 reference and of each other."""
     from torch.utils.checkpoint import checkpoint
 
     be = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_backend")
     kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
     real = be.tvm_ffi
     entered = [0]
+    bound = []
 
     class _Counting:
         def __getattr__(self, name):
             return getattr(real, name)
 
         @staticmethod
-        def use_torch_stream(*args, **kwargs):
+        def use_raw_stream(dev, raw):
             entered[0] += 1
-            return real.use_torch_stream(*args, **kwargs)
+            bound.append((dev.index, int(raw)))
+            return real.use_raw_stream(dev, raw)
 
     monkeypatch.setattr(be, "tvm_ffi", _Counting())
     cu, heads = [0, 700, 1900, 3000], (2, 6)
@@ -1022,6 +1025,8 @@ def test_launch_scope_enters_one_stream_context_per_entry_body(
             TENSORS,
             f"launch scope (checkpoint={ckpt})",
         )
+    caller = {(stream.device.index, stream.cuda_stream)}
+    assert bound and set(bound) == caller, set(bound)
 
 
 # --------------------------------------------------------------------------- the output walk kcp_fwdh_out (one GPU)
