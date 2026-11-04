@@ -184,6 +184,7 @@ from .core import (
     trtllm_fused_moe_workspace_size,
     trtllm_moe_allocate_routing_metadata,
     trtllm_moe_allocate_routing_metadata_multi_tile,
+    populate_trtllm_moe_routing_metadata_,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -191,6 +192,7 @@ from .core import (
 )
 
 from .prepare import (
+    interleave_cute_dsl_moe_weights,
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
@@ -408,6 +410,7 @@ __all__ = [
     "TrtllmMoERoutingMetadataSlot",
     "trtllm_moe_allocate_routing_metadata",
     "trtllm_moe_allocate_routing_metadata_multi_tile",
+    "populate_trtllm_moe_routing_metadata_",
     "trtllm_moe_acquire_da_graph_leases",
     "trtllm_moe_da_diagnostics",
     "trtllm_moe_release_da_resources",
@@ -447,6 +450,7 @@ __all__ = [
     "cutlass_fused_moe",
     "cutlass_fused_moe_workspace_size",
     "interleave_moe_scales_for_sm90_mixed_gemm",
+    "interleave_cute_dsl_moe_weights",
     "interleave_moe_weights_for_sm90_mixed_gemm",
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",

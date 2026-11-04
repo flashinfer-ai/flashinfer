@@ -116,7 +116,7 @@ def test_staged_routing_ffi_signatures_take_optional_weights(name, expected_para
     )
     assert source_path.exists(), f"JIT MoE source does not exist: {source_path}"
     source = source_path.read_text()
-    begin = source.index(f"Array<Tensor> {name}(")
+    begin = source.index(f" {name}(")
     signature = source[source.index("(", begin) + 1 : source.index(")", begin)]
     params = [param.strip() for param in signature.split(",")]
     names = [param.split()[-1] for param in params]

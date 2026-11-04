@@ -3062,8 +3062,8 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                 }
                 float acc[16];
                 int my_tid4 = tid * 4;
-                int sset = sc_split;
-                if (sset < 4) {
+                int sset_0 = sc_split;
+                if (sset_0 < 4) {
                     acc[0] = 0.0f;
                     acc[1] = 0.0f;
                     acc[2] = 0.0f;
@@ -3081,59 +3081,59 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     acc[14] = 0.0f;
                     acc[15] = 0.0f;
                     #pragma unroll 1
-                    for (int j_2 = 0; j_2 < sc_nsplit; j_2++) {
-                        int sb_2 = j_2 * 128;
-                        float w0_1 = approx_exp2(stats_smem[sb_2 + m0_local * 2] - merged_max0);
-                        float w1_1 = approx_exp2(stats_smem[sb_2 + m1_local * 2] - merged_max1);
-                        int base = (sc_first + j_2) * 8192 + sset * 2048 + my_tid4;
+                    for (int j_0 = 0; j_0 < sc_nsplit; j_0++) {
+                        int sb_0 = j_0 * 128;
+                        float w0_0 = approx_exp2(stats_smem[sb_0 + m0_local * 2] - merged_max0);
+                        float w1_0 = approx_exp2(stats_smem[sb_0 + m1_local * 2] - merged_max1);
+                        int base_0 = (sc_first + j_0) * 8192 + sset_0 * 2048 + my_tid4;
                         float _vec_load_0[4];
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + base + 0);
+                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + base_0 + 0);
                             _vec_load_0[0 + 0] = _v4.x;
                             _vec_load_0[0 + 1] = _v4.y;
                             _vec_load_0[0 + 2] = _v4.z;
                             _vec_load_0[0 + 3] = _v4.w;
                         }
-                        acc[0] = __fmaf_rn(_vec_load_0[0], w0_1, acc[0]);
-                        acc[1] = __fmaf_rn(_vec_load_0[1], w0_1, acc[1]);
-                        acc[2] = __fmaf_rn(_vec_load_0[2], w1_1, acc[2]);
-                        acc[3] = __fmaf_rn(_vec_load_0[3], w1_1, acc[3]);
-                        float vec_load_0[4];
+                        acc[0] = __fmaf_rn(_vec_load_0[0], w0_0, acc[0]);
+                        acc[1] = __fmaf_rn(_vec_load_0[1], w0_0, acc[1]);
+                        acc[2] = __fmaf_rn(_vec_load_0[2], w1_0, acc[2]);
+                        acc[3] = __fmaf_rn(_vec_load_0[3], w1_0, acc[3]);
+                        float _vec_load_1[4];
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base + 512) + 0);
-                            vec_load_0[0 + 0] = _v4.x;
-                            vec_load_0[0 + 1] = _v4.y;
-                            vec_load_0[0 + 2] = _v4.z;
-                            vec_load_0[0 + 3] = _v4.w;
+                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_0 + 512) + 0);
+                            _vec_load_1[0 + 0] = _v4.x;
+                            _vec_load_1[0 + 1] = _v4.y;
+                            _vec_load_1[0 + 2] = _v4.z;
+                            _vec_load_1[0 + 3] = _v4.w;
                         }
-                        acc[4] = __fmaf_rn(vec_load_0[0], w0_1, acc[4]);
-                        acc[5] = __fmaf_rn(vec_load_0[1], w0_1, acc[5]);
-                        acc[6] = __fmaf_rn(vec_load_0[2], w1_1, acc[6]);
-                        acc[7] = __fmaf_rn(vec_load_0[3], w1_1, acc[7]);
-                        float vec_load_1[4];
+                        acc[4] = __fmaf_rn(_vec_load_1[0], w0_0, acc[4]);
+                        acc[5] = __fmaf_rn(_vec_load_1[1], w0_0, acc[5]);
+                        acc[6] = __fmaf_rn(_vec_load_1[2], w1_0, acc[6]);
+                        acc[7] = __fmaf_rn(_vec_load_1[3], w1_0, acc[7]);
+                        float _vec_load_2[4];
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base + 1024) + 0);
-                            vec_load_1[0 + 0] = _v4.x;
-                            vec_load_1[0 + 1] = _v4.y;
-                            vec_load_1[0 + 2] = _v4.z;
-                            vec_load_1[0 + 3] = _v4.w;
+                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_0 + 1024) + 0);
+                            _vec_load_2[0 + 0] = _v4.x;
+                            _vec_load_2[0 + 1] = _v4.y;
+                            _vec_load_2[0 + 2] = _v4.z;
+                            _vec_load_2[0 + 3] = _v4.w;
                         }
-                        acc[8] = __fmaf_rn(vec_load_1[0], w0_1, acc[8]);
-                        acc[9] = __fmaf_rn(vec_load_1[1], w0_1, acc[9]);
-                        acc[10] = __fmaf_rn(vec_load_1[2], w1_1, acc[10]);
-                        acc[11] = __fmaf_rn(vec_load_1[3], w1_1, acc[11]);
-                        float vec_load_2[4];
+                        acc[8] = __fmaf_rn(_vec_load_2[0], w0_0, acc[8]);
+                        acc[9] = __fmaf_rn(_vec_load_2[1], w0_0, acc[9]);
+                        acc[10] = __fmaf_rn(_vec_load_2[2], w1_0, acc[10]);
+                        acc[11] = __fmaf_rn(_vec_load_2[3], w1_0, acc[11]);
+                        float _vec_load_3[4];
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base + 1536) + 0);
-                            vec_load_2[0 + 0] = _v4.x;
-                            vec_load_2[0 + 1] = _v4.y;
-                            vec_load_2[0 + 2] = _v4.z;
-                            vec_load_2[0 + 3] = _v4.w;
+                            float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_0 + 1536) + 0);
+                            _vec_load_3[0 + 0] = _v4.x;
+                            _vec_load_3[0 + 1] = _v4.y;
+                            _vec_load_3[0 + 2] = _v4.z;
+                            _vec_load_3[0 + 3] = _v4.w;
                         }
-                        acc[12] = __fmaf_rn(vec_load_2[0], w0_1, acc[12]);
-                        acc[13] = __fmaf_rn(vec_load_2[1], w0_1, acc[13]);
-                        acc[14] = __fmaf_rn(vec_load_2[2], w1_1, acc[14]);
-                        acc[15] = __fmaf_rn(vec_load_2[3], w1_1, acc[15]);
+                        acc[12] = __fmaf_rn(_vec_load_3[0], w0_0, acc[12]);
+                        acc[13] = __fmaf_rn(_vec_load_3[1], w0_0, acc[13]);
+                        acc[14] = __fmaf_rn(_vec_load_3[2], w1_0, acc[14]);
+                        acc[15] = __fmaf_rn(_vec_load_3[3], w1_0, acc[15]);
                     }
                     float rcp_2 = approx_rcp(fsum0);
                     float rcp_1_1 = approx_rcp(fsum1);
@@ -3191,7 +3191,7 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                     o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
                     o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                    int o_off_1_0 = o_row_base_1 + m_local_r_1_2 * 128 + (4 * sset + qj) * 8;
+                    int o_off_1_0 = o_row_base_1 + m_local_r_1_2 * 128 + (4 * sset_0 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_0)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
                     int m_local_r_1_3 = m1_local;
                     __nv_bfloat162 _bit_cast_src_326 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
@@ -3226,11 +3226,11 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                     o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
                     o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                    int o_off_1_1 = o_row_base_1 + m_local_r_1_3 * 128 + (4 * sset + qj) * 8;
+                    int o_off_1_1 = o_row_base_1 + m_local_r_1_3 * 128 + (4 * sset_0 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
                 }
-                int sset_3 = sc_split + n_active;
-                if (sset_3 < 4) {
+                int sset_1 = sc_split + n_active;
+                if (sset_1 < 4) {
                     acc[0] = 0.0f;
                     acc[1] = 0.0f;
                     acc[2] = 0.0f;
@@ -3248,59 +3248,59 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     acc[14] = 0.0f;
                     acc[15] = 0.0f;
                     #pragma unroll 1
-                    for (int j_3 = 0; j_3 < sc_nsplit; j_3++) {
-                        int sb_3 = j_3 * 128;
-                        float w0_2 = approx_exp2(stats_smem[sb_3 + m0_local * 2] - merged_max0);
-                        float w1_2 = approx_exp2(stats_smem[sb_3 + m1_local * 2] - merged_max1);
-                        int base_1 = (sc_first + j_3) * 8192 + sset_3 * 2048 + my_tid4;
-                        float _vec_load_12[4];
+                    for (int j_1_1 = 0; j_1_1 < sc_nsplit; j_1_1++) {
+                        int sb_1_1 = j_1_1 * 128;
+                        float w0_1 = approx_exp2(stats_smem[sb_1_1 + m0_local * 2] - merged_max0);
+                        float w1_1 = approx_exp2(stats_smem[sb_1_1 + m1_local * 2] - merged_max1);
+                        int base_1 = (sc_first + j_1_1) * 8192 + sset_1 * 2048 + my_tid4;
+                        float _vec_load_4[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + base_1 + 0);
-                            _vec_load_12[0 + 0] = _v4.x;
-                            _vec_load_12[0 + 1] = _v4.y;
-                            _vec_load_12[0 + 2] = _v4.z;
-                            _vec_load_12[0 + 3] = _v4.w;
+                            _vec_load_4[0 + 0] = _v4.x;
+                            _vec_load_4[0 + 1] = _v4.y;
+                            _vec_load_4[0 + 2] = _v4.z;
+                            _vec_load_4[0 + 3] = _v4.w;
                         }
-                        acc[0] = __fmaf_rn(_vec_load_12[0], w0_2, acc[0]);
-                        acc[1] = __fmaf_rn(_vec_load_12[1], w0_2, acc[1]);
-                        acc[2] = __fmaf_rn(_vec_load_12[2], w1_2, acc[2]);
-                        acc[3] = __fmaf_rn(_vec_load_12[3], w1_2, acc[3]);
-                        float _vec_load_13[4];
+                        acc[0] = __fmaf_rn(_vec_load_4[0], w0_1, acc[0]);
+                        acc[1] = __fmaf_rn(_vec_load_4[1], w0_1, acc[1]);
+                        acc[2] = __fmaf_rn(_vec_load_4[2], w1_1, acc[2]);
+                        acc[3] = __fmaf_rn(_vec_load_4[3], w1_1, acc[3]);
+                        float _vec_load_5[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_1 + 512) + 0);
-                            _vec_load_13[0 + 0] = _v4.x;
-                            _vec_load_13[0 + 1] = _v4.y;
-                            _vec_load_13[0 + 2] = _v4.z;
-                            _vec_load_13[0 + 3] = _v4.w;
+                            _vec_load_5[0 + 0] = _v4.x;
+                            _vec_load_5[0 + 1] = _v4.y;
+                            _vec_load_5[0 + 2] = _v4.z;
+                            _vec_load_5[0 + 3] = _v4.w;
                         }
-                        acc[4] = __fmaf_rn(_vec_load_13[0], w0_2, acc[4]);
-                        acc[5] = __fmaf_rn(_vec_load_13[1], w0_2, acc[5]);
-                        acc[6] = __fmaf_rn(_vec_load_13[2], w1_2, acc[6]);
-                        acc[7] = __fmaf_rn(_vec_load_13[3], w1_2, acc[7]);
-                        float _vec_load_14[4];
+                        acc[4] = __fmaf_rn(_vec_load_5[0], w0_1, acc[4]);
+                        acc[5] = __fmaf_rn(_vec_load_5[1], w0_1, acc[5]);
+                        acc[6] = __fmaf_rn(_vec_load_5[2], w1_1, acc[6]);
+                        acc[7] = __fmaf_rn(_vec_load_5[3], w1_1, acc[7]);
+                        float _vec_load_6[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_1 + 1024) + 0);
-                            _vec_load_14[0 + 0] = _v4.x;
-                            _vec_load_14[0 + 1] = _v4.y;
-                            _vec_load_14[0 + 2] = _v4.z;
-                            _vec_load_14[0 + 3] = _v4.w;
+                            _vec_load_6[0 + 0] = _v4.x;
+                            _vec_load_6[0 + 1] = _v4.y;
+                            _vec_load_6[0 + 2] = _v4.z;
+                            _vec_load_6[0 + 3] = _v4.w;
                         }
-                        acc[8] = __fmaf_rn(_vec_load_14[0], w0_2, acc[8]);
-                        acc[9] = __fmaf_rn(_vec_load_14[1], w0_2, acc[9]);
-                        acc[10] = __fmaf_rn(_vec_load_14[2], w1_2, acc[10]);
-                        acc[11] = __fmaf_rn(_vec_load_14[3], w1_2, acc[11]);
-                        float _vec_load_15[4];
+                        acc[8] = __fmaf_rn(_vec_load_6[0], w0_1, acc[8]);
+                        acc[9] = __fmaf_rn(_vec_load_6[1], w0_1, acc[9]);
+                        acc[10] = __fmaf_rn(_vec_load_6[2], w1_1, acc[10]);
+                        acc[11] = __fmaf_rn(_vec_load_6[3], w1_1, acc[11]);
+                        float _vec_load_7[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_1 + 1536) + 0);
-                            _vec_load_15[0 + 0] = _v4.x;
-                            _vec_load_15[0 + 1] = _v4.y;
-                            _vec_load_15[0 + 2] = _v4.z;
-                            _vec_load_15[0 + 3] = _v4.w;
+                            _vec_load_7[0 + 0] = _v4.x;
+                            _vec_load_7[0 + 1] = _v4.y;
+                            _vec_load_7[0 + 2] = _v4.z;
+                            _vec_load_7[0 + 3] = _v4.w;
                         }
-                        acc[12] = __fmaf_rn(_vec_load_15[0], w0_2, acc[12]);
-                        acc[13] = __fmaf_rn(_vec_load_15[1], w0_2, acc[13]);
-                        acc[14] = __fmaf_rn(_vec_load_15[2], w1_2, acc[14]);
-                        acc[15] = __fmaf_rn(_vec_load_15[3], w1_2, acc[15]);
+                        acc[12] = __fmaf_rn(_vec_load_7[0], w0_1, acc[12]);
+                        acc[13] = __fmaf_rn(_vec_load_7[1], w0_1, acc[13]);
+                        acc[14] = __fmaf_rn(_vec_load_7[2], w1_1, acc[14]);
+                        acc[15] = __fmaf_rn(_vec_load_7[3], w1_1, acc[15]);
                     }
                     float rcp_3 = approx_rcp(fsum0);
                     float rcp_1_2 = approx_rcp(fsum1);
@@ -3358,7 +3358,7 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                     o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
                     o_vec_2[3] = ((qj2_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                    int o_off_1_2 = o_row_base_2 + m_local_r_1_4 * 128 + (4 * sset_3 + qj) * 8;
+                    int o_off_1_2 = o_row_base_2 + m_local_r_1_4 * 128 + (4 * sset_1 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_2)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
                     int m_local_r_1_5 = m1_local;
                     __nv_bfloat162 _bit_cast_src_354 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
@@ -3393,11 +3393,11 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                     o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
                     o_vec_2[3] = ((qj2_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                    int o_off_1_3 = o_row_base_2 + m_local_r_1_5 * 128 + (4 * sset_3 + qj) * 8;
+                    int o_off_1_3 = o_row_base_2 + m_local_r_1_5 * 128 + (4 * sset_1 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_3)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
                 }
-                int sset_4 = sc_split + 2 * n_active;
-                if (sset_4 < 4) {
+                int sset_2 = sc_split + 2 * n_active;
+                if (sset_2 < 4) {
                     acc[0] = 0.0f;
                     acc[1] = 0.0f;
                     acc[2] = 0.0f;
@@ -3415,11 +3415,11 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     acc[14] = 0.0f;
                     acc[15] = 0.0f;
                     #pragma unroll 1
-                    for (int j_4 = 0; j_4 < sc_nsplit; j_4++) {
-                        int sb_4 = j_4 * 128;
-                        float w0_3 = approx_exp2(stats_smem[sb_4 + m0_local * 2] - merged_max0);
-                        float w1_3 = approx_exp2(stats_smem[sb_4 + m1_local * 2] - merged_max1);
-                        int base_2 = (sc_first + j_4) * 8192 + sset_4 * 2048 + my_tid4;
+                    for (int j_2 = 0; j_2 < sc_nsplit; j_2++) {
+                        int sb_2 = j_2 * 128;
+                        float w0_2 = approx_exp2(stats_smem[sb_2 + m0_local * 2] - merged_max0);
+                        float w1_2 = approx_exp2(stats_smem[sb_2 + m1_local * 2] - merged_max1);
+                        int base_2 = (sc_first + j_2) * 8192 + sset_2 * 2048 + my_tid4;
                         float _vec_load_8[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + base_2 + 0);
@@ -3428,10 +3428,10 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                             _vec_load_8[0 + 2] = _v4.z;
                             _vec_load_8[0 + 3] = _v4.w;
                         }
-                        acc[0] = __fmaf_rn(_vec_load_8[0], w0_3, acc[0]);
-                        acc[1] = __fmaf_rn(_vec_load_8[1], w0_3, acc[1]);
-                        acc[2] = __fmaf_rn(_vec_load_8[2], w1_3, acc[2]);
-                        acc[3] = __fmaf_rn(_vec_load_8[3], w1_3, acc[3]);
+                        acc[0] = __fmaf_rn(_vec_load_8[0], w0_2, acc[0]);
+                        acc[1] = __fmaf_rn(_vec_load_8[1], w0_2, acc[1]);
+                        acc[2] = __fmaf_rn(_vec_load_8[2], w1_2, acc[2]);
+                        acc[3] = __fmaf_rn(_vec_load_8[3], w1_2, acc[3]);
                         float _vec_load_9[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_2 + 512) + 0);
@@ -3440,10 +3440,10 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                             _vec_load_9[0 + 2] = _v4.z;
                             _vec_load_9[0 + 3] = _v4.w;
                         }
-                        acc[4] = __fmaf_rn(_vec_load_9[0], w0_3, acc[4]);
-                        acc[5] = __fmaf_rn(_vec_load_9[1], w0_3, acc[5]);
-                        acc[6] = __fmaf_rn(_vec_load_9[2], w1_3, acc[6]);
-                        acc[7] = __fmaf_rn(_vec_load_9[3], w1_3, acc[7]);
+                        acc[4] = __fmaf_rn(_vec_load_9[0], w0_2, acc[4]);
+                        acc[5] = __fmaf_rn(_vec_load_9[1], w0_2, acc[5]);
+                        acc[6] = __fmaf_rn(_vec_load_9[2], w1_2, acc[6]);
+                        acc[7] = __fmaf_rn(_vec_load_9[3], w1_2, acc[7]);
                         float _vec_load_10[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_2 + 1024) + 0);
@@ -3452,10 +3452,10 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                             _vec_load_10[0 + 2] = _v4.z;
                             _vec_load_10[0 + 3] = _v4.w;
                         }
-                        acc[8] = __fmaf_rn(_vec_load_10[0], w0_3, acc[8]);
-                        acc[9] = __fmaf_rn(_vec_load_10[1], w0_3, acc[9]);
-                        acc[10] = __fmaf_rn(_vec_load_10[2], w1_3, acc[10]);
-                        acc[11] = __fmaf_rn(_vec_load_10[3], w1_3, acc[11]);
+                        acc[8] = __fmaf_rn(_vec_load_10[0], w0_2, acc[8]);
+                        acc[9] = __fmaf_rn(_vec_load_10[1], w0_2, acc[9]);
+                        acc[10] = __fmaf_rn(_vec_load_10[2], w1_2, acc[10]);
+                        acc[11] = __fmaf_rn(_vec_load_10[3], w1_2, acc[11]);
                         float _vec_load_11[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_2 + 1536) + 0);
@@ -3464,10 +3464,10 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                             _vec_load_11[0 + 2] = _v4.z;
                             _vec_load_11[0 + 3] = _v4.w;
                         }
-                        acc[12] = __fmaf_rn(_vec_load_11[0], w0_3, acc[12]);
-                        acc[13] = __fmaf_rn(_vec_load_11[1], w0_3, acc[13]);
-                        acc[14] = __fmaf_rn(_vec_load_11[2], w1_3, acc[14]);
-                        acc[15] = __fmaf_rn(_vec_load_11[3], w1_3, acc[15]);
+                        acc[12] = __fmaf_rn(_vec_load_11[0], w0_2, acc[12]);
+                        acc[13] = __fmaf_rn(_vec_load_11[1], w0_2, acc[13]);
+                        acc[14] = __fmaf_rn(_vec_load_11[2], w1_2, acc[14]);
+                        acc[15] = __fmaf_rn(_vec_load_11[3], w1_2, acc[15]);
                     }
                     float rcp_4 = approx_rcp(fsum0);
                     float rcp_1_3 = approx_rcp(fsum1);
@@ -3525,7 +3525,7 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                     o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
                     o_vec_3[3] = ((qj2_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                    int o_off_1_4 = o_row_base_3 + m_local_r_1_6 * 128 + (4 * sset_4 + qj) * 8;
+                    int o_off_1_4 = o_row_base_3 + m_local_r_1_6 * 128 + (4 * sset_2 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_4)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
                     int m_local_r_1_7 = m1_local;
                     __nv_bfloat162 _bit_cast_src_382 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
@@ -3560,11 +3560,11 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                     o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
                     o_vec_3[3] = ((qj2_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                    int o_off_1_5 = o_row_base_3 + m_local_r_1_7 * 128 + (4 * sset_4 + qj) * 8;
+                    int o_off_1_5 = o_row_base_3 + m_local_r_1_7 * 128 + (4 * sset_2 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_5)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
                 }
-                int sset_5 = sc_split + 3 * n_active;
-                if (sset_5 < 4) {
+                int sset_3 = sc_split + 3 * n_active;
+                if (sset_3 < 4) {
                     acc[0] = 0.0f;
                     acc[1] = 0.0f;
                     acc[2] = 0.0f;
@@ -3582,59 +3582,59 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     acc[14] = 0.0f;
                     acc[15] = 0.0f;
                     #pragma unroll 1
-                    for (int j_5 = 0; j_5 < sc_nsplit; j_5++) {
-                        int sb_5 = j_5 * 128;
-                        float w0_4 = approx_exp2(stats_smem[sb_5 + m0_local * 2] - merged_max0);
-                        float w1_4 = approx_exp2(stats_smem[sb_5 + m1_local * 2] - merged_max1);
-                        int base_3 = (sc_first + j_5) * 8192 + sset_5 * 2048 + my_tid4;
-                        float _vec_load_12_1[4];
+                    for (int j_3 = 0; j_3 < sc_nsplit; j_3++) {
+                        int sb_3 = j_3 * 128;
+                        float w0_3 = approx_exp2(stats_smem[sb_3 + m0_local * 2] - merged_max0);
+                        float w1_3 = approx_exp2(stats_smem[sb_3 + m1_local * 2] - merged_max1);
+                        int base_3 = (sc_first + j_3) * 8192 + sset_3 * 2048 + my_tid4;
+                        float _vec_load_12[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + base_3 + 0);
-                            _vec_load_12_1[0 + 0] = _v4.x;
-                            _vec_load_12_1[0 + 1] = _v4.y;
-                            _vec_load_12_1[0 + 2] = _v4.z;
-                            _vec_load_12_1[0 + 3] = _v4.w;
+                            _vec_load_12[0 + 0] = _v4.x;
+                            _vec_load_12[0 + 1] = _v4.y;
+                            _vec_load_12[0 + 2] = _v4.z;
+                            _vec_load_12[0 + 3] = _v4.w;
                         }
-                        acc[0] = __fmaf_rn(_vec_load_12_1[0], w0_4, acc[0]);
-                        acc[1] = __fmaf_rn(_vec_load_12_1[1], w0_4, acc[1]);
-                        acc[2] = __fmaf_rn(_vec_load_12_1[2], w1_4, acc[2]);
-                        acc[3] = __fmaf_rn(_vec_load_12_1[3], w1_4, acc[3]);
-                        float _vec_load_13_1[4];
+                        acc[0] = __fmaf_rn(_vec_load_12[0], w0_3, acc[0]);
+                        acc[1] = __fmaf_rn(_vec_load_12[1], w0_3, acc[1]);
+                        acc[2] = __fmaf_rn(_vec_load_12[2], w1_3, acc[2]);
+                        acc[3] = __fmaf_rn(_vec_load_12[3], w1_3, acc[3]);
+                        float _vec_load_13[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_3 + 512) + 0);
-                            _vec_load_13_1[0 + 0] = _v4.x;
-                            _vec_load_13_1[0 + 1] = _v4.y;
-                            _vec_load_13_1[0 + 2] = _v4.z;
-                            _vec_load_13_1[0 + 3] = _v4.w;
+                            _vec_load_13[0 + 0] = _v4.x;
+                            _vec_load_13[0 + 1] = _v4.y;
+                            _vec_load_13[0 + 2] = _v4.z;
+                            _vec_load_13[0 + 3] = _v4.w;
                         }
-                        acc[4] = __fmaf_rn(_vec_load_13_1[0], w0_4, acc[4]);
-                        acc[5] = __fmaf_rn(_vec_load_13_1[1], w0_4, acc[5]);
-                        acc[6] = __fmaf_rn(_vec_load_13_1[2], w1_4, acc[6]);
-                        acc[7] = __fmaf_rn(_vec_load_13_1[3], w1_4, acc[7]);
-                        float _vec_load_14_1[4];
+                        acc[4] = __fmaf_rn(_vec_load_13[0], w0_3, acc[4]);
+                        acc[5] = __fmaf_rn(_vec_load_13[1], w0_3, acc[5]);
+                        acc[6] = __fmaf_rn(_vec_load_13[2], w1_3, acc[6]);
+                        acc[7] = __fmaf_rn(_vec_load_13[3], w1_3, acc[7]);
+                        float _vec_load_14[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_3 + 1024) + 0);
-                            _vec_load_14_1[0 + 0] = _v4.x;
-                            _vec_load_14_1[0 + 1] = _v4.y;
-                            _vec_load_14_1[0 + 2] = _v4.z;
-                            _vec_load_14_1[0 + 3] = _v4.w;
+                            _vec_load_14[0 + 0] = _v4.x;
+                            _vec_load_14[0 + 1] = _v4.y;
+                            _vec_load_14[0 + 2] = _v4.z;
+                            _vec_load_14[0 + 3] = _v4.w;
                         }
-                        acc[8] = __fmaf_rn(_vec_load_14_1[0], w0_4, acc[8]);
-                        acc[9] = __fmaf_rn(_vec_load_14_1[1], w0_4, acc[9]);
-                        acc[10] = __fmaf_rn(_vec_load_14_1[2], w1_4, acc[10]);
-                        acc[11] = __fmaf_rn(_vec_load_14_1[3], w1_4, acc[11]);
-                        float _vec_load_15_1[4];
+                        acc[8] = __fmaf_rn(_vec_load_14[0], w0_3, acc[8]);
+                        acc[9] = __fmaf_rn(_vec_load_14[1], w0_3, acc[9]);
+                        acc[10] = __fmaf_rn(_vec_load_14[2], w1_3, acc[10]);
+                        acc[11] = __fmaf_rn(_vec_load_14[3], w1_3, acc[11]);
+                        float _vec_load_15[4];
                         {
                             float4 _v4 = *reinterpret_cast<const float4*>(Wo + (base_3 + 1536) + 0);
-                            _vec_load_15_1[0 + 0] = _v4.x;
-                            _vec_load_15_1[0 + 1] = _v4.y;
-                            _vec_load_15_1[0 + 2] = _v4.z;
-                            _vec_load_15_1[0 + 3] = _v4.w;
+                            _vec_load_15[0 + 0] = _v4.x;
+                            _vec_load_15[0 + 1] = _v4.y;
+                            _vec_load_15[0 + 2] = _v4.z;
+                            _vec_load_15[0 + 3] = _v4.w;
                         }
-                        acc[12] = __fmaf_rn(_vec_load_15_1[0], w0_4, acc[12]);
-                        acc[13] = __fmaf_rn(_vec_load_15_1[1], w0_4, acc[13]);
-                        acc[14] = __fmaf_rn(_vec_load_15_1[2], w1_4, acc[14]);
-                        acc[15] = __fmaf_rn(_vec_load_15_1[3], w1_4, acc[15]);
+                        acc[12] = __fmaf_rn(_vec_load_15[0], w0_3, acc[12]);
+                        acc[13] = __fmaf_rn(_vec_load_15[1], w0_3, acc[13]);
+                        acc[14] = __fmaf_rn(_vec_load_15[2], w1_3, acc[14]);
+                        acc[15] = __fmaf_rn(_vec_load_15[3], w1_3, acc[15]);
                     }
                     float rcp_5 = approx_rcp(fsum0);
                     float rcp_1_4 = approx_rcp(fsum1);
@@ -3692,7 +3692,7 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_4[1] = ((qj2_4 != 0) ? o_tmp_4[1] : o_vec_4[1]);
                     o_vec_4[2] = ((qj2_4 == 0) ? o_tmp_4[2] : o_vec_4[2]);
                     o_vec_4[3] = ((qj2_4 == 0) ? o_tmp_4[3] : o_vec_4[3]);
-                    int o_off_1_6 = o_row_base_4 + m_local_r_1_8 * 128 + (4 * sset_5 + qj) * 8;
+                    int o_off_1_6 = o_row_base_4 + m_local_r_1_8 * 128 + (4 * sset_3 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_6)[0] = reinterpret_cast<int4*>(o_vec_4)[0];
                     int m_local_r_1_9 = m1_local;
                     __nv_bfloat162 _bit_cast_src_410 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
@@ -3727,7 +3727,7 @@ kernel_cake_vsa_sm90_148864cc74c1ab7d0e21(const __grid_constant__ CUtensorMap Q,
                     o_vec_4[1] = ((qj2_4 != 0) ? o_tmp_4[1] : o_vec_4[1]);
                     o_vec_4[2] = ((qj2_4 == 0) ? o_tmp_4[2] : o_vec_4[2]);
                     o_vec_4[3] = ((qj2_4 == 0) ? o_tmp_4[3] : o_vec_4[3]);
-                    int o_off_1_7 = o_row_base_4 + m_local_r_1_9 * 128 + (4 * sset_5 + qj) * 8;
+                    int o_off_1_7 = o_row_base_4 + m_local_r_1_9 * 128 + (4 * sset_3 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_1_7)[0] = reinterpret_cast<int4*>(o_vec_4)[0];
                 }
             }

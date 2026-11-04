@@ -1,7 +1,7 @@
 # Blackwell BF16 rank-major source drop
 
 This directory contains one generated CUDA source bundle for the capacity-
-bounded SM100 BF16 rank-major MoE-EP layer and the FlashInfer runtime adapter
+bounded SM100/SM107 BF16 rank-major MoE-EP layer and the FlashInfer runtime adapter
 that owns its workspace and launch sequence. Each launch accepts an active
 prefix of 1 to 128 rows per rank; every rank must use the same active row count.
 Up to 32 active rows per rank, `stage_inputs` already sends the rows to the
@@ -27,6 +27,10 @@ also for other eagerly staged inputs of up to 32 rows. Kernels that `run`
 recorded into a capture before one of its launches failed never run: calls
 inside that capture raise, and afterwards an eagerly staged forward restarts
 at its first kernel. Do not replay such a graph.
+
+The session compiles the one source for the architecture of its device:
+`sm_100a` on B200 and `sm_107a` (nvcc 13.4 or newer) on R200. The manifest
+lists both in `archs`.
 
 The `src/` directory is an immutable generated pair:
 

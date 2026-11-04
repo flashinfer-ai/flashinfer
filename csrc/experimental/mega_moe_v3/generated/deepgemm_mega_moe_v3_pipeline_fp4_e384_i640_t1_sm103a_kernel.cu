@@ -34,55 +34,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 40
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SCALE_A_OFFSET 32
-#define TMEM_SCALE_B_OFFSET 36
-#define NUM_PIPE_STAGES 11
-#define NUM_ACCUM_PIPE_STAGES 2
-#define NUM_TASK_PIPE_STAGES 4
-#define SMEM_COMBINE_SMEM_OFF 0
-#define SMEM_COMBINE_SMEM_STAGE_BYTES 143360
-#define SMEM_COMBINE_SMEM_STRIDE 143360
-#define SMEM_SMEM_HIST_OFF 0
-#define SMEM_SMEM_HIST_STAGE_BYTES 1536
-#define SMEM_SMEM_HIST_STRIDE 1536
-#define SMEM_SMEM_DST_ROW_OFF 2048
-#define SMEM_SMEM_DST_ROW_STAGE_BYTES 16
-#define SMEM_SMEM_DST_ROW_STRIDE 16
-#define SMEM_SMEM_ERO_OFF 2064
-#define SMEM_SMEM_ERO_STAGE_BYTES 1536
-#define SMEM_SMEM_ERO_STRIDE 1536
-#define SMEM_SMEM_XSF_OFF 3600
-#define SMEM_SMEM_XSF_STAGE_BYTES 160
-#define SMEM_SMEM_XSF_STRIDE 160
-#define SMEM_SMEM_SK_FLAG_OFF 3760
-#define SMEM_SMEM_SK_FLAG_STAGE_BYTES 16
-#define SMEM_SMEM_SK_FLAG_STRIDE 16
-#define SMEM_SMEM_OUTPUT_OFF 22528
-#define SMEM_SMEM_OUTPUT_STAGE_BYTES 4096
-#define SMEM_SMEM_OUTPUT_STRIDE 4096
-#define SMEM_SMEM_A_OFF 26624
-#define SMEM_SMEM_A_STAGE_BYTES 1024
-#define SMEM_SMEM_A_STRIDE 1024
-#define SMEM_SMEM_B_OFF 37888
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_SMEM_SFA_OFF 218112
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 512
-#define SMEM_SMEM_SFB_OFF 223744
-#define SMEM_SMEM_SFB_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_STRIDE 512
-#define SMEM_AMAX_REDUCTION_OFF 229376
-#define SMEM_AMAX_REDUCTION_STAGE_BYTES 256
-#define SMEM_AMAX_REDUCTION_STRIDE 256
-#define SMEM_TASK_INFOS_OFF 229632
-#define SMEM_TASK_INFOS_STAGE_BYTES 128
-#define SMEM_TASK_INFOS_STRIDE 128
-#define SMEM_TOTAL 230528
-#define THREADS 512
 #ifndef NUM_CTAS
 #error "NUM_CTAS is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -325,7 +276,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* combine_smem = reinterpret_cast<uint8_t*>(smem_raw + 0);
     const int combine_smem_addr = smem + 0;
     int* smem_hist = reinterpret_cast<int*>(smem_raw + 0);
@@ -352,6 +303,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
     const int amax_reduction_addr = smem + 229376;
     unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 229632);
     const int task_infos_addr = smem + 229632;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B1))) : "memory"); }
@@ -365,8 +318,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 82 barriers)
-    // Mbarriers at smem_raw[229760..230416)
+    // Mbarrier init (82 barriers at smem_raw[229760..230416))
 
     if (warp == 2) {
         uint32_t leader = elect_sync();
@@ -482,12 +434,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_scale_a = taddr + 32;
-    const int tmem_scale_b = taddr + 36;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_scale_a = taddr + 32;
+    const unsigned int tmem_scale_b = taddr + 36;
 
     // ---- Role: dispatch ----
     if (warp <= 3) {
@@ -765,13 +715,13 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
         { // load_b_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("barrier.sync 11, 256;" ::: "memory");
-            int direct_w_0 = 0 + lane;
+            int direct_w_0 = lane;
             if (direct_w_0 < 40) {
-                smem_xsf[0 + direct_w_0] = x_sf[0 + direct_w_0];
+                smem_xsf[direct_w_0] = x_sf[direct_w_0];
             }
             int direct_w_1 = 32 + lane;
             if (direct_w_1 < 40) {
-                smem_xsf[0 + direct_w_1] = x_sf[0 + direct_w_1];
+                smem_xsf[direct_w_1] = x_sf[direct_w_1];
             }
             __syncwarp();
             unsigned int task_1[8];
@@ -1164,8 +1114,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
                 if (task_4[0] == 1) {
                     unsigned int direct_routed = 0;
                     if (lane < 1) {
-                        int direct_route_0 = topk_idx_i32[(lane * 6 + 0) * 2] - local_expert_offset;
-                        float direct_rw_0 = topk_weights[lane * 6 + 0];
+                        int direct_route_0 = topk_idx_i32[lane * 6 * 2] - local_expert_offset;
+                        float direct_rw_0 = topk_weights[lane * 6];
                         if (direct_routed == 0 && (unsigned int)direct_route_0 == task_4[1]) {
                             direct_routed = 1;
                             pre_weight = direct_rw_0;
@@ -1323,7 +1273,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
                                         uint32_t _uv4_1_2;
                                         uint32_t _uv4_1_3;
                                         asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                            : "=r"(_uv4_1_0), "=r"(_uv4_1_1), "=r"(_uv4_1_2), "=r"(_uv4_1_3) : "l"((const void*)(PrivateSF1Words + (sk_base + 0 + sk_lane) + (0))) : "memory");
+                                            : "=r"(_uv4_1_0), "=r"(_uv4_1_1), "=r"(_uv4_1_2), "=r"(_uv4_1_3) : "l"((const void*)(PrivateSF1Words + (sk_base + sk_lane) + (0))) : "memory");
                                         _sk_p[0 + 0] = _uv4_1_0;
                                         _sk_p[0 + 1] = _uv4_1_1;
                                         _sk_p[0 + 2] = _uv4_1_2;
@@ -1335,7 +1285,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
                                         uint32_t _uv4_2_2;
                                         uint32_t _uv4_2_3;
                                         asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                            : "=r"(_uv4_2_0), "=r"(_uv4_2_1), "=r"(_uv4_2_2), "=r"(_uv4_2_3) : "l"((const void*)(PrivateSF1Words + (sk_base + 0 + 512 + sk_lane) + (0))) : "memory");
+                                            : "=r"(_uv4_2_0), "=r"(_uv4_2_1), "=r"(_uv4_2_2), "=r"(_uv4_2_3) : "l"((const void*)(PrivateSF1Words + (sk_base + 512 + sk_lane) + (0))) : "memory");
                                         _sk_p[4 + 0] = _uv4_2_0;
                                         _sk_p[4 + 1] = _uv4_2_1;
                                         _sk_p[4 + 2] = _uv4_2_2;
@@ -1875,7 +1825,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
                     }
                     unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         {
                             const uint4* _vptr_56 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
                             uint4* _vdst_56 = reinterpret_cast<uint4*>(&values[0]);
@@ -1948,7 +1898,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a(int* __restrict__ t
                     reduced[5] = 0.0f;
                     reduced[6] = 0.0f;
                     reduced[7] = 0.0f;
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         float _bf16x2_add_f32_0[2];
                         asm volatile(
                             "{\n\t"

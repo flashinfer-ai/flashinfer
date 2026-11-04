@@ -343,7 +343,7 @@ def _plan(
     arguments = dict(
         device=torch.device("cuda"),
         batch_size=batch_size,
-        max_seq_len_q=seq_len_q or seq_len,
+        max_q_len=seq_len_q or seq_len,
         max_kv_len=seq_len,
         num_qo_heads=num_heads,
         num_kv_heads=num_heads,
@@ -352,7 +352,7 @@ def _plan(
         k_dtype=qk_dtype,
         v_dtype=_FP8,
         out_dtype=torch.bfloat16,
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
         vc_config=vc_config,
     )
     wrapper.plan(**{**arguments, **overrides})
@@ -380,7 +380,7 @@ def _run_case(case: _VCCase):
             q_run,
             ops.k,
             ops.v,
-            sm_scale=sm_scale,
+            softmax_scale=sm_scale,
             out_dtype=torch.bfloat16,
             vc=ops.params,
             vc_config=VCAttentionConfig(
@@ -515,7 +515,9 @@ def test_vc_mean_step():
         pytest.param(
             {"mask_type": "causal"}, ValueError, "dense contiguous", id="causal"
         ),
-        pytest.param({"packed": True}, ValueError, "dense contiguous", id="packed"),
+        pytest.param(
+            {"packed_query": True}, ValueError, "dense contiguous", id="packed"
+        ),
         pytest.param(
             {"mask_type": "causal", "window_left": 256, "num_qo_heads": 2},
             ValueError,

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Loader and launch glue of the Cake deterministic GDN chunked-training kernels
-(SM100 / SM103): the device -> architecture map, the library loading through
+(SM100 / SM103 / SM107): the device -> architecture map, the library loading through
 the package's build manifest and the launch of one registry record.
 
 The registry (:mod:`.cake_jit`) is data: ``MODULES`` holds one record per
@@ -71,9 +71,10 @@ __all__ = [
     "stage_record",
 ]
 
-# One verified build per architecture: B200 / GB200 (``sm_100a``) and B300 /
-# GB300 (``sm_103a``).  Every architecture is compiled with its exact
-# ``-gencode`` flag set (``build.json`` ``arch_flags``); no family fallback.
+# One verified build per architecture: B200 / GB200 (``sm_100a``), B300 /
+# GB300 (``sm_103a``) and R200 (``sm_107a``, CUDA 13.4 or newer).  Every
+# architecture is compiled with its exact ``-gencode`` flag set
+# (``build.json`` ``arch_flags``); no family fallback.
 ARCHES: tuple[str, ...] = tuple(cake_jit.ARCHES)
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = dict(cake_jit.ARCH_BY_CAPABILITY)
 

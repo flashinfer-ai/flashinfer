@@ -42,8 +42,13 @@ class SparseMlaProfile:
     whole_kv_tile: bool = False
 
 
-def _base_fp8(rows, heads, capacity, sm_count):
-    """Small-grid tile and split selection for FP8."""
+def base_fp8_profile(rows, heads, capacity, sm_count, rope_dim):
+    """Small-grid tile and split selection for FP8.
+
+    ``rope_dim`` is the QK-only RoPE width (64 for D576). Rules gated on
+    ``rope_dim == 64`` are D576 crossovers measured on GB300 with top-k 2048;
+    D512 plans use the remaining rules.
+    """
     # M64 shares KV across more heads but can leave a small grid underfilled.
     # M16 exposes more tasks at the cost of repeating KV work for head tiles.
     throughput_h32 = heads == 32 and rows * 2 >= sm_count and (capacity >= 512)
@@ -74,11 +79,16 @@ def _base_fp8(rows, heads, capacity, sm_count):
     if heads == 32 and capacity >= 512 and rows >= sm_count:
         # Enough query rows amortize padded M64 work. Retaining two FP8 K
         # tiles saves V reloads; uniform coordinates amortize repeated D slices.
+        # D576 prefill-sized grids over long lists use the H64 issuer budget
+        # (GB300 top-k 2048, H24 prefill 8k: 1669 -> 1511 us).
+        prefill = rope_dim == 64 and capacity >= 2048 and rows >= 8 * sm_count
         return SparseMlaProfile(
             family="keep",
+            gather_issue_warps=8 if prefill else 4,
             reuse_kv=True,
             reuse_kv_stages=10,
             uniform_offset_cache=True,
+            paired_correction=prefill,
             scheduler="clc",
         )
     if (
@@ -94,11 +104,35 @@ def _base_fp8(rows, heads, capacity, sm_count):
     if heads == 32 and 32 <= rows <= sm_count // 2 and (capacity >= 512):
         # This intermediate grid favors M64 reuse, with a second split only
         # for longer lists; additional splits lose to their merge overhead.
+        if rope_dim != 64 or capacity <= 1024:
+            return SparseMlaProfile(
+                family="keep",
+                split_kv=1 if capacity <= 1024 else 2,
+                reuse_kv=True,
+                reuse_kv_stages=10,
+            )
+        # D576 long lists split KV up to one resident wave: four splits at
+        # 32-37 rows (GB300 top-k 2048, 29.6 -> 21.8 us), otherwise two. They
+        # use eight issuers; four splits finish their short K loops faster by
+        # streaming V than by retaining K (22.9 -> 20.7 us), two-split grids
+        # retain K with uniform coordinates (37.8 -> 36.3 us).
+        wave_splits = 1 << ((sm_count // rows).bit_length() - 1)
+        splits = min(4, max(2, wave_splits))
+        retain = splits < 4
         return SparseMlaProfile(
             family="keep",
-            split_kv=1 if capacity <= 1024 else 2,
-            reuse_kv=True,
-            reuse_kv_stages=10,
+            split_kv=splits,
+            gather_issue_warps=8,
+            reuse_kv=retain,
+            reuse_kv_stages=10 if retain else 0,
+            uniform_offset_cache=retain,
+        )
+    if rope_dim == 64 and heads == 32 and 8 <= rows < 16 and capacity >= 2048:
+        # Few D576 rows: M16 Swap-AB with resident-wave KV splits; retaining K
+        # through PV beats reloading V (GB300 top-k 2048, B1 Sq8: 13.1 ->
+        # 12.2 us).
+        return SparseMlaProfile(
+            family="swap", split_kv=0, reuse_kv=True, reuse_kv_stages=10
         )
     if heads <= 16 and rows * 4 >= sm_count and (capacity >= 512):
         # Narrow Q tiles avoid padded heads; twelve stages retain two FP8
@@ -155,7 +189,7 @@ def _base_fp8(rows, heads, capacity, sm_count):
     )
 
 
-def _base_bf16(rows, heads, capacity, sm_count):
+def base_bf16_profile(rows, heads, capacity, sm_count):
     """Small-grid tile and split selection for BF16."""
     # BF16 BK128 cannot retain two complete D512 tiles in SMEM. A narrow
     # grid favors more small-Q tasks; a large grid amortizes M64's padding
@@ -199,8 +233,30 @@ def _base_bf16(rows, heads, capacity, sm_count):
     return profile
 
 
-def _choose_fp8(rows, heads, query_length, capacity, sm_count):
-    """Prefer resident split grids or sustained-throughput schedules when eligible."""
+def choose_fp8_profile(rows, heads, query_length, capacity, sm_count, rope_dim):
+    """Prefer resident split grids or sustained-throughput schedules when eligible.
+
+    Falls back to :func:`base_fp8_profile`; ``rope_dim`` has the same meaning.
+    """
+    if (
+        rope_dim == 64
+        and heads == 32
+        and query_length <= 8
+        and capacity >= 2048
+        and 16 <= rows <= sm_count // 8
+    ):
+        # D576: one M64 tile per row with a resident wave of KV splits beats
+        # the one-stream M16 split below (GB300 top-k 2048, B4 Sq4: 17.2 ->
+        # 15.6 us).
+        wave_splits = 1 << ((sm_count // rows).bit_length() - 1)
+        return SparseMlaProfile(
+            family="keep",
+            split_kv=min(wave_splits, capacity // 256),
+            reuse_kv=True,
+            reuse_kv_stages=10,
+            paired_correction=True,
+            page_pipeline_stages=2,
+        )
     # These short-Q regions favor one KV stream with retained tiles and a
     # split grid near one device wave. The Q<=8 cutoff is empirical; the
     # kernel also supports prefill. Powers of two are policy, not a KV ABI.
@@ -257,6 +313,20 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
         # device wave, share KV across H128 even for short selected lists.
         # BF16's CLC choice below is a separately qualified schedule.
         return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
+    if rope_dim == 64 and 8 < heads <= 16 and capacity >= 2048 and rows >= 8 * sm_count:
+        # Long D576 lists keep M16 Swap-AB on prefill-sized grids: eight
+        # issuers, twelve retained stages and CLC persistence gather fast
+        # enough that M64 head padding no longer pays (GB300 top-k 2048, H12
+        # prefill 8k: 1637 -> 1374 us).
+        return SparseMlaProfile(
+            family="swap",
+            split_kv=1,
+            scheduler="clc",
+            gather_issue_warps=8,
+            balanced_registers=True,
+            reuse_kv=True,
+            reuse_kv_stages=12,
+        )
     if (
         heads <= 16
         and capacity >= 512
@@ -275,10 +345,10 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
             uniform_offset_cache=True,
             scheduler="clc",
         )
-    return _base_fp8(rows, heads, capacity, sm_count)
+    return base_fp8_profile(rows, heads, capacity, sm_count, rope_dim)
 
 
-def _choose_bf16(rows, heads, query_length, capacity, sm_count):
+def choose_bf16_profile(rows, heads, query_length, capacity, sm_count):
     """Prefer resident split grids or sustained-throughput schedules when eligible."""
     # Small-head workloads can retain one BK128 tile with five/six 32-KiB
     # stages: four hold D512, the rest prefetch. PV must release that tile
@@ -381,10 +451,13 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
             uniform_offset_cache=heads == 128,
             scheduler="clc" if heads == 128 and rows >= sm_count else "nonpersistent",
         )
-    return _base_bf16(rows, heads, capacity, sm_count)
+    return base_bf16_profile(rows, heads, capacity, sm_count)
 
 
-def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_count):
+def size_profile_buffers(
+    profile, *, rows, heads, query_length, capacity, dtype, sm_count
+):
+    """Set register-budget and KV/page stage counts for a chosen schedule."""
     # These are coupled measured budgets, not independent universal wins:
     # issuer/cache registers compete with softmax/correction, and extra KV
     # stages compete with Q, P, metadata and scheduler SMEM.
@@ -448,6 +521,25 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
     return profile
 
 
+QUALIFIED_POLICY_HEADS = (8, 16, 32, 64, 128)
+
+
+def sparse_policy_heads(heads, *, dtype, rope_dim):
+    """Return the head count whose measured schedule serves ``heads``.
+
+    The crossovers are measured for H8/16/32/64/128. For D576 FP8-MMA plans,
+    other counts (e.g. 12/24/48/96) use the next qualified count's schedule:
+    its Q tile already pads that count and the kernel masks the extra rows.
+    Matching them on their raw count instead falls through to a default M16
+    Swap-AB grid that repeats every KV tile once per 16-head tile (three times
+    for H48, six for H96).
+    BF16 and D512 plans keep their raw count until measured the same way.
+    """
+    if dtype != "fp8" or rope_dim != 64:
+        return heads
+    return next((h for h in QUALIFIED_POLICY_HEADS if heads <= h), heads)
+
+
 def select_sparse_mla_profile(
     *,
     rows,
@@ -459,7 +551,45 @@ def select_sparse_mla_profile(
     rope_dim=0,
     kv_cache_format="native",
 ):
-    """Resolve one complete schedule from the validated public plan bounds."""
+    """Resolve one complete schedule from the validated public plan bounds.
+
+    ``heads`` is first mapped by :func:`sparse_policy_heads`. A mapped
+    schedule with cluster reduction is replaced by the raw-count schedule when
+    ``heads`` is not a multiple of 16: the cluster finisher needs whole M16
+    head tiles, a kernel constraint rather than a measured crossover.
+    """
+    kwargs = dict(
+        rows=rows,
+        query_length=query_length,
+        capacity=capacity,
+        dtype=dtype,
+        sm_count=sm_count,
+        rope_dim=rope_dim,
+        kv_cache_format=kv_cache_format,
+    )
+    policy_heads = sparse_policy_heads(heads, dtype=dtype, rope_dim=rope_dim)
+    profile = resolve_sparse_mla_profile(heads=policy_heads, **kwargs)
+    if policy_heads != heads and profile.reduction == "cluster" and heads % 16:
+        profile = resolve_sparse_mla_profile(heads=heads, **kwargs)
+    return profile
+
+
+def resolve_sparse_mla_profile(
+    *,
+    rows,
+    heads,
+    query_length,
+    capacity,
+    dtype,
+    sm_count,
+    rope_dim=0,
+    kv_cache_format="native",
+):
+    """Choose, size and grid-fill the schedule for exactly ``heads`` heads.
+
+    :func:`select_sparse_mla_profile` is the planning entry point; it maps
+    unmeasured head counts before calling this.
+    """
     if (
         kv_cache_format in ("nvfp4", "nvfp4.fp8rope", "fp8")
         and dtype == "fp8"
@@ -491,18 +621,29 @@ def select_sparse_mla_profile(
             paired_correction=keep,
             scheduler="clc" if persistent else "nonpersistent",
         )
-    choose = _choose_fp8 if dtype == "fp8" else _choose_bf16
-    profile = choose(rows, heads, query_length, capacity, sm_count)
+    if dtype == "fp8":
+        profile = choose_fp8_profile(
+            rows, heads, query_length, capacity, sm_count, rope_dim
+        )
+    else:
+        profile = choose_bf16_profile(rows, heads, query_length, capacity, sm_count)
+    # D576 NVFP4 keeps this schedule down to one row: the general small-grid
+    # choice partitions V over four CTAs that each repeat the K conversion
+    # (GB300 H64 top-k 2048, B1 Sq4: 32.3 -> 13.1 us; Sq8: 18.0 -> 14.2 us).
     if (
         kv_cache_format != "native"
         and dtype == "fp8"
         and query_length <= 8
         and capacity >= 2048
-        and rows >= 16
+        and rows >= (1 if rope_dim == 64 else 16)
         and rows * 2 < sm_count
     ):
-        if heads == 64 or (
-            heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count
+        if (
+            heads == 64
+            or (heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count)
+            # D576 NVFP4 H128 below 16 rows: two whole-tile M64 heads beat the
+            # 2CTA split (GB300 top-k 2048, H96 B1 Sq8: 27.3 -> 16.8 us).
+            or (heads == 128 and rope_dim == 64 and rows < 16)
         ):
             # Small packed grids still benefit from whole-record gathers and
             # retained WS tiles. At low row counts, two M64 head tiles also
@@ -526,7 +667,7 @@ def select_sparse_mla_profile(
             # Conversion makes longer per-cluster loops costly. Use the same
             # resident-wave split sizing below, with two SMs per cluster.
             profile = replace(profile, split_kv=0)
-    profile = _size_buffers(
+    profile = size_profile_buffers(
         profile,
         rows=rows,
         heads=heads,
@@ -611,7 +752,7 @@ D576_SPLIT_KV_MIN_CTAS = 96
 D576_SPLIT_KV_CHOICES = (16, 8, 4, 2)
 
 
-def _d576_v_split(total_ctas: int, sm_count: int) -> int:
+def d576_v_split(total_ctas: int, sm_count: int) -> int:
     """V head-dim split of a split launch of ``total_ctas`` CTAs: 4 / 2 while the
     grid fills at most a quarter / half of the SMs, else 1."""
     if total_ctas * 4 <= sm_count:
@@ -648,7 +789,7 @@ def select_sparse_mla_d576_split(
         split = 2
     if split == 1:
         return 1, 1
-    return split, _d576_v_split(num_ctas * split, sm_count)
+    return split, d576_v_split(num_ctas * split, sm_count)
 
 
 def prefer_sparse_d576_reload(

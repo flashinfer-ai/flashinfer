@@ -31,7 +31,7 @@ from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
     nvfp4_row_bytes,
@@ -96,9 +96,11 @@ class MlaConfig(Nvfp4KVConfig):
     batch_size: int = 1
     num_heads_q: int = 16
     seq_len_q: int = 4
-    seq_len_kv: int = 4096
+    seq_len_kv: int | None = 4096
     logical_num_heads_q: int = 16
     logical_seq_len_q: int = 4
+    # True: the Q lengths are compile-time. Sparse flattened Q is always fixed.
+    fixed_seqlen: bool = False
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
@@ -107,6 +109,7 @@ class MlaConfig(Nvfp4KVConfig):
     # compile-time amount and skip that tile's O rescale.  E4M3 P then uses
     # the scale ``448 * 2**-T`` instead of 448.
     softmax_rescale_threshold_log2: float = 0.0
+    lse_base_on_e: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -196,6 +199,9 @@ class MlaConfig(Nvfp4KVConfig):
     sparse_direct: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
+    # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
+    # a runtime loop domain, while None derives the group from static lengths.
+    sparse_instruction_group: int | None = None
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
     clc_padding_warp_idx: int = 14
@@ -352,16 +358,22 @@ class MlaConfig(Nvfp4KVConfig):
 
         return ceil(self.tile_size_kv / self.num_tokens_per_page)
 
+    # Return the static KV tile count, or zero when live metadata owns the domain.
     @property
     def total_kv_tiles(self) -> int:
+        if self.seq_len_kv is None:
+            return 0
         return ceil(self.seq_len_kv / self.tile_size_kv)
 
     @property
     def kv_tiles_per_multi_cta_group(self) -> int:
         return self.num_ctas_per_seq_kv * self.num_insts_kv
 
+    # Return static loop steps per split CTA, or zero for a runtime KV domain.
     @property
     def num_steps_per_cta_kv(self) -> int:
+        if self.seq_len_kv is None:
+            return 0
         tokens_per_multi_cta_step = (
             self.num_ctas_per_seq_kv * self.num_insts_kv * self.tile_size_kv
         )
@@ -502,6 +514,8 @@ class MlaConfig(Nvfp4KVConfig):
         If the maximum planned split fits that group, every shorter valid
         prefix already has the same partition. Live lengths still mask data.
         """
+        if self.sparse_instruction_group is not None:
+            return self.sparse_instruction_group
         tiles = self.local_kv_tiles(self.total_kv_tiles)
         return (
             self.num_insts_kv
@@ -700,10 +714,15 @@ def q_tile_work_count(
 
 
 def automatic_split_kv_step_tokens(tile_size_q: int) -> int:
-    """Return one steady-state K step for the selected task graph."""
+    """Return a profitable K span per split, at least two physical KV tiles.
+
+    One-tile splits do not amortize CTA setup and final reduction. The
+    one-instance Q64+ schedules retain two tiles as a policy work bound,
+    while the kernel and its hardware ceiling still accept larger counts.
+    """
 
     num_kv_insts = 1 if tile_size_q >= 64 else MlaConfig.num_insts_kv
-    return MlaConfig.tile_size_kv * num_kv_insts
+    return MlaConfig.tile_size_kv * max(num_kv_insts, 2)
 
 
 def select_auto_split_kv(
@@ -720,7 +739,6 @@ def select_auto_split_kv(
     split_kv = min(
         max_split_kv,
         max(1, target_work // base_work),
-        MAX_MLA_SPLITS_KV,
     )
     local_k_steps = ceil(max_split_kv / split_kv)
     return ceil(max_split_kv / local_k_steps)
@@ -966,6 +984,8 @@ def resolve_runtime_cluster_reduction_mode(
     cfg: MlaConfig | None,
     *,
     reduction_mode: str | None,
+    hardware_info=None,
+    stream=None,
     log=None,
 ) -> str | None:
     """Use cached device occupancy to resolve the runtime reduction mode."""
@@ -981,7 +1001,11 @@ def resolve_runtime_cluster_reduction_mode(
     cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
     from ...._hardware import get_max_active_clusters
 
-    active_clusters = get_max_active_clusters(cluster_size)
+    active_clusters = (
+        get_max_active_clusters(cluster_size)
+        if hardware_info is None
+        else hardware_info.get_max_active_clusters(cluster_size, stream)
+    )
     cluster_count = cluster_reduction_cluster_count(cfg)
     if log is not None:
         log(

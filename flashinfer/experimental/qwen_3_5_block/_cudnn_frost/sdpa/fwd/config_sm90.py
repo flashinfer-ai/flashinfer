@@ -85,6 +85,37 @@ class TemplateParams:
     # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the Stats store
     # scales the natural-log LSE by log2(e).
     stats_log2: bool = False
+    # THD caller-buffer origins: per port in (Q, K, V, O, Stats) order, ``(bits, multiplier)`` of the
+    # port's bound ragged offsets (int32 / int64, and the offset unit in elements), or None for a port
+    # bound without offsets, which keeps the compact prefix. None for the whole field keeps the packed
+    # layout. The setup launch turns each offset into a token origin, so padded THD (gaps between
+    # sequences, TE's cu_seqlens_padded) is read and written where the caller put it.
+    thd_origins: tuple | None = None
+
+
+# The ports of ``TemplateParams.thd_origins``, in order.
+THD_ORIGIN_PORTS = ("q", "k", "v", "o", "stats")
+
+
+def thd_origin_maps(b: int) -> int:
+    """Tensor maps of a caller-origin THD plan: per-sequence O in ``0..B-1``, the dead-unit pad at
+    ``B``, then per-sequence K at ``B+1..2B`` and V at ``2B+1..3B``."""
+    return 3 * b + 1
+
+
+def thd_origins_off(b: int) -> int:
+    """Int32 word offset of the Int64 ``[5, B]`` token origins, right after the maps."""
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF
+
+    return THD_MAPS_OFF(b) + thd_origin_maps(b) * TENSOR_MAP_QWORDS * 2
+
+
+def thd_meta_words(b: int, origins: bool) -> int:
+    """Int32 words of the THD metadata operand: the shared layout with its ``B + 3`` maps or, with
+    caller-buffer origins, the ``3B + 1`` maps and then the origins."""
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd import THD_MAPS_META_WORDS
+
+    return thd_origins_off(b) + 2 * len(THD_ORIGIN_PORTS) * b if origins else THD_MAPS_META_WORDS(b)
 
 
 # A band bound at or beyond S_q + S_kv never masks a key inside the declared envelopes, and
@@ -109,6 +140,14 @@ def validate_params(params: TemplateParams) -> None:
             raise ValueError("SM90 D512 thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
         if params.seq_q_lens_present:
             raise ValueError("SM90 D512 seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+    if params.thd_origins is not None:
+        if not params.thd_varlen or len(params.thd_origins) != len(THD_ORIGIN_PORTS):
+            raise ValueError("SM90 D512 thd_origins is THD-only and lists Q, K, V, O and Stats")
+        for port, entry in zip(THD_ORIGIN_PORTS, params.thd_origins):
+            if entry is not None and (len(entry) != 2 or entry[0] not in (32, 64) or type(entry[1]) is not int or entry[1] < 1):
+                raise ValueError(f"SM90 D512 thd_origins[{port}] must be (32 or 64, multiplier >= 1)")
+        if params.thd_origins[4] is not None and not params.has_lse:
+            raise ValueError("SM90 D512 Stats origins require has_lse")
     if params.causal and params.window_right is not None:
         raise ValueError("SM90 D512 plain causal is causal=True; window_right holds only a widened right bound")
     for name, bound, low in (("window_left", params.window_left, 0), ("window_right", params.window_right, 1)):

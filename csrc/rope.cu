@@ -422,6 +422,28 @@ void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope
   });
 }
 
+namespace {
+
+// RopeQuantizeAppendPagedKVCacheKernel moves 16 elements per lane with 16-byte accesses (two
+// per FP16/BF16 input vector, one per FP8 output vector), so every row it touches must start
+// on a 16-byte boundary; otherwise the launch fails with a sticky cudaErrorMisalignedAddress.
+// Padded rows are fine as long as their strides stay multiples of 16 bytes.
+void check_append_rows_16b_aligned(const TensorView& t, const char* name) {
+  if (t.numel() == 0) {
+    return;
+  }
+  const int64_t elem_size = get_element_size(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, ValueError)
+      << "rope_quantize_fp8_append_paged_kv_cache: " << name << " must start on a 16-byte boundary";
+  for (int i = 0; i + 1 < t.ndim(); ++i) {
+    TVM_FFI_CHECK(t.size(i) <= 1 || (t.stride(i) * elem_size) % 16 == 0, ValueError)
+        << "rope_quantize_fp8_append_paged_kv_cache: " << name << ".stride(" << i << ") is "
+        << t.stride(i) * elem_size << " bytes, which is not a multiple of 16";
+  }
+}
+
+}  // namespace
+
 /*!
  * TVM FFI binding for fused RoPE + quantization + paged KV cache append kernel
  *
@@ -517,6 +539,37 @@ void rope_quantize_append_paged_kv_cache(
     // Cache must be 4D
     CHECK_DIM(4, k_cache);
     CHECK_DIM(4, v_cache);
+    // K and V are addressed with one page size, head count and head dim (their strides may
+    // differ). Both are indexed with the same kv_indices, so each must hold every page listed
+    // there; the number of pages is not checked here as that would need a device-to-host copy.
+    for (int i = 1; i < 4; ++i) {
+      TVM_FFI_ICHECK_EQ(v_cache.size(i), k_cache.size(i))
+          << "v_cache and k_cache must have the same shape except for dim 0 (num_pages); dim " << i
+          << " differs";
+    }
+  }
+
+  // The kernel works in 16-element vectors: each RoPE lane covers one vector, and V rows
+  // (rope_dim + no_rope_dim) are written in whole vectors. Reject shapes and layouts it cannot
+  // handle here, before the MLA/GQA split, instead of failing with a sticky
+  // cudaErrorMisalignedAddress or writing past the head.
+  TVM_FFI_CHECK(rope_dim > 0 && rope_dim % 16 == 0 && no_rope_dim % 16 == 0, ValueError)
+      << "rope_quantize_fp8_append_paged_kv_cache requires rope_dim and no_rope_dim to be "
+         "multiples of 16 (and rope_dim > 0), got rope_dim="
+      << rope_dim << ", no_rope_dim=" << no_rope_dim;
+  check_append_rows_16b_aligned(q_rope_in, "q_rope");
+  check_append_rows_16b_aligned(k_rope_in, "k_rope");
+  check_append_rows_16b_aligned(q_nope_in, "q_nope");
+  check_append_rows_16b_aligned(k_nope_in, "k_nope");
+  check_append_rows_16b_aligned(q_rope_out, "q_rope_out");
+  check_append_rows_16b_aligned(q_nope_out, "q_nope_out");
+  if (is_mla) {
+    check_append_rows_16b_aligned(ckv_cache, "ckv_cache");
+    check_append_rows_16b_aligned(kpe_cache, "kpe_cache");
+  } else {
+    check_append_rows_16b_aligned(v_in, "v");
+    check_append_rows_16b_aligned(k_cache, "k_cache");
+    check_append_rows_16b_aligned(v_cache, "v_cache");
   }
 
   // Extract Q strides
@@ -582,7 +635,8 @@ void rope_quantize_append_paged_kv_cache(
               enable_pdl, stream);
 
         } else {
-          // GQA/MHA: Construct paged_kv_t struct
+          // GQA/MHA: Construct paged_kv_t struct. The kernel reaches V only through
+          // get_v_ptr, so v_cache keeps its own strides (e.g. padded rows).
           auto k_strides = k_cache.strides();
           auto v_strides = v_cache.strides();
           uint32_t head_dim = rope_dim + no_rope_dim;
@@ -590,7 +644,7 @@ void rope_quantize_append_paged_kv_cache(
           paged_kv_t<c_quant_type, int32_t> paged_kv(
               num_kv_heads, page_size, head_dim, batch_size, kv_layout,
               static_cast<c_quant_type*>(k_cache.data_ptr()),
-              static_cast<c_quant_type*>(v_cache.data_ptr()), k_strides.data(),
+              static_cast<c_quant_type*>(v_cache.data_ptr()), k_strides.data(), v_strides.data(),
               static_cast<int32_t*>(kv_indices.data_ptr()),
               static_cast<int32_t*>(kv_indptr.data_ptr()),
               nullptr  // last_page_len not needed for this kernel

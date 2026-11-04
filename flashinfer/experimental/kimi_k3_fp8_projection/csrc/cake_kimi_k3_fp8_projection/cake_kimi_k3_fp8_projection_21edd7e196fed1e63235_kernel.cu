@@ -586,14 +586,14 @@ kernel_cake_kimi_k3_fp8_projection_21edd7e196fed1e63235(const __grid_constant__ 
                     } else {
                         int _max_4 = ((0) > (-my_rank) ? (0) : (-my_rank));
                         int _min_3 = ((1) < (_max_4) ? (1) : (_max_4));
-                        int o_idx = -_min_3;
-                        unsigned int stg_b = (unsigned int)(o_idx * 2560) + line_b;
+                        int o_idx_0 = -_min_3;
+                        unsigned int stg_b_0 = (unsigned int)(o_idx_0 * 2560) + line_b;
                         {
-                            uint32_t _addr_5 = static_cast<uint32_t>(smem_stg_addr + stg_b);
+                            uint32_t _addr_5 = static_cast<uint32_t>(smem_stg_addr + stg_b_0);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_5), "f"(_tmem_load_0[0]) : "memory");
                         }
                         {
-                            uint32_t _addr_6 = static_cast<uint32_t>(smem_stg_addr + (stg_b + 4));
+                            uint32_t _addr_6 = static_cast<uint32_t>(smem_stg_addr + (stg_b_0 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_6), "f"(_tmem_load_0[1]) : "memory");
                         }
                     }
@@ -634,23 +634,23 @@ kernel_cake_kimi_k3_fp8_projection_21edd7e196fed1e63235(const __grid_constant__ 
                 mbarrier_wait_cluster_hint(red_full_addr, _phase_red_full, 10000000);
                 if (epi_group == 0) {
                     if (0 == my_rank) {
-                        float total_1_0 = 0.0f;
+                        float total_0 = 0.0f;
                         #pragma unroll
-                        for (int src_1_0 = 0; src_1_0 < 14; src_1_0++) {
-                            total_1_0 = total_1_0 + smem_red[src_1_0 * 640 + lane_row * 5];
+                        for (int src_0 = 0; src_0 < 14; src_0++) {
+                            total_0 = total_0 + smem_red[src_0 * 640 + lane_row * 5];
                         }
-                        int tok_c_2_0 = tok0;
-                        if (feature < n_valid && tok_c_2_0 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_0;
+                        int tok_c_0 = tok0;
+                        if (feature < n_valid && tok_c_0 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0;
                         }
-                        float total_2_0 = 0.0f;
+                        float total_1 = 0.0f;
                         #pragma unroll
-                        for (int src_1_1 = 0; src_1_1 < 14; src_1_1++) {
-                            total_2_0 = total_2_0 + smem_red[src_1_1 * 640 + lane_row * 5 + 1];
+                        for (int src_1 = 0; src_1 < 14; src_1++) {
+                            total_1 = total_1 + smem_red[src_1 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_3_0 = tok0 + 1;
-                        if (feature < n_valid && tok_c_3_0 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_0;
+                        int tok_c_1 = tok0 + 1;
+                        if (feature < n_valid && tok_c_1 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1;
                         }
                     }
                 }

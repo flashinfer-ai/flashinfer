@@ -34,52 +34,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 40
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SCALE_A_OFFSET 32
-#define TMEM_SCALE_B_OFFSET 36
-#define NUM_PIPE_STAGES 11
-#define NUM_ACCUM_PIPE_STAGES 2
-#define NUM_TASK_PIPE_STAGES 4
-#define SMEM_COMBINE_SMEM_OFF 0
-#define SMEM_COMBINE_SMEM_STAGE_BYTES 143360
-#define SMEM_COMBINE_SMEM_STRIDE 143360
-#define SMEM_SMEM_HIST_OFF 0
-#define SMEM_SMEM_HIST_STAGE_BYTES 384
-#define SMEM_SMEM_HIST_STRIDE 384
-#define SMEM_SMEM_DST_ROW_OFF 1024
-#define SMEM_SMEM_DST_ROW_STAGE_BYTES 16
-#define SMEM_SMEM_DST_ROW_STRIDE 16
-#define SMEM_SMEM_ERO_OFF 1040
-#define SMEM_SMEM_ERO_STAGE_BYTES 384
-#define SMEM_SMEM_ERO_STRIDE 384
-#define SMEM_SMEM_XSF_OFF 1424
-#define SMEM_SMEM_XSF_STAGE_BYTES 640
-#define SMEM_SMEM_XSF_STRIDE 640
-#define SMEM_SMEM_OUTPUT_OFF 21504
-#define SMEM_SMEM_OUTPUT_STAGE_BYTES 4096
-#define SMEM_SMEM_OUTPUT_STRIDE 4096
-#define SMEM_SMEM_A_OFF 25600
-#define SMEM_SMEM_A_STAGE_BYTES 1024
-#define SMEM_SMEM_A_STRIDE 1024
-#define SMEM_SMEM_B_OFF 36864
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_SMEM_SFA_OFF 217088
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 512
-#define SMEM_SMEM_SFB_OFF 222720
-#define SMEM_SMEM_SFB_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_STRIDE 512
-#define SMEM_AMAX_REDUCTION_OFF 228352
-#define SMEM_AMAX_REDUCTION_STAGE_BYTES 256
-#define SMEM_AMAX_REDUCTION_STRIDE 256
-#define SMEM_TASK_INFOS_OFF 228608
-#define SMEM_TASK_INFOS_STAGE_BYTES 128
-#define SMEM_TASK_INFOS_STRIDE 128
-#define SMEM_TOTAL 229504
-#define THREADS 512
 #ifndef NUM_CTAS
 #error "NUM_CTAS is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -311,7 +265,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* combine_smem = reinterpret_cast<uint8_t*>(smem_raw + 0);
     const int combine_smem_addr = smem + 0;
     int* smem_hist = reinterpret_cast<int*>(smem_raw + 0);
@@ -336,6 +290,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
     const int amax_reduction_addr = smem + 228352;
     unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 228608);
     const int task_infos_addr = smem + 228608;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B1))) : "memory"); }
@@ -349,8 +305,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 82 barriers)
-    // Mbarriers at smem_raw[228736..229392)
+    // Mbarrier init (82 barriers at smem_raw[228736..229392))
 
     if (warp == 2) {
         uint32_t leader = elect_sync();
@@ -466,12 +421,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_scale_a = taddr + 32;
-    const int tmem_scale_b = taddr + 36;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_scale_a = taddr + 32;
+    const unsigned int tmem_scale_b = taddr + 36;
 
     // ---- Role: dispatch ----
     if (warp <= 3) {
@@ -730,15 +683,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
         { // load_b_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("barrier.sync 11, 256;" ::: "memory");
-            int direct_w_0 = 0 + lane;
+            int direct_w_0 = lane;
             if (direct_w_0 < 40) {
-                smem_xsf[0 + direct_w_0] = x_sf[0 + direct_w_0];
+                smem_xsf[direct_w_0] = x_sf[direct_w_0];
             }
             int direct_w_1 = 32 + lane;
             if (direct_w_1 < 40) {
-                smem_xsf[0 + direct_w_1] = x_sf[0 + direct_w_1];
+                smem_xsf[direct_w_1] = x_sf[direct_w_1];
             }
-            int direct_w_2 = 0 + lane;
+            int direct_w_2 = lane;
             if (direct_w_2 < 40) {
                 smem_xsf[40 + direct_w_2] = x_sf[40 + direct_w_2];
             }
@@ -746,7 +699,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
             if (direct_w_3 < 40) {
                 smem_xsf[40 + direct_w_3] = x_sf[40 + direct_w_3];
             }
-            int direct_w_4 = 0 + lane;
+            int direct_w_4 = lane;
             if (direct_w_4 < 40) {
                 smem_xsf[80 + direct_w_4] = x_sf[80 + direct_w_4];
             }
@@ -754,7 +707,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
             if (direct_w_5 < 40) {
                 smem_xsf[80 + direct_w_5] = x_sf[80 + direct_w_5];
             }
-            int direct_w_6 = 0 + lane;
+            int direct_w_6 = lane;
             if (direct_w_6 < 40) {
                 smem_xsf[120 + direct_w_6] = x_sf[120 + direct_w_6];
             }
@@ -973,7 +926,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
                     if (direct_hit_0 != 0) {
                         int _find_first_set_4 = __ffs(direct_hit_0);
                         unsigned int direct_lane_0 = _find_first_set_4 - 1;
-                        direct_expert = 0 + direct_lane_0;
+                        direct_expert = direct_lane_0;
                         if (direct_phase == 2) {
                             unsigned int _shfl_sync_5 = __shfl_sync(0xFFFFFFFF, counts[0], direct_lane_0);
                             direct_valid = _shfl_sync_5;
@@ -1114,8 +1067,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
                 if (task_4[0] == 1) {
                     unsigned int direct_routed = 0;
                     if (lane < 4) {
-                        int direct_route_0 = topk_idx_i32[(lane * 6 + 0) * 2] - local_expert_offset;
-                        float direct_rw_0 = topk_weights[lane * 6 + 0];
+                        int direct_route_0 = topk_idx_i32[lane * 6 * 2] - local_expert_offset;
+                        float direct_rw_0 = topk_weights[lane * 6];
                         if (direct_routed == 0 && (unsigned int)direct_route_0 == task_4[1]) {
                             direct_routed = 1;
                             pre_weight = direct_rw_0;
@@ -1658,7 +1611,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
                     }
                     unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         {
                             const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
                             uint4* _vdst_24 = reinterpret_cast<uint4*>(&values[0]);
@@ -1731,7 +1684,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a(int* __restrict__ t
                     reduced[5] = 0.0f;
                     reduced[6] = 0.0f;
                     reduced[7] = 0.0f;
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         float _bf16x2_add_f32_0[2];
                         asm volatile(
                             "{\n\t"

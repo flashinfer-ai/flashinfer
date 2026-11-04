@@ -2085,6 +2085,106 @@ def test_plan_queue_vf_route_rule(monkeypatch):
     assert not unpooled["queue"] and unpooled["queue_vf"] is False
 
 
+def _goal_ragged_mask(h_kv, m, n, topk, seed=42):
+    """The kv-head mask of a ragged benchmark row (``m`` / ``n`` tokens, ``topk`` blocks on the first
+    query block of each head and 1..topk on the others)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    idx = torch.rand((h_kv, m // 64, n // 64), generator=g).topk(topk, dim=-1)
+    counts = torch.randint(1, topk + 1, (h_kv, m // 64), generator=g)
+    counts[:, 0] = topk
+    mask = torch.zeros((h_kv, m // 64, n // 64), dtype=torch.bool)
+    mask.scatter_(
+        -1, idx.indices.sort(dim=-1).values, torch.arange(topk) < counts.unsqueeze(-1)
+    )
+    return mask
+
+
+def _sorted_tile_words(plan):
+    """The plan's tiles (valid meta rows, tile-count word cleared), sorted: the same tiles in any order."""
+    meta = plan["meta"].to(torch.int64)
+    rows = meta[meta[:, planner.META_NSEQ] > 0].clone()
+    rows[:, planner.META_NTILES] = 0
+    return sorted(tuple(r) for r in rows.tolist())
+
+
+def test_plan_fp8_ragged_pair_queue_rule(monkeypatch):
+    """Sage-FP8 grouped-query ragged pair plans whose heads hold the queue window join the queue (the
+    shared-transposer queue program) from FP8_POOL_RAGGED_PAIR_MIN_TILES tiles per CTA: h8-m32768-n32768-k64
+    ragged at g = 4 (2048 head-pair tiles, 14..16 per CTA) and g = 8 leave the position-selected static
+    program.  The tiles are the static plan's; the BF16 route (``fp8`` False, the default) and MHA plans
+    keep the shared thresholds, and so do Sage-FP8 plans below the tile count."""
+    assert planner.FP8_POOL_RAGGED_PAIR_MIN_TILES == 14
+    for h_kv, g in ((2, 4), (1, 8)):
+        mask = _goal_ragged_mask(h_kv, 32768, 32768, 64)
+        bf16 = plan_vsa_sm90(mask, sms=132, gqa=g)
+        fp8 = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group", fp8=True)
+        assert bf16["mode"] == fp8["mode"] == "pair"
+        assert not bf16["queue"] and planner.fp8_gqa_pin_vf(bf16) is True
+        assert fp8["queue"] and planner.fp8_gqa_xshare(fp8) is True
+        assert fp8["pin"] is False and fp8["pin_vf"] is False and fp8["tagged"] is False
+        assert fp8["num_tiles"] == bf16["num_tiles"] == 2048
+        assert _sorted_tile_words(fp8) == _sorted_tile_words(bf16)
+        assert min(len(lst) for lst in fp8["tile_lists"]) >= 14
+        # the threshold is the route: above every plan's tile count the static program stays
+        # (the pair pin_vf queue route off as well: the static plan is a pair pin_vf plan)
+        monkeypatch.setattr(planner, "FP8_POOL_RAGGED_PAIR_MIN_TILES", 10**9)
+        monkeypatch.setattr(planner, "FP8_PIN_VF_PAIR_QUEUE", False)
+        off = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group", fp8=True)
+        monkeypatch.undo()
+        assert not off["queue"] and planner.fp8_gqa_pin_vf(off) is True
+        assert torch.equal(off["meta"], bf16["meta"]) and torch.equal(
+            off["hdr"], bf16["hdr"]
+        )
+        mha = plan_vsa_sm90(_replicated(mask, g), sms=132, fp8=True)
+        mha_bf16 = plan_vsa_sm90(_replicated(mask, g), sms=132)
+        assert mha["gqa"] == 1 and torch.equal(mha["meta"], mha_bf16["meta"])
+        assert mha["queue"] == mha_bf16["queue"]
+    # uniform plans and short ragged plans: the ragged rule changes nothing (h8-m4096-n4096-k64 at
+    # g = 4 is a pair pin_vf plan: the pair pin_vf queue route off here)
+    monkeypatch.setattr(planner, "FP8_PIN_VF_PAIR_QUEUE", False)
+    for mask, g in ((_topk_mask(2, 64, 64, 64), 4), (_topk_mask(2, 528, 64, 8), 4)):
+        a = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group")
+        b = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group", fp8=True)
+        assert torch.equal(a["meta"], b["meta"]) and a["queue"] == b["queue"]
+
+
+def test_plan_fp8_pin_vf_pair_queue_rule(monkeypatch):
+    """Sage-FP8 grouped-query pair plans whose static route selects the second position-selected
+    program (``attention_fp8_gqa_pin_vf``) take the queue -- the shared-transposer queue program --
+    on the same tiles (FP8_PIN_VF_PAIR_QUEUE): h8-m4096-n4096-k64 at g = 4 and g = 8.  The BF16 route
+    (``fp8`` False, the default), MHA plans and the other pin plans keep their plans."""
+    assert planner.FP8_PIN_VF_PAIR_QUEUE is True
+    for h_kv, g in ((2, 4), (1, 8)):
+        mask = _topk_mask(h_kv, 64, 64, 64)  # h8-m4096-n4096-k64
+        bf16 = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group")
+        fp8 = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group", fp8=True)
+        assert bf16["mode"] == fp8["mode"] == "pair"
+        assert not bf16["queue"] and planner.fp8_gqa_pin_vf(bf16) is True
+        assert fp8["queue"] and planner.fp8_gqa_xshare(fp8) is True
+        assert fp8["pin"] is False and fp8["pin_vf"] is False and fp8["tagged"] is False
+        assert fp8["num_tiles"] == bf16["num_tiles"]
+        assert _sorted_tile_words(fp8) == _sorted_tile_words(bf16)
+        # the flag is the route: off, the static program stays
+        monkeypatch.setattr(planner, "FP8_PIN_VF_PAIR_QUEUE", False)
+        off = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group", fp8=True)
+        monkeypatch.undo()
+        assert not off["queue"] and planner.fp8_gqa_pin_vf(off) is True
+        assert torch.equal(off["meta"], bf16["meta"]) and torch.equal(
+            off["hdr"], bf16["hdr"]
+        )
+        mha = plan_vsa_sm90(_replicated(mask, g), sms=132, fp8=True)
+        mha_bf16 = plan_vsa_sm90(_replicated(mask, g), sms=132)
+        assert mha["gqa"] == 1 and torch.equal(mha["meta"], mha_bf16["meta"])
+        assert mha["queue"] == mha_bf16["queue"]
+    # pin plans of 16-position tiles (h8-m4096-n4096-k32 at g = 4) and split-mode pin plans
+    # (h8-m1024-n32768-k64 at g = 4) do not select pin_vf: the flag changes nothing
+    for mask, g in ((_topk_mask(2, 64, 64, 32), 4), (_topk_mask(2, 16, 512, 64), 4)):
+        a = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group")
+        b = plan_vsa_sm90(mask, sms=132, gqa=g, split_tile_order="group", fp8=True)
+        assert a["pin"] and not planner.fp8_gqa_pin_vf(a)
+        assert torch.equal(a["meta"], b["meta"]) and a["queue"] == b["queue"]
+
+
 def test_plan_pin_vf_route_rule(monkeypatch):
     """Pair-mode pin plans of long tiles (at least PIN_VF_MIN_TILE_POS ring positions) whose lightest
     CTA runs at least PIN_VF_MIN_CTA_LOOP_ITERS main-loop iterations carry ``pin_vf`` True and take the
@@ -4312,6 +4412,55 @@ def _fp8_gqa_plan_for(mask, h, scales, scale=None, route=None):
 
 
 @requires_hopper
+@pytest.mark.parametrize("h_kv, g", [(2, 4)])
+def test_fp8_gqa_ragged_pair_queue_route_is_bitwise_the_static_route(
+    h_kv, g, monkeypatch
+):
+    """The Sage-FP8 ragged pair queue route (FP8_POOL_RAGGED_PAIR_MIN_TILES) changes the program, not the
+    result: h8-m32768-n32768-k64 ragged at g = 4 on the shared-transposer queue program is bit for bit the
+    position-selected static program's output (the same tiles, each tile's accumulation order its own),
+    three launches each."""
+    h = g * h_kv
+    mask = _goal_ragged_mask(h_kv, 32768, 32768, 64).to("cuda")
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, 512, 512)
+    queue = _fp8_gqa_plan_for(mask, h, scales)
+    monkeypatch.setattr(planner, "FP8_POOL_RAGGED_PAIR_MIN_TILES", 10**9)
+    monkeypatch.setattr(planner, "FP8_PIN_VF_PAIR_QUEUE", False)
+    static = _fp8_gqa_plan_for(mask, h, scales)
+    monkeypatch.undo()
+    assert queue.stage == "attention_fp8_gqa_xs_queue"
+    assert static.stage == "attention_fp8_gqa_pin_vf"
+    want = static.run(q8, k8, v8).clone()
+    assert not torch.isnan(want).any()
+    for _ in range(3):
+        torch.testing.assert_close(queue.run(q8, k8, v8), want, atol=0, rtol=0)
+        torch.testing.assert_close(static.run(q8, k8, v8), want, atol=0, rtol=0)
+
+
+@requires_hopper
+def test_fp8_gqa_pin_vf_pair_queue_route_is_bitwise_the_static_route(monkeypatch):
+    """The Sage-FP8 pair pin_vf queue route (FP8_PIN_VF_PAIR_QUEUE) changes the program, not the
+    result: h8-m4096-n4096-k64 at g = 4 (softmax scale 0.5) on the shared-transposer queue program is
+    bit for bit the second position-selected static program's output (the same tiles, each tile's
+    accumulation order its own), three launches each."""
+    h_kv, g = 2, 4
+    h = g * h_kv
+    mask = _topk_mask(h_kv, 64, 64, 64).to("cuda")
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, 64, 64)
+    queue = _fp8_gqa_plan_for(mask, h, scales, scale=0.5)
+    monkeypatch.setattr(planner, "FP8_PIN_VF_PAIR_QUEUE", False)
+    static = _fp8_gqa_plan_for(mask, h, scales, scale=0.5)
+    monkeypatch.undo()
+    assert queue.stage == "attention_fp8_gqa_xs_queue"
+    assert static.stage == "attention_fp8_gqa_pin_vf"
+    want = static.run(q8, k8, v8).clone()
+    assert not torch.isnan(want).any()
+    for _ in range(3):
+        torch.testing.assert_close(queue.run(q8, k8, v8), want, atol=0, rtol=0)
+        torch.testing.assert_close(static.run(q8, k8, v8), want, atol=0, rtol=0)
+
+
+@requires_hopper
 @pytest.mark.parametrize(
     "g,h_kv,mb,nb,capacity,scale,route,ragged",
     [
@@ -4355,7 +4504,9 @@ def test_fp8_gqa_routes_match_the_fp8_mha_route_on_replicated_inputs(
     # from the stage the route picked, so a plan routed away from the pin program fails here.
     expected_stage = _gqa_stage_of(mha.stage)
     sms = torch.cuda.get_device_properties(gqa.device).multi_processor_count
-    fi_plan = plan_vsa_sm90(mask.cpu(), sms=sms, gqa=g, split_tile_order="group")
+    fi_plan = plan_vsa_sm90(
+        mask.cpu(), sms=sms, gqa=g, split_tile_order="group", fp8=True
+    )
     if planner.fp8_gqa_pin(fi_plan):
         assert expected_stage == "attention_fp8_gqa"
         expected_stage = "attention_fp8_gqa_pin"
@@ -4882,6 +5033,9 @@ def test_fp8_gqa_pin_vf_kernel_matches_the_pin_kernel_bit_exact(
     h = g * h_kv
     mask = _topk_mask(h_kv, mb, nb, 64).cuda()
     q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, mb, nb)
+    # the Sage-FP8 route sends this pair pin_vf plan to the queue (FP8_PIN_VF_PAIR_QUEUE); off, it
+    # keeps the static programs compared here
+    monkeypatch.setattr(planner, "FP8_PIN_VF_PAIR_QUEUE", False)
     routed = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
     if routed.stage != "attention_fp8_gqa_pin_vf":
         pytest.skip(

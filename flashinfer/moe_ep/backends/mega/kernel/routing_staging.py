@@ -16,8 +16,9 @@ def _kernel_class():
     import cutlass.cute as cute
 
     class RouteStager:
-        def __init__(self, topk: int):
+        def __init__(self, topk: int, zero_masked_scores: bool):
             self.topk = topk
+            self.zero_masked_scores = zero_masked_scores
 
         @cute.jit
         def __call__(
@@ -48,8 +49,11 @@ def _kernel_class():
             if index < ids.shape[0] * self.topk:
                 row, col = index // self.topk, index % self.topk
                 expert = cutlass.Int32(ids[row, col])
-                score = cutlass.Float32(0.0)
-                if expert != -1:
+                if cutlass.const_expr(self.zero_masked_scores):
+                    score = cutlass.Float32(0.0)
+                    if expert != -1:
+                        score = cutlass.Float32(scores[row, col])
+                else:
                     score = cutlass.Float32(scores[row, col])
                 ids_out[row, col] = expert
                 scores_out[row, col] = score
@@ -69,7 +73,14 @@ _COMPILED: dict[tuple, object] = {}
 
 
 def stage_routes(
-    ids, scores, ids_out, scores_out, *, workspace, use_tvm_ffi: bool = True
+    ids,
+    scores,
+    ids_out,
+    scores_out,
+    *,
+    workspace,
+    use_tvm_ffi: bool = True,
+    zero_masked_scores: bool = True,
 ) -> None:
     """Stage live rows; the caller validates routes and clears the capacity tail."""
     if (
@@ -79,7 +90,10 @@ def stage_routes(
     ):
         live = ids.shape[0]
         ids_out[:live].copy_(ids.to(torch.int32))
-        scores_out[:live].copy_(scores.float().masked_fill(ids == -1, 0))
+        staged_scores = (
+            scores.float().masked_fill(ids == -1, 0) if zero_masked_scores else scores
+        )
+        scores_out[:live].copy_(staged_scores)
         return
     if ids.numel() == 0:
         return
@@ -94,6 +108,7 @@ def stage_routes(
         ids.shape[1],
         tuple((t.device, t.dtype, tuple(t.stride())) for t in tensors),
         ffi,
+        zero_masked_scores,
     )
     entry = getattr(workspace, "_route_staging", None)
     if (
@@ -114,7 +129,7 @@ def stage_routes(
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm route staging before CUDA graph capture")
             compiled = cute.compile(
-                _kernel_class()(ids.shape[1]),
+                _kernel_class()(ids.shape[1], zero_masked_scores),
                 *arguments,
                 cuda.CUstream(torch.cuda.current_stream().cuda_stream),
                 options="--enable-tvm-ffi" if ffi else "",

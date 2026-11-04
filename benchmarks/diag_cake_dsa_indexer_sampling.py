@@ -16,7 +16,7 @@ limitations under the License.
 
 """Diagnose the sampled first threshold of the experimental Cake DSA indexer top-k backend.
 
-The scan kernel of ``flashinfer.experimental.cake_dsa_indexer`` streams the visible key
+The scan kernel of ``flashinfer.experimental.cake_dsa_indexer_det`` streams the visible key
 prefix of every work unit (a block of ``block_q`` consecutive queries of one segment) in
 128-key tiles.  A unit whose stream would overflow its candidate buffer first walks one tile
 of every ``stride`` (``n_sample`` sample tiles); at the last sample tile each query picks
@@ -52,7 +52,7 @@ Inputs are one of:
   bf16, ``w`` ``[T, 32]`` fp32, ``cu_seqlens_q`` / ``cu_seqlens_k`` int32 ``[S + 1]``, and
   optionally ``q_causal_offsets`` (int64 ``[S]``), ``top_k`` (default 2048), ``ratio``
   (default 1), ``max_seqlen_k``, ``softmax_scale`` (default ``128 ** -0.5``) -- one rank's
-  arguments to ``dsa_indexer_topk`` saved as they were passed;
+  arguments to ``dsa_indexer_det_topk`` saved as they were passed;
 * ``--row NAME``: a row of ``benchmarks/bench_cake_dsa_indexer.py`` (``S4sink``, ``Z1``, ``P1``,
   ...), built with that script's generators and seeds;
 * ``--cp16 MIX --dist DIST --rank R``: one rank of a 16-way context-parallel zigzag split of a
@@ -99,7 +99,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bench_cake_dsa_indexer as bcdi  # noqa: E402  (benchmarks/ is the script directory)
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.experimental.cake_dsa_indexer import cake_backend  # noqa: E402
+from flashinfer.experimental.cake_dsa_indexer_det import cake_backend  # noqa: E402
 from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
 
 TILE = 128
@@ -200,7 +200,7 @@ def parse_knobs(items):
 
 
 def host_plan(inputs, arch, num_sms, knobs, max_seqlen_k=None):
-    plan = cake_backend.plan_dsa_indexer_topk(
+    plan = cake_backend.plan_dsa_indexer_det_topk(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,

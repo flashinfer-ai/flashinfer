@@ -38,6 +38,7 @@ from .hopper.contiguous_gather_grouped_gemm_act_fusion import (
 )
 from .hopper.utils import TORCH_TO_CUTLASS_DTYPE
 from .moe_utils import (
+    SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
     validate_cute_dsl_moe_swiglu_config,
@@ -245,7 +246,11 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         ``w1_weight.shape[1] // 2`` for gated activations and
         ``w1_weight.shape[1]`` otherwise.
     """
-    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, gated = normalize_cute_dsl_moe_activation_type(
+        activation_type,
+        SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
+        backend="the SM90 CuTe-DSL MoE",
+    )
     validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     out_n_factor = 2 if gated else 1

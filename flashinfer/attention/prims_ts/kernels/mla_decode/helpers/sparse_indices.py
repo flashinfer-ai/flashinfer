@@ -32,9 +32,13 @@ from cutlass import Int32, Int64
 class SparseKVIndices:
     """Caller-owned index lists; optionally cache one query row's live lengths."""
 
+    # Bind source tensors and optional cached row lengths; capacity counts padded KV
+    # slots.
+    # assume_valid_prefix promises nonnegative indices within each live prefix;
+    # has_extra enables the second source, whose tile domain follows the primary span.
     def __init__(self, values, capacity, assume_valid_prefix=False, has_extra=True):
         """Carry caller-owned source metadata and an optional FP8-primary scale through JIT calls."""
-        self.values = values
+        self.values = (*values, capacity)
         (
             self.primary_indices,
             self.extra_indices,
@@ -54,17 +58,21 @@ class SparseKVIndices:
                 (self.primary_length + Int32(127)) // Int32(128) * Int32(128)
             )
 
+    # Flatten source tensors, row state and runtime capacity for CuTe calls.
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
 
+    # Rebind source values and live capacity while preserving format promises.
     def __new_from_mlir_values__(self, values):
+        rebound = cutlass.new_from_mlir_values(self.values, values)
         return SparseKVIndices(
-            cutlass.new_from_mlir_values(self.values, values),
-            self.capacity,
+            rebound[:-1],
+            rebound[-1],
             self.assume_valid_prefix,
             self.has_extra,
         )
 
+    # Load one query row's lengths once, or use the supplied token-count overrides.
     @cute.jit
     def bind_query_row(self, query_row, primary_length=None, extra_length=None):
         """Bind one query to live source lengths, optionally reusing register-cached lengths.
@@ -99,6 +107,7 @@ class SparseKVIndices:
             self.has_extra,
         )
 
+    # Select a source at a logical KV-token offset; for_mask may omit index loads.
     @cute.jit
     def tensor_scale_is_extra(self, tile_start, query_row=None):
         """Return whether a logical KV tile starts in the extra pool.
@@ -196,19 +205,25 @@ class SparseKVIndices:
 class SparseSourceTile:
     """Selected source and bounds; analytic prefix masks need no index pointer."""
 
+    # Bind one source's indices, token origin/length and descriptor tag; valid_prefix
+    # skips index validity checks.
     def __init__(self, values, valid_prefix=False):
         self.values = values
         self.indices, self.origin, self.length, self.tag = values
         self.valid_prefix = valid_prefix
 
+    # Flatten the selected source pointer and token bounds for CuTe calls.
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
 
+    # Rebind a source tile while retaining its valid-prefix promise.
     def __new_from_mlir_values__(self, values):
         return SparseSourceTile(
             cutlass.new_from_mlir_values(self.values, values), self.valid_prefix
         )
 
+    # Clamp an index load inside source storage and return its separate live-token
+    # validity.
     @cute.jit
     def _bounded_index(self, token):
         position = token - self.origin
@@ -224,6 +239,7 @@ class SparseSourceTile:
             valid = valid & (index >= Int32(0))
         return index, valid
 
+    # Return one physical row with its source tag, or the tagged invalid-row sentinel.
     @cute.jit
     def load_row(self, token):
         index, valid = self._bounded_index(token)
@@ -260,6 +276,7 @@ class SparseSourceTile:
                 rows[j] = self.load_row(token + Int32(j))
         return rows
 
+    # Test one logical KV token; request is unused because the source is row-bound.
     @cute.jit
     def is_invalid(self, token, request):
         del request
@@ -268,12 +285,14 @@ class SparseSourceTile:
         _, valid = self._bounded_index(token)
         return ~valid
 
+    # Check that a 128-token tile fits both the selected source and live execution span.
     @cute.jit
     def tile_is_full(self, start, live_length):
         return start + Int32(128) <= cute.math.min(
             self.origin + self.length, live_length
         )
 
+    # Return one invalid-bit mask for 32 tokens starting within the selected source.
     @cute.jit
     def prefix_mask32(self, start, live_length):
         # Source/tile boundaries are aligned; start is within this source.
@@ -287,6 +306,8 @@ class SparseSourceTile:
 class SparseKVLengths:
     """Adapter for the scheduler's lengths[query_row] interface only."""
 
+    # Bind per-query lengths or a cached scalar execution span; has_extra selects the
+    # second pool.
     def __init__(self, values, has_extra=True):
         self.values = values
         self.has_extra = has_extra
@@ -295,14 +316,17 @@ class SparseKVLengths:
             (rows,) if self.bound_length is not None else self.primary_lengths.shape
         )
 
+    # Flatten scheduler length tensors or the bound scalar for CuTe calls.
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
 
+    # Rebind scheduler lengths while retaining the source-count contract.
     def __new_from_mlir_values__(self, values):
         return SparseKVLengths(
             cutlass.new_from_mlir_values(self.values, values), self.has_extra
         )
 
+    # Return the padded execution span in tokens for one virtual query request.
     @cute.jit
     def __getitem__(self, query_row):
         if cutlass.const_expr(self.bound_length is not None):
@@ -315,6 +339,7 @@ class SparseKVLengths:
         )
 
 
+# Round each source to 128-token tiles; empty rows still execute one masked token.
 @cute.jit
 def _sparse_execution_length(primary_length, extra_length):
     primary_tiles = (primary_length + Int32(127)) // Int32(128)
@@ -329,7 +354,7 @@ def bind_sparse_kv_indices(
     extra_indices,
     primary_lengths,
     extra_lengths,
-    capacity: cutlass.Constexpr[int],
+    capacity: Int32,
     *,
     query_row=None,
     assume_valid_prefix: cutlass.Constexpr[bool] = False,
