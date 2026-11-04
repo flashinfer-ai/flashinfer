@@ -25,6 +25,7 @@ TRANSPORT_TABLE_NAMES = ("all_gin", "all_lsa", "lsa_where_reachable")
 TRANSPORT_TABLE_AUTO = "auto"
 TRANSPORT_TABLE_TUNED = "tuned"
 CODEC_OVERFLOW_BLOCKS_RANGE = (16, 256)
+CODEC_OVERFLOW_BLOCKS_DEFAULT = 16
 # ``return_codec`` names -> the device build's MOE_RETURN_CODEC value.
 RETURN_CODECS = {"bf16": 0, "int8": 1}
 
@@ -102,14 +103,17 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     Default 16 (25 % of a row at ``hidden_size=4096``, 14 % at 7168;
     real DeepSeek-V4 activations need ~0.3 %); 16..256.  Each extra block costs
     ``128 * max_tokens_per_rank * top_k`` bytes per peer and ring slot of
-    symmetric memory.  Used by ``return_codec="bf16"`` only.
+    symmetric memory.  Used by ``return_codec="bf16"`` only: with ``"int8"`` the device
+    build always uses the default (the value has no effect there, so it does not
+    create a separate build).
 
     ``return_codec`` (compile-time) selects the wire format of the expert results:
 
     * ``"bf16"`` (default): the lossless BF16 codec above; the output is the
       slot-ordered fp32 sum of the exact BF16 expert results.
     * ``"int8"``: every 64-value block of an expert result travels as 64 int8
-      codes plus one BF16 scale ``s = bf16(amax / 127)``; the receiver sums
+      codes plus one BF16 scale ``s = max(bf16(amax / 127), 2^-126)`` (the floor keeps
+      the scale of an all-zero block normal); the receiver sums
       ``q * s`` in fp32 (the same order and rounding as ``"bf16"``).  A route
       costs ``hidden_size * 66 / 64`` bytes (5280 B at ``hidden_size=5120``, against
       ``hidden_size * 98 / 64`` plus overflow for ``"bf16"``), there is no overflow
@@ -150,7 +154,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     intermediate_size: int = 2048
     top_k: int = 6
     swiglu_limit: int = 10
-    codec_overflow_blocks: int = 16
+    codec_overflow_blocks: int = CODEC_OVERFLOW_BLOCKS_DEFAULT
     kernel_name: str = "sm120_mxfp4_mxfp8_bf16_cake"
     shared_expert: str | None = None
     transport_table: TransportTableSpec = "all_gin"
@@ -263,6 +267,15 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
             )
 
     @property
+    def kernel_codec_overflow_blocks(self) -> int:
+        """``MOE_CODEC_OVF_BLOCKS`` of the device build: ``codec_overflow_blocks`` for
+        ``return_codec="bf16"``, the default for ``"int8"`` (no overflow area there)."""
+
+        if self.return_codec == "bf16":
+            return self.codec_overflow_blocks
+        return CODEC_OVERFLOW_BLOCKS_DEFAULT
+
+    @property
     def variant(self) -> str:
         return (
             "fp8shared"
@@ -272,6 +285,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
 
 
 __all__ = [
+    "CODEC_OVERFLOW_BLOCKS_DEFAULT",
     "CODEC_OVERFLOW_BLOCKS_RANGE",
     "RETURN_CODECS",
     "SHARED_EXPERT_FP8_IN_KERNEL",

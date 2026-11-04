@@ -54,7 +54,7 @@ SHAPES = {
     "qwen38_flash": (2560, 640, 512, 10, 0),
 }
 # Activation kernel-config fields per shape; every other shape uses plain SwiGLU.
-ACTIVATIONS = {
+ACTIVATION_FIELDS = {
     "minimax_m3": {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
     "kimi_k3": {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
     "kimi_k3_e512": {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
@@ -205,7 +205,7 @@ def main() -> None:
                 shared=shared,
                 transport_table=_table_spec(args.table, world),
                 swiglu_limit=limit,
-                activation=ACTIVATIONS.get(shape),
+                activation_fields=ACTIVATION_FIELDS.get(shape),
                 return_codec=codec,
             )
             layer.warmup(

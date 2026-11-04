@@ -146,6 +146,35 @@ def test_config_codec_overflow_blocks_validation() -> None:
             Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(codec_overflow_blocks=bad)
 
 
+def test_int8_return_ignores_codec_overflow_blocks() -> None:
+    """The raw-overflow capacity only exists in the BF16 codec: under ``return_codec="int8"``
+    every ``codec_overflow_blocks`` value maps to the same device build."""
+
+    from flashinfer.moe_ep import FleetParams
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
+        Sm120Mxfp4Mxfp8CakeMegaKernelBackend,
+    )
+
+    fleet = FleetParams(
+        num_experts=256, token_hidden_size=4096, max_tokens_per_rank=4096
+    )
+
+    def params(**kwargs):
+        config = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(**kwargs)
+        return Sm120Mxfp4Mxfp8CakeMegaKernelBackend(config).kernel_params(4, fleet)
+
+    assert params(return_codec="int8", codec_overflow_blocks=64) == params(
+        return_codec="int8"
+    )
+    assert params(codec_overflow_blocks=64).codec_ovf_blocks == 64
+    assert (
+        Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(
+            return_codec="int8", codec_overflow_blocks=64
+        ).kernel_codec_overflow_blocks
+        == 16
+    )
+
+
 def test_config_return_codec_validation() -> None:
     for good in ("bf16", "int8"):
         assert (

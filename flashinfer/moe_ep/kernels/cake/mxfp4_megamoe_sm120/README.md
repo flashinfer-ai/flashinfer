@@ -150,8 +150,11 @@ on first use; with `FLASHINFER_DISABLE_JIT=1` an unpackaged one raises `MissingJ
 deployment with the same `max_tokens_per_rank` (rounded up to 128).
 
 **Provenance.** The source is the generator's preprocessor-selected merge of its traced
-emissions over the parameter space: for every parameter set the selected text is byte for
-byte the generator's emission at that point.  At the qualified DeepSeek-V4-Flash points
+emissions over the parameter space: for every parameter set the selected text is the
+generator's emission at that point up to the names of its numbered local temporaries, which
+are renamed to position-independent names (a hash of the lines they occur on) so that the same
+code under different switch values merges into one branch.  The split keeps part numbers
+stable across regenerations (a part takes the number of the most similar previous part).  At the qualified DeepSeek-V4-Flash points
 (E256 / H4096 / I2048 / top-k 6 / 8192 rows; EP 4 / 8 / 16; both variants; all four
 instances) the source differs from the qualified per-configuration kernels only by the copier
 instances' LSA-bound copier pool and by the wait deadline above (the qualified kernels capped
