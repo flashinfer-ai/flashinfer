@@ -7161,6 +7161,95 @@ def test_device_zero_dlogp_rows_skip(glm_weight, T, kind):
     )
 
 
+# One-chunk calls (1 to 4096 valid rows) under the skip at floor 0: an all-live chunk ("none"), an all-zero chunk
+# ("all"), one live row ("single"), one zero row ("one") and random / grouped zero rows; 1946 valid rows = T 2048 with
+# 5 % ignored rows, 3891 = T 4096.
+ZERO_DLOGP_ONE_CHUNK_CASES = [
+    (1, "none"),
+    (1, "all"),
+    (2, "one"),
+    (31, ("random", 0.5)),
+    (255, ("random", 0.166)),
+    (1025, "none"),
+    (1025, ("random", 0.166)),
+    (1100, ("random", 0.5)),
+    (1946, "none"),
+    (1946, "all"),
+    (1946, "single"),
+    (1946, "one"),
+    (1946, ("random", 0.166)),
+    (1946, ("random", 0.5)),
+    (1946, ("group", 0.5)),
+    (3891, ("random", 0.166)),
+    (4096, "none"),
+    (4096, ("random", 0.5)),
+]
+
+
+@pytest.mark.parametrize("rows, kind", ZERO_DLOGP_ONE_CHUNK_CASES, ids=str)
+def test_device_zero_dlogp_one_chunk_skip(glm_weight, monkeypatch, rows, kind):
+    """At floor 0 a one-chunk backward of ``rows`` valid rows (one ignored row makes the call compacted) runs the skip:
+    the partition runs on every call (binding and remembered binding) over every valid row, the backward plan has the
+    counted forms and one chunk, ``logp`` keeps the bits of the backward without the skip, the zero rows' and the
+    ignored rows' ``dX`` rows are exact ``+0``, the live ``dX`` rows are within one BF16 rounding of the backward
+    without the skip, ``dW`` keeps its bits from run to run and the outputs pass the deterministic suite's gates
+    against the FP64 oracle.  Without zero rows ``dW`` is bitwise the backward without the skip's (the partition keeps
+    the forward's row order); every valid row zero gives zero gradients."""
+    _require_zero_dlogp_skip()
+    T = rows + 1
+    base = _device_inputs(T, "ce", W=glm_weight, ignore_frac=0.0)
+    labels = base.labels.clone()
+    labels[T // 2] = -100
+    dlogp = base.dlogp
+    base = dataclasses.replace(
+        base,
+        labels=labels,
+        dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous(),
+    )
+    zero = _zero_dlogp_set(base, kind)
+    inp = _with_zero_dlogp(base, zero)
+    valid = inp.labels >= 0
+    live = valid & ~zero
+    assert int(valid.sum()) == rows
+    assert bool((inp.dlogp[live] != 0).all())
+    case = (rows, kind)
+    calls = _counted_partition(monkeypatch)
+    cake_backend.BINDING_CACHE.clear()
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(inp)
+        again = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    assert calls == [rows, rows], (case, calls)
+    (skip_plan, _), (shipped, _) = _logprob_bwd_plans()
+    assert skip_plan.dcnt and not shipped.dcnt, case
+    assert skip_plan.num_chunks == 1 and shipped.num_chunks == 1, case
+    for run in (nd, again):
+        assert _same_bits(run["logp"], plain["logp"]), case
+        assert not bool(_bits(run["dX"][zero | ~valid]).any()), case
+    assert _same_bits(again["dW"], nd["dW"]), case
+    if not bool(live.any()):
+        for run in (nd, again):
+            assert not bool(_bits(run["dX"]).any()), case
+            assert not bool(run["dW"].float().any()), case
+        return
+    if not bool(zero.any()):
+        assert _same_bits(nd["dW"], plain["dW"]), case
+    scale = float(plain["dX"][live].float().abs().max())
+    dx_diff = 0.0
+    for run in (nd, again):
+        diff = float((run["dX"][live].float() - plain["dX"][live].float()).abs().max())
+        assert diff <= scale * 2**-7, (case, diff, scale)
+        dx_diff = max(dx_diff, diff)
+        _check_against_references(run, inp, entry="logprob", ceiling=True)
+    dw_rel = float(rel_l2(nd["dW"].float(), plain["dW"].float()))
+    assert dw_rel <= GATE_TINY["dW_rel_l2"], (case, dw_rel)
+    print(
+        f"\nzero-dlogp one-chunk skip rows={rows} {kind} zero {int(zero.sum())}/{rows}: dW rel-L2 vs no skip "
+        f"{dw_rel:.2e}, dX max|skip - no skip| {dx_diff:.2e}"
+    )
+
+
 def test_device_zero_dlogp_skip_runs_the_partition_kernel(glm_weight, monkeypatch):
     """The backward with the skip forms its row order with the partition kernel, never the PyTorch reference, and gives
     the backward that forms it with the reference the same ``dW`` bits (the same row order) and the same exact ``+0``
@@ -10357,9 +10446,23 @@ TAU_ZERO_DLOGP_CASES = [
     (5000, ("random", 0.5), "distinct"),
 ]
 
+# one-chunk calls (5 % ignored rows): T 2048 = 1946 valid rows (all live, all zero, z 0.166 / 0.5), T 1158 = 1100,
+# T 4096 = 3891, T 64 = 61
+TAU_ZERO_DLOGP_ONE_CHUNK_CASES = [
+    (2048, "none", "distinct"),
+    (2048, "all", "distinct"),
+    (2048, ("random", 0.166), "distinct"),
+    (2048, ("random", 0.5), "scalar"),
+    (1158, ("random", 0.166), "distinct"),
+    (4096, ("random", 0.166), "distinct"),
+    (64, ("random", 0.5), "scalar"),
+]
+
 
 @pytest.mark.parametrize("dz_form", ("counted", "mixed"))
-@pytest.mark.parametrize("T, kind, form", TAU_ZERO_DLOGP_CASES, ids=str)
+@pytest.mark.parametrize(
+    "T, kind, form", TAU_ZERO_DLOGP_CASES + TAU_ZERO_DLOGP_ONE_CHUNK_CASES, ids=str
+)
 def test_device_temperature_zero_dlogp_rows_skip(
     glm_weight, monkeypatch, T, kind, form, dz_form
 ):
