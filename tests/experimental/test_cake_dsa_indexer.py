@@ -30,6 +30,7 @@ limitations under the License.
 # warning contract are covered by ``test_cake_dsa_indexer_api.py``.
 
 import itertools
+import json
 import os
 import re
 from types import SimpleNamespace
@@ -4427,3 +4428,174 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
         lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
         for kind in policy_for(arch).static_scan_kinds:
             assert kind in kinds and kind not in lsf_kinds, (arch, kind)
+
+
+# ---------------------------------------------------------------------------
+# Eager entry: nothing launched before the scan
+# ---------------------------------------------------------------------------
+
+# a static call on every architecture (4 queries, split plan) and a call that draws tickets from a caller-owned buffer
+_EAGER_GEOMETRIES = (([4], [22018], 2048), ([600, 400], [600, 12000], 1024))
+
+
+def _device_ops(fn, tmp_path, name: str) -> list[str]:
+    """The categories (``kernel`` / ``gpu_memset`` / ``gpu_memcpy``) of the device activities ``fn`` issues, in start
+    order, from a profiler trace of one call (the stream is synchronized inside the trace)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    path = tmp_path / f"{name}.json"
+    prof.export_chrome_trace(str(path))
+    events = json.loads(path.read_text())["traceEvents"]
+    ops = sorted(
+        (
+            e
+            for e in events
+            if e.get("ph") == "X"
+            and e.get("cat") in ("kernel", "gpu_memset", "gpu_memcpy")
+        ),
+        key=lambda e: e["ts"],
+    )
+    assert ops, "the profiler recorded no device activity"
+    return [e["cat"] for e in ops]
+
+
+def _expected_ops(runner) -> list[str]:
+    """The device activities of one run: the scan binding's ``zero_region`` memset where it zeroes bytes, then one
+    kernel per launch."""
+    # a torch view, or the device's empty tvm_ffi region
+    region = _scan_zero_region(runner)
+    memset = ["gpu_memset"] if torch.Size(tuple(region.shape)).numel() else []
+    return memset + ["kernel"] * len(runner.launches)
+
+
+class _EagerCall:
+    """One eager call with a caller-owned workspace and outputs; records the runner of every call."""
+
+    def __init__(self, monkeypatch, inputs, device):
+        self.inputs = inputs
+        self.workspace = torch.empty(
+            _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+        )
+        self.indices = torch.empty(
+            (inputs.num_queries, inputs.top_k), dtype=torch.int32, device=device
+        )
+        self.scores = torch.empty(
+            (inputs.num_queries, inputs.top_k), dtype=torch.float32, device=device
+        )
+        self.runners = []
+        prepare = cake_backend._prepare_runner
+
+        def recording(*args, **kwargs):
+            runner = prepare(*args, **kwargs)
+            self.runners.append(runner)
+            return runner
+
+        monkeypatch.setattr(cake_backend, "_prepare_runner", recording)
+
+    def __call__(self):
+        i = self.inputs
+        return cake_backend.dsa_indexer_det_topk(
+            i.q,
+            i.k,
+            i.w,
+            i.cu_seqlens_q,
+            i.cu_seqlens_k,
+            **i.kwargs(),
+            workspace_buffer=self.workspace,
+            indices=self.indices,
+            scores=self.scores,
+        )
+
+
+def test_offsets_placeholder_is_one_never_written_tensor_per_device():
+    """A call without ``q_causal_offsets`` passes the device's offsets placeholder (one int64 element, ``has_offsets``
+    = 0): the same tensor for every runner and eager call of the device, never written by any launch."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    holder = cake_backend._offsets_placeholder(device.index)
+    assert holder is cake_backend._offsets_placeholder(device.index)
+    assert holder.dtype == torch.int64 and holder.numel() == 1
+    assert holder.device == device
+    before = holder.clone()
+    for n, (seg_q, seg_k, top_k) in enumerate(_EAGER_GEOMETRIES):
+        inputs = ref.make_random_inputs(
+            seg_q, seg_k, top_k=top_k, seed=93 + n, device="cuda"
+        )
+        assert inputs.q_causal_offsets is None
+        runner = _prepare(inputs)
+        assert runner.tensors["q_offsets"] is holder
+        expected = _cloned(runner())
+        for _ in range(2):
+            assert ref.same_bits(runner(), expected)
+            assert ref.same_bits(_run(inputs), expected)
+        torch.cuda.synchronize()
+        _judge_ok(expected, ref.select_reference(inputs))
+    assert torch.equal(holder, before)
+
+
+@pytest.mark.parametrize("geometry", range(len(_EAGER_GEOMETRIES)))
+def test_eager_entry_launches_nothing_before_its_scan(monkeypatch, tmp_path, geometry):
+    """One eager call issues exactly its runner's launches, the scan first (after its binding's ``zero_region``
+    memset where that zeroes bytes): no fill or copy of its own before them."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    seg_q, seg_k, top_k = _EAGER_GEOMETRIES[geometry]
+    inputs = ref.make_random_inputs(
+        seg_q, seg_k, top_k=top_k, seed=95 + geometry, device="cuda"
+    )
+    call = _EagerCall(monkeypatch, inputs, device)
+    expected = _cloned(call())  # loads the programs and makes the device's placeholders
+    ops = _device_ops(call, tmp_path, f"eager{geometry}")
+    runner = call.runners[-1]
+    assert ops == _expected_ops(runner), (ops, runner.stages)
+    assert runner.tensors["q_offsets"] is cake_backend._offsets_placeholder(
+        device.index
+    )
+    assert ref.same_bits((call.indices, call.scores), expected)
+
+
+@pytest.mark.parametrize("first_use", ["before_capture", "in_capture"])
+def test_eager_entry_graph_capture_holds_only_the_runner_launches(
+    monkeypatch, tmp_path, first_use
+):
+    """A CUDA graph capturing one eager call holds exactly the runner's launches, whether the device's offsets
+    placeholder was made before the capture or first needed inside it (then the capture's own tensor, not kept);
+    replays and later eager calls stay bit-exact, also after new values are copied into the bound inputs."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    seg_q, seg_k, top_k = _EAGER_GEOMETRIES[0]
+    inputs = ref.make_random_inputs(seg_q, seg_k, top_k=top_k, seed=97, device="cuda")
+    call = _EagerCall(monkeypatch, inputs, device)
+    expected = _cloned(call())  # loads the programs and makes the device's placeholders
+    kept = cake_backend._offsets_placeholder(device.index)
+    if first_use == "in_capture":
+        monkeypatch.setattr(cake_backend, "_OFFSETS_PLACEHOLDERS", {})
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    runner = call.runners[-1]
+    if first_use == "in_capture":
+        assert runner.tensors["q_offsets"] is not kept
+        # made during the capture: not kept
+        assert cake_backend._OFFSETS_PLACEHOLDERS == {}
+    else:
+        assert runner.tensors["q_offsets"] is kept
+    ops = _device_ops(graph.replay, tmp_path, f"graph_{first_use}")
+    assert ops == _expected_ops(runner), (ops, runner.stages)
+    assert ref.same_bits(captured, expected)
+    fresh = ref.make_random_inputs(seg_q, seg_k, top_k=top_k, seed=98, device="cuda")
+    inputs.q.copy_(fresh.q)
+    inputs.k.copy_(fresh.k)
+    inputs.w.copy_(fresh.w)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = _cloned(captured)
+    assert ref.same_bits(replayed, _run(fresh))
+    assert ref.same_bits(call(), replayed)
+    torch.cuda.synchronize()
+    _judge_ok(replayed, ref.select_reference(inputs))

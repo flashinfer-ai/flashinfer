@@ -728,6 +728,8 @@ def bind_program(
 _FFI_DEVICES: dict[int, Any] = {}
 _EMPTY_REGIONS: dict[int, Any] = {}
 _TICKET_PLACEHOLDERS: dict[int, Any] = {}
+_QUIET_SCAN_ARGS: dict[int, dict[str, Any]] = {}
+_OFFSETS_PLACEHOLDERS: dict[int, torch.Tensor] = {}
 # the ticket block a ``TicketWord`` argument points at: the ticket word (the low u32 of its first 8 bytes) and padding
 TICKET_BLOCK_BYTES = 16
 # the bytes a binding's ``zero_region`` zeroes to restore the ticket word of a block
@@ -757,6 +759,31 @@ def _ticket_placeholder(index: int) -> Any:
             ).view(torch.uint32)
         )
     return block
+
+
+def _quiet_scan_args(index: int) -> dict[str, Any]:
+    """The ticket arguments of a scan launch that zeroes nothing and draws from no block of its own (a static call, a
+    ``static_scan_kinds`` program, a program drawing from a tail it does not share): the device's empty
+    ``zero_region`` and ``TicketWord`` placeholder, one dict per device, so such a call adds them with one lookup."""
+    args = _QUIET_SCAN_ARGS.get(index)
+    if args is None:
+        args = _QUIET_SCAN_ARGS[index] = {
+            "zero_region": _empty_region(index),
+            "TicketWord": _ticket_placeholder(index),
+        }
+    return args
+
+
+def _offsets_placeholder(index: int) -> torch.Tensor:
+    """The ``q_offsets`` of a call without causal offsets (``has_offsets = 0``: no program dereferences it): one
+    int64 tensor per device, allocated without a device operation and never written, so such a call launches nothing
+    before its scan.  Made during a CUDA graph capture, it is the call's own (the capture's pool) and not kept."""
+    holder = _OFFSETS_PLACEHOLDERS.get(index)
+    if holder is None:
+        holder = torch.empty(1, dtype=torch.int64, device=f"cuda:{index}")
+        if not torch.cuda.is_current_stream_capturing():
+            _OFFSETS_PLACEHOLDERS[index] = holder
+    return holder
 
 
 def _ffi_stream_context(index: int):
@@ -1018,12 +1045,8 @@ def _prepare_runner(
     workspace_bytes = int(choice.workspace_bytes)
     # the ticket-tail decision (see the comment where the tail is passed) is host arithmetic only: it is made here,
     # before the call's first device operation, so an eager call does not hold the stream for it
-    tail_at, tail_static, drawing = -1, False, False
+    tail_at, tail_static, drawing, reads_word = -1, False, False, False
     tail_skips = ticket_tail_skips(arch)
-    # the scan program draws from its TicketWord argument instead of the tail (registry ``ticket_arg_arches``)
-    reads_word = (
-        num_queries > 0 and num_keys > 0 and reads_ticket_word(programs["scan"], arch)
-    )
     if (
         num_queries > 0
         and num_keys > 0
@@ -1032,6 +1055,8 @@ def _prepare_runner(
     ):
         tail_static = ticket_static_path(choice)
         drawing = not tail_static
+        # the scan program draws from its TicketWord argument instead of the tail (registry ``ticket_arg_arches``)
+        reads_word = reads_ticket_word(programs["scan"], arch)
         if not reads_word:
             tail_at = workspace_bytes - TICKET_TAIL_BYTES
     caller_owned_workspace = workspace_buffer is not None
@@ -1054,10 +1079,10 @@ def _prepare_runner(
         "W": w,
         "cu_seqlens_q": cu_seqlens_q,
         "cu_seqlens_k": cu_seqlens_k,
-        # a never-dereferenced placeholder when no offsets are supplied (has_offsets = 0)
+        # the device's never-dereferenced placeholder when no offsets are supplied (has_offsets = 0): no fill per call
         "q_offsets": q_causal_offsets
         if q_causal_offsets is not None
-        else torch.zeros(1, dtype=torch.int64, device=device),
+        else _offsets_placeholder(device_index),
         "Indices": indices
         if indices is not None
         else torch.empty((num_queries, int(top_k)), dtype=torch.int32, device=device),
@@ -1099,15 +1124,19 @@ def _prepare_runner(
     # the ticket tail the scan binding zeroes right before every scan launch (``zero_region``): a caller-owned tail
     # the call draws tickets from; any other call passes the device's empty region (nothing zeroed, no per-call view)
     shared_tail = caller_owned_workspace and tail_at >= 0 and not tail_static
-    zero_region = (
-        flat[tail_at:workspace_bytes] if shared_tail else _empty_region(device_index)
-    )
     # the scan's TicketWord: a program that reads it and draws gets a block no other work writes -- the runner's own
     # (zeroed here, once) or, for the eager entry's one launch, the first bytes of the workspace's tail, whose ticket
-    # word the scan binding zeroes right before the launch; any other launch gets the device's placeholder
+    # word the scan binding zeroes right before the launch; any other launch gets the device's placeholder.  A call
+    # that neither shares its tail nor draws from a block (every static call) passes the device's quiet pair as is.
     ticket_block: Optional[torch.Tensor] = None
-    ticket_word = _ticket_placeholder(device_index)
-    if reads_word and drawing:
+    scan_ticket = _quiet_scan_args(device_index)
+    if shared_tail:
+        scan_ticket = {
+            "zero_region": flat[tail_at:workspace_bytes],
+            "TicketWord": scan_ticket["TicketWord"],
+        }
+    elif reads_word and drawing:
+        zero_region = scan_ticket["zero_region"]
         if one_shot:
             block_at = workspace_bytes - TICKET_TAIL_BYTES
             ticket_block = flat[block_at : block_at + TICKET_BLOCK_BYTES]
@@ -1117,16 +1146,16 @@ def _prepare_runner(
                 TICKET_BLOCK_BYTES, dtype=torch.uint8, device=device
             )
         ticket_word = ticket_block.view(torch.uint32)
-    if reads_word and drawing and ticket_word is _ticket_placeholder(device_index):
-        raise RuntimeError(
-            f"{programs['scan']} ({arch}) draws from its TicketWord argument but was given the shared placeholder"
-        )
+        if ticket_word is _ticket_placeholder(device_index):
+            raise RuntimeError(
+                f"{programs['scan']} ({arch}) draws from its TicketWord argument but was given the shared placeholder"
+            )
+        scan_ticket = {"zero_region": zero_region, "TicketWord": ticket_word}
     ticket_restore: Optional[_Launch] = None
     if num_queries > 0 and num_keys > 0:
         values: dict[str, Any] = dict(t)
         values.update(scalars)
-        values["zero_region"] = zero_region
-        values["TicketWord"] = ticket_word
+        values.update(scan_ticket)
         launches.append(bind_program(programs["scan"], arch, "scan", values, grid))
         stages.append("scan")
         if ticket_block is not None and not one_shot:
@@ -1166,7 +1195,7 @@ def _prepare_runner(
     # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it.
     # (``tail_at`` / ``tail_static`` were decided above, before the first device operation; a call launches
     # iff it has queries and keys.)
-    tail_view = zero_region if shared_tail else None
+    tail_view = scan_ticket["zero_region"] if shared_tail else None
     if tail_at >= 0 and not tail_static and not caller_owned_workspace:
         tail_view = flat[tail_at:workspace_bytes]
         tail_view.zero_()
@@ -1309,7 +1338,9 @@ def dsa_indexer_det_topk(
     ticket word the scan draws from is zeroed once per call by the scan
     binding, right before the scan launch: the ticket tail of a caller-owned
     ``workspace_buffer``, or the first 8 bytes of the tail of either workspace
-    where the scan program reads its ``TicketWord`` argument.
+    where the scan program reads its ``TicketWord`` argument.  Nothing else is
+    launched before the scan: a call without ``q_causal_offsets`` passes the
+    device's offsets placeholder, which no program reads.
     """
     runner = _prepare_runner(
         q,
