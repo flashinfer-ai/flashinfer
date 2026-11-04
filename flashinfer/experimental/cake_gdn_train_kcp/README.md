@@ -198,13 +198,17 @@ The packed GDN training routes come in four combinations:
   output walk `kcp_fwdh_out` (#2+5 under "Kernel structure") at each of its
   tape walks in place of the #2 tape walk and #5: each chunk's output comes
   from the walk's own `h` snapshot and `v_new` operand, and the forward
-  allocates neither tape.  Its workspace peak is #1's.  The split form's
-  tape walk holds the `h` / `v_new` tapes in place of #1's `akk` / `gcum`
-  (30,528 B per token more at `HV = 48`), less the c1 send pool and its
-  `M_f^T` tiles on a rank whose group exchanges (released before that walk):
-  the split form peaks above #1 by that difference when it is positive, else
-  at #1 too (`gdn_workspace_layout_kcp(...)` reports both as `forward` and
-  `forward_split`).  The output and the saved set are
+  allocates neither tape.  Its workspace peak is #1's.  Under
+  `graph="off"` the split form's tape walk holds the `h` / `v_new` tapes in
+  place of #1's `akk` / `gcum` (30,528 B per padded row more at `HV = 48`), less
+  the c1 send pool and its `M_f^T` tiles on a rank whose group exchanges
+  and, in a forward without a saved set, less the arena `qk_rstd` (each
+  released before that walk): the split form peaks above #1 by that
+  difference when it is positive, else at #1 too.  Under `graph="replay"`
+  nothing is released, and the split form peaks above #1 by the `h` /
+  `v_new` tapes (36,864 B per padded row at `HV = 48`).
+  `gdn_workspace_layout_kcp(...)` reports both as `forward` and
+  `forward_split`.  The output and the saved set are
   bitwise those of the split form.  `save_mode="full"`,
   `boundary_mode="replay"`, a forward that hands its tapes to the kept-tape
   backward, a re-run that leaves #5 out and the backward's replayed forward
@@ -274,8 +278,8 @@ With `s = HV * 128 * 128 * 4` bytes (3 MiB at `HV = 48`), `s_owner = Hg *
 128 * 128 * 4` on a rank that owns heads (`Hg = ceil(HV / W)`), `s_pad =
 n_owners * s_owner` (`= s` when `HV % Hg == 0`), `n_in(r)` the rank's
 fragments with a predecessor on another rank, `n_out(r)` those with a
-successor and `N_out` the group's (the per-token figures are bytes per padded
-token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
+successor and `N_in` / `N_out` the group's totals (the per-token figures are
+bytes per padded token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
 
 | item | `save_mode="full"` | `save_mode="light"` | bytes per rank |
 |---|---|---|---|
@@ -311,7 +315,9 @@ Two replays exist, and they differ:
   recompute re-runs the whole module forward -- convolution halo, chunk
   preparation, offset and transfer walks, exchange, merge, tape walk and
   output -- and the backward then proceeds as in the saved form (around a
-  `"light"` call with `boundary_mode="saved"`, with the light replay on top).
+  `"light"` call with `boundary_mode="saved"`, with the light replay on top
+  unless `reuse_recompute_tapes` keeps the recompute's tapes for it; with
+  `recompute_output="auto"` the re-run may leave the output program out).
   Under `boundary_mode="replay"` the backward itself replays the whole forward
   in either `save_mode`; it is the minimum-memory option.
 
@@ -409,25 +415,37 @@ concatenate.  Autograd refuses an in-place change to the views while `qkv`
 requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 
 ```
-gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
-    c1_send = 2 * s * n_out(r)      c2_recv = s * n_in(r)      b2_recv = s * n_out(r)
-    b1_send = s * n_in(r) * (1 if save_transfer else 2)
-    c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
+gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C=None, save_transfer=True, boundary_mode="saved")
+    -> this rank's {c1, c2, b1, b2, halo_fwd, halo_bwd: {send, recv}; B1, B2, B3 (the boundary totals); b1_d, b1_m,
+    b1_design, b1_replay; padding; the crossing counts and state bytes}
+    c1 send = 2 * s_pad * n_out(r)      c2 recv = s_pad * n_in(r)      b2 recv = s_pad * n_out(r)
+    b1 send = s_pad * n_in(r), twice that with the re-sent maps (boundary_mode="saved", save_transfer=False)
+    on an owner: c1 recv = 2 * s_owner * N_out      c2 send = s_owner * N_in      b2 send = s_owner * N_out
+    b1 recv = s_owner * N_in (twice that with the re-sent maps)      halo = rows(r) * C * 2 forward, * 4 backward
 gdn_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
     C=None, P=None, use_qk_l2norm_in_kernel=False) -> per rank (the table above)
-gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None, graph="off", save_for_backward=True)
+gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, backward=True,
+    with_conv=True, C=None, P=None, group_reduce="fused", reuse_recompute_tapes=None, use_qk_l2norm_in_kernel=False,
+    fused_walks=1, graph="off", save_for_backward=True)
     -> per rank: the most the caller-held workspace binds in the forward or the backward.  Covered: exchange="a2a"
     under the shipped wait_first schedule, graph "off" or "replay", with or without a saved set, on a workspace
     created empty (WorkspaceKcp()): its first forward and the backward that follows on the arena that forward left
     (save_for_backward=False: with backward=True the replay a saved=None backward runs, with backward=False a
     forward-only call).  A backward leaves its tapes bound, so every later backward on the same workspace (another
-    layer, the next step) binds the graph="replay" figure (measured for the replay form) and every later forward
-    more than the first and less than that figure: size a reused workspace with graph="replay".
-    WorkspaceKcp(ctx, H_qk, HV, device) sizes every pool up front (the ring pools, c2_send, the c1_recv / stage_m
-    pools a saving call replaces, the b1 / b2 pools) and binds them from #1 on.  Not covered: exchange="ring" (also
-    binds ring_out / ring_in, max(n_in(r), n_out(r)) states each, and keeps the forward's c2 send pool and its c1
-    send pool with the M_f^T tiles through the tape walk), the schedule="overlap" test knob and the kept form's
-    recompute under a RecomputeHandleKcp (its c1 send pool stays bound through its tape walk; the replay form's
+    layer, the next step) binds the graph="replay" figure (measured for the replay form; at most that figure right
+    after the fused forward of a save_for_backward=False call, light with a saved boundary, which released h /
+    v_new: its replayed forward binds them again only after the c1 release) and every later forward more than the
+    first (the backward's tapes stay bound; under graph="replay" its b1 / b2 pools too) and at most that figure
+    (equal to it under graph="replay"): size a reused workspace with graph="replay".
+    WorkspaceKcp(ctx, H_qk, HV, device) sizes every pool up front at the plan's P with the fused walks (the ring
+    pools, c2_send, the c1_recv / stage_m pools a saving call replaces, the b1 / b2 pools; for a call with a smaller
+    segments override or fused_walks=0 also the plan's larger staging, carry and M_f^T pools) and binds them from #1
+    on.  Not covered: exchange="ring" (also binds ring_out / ring_in, max(n_in(r), n_out(r)) states each, and its
+    forward -- also the forward a replay backward re-runs -- keeps the c2 send pool and the c1 send pool with the
+    M_f^T tiles through the tape walk: up to fwd.c1_send + fwd.c1_send_mf more, plus the c2 send pool (bwd.c2_send)
+    in the forward), the schedule="overlap" test knob and the kept form's recompute under a RecomputeHandleKcp (a
+    handle forces save_transfer=False; with the query given save_transfer=False too, its c1 send pool stays bound
+    through its tape walk, up to fwd.c1_send + fwd.c1_send_mf above bwd.phase.recompute_forward; the replay form's
     figure bounds it).  The figures plan a workspace: no call checks a workspace against them (a caller-held
     WorkspaceKcp grows any pool or tape a call needs).
     graph="off": the forward is the larger of #1 (the pools, the eight tapes #1 writes -- none with save_mode="full"
@@ -435,17 +453,19 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None, gr
     the tape walk (akk / gcum gone; the split form, also `forward_split` of the layout, adds h / v_new; with a
     crossing fragment in the group the c1 send pool is gone); the eager forward's c2 send plane is a fresh tensor.
     S_in is never a workspace term: a call without a saved set also holds its fresh n_in(r) * s_pad bytes from the
-    c1 release to the end of the forward, or to #8 of the replay backward.  The backward is the largest of its
-    phases (the exchange, the adjoint tape walk, the end state; without a saved set also the replayed forward before
-    its c1 send pool goes).  The default (`None`, i.e. `"auto"`) reports the replay form, the bound of both forms, in
-    which the ten forward tapes are workspace; `reuse_recompute_tapes=True` gives the kept-tape figure (light
-    save_mode, saved set), in which they are the recompute forward's hand-off tensors outside the workspace, with its
-    M_seg^T staging plane at P > 1 without save_transfer (`gdn_workspace_layout_kcp` lists them as `bwd.kept_tapes`
-    and the total as `backward_transient`).  graph="replay": nothing is released, so the forward is every forward
-    pool and tape it writes (no tape with save_mode="full" and a saved set) and the backward every backward pool, the
-    ten light tapes (none with save_mode="full" and a saved set) and every backward tape; with
-    use_qk_l2norm_in_kernel both add qn / kn and the arena qk_rstd where #1 writes it (a forward without a saved
-    set, a backward that re-runs #1).
+    c1 release to the end of the forward, or to #8 of the replay backward (under graph="replay" to the end of the
+    backward).  The backward is the largest of its phases (the exchange, the adjoint tape walk, the end state;
+    without a saved set also the replayed forward before its c1 send pool goes: the eight tapes #1 re-writes, with
+    h / v_new only after a split forward).  The default (`None`, i.e. `"auto"`) reports the replay form, in which the
+    ten forward tapes are workspace (no forward tape with save_mode="full" and a saved set) and whose workspace
+    bounds the kept form's; `reuse_recompute_tapes=True` gives the kept-tape figure (light save_mode, saved set), in
+    which they are the recompute forward's hand-off tensors outside the workspace, with its M_seg^T staging plane at
+    P > 1 without save_transfer (`gdn_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as
+    `backward_transient`, which that plane can put above the replay form's).  graph="replay": nothing is released,
+    so the forward is every forward pool and tape it writes (no tape with save_mode="full" and a saved set) and the
+    backward every backward pool, the ten light tapes (none with save_mode="full" and a saved set) and every
+    backward tape; with use_qk_l2norm_in_kernel both add qn / kn and the arena qk_rstd where #1 writes it (a
+    forward without a saved set, a backward that re-runs #1).
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); graph=,
     save_for_backward= and fused_walks= are keywords of this package's query only (the deterministic twin's query

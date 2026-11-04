@@ -1541,6 +1541,7 @@ def test_byte_queries(W) -> None:
         for hq in (1, 3, 6):
             other = gb.gdn_comm_bytes_kcp(ctx, H_qk=hq, HV=HV, C=C_CONV)
             assert all(other[k] == cb[k] for k in ("c1", "c2", "b1", "b2"))
+        planes = 0  # kept-form rows that hand the M_seg^T plane over
         for save_mode in gb.SAVE_MODES:
             for boundary_mode in gb.BOUNDARY_MODES:
                 for save_transfer in (True, False):
@@ -1605,8 +1606,7 @@ def test_byte_queries(W) -> None:
                     assert ws["forward"] == max(fwd_phases.values())
                     assert all(v <= fwd_parts for v in fwd_phases.values())
                     # the backward is the largest of its lifetime phases, each below the sum of what the arena
-                    # can hold; the kept form lists the hand-off tensors apart and both forms need the same
-                    # transient memory besides the saved set
+                    # can hold; the kept form lists the hand-off tensors apart (its transient memory: below)
                     phases = {k: v for k, v in ws.items() if k.startswith("bwd.phase.")}
                     parts = sum(
                         v
@@ -1620,48 +1620,57 @@ def test_byte_queries(W) -> None:
                         phases[f"bwd.phase.{p}"] <= parts
                         for p in ("exchange", "walk", "end")
                     )
-                    kept_ws, replay_ws = (
-                        gb.gdn_workspace_layout_kcp(
-                            ctx,
-                            H_qk=H_qk,
-                            HV=HV,
-                            save_mode=save_mode,
-                            boundary_mode=boundary_mode,
-                            save_transfer=save_transfer,
-                            C=C_CONV,
-                            reuse_recompute_tapes=form,
-                        )
-                        for form in (True, False)
-                    )
                     tapes = ctx.NC_pad * HV * (32768 + 4) + ctx.R * HV * (
                         3 * 256 + 2 * 128 + 3 * 4
                     )
                     # the kept-tape form exists for the light form of a saved boundary only (no hand-off under a
-                    # replay boundary); at P > 1 without save_transfer it also hands the M_seg^T plane over
+                    # replay boundary); at P > 1 without save_transfer it also hands the M_seg^T plane over (the
+                    # plan's P and the override P = 2, where every rank has the plane)
                     light_saved = save_mode == "light" and boundary_mode == "saved"
-                    stage_plane = (
-                        ctx.n_frag * hp.P * s
-                        if (light_saved and hp.P > 1 and not save_transfer)
-                        else 0
-                    )
-                    assert kept_ws["bwd.kept_tapes"] == (
-                        tapes + stage_plane if light_saved else 0
-                    )
-                    if not light_saved:
-                        assert kept_ws == replay_ws
-                    assert replay_ws["bwd.kept_tapes"] == 0
-                    assert replay_ws["backward_transient"] == replay_ws["backward"]
-                    # both forms need the same transient bytes besides the saved set, but the kept form holds the
-                    # handed-over plane through the adjoint tape walk and #8 (the replay drops its staging before)
-                    assert kept_ws["backward_transient"] == (
-                        max(
-                            replay_ws["bwd.phase.exchange"],
-                            max(replay_ws["bwd.phase.walk"], replay_ws["bwd.phase.end"])
-                            + stage_plane,
+                    for P_q in (None, 2):
+                        kept_ws, replay_ws = (
+                            gb.gdn_workspace_layout_kcp(
+                                ctx,
+                                H_qk=H_qk,
+                                HV=HV,
+                                save_mode=save_mode,
+                                boundary_mode=boundary_mode,
+                                save_transfer=save_transfer,
+                                C=C_CONV,
+                                P=P_q,
+                                reuse_recompute_tapes=form,
+                            )
+                            for form in (True, False)
                         )
-                        if light_saved
-                        else replay_ws["backward"]
-                    )
+                        P_eff = hp.P if P_q is None else P_q
+                        stage_plane = (
+                            ctx.n_frag * P_eff * s
+                            if (light_saved and P_eff > 1 and not save_transfer)
+                            else 0
+                        )
+                        planes += stage_plane > 0
+                        assert kept_ws["bwd.kept_tapes"] == (
+                            tapes + stage_plane if light_saved else 0
+                        )
+                        if not light_saved:
+                            assert kept_ws == replay_ws
+                        assert replay_ws["bwd.kept_tapes"] == 0
+                        assert replay_ws["backward_transient"] == replay_ws["backward"]
+                        # both forms need the same transient bytes besides the saved set, but the kept form holds
+                        # the handed-over plane through the adjoint tape walk and #8 (the replay drops its staging
+                        # before)
+                        assert kept_ws["backward_transient"] == (
+                            max(
+                                replay_ws["bwd.phase.exchange"],
+                                max(
+                                    replay_ws["bwd.phase.walk"],
+                                    replay_ws["bwd.phase.end"],
+                                )
+                                + stage_plane,
+                            )
+                            if light_saved
+                            else replay_ws["backward"]
+                        )
                     assert (
                         ws["bwd.dv_new"] == 0 and ws["bwd.dv_intra"] == ctx.R * HV * 256
                     )  # dv_new is stored in place of dv_intra
@@ -1711,6 +1720,7 @@ def test_byte_queries(W) -> None:
                             and layout["c1_recv"] == 0
                             and ws["bwd.c1_send"] == cb["c1"]["send"]
                         )
+        assert planes > 0  # the P = 2 kept-form rows without save_transfer
         light, full = (
             gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, save_mode=m, C=C_CONV)
             for m in ("light", "full")
@@ -4766,7 +4776,7 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
     the form -- the kept-tape form ends with the re-adopted forward tapes (the fused set ``aqk`` / ``qscale``; the
     split forward's four with ``fused_o=0``) beside the backward tapes (the ten kept tapes are hand-off tensors outside
     the workspace, ``bwd.kept_tapes``), the replay form holds the ten light tapes through the backward; both forms need
-    the same transient bytes."""
+    the same transient bytes here (``save_transfer`` on, no norm)."""
     kcp, ctx, ops = _ckpt_setup()
     gb = _package("cake_bytes")
     H_qk, HV = 2, 6
@@ -5579,14 +5589,22 @@ _POOL_TERMS = {
 
 
 def _pool_peak_workspace(kcp):
-    """A :class:`_PeakWorkspace` that also records the largest size of every pool (``pool_max``) and the bytes it
-    binds when the adjoint tape walk first binds ``dh_tape`` (``walk_bytes``: the backward's walk phase)."""
+    """A :class:`_PeakWorkspace` that also records the largest size of every pool (``pool_max``), the bytes it
+    binds when the adjoint tape walk first binds ``dh_tape`` (``walk_bytes``: the backward's walk phase) and the
+    bytes it binds just before ``c1_send`` is first released (``c1_release_bytes``: in a replay backward the replayed
+    forward's moment before its c1 release, the backward's ``replay_forward`` phase)."""
 
     class Pools(type(_PeakWorkspace(kcp))):
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             self.pool_max: dict[str, int] = {}
             self.walk_bytes: int | None = None
+            self.c1_release_bytes: int | None = None
+
+        def release_pool(self, name):
+            if name == "c1_send" and self.c1_release_bytes is None:
+                self.c1_release_bytes = self.bytes
+            return super().release_pool(name)
 
         def _upd(self):
             super()._upd()
@@ -5669,6 +5687,10 @@ _SHORT_CU = (0, 100, 228)
     + [
         (2, 2, {"boundary_mode": "replay"}, 1, _SHORT_CU),
         (2, 2, {"save_for_backward": False, "save_mode": "full"}, 1, _SHORT_CU),
+        # the replay backward after a fused forward (light, saved boundary, no saved set): its replayed forward
+        # binds #1's eight tapes only before the c1 release (measured at that release; the backward peaks at the
+        # adjoint exchange here)
+        (2, 2, {"save_for_backward": False}, 1, _SHORT_CU),
     ],
 )
 def test_workspace_layout_follows_the_arena_of_every_rank(
@@ -5687,7 +5709,9 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
     ``graph="replay"`` (the first call of a key: no buffer is released), also with the norm; calls without a saved
     set (``save_for_backward=False``) and the ``saved=None`` replay backward after them; the in-kernel norm with and
     without a saved set; a short pack where the split forward peaks at #1 and the replay boundary's backward at its
-    replayed forward."""
+    replayed forward.  On every rank of a group that exchanges, a replay backward under ``graph="off"`` binds
+    ``bwd.phase.replay_forward`` just before its replayed forward releases the c1 send pool (after a fused forward
+    without a saved set: #1's eight tapes, no ``h`` / ``v_new``)."""
     kcp = _package("cake_kcp")
     H_qk, HV = CKPT_HEADS
     part = gp.partition_kcp(torch.tensor(list(cu), dtype=torch.int64), W, "contiguous")
@@ -5727,12 +5751,13 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             else sum(t.numel() * t.element_size() for t in saved.tensors()),
         }
         # without a saved set (saved=None) the backward is the replay
-        ws.peak, ws.pool_max, ws.walk_bytes = 0, {}, None
+        ws.peak, ws.pool_max, ws.walk_bytes, ws.c1_release_bytes = 0, {}, None, None
         kcp.chunk_gdn_bwd_kcp(*args, ctxs[r], loc["dout"], saved=saved, **kw)
         got[r].update(
             backward=ws.peak,
             bwd_pools=dict(ws.pool_max),
             walk=ws.walk_bytes,
+            c1_release=ws.c1_release_bytes,
             end=ws.bytes,
         )
 
@@ -5751,6 +5776,9 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
         for k, v in opts.items()
         if k not in ("graph", "save_for_backward", "use_qk_l2norm_in_kernel")
     }
+    # some fragment crosses: every rank runs the c1 exchange
+    exchanges = sum(c.n_out for c in ctxs) > 0
+    replay_c1 = 0
     for r, c in enumerate(ctxs):
         q = dict(H_qk=H_qk, HV=HV, P=segments, with_conv=False, **q_opts)
         l2n = dict(use_qk_l2norm_in_kernel=opts.get("use_qk_l2norm_in_kernel", False))
@@ -5780,6 +5808,13 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             norm = sum(lay.get(f"bwd.{k}", 0) for k in ("qn", "kn", "qk_rstd"))
             assert got[r]["walk"] == lay["bwd.phase.walk"], (r, got[r]["walk"])
             assert got[r]["end"] == lay["bwd.phase.end"] - norm, (r, "end")
+            if exchanges and "bwd.phase.replay_forward" in lay:
+                # the replayed forward's moment just before its c1 send pool goes (every rank of the group)
+                assert got[r]["c1_release"] == lay["bwd.phase.replay_forward"], (
+                    r,
+                    got[r]["c1_release"],
+                )
+                replay_c1 += 1
         if with_set:
             assert got[r]["saved"] == gb.gdn_saved_bytes_kcp(c, **q, **l2n), (r, got[r])
         else:
@@ -5812,12 +5847,16 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
                     **q_opts,
                     **l2n,
                 )
+    # every replay backward (no saved set kept) of an exchanging group under graph="off" measured that moment
+    replays = not with_set or opts.get("boundary_mode") == "replay"
+    graph_off = opts.get("graph", "off") == "off"
+    assert replay_c1 == (W if exchanges and replays and graph_off else 0), replay_c1
 
 
 @pytest.mark.parametrize(
     "opts",
-    [{}, _FULL_NO_ST, {"boundary_mode": "replay"}],
-    ids=["light", "full", "replay"],
+    [{}, _FULL_NO_ST, {"boundary_mode": "replay"}, {"save_for_backward": False}],
+    ids=["light", "full", "replay", "no_saved_set"],
 )
 def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
     monkeypatch, opts
@@ -5825,7 +5864,13 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
     """Three forward + backward steps of the explicit entries on one caller-held workspace per rank (two ranks, a
     crossing fragment, ``P = 2``): the first step binds the ``graph="off"`` figures; the arena keeps the tapes the
     backward bound, so every later backward binds the ``graph="replay"`` figure exactly and every later forward more
-    than the first forward and less than that figure."""
+    than the first forward and less than that figure.  A call without a saved set (light, saved boundary) is the
+    exception: its fused forward releases ``h`` / ``v_new``, which the replayed forward binds again only after its
+    c1 release, so its later backwards bind that figure less the c1 send pool and its ``M_f^T`` tiles (less on the
+    rank whose fragment crosses out) and at least the first backward; its later forwards peak when they size their
+    pools, the previous backward's ``h`` / ``v_new`` still bound: that figure less the backward-only pools
+    (``c2_send``, ``b1_send`` / ``b1_recv``, ``b2_send`` / ``b2_recv``).  Which of the two is larger is a relation of
+    pool sizes, not a rule."""
     kcp = _package("cake_kcp")
     H_qk, HV = CKPT_HEADS
     part = gp.partition_kcp(torch.tensor(CKPT_CU, dtype=torch.int64), 2, "contiguous")
@@ -5835,16 +5880,20 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
     ops = _inputs(CKPT_CU, H_qk, HV)
     wss = [_PeakWorkspace(kcp) for _ in range(2)]
     steps: dict[int, list[tuple[int, int]]] = {0: [], 1: []}
+    call = {k: v for k, v in opts.items() if k != "save_for_backward"}
+    with_set = opts.get("save_for_backward", True)
 
     def rank_fn(r, comm):
         loc = fake.slice_local(ops, part, r)
         args = [loc[n] for n in LEAVES]
         kw = dict(
-            backend="fake", segments=2, workspace=wss[r], deterministic=False, **opts
+            backend="fake", segments=2, workspace=wss[r], deterministic=False, **call
         )
         for _ in range(3):
             wss[r].peak = 0
-            _, saved = kcp.chunk_gdn_fwd_kcp(*args, ctxs[r], **kw)
+            _, saved = kcp.chunk_gdn_fwd_kcp(
+                *args, ctxs[r], save_for_backward=with_set, **kw
+            )
             fwd = wss[r].peak
             wss[r].peak = 0
             kcp.chunk_gdn_bwd_kcp(*args, ctxs[r], loc["dout"], saved=saved, **kw)
@@ -5857,17 +5906,34 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
         graph = gb.gdn_workspace_layout_kcp(c, graph="replay", **q, **opts)
         assert steps[r][0] == (eager["forward"], eager["backward"]), (r, steps[r])
         assert graph["backward"] > eager["backward"], r
+        # without a saved set: the c1 send pool the replayed forward releases before it binds h / v_new, and the
+        # pools only a backward sizes (the forward's ensure skips them)
+        c1 = graph["bwd.c1_send"] + graph["bwd.c1_send_mf"] if not with_set else 0
+        bwd_only = sum(
+            graph[f"bwd.{k}"]
+            for k in ("c2_send", "b1_send", "b1_recv", "b2_send", "b2_recv")
+        )
+        assert (c1 > 0) == (not with_set and c.n_out > 0), (r, c1)
         for fwd, bwd in steps[r][1:]:
-            assert bwd == graph["backward"] == graph["workspace"], (r, steps[r], graph)
-            assert eager["forward"] < fwd < bwd, (r, steps[r])
+            if with_set:
+                assert bwd == graph["backward"] == graph["workspace"], (r, steps[r])
+                assert eager["forward"] < fwd < bwd, (r, steps[r])
+            else:
+                # the replayed forward never holds the c1 send pool and h / v_new together
+                assert bwd == graph["backward"] - c1, (r, steps[r], graph)
+                assert bwd >= eager["backward"], (r, steps[r])
+                # the forward peaks at its ensure, the previous backward's h / v_new still bound
+                assert fwd == graph["backward"] - bwd_only, (r, steps[r], graph)
+                assert fwd > eager["forward"], (r, steps[r])
 
 
 def test_workspace_layout_option_checks() -> None:
     """The workspace queries refuse a ``graph`` value outside ``("off", "replay")``, the kept-tape form under
     ``graph="replay"`` (as the call's options do; the default there is the replay form) and a non-bool
     ``save_for_backward``.  ``save_for_backward=False`` with a backward reports the replay a ``saved=None`` backward
-    runs: the replay boundary's backward terms, in either ``save_mode`` and ``reuse_recompute_tapes`` form, beside
-    the forward of the call."""
+    runs: the replay boundary's backward terms, in either ``save_mode`` and ``reuse_recompute_tapes`` form, except
+    the replayed forward after the fused (light, saved boundary) forward, which finds no ``h`` / ``v_new``; the
+    forward is the call's."""
     _, ctx, _ = _ckpt_setup()
     q = dict(H_qk=2, HV=6)
     assert gb.GRAPH_MODES == _package("cake_options").GRAPH_MODES
@@ -5896,10 +5962,26 @@ def test_workspace_layout_option_checks() -> None:
         only_fwd = gb.gdn_workspace_layout_kcp(
             ctx, save_for_backward=False, save_mode=save_mode, backward=False, P=2, **q
         )
-        bwd_terms = {k: v for k, v in lay.items() if k.startswith("bwd.")}
-        assert bwd_terms == {k: v for k, v in rep.items() if k.startswith("bwd.")}
-        assert "bwd.phase.replay_forward" in bwd_terms and lay["bwd.kept_tapes"] == 0
-        assert lay["backward"] == rep["backward"] == lay["backward_transient"]
+        # after the fused forward of a light saved boundary the replayed forward finds no h / v_new before its c1
+        # release; every other backward term is the replay boundary's
+        fused = "fwd.h_tape" not in only_fwd  # the forward's own fused flag
+        assert fused == (save_mode == "light")
+        h_v = rep["bwd.h_tape"] + rep["bwd.v_new"] if fused else 0
+        assert lay["bwd.phase.replay_forward"] == rep["bwd.phase.replay_forward"] - h_v
+        bwd_terms = {
+            k: v
+            for k, v in lay.items()
+            if k.startswith("bwd.") and k != "bwd.phase.replay_forward"
+        }
+        assert bwd_terms == {
+            k: v
+            for k, v in rep.items()
+            if k.startswith("bwd.") and k != "bwd.phase.replay_forward"
+        }
+        assert lay["bwd.kept_tapes"] == 0
+        phases = [v for k, v in lay.items() if k.startswith("bwd.phase.")]
+        assert lay["backward"] == max(phases) == lay["backward_transient"]
+        assert lay["backward"] <= rep["backward"]
         assert lay["forward"] == only_fwd["forward"] and only_fwd["backward"] == 0
     with pytest.raises(TypeError, match="save_for_backward"):
         gb.gdn_workspace_layout_kcp(ctx, save_for_backward=0, backward=False, **q)

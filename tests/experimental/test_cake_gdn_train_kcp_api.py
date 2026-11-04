@@ -1403,13 +1403,21 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
         for kw in (
             {"graph": "replay"},
             {"save_for_backward": False},
-            {"fused_walks": 0},
+            {"fused_walks": 0, "P": 2, "backward": False},
         ):
             assert facade.gdn_workspace_bytes_kcp(
                 ctx, H_qk=2, HV=6, deterministic=False, **kw
             ) == pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, **kw), (rank, kw)
             with pytest.raises(TypeError, match=next(iter(kw))):
                 facade.gdn_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw)
+        # the facade passes fused_walks=0 on: at P = 2 its forward has no carry slots for the crossing fragments
+        assert max(ctx.n_in, ctx.n_out) > 0
+        split_walks = facade.gdn_workspace_bytes_kcp(
+            ctx, H_qk=2, HV=6, deterministic=False, fused_walks=0, P=2, backward=False
+        )
+        fused = pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, P=2, backward=False)
+        state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
+        assert fused - split_walks == max(ctx.n_in, ctx.n_out) * state, rank
 
 
 def test_the_context_holds_no_mode() -> None:
