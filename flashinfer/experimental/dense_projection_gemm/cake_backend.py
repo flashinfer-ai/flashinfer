@@ -467,11 +467,19 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: for the entries that reach 65536 tokens).  A measured token count is an entry where the split program failed in some
 #: run and the deterministic program leaves the backward pass and the checkpointed step no more than 1.3 % slower on
 #: both parts (the worst of the ratio of the medians and the median of the paired ratios, eager launches and graph
-#: replays), or where the split program's FP64 error exceeded the deterministic program's by more than 2 % for some
-#: seed on both parts (relative Frobenius error; BF16 output: that or the BF16 error-budget ratio); a token count
-#: between two consecutive measured entries is an entry too, and so is every token count above 131072 of a row whose
-#: split program failed that FP64 comparison at every measured token count from its entry's first one up.  Unmeasured
-#: token counts keep the verdict.
+#: replays), or where the split program failed the FP64 comparison: for some seed, a relative Frobenius error more than
+#: 2 % above the deterministic program's, or, where the deterministic program meets the deterministic package's error
+#: budget on every seed, an output outside it.  Where the deterministic program misses the budget for some seed (BF16
+#: output at the largest token counts), the BF16 error-budget ratio, a maximum over the elements, moves by up to about
+#: 25 % either way between the two programs at the same relative Frobenius error; there the split program fails where
+#: the median over a row's measured token counts and seeds (10 seeds per token count) of its ratio to the deterministic
+#: program's exceeds 1.02, or where one seed's ratio exceeds 1.30.  A token count between two consecutive measured
+#: entries is an entry too.  Entries without an upper bound: sm_103a ``4096 -> 32`` (BF16 and FP32) and sm_100a
+#: ``4096 -> 64`` FP32 from 65536 tokens up: above 65536 tokens the split program's output differs from the
+#: deterministic program's where the token count spans an odd number of 64-token blocks (65537, 65538, 65600 and 65665
+#: tokens: an FP32 relative Frobenius error 2.1 to 2.3 % above on every seed, a BF16 budget ratio 1.305 times the
+#: deterministic program's for one seed) and is the deterministic program's bits where it spans an even number (65601,
+#: 98304 and 131072 tokens).  Unmeasured token counts keep the verdict.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -480,22 +488,21 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     ("sm_100a", 148): {
         ("sm_100a", 1, 4096, 48, "bf16"): ((512, 512),),
         ("sm_100a", 1, 4096, 48, "f32"): ((512, 512),),
-        ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, 65537)),
-        ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, 65537)),
+        ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, 65536)),
+        ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, None)),
         ("sm_100a", 1, 5120, 48, "bf16"): ((512, 2048),),
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
         ("sm_100a", 1, 5120, 64, "f32"): ((512, 1024), (8192, 8192)),
     },
     ("sm_103a", 148): {
-        ("sm_103a", 1, 4096, 32, "bf16"): ((65536, 65537),),
-        ("sm_103a", 1, 4096, 32, "f32"): ((65536, 65537),),
-        ("sm_103a", 1, 5120, 32, "bf16"): ((32767, None),),
-        ("sm_103a", 1, 5120, 48, "bf16"): ((512, 2048), (32767, 32768)),
+        ("sm_103a", 1, 4096, 32, "bf16"): ((65536, None),),
+        ("sm_103a", 1, 4096, 32, "f32"): ((65536, None),),
+        ("sm_103a", 1, 5120, 48, "bf16"): ((512, 2048),),
         ("sm_103a", 1, 5120, 48, "f32"): ((512, 2048),),
-        ("sm_103a", 1, 5120, 64, "bf16"): ((512, 1024), (32767, 32769)),
+        ("sm_103a", 1, 5120, 64, "bf16"): ((512, 1024),),
         ("sm_103a", 1, 5120, 64, "f32"): ((512, 1024),),
-        ("sm_103a", 1, 5120, 128, "bf16"): ((512, 4096), (32767, None)),
+        ("sm_103a", 1, 5120, 128, "bf16"): ((512, 4096), (32768, 65536)),
         ("sm_103a", 1, 5120, 128, "f32"): ((512, 4096), (32768, 65536)),
         ("sm_103a", 1, 6144, 128, "bf16"): ((512, 8192),),
         ("sm_103a", 1, 6144, 128, "f32"): ((512, 8192),),

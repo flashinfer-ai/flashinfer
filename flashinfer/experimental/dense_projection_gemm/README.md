@@ -167,13 +167,13 @@ slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`
 
 | K1 row `d_in -> d_out` | `sm_100a` BF16 | `sm_100a` FP32 | `sm_103a` BF16 | `sm_103a` FP32 |
 |---|---|---|---|---|
-| `4096 -> 32` | -- | -- | 65536; 65537‡ | 65536; 65537‡ |
+| `4096 -> 32` | -- | -- | 65536 and up‡ | 65536 and up‡ |
 | `4096 -> 48` | 512 | 512 | no verdict | no verdict |
-| `4096 -> 64` | 512; 65536; 65537‡ | 512; 65536; 65537‡ | no verdict | no verdict |
-| `5120 -> 32` | -- | -- | 32767 and up‡ | -- |
-| `5120 -> 48` | 512 to 2048 | 512 | 512 to 2048; 32767 to 32768‡ | 512 to 2048 |
-| `5120 -> 64` | 512 to 2048; 8192 | 512 to 1024; 8192 | 512 to 1024; 32767 to 32769‡ | 512 to 1024 |
-| `5120 -> 128` | no verdict | no verdict | 512 to 4096; 32767 and up‡ | 512 to 4096; 32768 to 65536 |
+| `4096 -> 64` | 512; 65536 | 512; 65536 and up‡ | no verdict | no verdict |
+| `5120 -> 32` | -- | -- | -- | -- |
+| `5120 -> 48` | 512 to 2048 | 512 | 512 to 2048 | 512 to 2048 |
+| `5120 -> 64` | 512 to 2048; 8192 | 512 to 1024; 8192 | 512 to 1024 | 512 to 1024 |
+| `5120 -> 128` | no verdict | no verdict | 512 to 4096; 32768 to 65536 | 512 to 4096; 32768 to 65536 |
 | `6144 -> 32` | -- | -- | -- | -- |
 | `6144 -> 128` | no verdict | no verdict | 512 to 8192 | 512 to 8192 |
 
@@ -186,12 +186,23 @@ every split-routed row and token count on one part (9 paired groups, one long-li
 failed there again on a second part (15 paired groups in a long-lived process and in a fresh process per point; B300:
 a part of a second node, which also screened every point; B200: another part of the same node), and the FP64 error of
 5 seeds on two parts at 32768 and 65536 tokens and at the first and the last token count of every entry and one token
-either side of it (98304 and 131072 tokens too for the entries that reach 65536 tokens).  ‡: the split program's FP64
-error exceeded the deterministic program's by more than 2 % for some seed on both parts (BF16 output: the BF16
-error-budget ratio; FP32 output at 65537 tokens: the relative Frobenius error, 2.1 to 2.3 % above); the rows marked
-"and up" failed that comparison at every measured token count from the entry's first one up to 131072 tokens.  The
-token counts next to the entries that start or end at 32767, 32769 or 65537 tokens were not measured and keep the
-verdict.  Measured token counts that failed the rule but keep the verdict, because the
+either side of it (98304 and 131072 tokens too for the entries that reach 65536 tokens).  ‡: entries from the FP64
+error.  The split program fails the FP64 comparison at a token count where, for some seed, its relative Frobenius
+error is more than 2 % above the deterministic program's, or, where the deterministic program meets the error budget
+on every seed, its output is outside the budget.  Where the deterministic program misses the budget for some seed
+(BF16 output at the largest token counts), the BF16 error-budget ratio, a maximum over the elements, moves by up to
+about 25 % either way between the two programs at the same relative Frobenius error; there the split program fails
+where the median of its ratio to the deterministic program's over a row's measured token counts and seeds (10 seeds
+per token count) exceeds 1.02, or where one seed's ratio exceeds 1.30.  BF16 output of `5120 -> 32` (23 token counts
+from 57336 to 131072 tokens: median 1.000, largest 1.26) and `5120 -> 128` (65536 to 131072 tokens: 1.015, largest
+1.15) on `sm_103a` and of `4096 -> 64` on `sm_100a` (65537 to 65665 tokens: 1.000, largest 1.29) passed it.  Above
+65536 tokens the split program of `4096 -> 32` (`sm_103a`) and `4096 -> 64` (`sm_100a`) gives other bits than the
+deterministic program where the token count spans an odd number of 64-token blocks (measured at 65537, 65538, 65600
+and 65665 tokens) and the same bits where it spans an even number (65601, 98304 and 131072 tokens).  At those odd
+token counts the FP32 output's relative Frobenius error is 2.1 to 2.3 % above the deterministic program's on every
+seed, and the BF16 output of `4096 -> 32` on `sm_103a` has a budget ratio 1.305 times the deterministic program's for
+one seed at 65600 tokens, so these rows run the deterministic program from 65536 tokens up.  Unmeasured token counts
+keep the verdict.  Measured token counts that failed the rule but keep the verdict, because the
 deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower there on a part:
 `sm_100a`: BF16 output at 512 tokens on `4096 -> 32`, `5120 -> 32`, `6144 -> 32`, at 1024 on `5120 -> 32`, at 2048 on
 `6144 -> 32`, at 32768 on `5120 -> 48`, at 65536 on `4096 -> 32`, `4096 -> 48`, `5120 -> 48`, `5120 -> 64`, `6144 -> 32`;

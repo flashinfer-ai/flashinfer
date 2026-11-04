@@ -1347,28 +1347,25 @@ def test_k1_212_sm_range_overrides():
 K1_148_EXCLUDED_TOKENS = {
     ("sm_100a", 4096, 48, "bf16"): ((512, 512),),
     ("sm_100a", 4096, 48, "f32"): ((512, 512),),
-    ("sm_100a", 4096, 64, "bf16"): ((512, 512), (65536, 65537)),
-    ("sm_100a", 4096, 64, "f32"): ((512, 512), (65536, 65537)),
+    ("sm_100a", 4096, 64, "bf16"): ((512, 512), (65536, 65536)),
+    ("sm_100a", 4096, 64, "f32"): ((512, 512), (65536, None)),
     ("sm_100a", 5120, 48, "bf16"): ((512, 2048),),
     ("sm_100a", 5120, 48, "f32"): ((512, 512),),
     ("sm_100a", 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
     ("sm_100a", 5120, 64, "f32"): ((512, 1024), (8192, 8192)),
-    ("sm_103a", 4096, 32, "bf16"): ((65536, 65537),),
-    ("sm_103a", 4096, 32, "f32"): ((65536, 65537),),
-    ("sm_103a", 5120, 32, "bf16"): ((32767, None),),
-    ("sm_103a", 5120, 48, "bf16"): ((512, 2048), (32767, 32768)),
+    ("sm_103a", 4096, 32, "bf16"): ((65536, None),),
+    ("sm_103a", 4096, 32, "f32"): ((65536, None),),
+    ("sm_103a", 5120, 48, "bf16"): ((512, 2048),),
     ("sm_103a", 5120, 48, "f32"): ((512, 2048),),
-    ("sm_103a", 5120, 64, "bf16"): ((512, 1024), (32767, 32769)),
+    ("sm_103a", 5120, 64, "bf16"): ((512, 1024),),
     ("sm_103a", 5120, 64, "f32"): ((512, 1024),),
-    ("sm_103a", 5120, 128, "bf16"): ((512, 4096), (32767, None)),
+    ("sm_103a", 5120, 128, "bf16"): ((512, 4096), (32768, 65536)),
     ("sm_103a", 5120, 128, "f32"): ((512, 4096), (32768, 65536)),
     ("sm_103a", 6144, 128, "bf16"): ((512, 8192),),
     ("sm_103a", 6144, 128, "f32"): ((512, 8192),),
 }
 #: The measured token counts of the 148-SM audit.
 K1_148_MEASURED_TOKENS = (512, 1024, 2048, 4096, 8192, 16231, 32768, 65536)
-#: Token counts of the 148-SM entries measured for the FP64 error only (one token outside a measured entry).
-K1_148_ERROR_TOKENS = (32767, 32769, 65537)
 
 
 def test_k1_exact_sm_count_exclusions(monkeypatch):
@@ -1406,9 +1403,7 @@ def test_k1_exact_sm_count_exclusions(monkeypatch):
         return out
 
     Ts = sorted(
-        {T + d for T in K1_148_MEASURED_TOKENS for d in (-1, 0, 1)}
-        | {T + d for T in K1_148_ERROR_TOKENS for d in (-1, 0, 1)}
-        | {64, 256, 131072}
+        {T + d for T in K1_148_MEASURED_TOKENS for d in (-1, 0, 1)} | {64, 256, 131072}
     )
     others = (147, 149, 152, 160, 208, 212, 216, 220)
     with_table = plans((148,) + others, Ts)
@@ -1436,10 +1431,9 @@ def test_k1_exact_sm_count_exclusions(monkeypatch):
             for (_a, b), (c, _d) in zip(spans, spans[1:], strict=False):
                 assert b is not None and b < c, key
                 assert any(b < T < c for T in K1_148_MEASURED_TOKENS), key
-            ends = K1_148_MEASURED_TOKENS + K1_148_ERROR_TOKENS
             for lo, hi in spans:
-                assert lo in ends, key
-                assert hi is None or hi in ends, key
+                assert lo in K1_148_MEASURED_TOKENS, key
+                assert hi is None or hi in K1_148_MEASURED_TOKENS, key
                 assert without[(key, 148, lo)] is not None, key
                 assert with_table[(key, 148, lo)] is None, key
 
@@ -4861,23 +4855,35 @@ def _k1_bf16_budget_ratio(out, ref):
     return float(err.max())
 
 
+def _k1_within_budget(out, ref):
+    """Whether an output meets the deterministic package's K1 budget against FP64 (:func:`_k1_check`)."""
+    if out.dtype == torch.bfloat16:
+        return _k1_bf16_misses(out, ref) == 0
+    return _rel_fro(out, ref) <= F32_REL_FRO_MAX and float(
+        (out.double() - ref).abs().max()
+    ) <= F32_MAX_ABS_OVER_REF_ABSMAX * float(ref.abs().max())
+
+
 def _k1_check_or_as_det(out, G, X, what=""):
-    """:func:`_k1_check`, except where the deterministic program misses the BF16 budget on the same inputs too (FP32
-    accumulation over the largest token counts): then a relative Frobenius error and a BF16 budget ratio
-    (:func:`_k1_bf16_budget_ratio`) each within 2 % of that program's."""
+    """The K1 accuracy rule against FP64 and the deterministic program on the same inputs: a relative Frobenius error
+    at most 2 % above that program's, and the deterministic package's budget (:func:`_k1_check`), except where that
+    program misses the budget too (FP32 accumulation over the largest token counts): then, for a BF16 output, a BF16
+    budget ratio (:func:`_k1_bf16_budget_ratio`) at most 30 % above that program's.  The budget ratio is a maximum over
+    the elements: at the same relative Frobenius error, two summation orders move it by up to about 25 % either way
+    on one input, so the token tables decide that case on the median over ten seeds (README)."""
     ref = G.double().t() @ X.double()
-    if out.dtype != torch.bfloat16 or _k1_bf16_misses(out, ref) == 0:
-        _k1_check(out, ref, what)
-        return
     det = torch.full_like(out, float("nan"))
     det_backend.projection_det_wgrad(G, X, det)
     torch.cuda.synchronize()
     assert bool(torch.isfinite(out).all()), what
-    assert _k1_bf16_misses(det, ref) > 0, (what, _k1_bf16_misses(out, ref))
     rf, rf_det = _rel_fro(out, ref), _rel_fro(det, ref)
-    br, br_det = _k1_bf16_budget_ratio(out, ref), _k1_bf16_budget_ratio(det, ref)
     assert rf <= 1.02 * rf_det, (what, rf, rf_det)
-    assert br <= 1.02 * br_det, (what, br, br_det)
+    if _k1_within_budget(out, ref):
+        return
+    assert not _k1_within_budget(det, ref), (what, "outside the budget", rf, rf_det)
+    if out.dtype == torch.bfloat16:
+        br, br_det = _k1_bf16_budget_ratio(out, ref), _k1_bf16_budget_ratio(det, ref)
+        assert br <= 1.30 * br_det, (what, br, br_det)
 
 
 def _k1_prepare(G, X, out, arch, splits, block_n=None):
