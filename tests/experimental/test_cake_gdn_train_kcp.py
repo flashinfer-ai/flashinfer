@@ -1450,8 +1450,8 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         total += ctx.n_in * s_pad
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
-            if hp.P > 1:
-                total += (hp.P - 1) * ctx.n_frag * s
+        if (save_transfer or save_mode == "full") and hp.P > 1:
+            total += hp.P * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -2802,6 +2802,85 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     )
 
 
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", (False, True))
+def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
+    monkeypatch, use_qk_l2norm_in_kernel
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` at ``P > 1`` (also the only form of ``exchange="ring"``): the
+    backward's merges read the forward's ``M_seg^T`` plane (``stage_m``), which the full backward does not rebuild (no
+    transfer walk), so the saved set carries it as ``M_seg`` and the backward binds it.  Every tensor the package
+    allocates is filled with NaN bytes: an unwritten read shows up as a non-finite result.  The full form gives the
+    light form's bits (the fake backend is deterministic) on a ``None``, a fresh and a shared workspace (twice) and
+    under a non-reentrant checkpoint; the byte query counts ``M_seg``; a full saved set without it is refused."""
+    kcp = _package("cake_kcp")
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real_alloc(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    base = {
+        "segments": 2,
+        "save_transfer": False,
+        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+    }
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
+    _, saved = kcp.chunk_gdn_fwd_kcp(
+        *args, backend="fake", save_mode="full", deterministic=False, **base
+    )
+    assert saved is not None and saved.P == 2 and saved.c1_recv is None
+    assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
+    m_seg_bytes = gb.gdn_saved_layout_kcp(
+        ctx,
+        H_qk=H_qk,
+        HV=HV,
+        save_mode="full",
+        save_transfer=False,
+        P=2,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )["M_seg"]
+    # the query counts the saved plane itself: NSEG = n_frag P states
+    assert m_seg_bytes == 2 * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
+    # an older full saved set without M_seg would read an unwritten plane: refused
+    with pytest.raises(ValueError, match="needs M_seg"):
+        kcp.chunk_gdn_bwd_kcp(
+            *args,
+            ops["dout"],
+            saved=dataclasses.replace(saved, M_seg=None),
+            backend="fake",
+            save_mode="full",
+            deterministic=False,
+            **base,
+        )
+    light = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
+    for n, t in light.items():
+        assert torch.isfinite(t.float()).all(), ("light", n)
+    shared = kcp.WorkspaceKcp()
+    arms = (
+        (None, False),
+        (kcp.WorkspaceKcp(), False),
+        (shared, False),
+        (shared, False),
+        (None, True),
+    )
+    for i, (ws, ckpt) in enumerate(arms):
+        full = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=ckpt, workspace=ws, save_mode="full", **base
+        )
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
+        for n in light:
+            assert torch.equal(full[n], light[n]), (i, n)
+
+
 def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
     """R2-L1 1a: the ``M_f -> M_f^T`` scatter with the gather in a caller scratch (the carry plane during the
     summaries) writes the same bytes as the fresh-temporary form and leaves the gathered tiles in the scratch.  Exact:
@@ -3508,15 +3587,24 @@ def _frame_delta(kcp, skipped: int, launched: int) -> dict[str, int]:
     return {"skipped": 0, "launched": 0}
 
 
-def _dead_decision(kcp) -> str:
-    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch, else ``launched``."""
-    return "skipped" if _verified_torch(kcp) else "launched"
+def _auto_hand_off(kcp) -> bool:
+    """Whether the shipped ``reuse_recompute_tapes="auto"`` hands the recompute's tapes to the backward when the node
+    closes the segment: the frame proof is read on a verified torch only; elsewhere every recompute takes the replay
+    form (no hand-off, no kept entry)."""
+    return _verified_torch(kcp)
 
 
-def _fwd_o_after_recompute(kcp) -> list[bool]:
+def _dead_decision(kcp, hand_off: bool = True) -> str:
+    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch; elsewhere the
+    recompute writes the output, as :func:`_wrote` gives for a forward with or without the hand-off (``launched``
+    with the hand-off of ``reuse_recompute_tapes=True``)."""
+    return "skipped" if _verified_torch(kcp) else _wrote(kcp, hand_off)
+
+
+def _fwd_o_after_recompute(kcp, hand_off: bool = True) -> list[bool]:
     """``fwd_o`` hand-off flags of one original forward and one recompute whose output is dead: the original's only on
-    a verified torch, the recompute's too elsewhere."""
-    return [False] if _verified_torch(kcp) else [False, True]
+    a verified torch, the recompute's too elsewhere (``hand_off``: whether that recompute hands its tapes off)."""
+    return [False] if _verified_torch(kcp) else [False, hand_off]
 
 
 def _skip_delta(kcp, before: dict[str, int]) -> dict[str, int]:
@@ -3537,12 +3625,15 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
     the kept-tape accounting is unchanged, and the
     skip does not rest on the kept tapes (the replay form skips too).  A later op of the segment that saves nothing
     (``.sum()``) keeps the skip: torch's early stop ends the recompute right after this node's tensors are re-saved,
-    before that op runs.  On a torch build outside the verified set every recompute launches #5 instead (reason
-    ``torch_version``, counters untouched) and the same budget checks hold."""
+    before that op runs.  On a torch build outside the verified set every recompute writes the output instead (reason
+    ``torch_version``, counters untouched): the shipped ``reuse_recompute_tapes="auto"`` takes the replay form
+    there, so the recompute hands nothing off, puts no kept entry and writes the output as a plain forward; the same
+    budget checks hold."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
-    fwd_o, decision = _fwd_o_after_recompute(kcp), _dead_decision(kcp)
+    hand = _auto_hand_off(kcp)
+    fwd_o, decision = _fwd_o_after_recompute(kcp, hand), _dead_decision(kcp, hand)
     reason, delta = _frame_reason(kcp, "dead"), _frame_delta(kcp, 1, 0)
 
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
@@ -3566,23 +3657,23 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         always = _ckpt_autograd(
             kcp, ctx, ops, ckpt=True, segments=2, recompute_output="always"
         )
-        assert _launches(seen, "fwd_prep") == [False, True]
-        assert _o_writes(seen) == [False, True]
-        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert _launches(seen, "fwd_prep") == [False, hand]
+        assert _o_writes(seen) == [False, hand]
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == _wrote(kcp, hand)
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "always"
         seen.clear()
         before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
         auto = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
-        assert _launches(seen, "fwd_prep") == [False, True]
+        assert _launches(seen, "fwd_prep") == [False, hand]
         assert _o_writes(seen) == fwd_o
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason
         assert _skip_delta(kcp, before) == delta
         assert _stats_delta(kcp, kept_before) == {
-            "put": 1,
-            "take": 1,
+            "put": int(hand),
+            "take": int(hand),
             "miss": 0,
-            "released": 1,
+            "released": int(hand),
             "callback": 0,
             "evicted": 0,
         }
@@ -3620,6 +3711,7 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
 # The recompute_output tests below pin reuse_recompute_tapes=True: they check the output program's gate under the
 # kept-tape form (the recompute launches #1 and hands the tapes off); the shipped default "auto" takes the replay form
 # in several of these scenarios (a later saver, a failed frame proof), which the reuse_recompute_tapes tests cover.
+# The untaken-node test runs the default "auto" (its hand-off holds on a verified torch only: _auto_hand_off).
 def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_output() -> (
     None
 ):
@@ -3735,10 +3827,14 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     """(a) The segment is recomputed for another saved tensor while the GDN node itself is not in the backward: the
     node is still the segment's last saver, so #5 is left out, and the kept-tape accounting is the shipped one (the
     untaken entry goes at the task's end).  (b) ``retain_graph`` and a second ``.backward()``: two recomputes, two
-    skips, two kept entries put and taken, gradients within the budget of twice the FP64 gradient."""
+    skips, two kept entries put and taken, gradients within the budget of twice the FP64 gradient.  Both parts run
+    the shipped ``reuse_recompute_tapes="auto"``: on a torch build outside the verified set it takes the replay form
+    (no kept entry is put, taken or dropped), the recompute writes the output as a plain forward and the counters
+    stay."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
+    hand = int(_auto_hand_off(kcp))  # kept entries per recompute
     leaves = _ckpt_leaves(ops)
     a = torch.randn(3, requires_grad=True)
 
@@ -3751,14 +3847,14 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
     b.sum().backward()
     assert a.grad is not None and all(lf.grad is None for lf in leaves)
-    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp)
+    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp, bool(hand))
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 1, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 1,
+        "put": hand,
         "take": 0,
         "miss": 0,
         "released": 0,
-        "callback": 1,
+        "callback": hand,
         "evicted": 0,
     }
     assert kcp.kept_registry_size() == 0
@@ -3769,10 +3865,10 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     _assert_accumulated(twice, direct, "two recomputes", _ckpt_reference())
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 2, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 2,
-        "take": 2,
+        "put": 2 * hand,
+        "take": 2 * hand,
         "miss": 0,
-        "released": 2,
+        "released": 2 * hand,
         "callback": 0,
         "evicted": 0,
     }
@@ -5271,18 +5367,22 @@ def test_launch_cache_keeps_every_calls_launch_records(monkeypatch) -> None:
 
 def test_launch_scope_binds_the_stream_once_per_entry_body(monkeypatch) -> None:
     """``cake_backend.launch_scope`` with a counting stand-in for ``tvm_ffi`` and a set current stream (CPU): a launch
-    outside every scope enters its own ``use_torch_stream()`` context; inside a scope it enters none while the current
-    stream is the bound one and its own after a stream switch; a nested scope on the same stream enters nothing, one
-    on another stream binds that stream until it exits; another thread sees no scope; an exception restores the
-    binding.  The kernels backend hands out its glue's scope; a glue without one and the fake backend none."""
+    outside every scope enters its own ``use_raw_stream(device, raw)`` context on the current stream's device and raw
+    handle; inside a scope it enters none while the current stream is the bound one and its own after a stream switch;
+    a nested scope on the same stream enters nothing, one on another stream binds that stream until it exits; another
+    thread sees no scope; an exception restores the binding.  The kernels backend hands out its glue's scope; a glue
+    without one and the fake backend none."""
     be = _package("cake_backend")
     kcp = _package("cake_kcp")
     state = {"stream": (0, 11), "enters": 0, "bound": [], "launched": []}
 
     class _Context:
+        def __init__(self, device, raw):
+            self.stream = (device[1], raw)  # the stand-in device is ("cuda", index)
+
         def __enter__(self):
             state["enters"] += 1
-            state["bound"].append(state["stream"])
+            state["bound"].append(self.stream)
             return self
 
         def __exit__(self, *exc):
@@ -5291,8 +5391,9 @@ def test_launch_scope_binds_the_stream_once_per_entry_body(monkeypatch) -> None:
     monkeypatch.setattr(
         be,
         "tvm_ffi",
-        types.SimpleNamespace(use_torch_stream=lambda: _Context()),
+        types.SimpleNamespace(use_raw_stream=_Context),
     )
+    monkeypatch.setattr(be, "_ffi_device", lambda index: ("cuda", index))
     monkeypatch.setattr(be, "_current_stream", lambda: state["stream"])
     name = "fwd_prep"
     values = {n: n for n, _axis in be._argument_plan(name) if n is not None}
@@ -5320,11 +5421,12 @@ def test_launch_scope_binds_the_stream_once_per_entry_body(monkeypatch) -> None:
         with be.launch_scope():
             assert enters_after(launch) == 0
         assert be._SCOPE.stream == (0, 11) and state["bound"] == [(0, 11)]
-        state["stream"] = (0, 22)  # a stream switch inside the scope
-        assert enters_after(launch) == 1 and state["launched"][-1] == (0, 22)
+        # a stream switch (to another device's stream) inside the scope
+        state["stream"] = (1, 22)
+        assert enters_after(launch) == 1 and state["launched"][-1] == (1, 22)
         with be.launch_scope():  # a scope on the other stream binds it
-            assert be._SCOPE.stream == (0, 22)
-            assert enters_after(launch) == 0 and state["launched"][-1] == (0, 22)
+            assert be._SCOPE.stream == (1, 22)
+            assert enters_after(launch) == 0 and state["launched"][-1] == (1, 22)
         assert be._SCOPE.stream == (0, 11)
         assert enters_after(launch) == 1
         state["stream"] = (0, 11)
@@ -5345,6 +5447,265 @@ def test_launch_scope_binds_the_stream_once_per_entry_body(monkeypatch) -> None:
         assert be._SCOPE.stream == (0, 11)
         assert enters_after(launch) == 0
     assert getattr(be._SCOPE, "stream", None) is None
+
+
+def test_stream_context_sets_the_ffi_stream_of_the_device() -> None:
+    """``cake_backend.stream_context((index, raw))`` with the real ``tvm_ffi``: inside, tvm-ffi's current stream of CUDA
+    device ``index`` is ``raw``, another device's stream is untouched, nested contexts restore in order and the
+    previous stream is back after the outermost one; ``_ffi_device`` builds each device once.  With CUDA: for torch's
+    current stream (the default one and a side stream) the stream it binds is the one ``tvm_ffi.use_torch_stream()``
+    binds."""
+    import tvm_ffi
+
+    be = _package("cake_backend")
+    dev0, dev1 = tvm_ffi.device("cuda", 0), tvm_ffi.device("cuda", 1)
+    before0, before1 = tvm_ffi.get_raw_stream(dev0), tvm_ffi.get_raw_stream(dev1)
+    with be.stream_context((0, 0x1234)):
+        assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        assert tvm_ffi.get_raw_stream(dev1) == before1
+        with be.stream_context((1, 0x5678)):
+            assert tvm_ffi.get_raw_stream(dev1) == 0x5678
+            assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        with be.stream_context((0, 0x9ABC)):
+            assert tvm_ffi.get_raw_stream(dev0) == 0x9ABC
+        assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        assert tvm_ffi.get_raw_stream(dev1) == before1
+    assert tvm_ffi.get_raw_stream(dev0) == before0
+    assert be._ffi_device(0) is be._ffi_device(0)
+    d1 = be._ffi_device(1)
+    assert (d1.dlpack_device_type(), d1.index) == (dev1.dlpack_device_type(), 1)
+    if not torch.cuda.is_available():
+        return
+    index = torch.cuda.current_device()
+    dev = tvm_ffi.device("cuda", index)
+    side = torch.cuda.Stream()
+    for stream in (torch.cuda.current_stream(), side):
+        with torch.cuda.stream(stream):
+            with tvm_ffi.use_torch_stream():
+                want = tvm_ffi.get_raw_stream(dev)
+            with be.stream_context(be._current_stream()):
+                got = tvm_ffi.get_raw_stream(dev)
+        assert got == want == stream.cuda_stream, (got, want, stream)
+
+
+def test_registry_answers_are_derived_once_per_registry_identity(monkeypatch) -> None:
+    """``l2n_records_shipped`` / ``fused_o_shipped(arch)`` answer as their derivation from the registry and derive it
+    once per registry identity: a repeated question reads no record; another ``records_of_program``, another record
+    table (a copy of the same records), a table of another size, another registry (a stand-in) or another
+    architecture is derived again; a registry without a record table is derived on every call."""
+    kcp = _package("cake_kcp")
+    jit = _package("cake_jit")
+    real = jit.records_of_program
+    calls: list[str] = []
+
+    def counting(program):
+        calls.append(program)
+        return real(program)
+
+    def want_l2n(lookup) -> bool:
+        try:
+            return all(lookup(p) for p in kcp.L2N_PROGRAMS)
+        except ValueError:
+            return False
+
+    def want_fused(modules, lookup, arch) -> bool:
+        try:
+            names = lookup("kcp_fwdh_out")
+        except ValueError:
+            return False
+        forms = {
+            int(modules[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in modules[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    def derives(fn) -> int:
+        n = len(calls)
+        fn()
+        return len(calls) - n
+
+    monkeypatch.setattr(jit, "records_of_program", counting)
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) == 0
+    assert kcp.l2n_records_shipped() == want_l2n(real)
+    for arch in (None, *jit.ARCHES, "sm_00"):
+        assert derives(lambda a=arch: kcp.fused_o_shipped(a)) == 1, arch
+        assert derives(lambda a=arch: kcp.fused_o_shipped(a)) == 0, arch
+        assert kcp.fused_o_shipped(arch) == want_fused(jit.MODULES, real, arch), arch
+    # the same records in another table
+    monkeypatch.setattr(jit, "MODULES", dict(jit.MODULES))
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.fused_o_shipped(None)) == 1
+    del jit.MODULES[next(iter(jit.MODULES))]  # a table of another size
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) == 0
+
+    # stand-in registries: the answer is the stand-in's
+    def form(ctas: int) -> dict:
+        return {
+            "program": "kcp_fwdh_out",
+            "grid_rule": {"ctas_per_head": ctas},
+            "arches": ["sm_x"],
+        }
+
+    def registry(table) -> types.SimpleNamespace:
+        def lookup(program):
+            calls.append(program)
+            if program not in kcp.PROGRAMS:
+                raise ValueError(program)
+            return tuple(n for n, r in table.items() if r["program"] == program)
+
+        return types.SimpleNamespace(MODULES=table, records_of_program=lookup)
+
+    both = registry({"a": form(1), "b": form(2)})
+    for stand_in, fused in ((both, True), (registry({"a": form(1)}), False)):
+        monkeypatch.setattr(kcp, "_registry", lambda s=stand_in: s)
+        assert derives(lambda: kcp.fused_o_shipped("sm_x")) == 1
+        assert kcp.fused_o_shipped("sm_x") is fused
+        assert kcp.fused_o_shipped("sm_y") is False
+        assert derives(lambda: kcp.l2n_records_shipped()) > 0
+        assert kcp.l2n_records_shipped() is False
+    both.MODULES["c"] = form(1)  # the same table, grown
+    monkeypatch.setattr(kcp, "_registry", lambda: both)
+    assert derives(lambda: kcp.fused_o_shipped("sm_x")) == 1
+    tableless = types.SimpleNamespace(
+        MODULES=None, records_of_program=both.records_of_program
+    )
+    monkeypatch.setattr(kcp, "_registry", lambda: tableless)
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+
+
+def test_chunk_tokens_follow_the_contexts_chunk_table(monkeypatch) -> None:
+    """``_chunk_tokens`` (the in-kernel L2 norm's coverage check) is the table's sum, kept in the context's cache with
+    the table it was taken over: another table object is summed again, a list or a context without a cache dict is
+    summed per call and never kept; ``_prepare`` refuses a coverage other than the call's tokens."""
+    kcp, ctx, ops = _ckpt_setup()
+    key = ("kcp_chunk_tokens",)
+    stub = types.SimpleNamespace(_caches={})
+    t1, t2 = (64, 64, 10), (64, 64, 11)
+    assert kcp._chunk_tokens(stub, t1) == 138 and stub._caches[key] == (t1, 138)
+    assert kcp._chunk_tokens(stub, t1) == 138
+    assert kcp._chunk_tokens(stub, t2) == 139 and stub._caches[key][0] is t2
+    assert kcp._chunk_tokens(stub, [64, 1]) == 65 and stub._caches[key][0] is t2
+    for other in (types.SimpleNamespace(), types.SimpleNamespace(_caches=None)):
+        assert kcp._chunk_tokens(other, t1) == 138
+    # the real context: its own table, kept once; a wrong coverage is refused
+    out = _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+    assert ctx._caches[key] == (ctx.chunk_len, sum(ctx.chunk_len))
+    assert ctx._caches[key][0] is ctx.chunk_len
+    again = _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+    assert all(torch.equal(out[k], again[k]) for k in out)
+    monkeypatch.setattr(kcp, "_chunk_tokens", lambda c, table: sum(table) - 1)
+    with pytest.raises(ValueError, match="chunks cover"):
+        _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+
+
+def test_chunk_gdn_kcp_options_dicts_are_validated_once_per_content() -> None:
+    """``chunk_gdn_kcp`` with an ``options`` dict validates it once per distinct content (taken at each call: the same
+    dict changed is another key; with the value types: ``save_transfer=1`` never stands in for ``True``), together
+    with the literal keywords and knobs beside it; equal content in another dict shares that OptionsKcp; an
+    unhashable value (a ``test_knobs`` dict) is validated per call; an invalid dict raises on every call; an OptionsKcp
+    instance is not memoized."""
+    kcp, ctx, ops = _ckpt_setup()
+    kcp._KEYWORD_OPTIONS.clear()
+    seen = []
+    real = kcp._fwd_entry
+
+    def spy(*a, opts, **kw):
+        seen.append(opts)
+        return real(*a, opts=opts, **kw)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(kcp, "_fwd_entry", spy)
+    d = {"segments": 2}
+    try:
+        r1 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=d)
+        r2 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=dict(d))
+        d["save_transfer"] = False  # the same dict, changed (the default is True)
+        r3 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=d)
+        _ckpt_autograd(
+            kcp, ctx, ops, ckpt=False, options={"segments": 2}, save_mode="full"
+        )
+        # keywords only: its own key
+        _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
+        for _ in range(2):
+            knobs = {"segments": 2, "test_knobs": {"schedule": "overlap"}}
+            _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=knobs)
+        for _ in range(2):
+            with pytest.raises(TypeError, match="save_transfer must be a bool"):
+                _ckpt_autograd(kcp, ctx, ops, ckpt=False, options={"save_transfer": 1})
+            with pytest.raises(TypeError, match="unexpected option"):
+                _ckpt_autograd(kcp, ctx, ops, ckpt=False, options={"no_such_option": 1})
+        inst = kcp.make_options(None, segments=2, backend="fake")
+        n_keys = len(kcp._KEYWORD_OPTIONS)
+        _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=inst)
+    finally:
+        mp.undo()
+    assert len(seen) == 8
+    assert seen[0] is seen[1] and seen[0].save_transfer is True
+    assert seen[2] is not seen[0] and seen[2].save_transfer is False
+    assert seen[3] is not seen[0] and seen[3].save_mode == "full"
+    assert seen[4] is not seen[0] and seen[4] == seen[0]
+    assert seen[5] is not seen[6] and seen[5].knob("schedule") == "overlap"
+    assert seen[0] == kcp.make_options({"segments": 2}, backend="fake")
+    assert n_keys == 4 == len(kcp._KEYWORD_OPTIONS)
+    assert seen[7] == inst
+    assert set(r3) == set(r1)
+    for k in r1:
+        assert torch.equal(r1[k], r2[k]), k
+
+
+def test_launch_key_reads_every_resolve_input() -> None:
+    """``_launch_key`` changes with the program, every private scalar ``resolve_launch`` reads, the grid rule's
+    arguments (values and order), ``ncols`` / ``cols_per_cta`` / the caller's grid x and the backend's merge columns,
+    and with nothing else (another tensor of the same launch is the same key)."""
+    kcp = _package("cake_kcp")
+    base = {
+        "_grid_args": {"n_walk": 2, "num_heads": 6},
+        "_precision_mode": 0,
+        "_transfer_walk": "plain",
+        "_sm_count": 148,
+        "_fwdh_vh": 0,
+        "_dhu_vh": 0,
+        "_vh64_fits": False,
+        "_dhu_long_chain": False,
+        "_arch": "sm_100a",
+        "ncols": 128,
+        "cols_per_cta": 8,
+        "_grid": 12,
+        "q": object(),
+        "num_heads": 6,
+    }
+    k0 = kcp._launch_key("kcp_fwdh_tape", base, 8)
+    assert k0 == kcp._launch_key("kcp_fwdh_tape", {**base, "q": object()}, 8)
+    assert k0 == kcp._launch_key("kcp_fwdh_tape", dict(base), 8)
+    names = ("_precision_mode", "_transfer_walk", *kcp._LAUNCH_KEY_ARGS)
+    assert set(names) >= {
+        "_sm_count",
+        "_fwdh_vh",
+        "_dhu_vh",
+        "_vh64_fits",
+        "_dhu_long_chain",
+        "_arch",
+        "ncols",
+        "cols_per_cta",
+        "_grid",
+    }
+    for name in names:
+        assert kcp._launch_key("kcp_fwdh_tape", {**base, name: "other"}, 8) != k0, name
+        missing = {k: v for k, v in base.items() if k != name}
+        assert kcp._launch_key("kcp_fwdh_tape", missing, 8) != k0, name
+    assert kcp._launch_key("kcp_fwdh_offset", base, 8) != k0
+    assert kcp._launch_key("kcp_fwdh_tape", base, 16) != k0
+    for grid_args in (
+        {"n_walk": 3, "num_heads": 6},
+        {"num_heads": 6, "n_walk": 2},
+        None,
+    ):
+        changed = {**base, "_grid_args": grid_args}
+        assert kcp._launch_key("kcp_fwdh_tape", changed, 8) != k0
 
 
 # --------------------------------------------------------------------------- host launch path: launch memo, per-call workspace

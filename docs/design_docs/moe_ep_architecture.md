@@ -98,7 +98,7 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103 / SM107, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
@@ -340,14 +340,15 @@ Each variant's winning knobs are stored in its fixed-variant managed-cache
 records and the MegaMoE compatibility file when persistence is enabled. The
 overall selection has a separate managed entry containing the variant and knobs,
 matched to the workspace capacity, per-rank live-token counts, eligible variants
-and execution contract. On an overall miss, tuning reuses compatible fixed-variant
-records, including token-bucket fallbacks, and searches missing variants. Cached
-partial-batch records stay within their workspace capacity; full-capacity records
-can supply knobs for another capacity, following fixed-variant lookup. Cached
-knobs are checked and timed at the current workload before comparing variants;
-a rejected cached choice triggers a fresh search within that variant. Reused
-records retain their original workload and score. An explicit fresh search
-bypasses both levels. Skipping fixed-variant tuning compares heuristic knobs
+and execution contract. Enabled tuning reuses fixed-variant records only when
+their capacity and EP-wide live-token count match the requested workload;
+otherwise it searches that variant's knob grid. Replay retains token-bucket and
+capacity fallbacks for fixed variants. On an overall miss, cached winners are
+checked and timed before comparing variants; a rejected cached choice triggers
+a fresh search within that variant. Reused records retain their search score.
+Overall selections from the previous fallback-only search are invalidated.
+An explicit fresh search bypasses both levels. Skipping fixed-variant tuning
+compares heuristic knobs
 without publishing fixed-variant managed records. A variant-selection replay
 miss uses the inference heuristic and leaves selection pending. Low-level tuning
 of already-staged workspaces remains available for kernel measurements.

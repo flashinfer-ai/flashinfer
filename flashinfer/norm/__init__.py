@@ -1584,6 +1584,7 @@ def layernorm(
     ----------
     input: torch.Tensor
         Input tensor, shape (batch_size, hidden_size). Need to be bfloat16.
+        The last dimension must be contiguous; row strides are supported.
     gemma: torch.Tensor
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor

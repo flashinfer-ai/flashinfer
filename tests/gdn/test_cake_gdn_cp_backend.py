@@ -467,6 +467,7 @@ def _sm107_plan(
     seq_lens: tuple[int, ...],
     heads: int,
     num_sms: int,
+    cp_chunk_len: int | None = None,
 ) -> gdn_cp.GDNCPPrefillPlan:
     monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_107a")
     monkeypatch.setattr(
@@ -480,22 +481,43 @@ def _sm107_plan(
     k = SimpleNamespace(shape=(total, heads, 128))
     v = SimpleNamespace(shape=(total, heads, 128))
     return gdn_cp._build_plan(
-        q, k, v, num_seqs=len(seq_lens), max_seqlen=max(seq_lens, default=0)
+        q,
+        k,
+        v,
+        num_seqs=len(seq_lens),
+        max_seqlen=max(seq_lens, default=0),
+        cp_chunk_len=cp_chunk_len,
     )
+
+
+_ROW_SPLIT_CTAS = {
+    "state_fixup_simt_row3_sb2": 43,
+    "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row10_sb2": 13,
+}
 
 
 @pytest.mark.parametrize(
     ("seq_lens", "heads", "num_sms", "expected"),
     [
         # More than 2 CTAs per SM over sequences of one length: 3 CTAs per SM.
-        ((16384,), 16, 212, "state_fixup_simt_row4_mb3"),
-        ((8192, 8192), 16, 212, "state_fixup_simt_row4_mb3"),
-        ((2048,) * 4, 8, 212, "state_fixup_simt_row4_mb3"),
         ((1024,) * 8, 8, 212, "state_fixup_simt_row4_mb3"),
         ((16384,), 14, 216, "state_fixup_simt_row4_mb3"),
+        # 16 states whose 26-CTA row split does not fit 2 CTAs per SM.
+        ((16384,), 16, 200, "state_fixup_simt_row4_mb3"),
+        # Sequences of one length with 4, 8, 16 or 32 states: the row-split
+        # builds (4 states from 6 CP chunks per sequence on).
+        ((16384,), 4, 212, "state_fixup_simt_row3_sb2"),
+        ((4096,), 4, 212, "state_fixup_simt_row3_sb2"),
+        ((16384,), 8, 212, "state_fixup_simt_row3_sb2"),
+        ((8192, 8192), 4, 212, "state_fixup_simt_row3_sb2"),
+        ((16384,), 16, 212, "state_fixup_simt_row5_mb3"),
+        ((16384,), 16, 216, "state_fixup_simt_row5_mb3"),
+        ((8192, 8192), 16, 212, "state_fixup_simt_row10_sb2"),
+        ((2048,) * 4, 8, 212, "state_fixup_simt_row10_sb2"),
         # At most 2 CTAs per SM: the default build.
-        ((16384,), 8, 212, "state_fixup_simt_row4"),
-        ((8192, 8192), 4, 212, "state_fixup_simt_row4"),
+        ((16384,), 6, 212, "state_fixup_simt_row4"),
+        ((16384,), 8, 160, "state_fixup_simt_row4"),
         ((16384,), 14, 224, "state_fixup_simt_row4"),
         ((4096,), 13, 208, "state_fixup_simt_row4"),
         # Unequal sequences keep the default build at any grid: 8 heads over
@@ -514,7 +536,8 @@ def test_sm107_fixup_takes_three_ctas_per_sm_past_two_over_equal_sequences(
 ) -> None:
     plan = _sm107_plan(monkeypatch, seq_lens, heads, num_sms)
     assert plan.fixup_kernel == expected
-    assert plan.fixup_grid == (len(seq_lens) * heads * 32, 1, 1)
+    row_ctas = _ROW_SPLIT_CTAS.get(expected, 32)
+    assert plan.fixup_grid == (len(seq_lens) * heads * row_ctas, 1, 1)
     assert gdn_cp_jit.has_gdn_cp_kernel(expected, "sm_107a")
 
 
@@ -533,6 +556,118 @@ def test_sm107_fixup_gate_needs_the_shipped_three_cta_program(
     monkeypatch.setattr(gdn_cp, "has_gdn_cp_kernel", lambda _name, _arch: False)
     plan = _sm107_plan(monkeypatch, (16384,), 16, 212)
     assert plan.fixup_kernel == "state_fixup_simt_row4"
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "expected"),
+    [
+        ((2560,), 4, "state_fixup_simt_row4"),
+        ((3072,), 4, "state_fixup_simt_row3_sb2"),
+        ((1024, 1024), 2, "state_fixup_simt_row4"),
+        ((3072, 3072), 2, "state_fixup_simt_row3_sb2"),
+        ((1024,), 8, "state_fixup_simt_row3_sb2"),
+    ],
+)
+def test_sm107_four_state_row_split_needs_six_cp_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    expected: str,
+) -> None:
+    plan = _sm107_plan(monkeypatch, seq_lens, heads, 212, cp_chunk_len=512)
+    assert plan.cp_chunk_len == 512
+    assert plan.fixup_kernel == expected
+
+
+def test_sm107_row_split_fixups_share_the_shipped_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shipped = gdn_cp_jit.program_for("state_fixup_simt_row4", "sm_107a")
+    records = gdn_cp_jit.MODULES
+    for name in _ROW_SPLIT_CTAS:
+        program = gdn_cp_jit.program_for(name, "sm_107a")
+        assert program != shipped
+        assert records[program]["arg_plan"] == records[shipped]["arg_plan"]
+        assert records[program]["arches"] == ["sm_107a"]
+        for arch in ("sm_100a", "sm_103a"):
+            assert not gdn_cp_jit.has_gdn_cp_kernel(name, arch)
+    # Without a row-split program the gate keeps the 4-row builds.
+    monkeypatch.setattr(
+        gdn_cp,
+        "has_gdn_cp_kernel",
+        lambda name, _arch: name not in _ROW_SPLIT_CTAS,
+    )
+    assert (
+        _sm107_plan(monkeypatch, (16384,), 16, 212).fixup_kernel
+        == "state_fixup_simt_row4_mb3"
+    )
+    assert (
+        _sm107_plan(monkeypatch, (16384,), 8, 212).fixup_kernel
+        == "state_fixup_simt_row4"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="requires an SM107a GPU",
+)
+@pytest.mark.parametrize(
+    ("name", "heads", "seq_lens", "chunk_len"),
+    [
+        ("state_fixup_simt_row3_sb2", 4, (4096,), 512),
+        ("state_fixup_simt_row3_sb2", 3, (1000, 1, 2000, 0, 640), 256),
+        ("state_fixup_simt_row5_mb3", 16, (4096, 4096), 1024),
+        ("state_fixup_simt_row5_mb3", 16, (6144, 2048), 1024),
+        ("state_fixup_simt_row10_sb2", 32, (8192,), 1024),
+        ("state_fixup_simt_row10_sb2", 2, (128, 128, 129), 128),
+    ],
+)
+def test_sm107_row_split_fixups_match_the_four_row_build_bitwise(
+    name: str, heads: int, seq_lens: tuple[int, ...], chunk_len: int
+) -> None:
+    num_seqs, total = len(seq_lens), sum(seq_lens)
+    bounded = min(num_seqs, total)
+    total_cp_chunks = bounded + (total - bounded) // chunk_len
+    gen = torch.Generator(device="cuda").manual_seed(8457)
+    chunks = (total_cp_chunks, heads, 128, 128)
+    transfer = (torch.rand(chunks, generator=gen, device="cuda") - 0.5) / 8
+    local = torch.rand(chunks, generator=gen, device="cuda") * 2 - 1
+    initial = (
+        torch.rand((num_seqs, heads, 128, 128), generator=gen, device="cuda") * 2 - 1
+    )
+    cu = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    results = []
+    for kind, row_ctas in (
+        ("state_fixup_simt_row4", 32),
+        (name, _ROW_SPLIT_CTAS[name]),
+    ):
+        workspace = torch.full_like(initial, float("nan"))
+        fixed = torch.full_like(local, float("nan"))
+        output = torch.full_like(initial, float("nan"))
+        gdn_cp_jit.load_gdn_cp_kernel(kind, "sm_107a")(
+            transfer,
+            local,
+            initial,
+            workspace,
+            fixed,
+            output,
+            cu,
+            chunk_len,
+            total_cp_chunks,
+            num_seqs,
+            heads,
+            num_seqs * heads * row_ctas,
+            1,
+            1,
+        )
+        torch.cuda.synchronize()
+        results.append((workspace, fixed, output))
+    for base, split in zip(results[0], results[1], strict=True):
+        assert torch.equal(base.view(torch.int32), split.view(torch.int32))
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
@@ -668,13 +803,10 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
 
 
 def _cu32_arches_only(name: str, arch: str) -> bool:
-    """Registry stand-in: the cu32 Stage-1 programs ship for sm_100a/sm_103a,
-    and the BF16 one for sm_107a too."""
+    """Registry stand-in: the FP16 and BF16 cu32 Stage-1 programs ship for
+    sm_100a, sm_103a and sm_107a."""
 
-    return name.endswith("_cu32") and (
-        arch in ("sm_100a", "sm_103a")
-        or (arch == "sm_107a" and name == "t_precompute_bf16_cu32")
-    )
+    return name.endswith("_cu32") and arch in ("sm_100a", "sm_103a", "sm_107a")
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
@@ -737,7 +869,7 @@ def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
             "t_precompute_bf16",
             False,
         ),
-        # sm_107a ships the BF16 cu32 program ...
+        # sm_107a ships the BF16 and the FP16 cu32 programs.
         (
             "sm_107a",
             torch.bfloat16,
@@ -748,7 +880,6 @@ def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
             "t_precompute_bf16_cu32",
             False,
         ),
-        # ... and no FP16 one: the host keeps the per-launch cast.
         (
             "sm_107a",
             torch.float16,
@@ -756,8 +887,8 @@ def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
             (512, 512),
             512,
             torch.int32,
-            "t_precompute",
-            True,
+            "t_precompute_cu32",
+            False,
         ),
         # Stage 1 does not run for an all-empty batch: the host casts once per launch.
         (
@@ -840,6 +971,7 @@ def test_build_plan_selects_cu32_only_for_int32_where_shipped(
         ("sm_100a", "t_precompute_bf16_cu32"),
         ("sm_103a", "t_precompute_cu32"),
         ("sm_103a", "t_precompute_bf16_cu32"),
+        ("sm_107a", "t_precompute_cu32"),
         ("sm_107a", "t_precompute_bf16_cu32"),
     ],
 )

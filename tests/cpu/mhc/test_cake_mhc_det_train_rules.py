@@ -25,6 +25,7 @@ and the program dispatch of record (``fwd_map_program``, ``fwd_coef_program``
 and ``bwd_token_program``: which mapping-pass, coefficient-pass and token-owner
 form a call launches, by token count, SM count and architecture;
 ``FWD_MAP_CLAIM``: the mapping pass's schedule form by its K units per CTA;
+``FWD_MAP_XNRM``: the token-count bands of its X-read L2 hint form ``_xn``;
 ``bwd_reduce_program`` / ``bwd_reduce_grid``: the reduction form and its fixed
 grid per token count and architecture; ``fn_split_program`` the fn split's form per
 architecture and route (``want_t`` 0 = the forward operand layout, 1 = the
@@ -107,6 +108,14 @@ MAP_LIBRARY = {
     "tk_nsx_ct": "cake_mhc_det_train_fwd_map__nsx",
     # likewise ns96_g2_ol2l's ticket form (sm_100a): its __tk record runs ns96_g2_ol2l
     "tk_ns96_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+    # the X-read L2 hint forms of FWD_MAP_XNRM (the ticket forms' __tk records run their programs, as above)
+    "nsx_st5_mb1_xn": "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
+    "nsx_xn": "cake_mhc_det_train_fwd_map__nsx_xn",
+    "nsx_ct_xn": "cake_mhc_det_train_fwd_map__nsx_ct_xn",
+    "tk_nsx_ct_xn": "cake_mhc_det_train_fwd_map__nsx_xn",
+    "ns96_g2_ol2l_xn": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+    "ns96_g2_ol2l_ct_xn": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn",
+    "tk_ns96_g2_ol2l_ct_xn": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
 }
 COEF_LIBRARY = {
     "qe_mb10": "cake_mhc_det_train_fwd_coef__qe_mb10",
@@ -224,7 +233,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fn_split__tv128_t128": ("sm_107a",),
     "cake_mhc_det_train_fwd_coef__g2_el": ("sm_107a",),
@@ -246,10 +255,15 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_fwd_map": ("sm_107a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_ct_xn": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_map__nsx_xn": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": ("sm_100a",),
 }
@@ -268,9 +282,17 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_fwd_map__nsx",
         "cake_mhc_det_train_fwd_map__nsx__tk",
     ],
+    "cake_mhc_det_train_fwd_map__nsx_xn": [
+        "cake_mhc_det_train_fwd_map__nsx_xn",
+        "cake_mhc_det_train_fwd_map__nsx_xn__tk",
+    ],
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": [
         "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
         "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
+    ],
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn": [
+        "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn__tk",
     ],
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": [
         "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
@@ -306,7 +328,9 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 69, 54
+N_RECORDS, N_LIBRARIES = 76, 59
+# the tail forms each architecture routes beside their X-hint forms (FWD_MAP_XNRM)
+XN_KEPT_TAILS = {"sm_100a": ("ns96_g2_ol2l_ct",), "sm_103a": ("nsx_ct",)}
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
@@ -317,6 +341,7 @@ RECORD_SCALARS = {
 FN_SPLIT_CARRY = {
     "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
     "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
+    "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
 }
 # The reference master's per-architecture tables of record (generated from the master text).
 TABLES = {
@@ -349,6 +374,7 @@ TABLES = {
         ),
         "sm_107a": (),
     },
+    "FWD_MAP_XNRM": {"sm_100a": ((64, 6144),), "sm_103a": ((64, 6144),), "sm_107a": ()},
     "FWD_COEF_REGIMES": {"sm_100a": "round7", "sm_103a": "round5", "sm_107a": "round9"},
     "BWD_TOKEN_PROGRAM": {
         "sm_100a": "dot_ao8",
@@ -594,156 +620,156 @@ DISPATCH_EXPECTED = (
     (64, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (64, 'sm_107a', 208, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (64, 'sm_107a', 216, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (65, 'sm_100a', 148, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (65, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (65, 'sm_100a', 148, 32, 32, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (65, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (65, 'sm_107a', 208, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (65, 'sm_107a', 216, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (127, 'sm_100a', 148, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (127, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (127, 'sm_100a', 148, 32, 32, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (127, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (127, 'sm_107a', 208, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (127, 'sm_107a', 216, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (128, 'sm_100a', 148, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (128, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (128, 'sm_100a', 148, 32, 32, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (128, 'sm_103a', 152, 32, 32, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (128, 'sm_107a', 208, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (128, 'sm_107a', 216, 32, 32, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (129, 'sm_100a', 148, 32, 64, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (129, 'sm_103a', 152, 32, 64, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (129, 'sm_100a', 148, 32, 64, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (129, 'sm_103a', 152, 32, 64, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (129, 'sm_107a', 208, 32, 64, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (129, 'sm_107a', 216, 32, 64, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (255, 'sm_100a', 148, 32, 64, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (255, 'sm_103a', 152, 32, 64, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (255, 'sm_100a', 148, 32, 64, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (255, 'sm_103a', 152, 32, 64, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (255, 'sm_107a', 208, 32, 64, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (255, 'sm_107a', 216, 32, 64, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (1000, 'sm_100a', 148, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (1000, 'sm_103a', 152, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1000, 'sm_100a', 148, 16, 128, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (1000, 'sm_103a', 152, 16, 128, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1000, 'sm_107a', 208, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (1000, 'sm_107a', 216, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (1024, 'sm_100a', 148, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
-    (1024, 'sm_103a', 152, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1024, 'sm_100a', 148, 16, 128, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411),
+    (1024, 'sm_103a', 152, 16, 128, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1024, 'sm_107a', 208, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (1024, 'sm_107a', 216, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (1152, 'sm_100a', 148, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1152, 'sm_103a', 152, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1152, 'sm_100a', 148, 16, 144, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1152, 'sm_103a', 152, 16, 144, 'nsx_st5_mb1_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1152, 'sm_107a', 208, 16, 144, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1152, 'sm_107a', 216, 16, 144, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1153, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1153, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1153, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1153, 'sm_103a', 152, 32, 320, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1153, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1153, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1176, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1176, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1176, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l_xn', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1176, 'sm_103a', 152, 32, 320, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1176, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1176, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1177, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1177, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1177, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1177, 'sm_103a', 152, 32, 320, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1177, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1177, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1208, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1208, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1208, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1208, 'sm_103a', 152, 32, 320, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1208, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1208, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1209, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1209, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1209, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1209, 'sm_103a', 152, 32, 320, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1209, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1209, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1656, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1656, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1656, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1656, 'sm_103a', 152, 32, 416, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1656, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1656, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1657, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1657, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1657, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1657, 'sm_103a', 152, 32, 416, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1657, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1657, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1664, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1664, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1664, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1664, 'sm_103a', 152, 32, 416, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1664, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1664, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (1665, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (1665, 'sm_103a', 152, 32, 448, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1665, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1665, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (1720, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (1720, 'sm_103a', 152, 32, 448, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1720, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1720, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (1721, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (1721, 'sm_103a', 152, 32, 448, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1721, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1721, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1792, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1792, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1792, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1792, 'sm_103a', 152, 32, 448, 'nsx_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1792, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1792, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1793, 'sm_100a', 148, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (1793, 'sm_103a', 152, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (1793, 'sm_100a', 148, 8, 120, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (1793, 'sm_103a', 152, 8, 120, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1793, 'sm_107a', 208, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1793, 'sm_107a', 216, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2049, 'sm_100a', 148, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (2049, 'sm_103a', 152, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2049, 'sm_100a', 148, 8, 136, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (2049, 'sm_103a', 152, 8, 136, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2049, 'sm_107a', 208, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2049, 'sm_107a', 216, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2304, 'sm_100a', 148, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 'wpu4_spred', 411),
-    (2304, 'sm_103a', 152, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2304, 'sm_100a', 148, 8, 144, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 'wpu4_spred', 411),
+    (2304, 'sm_103a', 152, 8, 144, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2304, 'sm_107a', 208, 32, 576, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2304, 'sm_107a', 216, 32, 576, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2305, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (2305, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2305, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (2305, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2305, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2305, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2432, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (2432, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2432, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (2432, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1_xn', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2432, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2432, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2433, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
-    (2433, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2433, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (2433, 'sm_103a', 152, 32, 640, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2433, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2433, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2560, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (2560, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2560, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (2560, 'sm_103a', 152, 32, 640, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2560, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2560, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2561, 'sm_100a', 148, 32, 672, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
-    (2561, 'sm_103a', 152, 32, 672, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (2561, 'sm_100a', 148, 32, 672, 'ns96_g2_ol2l_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
+    (2561, 'sm_103a', 152, 32, 672, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2561, 'sm_107a', 208, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2561, 'sm_107a', 216, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (3328, 'sm_103a', 152, 16, 416, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (3328, 'sm_103a', 152, 16, 416, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3328, 'sm_107a', 208, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3328, 'sm_107a', 216, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (3329, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (3329, 'sm_103a', 152, 16, 432, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3329, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3329, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (3456, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (3456, 'sm_103a', 152, 16, 432, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3456, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3456, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
-    (3457, 'sm_103a', 152, 16, 448, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (3457, 'sm_103a', 152, 16, 448, 'nsx_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3457, 'sm_107a', 208, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3457, 'sm_107a', 216, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
-    (4095, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
+    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4095, 'sm_103a', 152, 8, 256, 'nsx_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (4095, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4095, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
-    (4096, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
+    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4096, 'sm_103a', 152, 8, 256, 'nsx_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (4096, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4096, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (5328, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
-    (5328, 'sm_103a', 152, 16, 672, 'nsx', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
+    (5328, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5328, 'sm_103a', 152, 16, 672, 'nsx_xn', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5328, 'sm_107a', 208, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5328, 'sm_107a', 216, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5329, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
-    (5329, 'sm_103a', 152, 16, 672, 'nsx', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
+    (5329, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5329, 'sm_103a', 152, 16, 672, 'nsx_xn', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5329, 'sm_107a', 208, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5329, 'sm_107a', 216, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5472, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
-    (5472, 'sm_103a', 152, 16, 688, 'nsx', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
+    (5472, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5472, 'sm_103a', 152, 16, 688, 'nsx_xn', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5472, 'sm_107a', 208, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5472, 'sm_107a', 216, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5473, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
-    (5473, 'sm_103a', 152, 16, 688, 'nsx', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
+    (5473, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5473, 'sm_103a', 152, 16, 688, 'nsx_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5473, 'sm_107a', 208, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5473, 'sm_107a', 216, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7488, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
@@ -1083,40 +1109,40 @@ RULES_ROWS = (
     (64, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 32, 64, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (64, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 64, 64, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (64, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 64, 64, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (65, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 33, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (65, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 65, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (65, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 33, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (65, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 65, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (65, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 65, 65, 3555584, 6329856, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (65, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 65, 65, 3555584, 6329856, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (127, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (127, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 127, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (127, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (127, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 127, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (127, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 127, 127, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (127, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 127, 127, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (128, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (128, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 128, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (128, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (128, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 128, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (128, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 128, 128, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (128, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 128, 128, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (129, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 65, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (129, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 129, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (129, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 65, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (129, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 129, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (129, 208, 'sm_107a', 256, True, 32, 64, 64, 3, 192, 192, 64, 17, 8, 9, 129, 258, 129, 129, 3965184, 7940608, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (129, 216, 'sm_107a', 256, True, 32, 64, 64, 3, 192, 192, 64, 17, 8, 9, 129, 258, 129, 129, 3965184, 7940608, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (255, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 128, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (255, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 255, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (255, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 128, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (255, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 255, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (255, 208, 'sm_107a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 255, 255, 3965184, 6369536, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (255, 216, 'sm_107a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 255, 255, 3965184, 6369536, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (1000, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 592, 2000, 500, 296, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (1000, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 608, 2000, 500, 1000, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (1000, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 592, 2000, 500, 296, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (1000, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 608, 2000, 500, 1000, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (1000, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 125, 8, 63, 832, 2000, 1000, 1000, 4784384, 8175616, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (1000, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 125, 8, 63, 864, 2000, 1000, 1000, 4784384, 8175616, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (1024, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 592, 2048, 512, 296, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
-    (1024, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 608, 2048, 512, 1024, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (1024, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 592, 2048, 512, 296, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (1024, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 608, 2048, 512, 1024, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (1024, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 832, 2048, 1024, 1024, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (1024, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 864, 2048, 1024, 1024, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (2049, 148, 'sm_100a', 2176, True, 8, 136, 136, 11, 704, 148, 192, 257, 8, 129, 592, 4098, 1025, 2049, 4886784, 21107200, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411, 't128', 'production'),
-    (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (2049, 148, 'sm_100a', 2176, True, 8, 136, 136, 11, 704, 148, 192, 257, 8, 129, 592, 4098, 1025, 2049, 4886784, 21107200, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411, 't128', 'production'),
+    (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l_ct', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
-    (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_ct', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
+    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l_ct_xn', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
+    (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_ct_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 4096, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 4096, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (8192, 148, 'sm_100a', 8192, True, 16, 1024, 296, 16, 1024, 148, 512, 296, 32, 512, 592, 16384, 4096, 8192, 16253184, 30708992, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411, 't128', 'production'),
@@ -1176,16 +1202,23 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_fn_split__tv128_t128__t": ((128, 1, 1), 0, 1),
     "cake_mhc_det_train_fn_split__dual": ((256, 1, 1), DUAL_SMEM, 1),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ((192, 1, 1), 144384, 1),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__nsx": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__nsx_xn": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__nsx__tk": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__nsx_xn__tk": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__nsx_ct": ((192, 1, 1), 114816, 2),
+    "cake_mhc_det_train_fwd_map__nsx_ct_xn": ((192, 1, 1), 114816, 2),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ((192, 1, 1), 114944, 2),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": ((192, 1, 1), 114944, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn__tk": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ((192, 1, 1), 114816, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn": ((192, 1, 1), 114816, 2),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
@@ -1249,18 +1282,25 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128__t": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fn_split__tv128_t128__t": ("sm_107a",),
-    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_xn": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx__tk": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_xn__tk": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_ct_xn": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn__tk": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ("sm_107a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ("sm_107a",),
@@ -1615,10 +1655,14 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     # ceil(SMs / 8) claim seats free (slack = SMs x ceil(units / SMs) - units), the program elsewhere; nsx's and
     # ns96_g2_ol2l's ticket forms are named on no SM count of record (their programs' records stand in for them
     # elsewhere)
+    # (the _xn form of a program inside FWD_MAP_XNRM keeps its claim form: the claim reading is on the program)
     for T in DISPATCH_T:
         for arch, sm in ((a, s) for a in ARCHES for s in SM_COUNTS):
             p_k, units, grid = loader.k1_units(T, sm, arch)
             program = loader.fwd_map_program(T, sm, arch)
+            xn = any(a < T <= b for a, b in loader.FWD_MAP_XNRM[arch])
+            assert program.endswith("_xn") == xn, (T, arch, sm)
+            program = program[: -len("_xn")] if xn else program
             assert program not in ("tk_nsx_ct", "tk_ns96_g2_ol2l_ct"), (T, arch, sm)
             for _base, ticket, tail, cap in loader.FWD_MAP_CLAIM[arch]:
                 assert program != ticket or units >= 4 * grid, (T, arch, sm)
@@ -1627,7 +1671,13 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
                 assert program != cap or (
                     p_k == 8 and 3 * grid <= units < 4 * grid and slack >= -(-sm // 8)
                 ), (T, arch, sm)
-    assert loader.fwd_map_program(4096, 152, "sm_103a") == "nsx_ct"
+    assert loader.fwd_map_program(4096, 152, "sm_103a") == "nsx_ct_xn"
+    assert loader.fwd_map_program(5120, 152, "sm_103a") == "nsx_xn"
+    assert loader.fwd_map_program(6144, 152, "sm_103a") == "nsx_xn"
+    assert loader.fwd_map_program(6145, 152, "sm_103a") == "nsx"
+    assert loader.fwd_map_program(1024, 152, "sm_103a") == "nsx_st5_mb1_xn"
+    assert loader.fwd_map_program(64, 152, "sm_103a") == "nsx_st5_mb1"
+    assert loader.fwd_map_program(65, 152, "sm_103a") == "nsx_st5_mb1_xn"
     assert loader.fwd_map_program(8192, 152, "sm_103a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(16263, 152, "sm_103a") == "tk_nsx_g2_ol2l_ct"
     # slack 12 < 19
@@ -1638,7 +1688,13 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.fwd_map_program(14592, 152, "sm_100a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(8320, 152, "sm_100a") == "nsx_g2_ol2l"  # P_K 16
     assert loader.fwd_map_program(32768, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct"
-    assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct"
+    assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct_xn"
+    assert loader.fwd_map_program(6144, 148, "sm_100a") == "ns96_g2_ol2l_xn"
+    assert loader.fwd_map_program(6145, 148, "sm_100a") == "ns96_g2_ol2l"
+    assert loader.fwd_map_program(1024, 148, "sm_100a") == "nsx_st5_mb1_xn"
+    assert loader.fwd_map_program(1024, 208, "sm_107a") == "nsx_st5_mb1"
+    assert loader.fwd_map_program(64, 148, "sm_100a") == "nsx_st5_mb1"
+    assert loader.fwd_map_program(65, 148, "sm_100a") == "nsx_st5_mb1_xn"
     assert loader.K5_GRID_BANDS == {
         "sm_100a": ((0, 1024, 2),),
         "sm_103a": ((0, 4096, 2),),
@@ -1703,7 +1759,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         "BWD_TOKEN_REGIMES", "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM",
         "BWD_REDUCE_REGIMES",
         "K5_GRID_BANDS", "K5_FORM_BANDS", "BWD_TOKEN_BANDS", "BWD_REDUCE_PARTS", "FWD_FINISH_PROGRAM", "PDL_OFF_BANDS",
-        "FWD_MAP_CLAIM",
+        "FWD_MAP_CLAIM", "FWD_MAP_XNRM",
     ):  # fmt: skip
         assert tuple(getattr(loader, table)) == ARCHES, table
     assert set(loader.FN_SPLIT_GRID) == {
@@ -1839,6 +1895,7 @@ def test_registry_tables_are_literals() -> None:
         "FWD_MAP_BANDS",
         "FWD_MAP_FIT",
         "FWD_MAP_CLAIM",
+        "FWD_MAP_XNRM",
         "FWD_COEF_REGIMES",
         "BWD_TOKEN_PROGRAM",
         "BWD_TOKEN_REGIMES",
@@ -2130,11 +2187,19 @@ def test_records_are_consistent() -> None:
             for n in libs(H4096_ROUTES[arch]["fwd_prepare_h4096"])
             if n.startswith("cake_mhc_det_train_fwd_coef")
         ]
-        assert set(maps) == {
-            MAP_LIBRARY[loader.fwd_map_program(T, sm, arch)]
-            for T in DISPATCH_T
-            for sm in SM_COUNTS
-        }, arch
+        # the tail forms stay routed beside their X-hint forms: the rule names them above the FWD_MAP_XNRM band on
+        # 208-216 SMs, at token counts between the DISPATCH_T rows
+        kept = XN_KEPT_TAILS.get(arch, ())
+        for program in kept:
+            assert any(
+                loader.fwd_map_program(T, sm, arch) == program
+                for T in range(6145, 8193)
+                for sm in SM_COUNTS
+            ), (arch, program)
+        dispatched = {
+            loader.fwd_map_program(T, sm, arch) for T in DISPATCH_T for sm in SM_COUNTS
+        }
+        assert set(maps) == {MAP_LIBRARY[p] for p in dispatched | set(kept)}, arch
         # the coefficient-pass records the rules dispatch, then the run-time-count record
         assert coefs[-1] == "cake_mhc_det_train_fwd_coef__rt64", arch
         assert set(coefs[:-1]) == {
@@ -2443,7 +2508,7 @@ def test_launch_facts_of_record() -> None:
     pools = {4 * 28672 + 1024: 2, 3 * 28672 + 1024: 2, 5 * 28672 + 1024: 1}
     for name in (n for n in H4096_MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
         block, smem, pcs = facts[name]
-        if H4096_MODULES[name]["library"].endswith(("_ct", "_ct_ef_cap")):
+        if H4096_MODULES[name]["library"].endswith(("_ct", "_ct_ef_cap", "_ct_xn")):
             # the tail-control forms (and the cap form of the ticket one) keep the control records after the ring,
             # not in the 1024-byte prefix: their pools are the render's figures (LAUNCH_FACTS pins them), below the
             # prefix form's

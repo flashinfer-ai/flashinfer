@@ -102,7 +102,7 @@ kernel_cake_mhc_det_train_bwd_prepare(__nv_bfloat16* __restrict__ dy, __nv_bfloa
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 

@@ -56,14 +56,17 @@ backend are experimental: no compatibility guarantee.
   the backward of the package that wrote it (`SavedKcp` here, the other
   package's set raises `ValueError`), and a workspace (`WorkspaceKcp`) serves
   this package only.
-* This package runs the explicit FP32 gate without the in-kernel q / k L2
-  norm.  The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias`
-  and `lower_bound`, FlashInfer #7816) runs on the deterministic package only,
-  and the in-kernel L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not
-  available here: the entry points and `kda_workspace_bytes_kcp` raise
-  `ValueError` for them.  The off values (`use_gate_in_kernel=False`, `A_log` /
-  `dt_bias` / `lower_bound` `None`, `use_qk_l2norm_in_kernel=False`) are
-  accepted, so a call that spells them out runs unchanged.
+* The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and
+  `lower_bound`, FlashInfer #7816) runs on this package too ("Raw gate mode"
+  below): the rank's local stages take the single-rank package's raw records,
+  the deterministic programs on every row (no `S1` row runs in this mode), so
+  every output, the raw gate's gradient and the per-rank parameter partial
+  sums are bitwise those of the deterministic package.  The in-kernel q / k
+  L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
+  entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
+  `ValueError` for it, naming `deterministic=True`.  Its off value
+  (`use_qk_l2norm_in_kernel=False`) is accepted, so a call that spells it out
+  runs unchanged.
 
 ### Names
 
@@ -77,6 +80,7 @@ backend are experimental: no compatibility guarantee.
 | `kda_det_workspace_bytes_kcp` | `kda_workspace_bytes_kcp` |
 | `kda_det_saved_bytes_kcp` | `kda_saved_bytes_kcp` |
 | `kda_det_comm_bytes_kcp` | `kda_comm_bytes_kcp` |
+| `reduce_gate_param_grads_det_kcp` | `reduce_gate_param_grads_kcp` |
 | `RecomputeHandleDetKcp` | `RecomputeHandleKcp` |
 | `WorkspaceDetKcp` | `WorkspaceKcp` |
 | `SavedDetKcp` | `SavedKcp` |
@@ -469,6 +473,65 @@ Per layer the halo collectives drop from 3 / 3 / 3 (original forward /
 recompute / backward, without handles) or 3 / 0 / 3 (with handles) to 1 / 1 / 1
 or 1 / 0 / 1.
 
+Raw gate mode on the KCP route (issue #7816): the three KDA entry points take
+the single-rank keywords `use_gate_in_kernel=True, A_log=, dt_bias=,
+lower_bound=` with the same operand rules (`g` is the rank's raw BF16 gate,
+any view under the stride rule of the single-rank package's raw gate mode,
+never copied; `A_log` / `dt_bias` are the full parameters, the same tensors
+on every rank).
+
+```python
+from flashinfer.cake_kda_train_kcp import WorkspaceKcp, reduce_gate_param_grads_kcp
+
+nd = dict(deterministic=False)
+ws = WorkspaceKcp(use_gate_in_kernel=True)                        # the workspace's mode, fixed
+gate = dict(use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
+out_local, saved = chunk_kda_fwd_kcp(q_local, k_local, v_local, raw_local, beta_local, ctx,
+                                     workspace=ws, **gate, **nd)
+dq, dk, dv, dbeta, draw, dA_log_r, ddt_bias_r = chunk_kda_bwd_kcp(
+    q_local, k_local, v_local, raw_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    **gate, **nd)
+dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd)   # optional, see below
+```
+
+* The local stages run the raw records of the rank's plan
+  (`cake_backend.plan(..., gate="raw")` of the single-rank package: copies of
+  the deterministic raw programs; the intra and prep programs activate the
+  gate, the raw GLM intra program writes `draw` and the per-chunk partials,
+  one `param_finalize` launch reduces them; no gate epilogue, no `S1` pair).
+  The `gk` rows the K1 / K2 / K3 walks read are the explicit path's bits for
+  the same activated gate, so every KCP program, collective and exchanged
+  byte is the explicit path's; no full-size FP32 gate or gate gradient exists
+  on the route.  Every output, `draw` and the parameter partial sums are
+  bitwise those of `chunk_kda_det_bwd_kcp` on the same rank.
+* `dA_log` / `ddt_bias` of a rank are its partial sums: the gradients through
+  its own tokens, reduced on the rank in an order fixed by its local chunks
+  (bitwise repeatable, the same under every exchange, schedule, graph replay
+  and recompute).  The full gradient is their sum over `ctx.group`; a
+  training framework sums them as it sums the gradients of any parameter
+  replicated across the context-parallel ranks.  An NCCL all-reduce gives
+  that sum to FP32 rounding but does not fix its summation order, so it is
+  not bitwise reproducible; `reduce_gate_param_grads_kcp(ctx, dA_log,
+  ddt_bias)` is: one `all_gather_into_tensor` of the `H + 128 H` values, then
+  an FP32 sum in rank order on every rank (the same bits everywhere, and the
+  same bits as the deterministic package's `reduce_gate_param_grads_det_kcp`).
+* The mode is fixed per workspace (`WorkspaceKcp(use_gate_in_kernel=True)`:
+  its local arena is the replay arena planned in raw mode, whose backward
+  layouts carry no gate epilogue buffers; the KCP pools do not change;
+  `local_arena="lean"` is refused in raw mode), recorded in the saved set
+  (`SavedKcp.gate`, `.lower_bound`) and in a recompute handle's fingerprint;
+  a call in the other mode, a backward with another `lower_bound` and a
+  recompute of another mode are refused with `ValueError`.
+  `kda_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)` sizes it;
+  `kda_saved_bytes_kcp` and `kda_comm_bytes_kcp` do not depend on the mode.
+* The checkpoint hand-off does not engage in raw mode (its tape set is
+  verified on the explicit gate only): a raw call keeps the light set under
+  every `checkpoint_handoff` value and records no decision.
+* The backward allocates the raw gate's BF16 gradient, the partials (two FP32
+  `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for the duration of the
+  call) and the two parameter gradients; a rank without tokens returns zero
+  parameter gradients.
+
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
 below it on one-fragment ranks the
@@ -545,6 +608,11 @@ points, the mode keyword, the names and the import isolation),
 `tests/experimental/test_cake_kda_train_kcp_handoff.py` (the checkpoint
 hand-off: multi-GPU rows bitwise against `"off"`, the admission rule, the
 once-per-call decision, the byte queries),
+`tests/experimental/test_cake_kda_train_kcp_raw_gate.py` (the raw gate mode:
+the keywords, the workspace and its byte query, the saved set, the reduction
+helper, the local stages' records; multi-GPU rows against the single-rank raw
+path, the FP64 reference and, bitwise, the deterministic package's raw KCP
+route),
 `_fsdp_walk.py`, `_shared_ws.py` and `_upload.py`; benchmark
 `benchmarks/bench_cake_kda_train_kcp.py` (`torchrun`, one process per
 rank; the deterministic and the non-deterministic package interleaved).
