@@ -383,11 +383,13 @@ def plan_record(prepared):
             rule_value=p.units,
         )
         if getattr(p, "simt", None) is not None:
-            # the SIMT program: one CTA per output tile (m_tiles x n_tiles), the window spec of its tile
+            # the SIMT program: one CTA per output tile (m_tiles x n_tiles), the window spec of its tile (a
+            # compensated tile carries its group: "g<group>")
             record.update(
                 simt=list(p.simt),
                 tiles=p.m_tiles * p.n_tiles,
-                rule_value="simt_n{}m{}s{}".format(*p.simt),
+                rule_value="simt_n{}m{}s{}".format(*p.simt[:3])
+                + "".join(f"g{group}" for group in p.simt[3:]),
             )
     elif hasattr(prepared, "splits"):
         record["splits"] = prepared.splits
