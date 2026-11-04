@@ -289,7 +289,7 @@ torchrun --nnodes=2 --nproc-per-node=2 --node-rank="$NODE_RANK" \
 
 GPU 为 GB300（SM103，152 SM/device），Torch `2.13.0a0+9186a08b2c.nv26.07`、
 CUDA `13.3`、CuTe DSL `4.6.2`、nccl4py `0.3.1`、NCCL `2.30.7`、driver `580.173.10`。
-以下为此前 eager 性能测量，不是新 Graph 路径的计时或加速比。
+本节 5.1–5.2 为此前 eager 性能测量；新增 Graph 对比见 5.3。
 测量使用独占 GPU，未锁定 clocks；每对实现使用同一次 Slurm 作业资源分配（相同物理 GPU）和相同输入；
 这里的 allocation 不是指两个实现共享 CUDA 内存。
 
@@ -355,6 +355,51 @@ launch 方差；但它没有消除所有 N2R2 波动。旧 raw +18.8% 回退在�
 benchmark 的独立进程协议与最终 resident experiment 的 controller 不相同；
 最终 resident 数据、conditioned protocol、旧负面结果和失败记录随调查归档保留，
 不把未运行过的新协议结果代入本文数字。
+
+### 5.3 CUDA Graph 与同版本 eager
+
+job `3593453` 在两台 GB200/SM100（`lyris0097/0138`）上 COMPLETED，exit0。
+测试源码为 `ae6a8c56b`，99个 Python 文件哈希与提交一致；同 allocation 内使用
+同一 layer、权重和静态输入 buffer 对比 eager/replay，基线为当前 legacy eager，
+没有使用 next 或将历史 native donor 数字代入。本节不改变5.2的 donor 迁移门槛结论。
+CUDA13.3、Torch2.13dev、DSL4.6.2、NCCL2.30.7、driver580.196；SM clock前后2062MHz，
+未锁频。配置固定为N2R2、T32/rank、H7168、公共I1536、E48、K4。
+
+每项3轮交替模式顺序，10次 warmup 后采样50次，共150样本/模式；cold在计时外
+驱逐512MiB。排除初始化、编译、capture、入口CPU/Gloo rendezvous和正确性检查。
+每次取4个rank中的最大值，再汇总中位数；下表为单次调用完成同步的wall µs。
+BF16 full包含输入量化/staging；packed full接受预量化输入及SF。Raw只包含已准备的
+mega+独立reduce调用，不含staging/公共校验/输出copy。
+
+| 输入 | 范围 | Cache | Eager µs | Graph µs | Eager / Graph |
+| --- | --- | --- | ---: | ---: | ---: |
+| BF16 | Full | Warm | 1505.30 | 308.11 | 4.886× |
+| BF16 | Full | Cold | 1676.78 | 324.74 | 5.163× |
+| BF16 | Raw | Warm | 381.68 | 312.31 | 1.222× |
+| BF16 | Raw | Cold | 373.63 | 312.90 | 1.194× |
+| Packed | Full | Warm | 1803.99 | 359.94 | 5.012× |
+| Packed | Full | Cold | 1853.61 | 359.67 | 5.154× |
+| Packed | Raw | Warm | 383.44 | 322.32 | 1.190× |
+| Packed | Raw | Cold | 390.07 | 334.24 | 1.167× |
+
+连续提交32次、末尾统一同步的warm full结果，按每次调用归一化：BF16
+`1474.62 → 226.20 µs`，packed `1493.44 → 233.93 µs`，各3轮×10个采样block。
+Graph连续提交的wall CV为0.3–0.5%；单次full的CV为8.9–14.1%。全部样本保留，
+packed raw包含3–4ms长尾，部分单次raw的CV达89.7%，因此不宣称稳定的kernel算术加速。
+
+同时记录CUDA event interval和CPU enqueue：warm full的GPU interval分别为
+BF16 `1493.47 → 297.18 µs`、packed `1794.56 → 352.91 µs`；CPU enqueue分别为
+`1272.15 → 6.85 µs`、`1591.80 → 14.74 µs`。Event interval包含host提交间隙与设备通信等待，
+不能视为单个fused kernel时间。Profiler在独立非计时调用确认每次replay含1个mega和1个reduce；
+首次profile有22.66ms跨rank进入偏移，早到rank在GIN中等待，不能用于kernel耗时比值。
+主要收益与replay省去Python/CPU控制并减少launch间隙一致；本轮没有修改device算法。
+
+同一allocation中每rank24项strong/public测试全部通过，包括protocol/Torch oracle、
+BF16/packed、partial/empty、三种入口、每case48次replay（含12次连续排队）、
+污染staged输入/输出，以及混合capture/metadata/warmup错误恢复。计时adapter另外对
+每种输入的12组变化payload/local/remote/sparse路由比较full/raw replay与eager，均bitwise通过；
+每个计时block和profile后的输出也通过。逐rank原始样本、配置、源码哈希、波动、
+3轮中位数和完整trace保留在该job对应的独立实验目录，不增加代码PR文件。
 
 ## 6. 合并评审边界
 
