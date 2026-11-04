@@ -25,10 +25,21 @@ import torch.nn.functional as F
 import flashinfer
 from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.gemm import (
+    DEFAULT_GEMM_BACKENDS,
+    CublasGemmConfig,
+    CudnnGemmConfig,
+    CuteDslGemmConfig,
+    CutlassGemmConfig,
+    GemmConfig,
+    GemmProblem,
+    TrtllmGemmConfig,
     batch_deepgemm_fp8_nt_groupwise,
     gemm_fp8_nt_blockscaled,
     gemm_fp8_nt_groupwise,
+    supported_backends,
 )
+from flashinfer.gemm import Linear as UnifiedGemmLinear
+from flashinfer.gemm.api import BackendOptions, QuantConfig, QuantFormat
 from flashinfer.prefill import (
     single_prefill_with_kv_cache,
     trtllm_batch_context_with_kv_cache,
@@ -75,6 +86,13 @@ class GEMMBackend(Enum):
     BMM_BF16 = "bmm_bf16"  # FlashInfer bmm_bf16 (SM100+)
     MXFP8 = "mxfp8"  # FlashInfer mm_mxfp8 (SM100+/SM120+)
     BMM_MXFP8 = "bmm_mxfp8"  # FlashInfer bmm_mxfp8 (SM100+/SM120+)
+    # Unified GEMM API (flashinfer.gemm.Linear, docs/design_docs/flashinfer_gemm_api.md).
+    # The "-<kernel>" suffix names one backend candidate; no suffix (or "-auto")
+    # uses DEFAULT_GEMM_BACKENDS.
+    UNIFIED_FP4 = (
+        "unified_fp4"  # NVFP4 x NVFP4: cutlass / cute-dsl / trtllm / cudnn (SM100+)
+    )
+    UNIFIED_FP8 = "unified_fp8"  # per-tensor FP8: cublas / cudnn / cutlass (SM89+)
 
 
 # Human-readable per-backend SM requirement, used by the fallback warning.
@@ -92,6 +110,8 @@ _GEMM_BACKEND_REQUIREMENT_STR: Dict[str, str] = {
     "bmm_bf16": "SM100+ (Blackwell)",
     "mxfp8": "SM100+ (Blackwell)",
     "bmm_mxfp8": "SM100+ (Blackwell)",
+    "unified_fp4": "SM100+ (Blackwell)",
+    "unified_fp8": "SM89+",
 }
 
 
@@ -138,12 +158,70 @@ def _check_gemm_backend_support(backend: GEMMBackend, device: torch.device) -> b
     elif backend == GEMMBackend.BMM_MXFP8:
         # bmm_mxfp8 requires SM100+ or SM120+
         return sm >= 100
+    elif backend == GEMMBackend.UNIFIED_FP4:
+        # NVFP4 GEMMs need Blackwell tensor cores; the unified API's own
+        # supported_backends() refines this per candidate at construction.
+        return sm >= 100
+    elif backend == GEMMBackend.UNIFIED_FP8:
+        # Per-tensor FP8 GEMMs run from SM89 (cuBLAS / cuDNN) upward.
+        return sm >= 89
 
     return False
 
 
 def _gemm_backend_requirement_str(backend: GEMMBackend) -> str:
     return _GEMM_BACKEND_REQUIREMENT_STR.get(backend.value, "unspecified")
+
+
+# Unified GEMM API: kernel suffix -> backend candidate. The suffix is the
+# legacy ``backend=`` string, which is also each config's ``backend_key``.
+_UNIFIED_KERNEL_CONFIGS = {
+    "cutlass": CutlassGemmConfig,
+    "cute-dsl": CuteDslGemmConfig,
+    "trtllm": TrtllmGemmConfig,
+    "cudnn": CudnnGemmConfig,
+    "cublas": CublasGemmConfig,
+}
+
+_UNIFIED_QUANT = {
+    GEMMBackend.UNIFIED_FP4: QuantConfig(
+        weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+    ),
+    GEMMBackend.UNIFIED_FP8: QuantConfig(
+        weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+    ),
+}
+
+# Fixed activation scale used when ``online_act_quant=False``; the same
+# constants the fp4 / bmm_fp8 paths use (NVFP4: the ``nvfp4_quantize`` global
+# scale for amax == 1; FP8: a unit dequantization scale).
+_UNIFIED_OFFLINE_ACT_SCALE = {
+    GEMMBackend.UNIFIED_FP4: 448.0 * 6.0,
+    GEMMBackend.UNIFIED_FP8: 1.0,
+}
+
+
+def _unified_gemm_config(
+    backend: GEMMBackend, kernel_backend: Optional[str]
+) -> GemmConfig:
+    """Build the ``GemmConfig`` for ``unified_fp4`` / ``unified_fp8``.
+
+    ``kernel_backend`` is the ``"-<kernel>"`` suffix: one of
+    ``_UNIFIED_KERNEL_CONFIGS`` selects a single candidate (which then never
+    falls back to another backend); ``None`` or ``"auto"`` keeps the library's
+    ``DEFAULT_GEMM_BACKENDS`` order.
+    """
+    if kernel_backend is None or kernel_backend == "auto":
+        candidates = DEFAULT_GEMM_BACKENDS
+    else:
+        config_cls = _UNIFIED_KERNEL_CONFIGS.get(kernel_backend)
+        if config_cls is None:
+            raise ValueError(
+                f"{backend.value}: unknown kernel suffix {kernel_backend!r}; "
+                f"expected one of {sorted(_UNIFIED_KERNEL_CONFIGS)} or 'auto'."
+            )
+        candidates = BackendOptions((config_cls(),))
+    return GemmConfig(quant=_UNIFIED_QUANT[backend], backend=candidates)
 
 
 class FlashInferLinear(nn.Module):
@@ -156,6 +234,11 @@ class FlashInferLinear(nn.Module):
     - BF16: FlashInfer mm_bf16 with CUTLASS/cuDNN (SM100+)
     - FP8: FlashInfer mm_fp8 with TRT-LLM low-latency backend (SM89+)
     - FP4: FlashInfer mm_fp4 with block quantization (SM100+)
+    - UNIFIED_FP4 / UNIFIED_FP8: the unified GEMM API (``flashinfer.gemm.Linear``;
+      NVFP4 on SM100+, per-tensor FP8 on SM89+). The ``"-<kernel>"`` suffix
+      names a single backend candidate (``cutlass``, ``cute-dsl``, ``trtllm``,
+      ``cudnn``, ``cublas``); without it the library's default candidate
+      order is used. See ``docs/design_docs/flashinfer_gemm_api.md``.
 
     Args:
         in_features: Size of input features
@@ -281,6 +364,33 @@ class FlashInferLinear(nn.Module):
                 )
                 self._backend = GEMMBackend.TORCH
 
+        # Unified GEMM API: ask the library which candidates can serve this
+        # layer here instead of keeping a shape table in this file. No kernel
+        # module is loaded by the query.
+        self._unified_config: Optional[GemmConfig] = None
+        if self._backend in (GEMMBackend.UNIFIED_FP4, GEMMBackend.UNIFIED_FP8):
+            config = _unified_gemm_config(self._backend, self.kernel_backend)
+            reports = supported_backends(
+                config,
+                GemmProblem(n=out_features, k=in_features),
+                torch.device(device),
+            )
+            if not any(r.ok for r in reports):
+                major, minor = get_compute_capability(device)
+                reasons = "; ".join(
+                    f"{r.backend_key}: {r.reason}" for r in reports if not r.ok
+                )
+                warnings.warn(
+                    f"{self._backend.value} GEMM backend has no usable candidate on "
+                    f"SM{major * 10 + minor} for N={out_features}, K={in_features} "
+                    f"({reasons}); falling back to TORCH.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._backend = GEMMBackend.TORCH
+            else:
+                self._unified_config = config
+
         # Handle bias - only TORCH backend supports bias directly
         # Note: bias is added separately in forward() for non-TORCH backends
 
@@ -303,6 +413,8 @@ class FlashInferLinear(nn.Module):
             self._init_mxfp8_weights(dtype or torch.bfloat16)
         elif self._backend == GEMMBackend.BMM_MXFP8:
             self._init_bmm_mxfp8_weights(dtype or torch.bfloat16)
+        elif self._backend in (GEMMBackend.UNIFIED_FP4, GEMMBackend.UNIFIED_FP8):
+            self._init_unified_weights(dtype or torch.bfloat16)
         else:
             # TORCH, BF16, and BMM_BF16 use standard weight layout
             self._init_standard_weights(dtype or torch.bfloat16)
@@ -514,6 +626,57 @@ class FlashInferLinear(nn.Module):
         self.register_buffer("_weight_scale_mxfp8_bmm", None)
         self._bmm_mxfp8_prepared = False
 
+    def _init_unified_weights(self, dtype: torch.dtype):
+        """Initialize weights for UNIFIED_FP4 / UNIFIED_FP8 (flashinfer.gemm.Linear).
+
+        ``weight`` / ``bias`` stay this module's own parameters, exactly as on
+        the other paths, so ``state_dict`` keys and checkpoint loading do not
+        change. The composed ``flashinfer.gemm.Linear`` shares those parameter
+        objects and owns the quantized views, the backend selection and the
+        bias add (its layer applies the bias, so ``_forward_unified`` must not
+        add it again).
+        """
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.out_features, self.in_features, device=self.device, dtype=dtype
+            )
+        )
+        if self.has_bias:
+            self.bias = nn.Parameter(
+                torch.zeros(self.out_features, device=self.device, dtype=dtype)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_features
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+        # Built on the meta device so no second weight is allocated; the real
+        # parameters are shared in below. Stored with object.__setattr__ so it
+        # is NOT registered as a submodule: a registered child would add
+        # ``_unified_linear.weight`` / ``.bias`` keys to this module's
+        # state_dict, which must stay identical to every other backend's.
+        inner = UnifiedGemmLinear(
+            self.in_features,
+            self.out_features,
+            bias=self.has_bias,
+            device="meta",
+            dtype=dtype,
+            config=self._unified_config,
+        )
+        object.__setattr__(self, "_unified_linear", inner)
+        self._share_unified_parameters()
+        self._unified_prepared = False
+
+    def _share_unified_parameters(self):
+        """Point the inner ``flashinfer.gemm.Linear`` at this module's parameters."""
+        inner = self._unified_linear
+        inner.weight = self.weight
+        inner.bias = self.bias
+
     @torch.no_grad()
     def prepare_weights(self):
         """Prepare weights for optimized inference (call after loading weights)."""
@@ -539,6 +702,34 @@ class FlashInferLinear(nn.Module):
             self._prepare_mxfp8_weights()
         elif self._backend == GEMMBackend.BMM_MXFP8:
             self._prepare_bmm_mxfp8_weights()
+        elif self._backend in (GEMMBackend.UNIFIED_FP4, GEMMBackend.UNIFIED_FP8):
+            self._prepare_unified_weights()
+
+    @torch.no_grad()
+    def _prepare_unified_weights(self):
+        """Prepare weights for UNIFIED_FP4 / UNIFIED_FP8.
+
+        Re-shares ``weight`` / ``bias`` (loading code may have replaced the
+        Parameter objects) and lets ``flashinfer.gemm.Linear.prepare_weights``
+        build one backend-native view per candidate. With
+        ``online_act_quant=False`` the fixed activation scale is folded in
+        here, so the per-call path skips the activation ``amax``.
+        """
+        if self._unified_prepared:
+            return
+        self._share_unified_parameters()
+        activation_global_scale = None
+        if not self.online_act_quant:
+            activation_global_scale = torch.full(
+                (),
+                _UNIFIED_OFFLINE_ACT_SCALE[self._backend],
+                device=self.weight.device,
+                dtype=torch.float32,
+            )
+        self._unified_linear.prepare_weights(
+            activation_global_scale=activation_global_scale
+        )
+        self._unified_prepared = True
 
     @torch.no_grad()
     def _prepare_bf16_weights(self):
@@ -817,6 +1008,8 @@ class FlashInferLinear(nn.Module):
             out = self._forward_mxfp8(x_2d)
         elif self._backend == GEMMBackend.BMM_MXFP8:
             out = self._forward_bmm_mxfp8(x_2d)
+        elif self._backend in (GEMMBackend.UNIFIED_FP4, GEMMBackend.UNIFIED_FP8):
+            out = self._forward_unified(x_2d)
         else:
             out = self._forward_torch(x_2d)
 
@@ -826,6 +1019,23 @@ class FlashInferLinear(nn.Module):
     def _forward_torch(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using standard PyTorch."""
         return F.linear(x, self.weight, self.bias)
+
+    def _forward_unified(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward through ``flashinfer.gemm.Linear`` (unified GEMM API).
+
+        The inner module quantizes the activation for the configured pair,
+        picks the backend (deterministic ``auto`` outside ``autotune(True)``,
+        measured inside it, cached per M bucket) and applies the bias itself,
+        so nothing is added here.
+        """
+        if not self._unified_prepared:
+            self._prepare_unified_weights()
+        # The quantizers take bf16 / fp16 activations.
+        x_in = x if x.dtype in (torch.bfloat16, torch.float16) else x.to(torch.bfloat16)
+        out = self._unified_linear(x_in)
+        # The configured output format is BF16; cast back to the input dtype
+        # for consistency with the other backends.
+        return out.to(x.dtype)
 
     def _forward_bf16(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer mm_bf16."""
