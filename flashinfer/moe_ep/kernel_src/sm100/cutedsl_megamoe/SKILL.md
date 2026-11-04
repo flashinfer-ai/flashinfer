@@ -84,6 +84,11 @@ capture. Keep resources live and streams ordered; metadata/mode errors are
 agreed over CPU control during capture, while replay runs no host checks.
 Do not reintroduce GPU-to-host route reads into capture; each replay requires
 valid route IDs. Mixed eager/capture ranks must reject before device work.
+Reject initialization capture and unsupported explicit compile buckets through
+CPU agreement. Keep all post-session allocations, epilogue vectors and workspace
+construction inside `GinSession.workspace_construction`; publish only after
+all ranks succeed, coordinate cleanup on rejection, and escalate failed cleanup
+collectively. Do not add steady-state/replay collectives for these checks.
 Qualify host contracts with
 `python -m unittest discover -s tests/cpu/moe_ep -p test_legacy_nvfp4_gin_contracts.py -v`
 from the repository root; this does not qualify CUDA or NCCL execution.

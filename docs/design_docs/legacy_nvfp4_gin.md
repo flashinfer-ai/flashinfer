@@ -171,6 +171,14 @@ VENDOR 中登记为 pending-upstream diff，不声称是原 donor 的逐字副�
 
 初始化在 communicator、allocation、registration、peer mapping 等资源边界汇总
 rank-local 错误，避免某个 rank 提前退出、其他 rank 继续进入设备通信。
+workspace factory 和直接 session 初始化都会在创建资源前共同拒绝 capture 初始化。
+session 创建后，view、routes/output、epilogue 向量和workspace对象构建由同一阶段保护；
+所有rank完成后才返回workspace。局部分配失败时共同拒绝并释放session；清理结果也经协商，
+任一rank清理失败都升级为全作业`GinFatalError`，保留失败资源的依赖。
+
+GIN仅支持默认`compile_tokens_per_rank=None`的固定workspace容量；显式bucket（包括32）
+不增加支持。超出bucket、各rank bucket不一致及不支持的显式bucket在既有输入agreement内
+共同拒绝，修正为默认None后可恢复；不增加普通forward或Graph replay的控制通信轮数。
 eager 的公共 forward 和独立 `stage_inputs` 每次都校验 metadata、route 值与 bound device；
 capture 只校验 metadata 和绑定状态，route 值是每次 replay 的调用方前提。
 预检同时比较 phase、配置 signature 和 session identity。
@@ -240,14 +248,21 @@ activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。VENDOR 列出�
 
 | 验证层 | 已完成结果 |
 | --- | --- |
-| Host contracts | 18 项：arena/wire、LSA offsets、集体错误、控制组复用/PG 重建和生命周期 |
+| Host contracts | 22 项：arena/wire、LSA offsets、集体错误、控制组复用/PG 重建、构建清理与清理失败升级 |
 | 固定 N2R2 强 oracle | 每 rank 24 次 exact protocol 调用，全作业合计 96 项 transport/L1 byte 检查；包含 partial/empty rank、sparse holes 与 NaN invalid scores |
 | 独立 math | 原容差不变；最大 relative L2 为 `0.0026485608`，阈值 `0.02` |
-| 公共/强测试 | 每 rank 24 项通过，无 skips；包含三种 Graph 入口、BF16/packed、partial/empty rank、混合 capture 拒绝、未 warmup/metadata 错误恢复，以及已有 protocol/math/session/stream/device 检查 |
-| NCCL-only 默认组 | 每 rank 5 项通过，确认只在 capture 外创建一次 CPU/Gloo 控制组并复用 |
+| 公共/强测试 | 每 rank 38 项通过，无 skips；包含原24项Graph/oracle/lifetime检查与新增14项bucket、初始化capture、分配失败清理/重建检查 |
+| NCCL-only 默认组 | 每 rank 19 项通过，包含新增14项错误路径；确认只在capture外创建一次CPU/Gloo控制组并复用 |
 | 当前 off 兼容性 | 每 rank 6 项通过：4 项 finalizer、1 项 workspace/cache/graph、1 项 legacy public graph replay |
 
-当前 runtime 验收 source 为 `3bb3a307b`，job `3578913` 在两台 GB200/SM100
+当前错误协议修复source为`6a32476ae`，job`3594770`在GB200 `lyris0144/0238`
+上COMPLETED，exit0：先独立通过14项新增错误路径/rank，再通过上表38+19+6项/rank。
+分配失败通过单rank注入`torch.OutOfMemoryError`模拟，没有实际耗尽显存；检查view、routes、
+output和最后epilogue四处失败后的window/device-comm/comm/root/views清理与session重建。
+清理失败的全rank致命升级由CPU contract覆盖，不注入破坏性NCCL设备故障。
+99个Python源码哈希与该次运行一致，device文件未变；本轮不重跑性能，5节保留各历史source/范围。
+
+此前 Graph runtime source 为 `3bb3a307b`，job `3578913` 在两台 GB200/SM100
 上 COMPLETED，exit0（CUDA13.3、Torch2.13dev、DSL4.6.2、NCCL2.30.7、driver580.196）。
 每种 Graph case 比较三份 Graph、12组变化输入，共36次 replay/rank；覆盖实际
 capture stream、输出污染、上游 clone 和下游 GPU 运算，profiler 断言 mega/reducer
@@ -403,7 +418,7 @@ Profiler启动后先做CPU barrier，再提交被测操作；profile与主要计
 所有2592条样本/rank完整对齐，污染staged输入/输出、所有路径和计时block的结果均bitwise通过。
 原job `3593453` 同allocation每rank24项strong/public测试也全部通过；93个非空math批次
 最大relative L2为0.0026485608，原阈值0.02未改。实验adapter、完整trace及原始数据保留在
-独立实验目录；本轮仅修正文档，不修改运行时或device代码。
+独立实验目录；该次口径审计仅修正文档。随后host错误协议修复的验收见4节，device代码未改。
 
 ## 6. 合并评审边界
 
