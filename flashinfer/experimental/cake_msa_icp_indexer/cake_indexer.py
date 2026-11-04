@@ -409,7 +409,15 @@ class MSAIcpIndexerPlan:
         they wait on the preceding kernel.  The kernel launched just before
         ``decode`` must not write them and must either be launched without
         programmatic dependent launch or wait on its own predecessor before
-        it triggers; ``enable_pdl=False`` removes the requirement.
+        it triggers; ``enable_pdl=False`` removes the requirement.  With
+        ``tagged`` rows at world size 4 the merge also reads ``num_valid_pages``, its receive
+        rows and the slot set's merge counters before it waits (it waits
+        before it exits): no kernel of the step may write ``num_valid_pages``,
+        and a kernel launched without programmatic dependent launch must run
+        between two decodes on one slot set, so the merge that last wrote the
+        counters has completed (vLLM writes ``num_valid_pages`` in its
+        metadata builder and launches its decode K writer that way).  vLLM
+        runs tagged rows on decode-only steps; legacy rows wait first.
 
         ``tagged`` selects the generation-tagged rows; it needs at least two
         sparse layers between uses of one slot set (``num_sparse_layers >= 2``
@@ -486,6 +494,7 @@ class MSAIcpIndexerPlan:
             enable_pdl=enable_pdl,
             expected_generations=views[1],
             _trusted=True,
+            _poll_first=self.world_size in cb.POLL_FIRST_WORLD_SIZES,
         )
 
     def _decode_plane_publish(

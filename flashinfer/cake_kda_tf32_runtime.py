@@ -120,6 +120,19 @@ BF16_N16_M128_CHUNK = 16
 # part: BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 on a 152-SM sm_103a.
 BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS = 8
 BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
+# The work-bin turnover launches that take their module's short-task turnover
+# build where the loader names one (``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES``,
+# see _work_bin_turn_short_program): at most this many 32-token chunks in the
+# longest task and at least this many tasks per SM.  That build stores each
+# task's final state with per-warp TMA boxes; on sm_100a it spills more in the
+# chunk loop than the stock store and binds a tensor map of the final state on
+# every call, which pays only where the bins turn their state over every few
+# chunks and the launch has many such tasks per SM.  Measured on a 148-SM
+# sm_100a: 64-token tasks at 768 and 1024 tasks gain; 256 tasks of 64 tokens
+# and launches of up to 255-token tasks do not.  Every other turnover launch
+# keeps the turnover build (the stock store there).
+BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS = 2
+BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
 # loop: a CTA of the one-task-per-CTA body pays it for every task, a bin of the
 # turnover build hides it beside the previous task's chunks.  An unbounded
@@ -1523,6 +1536,39 @@ def _work_bin_pool_program(program, gpu_arch: str):
     for module, turnover in turn.items():
         if turnover == program and module in pool:
             return pool[module]
+    return None
+
+
+def _work_bin_turn_short_scope(seq_lens, num_heads: int, sm_count: int) -> bool:
+    """Whether a work-bin turnover launch of ``seq_lens`` at ``num_heads``
+    heads on ``sm_count`` SMs takes the short-task turnover build: at least
+    ``BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM`` tasks per SM and at most
+    ``BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS`` chunks in its longest task."""
+    tasks = len(seq_lens) * num_heads
+    if tasks < BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM * sm_count:
+        return False
+    return max(seq_lens) <= BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS * BF16_M128_CHUNK
+
+
+def _work_bin_turn_short_program(
+    program, gpu_arch: str, seq_lens, num_heads: int, sm_count: int
+):
+    """The ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` build beside the work-bin
+    turnover build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``) for a launch
+    of ``seq_lens`` at ``num_heads`` heads on ``sm_count`` SMs, or ``None``:
+    ``None`` on an architecture whose table is empty (no further work) and for
+    a launch outside _work_bin_turn_short_scope."""
+    if program is None:
+        return None
+    short = getattr(_kda_registry, "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not short or not _work_bin_turn_short_scope(seq_lens, num_heads, sm_count):
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in short:
+            return short[module]
     return None
 
 
@@ -4374,6 +4420,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.ir = self.module.schedule
         num_work_bins = 0
         bin_mix_plan = None
+        turn_short_program = None
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
@@ -4428,6 +4475,22 @@ class FlashKDABlackwellBF16FusedLaunch:
             if bin_pool_plan is not None:
                 bin_mix_program = bin_pool_program
                 bin_mix_plan = bin_pool_plan
+            # A turnover launch of short tasks with many tasks per SM that
+            # takes neither build takes the module's short-task turnover build
+            # where the loader names one: the same bins, table and bits with
+            # the per-warp TMA final-state store.
+            if (
+                bin_mix_plan is None
+                and uses_default_fused_m128
+                and not use_direct_m128_n16
+            ):
+                turn_short_program = _work_bin_turn_short_program(
+                    getattr(self.module, "name", None),
+                    gpu_arch,
+                    seq_lens,
+                    num_heads,
+                    sm_count,
+                )
             work_bin_upload = _upload_int32_batch(
                 q.device,
                 {"seq_order": list(work_bin_table) + list(bin_mix_plan or ())},
@@ -4517,6 +4580,15 @@ class FlashKDABlackwellBF16FusedLaunch:
                 _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {}).values()
             ):
                 self.schedule += "_turnover"
+            if turn_short_program is not None:
+                turn_short_module = _kda_registry.PreparedKernel(
+                    turn_short_program, gpu_arch
+                )
+                self._qkv_carrier_names[id(turn_short_module)] = (
+                    self._qkv_carrier_names.get(id(self.module), ())
+                )
+                self.module = turn_short_module
+                self.ir = turn_short_module.schedule
             if bin_mix_plan is not None:
                 # The bin-mix build runs the same bins on the same grid; a
                 # refused cooperative launch takes the turnover program
