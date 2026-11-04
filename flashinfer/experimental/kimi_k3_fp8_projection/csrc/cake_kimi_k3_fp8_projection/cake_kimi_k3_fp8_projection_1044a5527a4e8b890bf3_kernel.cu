@@ -47,46 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 280
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_TMEM_SFA_OFFSET 256
-#define TMEM_TMEM_SFB_OFFSET 264
-#define NUM_TMA_PIPE_STAGES 2
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_SMEM_OUT_OFF 139264
-#define SMEM_SMEM_OUT_STAGE_BYTES 8192
-#define SMEM_SMEM_OUT_STRIDE 8192
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 32768
-#define SMEM_SMEM_A_STRIDE 68608
-#define SMEM_SMEM_B_OFF 33792
-#define SMEM_SMEM_B_STAGE_BYTES 32768
-#define SMEM_SMEM_B_STRIDE 68608
-#define SMEM_SMEM_SFA_ALL_OFF 66560
-#define SMEM_SMEM_SFA_ALL_STAGE_BYTES 1024
-#define SMEM_SMEM_SFA_ALL_STRIDE 68608
-#define SMEM_SMEM_SFB_ALL_OFF 67584
-#define SMEM_SMEM_SFB_ALL_STAGE_BYTES 2048
-#define SMEM_SMEM_SFB_ALL_STRIDE 68608
-#define SMEM_SMEM_SFA0_OFF 66560
-#define SMEM_SMEM_SFA0_STAGE_BYTES 512
-#define SMEM_SMEM_SFA0_STRIDE 68608
-#define SMEM_SMEM_SFA1_OFF 67072
-#define SMEM_SMEM_SFA1_STAGE_BYTES 512
-#define SMEM_SMEM_SFA1_STRIDE 68608
-#define SMEM_SMEM_SFB0_OFF 67584
-#define SMEM_SMEM_SFB0_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB0_STRIDE 68608
-#define SMEM_SMEM_SFB1_OFF 68608
-#define SMEM_SMEM_SFB1_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB1_STRIDE 68608
-#define SMEM_WORK_RESPONSE_OFF 138240
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 204800
-#define THREADS 320
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define B_HALF_N 128
@@ -275,7 +235,7 @@ kernel_cake_kimi_k3_fp8_projection_1044a5527a4e8b890bf3(const __grid_constant__ 
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 139264);
     const int smem_out_addr = smem + 139264;
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -297,8 +257,7 @@ kernel_cake_kimi_k3_fp8_projection_1044a5527a4e8b890bf3(const __grid_constant__ 
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 138240);
     const int work_response_addr = smem + 138240;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[0..112)
+    // Mbarrier init (14 barriers at smem_raw[0..112))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -346,12 +305,10 @@ kernel_cake_kimi_k3_fp8_projection_1044a5527a4e8b890bf3(const __grid_constant__ 
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_tmem_sfa = taddr + 256;
-    const int tmem_tmem_sfb = taddr + 264;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_tmem_sfa = taddr + 256;
+    const unsigned int tmem_tmem_sfb = taddr + 264;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -510,9 +467,9 @@ kernel_cake_kimi_k3_fp8_projection_1044a5527a4e8b890bf3(const __grid_constant__ 
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                         uint32_t _elected_0 = elect_sync();
-                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)), _elected_0);
-                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)), _elected_0);
-                        tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa + 0, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb + 0, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)), _elected_0);
+                        tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 0 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)), _elected_0);
                         tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_sfa1_addr) >> 4) + (mma_tma_stage) * 4288)), _elected_0);
                         tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288)), _elected_0);
                         tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288 + 32)), _elected_0);
@@ -523,13 +480,13 @@ kernel_cake_kimi_k3_fp8_projection_1044a5527a4e8b890bf3(const __grid_constant__ 
                             uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
 
                             tcgen05_mma_mxf8_bs_cta2_leader(tmem_accum, a_desc + 0, b_desc + 0,
-                                0x10c00000U, tmem_tmem_sfa, tmem_tmem_sfb, ((init_flag) ? 0 : 1), _elected_0);
+                                0x10c00000U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1), _elected_0);
                             tcgen05_mma_mxf8_bs_cta2_leader(tmem_accum, a_desc + 2, b_desc + 2,
-                                0x30c00010U, tmem_tmem_sfa, tmem_tmem_sfb, 1, _elected_0);
+                                0x30c00010U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1, _elected_0);
                             tcgen05_mma_mxf8_bs_cta2_leader(tmem_accum, a_desc + 4, b_desc + 4,
-                                0x50c00020U, tmem_tmem_sfa, tmem_tmem_sfb, 1, _elected_0);
+                                0x50c00020U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1, _elected_0);
                             tcgen05_mma_mxf8_bs_cta2_leader(tmem_accum, a_desc + 6, b_desc + 6,
-                                0x70c00030U, tmem_tmem_sfa, tmem_tmem_sfb, 1, _elected_0);
+                                0x70c00030U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1, _elected_0);
                         }
                         int _smem_desc_lo_3 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
                         int _smem_desc_lo_4 = (((smem_b_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
