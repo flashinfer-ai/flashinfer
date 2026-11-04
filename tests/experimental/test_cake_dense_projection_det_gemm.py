@@ -3180,10 +3180,12 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # the 17408 x 5120 weight gradients: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 3 adds
     # 2 sm_100a and 2 sm_103a keys (the indexer_q weight gradient: test_gb_t_exact_sks_wgrad_rules_plan_their_programs);
     # their round 4 adds 2 sm_100a keys (the 5120 -> 17408 input gradient:
-    # test_gb_t_exact_rules_plan_their_programs)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 2
+    # test_gb_t_exact_rules_plan_their_programs);
+    # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
+    # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 2 + 1
     assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -9780,6 +9782,125 @@ def test_sm107a_n128_wgrad_rules_plan():
                 plan.sk_units,
                 plan.iters_per_unit,
             ) == (template, tail, units, ipu), (K, f32)
+
+
+# The sm_107a T-exact weight-gradient key of the 4096 -> 1024 fp32 weight gradient at T 16384 (K = T, the direct
+# orientation): the rule of its T 16231 key, with the per-tile K partitions of the row's plan without it.
+SM107A_T16384_WGRAD_KEY = ("sm_107a", True, True, True, False, False, 4096, 16384, 1024)
+
+
+def _k_partitions(plan):
+    """The distinct per-tile K-step partitions of a plan (where every output element's K sum is split)."""
+    kb = int(plan.k_blocks)
+    if not plan.sk_units or plan.htail_plan:
+        return [(0, kb)]
+    parts = {(0, kb)} if plan.num_full else set()
+    if plan.sk_exact:
+        step = -(-kb // int(plan.sk_exact))
+        parts.add(tuple(sorted(set(range(0, kb, step)) | {kb})))
+    elif plan.sk_sync:
+        parts.add((0, int(plan.iters_per_unit), kb))
+    else:
+        ipu, units = int(plan.iters_per_unit), int(plan.sk_units)
+        for t in range(int(plan.tail_tiles)):
+            lo, hi = t * kb, (t + 1) * kb
+            cuts = {lo, hi} | {u * ipu for u in range(units + 1) if lo < u * ipu < hi}
+            parts.add(tuple(x - lo for x in sorted(cuts)))
+    return sorted(parts)
+
+
+def _sm107a_wgrad_plan(N, T, M, sm_count):
+    G = torch.empty(T, M, dtype=torch.bfloat16)
+    X = torch.empty(T, N, dtype=torch.bfloat16)
+    out = torch.empty(M, N, dtype=torch.float32)
+    A, B, transposed = wgrad_views(G, X, arch="sm_107a", out_f32=True)
+    assert not transposed, (N, T, M)
+    plan, *_ = plan_dense_projection_det_gemm(
+        A,
+        B,
+        out,
+        sm_count=sm_count,
+        l2_bytes=L2_BYTES,
+        arch="sm_107a",
+    )
+    return plan
+
+
+def test_sm107a_t16384_wgrad_key_plans_the_t16231_rule(monkeypatch):
+    """The sm_107a 4096 -> 1024 fp32 weight-gradient key at T 16384 carries the rule of the row's T 16231 key and plans
+    its program on every sm_107a SM count without a registry fallback, with the per-tile K partitions of the row's plan
+    without the key (the launcher's plan: the registry fallback of the default tile to the 256-row tall tile);
+    one token more or less plans that plan."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    key = SM107A_T16384_WGRAD_KEY
+    _arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+    sibling = key[:7] + (16231,) + key[8:]
+    assert ROW_RULES[key] == ROW_RULES[sibling]
+    registered = _registered("sm_107a")
+    for sm_count in (208, 212, 216):
+        plans = {t: _sm107a_wgrad_plan(N, t, M, sm_count) for t in (T - 1, T, T + 1)}
+        sib = _sm107a_wgrad_plan(N, 16231, M, sm_count)
+        with monkeypatch.context() as m:
+            m.delitem(ROW_RULES, key)
+            without = {
+                t: _sm107a_wgrad_plan(N, t, M, sm_count) for t in (T - 1, T, T + 1)
+            }
+        for t in (T - 1, T + 1):
+            assert _plan_signature(plans[t]) == _plan_signature(without[t]), (
+                sm_count,
+                t,
+            )
+        plan, plain = plans[T], without[T]
+        assert plan.template == sib.template and plan.template in registered, (
+            sm_count,
+            plan.template,
+        )
+        assert not (plan.rule_fallback or plan.knob_fallback or plan.swap_fallback)
+        assert plan.template != plain.template, (sm_count, plain.template)
+        assert (plan.block_n, plan.cta_rows, plan.b_swz) == (160, 256, 64)
+        assert _k_partitions(plan) == _k_partitions(plain), (sm_count, plain.template)
+
+
+def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatch):
+    """On sm_107a the 4096 -> 1024 fp32 weight gradient at T 16384 runs the key's program against the FP64 reference
+    of the exact BF16 operands (the package tolerance), and its output is bitwise equal to the output of the plan the
+    row has without the key (the rule changes the program, never a K sum).  Other architectures skip."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    key = SM107A_T16384_WGRAD_KEY
+    arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    out = torch.full((M, N), float("nan"), dtype=torch.float32, device=device)
+    cake_backend.clear_convenience_caches()
+    prepared = prepare_projection_det_wgrad(G, X, out)
+    template = prepared.template
+    _require_program(template)
+    assert not prepared.plan.transposed_out
+    assert (prepared.plan.block_n, prepared.plan.cta_rows) == (160, 256), template
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(G.double().t(), X.double()))
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        m.delitem(ROW_RULES, key)
+        cake_backend.clear_convenience_caches()
+        plain = prepare_projection_det_wgrad(G, X, plain_out)
+    assert plain.template != template, plain.template
+    plain.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int32), plain_out.view(torch.int32)), (
+        template,
+        plain.template,
+    )
+    cake_backend.clear_convenience_caches()
 
 
 # The determinism contract of the package: a prepared launch rerun over the same operands gives the same bits.
