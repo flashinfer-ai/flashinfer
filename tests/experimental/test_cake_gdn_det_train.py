@@ -354,7 +354,7 @@ def test_former_names_are_aliases_of_the_det_names() -> None:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 36 and len(set(cake_jit.STAGES)) == 36
+    assert len(cake_jit.STAGES) == 37 and len(set(cake_jit.STAGES)) == 37
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -379,9 +379,10 @@ def test_registry_records_are_well_formed() -> None:
         params = cake_backend.parameters(name)
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
-    # one program per record: a kernel swap renames exactly the records it touches; the two shared libraries are the
-    # sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program, and the
-    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program
+    # one program per record: a kernel swap renames exactly the records it touches; the three shared libraries are
+    # the sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program, the
+    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program, and the sm_100a / sm_103a fwd_ho_vh2, which is
+    # the fwd_ho program
     wavefront = cake_jit.MODULES["dhu_tc2_wavefront"]
     assert wavefront["arches"] == ["sm_100a", "sm_103a"]
     shared = cake_jit.MODULES["dhu_tc2_wavefront_split_sm_107a"]
@@ -401,7 +402,11 @@ def test_registry_records_are_well_formed() -> None:
         wy2_107["library"] == wy2["library"] != wy["library"]
         and "sm_107a" in wy["arches"]
     )
-    assert len(libraries) == len(cake_jit.MODULES) - 2
+    assert (
+        cake_jit.MODULES["fwd_ho_vh2"]["library"]
+        == cake_jit.MODULES["fwd_ho"]["library"]
+    )
+    assert len(libraries) == len(cake_jit.MODULES) - 3
 
 
 def test_the_wy_stage_follows_the_architecture() -> None:
@@ -415,6 +420,68 @@ def test_the_wy_stage_follows_the_architecture() -> None:
     assert (
         cake_jit.MODULES["wy_tc2"]["arg_plan"] == cake_jit.MODULES["wy_tc"]["arg_plan"]
     )
+
+
+def test_the_value_half_split_rule() -> None:
+    assert cake_chain.FWD_HO_VH2_ARCHS == ("sm_107a",)
+    assert cake_chain.LAUNCH_ARGS["fwd_ho_vh2"] == cake_chain.LAUNCH_ARGS["fwd_ho"]
+    split, fwd_ho = cake_jit.MODULES["fwd_ho_vh2_sm_107a"], cake_jit.MODULES["fwd_ho"]
+    assert split["stage"] == "fwd_ho_vh2" and split["arches"] == ["sm_107a"]
+    assert split["arg_plan"] == fwd_ho["arg_plan"]
+    assert split["library"] != fwd_ho["library"]
+    assert split["launch"] == fwd_ho["launch"]
+    # sm_100a / sm_103a never run the split: the stage's record there is the fwd_ho program
+    other = cake_jit.MODULES["fwd_ho_vh2"]
+    assert other["stage"] == "fwd_ho_vh2" and other["arches"] == ["sm_100a", "sm_103a"]
+    assert {
+        key: value for key, value in other.items() if key not in ("arches", "stage")
+    } == {key: value for key, value in fwd_ho.items() if key not in ("arches", "stage")}
+    assert [cake_jit.stage_record("fwd_ho_vh2", arch) for arch in ARCHES] == [
+        "fwd_ho_vh2",
+        "fwd_ho_vh2",
+        "fwd_ho_vh2_sm_107a",
+    ]
+    engaged = cake_chain.fwd_ho_vh2_engaged
+    # twice the CTAs in one round of one CTA per SM
+    assert engaged(6, 16, 192) and not engaged(6, 16, 191)
+    assert engaged(1, 1, 2) and not engaged(1, 1, 1)
+    assert not engaged(6, 16, 148) and not engaged(6, 16, 152)
+
+
+# The forward scans of the campaign rows that run fwd_ho_vh2 per device (SMs, architecture): on the R200 boards the
+# one-launch forward scan of r07 (one sequence, a split plan of 96 CTAs); no row on sm_100a / sm_103a.
+VH2_DEVICES = {
+    (148, "sm_100a"): set(),
+    (152, "sm_103a"): set(),
+    (208, "sm_107a"): {"r07"},
+    (212, "sm_107a"): {"r07"},
+    (216, "sm_107a"): {"r07"},
+}
+
+
+@pytest.mark.parametrize("sms,arch", sorted(VH2_DEVICES))
+def test_value_half_split_on_the_campaign_rows(sms, arch, monkeypatch) -> None:
+    props = (sms, 232448, 10)
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    rows = {row: (seq_lens, hv) for row, seq_lens, hv, _sel in RULE_ROWS}
+    rows.update({row: (seq_lens, hv) for row, seq_lens, hv in SDT_ROWS})
+    engaged = set()
+    for row, (seq_lens, num_v_heads) in rows.items():
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=True)
+        fwd, _bwd = cake_chain.sequence_groups(meta, num_v_heads, sms)
+        if (
+            fwd is None
+            and arch in cake_chain.FWD_HO_VH2_ARCHS
+            and cake_chain.fwd_ho_vh2_engaged(
+                meta.fwd_segments.num_segments, num_v_heads, sms
+            )
+        ):
+            engaged.add(row)
+    assert engaged == VH2_DEVICES[(sms, arch)]
 
 
 def test_scan_records_carry_the_planner_constants() -> None:
@@ -1699,6 +1766,42 @@ def test_the_wy_stage_of_the_device_gives_the_wy_tc_bits(
     replaced = [stage for stage in stages if stage.startswith("wy_tc")]
     assert replaced == ["wy_tc"] * len(launched), stages
     _assert_bitwise(ruled, plain, OUTPUT_NAMES)
+
+
+# (layout, heads, route, pins): a serial plan with grouped value heads and partial chunks, a split plan (segment start
+# states from the pre-scan and the stitch) and the device route (the table's segment bound, padding segments
+# included); each forward scan is one launch of at most half the SMs of any of the devices
+VH2_FORMS = {
+    "serial": ((300, 77, 640, 17), (2, 4), "host", {}),
+    "split": (
+        (2000, 300),
+        (1, 2),
+        "host",
+        {"scan_config": (32, 2), "segment_chunks": 4},
+    ),
+    "device": ((100, 640, 77, 300), (2, 6), "device", {}),
+}
+
+
+@pytest.mark.parametrize("form", sorted(VH2_FORMS))
+def test_the_value_half_split_gives_the_fwd_ho_bits(form, device, monkeypatch) -> None:
+    # with the rule on for the device's architecture (fwd_ho_vh2 is delivered for every architecture) the forward scan
+    # runs fwd_ho_vh2; fwd_ho in its place gives the same bits, the final state and the gradients included
+    seq_lens, heads, route, pins = VH2_FORMS[form]
+    arch = cake_backend.device_arch(torch.cuda.current_device())
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=83)
+    gen = torch.Generator().manual_seed(89)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    stages = _record_launches(monkeypatch)
+    runs = []
+    for archs, stage in (((arch,), "fwd_ho_vh2"), ((), "fwd_ho")):
+        monkeypatch.setattr(cake_chain, "FWD_HO_VH2_ARCHS", archs)
+        stages.clear()
+        runs.append(_run(inputs, seq_lens, route=route, initial_state=h0, output_final_state=True, **pins))  # fmt: skip
+        assert [name for name in stages if name.startswith("fwd_ho")] == [stage], stages
+    _assert_bitwise(runs[0], runs[1], OUTPUT_NAMES + ("final_state", "dh0"))
 
 
 def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:

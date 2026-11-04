@@ -25,7 +25,10 @@ the plain prep; both give the same bits), the tcgen05 WY stage
 (:func:`wy_stage`: ``wy_tc2``, five CTAs per SM, on the architectures of
 ``WY_TC2_ARCHS``, else ``wy_tc``; the same bits) and the fused tcgen05 scan
 and output (``fwd_ho``; a split plan first runs the pre-scan and the stitch
-for the segment start states).  The backward runs ``dv_local`` and
+for the segment start states; on the architectures of ``FWD_HO_VH2_ARCHS`` a
+scan of one launch whose CTAs fill at most half of the SMs runs as
+``fwd_ho_vh2``, two CTAs per segment and value head, one value half each,
+:func:`fwd_ho_vh2_engaged`; the same bits).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -114,6 +117,7 @@ __all__ = [
     "chunk_gated_delta_rule_det",
     "dhu_tc_pricing",
     "finalize_stage",
+    "fwd_ho_vh2_engaged",
     "gdn_chunk_backward",
     "gdn_chunk_det_backward",
     "gdn_chunk_det_forward",
@@ -198,6 +202,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "wy_tc": _WY_ARGS,
     "wy_tc2": _WY_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
+    "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
@@ -1699,6 +1704,19 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
     return h, v_new, final_state
 
 
+# The value-half split of the fused forward scan and output: on an architecture of ``FWD_HO_VH2_ARCHS`` a forward
+# scan of one launch (no two-stream groups) whose CTAs fill at most half of the SMs runs ``fwd_ho_vh2``, two CTAs per
+# (segment, value head) on twice the grid, each the scan and output of one value half.  Its per-element math is
+# fwd_ho's, so the bits are the same; the split shortens each CTA's per-chunk chain where the SMs would sit idle.
+FWD_HO_VH2_ARCHS = ("sm_107a",)
+
+
+def fwd_ho_vh2_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> bool:
+    """Whether a one-launch forward scan of ``num_segments`` segments runs as ``fwd_ho_vh2``: its ``2 x num_segments
+    x num_v_heads`` CTAs fit one round of ``sm_count`` SMs (one CTA per SM)."""
+    return 2 * int(num_segments) * int(num_v_heads) <= int(sm_count)
+
+
 _WALKS: dict = {}
 
 
@@ -1787,10 +1805,14 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         use_seg = 1
     walk = _walk(device, segs, options)
     if wy is None:
-        _launch("fwd_ho", segs.num_segments * num_v_heads, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o,
-                o, final_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
-                meta.seq_chunk_start, walk, num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg,
-                float(scale))  # fmt: skip
+        stage, ctas = "fwd_ho", segs.num_segments * num_v_heads
+        if arch in FWD_HO_VH2_ARCHS and fwd_ho_vh2_engaged(
+            segs.num_segments, num_v_heads, _device_props(_tensor_index(kn))[0]
+        ):
+            stage, ctas = "fwd_ho_vh2", 2 * ctas
+        _launch(stage, ctas, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o, final_state,
+                meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, walk,
+                num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip
         return h, v_new, final_state, o
     # P form: the side stream runs wy_tc and fwd_ho of group A (the partial round); the caller's stream runs those of
     # group B (the full rounds) once wy_tc(A) is done, then joins the side stream.  fwd_ho(A) can read w / u rows past
