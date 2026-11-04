@@ -12282,7 +12282,7 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12428,7 +12428,9 @@ def batch_deepgemm_fp8_nt_groupwise(
         ``"cake"`` runs the generated Cake programs for the band they own
         (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
         (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
-        (4096, 2048)}``; bfloat16 output; FP32 accumulation with the same
+        (4096, 2048)}``; SM107a: the masked BLOCK_N programs, ``(n, k)`` in
+        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}`` with float32
+        scales; bfloat16 output; FP32 accumulation with the same
         ordered block-scale application as DeepGEMM) and raises for every other
         problem.  With ``backend="cake"`` the scales may also be the native
         MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes

@@ -7,14 +7,17 @@ import torch
 
 from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
 from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
+    PACKED_ARCHS,
     PACKED_GROUPS,
     PACKED_NK,
     SUPPORTED_NK,
     is_batch_deepgemm_fp8_nt_groupwise_cake_available,
     prepare_batch_deepgemm_fp8_nt_groupwise,
     select_route,
+    supported_nk,
 )
 from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
+    _TABLE,
     PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
@@ -25,6 +28,20 @@ from flashinfer.utils import BackendSupportedError
 ATOL = RTOL = 3e-2
 
 
+def _arch():
+    return device_arch(torch.cuda.current_device())
+
+
+def _require_nk(nk):
+    if nk not in supported_nk(_arch()):
+        pytest.skip(f"{_arch()} owns no route for (N, K) = {nk}")
+
+
+def _require_packed():
+    if _arch() not in PACKED_ARCHS:
+        pytest.skip(f"no packed-scale serving program ships for {_arch()}")
+
+
 @pytest.fixture(autouse=True)
 def _require_generated_program():
     if not torch.cuda.is_available():
@@ -32,7 +49,7 @@ def _require_generated_program():
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
         pytest.skip(
-            "generated Cake batch DeepGEMM FP8 programs target SM100a and SM103a"
+            "generated Cake batch DeepGEMM FP8 programs target SM100a, SM103a and SM107a"
         )
     if not is_batch_deepgemm_fp8_nt_groupwise_cake_available(device):
         pytest.skip(
@@ -117,6 +134,7 @@ def _pack_ue8m0(scale):
 @pytest.mark.parametrize("nk", sorted(SUPPORTED_NK))
 @pytest.mark.parametrize("groups,m", [(1, 128), (4, 256), (8, 128)])
 def test_prepared_matches_reference(nk, groups, m):
+    _require_nk(nk)
     device = torch.device("cuda")
     n, k = nk
     a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(
@@ -165,6 +183,7 @@ def test_public_api_backend_cake(nk):
 
 
 def test_cuda_graph_capture_of_first_launch():
+    _require_nk((4096, 2048))
     device = torch.device("cuda")
     # A swap-AB route (scale-pack kernel + GEMM, packed-scale workspace): the
     # DeepGEMM expected-M 230 profile on (4096, 2048).
@@ -215,10 +234,12 @@ def test_public_api_first_call_is_graph_capturable():
     )
 
 
-def test_launch_allocates_nothing():
+@pytest.mark.parametrize("nk", [(4096, 2048), (4096, 7168)])
+def test_launch_allocates_nothing(nk):
+    _require_nk(nk)
     device = torch.device("cuda")
     a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(
-        2, 4096, 4096, 2048, seed=928, device=device, masked=[230, 230]
+        2, 4096, *nk, seed=928, device=device, masked=[230, 230]
     )
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, b, a_scale, b_scale, masked_m, expected_m
@@ -234,6 +255,7 @@ def test_launch_allocates_nothing():
 
 
 def test_packed_ue8m0_scales_match_reference():
+    _require_packed()
     device = torch.device("cuda")
     groups, m, n, k = 32, 256, 7168, 2048
     a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
@@ -265,6 +287,7 @@ def test_packed_ue8m0_scales_match_reference():
 def test_packed_serving_expected_m_one_with_multi_block_groups(nk, groups):
     """``expected_m`` is only a hint: at ``expected_m=1`` a group can still hold
     more than one 32-row M block (here 40 and 33 rows) on the serving route."""
+    _require_packed()
     device = torch.device("cuda")
     n, k = nk
     m = 256
@@ -313,7 +336,10 @@ def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, b, a_scale, b_scale, masked_m, 1
     )
-    assert prepared.route == route
+    if _arch() in PACKED_ARCHS:
+        assert prepared.route == route
+    else:
+        assert prepared.parent == "seed_masked_bn"
     out = prepared.launch()
     torch.cuda.synchronize()
     _assert_valid_rows_close(
@@ -327,6 +353,10 @@ def test_out_of_band_problems_raise():
         2, 256, 256, 256, seed=930, device=device
     )
     assert (256, 256) not in SUPPORTED_NK
+    assert (
+        supported_nk("sm_107a") < SUPPORTED_NK
+        and supported_nk("sm_100a") == SUPPORTED_NK
+    )
     with pytest.raises(ValueError, match=r"\(N, K\)"):
         batch_deepgemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, masked_m, expected_m, backend="cake"
@@ -353,6 +383,7 @@ def test_out_of_band_problems_raise():
         2, 128, 7168, 2048, seed=932, device=device
     )
     assert 2 not in PACKED_GROUPS and (7168, 2048) in PACKED_NK
+    assert "sm_107a" not in PACKED_ARCHS
     with pytest.raises(ValueError, match="packed UE8M0"):
         prepare_batch_deepgemm_fp8_nt_groupwise(
             a,
@@ -372,6 +403,16 @@ def test_out_of_band_problems_raise():
     assert not batch_deepgemm_fp8_nt_groupwise.is_backend_supported("cake", 120)
     assert batch_deepgemm_fp8_nt_groupwise.is_backend_supported("cake", 100)
     assert batch_deepgemm_fp8_nt_groupwise.is_backend_supported("cake", 103)
+    assert batch_deepgemm_fp8_nt_groupwise.is_backend_supported("cake", 107)
+    # A geometry another architecture owns is out of the band on SM107a.
+    if _arch() == "sm_107a":
+        a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(
+            2, 256, 4096, 2048, seed=934, device=device
+        )
+        with pytest.raises(ValueError, match=r"\(N, K\)"):
+            prepare_batch_deepgemm_fp8_nt_groupwise(
+                a, b, a_scale, b_scale, masked_m, expected_m
+            )
     with pytest.raises(BackendSupportedError):
         batch_deepgemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, masked_m, expected_m, backend="nonexistent"
@@ -425,7 +466,7 @@ def test_route_chain_covers_inventory_with_registered_programs():
     index = device.index if device.index is not None else torch.cuda.current_device()
     arch = device_arch(index)
     sm_count = device_sm_count(index)
-    for n, k in sorted(SUPPORTED_NK):
+    for n, k in sorted(supported_nk(arch)):
         for groups, m in ((1, 128), (4, 1024), (64, 256), (256, 128)):
             for expected_m in (1, m // 2, m):
                 plan = select_route(arch, sm_count, groups, m, n, k, expected_m)
@@ -435,3 +476,45 @@ def test_route_chain_covers_inventory_with_registered_programs():
                     assert all(int(v) > 0 for v in stage.grid)
     # Geometry outside the inventory is a named gap, never a fallback.
     assert select_route(arch, sm_count, 1, 128, 256, 256, 1) is None
+
+
+def _band_points(row):
+    """The CTA counts at the ends of each of the row's intervals on SM107a (an open
+    lower end at 1, an open upper end 32 CTAs past the lower end, at least 320)."""
+    points = set()
+    for lo, hi in row.where["ctas"]["sm_107a"]:
+        points.add(1 if lo is None else lo)
+        points.add(max(320, (lo or 1) + 32) if hi is None else hi)
+    return sorted(points)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [row for row in _TABLE.get("sm_107a", ()) if row.form == "band"],
+    ids=lambda row: row.route,
+)
+def test_sm107a_band_boundaries_match_reference(row):
+    """Every end of every SM107a BLOCK_N band selects that band's program and matches the reference."""
+    if _arch() != "sm_107a":
+        pytest.skip("the SM107a bands run on SM107a")
+    device = torch.device("cuda")
+    n, k = row.where["nk"]
+    for cta in _band_points(row):
+        # One group of ``cta`` 128-row M tiles: CTA = ceil(expected_m / 128).
+        m = 128 * cta
+        rows = m - 5
+        a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+            1, m, n, k, seed=935 + cta, device=device, masked=[rows]
+        )
+        prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, masked_m, rows
+        )
+        assert prepared.route == row.route, (cta, prepared.route)
+        assert prepared.programs == (row.stages[0][0],)
+        out = prepared.launch()
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(
+            out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+        )
+        del a, b, out
+        torch.cuda.empty_cache()

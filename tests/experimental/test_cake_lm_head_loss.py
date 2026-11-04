@@ -33,6 +33,7 @@ rendered programs.
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import functools
 import gc
@@ -40,6 +41,7 @@ import inspect
 import json
 import math
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -6932,6 +6934,104 @@ def test_zero_dlogp_floor_switch():
     assert cake_backend.zero_dlogp_min_rows() == default
 
 
+def test_zero_dlogp_floor_per_architecture(monkeypatch):
+    """The skip's default floor is per architecture: ``zero_dlogp_min_rows(index)`` reads the device's architecture
+    once per device index and returns its floor in ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` (sm_100a: 1946 valid rows,
+    sm_103a: 3891), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and without a
+    device.  An override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device; the setter
+    returns ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every returned value
+    passed back restores the previous state exactly."""
+    sentinel = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    assert cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
+    assert cake_backend.ZERO_DLOGP_MIN_ROWS_BY_ARCH == {
+        "sm_100a": 1946,
+        "sm_103a": 3891,
+    }
+    assert repr(sentinel) == "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+    archs = {0: "sm_100a", 1: "sm_103a", 2: "sm_107a", 3: None}
+    resolved = []
+
+    def arch_for(device=None):
+        resolved.append(device.index)
+        return archs[device.index]
+
+    monkeypatch.setattr(cake_backend, "arch_for", arch_for)
+    monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_ARCH", {})
+    monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_MIN_ROWS", {"rows": sentinel})
+    defaults = {0: 1946, 1: 3891, 2: 4097, 3: 4097}
+
+    def floors():
+        return {index: cake_backend.zero_dlogp_min_rows(index) for index in archs}
+
+    assert floors() == defaults and floors() == defaults
+    assert sorted(resolved) == [0, 1, 2, 3]  # once per device index
+    assert cake_backend.zero_dlogp_min_rows() == 4097
+    previous = cake_backend.set_zero_dlogp_min_rows(0)
+    assert previous is sentinel
+    assert floors() == dict.fromkeys(archs, 0)
+    assert cake_backend.zero_dlogp_min_rows() == 0
+    assert cake_backend.set_zero_dlogp_min_rows(None) == 0
+    assert floors() == dict.fromkeys(archs)
+    assert cake_backend.zero_dlogp_min_rows() is None
+    assert cake_backend.set_zero_dlogp_min_rows(previous) is None
+    assert floors() == defaults and cake_backend.zero_dlogp_min_rows() == 4097
+    with _zero_dlogp_floor(2049):
+        assert floors() == dict.fromkeys(archs, 2049)
+        with _zero_dlogp_floor(sentinel):
+            assert floors() == defaults
+        assert floors() == dict.fromkeys(archs, 2049)
+    assert floors() == defaults
+    assert cake_backend.set_zero_dlogp_min_rows(sentinel) is sentinel
+    assert sorted(resolved) == [0, 1, 2, 3]
+
+
+def test_zero_dlogp_floor_sentinel_survives_copy_and_pickle(monkeypatch):
+    """``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` is one object per process: ``copy.copy``, ``copy.deepcopy`` (also inside a
+    container) and a pickle round trip give that object back, and ``set_zero_dlogp_min_rows`` stores it for any value
+    of its type, so a previous setting the caller copied or unpickled restores the per-architecture default floor (the
+    backward's ``rows < floor`` compare never sees another object of the type)."""
+    sentinel = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    assert copy.copy(sentinel) is sentinel
+    assert copy.deepcopy(sentinel) is sentinel
+    assert copy.deepcopy({"floor": [sentinel]})["floor"][0] is sentinel
+    assert pickle.loads(pickle.dumps(sentinel)) is sentinel
+    stray = object.__new__(type(sentinel))
+    assert stray is not sentinel
+    assert copy.copy(stray) is sentinel and copy.deepcopy(stray) is sentinel
+    monkeypatch.setattr(cake_backend, "arch_for", lambda device=None: "sm_100a")
+    monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_ARCH", {})
+    monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_MIN_ROWS", {"rows": 0})
+    copies = (stray, copy.deepcopy(sentinel), pickle.loads(pickle.dumps(sentinel)))
+    for value in copies:
+        assert cake_backend.set_zero_dlogp_min_rows(value) == 0
+        assert cake_backend._ZERO_DLOGP_MIN_ROWS["rows"] is sentinel
+        assert cake_backend.zero_dlogp_min_rows(0) == 1946
+        assert cake_backend.zero_dlogp_min_rows() == 4097
+        assert cake_backend.set_zero_dlogp_min_rows(0) is sentinel
+
+
+def test_dlogp_rows_takes_a_ready_gradient_as_is():
+    """The log-probability backward binds ``dlogp`` as is when it already is a contiguous FP32 ``[T]`` tensor that
+    needs no detach (the autograd gradient of ``logp``); any other one (another dtype, shape or stride, or one that
+    requires a gradient) is normalized to the same values as before (``detach().reshape(T).to(float32).contiguous()``)."""
+    rows = cake_backend._dlogp_rows
+    gen = torch.Generator(device="cpu").manual_seed(SEED)
+    d = torch.randn(37, generator=gen)
+    assert rows(d, 37) is d
+    for other in (
+        d.double(),
+        d.half(),
+        d.reshape(1, 37),
+        torch.randn(74, generator=gen)[::2],
+        d.clone().requires_grad_(),
+    ):
+        got = rows(other, 37)
+        assert got is not other
+        assert got.dtype == torch.float32 and tuple(got.shape) == (37,)
+        assert got.is_contiguous() and not got.requires_grad
+        assert torch.equal(got, other.detach().reshape(37).to(torch.float32))
+
+
 def test_dcnt_stage_names_round_trip():
     """The ``_dcnt`` forms: the dz arm, the K-sliced dX reduction (not its swapped tile; the one-slice plain store has
     none), the weight-gradient accumulate (plain and blocked) and the bf16 fused cast (its TMA store too); every
@@ -7159,6 +7259,370 @@ def test_device_zero_dlogp_rows_skip(glm_weight, T, kind):
         f"\nzero-dlogp skip T={T} {kind} zero {int(zero.sum())}/{int(valid.sum())}: dW rel-L2 vs no skip "
         f"{dw_rel:.2e}, dX max|skip - no skip| {dx_diff:.2e}"
     )
+
+
+# One-chunk calls (1 to 4096 valid rows) under the skip at floor 0: an all-live chunk ("none"), an all-zero chunk
+# ("all"), one live row ("single"), one zero row ("one") and random / grouped zero rows; 1946 valid rows = T 2048 with
+# 5 % ignored rows, 3891 = T 4096.
+ZERO_DLOGP_ONE_CHUNK_CASES = [
+    (1, "none"),
+    (1, "all"),
+    (2, "one"),
+    (31, ("random", 0.5)),
+    (255, ("random", 0.166)),
+    (1025, "none"),
+    (1025, ("random", 0.166)),
+    (1100, ("random", 0.5)),
+    (1946, "none"),
+    (1946, "all"),
+    (1946, "single"),
+    (1946, "one"),
+    (1946, ("random", 0.166)),
+    (1946, ("random", 0.5)),
+    (1946, ("group", 0.5)),
+    (3891, ("random", 0.166)),
+    (4096, "none"),
+    (4096, ("random", 0.5)),
+]
+
+
+@pytest.mark.parametrize("rows, kind", ZERO_DLOGP_ONE_CHUNK_CASES, ids=str)
+def test_device_zero_dlogp_one_chunk_skip(glm_weight, monkeypatch, rows, kind):
+    """At floor 0 a one-chunk backward of ``rows`` valid rows (one ignored row makes the call compacted) runs the skip:
+    the partition runs on every call (binding and remembered binding) over every valid row, the backward plan has the
+    counted forms and one chunk, ``logp`` keeps the bits of the backward without the skip, the zero rows' and the
+    ignored rows' ``dX`` rows are exact ``+0``, the live ``dX`` rows are within one BF16 rounding of the backward
+    without the skip, ``dW`` keeps its bits from run to run and the outputs pass the deterministic suite's gates
+    against the FP64 oracle.  Without zero rows ``dW`` is bitwise the backward without the skip's (the partition keeps
+    the forward's row order); every valid row zero gives zero gradients."""
+    _require_zero_dlogp_skip()
+    T = rows + 1
+    base = _device_inputs(T, "ce", W=glm_weight, ignore_frac=0.0)
+    labels = base.labels.clone()
+    labels[T // 2] = -100
+    dlogp = base.dlogp
+    base = dataclasses.replace(
+        base,
+        labels=labels,
+        dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous(),
+    )
+    zero = _zero_dlogp_set(base, kind)
+    inp = _with_zero_dlogp(base, zero)
+    valid = inp.labels >= 0
+    live = valid & ~zero
+    assert int(valid.sum()) == rows
+    assert bool((inp.dlogp[live] != 0).all())
+    case = (rows, kind)
+    calls = _counted_partition(monkeypatch)
+    cake_backend.BINDING_CACHE.clear()
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(inp)
+        again = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    assert calls == [rows, rows], (case, calls)
+    (skip_plan, _), (shipped, _) = _logprob_bwd_plans()
+    assert skip_plan.dcnt and not shipped.dcnt, case
+    assert skip_plan.num_chunks == 1 and shipped.num_chunks == 1, case
+    for run in (nd, again):
+        assert _same_bits(run["logp"], plain["logp"]), case
+        assert not bool(_bits(run["dX"][zero | ~valid]).any()), case
+    assert _same_bits(again["dW"], nd["dW"]), case
+    if not bool(live.any()):
+        for run in (nd, again):
+            assert not bool(_bits(run["dX"]).any()), case
+            assert not bool(run["dW"].float().any()), case
+        return
+    if not bool(zero.any()):
+        assert _same_bits(nd["dW"], plain["dW"]), case
+    scale = float(plain["dX"][live].float().abs().max())
+    dx_diff = 0.0
+    for run in (nd, again):
+        diff = float((run["dX"][live].float() - plain["dX"][live].float()).abs().max())
+        assert diff <= scale * 2**-7, (case, diff, scale)
+        dx_diff = max(dx_diff, diff)
+        _check_against_references(run, inp, entry="logprob", ceiling=True)
+    dw_rel = float(rel_l2(nd["dW"].float(), plain["dW"].float()))
+    assert dw_rel <= GATE_TINY["dW_rel_l2"], (case, dw_rel)
+    print(
+        f"\nzero-dlogp one-chunk skip rows={rows} {kind} zero {int(zero.sum())}/{rows}: dW rel-L2 vs no skip "
+        f"{dw_rel:.2e}, dX max|skip - no skip| {dx_diff:.2e}"
+    )
+
+
+def _one_chunk_skip_inputs(W, T, kind, tau):
+    """``T`` rows (5 % ignored: a compacted one-chunk call) with no zero ``dlogp`` outside ``kind``'s zero rows
+    (:func:`_zero_dlogp_set`) and, with ``tau="distinct"``, a distinct per-token temperature."""
+    base = _device_inputs(T, "ce", W=W)
+    dlogp = base.dlogp
+    base = dataclasses.replace(
+        base, dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous()
+    )
+    zero = _zero_dlogp_set(base, kind)
+    inp = _with_zero_dlogp(base, zero)
+    if tau is not None:
+        inp = dataclasses.replace(inp, temperature=_distinct_tau(T))
+    return inp, zero
+
+
+@pytest.mark.parametrize("slices", ["one", "default"])
+@pytest.mark.parametrize("warm", [1, 2])
+@pytest.mark.parametrize("tau", [None, "distinct"])
+def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
+    glm_weight, monkeypatch, tau, warm, slices
+):
+    """A one-chunk log-probability backward under the zero-gradient row skip (plain and with a distinct per-token
+    temperature) captured in a CUDA graph through its remembered binding -- the first warm-up call (the runner's) makes
+    and remembers the binding, so the captured call is the binding's first remembered call after one warm-up and its
+    second after two -- replays with other ``dlogp`` values written into the captured input
+    (other zero rows and live counts, none, a single live row and every row zero) and gives the eager backward's bits
+    on those values: ``dW`` bitwise; ``dX`` bitwise with one dX slice pinned and, with the default slices (an
+    unordered split-K reduction), exact ``+0`` on the zero and ignored rows and the eager values within the reduction
+    order on the live rows.  The replays leave the forward's ``lse`` bits unchanged, and every captured and eager call
+    ran the partition over every valid row."""
+    _require_zero_dlogp_skip()
+    if tau is not None:
+        _require_tau_program()
+    inp, _zero = _one_chunk_skip_inputs(glm_weight, 2048, "none", tau)
+    kw = dict(chunk_size=4096, **ND)
+    if tau is None:
+        fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, **kw)
+        entry, extra = cake_backend.backward_logprob, {}
+    else:
+        fr = cake_backend.forward_logprob_temperature(
+            inp.X, inp.W, inp.labels, temperature=inp.temperature, **kw
+        )
+        form = cake_backend._resolve_temperature(
+            inp.temperature, int(inp.labels.numel()), inp.X.device
+        )
+        entry = cake_backend.backward_logprob_temperature
+        extra = dict(temperature=form, temperature_rows=fr.temperature_rows)
+    if slices == "one":
+        extra.update(_TAU_ONE)
+    torch.cuda.synchronize()
+    assert fr.row_index is not None
+    lse_bits = _bits(fr.lse).clone()
+    dlogp = inp.dlogp.clone()
+
+    def backward(d):
+        return entry(
+            inp.X, inp.W, inp.labels, fr.lse, d, row_index=fr.row_index, **extra, **kw
+        )
+
+    valid = inp.labels >= 0
+    rows = int(valid.sum())
+    calls = _counted_partition(monkeypatch)
+    with _zero_dlogp_floor(0):
+        cake_backend.BINDING_CACHE.clear()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warm):
+                backward(dlogp)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dx_g, dw_g = backward(dlogp)
+        for kind in (("random", 0.166), ("random", 0.5), "none", "single", "all"):
+            zero = _zero_dlogp_set(inp, kind)
+            new = _with_zero_dlogp(inp, zero).dlogp
+            dlogp.copy_(new)
+            graph.replay()
+            torch.cuda.synchronize()
+            got_dx, got_dw = dx_g.clone(), dw_g.clone()
+            want_dx, want_dw = backward(new.clone())
+            torch.cuda.synchronize()
+            assert _same_bits(got_dw, want_dw), kind
+            assert not bool(_bits(got_dx[zero | ~valid]).any()), kind
+            if slices == "one":
+                assert _same_bits(got_dx, want_dx), kind
+                continue
+            live = valid & ~zero
+            if bool(live.any()):
+                scale = float(want_dx[live].float().abs().max())
+                err = float((got_dx[live].float() - want_dx[live].float()).abs().max())
+                assert err <= scale * 2**-7, (kind, err, scale)
+    assert calls == [rows] * (warm + 6), calls
+    bindings = [
+        b
+        for k, b in cake_backend.BINDING_CACHE._bindings.items()
+        if k[:2] == ("bwd", "logprob") and b.plan.dcnt
+    ]
+    assert len(bindings) == 1
+    assert bindings[0].holds_no_tensor()
+    assert torch.equal(_bits(fr.lse), lse_bits)
+
+
+@pytest.mark.parametrize("tau", [None, "distinct"])
+def test_device_logprob_backward_reuses_the_forward_problem(
+    glm_weight, monkeypatch, tau
+):
+    """The autograd log-probability backward takes the forward's validated problem back (``ForwardResult.problem``,
+    the internal ``_problem`` keyword) instead of validating ``X`` / ``W`` / ``labels`` again: one validation fewer per
+    call.  Under saved-tensor hooks (which may unpack another ``X``) the backward gets none and validates its own.  The
+    bits are the same either way (plain and with a temperature)."""
+    _require_program(entry="logprob")
+    if tau is not None:
+        _require_tau_program()
+    inp, _zero = _one_chunk_skip_inputs(glm_weight, 2048, "none", tau)
+    name = "backward_logprob" if tau is None else "backward_logprob_temperature"
+    validate, backward = (
+        cake_backend.validate_lm_head_inputs,
+        getattr(cake_backend, name),
+    )
+    validated, problems = [], []
+
+    def counting(*args, **kwargs):
+        validated.append(kwargs.get("entry"))
+        return validate(*args, **kwargs)
+
+    def recording(*args, **kwargs):
+        problems.append(kwargs.get("_problem"))
+        return backward(*args, **kwargs)
+
+    kw = dict(entry="logprob", backend="cake", **_TAU_ONE)
+    cake_backend.BINDING_CACHE.clear()
+    first = _run(inp, 4096, **kw)  # remembers the bindings
+    monkeypatch.setattr(cake_backend, "validate_lm_head_inputs", counting)
+    monkeypatch.setattr(cake_backend, name, recording)
+    plain = _run(inp, 4096, **kw)
+    unhooked = len(validated)
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+        hooked = _run(inp, 4096, **kw)
+    assert len(validated) == 2 * unhooked + 1, validated
+    assert len(problems) == 2, problems
+    assert problems[0] is not None and problems[1] is None
+    assert problems[0].num_rows == 2048 and not problems[0].temperature
+    for key in ("logp", "dX", "dW"):
+        assert _same_bits(plain[key], first[key]), key
+        assert _same_bits(hooked[key], first[key]), key
+
+
+class _ScratchProbe(dict):
+    """The host values of a remembered binding's call with only the scratch slots ``allowed``
+    (``cake_backend._SCRATCH_SLOTS``): an absent slot raises ``KeyError`` (``t[name]``) or reads ``None``
+    (``t.get(name)``); every other name is the placeholder tensor."""
+
+    def __init__(self, allowed, placeholder):
+        super().__init__()
+        self.allowed, self.placeholder = frozenset(allowed), placeholder
+
+    def _absent(self, name):
+        return name in cake_backend._SCRATCH_SLOTS and name not in self.allowed
+
+    def __getitem__(self, name):
+        if self._absent(name):
+            raise KeyError(name)
+        return self.placeholder
+
+    def get(self, name, default=None):
+        return default if self._absent(name) else self.placeholder
+
+
+# Plans whose bindings :func:`test_device_binding_scratch_slots_cover_every_launch` checks: the loss entry (CE, policy),
+# the log-probability entry, under the zero-gradient row skip and with a temperature, at one chunk (T 2048) and three
+# (T 9000, the hidden valid-row count).
+SCRATCH_SLOT_CASES = [
+    (T, case)
+    for T in (2048, 9000)
+    for case in ("loss_ce", "loss_policy", "logprob", "logprob_skip", "logprob_tau")
+]
+
+
+@pytest.mark.parametrize("T, case", SCRATCH_SLOT_CASES, ids=str)
+def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
+    """A remembered binding allocates per call only the scratch slots (``d`` / ``term`` / ``loss_acc`` / ``loss``) its
+    sequences bind or return: the log-probability forward ``d`` and ``term`` (``row_finalize``), its backward none,
+    the loss entry's forward all four.  Every launch and host step of a binding's forward / backward sequence finds
+    every value it binds when only that sequence's scratch slots are present, and the remembered calls give the first
+    call's bits.  The log-probability cases set the zero-gradient row skip's floor: ``logprob_skip`` runs it (``0``),
+    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a the
+    default floor (1946 valid rows) would put both sizes on the skip."""
+    _require_program(entry="loss" if case.startswith("loss") else "logprob")
+    objective = "policy" if case == "loss_policy" else "ce"
+    inp = _device_inputs(T, objective, W=glm_weight)
+    floor = None
+    if case == "logprob_skip":
+        _require_zero_dlogp_skip()
+        inp = _with_zero_dlogp(inp, _zero_dlogp_set(inp, ("random", 0.166)))
+        floor = 0
+    if case == "logprob_tau":
+        _require_tau_program()
+        inp = dataclasses.replace(inp, temperature=_distinct_tau(T))
+    entry = "loss" if case.startswith("loss") else "logprob"
+    kw = dict(entry=entry, backend="cake", **_TAU_ONE)
+    cake_backend.BINDING_CACHE.clear()
+    with contextlib.ExitStack() as stack:
+        if entry == "logprob":
+            stack.enter_context(_zero_dlogp_floor(floor))
+        runs = [_run(inp, 4096, **kw) for _ in range(3)]
+    for run in runs[1:]:
+        for key in ("loss", "logp", "dX", "dW"):
+            assert _same_bits(run[key], runs[0][key]), (case, key)
+    placeholder = torch.empty((0,), device=CUDA)
+    checked = {"fwd": 0, "bwd": 0}
+    for key, binding in list(cake_backend.BINDING_CACHE._bindings.items()):
+        kind, binding_entry = key[0], key[1]
+        if kind not in checked:
+            continue
+        slot_values = (
+            cake_backend._slot_values_temperature
+            if isinstance(binding, cake_backend._TemperatureBinding)
+            else cake_backend._slot_values
+        )
+        if kind == "fwd":
+            run, allowed = binding.forward_run, binding.forward_scratch
+            if binding_entry == "loss":
+                assert allowed == cake_backend._SCRATCH_SLOTS, (case, allowed)
+            else:
+                assert set(allowed) <= {"d", "term"}, (case, allowed)
+        else:
+            run, allowed = binding.backward_run, binding.backward_scratch
+            if binding_entry == "logprob":
+                assert allowed == (), (case, allowed)
+        probe = _ScratchProbe(allowed, placeholder)
+        for launch_key in run:
+            values = slot_values(launch_key[0], probe, binding.plan, launch_key[1])
+            launch = binding.launches.get(launch_key)
+            if launch is not None:
+                launch.arguments_for(values)
+        checked[kind] += 1
+    assert checked["fwd"] >= 1, (case, checked)
+    assert entry == "loss" or checked["bwd"] >= 1, (case, checked)
+    if entry == "logprob":
+        skip = {
+            bool(b.plan.dcnt)
+            for k, b in cake_backend.BINDING_CACHE._bindings.items()
+            if k[0] == "bwd"
+        }
+        assert skip == {floor == 0}, (case, skip)
+
+
+def test_device_zero_dlogp_default_floor_per_architecture(glm_weight, monkeypatch):
+    """Without an override a one-chunk log-probability backward runs the skip from this device's default floor on
+    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a, 3891 on sm_103a, else 4097): a backward of one row
+    fewer runs without it (the zero rows' ``dX`` zeros either way)."""
+    _require_zero_dlogp_skip()
+    index = torch.cuda.current_device()
+    _module_name, record = cake_backend.record_for(CUDA)
+    floor = cake_backend.ZERO_DLOGP_MIN_ROWS_BY_ARCH.get(
+        record["arch"], cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
+    )
+    calls = _counted_partition(monkeypatch)
+    cake_backend.BINDING_CACHE.clear()
+    with _zero_dlogp_floor(cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT):
+        assert cake_backend.zero_dlogp_min_rows(index) == floor
+        for rows in (floor - 1, floor):
+            T = rows + 1
+            base = _device_inputs(T, "ce", W=glm_weight, ignore_frac=0.0)
+            labels = base.labels.clone()
+            # one ignored row: a compacted call of T - 1 valid rows
+            labels[T // 2] = -100
+            base = dataclasses.replace(base, labels=labels)
+            zero = _zero_dlogp_set(base, ("random", 0.3))
+            run = _logprob_call(_with_zero_dlogp(base, zero, negative_zero=False))
+            assert not bool(run["dX"][zero].float().any()), rows
+    assert calls == [floor], (floor, calls)
 
 
 def test_device_zero_dlogp_skip_runs_the_partition_kernel(glm_weight, monkeypatch):
@@ -7427,11 +7891,11 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     )
 
 
-def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(
+def test_device_zero_dlogp_generic_floor_is_one_row_above_a_chunk(
     glm_weight, monkeypatch
 ):
-    """The default floor is one row above a default 4096-row chunk: a backward of 4096 valid rows runs without the skip,
-    one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
+    """The generic floor (``ZERO_DLOGP_MIN_ROWS_DEFAULT``) is one row above a default 4096-row chunk: a backward of 4096
+    valid rows runs without the skip, one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
     _require_zero_dlogp_skip()
     assert (
         cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
@@ -10357,9 +10821,23 @@ TAU_ZERO_DLOGP_CASES = [
     (5000, ("random", 0.5), "distinct"),
 ]
 
+# one-chunk calls (5 % ignored rows): T 2048 = 1946 valid rows (all live, all zero, z 0.166 / 0.5), T 1158 = 1100,
+# T 4096 = 3891, T 64 = 61
+TAU_ZERO_DLOGP_ONE_CHUNK_CASES = [
+    (2048, "none", "distinct"),
+    (2048, "all", "distinct"),
+    (2048, ("random", 0.166), "distinct"),
+    (2048, ("random", 0.5), "scalar"),
+    (1158, ("random", 0.166), "distinct"),
+    (4096, ("random", 0.166), "distinct"),
+    (64, ("random", 0.5), "scalar"),
+]
+
 
 @pytest.mark.parametrize("dz_form", ("counted", "mixed"))
-@pytest.mark.parametrize("T, kind, form", TAU_ZERO_DLOGP_CASES, ids=str)
+@pytest.mark.parametrize(
+    "T, kind, form", TAU_ZERO_DLOGP_CASES + TAU_ZERO_DLOGP_ONE_CHUNK_CASES, ids=str
+)
 def test_device_temperature_zero_dlogp_rows_skip(
     glm_weight, monkeypatch, T, kind, form, dz_form
 ):
