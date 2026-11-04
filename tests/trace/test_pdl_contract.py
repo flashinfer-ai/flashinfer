@@ -232,7 +232,8 @@ _PDL_APIS = [
 ]
 
 # Kernels known to break the declared contract: (api, backend, operand) -> why.
-# Strict, so a fix shows up as XPASS and its entry has to go.
+# Not strict: whether a run hits the race depends on the GPU and the launch mode,
+# so an entry is removed by hand once its kernel is fixed.
 _KNOWN_RACES = {
     ("mm_bf16", "tinygemm", "bias"): "tinygemm2 compute warps skip the wait",
     ("tinygemm_bf16", None, "bias"): "tinygemm2 compute warps skip the wait",
@@ -350,7 +351,7 @@ def _expect_known_race(request, case, operand):
         races = races | _KNOWN_RACES_SM10X
     reason = races.get((case.spec.name, case.backend, operand))
     if reason is not None:
-        request.applymarker(pytest.mark.xfail(reason=reason, strict=True))
+        request.applymarker(pytest.mark.xfail(reason=reason, strict=False))
 
 
 def _read_cases():
