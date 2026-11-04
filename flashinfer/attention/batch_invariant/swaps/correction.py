@@ -8,11 +8,12 @@ moved -- ``mul(O, 1.0)`` is an identity), ``O_m^T[d, n] = fma(O_c^T[d, n], a2[n]
 epilogue ``cvt_bf16(add(mul(O, inv[n]), +0))`` to the output rows (mode 0) or the raw fp32 ``O^T`` columns and ``(m, l)`` to the workspace
 rows (mode 1, folded by ``fixup.py`` or the in-kernel last arriver).
 """
+
 from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
@@ -26,10 +27,22 @@ _NEG_INF = float("-inf")
 def copy_atoms(st):
     """The TMEM load / store atoms of one ``O^T`` slot: 32 lanes x n_pad columns at M = 128; the 16-lane shape at M = 64 (D = 64)."""
     if st.M_pv == 128:
-        return (cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(st.n_pad)), ACC_DTYPE),
-                cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(st.n_pad)), ACC_DTYPE))
-    return (cute.make_copy_atom(tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(st.n_pad // 8)), ACC_DTYPE),
-            cute.make_copy_atom(tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(st.n_pad // 8)), ACC_DTYPE))
+        return (
+            cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(st.n_pad)), ACC_DTYPE
+            ),
+            cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(st.n_pad)), ACC_DTYPE
+            ),
+        )
+    return (
+        cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(st.n_pad // 8)), ACC_DTYPE
+        ),
+        cute.make_copy_atom(
+            tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(st.n_pad // 8)), ACC_DTYPE
+        ),
+    )
 
 
 @cute.jit
@@ -40,10 +53,34 @@ def load_coefs(src: cute.Tensor, idx: Int32, tLDc: cute.Tensor, out):
 
 
 @cute.jit
-def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_cons, stats_cons, s_alpha: cute.Tensor, s_m: cute.Tensor,
-                    s_r: cute.Tensor, s_ab: cute.Tensor, s_inv: cute.Tensor, mO: cute.Tensor, mWs: cute.Tensor, c: Float32, nc: Float32,
-                    rows_valid: Int32, q_base: Int32, q_tok0: Int32, Hq: Int32, kv_head: Int32, chunk_lo: Int32, chunk_hi: Int32, tile_lo: Int32,
-                    tile_hi: Int32, mode: Int32, slot_base: Int32):
+def correction_loop(
+    st,
+    pv_thr_mma: cute.TiledMma,
+    tOtO_slots,
+    tOtOm_slots,
+    o_cons,
+    stats_cons,
+    s_alpha: cute.Tensor,
+    s_m: cute.Tensor,
+    s_r: cute.Tensor,
+    s_ab: cute.Tensor,
+    s_inv: cute.Tensor,
+    mO: cute.Tensor,
+    mWs: cute.Tensor,
+    c: Float32,
+    nc: Float32,
+    rows_valid: Int32,
+    q_base: Int32,
+    q_tok0: Int32,
+    Hq: Int32,
+    kv_head: Int32,
+    chunk_lo: Int32,
+    chunk_hi: Int32,
+    tile_lo: Int32,
+    tile_hi: Int32,
+    mode: Int32,
+    slot_base: Int32,
+):
     D, g, TPC, NP, WS = st.D, st.g, st.tpc, st.n_pad, st.ws_row
     SPT = st.slots_per_tile
     tidx, _, _ = cute.arch.thread_idx()
@@ -64,16 +101,17 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
         tST.append(thr_st.partition_D(tOtO_slots[sl]))
         tLDm.append(thr_ld.partition_S(tOtOm_slots[sl]))
         tSTm.append(thr_st.partition_D(tOtOm_slots[sl]))
-    tLDc = thr_ld.partition_D(tOcO)                              # (dim, row) coordinates of the thread's registers
+    tLDc = thr_ld.partition_D(tOcO)  # (dim, row) coordinates of the thread's registers
     rO = cute.make_rmem_tensor(tLDc.shape, ACC_DTYPE)
     rM = cute.make_rmem_tensor(tLDc.shape, ACC_DTYPE)
     n_el = cute.size(rO)
-    rA = cute.make_rmem_tensor(cute.make_layout((n_el,)), ACC_DTYPE)   # per-register coefficients (alpha / a1 / a2 / inv of the register's row)
+    rA = cute.make_rmem_tensor(
+        cute.make_layout((n_el,)), ACC_DTYPE
+    )  # per-register coefficients (alpha / a1 / a2 / inv of the register's row)
     rB = cute.make_rmem_tensor(cute.make_layout((n_el,)), ACC_DTYPE)
-    own = thread_idx < NP                                        # this thread owns row thread_idx's statistics chain
+    own = thread_idx < NP  # this thread owns row thread_idx's statistics chain
     multi = (mode == 0) & (chunk_hi - chunk_lo > 1)
     N = tile_hi - tile_lo
-    neg_inf = Float32(_NEG_INF)
     m = Float32(_NEG_INF)
     l = Float32(0.0)
     m_r = Float32(_NEG_INF)
@@ -85,7 +123,7 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
         t = tile_lo + n_t
         chunk_first = ((t % TPC) == 0) | (t == tile_lo)
         chunk_last = ((t % TPC) == TPC - 1) | (t == tile_hi - 1)
-        cont = ((t % TPC) != 0) & (t != tile_lo)                   # a previous PV of this chunk exists
+        cont = ((t % TPC) != 0) & (t != tile_lo)  # a previous PV of this chunk exists
         # ---- alpha of every row (the stats ring), the rescale of O^T once the previous PV is complete
         sth = stats_cons.wait_and_advance()
         my_alpha = s_alpha[(sth.index, thread_idx)]
@@ -96,11 +134,13 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
                 any_rescale = any_rescale | (s_alpha[(sth.index, n)] != Float32(1.0))
         sth.release()
         if cont:
-            oh = o_cons.wait_and_advance()                     # PV(n-1) complete
+            oh = o_cons.wait_and_advance()  # PV(n-1) complete
             if any_rescale:
                 for sl in cutlass.range_constexpr(SPT):
                     cute.copy(tiled_ld, tLD[sl], rO)
-                    for e in cutlass.range_constexpr(0, n_el, 2):          # mul(O, alpha[row]) two elements per mul.rn.f32x2
+                    for e in cutlass.range_constexpr(
+                        0, n_el, 2
+                    ):  # mul(O, alpha[row]) two elements per mul.rn.f32x2
                         y0, y1 = CuteF32.mul2((rO[e], rO[e + 1]), (rA[e], rA[e + 1]))
                         rO[e] = y0
                         rO[e + 1] = y1
@@ -111,7 +151,9 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
         sth = stats_cons.wait_and_advance()
         if own:
             m_new = s_m[(sth.index, thread_idx)]
-            r_t = row_sum(s_r, sth.index, thread_idx, 4)          # the top levels of the rowsum tree: the four warps' partials in warp order
+            r_t = row_sum(
+                s_r, sth.index, thread_idx, 4
+            )  # the top levels of the rowsum tree: the four warps' partials in warp order
             if chunk_first:
                 l = Float32(0.0)
             l = CuteF32.fma(l, my_alpha, r_t)
@@ -124,7 +166,7 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
                     s_ab[(0, thread_idx)] = a1
                     s_ab[(1, thread_idx)] = a2
                 cute.arch.barrier(barrier_id=BAR_COEF, number_of_threads=128)
-                if t != tile_hi - 1:                               # an interior chunk end: fold O_c^T into O_m^T now
+                if t != tile_hi - 1:  # an interior chunk end: fold O_c^T into O_m^T now
                     load_coefs(s_ab, Int32(0), tLDc, rA)
                     load_coefs(s_ab, Int32(1), tLDc, rB)
                     oh = o_cons.wait_and_advance()
@@ -136,7 +178,9 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
                         else:
                             cute.copy(tiled_ld, tLDm[sl], rM)
                             for e in cutlass.range_constexpr(n_el):
-                                rM[e] = CuteF32.fma(rO[e], rB[e], CuteF32.mul(rM[e], rA[e]))
+                                rM[e] = CuteF32.fma(
+                                    rO[e], rB[e], CuteF32.mul(rM[e], rA[e])
+                                )
                         cute.copy(tiled_st, rM, tSTm[sl])
                     cute.arch.fence_view_async_tmem_store()
                     cute.arch.fence_view_async_tmem_load()
@@ -146,7 +190,9 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
                 if own:
                     m_r = m
                     l_r = l
-    if N % 2 == 1:                                              # an odd unit: the phantom tile's two (empty) entries, committed by softmax warpgroup 1
+    if (
+        N % 2 == 1
+    ):  # an odd unit: the phantom tile's two (empty) entries, committed by softmax warpgroup 1
         sth = stats_cons.wait_and_advance()
         sth.release()
         sth = stats_cons.wait_and_advance()
@@ -161,11 +207,13 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
     cute.arch.barrier(barrier_id=BAR_COEF, number_of_threads=128)
     load_coefs(s_ab, Int32(0), tLDc, rA)
     load_coefs(s_ab, Int32(1), tLDc, rB)
-    oh = o_cons.wait_and_advance()                                 # the unit's last PV complete; held until the reads below are done
+    oh = (
+        o_cons.wait_and_advance()
+    )  # the unit's last PV complete; held until the reads below are done
     for sl in cutlass.range_constexpr(SPT):
         cute.copy(tiled_ld, tLD[sl], rO)
         if mode == 0:
-            if multi:                                              # the last chunk's merge, as the interior one
+            if multi:  # the last chunk's merge, as the interior one
                 if first_merge:
                     for e in cutlass.range_constexpr(n_el):
                         rM[e] = CuteF32.fma(rO[e], rB[e], Float32(0.0))
@@ -181,7 +229,9 @@ def correction_loop(st, pv_thr_mma: cute.TiledMma, tOtO_slots, tOtOm_slots, o_co
                 d = tLDc[e][0] + sl * st.slot_dims
                 if n < rows_valid:
                     out_row = (q_base + q_tok0 + n // g) * Hq + kv_head * g + n % g
-                    mO[(out_row, d)] = CuteF32.add(CuteF32.mul(rM[e], s_inv[n]), Float32(0.0)).to(IN_DTYPE)
+                    mO[(out_row, d)] = CuteF32.add(
+                        CuteF32.mul(rM[e], s_inv[n]), Float32(0.0)
+                    ).to(IN_DTYPE)
         else:
             for e in cutlass.range_constexpr(n_el):
                 n = tLDc[e][1]

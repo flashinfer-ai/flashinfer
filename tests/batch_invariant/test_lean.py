@@ -179,5 +179,7 @@ def test_axioms_policy():
     r = _lake("exe", "axioms", timeout=600)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "0 with sorry, 0 violations" in r.stdout, r.stdout
-    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(lean_cases.MODULE_DECIDED_THEOREMS)
+    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(
+        lean_cases.MODULE_DECIDED_THEOREMS
+    )
     assert f"{n_decided} named table theorems" in r.stdout, r.stdout

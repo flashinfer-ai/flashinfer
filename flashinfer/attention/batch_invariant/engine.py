@@ -12,20 +12,30 @@ Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) o
 host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
 split units, the fixup.
 """
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional
 
 import torch
 
-from .plan import DESC_FIELDS, GROUP_FIELDS, WS_ROW, Plan, build_plan, ws_row
+from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, ws_row
 from .spec import HEAD_DIMS, scale_log2
 
 
-PAGE_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)   # every power of two up to 128 (page size is a placement / layout input, never a class parameter)
-MAX_GROUP = 128                                # GQA group g = Hq / Hkv: 1 .. 128 (a Q tile holds (128 // g) g rows)
+PAGE_SIZES = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+)  # every power of two up to 128 (page size is a placement / layout input, never a class parameter)
+MAX_GROUP = 128  # GQA group g = Hq / Hkv: 1 .. 128 (a Q tile holds (128 // g) g rows)
 
 
 def check_supported(D: int, Hq: int, Hkv: int, page: int) -> None:
@@ -34,7 +44,9 @@ def check_supported(D: int, Hq: int, Hkv: int, page: int) -> None:
     if D not in HEAD_DIMS:
         raise ValueError(f"head_dim {D} is not a class (supported: {HEAD_DIMS})")
     if Hkv <= 0 or Hq % Hkv != 0 or not 1 <= Hq // Hkv <= MAX_GROUP:
-        raise ValueError(f"num_qo_heads / num_kv_heads = {Hq} / {Hkv}: the GQA group must be an integer in 1..{MAX_GROUP}")
+        raise ValueError(
+            f"num_qo_heads / num_kv_heads = {Hq} / {Hkv}: the GQA group must be an integer in 1..{MAX_GROUP}"
+        )
     if page not in PAGE_SIZES:
         raise ValueError(f"page_size {page}: supported page sizes are {PAGE_SIZES}")
 
@@ -51,55 +63,76 @@ def valid_kv_slots(D: int = 128) -> tuple:
 class AttnConfig:
     """A configuration of the kernel: every member of the space computes the class (R3)."""
 
-    kv_slots: int = 4                  # smem ring depth (K or V tiles): 2..4
-    split_policy: str = "auto"         # "auto" | "split" | "fused": the planner's unit kind
-    grid: int = 0                      # persistent CTAs (0 = min(units, SMs)); a launch parameter (I10)
-    softmax_wgs: int = 1               # softmax warpgroups (1 or 2): all work on every tile, splitting its keys
-    merge: str = "auto"                # where a split group's chunk fold runs: "auto" (in-kernel for groups of <= 32 rows, the fixup kernel
-                                       # otherwise), "fixup" (always the kernel), "inkernel" (always the last arriver): plan.py, same bits
-    small: str = "swap"                # the placement of a batch whose units all have <= SWAPS_MAX_ROWS (8) live rows (decode at g <= 8): "swap" = the
-                                       # Swaps-AB kernel (``swaps``: keys on the MMA M dimension, the rows on N = 8 / 16 / 32, two
-                                       # softmax warpgroups on alternate tiles; the default since the ABBA of docs/attention_scoping.md 12.6.2:
-                                       # 1.02 / 1.09 / 1.04x of "rep" at D = 128 / 256 / 64), "rep" = the row body's replicated-row placement;
-                                       # mixed batches take the row body either way (same bits)
-    q2: bool = False                   # with softmax_wgs = 2: the paired placement -- two Q tiles per unit, warpgroup k owns Q tile k (whole rows), one
-                                       # K / V stream for both; D = 64 (blocks/operands.py: S_A | S_B | O_c,A | O_m,A | O_c,B | O_m,B in TMEM)
+    kv_slots: int = 4  # smem ring depth (K or V tiles): 2..4
+    split_policy: str = "auto"  # "auto" | "split" | "fused": the planner's unit kind
+    grid: int = 0  # persistent CTAs (0 = min(units, SMs)); a launch parameter (I10)
+    softmax_wgs: int = (
+        1  # softmax warpgroups (1 or 2): all work on every tile, splitting its keys
+    )
+    merge: str = "auto"  # where a split group's chunk fold runs: "auto" (in-kernel for groups of <= 32 rows, the fixup kernel
+    # otherwise), "fixup" (always the kernel), "inkernel" (always the last arriver): plan.py, same bits
+    small: str = "swap"  # the placement of a batch whose units all have <= SWAPS_MAX_ROWS (8) live rows (decode at g <= 8): "swap" = the
+    # Swaps-AB kernel (``swaps``: keys on the MMA M dimension, the rows on N = 8 / 16 / 32, two
+    # softmax warpgroups on alternate tiles; the default since the ABBA of docs/attention_scoping.md 12.6.2:
+    # 1.02 / 1.09 / 1.04x of "rep" at D = 128 / 256 / 64), "rep" = the row body's replicated-row placement;
+    # mixed batches take the row body either way (same bits)
+    q2: bool = False  # with softmax_wgs = 2: the paired placement -- two Q tiles per unit, warpgroup k owns Q tile k (whole rows), one
+    # K / V stream for both; D = 64 (blocks/operands.py: S_A | S_B | O_c,A | O_m,A | O_c,B | O_m,B in TMEM)
 
     def describe(self) -> str:
-        return (f"s{self.kv_slots}_w{self.softmax_wgs}_{self.split_policy}" + (f"_g{self.grid}" if self.grid else "")
-                + ({"auto": "", "fixup": "_fx", "inkernel": "_ik"}[self.merge]) + ("_sw" if self.small == "swap" else "") + ("_q2" if self.q2 else ""))
+        return (
+            f"s{self.kv_slots}_w{self.softmax_wgs}_{self.split_policy}"
+            + (f"_g{self.grid}" if self.grid else "")
+            + ({"auto": "", "fixup": "_fx", "inkernel": "_ik"}[self.merge])
+            + ("_sw" if self.small == "swap" else "")
+            + ("_q2" if self.q2 else "")
+        )
 
     def well_formed(self, D: int = 128) -> bool:
         """The body's static knob constraints at head dim ``D`` (mirror of ``BIK.Attn.ConfigOKD``: ``2 <= kv_slots``,
         ``kv_slots * D <= 512``, ``small <= 1``)."""
-        return (self.kv_slots in valid_kv_slots(D) and self.split_policy in ("auto", "split", "fused") and self.softmax_wgs in (1, 2) and self.grid >= 0
-                and self.merge in ("auto", "fixup", "inkernel") and self.small in ("rep", "swap")
-                and (not self.q2 or (self.softmax_wgs == 2 and D == 64)))
+        return (
+            self.kv_slots in valid_kv_slots(D)
+            and self.split_policy in ("auto", "split", "fused")
+            and self.softmax_wgs in (1, 2)
+            and self.grid >= 0
+            and self.merge in ("auto", "fixup", "inkernel")
+            and self.small in ("rep", "swap")
+            and (not self.q2 or (self.softmax_wgs == 2 and D == 64))
+        )
 
     def lean(self) -> str:
         """The record ``BIK.Attn.Config`` (kvSlots, policy, softmaxWgs, merge, small) of ``lean/BIKernels/Attention.lean``."""
-        return (f"⟨{self.kv_slots}, {dict(auto=0, split=1, fused=2)[self.split_policy]}, {self.softmax_wgs}, "
-                f"{dict(auto=0, fixup=1, inkernel=2)[self.merge]}, {dict(rep=0, swap=1)[self.small]}⟩")
+        return (
+            f"⟨{self.kv_slots}, {dict(auto=0, split=1, fused=2)[self.split_policy]}, {self.softmax_wgs}, "
+            f"{dict(auto=0, fixup=1, inkernel=2)[self.merge]}, {dict(rep=0, swap=1)[self.small]}⟩"
+        )
 
 
 def all_valid_configs(D: int = 128) -> list:
     """The enumerated space at head dim ``D`` (R3 is claimed over it): ring ``valid_kv_slots(D)`` x unit kind x softmax warpgroups x
     merge placement x small-unit placement = 252 / 108 / 36 points at D = 64 / 128 / 256."""
     assert D in HEAD_DIMS, D
-    return [AttnConfig(s, p, 0, w, merge=m, small=sm) for sm in ("rep", "swap") for m in ("auto", "fixup", "inkernel") for w in (1, 2)
-            for s in valid_kv_slots(D) for p in ("auto", "split", "fused")]
+    return [
+        AttnConfig(s, p, 0, w, merge=m, small=sm)
+        for sm in ("rep", "swap")
+        for m in ("auto", "fixup", "inkernel")
+        for w in (1, 2)
+        for s in valid_kv_slots(D)
+        for p in ("auto", "split", "fused")
+    ]
 
 
-SWAPS_MAX_ROWS = 8                         # units of at most this many live rows take the Swaps-AB kernel under small = "swap": the 8-row
-                                           # (n_pad = 8) kernel beats the row body 1.02-1.12x; the 16-row kernel (24/2 heads, g = 12) measured
-                                           # 0.90-0.98x of it at every D (its per-row chains and 54 spills), so 9-32-row units keep the row
-                                           # body's replicated placement (docs/attention_scoping.md 12.9; the 16 / 32-row kernels stay built
-                                           # and IR-pinned as retired placements)
-SWAPS_DIMS = (64, 128, 256)                # head dims the Swaps-AB kernel implements
+SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB kernel under small = "swap": the 8-row
+# (n_pad = 8) kernel beats the row body 1.02-1.12x; the 16-row kernel (24/2 heads, g = 12) measured
+# 0.90-0.98x of it at every D (its per-row chains and 54 spills), so 9-32-row units keep the row
+# body's replicated placement (docs/attention_scoping.md 12.9; the 16 / 32-row kernels stay built
+# and IR-pinned as retired placements)
+SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
 
 
-Q2_MIN_UNITS_PER_SM = 4   # the paired placement halves the unit count: below ~4 units per SM the lost parallelism outweighs the overlap
-                          # (Rubin D = 64 prefill, 2026-11-03: 0.85-0.98x below, 1.11-1.25x above); a placement rule, the bits are the same
+Q2_MIN_UNITS_PER_SM = 4  # the paired placement halves the unit count: below ~4 units per SM the lost parallelism outweighs the overlap
+# (Rubin D = 64 prefill, 2026-11-03: 0.85-0.98x below, 1.11-1.25x above); a placement rule, the bits are the same
 
 
 def pair_units(desc: list) -> list:
@@ -107,11 +140,24 @@ def pair_units(desc: list) -> list:
     request, the KV head, the chunk range and the kind (``F_MODE``): consecutive Q tiles of one (request, head, chunk range) in token order; an
     odd one out pairs with an empty B (no rows, empty tile range, no group). Pairs are ordered longest first (LPT, as ``build_plan``). A
     placement: every unit's descriptor is unchanged, only its CTA and warpgroup move."""
-    from .plan import F_CHUNK_HI, F_CHUNK_LO, F_GROUP, F_KVHEAD, F_MODE, F_QTOK0, F_REQ, F_ROWS, F_TILE_HI, F_TILE_LO
+    from .plan import (
+        F_CHUNK_HI,
+        F_CHUNK_LO,
+        F_GROUP,
+        F_KVHEAD,
+        F_MODE,
+        F_QTOK0,
+        F_REQ,
+        F_ROWS,
+        F_TILE_HI,
+        F_TILE_LO,
+    )
 
     buckets = {}
     for d in desc:
-        buckets.setdefault((d[F_REQ], d[F_KVHEAD], d[F_CHUNK_LO], d[F_CHUNK_HI], d[F_MODE]), []).append(d)
+        buckets.setdefault(
+            (d[F_REQ], d[F_KVHEAD], d[F_CHUNK_LO], d[F_CHUNK_HI], d[F_MODE]), []
+        ).append(d)
     pairs = []
     for key in buckets:
         units = sorted(buckets[key], key=lambda d: d[F_QTOK0])
@@ -125,7 +171,13 @@ def pair_units(desc: list) -> list:
                 b[F_TILE_LO] = b[F_TILE_HI] = a[F_TILE_LO]
                 b[F_GROUP] = -1
             pairs.append((a, b))
-    pairs.sort(key=lambda ab: -max(ab[0][F_TILE_HI] - ab[0][F_TILE_LO], ab[1][F_TILE_HI] - ab[1][F_TILE_LO]))
+    pairs.sort(
+        key=lambda ab: (
+            -max(
+                ab[0][F_TILE_HI] - ab[0][F_TILE_LO], ab[1][F_TILE_HI] - ab[1][F_TILE_LO]
+            )
+        )
+    )
     return [row for ab in pairs for row in ab]
 
 
@@ -137,9 +189,13 @@ def swaps_n_pad(plan) -> int:
     return n_pad_for(rows) if 1 <= rows <= SWAPS_MAX_ROWS else 0
 
 
-DEFAULT_RING = {64: 4, 128: 4, 256: 2}   # ring depth per head dim: D = 64 and 128 keep the measured 4 (the D = 64 ring-8 candidate of the
-                                         # page-16 search was a noise-selected maximum: the same-GPU ABBA A/B gave 1.004x geomean, +-10 % by
-                                         # regime -- docs/attention_scoping.md 9.1.2), D = 256 has only 2 (11.4)
+DEFAULT_RING = {
+    64: 4,
+    128: 4,
+    256: 2,
+}  # ring depth per head dim: D = 64 and 128 keep the measured 4 (the D = 64 ring-8 candidate of the
+# page-16 search was a noise-selected maximum: the same-GPU ABBA A/B gave 1.004x geomean, +-10 % by
+# regime -- docs/attention_scoping.md 9.1.2), D = 256 has only 2 (11.4)
 
 
 def default_config(D: int = 128):
@@ -148,9 +204,9 @@ def default_config(D: int = 128):
     return AttnConfig(DEFAULT_RING[D], "auto", 0, 1)
 
 
-
-
-def _kv_view(cache: torch.Tensor, kv_layout: str, Hkv: int, page: int, D: int) -> torch.Tensor:
+def _kv_view(
+    cache: torch.Tensor, kv_layout: str, Hkv: int, page: int, D: int
+) -> torch.Tensor:
     """(D, page, Hkv, num_pages) view of an NHD / HND pool (runtime strides; no copy)."""
     if kv_layout == "NHD":
         assert cache.shape[1:] == (page, Hkv, D), cache.shape
@@ -171,30 +227,58 @@ def _kv_view_ragged(kv: torch.Tensor, kv_layout: str, Hkv: int, D: int) -> torch
         assert kv.shape[0] == Hkv and kv.shape[2] == D, kv.shape
         total = kv.shape[1]
         base = kv.permute(2, 1, 0)
-    return base.as_strided((D, total, Hkv, 1), (base.stride(0), base.stride(1), base.stride(2), max(8, total * Hkv * D)), base.storage_offset())
+    return base.as_strided(
+        (D, total, Hkv, 1),
+        (base.stride(0), base.stride(1), base.stride(2), max(8, total * Hkv * D)),
+        base.storage_offset(),
+    )
 
 
 class WorkspaceTooSmall(RuntimeError):
     """The caller's workspace cannot hold the split-KV partials of this batch; ``needed`` is the byte count."""
 
     def __init__(self, needed: int, given: int):
-        super().__init__(f"workspace of {given} bytes; the split partials of this batch need {needed}")
+        super().__init__(
+            f"workspace of {given} bytes; the split partials of this batch need {needed}"
+        )
         self.needed = needed
 
 
 class _Planned:
-    def __init__(self, plan, desc: torch.Tensor, groups: torch.Tensor, ws: torch.Tensor,
-                 scratch: Optional[torch.Tensor] = None, fixup_groups: Optional[torch.Tensor] = None, fold_counters: Optional[torch.Tensor] = None):
+    def __init__(
+        self,
+        plan,
+        desc: torch.Tensor,
+        groups: torch.Tensor,
+        ws: torch.Tensor,
+        scratch: Optional[torch.Tensor] = None,
+        fixup_groups: Optional[torch.Tensor] = None,
+        fold_counters: Optional[torch.Tensor] = None,
+    ):
         self.plan, self.desc, self.groups, self.ws = plan, desc, groups, ws
-        self.scratch = scratch                                 # the per-CTA O_m scratch (D = 256)
-        self.fixup_groups = fixup_groups if fixup_groups is not None else groups   # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
+        self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
+        self.fixup_groups = (
+            fixup_groups if fixup_groups is not None else groups
+        )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
         self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
-        self.fold_counters = fold_counters                     # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
+        self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
 
 
-def plan_attention(qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_last_page_len: torch.Tensor, Hq: int, Hkv: int, D: int, page: int,
-                   window_left: int = -1, config: Optional[AttnConfig] = None, workspace: Optional[torch.Tensor] = None,
-                   device=None, sm_count: Optional[int] = None, ragged: bool = False) -> _Planned:
+def plan_attention(
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    Hq: int,
+    Hkv: int,
+    D: int,
+    page: int,
+    window_left: int = -1,
+    config: Optional[AttnConfig] = None,
+    workspace: Optional[torch.Tensor] = None,
+    device=None,
+    sm_count: Optional[int] = None,
+    ragged: bool = False,
+) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
     holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
@@ -205,26 +289,61 @@ def plan_attention(qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_last_pag
     assert config.well_formed(D), (config, D)
     check_supported(D, Hq, Hkv, page)
     device = device or qo_indptr.device
-    sm = sm_count if sm_count is not None else (torch.cuda.get_device_properties(device).multi_processor_count if device.type == "cuda" else 204)
-    plan = build_plan(qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist(), kv_last_page_len.cpu().tolist(), Hq, Hkv, D, page,
-                      window_left, config.split_policy, sm, merge=config.merge,
-                      small_swap=config.small == "swap" and D in SWAPS_DIMS, swap_max_rows=SWAPS_MAX_ROWS)   # Swaps batches at D = 256 take the
-                                                                                                  # D = 128 rules (TMEM merges; 12.6)
-    desc = torch.tensor(plan.desc if plan.desc else [[0] * DESC_FIELDS], dtype=torch.int32, device=device)
-    if (config.q2 and len(plan.desc) >= Q2_MIN_UNITS_PER_SM * sm
-            and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))):
+    sm = (
+        sm_count
+        if sm_count is not None
+        else (
+            torch.cuda.get_device_properties(device).multi_processor_count
+            if device.type == "cuda"
+            else 204
+        )
+    )
+    plan = build_plan(
+        qo_indptr.cpu().tolist(),
+        kv_indptr.cpu().tolist(),
+        kv_last_page_len.cpu().tolist(),
+        Hq,
+        Hkv,
+        D,
+        page,
+        window_left,
+        config.split_policy,
+        sm,
+        merge=config.merge,
+        small_swap=config.small == "swap" and D in SWAPS_DIMS,
+        swap_max_rows=SWAPS_MAX_ROWS,
+    )  # Swaps batches at D = 256 take the
+    # D = 128 rules (TMEM merges; 12.6)
+    desc = torch.tensor(
+        plan.desc if plan.desc else [[0] * DESC_FIELDS],
+        dtype=torch.int32,
+        device=device,
+    )
+    if (
+        config.q2
+        and len(plan.desc) >= Q2_MIN_UNITS_PER_SM * sm
+        and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))
+    ):
         paired = pair_units(plan.desc)
         plan.num_launch = len(paired) // 2
         desc = torch.tensor(paired, dtype=torch.int32, device=device)
-    groups = torch.tensor(plan.groups if plan.groups else [[0] * GROUP_FIELDS], dtype=torch.int32, device=device)
+    groups = torch.tensor(
+        plan.groups if plan.groups else [[0] * GROUP_FIELDS],
+        dtype=torch.int32,
+        device=device,
+    )
     fx = getattr(plan, "fixup_groups", plan.groups)
-    fixup_groups = torch.tensor(fx if fx else [[0] * GROUP_FIELDS], dtype=torch.int32, device=device)
+    fixup_groups = torch.tensor(
+        fx if fx else [[0] * GROUP_FIELDS], dtype=torch.int32, device=device
+    )
     need = max(1, plan.ws_rows) * ws_row(D)
     if workspace is None:
         ws = torch.empty(need, dtype=torch.float32, device=device)
     else:
         if workspace.numel() * workspace.element_size() < need * 4:
-            raise WorkspaceTooSmall(need * 4, workspace.numel() * workspace.element_size())
+            raise WorkspaceTooSmall(
+                need * 4, workspace.numel() * workspace.element_size()
+            )
         ws = workspace.view(torch.uint8).reshape(-1)[: need * 4].view(torch.float32)
     # the per-CTA O_m scratch of fused multi-chunk units when O_m is not in TMEM (D = 256: blocks/operands.om_scratch_blocks); one 128 x D fp32
     # block per CTA in the row-interleaved layout of operands.OM_VEC, touched once per chunk end, L2-resident (26 MB at 204 CTAs x D = 256)
@@ -236,90 +355,207 @@ def plan_attention(qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_last_pag
         n_cta = max(1, min(plan.num_units, max(sm, config.grid)))
         scr = n_cta * om_scratch_blocks(D) * 128 * D
     # the in-kernel fold's arrival counters: one per group, zero at every launch (the last arriver resets its group's counter)
-    planned = _Planned(plan, desc, groups, ws, torch.empty(scr, dtype=torch.float32, device=device), fixup_groups,
-                       torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device))
+    planned = _Planned(
+        plan,
+        desc,
+        groups,
+        ws,
+        torch.empty(scr, dtype=torch.float32, device=device),
+        fixup_groups,
+        torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
+    )
     planned.ragged = ragged
     return planned
 
 
-def run_attention(planned: _Planned, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, kv_indptr: torch.Tensor,
-                  kv_indices: torch.Tensor, sm_scale: float, window_left: int = -1, kv_layout: str = "NHD",
-                  out: Optional[torch.Tensor] = None, config: Optional[AttnConfig] = None, ragged: bool = False) -> torch.Tensor:
+def run_attention(
+    planned: _Planned,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    sm_scale: float,
+    window_left: int = -1,
+    kv_layout: str = "NHD",
+    out: Optional[torch.Tensor] = None,
+    config: Optional[AttnConfig] = None,
+    ragged: bool = False,
+) -> torch.Tensor:
     from .blocks.compile import get_compiled_attention
     from .fixup import get_fixup
     from .spec import TILE_KEYS
 
     total_q, Hq, D = q.shape
     config = config or default_config(D=D)
-    assert bool(getattr(planned, "ragged", False)) == bool(ragged), "plan_attention and run_attention must agree on ragged"
+    assert bool(getattr(planned, "ragged", False)) == bool(ragged), (
+        "plan_attention and run_attention must agree on ragged"
+    )
     if ragged:
         # the packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND; the kernel is compiled at page = T
         page = TILE_KEYS
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
-        kv_k, kv_v = _kv_view_ragged(k_cache, kv_layout, Hkv, D), _kv_view_ragged(v_cache, kv_layout, Hkv, D)
+        kv_k, kv_v = (
+            _kv_view_ragged(k_cache, kv_layout, Hkv, D),
+            _kv_view_ragged(v_cache, kv_layout, Hkv, D),
+        )
     else:
         page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
         Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
-        kv_k, kv_v = _kv_view(k_cache, kv_layout, Hkv, page, D), _kv_view(v_cache, kv_layout, Hkv, page, D)
+        kv_k, kv_v = (
+            _kv_view(k_cache, kv_layout, Hkv, page, D),
+            _kv_view(v_cache, kv_layout, Hkv, page, D),
+        )
     g = Hq // Hkv
-    assert q.dtype == torch.bfloat16 and k_cache.dtype == torch.bfloat16 and v_cache.dtype == torch.bfloat16
+    assert (
+        q.dtype == torch.bfloat16
+        and k_cache.dtype == torch.bfloat16
+        and v_cache.dtype == torch.bfloat16
+    )
     assert q.is_contiguous(), "Q must be a packed (total_q, Hq, D) tensor"
-    assert sm_scale > 0.0, "sm_scale must be positive (the class forms exp2 arguments with it)"
+    assert sm_scale > 0.0, (
+        "sm_scale must be positive (the class forms exp2 arguments with it)"
+    )
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
     c = scale_log2(sm_scale)
     plan = planned.plan
     assert plan.g == g
-    q_view = q.permute(2, 1, 0)                                        # (D, Hq, total_q)
+    q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
     sm = torch.cuda.get_device_properties(q.device).multi_processor_count
     grid = config.grid if config.grid else min(plan.num_units, sm)
     grid = max(1, min(grid, plan.num_units))
-    assert planned.fold_counters is not None and planned.scratch is not None, "plan_attention must be called with the same (FMHA) config"
+    assert planned.fold_counters is not None and planned.scratch is not None, (
+        "plan_attention must be called with the same (FMHA) config"
+    )
     n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
-    if n_pad:                                                         # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
+    if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
+
         kernel = get_compiled_swaps(D, g, page, n_pad, ragged)
-        kernel(q_view, kv_k, kv_v, o_view, planned.ws,
-               planned.groups, planned.fold_counters, planned.desc, kv_indptr, kv_indices, float(c), float(-c), int(window_left), int(plan.num_units),
-               int(grid))
+        kernel(
+            q_view,
+            kv_k,
+            kv_v,
+            o_view,
+            planned.ws,
+            planned.groups,
+            planned.fold_counters,
+            planned.desc,
+            kv_indptr,
+            kv_indices,
+            float(c),
+            float(-c),
+            int(window_left),
+            int(plan.num_units),
+            int(grid),
+        )
     else:
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
-        if config.q2 and n_launch is None:            # too few units to pair: the one-warpgroup body (same bits)
-            kernel = get_compiled_attention(D, g, page, config.kv_slots, 1, False, ragged)
+        if (
+            config.q2 and n_launch is None
+        ):  # too few units to pair: the one-warpgroup body (same bits)
+            kernel = get_compiled_attention(
+                D, g, page, config.kv_slots, 1, False, ragged
+            )
         else:
-            kernel = get_compiled_attention(D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged)
-        if n_launch is not None:                                      # the paired placement walks pairs of units
-            grid = max(1, min(config.grid if config.grid else min(n_launch, sm), n_launch))
-        if planned.scratch.numel() > 1:                               # O_m in the per-CTA global scratch: om_scratch_blocks(D) blocks per CTA
+            kernel = get_compiled_attention(
+                D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged
+            )
+        if n_launch is not None:  # the paired placement walks pairs of units
+            grid = max(
+                1, min(config.grid if config.grid else min(n_launch, sm), n_launch)
+            )
+        if (
+            planned.scratch.numel() > 1
+        ):  # O_m in the per-CTA global scratch: om_scratch_blocks(D) blocks per CTA
             from .blocks.operands import om_scratch_blocks
-            grid = max(1, min(grid, planned.scratch.numel() // (om_scratch_blocks(D) * 128 * D)))
-        kernel(q_view, kv_k, kv_v, o_view, planned.ws, planned.scratch,
-               planned.groups, planned.fold_counters, planned.desc, kv_indptr, kv_indices, float(c), float(-c), int(window_left),
-               int(n_launch if n_launch is not None else plan.num_units), int(grid))
+
+            grid = max(
+                1,
+                min(grid, planned.scratch.numel() // (om_scratch_blocks(D) * 128 * D)),
+            )
+        kernel(
+            q_view,
+            kv_k,
+            kv_v,
+            o_view,
+            planned.ws,
+            planned.scratch,
+            planned.groups,
+            planned.fold_counters,
+            planned.desc,
+            kv_indptr,
+            kv_indices,
+            float(c),
+            float(-c),
+            int(window_left),
+            int(n_launch if n_launch is not None else plan.num_units),
+            int(grid),
+        )
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(planned.ws, o_view, planned.fixup_groups, float(c), float(-c), int(window_left), int(Hq), int(len(fx)), int(max_rows))
+        get_fixup(D, g)(
+            planned.ws,
+            o_view,
+            planned.fixup_groups,
+            float(c),
+            float(-c),
+            int(window_left),
+            int(Hq),
+            int(len(fx)),
+            int(max_rows),
+        )
     return out
 
 
-def attention_paged(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor,
-                    kv_indices: torch.Tensor, kv_last_page_len: torch.Tensor, sm_scale: Optional[float] = None, window_left: int = -1,
-                    kv_layout: str = "NHD", out: Optional[torch.Tensor] = None, config: Optional[AttnConfig] = None,
-                    workspace: Optional[torch.Tensor] = None) -> torch.Tensor:
+def attention_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    sm_scale: Optional[float] = None,
+    window_left: int = -1,
+    kv_layout: str = "NHD",
+    out: Optional[torch.Tensor] = None,
+    config: Optional[AttnConfig] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
     sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
-    planned = plan_attention(qo_indptr, kv_indptr, kv_last_page_len, Hq, Hkv, D, page, window_left, config, workspace, q.device)
-    return run_attention(planned, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale, window_left, kv_layout, out, config)
-
-
-
-
-
-
+    planned = plan_attention(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_len,
+        Hq,
+        Hkv,
+        D,
+        page,
+        window_left,
+        config,
+        workspace,
+        q.device,
+    )
+    return run_attention(
+        planned,
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        window_left,
+        kv_layout,
+        out,
+        config,
+    )

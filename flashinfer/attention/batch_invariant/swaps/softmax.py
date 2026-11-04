@@ -17,11 +17,12 @@ key ``t`` of every tile and the ``n_pad`` scores ``S^T[t, n]`` of the unit's row
 A tile with no visible key for a row is a *null step* for that row (``alpha = 1``, ``P^T`` column ``+0``, ``m`` untouched). Padding rows
 (``n >= rows``) are never masked and never stored: their columns of ``S^T`` / ``P^T`` / ``O^T`` are their own.
 """
+
 from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant import canon
@@ -31,8 +32,8 @@ from ..blocks.operands import ACC_DTYPE, IN_DTYPE
 from .operands import BAR_SOFTMAX
 
 _NEG_INF = float("-inf")
-                                                                  # to the shuffle fmax tree on subnormals, +-0, one NaN and all-NaN; probed on sm_100 /
-                                                                  # sm_103 / sm_107, 2026-11-03, bench/probe_redux.py)
+# to the shuffle fmax tree on subnormals, +-0, one NaN and all-NaN; probed on sm_100 /
+# sm_103 / sm_107, 2026-11-03, bench/probe_redux.py)
 LANES = 32
 
 
@@ -52,7 +53,9 @@ class _LanePeers(canon.Peers):
     def shuffle_xor(self, key, value, mask):
         return cute.arch.shuffle_sync_bfly(value, offset=mask)
 
-    def exchange(self, step, state):  # pragma: no cover - the warp factor's top levels run through smem in warp order (unit_loop)
+    def exchange(
+        self, step, state
+    ):  # pragma: no cover - the warp factor's top levels run through smem in warp order (unit_loop)
         raise NotImplementedError
 
 
@@ -73,7 +76,9 @@ def warp_reduce(plan, value: Float32, peers) -> Float32:
 def lane_masks(plan) -> list:
     """The xor masks of the plan's lane steps, in the engine's order (asserted: five lane steps, nothing else)."""
     masks = [s.lane_mask for s in plan.steps]
-    assert all(s.level == "lane" for s in plan.steps) and masks == [1, 2, 4, 8, 16], plan.describe()
+    assert all(s.level == "lane" for s in plan.steps) and masks == [1, 2, 4, 8, 16], (
+        plan.describe()
+    )
     return masks
 
 
@@ -87,7 +92,7 @@ def warp_reduce_rows(plan, vals, combine, peers):
         for v in vals:
             partners.append(peers.shuffle_xor((), v, mask))
         nxt = []
-        for v, q in zip(vals, partners):
+        for v, q in zip(vals, partners, strict=True):
             nxt.append(combine(v, q))
         vals = nxt
     return vals
@@ -105,37 +110,65 @@ def row_of_lane(vals, lane: Int32) -> Float32:
 
 
 @cute.jit
-def unit_loop(st, k: Int32, qk_thr_mma: cute.TiledMma, tStS: cute.Tensor, s_cons, p_prod, stats_prod, hm_prod, hm_cons, s_alpha: cute.Tensor,
-              s_m: cute.Tensor, s_r: cute.Tensor, s_x: cute.Tensor, s_hm: cute.Tensor, sP_e: cute.Tensor, c: Float32, nc: Float32,
-              window_left: Int32, rows_valid: Int32, q_tok0: Int32, kv_len: Int32, q_len: Int32, tile_lo: Int32, tile_hi: Int32):
+def unit_loop(
+    st,
+    k: Int32,
+    qk_thr_mma: cute.TiledMma,
+    tStS: cute.Tensor,
+    s_cons,
+    p_prod,
+    stats_prod,
+    hm_prod,
+    hm_cons,
+    s_alpha: cute.Tensor,
+    s_m: cute.Tensor,
+    s_r: cute.Tensor,
+    s_x: cute.Tensor,
+    s_hm: cute.Tensor,
+    sP_e: cute.Tensor,
+    c: Float32,
+    nc: Float32,
+    window_left: Int32,
+    rows_valid: Int32,
+    q_tok0: Int32,
+    kv_len: Int32,
+    q_len: Int32,
+    tile_lo: Int32,
+    tile_hi: Int32,
+):
     """One unit for softmax warpgroup ``k`` (dynamic: one code copy): the tiles ``n_t = k, k + 2, ...`` of the unit. The running row maximum
     after tile ``n_t - 1`` arrives from the other warpgroup through the hand-off ring (``hm_cons``: the entry it wrote), and this
     warpgroup's ``m'`` goes back the same way when a next tile exists (``hm_prod``). The S / P / stats pipelines advance past the other
     warpgroup's stages (``advance``), and after a unit with an odd tile count warpgroup 1 skips the phantom tile's stages too."""
     T, g, TPC, NP = st.T, st.g, st.tpc, st.n_pad
     tidx, _, _ = cute.arch.thread_idx()
-    thread_idx = tidx % 128                                     # = TMEM lane = key within the tile
+    thread_idx = tidx % 128  # = TMEM lane = key within the tile
     wq = cute.arch.make_warp_uniform(thread_idx // 32)
     lane = thread_idx % 32
     peers = _LanePeers()
     # TMEM -> registers: this key's n_pad scores (the S^T accumulator's (128, n_pad) C partition, one 32x32b load of n_pad columns)
     cS = cute.make_identity_tensor((T, NP))
     tScS = qk_thr_mma.partition_C(cS)
-    ld = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(NP)), ACC_DTYPE)
+    ld = cute.make_copy_atom(
+        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(NP)), ACC_DTYPE
+    )
     tiled = tcgen05.make_tmem_copy(ld, tStS)
     thr = tiled.get_slice(thread_idx)
     tFtS = thr.partition_S(tStS)
     tFcS = thr.partition_D(tScS)
     rS = cute.make_rmem_tensor(tFcS.shape, ACC_DTYPE)
     assert cute.size(rS) == NP
-    col_of = []                                                 # register i holds row (column) col_of[i]
+    col_of = []  # register i holds row (column) col_of[i]
     for i in cutlass.range_constexpr(NP):
         col_of.append(int(tFcS[i][1]))
     reg_of = {}
     for i in cutlass.range_constexpr(NP):
         reg_of[col_of[i]] = i
     assert len(reg_of) == NP, "every row must be owned exactly once by the thread"
-    plan_sum = canon.plan(spec.rowsum_reduction(LANES, None), canon.Placement.make({"key": [(LANES, "lane")]}))
+    plan_sum = canon.plan(
+        spec.rowsum_reduction(LANES, None),
+        canon.Placement.make({"key": [(LANES, "lane")]}),
+    )
     # the rows' visible ranges: row n is token n // g of the unit (bottom-right causal), head n % g
     L_row = []
     lo_row = []
@@ -153,10 +186,16 @@ def unit_loop(st, k: Int32, qk_thr_mma: cute.TiledMma, tStS: cute.Tensor, s_cons
     for n_t in range(k, N, 2):
         t = tile_lo + n_t
         chunk_first = ((t % TPC) == 0) | (t == tile_lo)
-        par = (n_t // 2) % 2                                    # this warpgroup's exchange-buffer parity (its tiles alternate the two halves)
+        par = (
+            (n_t // 2) % 2
+        )  # this warpgroup's exchange-buffer parity (its tiles alternate the two halves)
         sh = s_cons.wait_and_advance()
-        s_cons.advance(1)                                       # the other warpgroup's stage
-        cute.copy(tiled, cute.make_tensor(tFtS.iterator + sh.index * st.tmem_s_stride, tFtS.layout), rS)
+        s_cons.advance(1)  # the other warpgroup's stage
+        cute.copy(
+            tiled,
+            cute.make_tensor(tFtS.iterator + sh.index * st.tmem_s_stride, tFtS.layout),
+            rS,
+        )
         cute.arch.fence_view_async_tmem_load()
         sh.release()
         key = t * T + thread_idx
@@ -181,11 +220,21 @@ def unit_loop(st, k: Int32, qk_thr_mma: cute.TiledMma, tStS: cute.Tensor, s_cons
         cute.arch.barrier(barrier_id=BAR_SOFTMAX + k, number_of_threads=128)
         m_t = []
         for n in cutlass.range_constexpr(NP):
-            m_t.append(_pairwise([s_x[(par, 0, n)], s_x[(par, 1, n)], s_x[(par, 2, n)], s_x[(par, 3, n)]], CuteF32.fmaxc))
+            m_t.append(
+                _pairwise(
+                    [
+                        s_x[(par, 0, n)],
+                        s_x[(par, 1, n)],
+                        s_x[(par, 2, n)],
+                        s_x[(par, 3, n)],
+                    ],
+                    CuteF32.fmaxc,
+                )
+            )
         # ---- the running maximum after the previous tile, from the other warpgroup (none before the unit's first tile): taken only now,
         # after this tile's own maximum, so the warpgroups' serial chain is the hand-off and one fmax per tile (a schedule, not a value)
         m = []
-        for n in cutlass.range_constexpr(NP):
+        for _n in cutlass.range_constexpr(NP):
             m.append(Float32(_NEG_INF))
         if n_t > 0:
             hh = hm_cons.wait_and_advance()
@@ -199,12 +248,14 @@ def unit_loop(st, k: Int32, qk_thr_mma: cute.TiledMma, tStS: cute.Tensor, s_cons
             m_old = m[n]
             if chunk_first:
                 m_old = neg_inf
-            null = m_t[n] == neg_inf                            # no visible key for this row: a null step
+            null = m_t[n] == neg_inf  # no visible key for this row: a null step
             m_new = CuteF32.fmaxc(m_old, m_t[n])
             m_base = m_new
             if null:
                 m_base = Float32(0.0)
-            a = spec.alpha_term(CuteF32, m_old, m_base, c, nc)   # EX2(add(mul(m, c), mul(m_new, nc)))
+            a = spec.alpha_term(
+                CuteF32, m_old, m_base, c, nc
+            )  # EX2(add(mul(m, c), mul(m_new, nc)))
             if null:
                 a = Float32(1.0)
             alpha.append(a)
@@ -225,7 +276,9 @@ def unit_loop(st, k: Int32, qk_thr_mma: cute.TiledMma, tStS: cute.Tensor, s_cons
         # ---- this key's probabilities for every row: p_n = EX2(fma(s_n, c, mul(m_n', nc))), two rows per fma.rn.f32x2 (a packing placement)
         ps = [None] * NP
         for n in cutlass.range_constexpr(0, NP, 2):
-            x0, x1 = CuteF32.fma2((rS[reg_of[n]], rS[reg_of[n + 1]]), (c, c), (nms[n], nms[n + 1]))
+            x0, x1 = CuteF32.fma2(
+                (rS[reg_of[n]], rS[reg_of[n + 1]]), (c, c), (nms[n], nms[n + 1])
+            )
             ps[n] = CuteF32.ex2(x0)
             ps[n + 1] = CuteF32.ex2(x1)
         # ---- the row sums over the warp's keys (the lane plan); the correction adds the four warp partials in warp order
@@ -236,14 +289,20 @@ def unit_loop(st, k: Int32, qk_thr_mma: cute.TiledMma, tStS: cute.Tensor, s_cons
             if wq == 0:
                 s_m[(sth.index, lane)] = row_of_lane(m, lane)
         sth.commit()
-        stats_prod.advance(2)                                   # the other warpgroup's two entries of the next tile
+        stats_prod.advance(2)  # the other warpgroup's two entries of the next tile
         # ---- P^T to smem (bf16, cvt.rn per element): element (n, key) of the K-major SW128 B operand of this P stage
         ph = p_prod.acquire_and_advance()
         p_prod.advance(1)
-        kk = thread_idx                                         # the key within the tile
+        kk = thread_idx  # the key within the tile
         for n in cutlass.range_constexpr(NP):
             # row n: + 64 n, the 16-byte granule of the key XORed with n % 8 (SW128 from the smem address bits)
-            off = ph.index * st.p_stage_elems + (((kk % 64) >> 3) ^ (n % 8)) * 8 + (kk % 8) + 64 * n + 64 * NP * (kk // 64)
+            off = (
+                ph.index * st.p_stage_elems
+                + (((kk % 64) >> 3) ^ (n % 8)) * 8
+                + (kk % 8)
+                + 64 * n
+                + 64 * NP * (kk // 64)
+            )
             sP_e[off] = ps[n].to(IN_DTYPE)
         cute.arch.fence_view_async_shared()
         ph.commit()

@@ -433,7 +433,9 @@ BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 DECIDED_THEOREMS = (
     tuple(n for F in FORMATS for n in F.decided)
     + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
-    + tuple(f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok"))
+    + tuple(
+        f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
+    )
 )
 #: `native_decide` theorems of the hand-written modules (not of the generated `Cases.lean`): the attention class-separation
 #: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
@@ -497,7 +499,9 @@ def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str]]:
 
     out = []
     for name, D, T, C, p, win, rid, d in ATTN_CASES:
-        sx = sexpr(AttentionSpec(D, T=T, C=C).output(RowSpec(p=p, window_left=win, row=rid), d))
+        sx = sexpr(
+            AttentionSpec(D, T=T, C=C).output(RowSpec(p=p, window_left=win, row=rid), d)
+        )
         out.append((name, D, T, C, p, win, rid, d, sx))
     return out
 
@@ -856,8 +860,12 @@ def render() -> str:
     )
     for name, D, T, C, p, win, rid, d, sx in attn_cases():
         tb = T.bit_length() - 1
-        L.append(f"def attnP_{name} : Attn.Params := ⟨{D // MMA_K}, {tb}, {C}, {p}, {win}, {rid}, {d}⟩")
-        L.append(f"theorem attn_{name}_spec : (Attn.output attnP_{name}).sexpr = {lean_str(sx)} := by native_decide")
+        L.append(
+            f"def attnP_{name} : Attn.Params := ⟨{D // MMA_K}, {tb}, {C}, {p}, {win}, {rid}, {d}⟩"
+        )
+        L.append(
+            f"theorem attn_{name}_spec : (Attn.output attnP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
         L.append(
             f"theorem attn_{name}_split : ∀ σ : Nat → Nat, Attn.splitKernel attnP_{name} σ = Attn.output attnP_{name} := "
             f"fun σ => Attn.splitKernel_eq_fused _ σ"
@@ -873,9 +881,17 @@ def render() -> str:
         "against the static constraints (`ConfigOKD`), counted, and `space_invariant` instantiated on it (R3). -/"
     )
     for D, cfgs in attn_spaces().items():
-        L.append(f"def attnSpaceD{D} : List Attn.Config := [" + ", ".join(c.lean() for c in cfgs) + "]")
-        L.append(f"theorem attn_space_d{D}_size : attnSpaceD{D}.length = {len(cfgs)} := by native_decide")
-        L.append(f"theorem attn_space_d{D}_ok : attnSpaceD{D}.all (Attn.ConfigOKD {D}) = true := by native_decide")
+        L.append(
+            f"def attnSpaceD{D} : List Attn.Config := ["
+            + ", ".join(c.lean() for c in cfgs)
+            + "]"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_size : attnSpaceD{D}.length = {len(cfgs)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_ok : attnSpaceD{D}.all (Attn.ConfigOKD {D}) = true := by native_decide"
+        )
         L.append(
             f"theorem attn_space_d{D}_invariant : ∀ b₁ ∈ attnSpaceD{D}, ∀ b₂ ∈ attnSpaceD{D}, "
             "∀ (f₁ f₂ : Bool) (P : Attn.Params) (σ τ : Nat → Nat), Attn.kernel b₁ f₁ P σ = Attn.kernel b₂ f₂ P τ := "

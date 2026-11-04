@@ -13,6 +13,7 @@ one per chunk: with ``C = 512`` a 32K row has 64 chunks and the one-load-per-mer
 B = 1, longer than the attention kernel itself; docs/attention_scoping.md section 7, 2026-10-28). The
 fold order and every operation are unchanged.
 """
+
 from __future__ import annotations
 
 import functools
@@ -23,27 +24,57 @@ from cutlass import Float32, Int32, Int64
 
 from ...batch_invariant import jit
 from ...batch_invariant.fp_interface.cute import CuteF32
-from .plan import G_CHUNK_LO, G_KVHEAD, G_KVLEN, G_NCHUNKS, G_QBASE, G_QLEN, G_QTOK0, G_ROWS, G_SLOT, GROUP_FIELDS, ws_row
+from .plan import (
+    G_CHUNK_LO,
+    G_KVHEAD,
+    G_KVLEN,
+    G_NCHUNKS,
+    G_QBASE,
+    G_QLEN,
+    G_QTOK0,
+    G_ROWS,
+    G_SLOT,
+    GROUP_FIELDS,
+    ws_row,
+)
 from .spec import chunk_len
 
 VEC = 4
 THREADS = 128
-PF = 32                 # chunks whose partials are loaded ahead of their merges in the fixup KERNEL (a placement: the merges stay in chunk order;
-                        # 32 since 2026-10-29: two load batches for a 64-chunk row -- the fixup node was 12-18 % of B = 1 decode at D = 256 (8.8.4);
-                        # 192 registers of partials at 128 threads per block; the in-kernel fold uses 8 / 4 at the correction warpgroup's budget, blocks/correction.py)
-PDL = True   # the fixup kernel is launched with programmatic dependent launch: its blocks are scheduled while the attention kernel's
-                        # last CTAs drain (every working role of the attention kernel issues griddepcontrol.launch_dependents AFTER its unit
-                        # walk -- at the kernel start the resident blocks cost 10-22 % at multi-wave folds, 12.5.1) and griddepcontrol.wait
-                        # before the first workspace read orders every partial row behind the whole attention grid (a placement: the second graph
-                        # node's launch gap overlaps the drain, +1-6 % at B = 1 / 8; docs/attention_scoping.md 12.2, 12.5.2)
+PF = 32  # chunks whose partials are loaded ahead of their merges in the fixup KERNEL (a placement: the merges stay in chunk order;
+# 32 since 2026-10-29: two load batches for a 64-chunk row -- the fixup node was 12-18 % of B = 1 decode at D = 256 (8.8.4);
+# 192 registers of partials at 128 threads per block; the in-kernel fold uses 8 / 4 at the correction warpgroup's budget, blocks/correction.py)
+PDL = True  # the fixup kernel is launched with programmatic dependent launch: its blocks are scheduled while the attention kernel's
+# last CTAs drain (every working role of the attention kernel issues griddepcontrol.launch_dependents AFTER its unit
+# walk -- at the kernel start the resident blocks cost 10-22 % at multi-wave folds, 12.5.1) and griddepcontrol.wait
+# before the first workspace read orders every partial row behind the whole attention grid (a placement: the second graph
+# node's launch gap overlaps the drain, +1-6 % at B = 1 / 8; docs/attention_scoping.md 12.2, 12.5.2)
 _NEG_INF = float("-inf")
 
 
 @cute.jit
-def fold_row_state(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, n_chunks: Int32, pos: Int32, c: Float32, nc: Float32,
-                   window_left: Int32, r: Int32, d0: Int32, o: cute.Tensor, D: cutlass.Constexpr, C: cutlass.Constexpr, PF: cutlass.Constexpr,
-                   WS: cutlass.Constexpr, layout: cutlass.Constexpr = "row", lane_rows: cutlass.Constexpr = 0, cells: cutlass.Constexpr = None,
-                   grid: cutlass.Constexpr = None):
+def fold_row_state(
+    mWs: cute.Tensor,
+    slot: Int32,
+    rows: Int32,
+    chunk_lo: Int32,
+    n_chunks: Int32,
+    pos: Int32,
+    c: Float32,
+    nc: Float32,
+    window_left: Int32,
+    r: Int32,
+    d0: Int32,
+    o: cute.Tensor,
+    D: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    PF: cutlass.Constexpr,
+    WS: cutlass.Constexpr,
+    layout: cutlass.Constexpr = "row",
+    lane_rows: cutlass.Constexpr = 0,
+    cells: cutlass.Constexpr = None,
+    grid: cutlass.Constexpr = None,
+):
     """The ``chunk`` fold digit for row ``r`` (query position ``pos``) of a split group over output columns ``[d0, d0 + VEC)``: the
     row's present chunks folded in chunk order with ``spec.merge`` from the init state ``(-inf, +0, +0)`` into ``o`` (``VEC`` fp32,
     caller-allocated) and the returned ``(m, l)``. ``PF`` partial rows are loaded ahead of their merges; ``WS`` is the workspace row
@@ -59,7 +90,7 @@ def fold_row_state(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, 
     arithmetic below, bit for bit): a device function ``cells(grid, lo, L) -> (j_lo, j_hi)`` giving the first and one-past-last
     chunk (cell) of the row's visible range on the class's absolute chunk grid ``grid``;
     the regions stay one per chunk index, so the fold below is unchanged.
-"""
+    """
     L = pos + 1
     lo = Int32(0)
     if window_left >= 0:
@@ -83,17 +114,23 @@ def fold_row_state(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, 
     r_hi = j_hi - chunk_lo
     # PF partial rows (m, l, O[d0 .. d0 + VEC)) per step, loaded before the step's merges; a region past r_hi is
     # loaded from the last present region's row (a valid address) and skipped
-    pml = cute.make_rmem_tensor(cute.make_layout((PF, 2), stride=(1, PF)), Float32)     # [i] -> m at i, l at PF + i (an (m, l) pair is one 8-byte load)
+    pml = cute.make_rmem_tensor(
+        cute.make_layout((PF, 2), stride=(1, PF)), Float32
+    )  # [i] -> m at i, l at PF + i (an (m, l) pair is one 8-byte load)
     pm = cute.make_tensor(pml.iterator, cute.make_layout((PF,)))
     pl = cute.make_tensor(pml.iterator + PF, cute.make_layout((PF,)))
-    po = cute.make_rmem_tensor(cute.make_layout((PF, VEC), stride=(VEC, 1)), Float32)   # row-major: chunk i's VEC values are contiguous (the 16-byte load)
+    po = cute.make_rmem_tensor(
+        cute.make_layout((PF, VEC), stride=(VEC, 1)), Float32
+    )  # row-major: chunk i's VEC values are contiguous (the 16-byte load)
     for r0 in range(r_lo, r_hi, PF):
         for i in cutlass.range_constexpr(PF):
             rg = r0 + i
             if rg > r_hi - 1:
                 rg = r_hi - 1
             if cutlass.const_expr(layout == "row"):
-                base = (slot + rg * rows + r).to(Int64) * WS                 # 64-bit: the workspace may exceed 2^31 fp32
+                base = (slot + rg * rows + r).to(
+                    Int64
+                ) * WS  # 64-bit: the workspace may exceed 2^31 fp32
                 pm[i] = mWs[base + D]
                 pl[i] = mWs[base + D + 1]
                 for e in cutlass.range_constexpr(VEC):
@@ -104,8 +141,16 @@ def fold_row_state(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, 
                 region = (slot + rg * lane_rows).to(Int64) * WS
                 ml = cute.assume(region + ((D // VEC) * lane_rows + r) * VEC, divby=4)
                 og = cute.assume(region + ((d0 // VEC) * lane_rows + r) * VEC, divby=4)
-                cute.autovec_copy(cute.make_tensor(mWs.iterator + ml, cute.make_layout((2,))), cute.make_tensor(pm.iterator + i, cute.make_layout((2,), stride=(PF,))))
-                cute.autovec_copy(cute.make_tensor(mWs.iterator + og, cute.make_layout((VEC,))), cute.make_tensor(po.iterator + i * VEC, cute.make_layout((VEC,))))  # po is (PF, VEC) with VEC contiguous
+                cute.autovec_copy(
+                    cute.make_tensor(mWs.iterator + ml, cute.make_layout((2,))),
+                    cute.make_tensor(
+                        pm.iterator + i, cute.make_layout((2,), stride=(PF,))
+                    ),
+                )
+                cute.autovec_copy(
+                    cute.make_tensor(mWs.iterator + og, cute.make_layout((VEC,))),
+                    cute.make_tensor(po.iterator + i * VEC, cute.make_layout((VEC,))),
+                )  # po is (PF, VEC) with VEC contiguous
         for i in cutlass.range_constexpr(PF):
             if r0 + i < r_hi:
                 m2 = pm[i]
@@ -122,23 +167,63 @@ def fold_row_state(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, 
 
 
 @cute.jit
-def fold_row(mWs: cute.Tensor, mO: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, n_chunks: Int32, q_tok0: Int32, kv_head: Int32,
-             kv_len: Int32, q_len: Int32, q_base: Int32, c: Float32, nc: Float32, window_left: Int32, Hq: Int32, r: Int32, d0: Int32,
-             D: cutlass.Constexpr, g: cutlass.Constexpr, C: cutlass.Constexpr, PF: cutlass.Constexpr, WS: cutlass.Constexpr):
+def fold_row(
+    mWs: cute.Tensor,
+    mO: cute.Tensor,
+    slot: Int32,
+    rows: Int32,
+    chunk_lo: Int32,
+    n_chunks: Int32,
+    q_tok0: Int32,
+    kv_head: Int32,
+    kv_len: Int32,
+    q_len: Int32,
+    q_base: Int32,
+    c: Float32,
+    nc: Float32,
+    window_left: Int32,
+    Hq: Int32,
+    r: Int32,
+    d0: Int32,
+    D: cutlass.Constexpr,
+    g: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    PF: cutlass.Constexpr,
+    WS: cutlass.Constexpr,
+):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
     init state (``fold_row_state``, the single implementation), then the epilogue to the output row. ``WS`` is the workspace row
     pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256)."""
     token = q_tok0 + r // g
     pos = kv_len - q_len + token
     o = cute.make_rmem_tensor(cute.make_layout((VEC,)), Float32)
-    m, l = fold_row_state(mWs, slot, rows, chunk_lo, n_chunks, pos, c, nc, window_left, r, d0, o, D, C, PF, WS)
+    m, l = fold_row_state(
+        mWs,
+        slot,
+        rows,
+        chunk_lo,
+        n_chunks,
+        pos,
+        c,
+        nc,
+        window_left,
+        r,
+        d0,
+        o,
+        D,
+        C,
+        PF,
+        WS,
+    )
     inv = CuteF32.div(Float32(1.0), l)
     out_row = (q_base + token) * Hq + kv_head * g + r % g
     for e in cutlass.range_constexpr(VEC):
-        mO[(out_row, d0 + e)] = CuteF32.add(CuteF32.mul(o[e], inv), Float32(0.0)).to(mO.element_type)
+        mO[(out_row, d0 + e)] = CuteF32.add(CuteF32.mul(o[e], inv), Float32(0.0)).to(
+            mO.element_type
+        )
 
 
-WIDE_PF = 32            # the fixup kernel's batch of chunks loaded before their merges (the wide thread mapping below)
+WIDE_PF = 32  # the fixup kernel's batch of chunks loaded before their merges (the wide thread mapping below)
 
 
 def wide_vec(D: int) -> int:
@@ -147,9 +232,25 @@ def wide_vec(D: int) -> int:
 
 
 @cute.jit
-def fold_row_state_wide(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32, n_chunks: Int32, pos: Int32, c: Float32, nc: Float32,
-                        window_left: Int32, r: Int32, d0: Int32, o: cute.Tensor, D: cutlass.Constexpr, C: cutlass.Constexpr, PF: cutlass.Constexpr,
-                        WS: cutlass.Constexpr, V: cutlass.Constexpr):
+def fold_row_state_wide(
+    mWs: cute.Tensor,
+    slot: Int32,
+    rows: Int32,
+    chunk_lo: Int32,
+    n_chunks: Int32,
+    pos: Int32,
+    c: Float32,
+    nc: Float32,
+    window_left: Int32,
+    r: Int32,
+    d0: Int32,
+    o: cute.Tensor,
+    D: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    PF: cutlass.Constexpr,
+    WS: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+):
     """``fold_row_state`` for the fixup kernel's wide thread mapping (``V`` output columns per thread, ``"row"`` workspace layout): the
     same present chunks, the same fold order and the same operations on the same operands, scheduled for latency: a batch's partials
     are all loaded first, then the running-maximum chain and the batch's ``a1`` / ``a2`` exponentials (independent of the ``O`` chain),
@@ -202,7 +303,9 @@ def fold_row_state_wide(mWs: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: In
     return m, l
 
 
-COOP_NCB = 64           # chunks per batch of the cooperative fold (two per lane of the scan warp)
+COOP_NCB = (
+    64  # chunks per batch of the cooperative fold (two per lane of the scan warp)
+)
 
 
 @cute.jit
@@ -218,9 +321,29 @@ def _warp_inclusive_max(v: Float32, lane: Int32) -> Float32:
 
 
 @cute.jit
-def fold_row_coop(mWs: cute.Tensor, sA1: cute.Tensor, sA2: cute.Tensor, sL: cute.Tensor, slot: Int32, rows: Int32, chunk_lo: Int32,
-                  n_chunks: Int32, pos: Int32, c: Float32, nc: Float32, window_left: Int32, r: Int32, d0: Int32, o: cute.Tensor,
-                  is_scan_warp, lane: Int32, D: cutlass.Constexpr, C: cutlass.Constexpr, WS: cutlass.Constexpr, V: cutlass.Constexpr):
+def fold_row_coop(
+    mWs: cute.Tensor,
+    sA1: cute.Tensor,
+    sA2: cute.Tensor,
+    sL: cute.Tensor,
+    slot: Int32,
+    rows: Int32,
+    chunk_lo: Int32,
+    n_chunks: Int32,
+    pos: Int32,
+    c: Float32,
+    nc: Float32,
+    window_left: Int32,
+    r: Int32,
+    d0: Int32,
+    o: cute.Tensor,
+    is_scan_warp,
+    lane: Int32,
+    D: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    WS: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+):
     """The fixup kernel's cooperative fold of row ``r`` (every thread of the row's thread group calls it; ``is_scan_warp`` marks the
     row's first warp). Per batch of up to ``COOP_NCB`` present chunks: every thread loads its ``V`` columns of every chunk's partial;
     the scan warp loads the chunks' ``(m, l)``, forms the running maxima (``_warp_inclusive_max``) and every chunk's
@@ -317,18 +440,42 @@ class SplitKVFixup:
         self.WS = ws_row(D)
 
     @cute.jit
-    def __call__(self, mWs: cute.Tensor, mO: cute.Tensor, mGroups: cute.Tensor, c: Float32, nc: Float32, window_left: Int32,
-                 Hq: Int32, num_groups: Int32, max_rows: Int32, stream):
+    def __call__(
+        self,
+        mWs: cute.Tensor,
+        mO: cute.Tensor,
+        mGroups: cute.Tensor,
+        c: Float32,
+        nc: Float32,
+        window_left: Int32,
+        Hq: Int32,
+        num_groups: Int32,
+        max_rows: Int32,
+        stream,
+    ):
         # grid: (row blocks of a group, groups); a block handles 128 / (D / V) rows, V = wide_vec(D) output columns per thread
         rows_per_block = THREADS // (self.D // wide_vec(self.D))
         self.kernel(mWs, mO, mGroups, c, nc, window_left, Hq).launch(
-            grid=[cute.ceil_div(max_rows, rows_per_block), num_groups, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=self.pdl)
+            grid=[cute.ceil_div(max_rows, rows_per_block), num_groups, 1],
+            block=[THREADS, 1, 1],
+            stream=stream,
+            use_pdl=self.pdl,
+        )
 
     @cute.kernel
-    def kernel(self, mWs: cute.Tensor, mO: cute.Tensor, mGroups: cute.Tensor, c: Float32, nc: Float32, window_left: Int32, Hq: Int32):
+    def kernel(
+        self,
+        mWs: cute.Tensor,
+        mO: cute.Tensor,
+        mGroups: cute.Tensor,
+        c: Float32,
+        nc: Float32,
+        window_left: Int32,
+        Hq: Int32,
+    ):
         D, g, C = self.D, self.g, self.C
         if cutlass.const_expr(self.pdl):
-            cute.arch.griddepcontrol_wait()                 # every partial row of the attention grid is complete and visible before any read
+            cute.arch.griddepcontrol_wait()  # every partial row of the attention grid is complete and visible before any read
         tidx, _, _ = cute.arch.thread_idx()
         bx, grp, _ = cute.arch.block_idx()
         V = wide_vec(D)
@@ -340,7 +487,9 @@ class SplitKVFixup:
         lane = tidx % 32
         is_scan_warp = (tidx % thr_per_row) < 32
         smem = cutlass.utils.SmemAllocator()
-        sbuf = smem.allocate_tensor(Float32, cute.make_layout((3, rows_per_block, COOP_NCB)), byte_alignment=16)
+        sbuf = smem.allocate_tensor(
+            Float32, cute.make_layout((3, rows_per_block, COOP_NCB)), byte_alignment=16
+        )
         sA1 = sbuf[0, ri, None]
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
@@ -356,13 +505,40 @@ class SplitKVFixup:
         token = q_tok0 + rr // g
         pos = kv_len - q_len + token
         o = cute.make_rmem_tensor(cute.make_layout((V,)), Float32)
-        l = fold_row_coop(mWs, sA1, sA2, sL, mGroups[(grp, G_SLOT)], rows, mGroups[(grp, G_CHUNK_LO)], mGroups[(grp, G_NCHUNKS)], pos, c, nc,
-                          window_left, rr, d0, o, is_scan_warp, lane, D, C, self.WS, V)
+        l = fold_row_coop(
+            mWs,
+            sA1,
+            sA2,
+            sL,
+            mGroups[(grp, G_SLOT)],
+            rows,
+            mGroups[(grp, G_CHUNK_LO)],
+            mGroups[(grp, G_NCHUNKS)],
+            pos,
+            c,
+            nc,
+            window_left,
+            rr,
+            d0,
+            o,
+            is_scan_warp,
+            lane,
+            D,
+            C,
+            self.WS,
+            V,
+        )
         if live:
             inv = CuteF32.div(Float32(1.0), l)
-            out_row = (mGroups[(grp, G_QBASE)] + token) * Hq + mGroups[(grp, G_KVHEAD)] * g + rr % g
+            out_row = (
+                (mGroups[(grp, G_QBASE)] + token) * Hq
+                + mGroups[(grp, G_KVHEAD)] * g
+                + rr % g
+            )
             for e in cutlass.range_constexpr(V):
-                mO[(out_row, d0 + e)] = CuteF32.add(CuteF32.mul(o[e], inv), Float32(0.0)).to(mO.element_type)
+                mO[(out_row, d0 + e)] = CuteF32.add(
+                    CuteF32.mul(o[e], inv), Float32(0.0)
+                ).to(mO.element_type)
 
 
 @functools.cache
@@ -371,11 +547,32 @@ def get_fixup(D: int, g: int):
 
     def compile_fn():
         f32, i32, bf16 = cutlass.Float32, cutlass.Int32, cutlass.BFloat16
-        ws_fake = cute.runtime.make_fake_tensor(f32, (cute.sym_int(64),), (1,), assumed_align=16)      # > 2^31 fp32 of partials is legal
-        o_fake = cute.runtime.make_fake_tensor(bf16, (cute.sym_int(32), D), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        groups_fake = cute.runtime.make_fake_tensor(i32, (cute.sym_int(32), GROUP_FIELDS), (GROUP_FIELDS, 1), assumed_align=4)
+        ws_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(64),), (1,), assumed_align=16
+        )  # > 2^31 fp32 of partials is legal
+        o_fake = cute.runtime.make_fake_tensor(
+            bf16,
+            (cute.sym_int(32), D),
+            (cute.sym_int64(divisibility=8), 1),
+            assumed_align=16,
+        )
+        groups_fake = cute.runtime.make_fake_tensor(
+            i32, (cute.sym_int(32), GROUP_FIELDS), (GROUP_FIELDS, 1), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        return cute.compile(SplitKVFixup(D, g), ws_fake, o_fake, groups_fake, Float32(1.0), Float32(-1.0), Int32(-1), Int32(1), Int32(1), Int32(1),
-                            stream_fake, options="--enable-tvm-ffi")
+        return cute.compile(
+            SplitKVFixup(D, g),
+            ws_fake,
+            o_fake,
+            groups_fake,
+            Float32(1.0),
+            Float32(-1.0),
+            Int32(-1),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
 
     return jit.build_and_load("batch_invariant_attention", name, compile_fn)

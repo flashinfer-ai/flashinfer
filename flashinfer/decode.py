@@ -2363,7 +2363,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if window_right != 0:
                 from .batch_invariant.support import unsupported
 
-                raise unsupported("attention.bf16", f"window_right {window_right}", "window_right 0 (causal)")
+                raise unsupported(
+                    "attention.bf16",
+                    f"window_right {window_right}",
+                    "window_right 0 (causal)",
+                )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
             self._num_kv_heads = num_kv_heads

@@ -164,9 +164,15 @@ CLASSES: Dict[str, ClassInfo] = {
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
     # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
-    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo("attention.bf16", ("head_dim",), _attention_fingerprint),
-    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo("attention.bf16", ("head_dim",), _attention_fingerprint),
-    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo("attention.bf16", ("head_dim",), _attention_fingerprint),
+    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
 }
 
 

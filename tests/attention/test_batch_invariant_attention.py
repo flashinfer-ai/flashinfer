@@ -38,23 +38,67 @@ class Problem:
 
     def __init__(self, q_lens, kv_lens, Hq, Hkv, D, page, seed=0, device="cuda"):
         g = torch.Generator(device="cpu").manual_seed(seed)
-        self.q_lens, self.kv_lens, self.Hq, self.Hkv, self.D, self.page = list(q_lens), list(kv_lens), Hq, Hkv, D, page
+        self.q_lens, self.kv_lens, self.Hq, self.Hkv, self.D, self.page = (
+            list(q_lens),
+            list(kv_lens),
+            Hq,
+            Hkv,
+            D,
+            page,
+        )
         self.device = torch.device(device)
         total_q = sum(q_lens)
-        self.q = (torch.randn(total_q, Hq, D, generator=g) * 1.5).to(torch.bfloat16).to(device)
-        self.k_rag = (torch.randn(sum(kv_lens), Hkv, D, generator=g) * 1.5).to(torch.bfloat16).to(device)
-        self.v_rag = (torch.randn(sum(kv_lens), Hkv, D, generator=g) * 1.5).to(torch.bfloat16).to(device)
-        self.qo_indptr = torch.tensor([0] + list(torch.cumsum(torch.tensor(q_lens), 0)), dtype=torch.int32, device=device)
-        self.kv_indptr_rag = torch.tensor([0] + list(torch.cumsum(torch.tensor(kv_lens), 0)), dtype=torch.int32, device=device)
+        self.q = (
+            (torch.randn(total_q, Hq, D, generator=g) * 1.5)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+        self.k_rag = (
+            (torch.randn(sum(kv_lens), Hkv, D, generator=g) * 1.5)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+        self.v_rag = (
+            (torch.randn(sum(kv_lens), Hkv, D, generator=g) * 1.5)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+        self.qo_indptr = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(q_lens), 0)),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.kv_indptr_rag = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(kv_lens), 0)),
+            dtype=torch.int32,
+            device=device,
+        )
         # the paged cache: each request's pages in a random order of a pool with junk pages in between
         n_pages = [(L + page - 1) // page for L in kv_lens]
         pool_pages = sum(n_pages) + 7
         perm = torch.randperm(pool_pages, generator=g).tolist()
-        self.kv_indices = torch.tensor(perm[: sum(n_pages)], dtype=torch.int32, device=device)
-        self.kv_indptr = torch.tensor([0] + list(torch.cumsum(torch.tensor(n_pages), 0)), dtype=torch.int32, device=device)
-        self.kv_last = torch.tensor([L - (n - 1) * page if n else 0 for L, n in zip(kv_lens, n_pages)], dtype=torch.int32, device=device)
-        k_pool = (torch.randn(pool_pages, page, Hkv, D, generator=g) * 1.5).to(torch.bfloat16)   # junk everywhere, then the live keys
-        v_pool = (torch.randn(pool_pages, page, Hkv, D, generator=g) * 1.5).to(torch.bfloat16)
+        self.kv_indices = torch.tensor(
+            perm[: sum(n_pages)], dtype=torch.int32, device=device
+        )
+        self.kv_indptr = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(n_pages), 0)),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.kv_last = torch.tensor(
+            [
+                L - (n - 1) * page if n else 0
+                for L, n in zip(kv_lens, n_pages, strict=True)
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        k_pool = (torch.randn(pool_pages, page, Hkv, D, generator=g) * 1.5).to(
+            torch.bfloat16
+        )  # junk everywhere, then the live keys
+        v_pool = (torch.randn(pool_pages, page, Hkv, D, generator=g) * 1.5).to(
+            torch.bfloat16
+        )
         k_rag, v_rag = self.k_rag.cpu(), self.v_rag.cpu()
         tok = 0
         off = 0
@@ -71,12 +115,16 @@ class Problem:
     def cache(self, layout):
         if layout == "NHD":
             return self.k_nhd, self.v_nhd
-        return self.k_nhd.transpose(1, 2).contiguous(), self.v_nhd.transpose(1, 2).contiguous()
+        return self.k_nhd.transpose(1, 2).contiguous(), self.v_nhd.transpose(
+            1, 2
+        ).contiguous()
 
     def ragged(self, layout):
         if layout == "NHD":
             return self.k_rag, self.v_rag
-        return self.k_rag.transpose(0, 1).contiguous(), self.v_rag.transpose(0, 1).contiguous()
+        return self.k_rag.transpose(0, 1).contiguous(), self.v_rag.transpose(
+            0, 1
+        ).contiguous()
 
 
 def workspace(device, mb=128):
@@ -84,16 +132,43 @@ def workspace(device, mb=128):
 
 
 def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
-    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws if ws is not None else workspace(pr.device), layout, batch_invariant=True)
-    w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page, causal=True, window_left=window_left,
-           q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16, **plan_kw)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        **plan_kw,
+    )
     return w.run(pr.q, pr.cache(layout))
 
 
 def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
-    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws if ws is not None else workspace(pr.device), layout, batch_invariant=True)
-    w.plan(pr.qo_indptr, pr.kv_indptr_rag, pr.Hq, pr.Hkv, pr.D, causal=True, window_left=window_left, q_data_type=torch.bfloat16,
-           kv_data_type=torch.bfloat16, **plan_kw)
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr_rag,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        causal=True,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        **plan_kw,
+    )
     k, v = pr.ragged(layout)
     return w.run(pr.q, k, v)
 
@@ -101,11 +176,26 @@ def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **pla
 def run_decode(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
     """Decode of the LAST token of every request of ``pr`` (q rows picked from the prefill problem)."""
     assert all(ql >= 1 for ql in pr.q_lens)
-    last = torch.tensor([int(pr.qo_indptr[i + 1]) - 1 for i in range(len(pr.q_lens))], device=pr.device)
+    last = torch.tensor(
+        [int(pr.qo_indptr[i + 1]) - 1 for i in range(len(pr.q_lens))], device=pr.device
+    )
     q = pr.q[last].contiguous()
-    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws if ws is not None else workspace(pr.device), layout, batch_invariant=True)
-    w.plan(pr.kv_indptr, pr.kv_indices, pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page, window_left=window_left, q_data_type=torch.bfloat16,
-           kv_data_type=torch.bfloat16, **plan_kw)
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        **plan_kw,
+    )
     return w.run(q, pr.cache(layout)), last
 
 
@@ -114,9 +204,11 @@ def reference(pr: Problem, window_left=-1):
     outs = []
     tok_q = tok_kv = 0
     g = pr.Hq // pr.Hkv
-    for ql, kl in zip(pr.q_lens, pr.kv_lens):
-        q = pr.q[tok_q : tok_q + ql].float()                                # (ql, Hq, D)
-        k = pr.k_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)  # (kl, Hq, D)
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        q = pr.q[tok_q : tok_q + ql].float()  # (ql, Hq, D)
+        k = (
+            pr.k_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
+        )  # (kl, Hq, D)
         v = pr.v_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
         s = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(pr.D)
         pos = torch.arange(kl - ql, kl, device=pr.device)[:, None]
@@ -138,7 +230,9 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
     fps = {D: bi.fingerprint(op, head_dim=D) for D in (64, 128, 256)}
     assert len(set(fps.values())) == 3
     for D, fp in fps.items():
-        assert fp.startswith("attn-bf16-d") and fp == bi.fingerprint(WRAPPERS[0], head_dim=D)   # one class for the three wrappers
+        assert fp.startswith("attn-bf16-d") and fp == bi.fingerprint(
+            WRAPPERS[0], head_dim=D
+        )  # one class for the three wrappers
     assert bi.class_name(op) == "attention.bf16"
     with pytest.raises(TypeError):
         bi.fingerprint(op, head_dim=128, page_size=16)
@@ -148,11 +242,20 @@ def test_cache_key_covers_every_kernel_source():
     from flashinfer.batch_invariant.jit import relative_sources
 
     srcs = relative_sources("batch_invariant_attention")
-    for f in ("attention/batch_invariant/blocks/compile.py", "attention/batch_invariant/blocks/kernel.py",
-              "attention/batch_invariant/swaps/kernel.py", "attention/batch_invariant/fixup.py", "attention/batch_invariant/spec.py",
-              "attention/batch_invariant/plan.py", "batch_invariant/canon.py", "batch_invariant/fp_interface/cute.py"):
+    for f in (
+        "attention/batch_invariant/blocks/compile.py",
+        "attention/batch_invariant/blocks/kernel.py",
+        "attention/batch_invariant/swaps/kernel.py",
+        "attention/batch_invariant/fixup.py",
+        "attention/batch_invariant/spec.py",
+        "attention/batch_invariant/plan.py",
+        "batch_invariant/canon.py",
+        "batch_invariant/fp_interface/cute.py",
+    ):
         assert f in srcs, f
-    assert "attention/batch_invariant/wrappers.py" not in srcs    # the API module stays outside the closure
+    assert (
+        "attention/batch_invariant/wrappers.py" not in srcs
+    )  # the API module stays outside the closure
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -160,7 +263,9 @@ def test_unsupported_device_raises_before_any_kernel():
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", backend="fa2", batch_invariant=True)
+        flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa2", batch_invariant=True
+        )
 
 
 # ------------------------------------------------------------------------------------------------------ on the device
@@ -193,7 +298,9 @@ def test_paged_equals_ragged(D, page):
     """R4: the paged and the ragged KV layouts hand the kernel the same keys at the same positions: the same bits."""
     pr = Problem([300, 1000, 64, 2048], [700, 2500, 3000, 2048], 32, 8, D, page, seed=3)
     assert torch.equal(bits(run_paged_prefill(pr)), bits(run_ragged_prefill(pr)))
-    assert torch.equal(bits(run_paged_prefill(pr, "HND")), bits(run_ragged_prefill(pr, "HND")))
+    assert torch.equal(
+        bits(run_paged_prefill(pr, "HND")), bits(run_ragged_prefill(pr, "HND"))
+    )
 
 
 @needs_device
@@ -205,8 +312,19 @@ def test_determinism_and_graph_replay(D):
         assert torch.equal(bits(run_paged_prefill(pr)), ref)
     ws = workspace(pr.device)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
-    w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page, causal=True, q_data_type=torch.bfloat16,
-           kv_data_type=torch.bfloat16)
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
     out = torch.empty_like(pr.q)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
@@ -229,23 +347,44 @@ def test_batch_permutation_and_subbatch_invariance(D):
     q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
     pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=5)
     full = bits(run_paged_prefill(pr))
-    rows = [slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])) for i in range(len(q_lens))]
+    rows = [
+        slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1]))
+        for i in range(len(q_lens))
+    ]
     # one request alone
     for i in (0, 2, 4):
         single = Problem([q_lens[i]], [kv_lens[i]], 32, 8, D, 16, seed=5)
         single.q = pr.q[rows[i]].clone()
-        single.k_rag = pr.k_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])].clone()
-        single.v_rag = pr.v_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])].clone()
-        assert torch.equal(bits(run_ragged_prefill(single)), bits(run_ragged_prefill(pr))[rows[i]]), i
+        single.k_rag = pr.k_rag[
+            int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])
+        ].clone()
+        single.v_rag = pr.v_rag[
+            int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])
+        ].clone()
+        assert torch.equal(
+            bits(run_ragged_prefill(single)), bits(run_ragged_prefill(pr))[rows[i]]
+        ), i
     # a permutation of the requests
     perm = [3, 0, 4, 1, 2]
-    pp = Problem([q_lens[i] for i in perm], [kv_lens[i] for i in perm], 32, 8, D, 16, seed=5)
+    pp = Problem(
+        [q_lens[i] for i in perm], [kv_lens[i] for i in perm], 32, 8, D, 16, seed=5
+    )
     pp.q = torch.cat([pr.q[rows[i]] for i in perm]).contiguous()
-    pp.k_rag = torch.cat([pr.k_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])] for i in perm]).contiguous()
-    pp.v_rag = torch.cat([pr.v_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])] for i in perm]).contiguous()
+    pp.k_rag = torch.cat(
+        [
+            pr.k_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])]
+            for i in perm
+        ]
+    ).contiguous()
+    pp.v_rag = torch.cat(
+        [
+            pr.v_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])]
+            for i in perm
+        ]
+    ).contiguous()
     permuted = bits(run_ragged_prefill(pp))
     ref_rag = bits(run_ragged_prefill(pr))
-    assert torch.equal(ref_rag, full)      # paged == ragged on the full batch
+    assert torch.equal(ref_rag, full)  # paged == ragged on the full batch
     off = 0
     for i in perm:
         n = q_lens[i]
@@ -262,18 +401,32 @@ def test_decode_batch_invariance_and_page_table_junk(D):
     pr = Problem([1] * 8, kv, 32, 8, D, 16, seed=6)
     out8, _ = run_decode(pr)
     for i in (0, 1, 5, 6):
-        one = Problem([1], [kv[i]], 32, 8, D, 16, seed=100 + i)  # a different pool and page order
+        one = Problem(
+            [1], [kv[i]], 32, 8, D, 16, seed=100 + i
+        )  # a different pool and page order
         one.q = pr.q[i : i + 1].clone()
-        one.k_rag = pr.k_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])].clone()
-        one.v_rag = pr.v_rag[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])].clone()
-        one = _repack(one)                                      # the request's keys in a fresh random page table
+        one.k_rag = pr.k_rag[
+            int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])
+        ].clone()
+        one.v_rag = pr.v_rag[
+            int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])
+        ].clone()
+        one = _repack(one)  # the request's keys in a fresh random page table
         out1, _ = run_decode(one)
         assert torch.equal(bits(out1), bits(out8[i : i + 1])), i
 
 
 def _repack(p: Problem) -> Problem:
     """Rebuild the paged pool of ``p`` from its ragged keys (after the ragged keys were replaced)."""
-    fresh = Problem(p.q_lens, p.kv_lens, p.Hq, p.Hkv, p.D, p.page, seed=int(torch.randint(0, 1 << 30, (1,)).item()))
+    fresh = Problem(
+        p.q_lens,
+        p.kv_lens,
+        p.Hq,
+        p.Hkv,
+        p.D,
+        p.page,
+        seed=int(torch.randint(0, 1 << 30, (1,)).item()),
+    )
     fresh.q, fresh.k_rag, fresh.v_rag = p.q, p.k_rag, p.v_rag
     # rewrite the pool's live pages from the new ragged keys
     k_pool, v_pool = fresh.k_nhd.clone(), fresh.v_nhd.clone()
@@ -299,15 +452,64 @@ def test_sm_count_and_grid_do_not_change_bits():
     ref = bits(run_paged_prefill(pr))
     cfg = engine.default_config(D=128)
     for sm in (1, 8, 148, 1000):
-        planned = engine.plan_attention(pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, 128, 16, -1, cfg, None, pr.device, sm_count=sm)
-        out = engine.run_attention(planned, pr.q, pr.k_nhd, pr.v_nhd, pr.kv_indptr, pr.kv_indices, 1.0 / math.sqrt(128), -1, "NHD", None, cfg)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            sm_count=sm,
+        )
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
         assert torch.equal(bits(out), ref), sm
     from dataclasses import replace
 
     for grid in (1, 3, 64):
         c = replace(cfg, grid=grid)
-        planned = engine.plan_attention(pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, 128, 16, -1, c, None, pr.device)
-        out = engine.run_attention(planned, pr.q, pr.k_nhd, pr.v_nhd, pr.kv_indptr, pr.kv_indices, 1.0 / math.sqrt(128), -1, "NHD", None, c)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            c,
+            None,
+            pr.device,
+        )
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            c,
+        )
         assert torch.equal(bits(out), ref), grid
 
 
@@ -320,8 +522,32 @@ def test_config_agreement():
     pr = Problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, 128, 16, seed=8)
     ref = bits(run_paged_prefill(pr))
     for cfg in engine.all_valid_configs(128)[::7]:
-        planned = engine.plan_attention(pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, 128, 16, -1, cfg, None, pr.device)
-        out = engine.run_attention(planned, pr.q, pr.k_nhd, pr.v_nhd, pr.kv_indptr, pr.kv_indices, 1.0 / math.sqrt(128), -1, "NHD", None, cfg)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+        )
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
         assert torch.equal(bits(out), ref), cfg
 
 
@@ -341,25 +567,98 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
     kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, causal=False, **kw)
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=False,
+            **kw,
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, causal=True, logits_soft_cap=30.0, **kw)
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            logits_soft_cap=30.0,
+            **kw,
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 192, 16, causal=True, **kw)
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            192,
+            16,
+            causal=True,
+            **kw,
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, causal=True, q_data_type=torch.float16, kv_data_type=torch.float16)
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, causal=True, pos_encoding_mode="ROPE_LLAMA", **kw)
-    w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, causal=True, **kw)
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            pos_encoding_mode="ROPE_LLAMA",
+            **kw,
+        )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        32,
+        8,
+        128,
+        16,
+        causal=True,
+        **kw,
+    )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         w.run(pr.q, pr.cache("NHD"), return_lse=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         w.run(pr.q, pr.cache("NHD"), k_scale=2.0)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="cute-dsl", batch_invariant=True)
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="cute-dsl", batch_invariant=True
+        )
     # a workspace too small for the split partials names the needed size instead of launching anything
     tiny = torch.empty(4096, dtype=torch.uint8, device=pr.device)
     big = Problem([1] * 4, [32768] * 4, 32, 8, 128, 16, seed=11)
-    wd = flashinfer.BatchDecodeWithPagedKVCacheWrapper(tiny, "NHD", batch_invariant=True)
+    wd = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        tiny, "NHD", batch_invariant=True
+    )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bytes"):
         wd.plan(big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **kw)

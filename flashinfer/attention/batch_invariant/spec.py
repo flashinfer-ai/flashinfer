@@ -20,6 +20,7 @@ Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` o
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
 the term depends on the batch, the page table or the configuration (R2, R3).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -36,15 +37,23 @@ from ...batch_invariant.fp_interface.term import Term, TermAlgebra
 
 # ----------------------------------------------------------------------------- the class constants
 
-TILE_KEYS = 128                 # T: keys per KV tile (the N extent of one QK^T MMA tile)
-MMA_K = 16                      # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
-MMA_OP = _GEMM_MMA_OP   # "mma_bf16_k16": the same opaque instruction family as the GEMM
-HEAD_DIMS = (64, 128, 256)     # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)); docs/attention_scoping.md sections 2, 8, 9)
+TILE_KEYS = 128  # T: keys per KV tile (the N extent of one QK^T MMA tile)
+MMA_K = 16  # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
+MMA_OP = _GEMM_MMA_OP  # "mma_bf16_k16": the same opaque instruction family as the GEMM
+HEAD_DIMS = (
+    64,
+    128,
+    256,
+)  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)); docs/attention_scoping.md sections 2, 8, 9)
 NEG_INF = float("-inf")
 
 
-CHUNK_LEN = 512                 # C: keys per chunk (4 tiles) -- the class constant since 2026-10-28 (C = 1024 before: a different class)
-CHUNK_LEN_OF = {64: CHUNK_LEN, 128: CHUNK_LEN, 256: CHUNK_LEN}   # C(D): the chunk length per head dim (a class parameter per D; all 512 as of 2026-10-28)
+CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- the class constant since 2026-10-28 (C = 1024 before: a different class)
+CHUNK_LEN_OF = {
+    64: CHUNK_LEN,
+    128: CHUNK_LEN,
+    256: CHUNK_LEN,
+}  # C(D): the chunk length per head dim (a class parameter per D; all 512 as of 2026-10-28)
 
 
 def chunk_len(D: int, L: Optional[int] = None) -> int:
@@ -80,6 +89,7 @@ def scale_log2(sm_scale: float) -> float:
 
 # ----------------------------------------------------------------------------- the row and its tiles
 
+
 @dataclass(frozen=True)
 class RowSpec:
     """One logical row: query position ``p`` (0-based, absolute in the KV sequence), head ``h``, and
@@ -88,7 +98,7 @@ class RowSpec:
     p: int
     h: int = 0
     window_left: int = -1
-    row: int = 0            # the row's identity in the leaf terms (query token / head index)
+    row: int = 0  # the row's identity in the leaf terms (query token / head index)
 
     @property
     def L(self) -> int:
@@ -110,30 +120,50 @@ def visible_keys(row: RowSpec, t: int, T: int = TILE_KEYS) -> List[int]:
 
 def present_chunks(row: RowSpec, D: int) -> List[int]:
     C = chunk_len(D, row.L)
-    return list(range(row.lo // C, -(-row.L // C))) if row.L > row.lo else []
+    return list(range(row.lo // C, -(-row.L // C))) if row.lo < row.L else []
 
 
 # ----------------------------------------------------------------------------- the engine reductions
 
+
 def rowmax_reduction(T: int, leaf: Callable[[Any, int], Any]) -> Reduction:
     """``fmax`` over the keys of one tile. ``leaf(fp, k)`` returns the score term/value of key
     ``k`` (0 .. T-1 inside the tile) or ``None`` when the key is masked."""
-    key = Digit("key", T, "pairwise", combine=lambda fp, a, b: fp.fmaxc(a, b),
-                identity_note="fmax(v, -inf) == v for every non-NaN v: -inf is a global identity of the join "
-                              "(max.f32 is the join of the total order -inf < .. < -0 < +0 < .. < inf on sm_107)")
-    return Reduction(f"attn.rowmax[T={T}]", (key,), lambda fp, idx: leaf(fp, idx["key"]))
+    key = Digit(
+        "key",
+        T,
+        "pairwise",
+        combine=lambda fp, a, b: fp.fmaxc(a, b),
+        identity_note="fmax(v, -inf) == v for every non-NaN v: -inf is a global identity of the join "
+        "(max.f32 is the join of the total order -inf < .. < -0 < +0 < .. < inf on sm_107)",
+    )
+    return Reduction(
+        f"attn.rowmax[T={T}]", (key,), lambda fp, idx: leaf(fp, idx["key"])
+    )
 
 
 def rowsum_reduction(T: int, leaf: Callable[[Any, int], Any]) -> Reduction:
     """``add`` over the keys of one tile. ``leaf(fp, k)`` returns the probability term/value
     ``p_k`` or ``None`` when the key is masked."""
-    key = Digit("key", T, "pairwise", combine=lambda fp, a, b: fp.add(a, b),
-                identity_note="add(v, +0) == v for v != -0; every leaf is ex2(.) >= +0 and no partial sum is -0")
-    return Reduction(f"attn.rowsum[T={T}]", (key,), lambda fp, idx: leaf(fp, idx["key"]))
+    key = Digit(
+        "key",
+        T,
+        "pairwise",
+        combine=lambda fp, a, b: fp.add(a, b),
+        identity_note="add(v, +0) == v for v != -0; every leaf is ex2(.) >= +0 and no partial sum is -0",
+    )
+    return Reduction(
+        f"attn.rowsum[T={T}]", (key,), lambda fp, idx: leaf(fp, idx["key"])
+    )
 
 
-def reduce_keys(red: Reduction, fp, placement: Optional[canon.Placement] = None, peers: Optional[canon.Peers] = None,
-                loader: Optional[Callable[[tuple], Any]] = None):
+def reduce_keys(
+    red: Reduction,
+    fp,
+    placement: Optional[canon.Placement] = None,
+    peers: Optional[canon.Peers] = None,
+    loader: Optional[Callable[[tuple], Any]] = None,
+):
     """The tile's key reduction: the canonical term when no placement is given (spec, CPU model),
     or the engine's plan executed with the caller's loader and peers (the kernel)."""
     if placement is None:
@@ -145,6 +175,7 @@ def reduce_keys(red: Reduction, fp, placement: Optional[canon.Placement] = None,
 
 
 # ----------------------------------------------------------------------------- the arithmetic (written once)
+
 
 @dataclass(frozen=True)
 class State:
@@ -178,17 +209,32 @@ def prob_term(fp, s, m_new, c, nc):
     return fp.ex2(fp.fma(s, c, fp.mul(m_new, nc)))
 
 
-def tile_stats(fp, m, l, scores: Sequence[Any], c, nc, placement=None, peers=None, loader_max=None, loader_sum=None):
+def tile_stats(
+    fp,
+    m,
+    l,
+    scores: Sequence[Any],
+    c,
+    nc,
+    placement=None,
+    peers=None,
+    loader_max=None,
+    loader_sum=None,
+):
     """The statistics part of one tile step for one row: ``scores[k]`` is the score of key ``k``
     of the tile or ``None`` when masked (at least one present). Returns
     ``(m_new, alpha, probs, l_new)`` with ``probs[k] = +0`` for masked keys."""
     T = len(scores)
-    m_t = reduce_keys(rowmax_reduction(T, lambda fp_, k: scores[k]), fp, placement, peers, loader_max)
+    m_t = reduce_keys(
+        rowmax_reduction(T, lambda fp_, k: scores[k]), fp, placement, peers, loader_max
+    )
     m_new = fp.fmaxc(m, m_t)
     alpha = alpha_term(fp, m, m_new, c, nc)
     nms = fp.mul(m_new, nc)
     probs = [None if s is None else fp.ex2(fp.fma(s, c, nms)) for s in scores]
-    r_t = reduce_keys(rowsum_reduction(T, lambda fp_, k: probs[k]), fp, placement, peers, loader_sum)
+    r_t = reduce_keys(
+        rowsum_reduction(T, lambda fp_, k: probs[k]), fp, placement, peers, loader_sum
+    )
     l_new = fp.fma(l, alpha, r_t)
     return m_new, alpha, [fp.const(0.0) if q is None else q for q in probs], l_new
 
@@ -198,7 +244,7 @@ def pv_fold(fp, o_scaled, probs_bf16: Sequence[Any], v_slice: Callable[[int], An
     the bf16 P slice of keys ``16j .. 16j+15`` (masked keys carry ``+0``) and ``v_slice(j)``."""
     acc = o_scaled
     for j in range(len(probs_bf16) // MMA_K):
-        p_slice = fp.op("p_slice", *probs_bf16[j * MMA_K:(j + 1) * MMA_K])
+        p_slice = fp.op("p_slice", *probs_bf16[j * MMA_K : (j + 1) * MMA_K])
         acc = fp.op(MMA_OP, acc, fp.op("pv_kslice", p_slice, v_slice(j)))
     return acc
 
@@ -207,10 +253,18 @@ def tile_step(fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int) -> Sta
     """One tile of the per-chunk fold (the ``tile`` digit's step). ``tile`` = ``{"t": abs tile index,
     "keys": visible absolute keys, "row": RowSpec}``."""
     row, t, keys, T = tile["row"], tile["t"], tile["keys"], tile["T"]
-    scores = [score_term(fp, row, t * T + k, D) if (t * T + k) in keys else None for k in range(T)]
+    scores = [
+        score_term(fp, row, t * T + k, D) if (t * T + k) in keys else None
+        for k in range(T)
+    ]
     m_new, alpha, probs, l_new = tile_stats(fp, st.m, st.l, scores, c, nc)
     probs_bf16 = [fp.cvt_out(q, "bf16") for q in probs]
-    o_new = pv_fold(fp, fp.mul(st.o, alpha), probs_bf16, lambda j: fp.op("v_slice", t * (T // MMA_K) + j, d))
+    o_new = pv_fold(
+        fp,
+        fp.mul(st.o, alpha),
+        probs_bf16,
+        lambda j: fp.op("v_slice", t * (T // MMA_K) + j, d),
+    )
     return State(m_new, l_new, o_new)
 
 
@@ -232,7 +286,10 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
 
 # ----------------------------------------------------------------------------- the reduction object
 
-def attention_reduction(row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS, C: Optional[int] = None) -> Reduction:
+
+def attention_reduction(
+    row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS, C: Optional[int] = None
+) -> Reduction:
     """The per-row dataflow as an engine ``Reduction`` with two ``fold`` digits: ``tile`` (radix
     ``C/T``, the online softmax inside a chunk) and ``chunk`` (radix = chunks of the prefix, the
     merge). Leaves are tile descriptors; absent tiles (no visible key) are ``None`` and dropped, an
@@ -247,11 +304,23 @@ def attention_reduction(row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS,
         keys = visible_keys(row, t, T)
         return {"t": t, "keys": keys, "row": row, "T": T} if keys else None
 
-    tile = Digit("tile", C // T, "fold", init=init_state, step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d),
-                 identity_note="absent tiles are dropped; a kernel's null step (P row = 0, alpha = 1) is exact on (m, l) "
-                               "and exact on O up to the sign of an exact zero, which the epilogue's add(+0) erases")
-    chunk = Digit("chunk", n_chunks, "fold", init=init_state, step=lambda fp, a, b: merge(fp, a, b, c, nc),
-                  identity_note="absent chunks are dropped (never merged)")
+    tile = Digit(
+        "tile",
+        C // T,
+        "fold",
+        init=init_state,
+        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d),
+        identity_note="absent tiles are dropped; a kernel's null step (P row = 0, alpha = 1) is exact on (m, l) "
+        "and exact on O up to the sign of an exact zero, which the epilogue's add(+0) erases",
+    )
+    chunk = Digit(
+        "chunk",
+        n_chunks,
+        "fold",
+        init=init_state,
+        step=lambda fp, a, b: merge(fp, a, b, c, nc),
+        identity_note="absent chunks are dropped (never merged)",
+    )
     return Reduction(f"attn.bf16.d{D}[T={T},C={C}]", (tile, chunk), leaf)
 
 
@@ -273,10 +342,18 @@ def verify_plan(red: Reduction, fp) -> Any:
 
 # ----------------------------------------------------------------------------- symbolic spec + fingerprint
 
+
 class AttentionSpec:
     """Symbolic view: ``output(row, d)`` is the term of one output element."""
 
-    def __init__(self, D: int = 128, alg: Optional[TermAlgebra] = None, T: int = TILE_KEYS, C: Optional[int] = None, out_fmt: str = "bf16"):
+    def __init__(
+        self,
+        D: int = 128,
+        alg: Optional[TermAlgebra] = None,
+        T: int = TILE_KEYS,
+        C: Optional[int] = None,
+        out_fmt: str = "bf16",
+    ):
         self.D, self.T, self.out_fmt = D, T, out_fmt
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
@@ -313,6 +390,16 @@ def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
 
         spec = AttentionSpec(D)
         row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
-        parts = [f"D={D}", f"T={spec.T}", f"C={spec.C}", f"win={window_left}", fingerprint(spec.output(row, 0)), fingerprint(spec.output(row, 1))]
-        _FINGERPRINTS[key] = f"attn-bf16-d{D}-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        parts = [
+            f"D={D}",
+            f"T={spec.T}",
+            f"C={spec.C}",
+            f"win={window_left}",
+            fingerprint(spec.output(row, 0)),
+            fingerprint(spec.output(row, 1)),
+        ]
+        _FINGERPRINTS[key] = (
+            f"attn-bf16-d{D}-"
+            + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        )
     return _FINGERPRINTS[key]
