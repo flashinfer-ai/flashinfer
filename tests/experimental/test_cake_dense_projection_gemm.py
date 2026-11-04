@@ -3277,11 +3277,13 @@ def test_k2_values_feed_every_registered_router_program():
             8,
             1,
         ]
+    # the stream-K router programs (the partial sum program has its own plan: test_partials_sum_serves_...)
     names = [
         n
         for n, r in cake_jit.MODULES.items()
         if r["template"].startswith("router_")
         and not r["template"].startswith((simt_prefix, dgrad_prefix))
+        and r["template"] != cake_backend.PARTIALS_SUM_TEMPLATE
     ]
     for name in names:
         plan_args = cake_jit.arg_plan_of(cake_jit.MODULES[name])
@@ -3475,13 +3477,20 @@ def test_splitk_binding_is_the_deterministic_launch(monkeypatch, case, pdl):
     the lists the deterministic package's convenience path resolves (``_k2_values`` / ``_split_values`` in its
     argument plans) -- the stack, the partials ``[splits, rows, cols]`` of several splits or ``out`` itself (its flat
     alias when padded) for one split -- carved from this package's arena, and carved again after the arena grows; the
-    PDL flag is bound into both lists."""
+    PDL flag is bound into both lists.  Several splits bind this package's partial sum: the partials, the call's
+    ``out`` (its flat alias when padded), the split count, the rows, columns and row stride of ``out``, the PDL flag and
+    one thread per four columns of a row."""
     monkeypatch.setattr(cake_backend.tvm_ffi, "from_dlpack", lambda t, **_: t)
     arch, T, H = "sm_103a", 64, 6144
     monkeypatch.setattr(det_backend, "require_arch", lambda device: arch)
     monkeypatch.setattr(
         det_backend,
         "load_cake_dense_projection_det_gemm_module",
+        lambda name, arch: _FakeModule(),
+    )
+    monkeypatch.setattr(
+        cake_backend,
+        "load_cake_dense_projection_gemm_module",
         lambda name, arch: _FakeModule(),
     )
     monkeypatch.setattr(cake_backend, "_ATOMIC_ARENAS", {})
@@ -3524,8 +3533,34 @@ def test_splitk_binding_is_the_deterministic_launch(monkeypatch, case, pdl):
             assert _geometry(bound.workspace) == _geometry(workspace)
             out32, ldo, out_l = workspace, dims[1], dims[0] * dims[1]
             call_out = None
+            # the partial sum of the partials into ``out`` (its flat alias when padded)
+            assert entry.sum_entry is not None and bound.sum_template is not None
+            sum_out = det_backend._k2_out32(out)
+            assert bound.out_contiguous == (not case.endswith("padded_out"))
+            sum_module = cake_jit.select_module(
+                arch, cake_backend.PARTIALS_SUM_TEMPLATE
+            )
+            sum_grid = (-(-dims[0] * (-(-dims[1] // 4)) // 256), 1, 1)
+            _same_arguments(
+                bound.sum_arguments((a_view, sum_out, None, None)),
+                cake_backend._order_atomic_arguments(
+                    sum_module,
+                    cake_jit.arg_plan_of(cake_jit.MODULES[sum_module]),
+                    dict(
+                        ws=workspace,
+                        out=sum_out,
+                        splits=plan.splits,
+                        rows=dims[0],
+                        cols=dims[1],
+                        ldo=int(out.stride(0)),
+                        enable_pdl=pdl,
+                    ),
+                    sum_grid,
+                ),
+            )
         else:
             assert bound.partials_shape is None and bound.workspace is None
+            assert entry.sum_entry is None and bound.sum_template is None
             out32 = det_backend._k2_out32(out)
             assert bound.out_contiguous == (not case.endswith("padded_out"))
             ldo, out_l, call_out = int(out.stride(0)), 0, out32
@@ -3561,6 +3596,45 @@ def test_splitk_binding_is_the_deterministic_launch(monkeypatch, case, pdl):
                     det_backend._split_grid(n),
                 ),
             )
+
+
+def test_partials_sum_serves_two_to_eight_splits():
+    """This package's partial sum serves the deterministic K2 program's partials ``[splits, rows, cols]`` with two to
+    eight splits (the forward's four and the weight gradient's six among them) and two outputs or more, into an FP32
+    ``out [rows, cols]`` with unit inner stride and a row stride of ``cols`` or more; every other launch keeps
+    ``torch.sum``.  Its program is registered on every architecture of the package, one program for all."""
+    assert list(cake_backend.PARTIALS_SUM_SPLITS) == [2, 3, 4, 5, 6, 7, 8]
+    assert cake_backend.PARTIALS_SUM_TEMPLATE == "router_partials_sum"
+    names = {
+        cake_jit.select_module(arch, cake_backend.PARTIALS_SUM_TEMPLATE)
+        for arch in cake_jit.ARCHES
+    }
+    assert len(names) == 1
+    record = cake_jit.MODULES[names.pop()]
+    assert record["arches"] == list(cake_jit.ARCHES)
+    assert [name for _, name in cake_jit.arg_plan_of(record)] == [
+        "ws",
+        "out",
+        "splits",
+        "rows",
+        "cols",
+        "ldo",
+        "enable_pdl",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ]
+    serves = cake_backend._partials_sum_serves
+    out = torch.empty(64, 256)
+    for splits in range(1, 11):
+        assert serves((splits, 64, 256), out) == (2 <= splits <= 8), splits
+    assert serves((6, 256, 6144), torch.empty(256, 6144))
+    assert serves((4, 1, 8), torch.empty(1, 8))
+    assert serves((4, 64, 256), torch.empty(64, 320)[:, :256])  # padded rows
+    assert not serves((4, 1, 1), torch.empty(1, 1))  # one output: a full reduction
+    assert not serves((4, 64, 256), torch.empty(256, 64).t())  # no unit inner stride
+    assert not serves((4, 64, 256), torch.empty(64, 128))  # another shape
+    assert not serves((4, 64, 256), torch.empty(64, 256, dtype=torch.float64))
 
 
 def test_k1_view_recipes():
@@ -4748,10 +4822,13 @@ def test_router_entry_points_launch_their_paths_launches(monkeypatch, case):
         assert call() is out
     recorders = (entry_fn, fill, split)
     want = [list(r.calls) for r in recorders]
-    assert len(want[0]) == (1 if case.endswith("torch_chain") else 2)
+    # the deterministic program's split-K partials (4 forward, 6 weight gradient) are summed in the chain
+    sums = not atomic and op != "dgrad"
+    assert len(want[0]) == (1 if case.endswith("torch_chain") else 2 + sums)
     assert len(want[2]) == (1 if case.endswith("torch_chain") else 0)
     inner = cake_backend._K2_ATOMIC_CACHE if atomic else cake_backend._K2_SPLITK_CACHE
     ((inner_key, launch),) = [(k, e) for k, e in inner.items() if e.plan is not None]
+    assert atomic or (launch.sum_entry is not None) == sums
     for again in range(3):
         for r in recorders:
             r.calls.clear()
@@ -5162,9 +5239,10 @@ def test_registry_is_disjoint_from_the_deterministic_package():
 def test_registered_templates_are_the_ones_the_planners_name():
     """Every template this checkout registers is one the host plans: the K1 programs of each tile width
     (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t`` and the row-major ``dense_proj_gemm_atomic_nn_n192[_f32]``),
-    the two router classes, the weight gradient's head/tail programs (of the architecture and of its SM counts) and
-    the SIMT programs the windows of the weight gradient and the input gradient name (in :data:`ROUTER_RULES` and
-    the architecture's tables of :data:`ROUTER_RULES_BY_SM`); each SIMT program a window names is registered."""
+    the two router classes, the weight gradient's head/tail programs (of the architecture and of its SM counts), the
+    SIMT programs the windows of the weight gradient and the input gradient name (in :data:`ROUTER_RULES` and the
+    architecture's tables of :data:`ROUTER_RULES_BY_SM`) and the partial sum of the deterministic router program's
+    split-K partials; each SIMT program a window names is registered."""
     wanted = {
         cake_backend.atomic_k1_template(bn, f32)
         for bn in cake_backend.K1_BLOCK_N_CHOICES
@@ -5173,6 +5251,7 @@ def test_registered_templates_are_the_ones_the_planners_name():
         "router_fp32_gemm_atomic_kk",
         "router_fp32_gemm_atomic_nn_t",
         "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
+        cake_backend.PARTIALS_SUM_TEMPLATE,
     }
     by_sm = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES_BY_SM
     rule_tables = (
@@ -7243,6 +7322,10 @@ def test_gpu_router_deterministic_program_through_the_binding():
     assert all(e.k2 is not None for e in entries)
     assert any(e.k2.partials_shape is not None for e in entries)
     assert any(e.k2.partials_shape is None for e in entries)
+    # several splits: this package's partial sum reduces the partials (the forward's four, the weight gradient's six)
+    assert all(
+        (e.sum_entry is not None) == (e.k2.partials_shape is not None) for e in entries
+    )
     assert any(e.split_entry is None for e in entries)  # the padded split source
     versions = {id(e): e.k2.version for e in entries}
     check(8000, SEED + 71)  # a larger row: the arena grows
@@ -7262,6 +7345,171 @@ def test_gpu_router_deterministic_program_through_the_binding():
         cake_backend.router_dgrad(G, W, out)
     with pytest.raises(ValueError, match=re.escape(str(refused.value))):
         cake_backend.router_dgrad(G, W, out, deterministic=False)
+
+
+def _special_partials(splits, rows, cols, seed):
+    """FP32 partials ``[splits, rows, cols]`` (on the CPU) with signed zeros, NaN, infinities, subnormals, values whose
+    sums overflow, whole columns of signed zeros and exact cancellations next to scaled normal values."""
+    g = torch.Generator().manual_seed(seed)
+    n = splits * rows * cols
+    base = torch.randn(n, generator=g) * torch.pow(
+        10.0, torch.randint(-3, 4, (n,), generator=g).float()
+    )
+    kind = torch.randint(0, 20, (n,), generator=g)
+    v = base.clone()
+    v[kind == 0] = 0.0
+    v[kind == 1] = -0.0
+    v[kind == 2] = float("nan")
+    v[kind == 3] = float("inf")
+    v[kind == 4] = float("-inf")
+    v[kind == 5] = 1e-40 * torch.sign(base[kind == 5])
+    v[kind == 6] = 3.0e38 * torch.sign(base[kind == 6])
+    v = v.view(splits, rows * cols)
+    picked = torch.randint(0, rows * cols, (max(3, rows * cols // 16),), generator=g)
+    third = len(picked) // 3
+    v[:, picked[:third]] = -0.0
+    v[:, picked[third : 2 * third]] = torch.where(
+        torch.rand(splits, 2 * third - third, generator=g) < 0.5, 0.0, -0.0
+    )
+    cancel = picked[2 * third :]
+    v[1, cancel] = -v[0, cancel]
+    v[2:, cancel] = -0.0
+    return v.view(splits, rows, cols)
+
+
+def _partials_sum_in_written_order(partials):
+    """The partial sum's written order: four accumulators from ``+0``, partial ``s`` into accumulator ``s % 4`` in
+    ascending ``s``, then ``((a0 + a1) + a2) + a3`` (one FP32 add per step)."""
+    acc = [torch.zeros_like(partials[0]) for _ in range(4)]
+    for s in range(partials.shape[0]):
+        acc[s % 4] = acc[s % 4] + partials[s]
+    return ((acc[0] + acc[1]) + acc[2]) + acc[3]
+
+
+def _launch_partials_sum(partials, out, pdl):
+    """Launch this package's partial sum of ``partials`` into ``out`` on the current stream, bound as the binding of
+    the deterministic K2 program binds it (``out`` through its flat alias when padded)."""
+    index = out.get_device()
+    arch = det_backend.arch_for(out.device)
+    entry, template = cake_backend._partials_sum_binding(
+        arch, tuple(partials.shape), out, pdl
+    )
+    out_arg = out if out.is_contiguous() else det_backend.flat_alias(out)
+    args = [
+        partials
+        if a is cake_backend._K2_PARTIALS_ARG
+        else out_arg
+        if a is cake_backend._K2_CALL_ARGS[1]
+        else a
+        for a in template
+    ]
+    with det_backend._ffi_stream_context(index):
+        entry(*args)
+
+
+def test_gpu_partials_sum_is_torch_sum_and_the_written_order():
+    """This package's partial sum gives the bits of ``torch.sum(partials, 0, out=out)`` -- the deterministic
+    package's reduction -- and of its written order, on every split count it serves (two to eight), with signed
+    zeros, NaN, infinities, subnormals, overflowing sums and exact cancellations: every 32-bit word of ``out``
+    compared.  Rows of a column count that is no multiple of four, partials and ``out`` at an address that is no
+    multiple of 16 bytes (the scalar loads and stores) and a padded ``out`` (row stride above the columns, the padding
+    untouched) included, with and without PDL."""
+    device, arch = _atomic_device_or_skip()
+    _require_template(arch, cake_backend.PARTIALS_SUM_TEMPLATE)
+    shapes = ((1, 8), (3, 37), (64, 256), (1000, 32), (129, 1024))
+    checked = 0
+    for splits in cake_backend.PARTIALS_SUM_SPLITS:
+        for rows, cols in shapes:
+            host = _special_partials(splits, rows, cols, SEED + 100 * splits + cols)
+            for ws_offset, out_kind, pdl in (
+                (0, "dense", 0),
+                (1, "dense", 1),
+                (0, "padded", 1),
+                (1, "offset", 0),
+            ):
+                n = splits * rows * cols
+                ws_buf = torch.empty(n + 8, device=device)
+                partials = ws_buf[ws_offset : ws_offset + n].view(splits, rows, cols)
+                partials.copy_(host.to(device))
+                if out_kind == "padded":
+                    storage = torch.full((rows, cols + 4), 7.0, device=device)
+                    out = storage[:, :cols]
+                elif out_kind == "offset":
+                    storage = torch.full((rows * cols + 4,), 7.0, device=device)
+                    out = storage[1 : 1 + rows * cols].view(rows, cols)
+                else:
+                    storage = None
+                    out = torch.empty(rows, cols, device=device)
+                assert cake_backend._partials_sum_serves(partials.shape, out)
+                want = torch.full((rows, cols), float("nan"), device=device)
+                torch.sum(partials, 0, out=want)
+                written = _partials_sum_in_written_order(partials)
+                out.fill_(float("nan"))
+                _launch_partials_sum(partials, out, pdl)
+                torch.cuda.synchronize()
+                case = (splits, rows, cols, ws_offset, out_kind, pdl)
+                bits = out.view(torch.int32)
+                assert torch.equal(bits, want.view(torch.int32)), case
+                assert torch.equal(bits, written.view(torch.int32)), case
+                if out_kind == "padded":
+                    assert bool((storage[:, cols:] == 7.0).all()), case
+                elif out_kind == "offset":
+                    assert float(storage[0]) == 7.0 and float(storage[-1]) == 7.0, case
+                checked += 1
+    print(
+        f"PARTIALS_SUM_BITS {arch}: {checked} launches equal torch.sum and the written order"
+    )
+
+
+def test_gpu_router_partials_sum_eager_graph_and_recompute():
+    """The deterministic router program through this package's binding with its partial sum (a row without a router
+    verdict: the forward's four splits, the weight gradient's six) gives the deterministic package's bits -- its
+    ``torch.sum`` -- eagerly, again when recomputed (a checkpointed forward runs it twice) and from a CUDA graph that
+    captured the calls, replayed several times."""
+    device, arch = _atomic_device_or_skip()
+    _require_template(arch, cake_backend.PARTIALS_SUM_TEMPLATE)
+    hidden, T = 6144, 4096  # no router verdict at 4096 tokens on any architecture
+    X, W, G = _router_inputs(T, device, SEED + 91, K=hidden)
+    cake_backend.clear_convenience_caches()
+    want_fwd = det_backend.router_det_forward(X, W, enable_pdl=False)
+    want_wgrad = det_backend.router_det_wgrad(G, X, enable_pdl=False)
+    Y = torch.empty(T, 256, device=device)
+    dW = torch.empty(256, hidden, device=device)
+    stream = torch.cuda.Stream(device)
+
+    def step():
+        cake_backend.router_forward(X, W, Y, deterministic=False)
+        cake_backend.router_wgrad(G, X, dW, deterministic=False)
+
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        step()
+    stream.synchronize()
+    entries = [
+        e
+        for key, e in cake_backend._K2_SPLITK_CACHE.items()
+        if key[1] == stream.cuda_stream
+    ]
+    assert sorted(e.plan.splits for e in entries) == [4, 6]
+    assert all(e.sum_entry is not None for e in entries)
+    assert not cake_backend._K2_ATOMIC_CACHE
+    assert torch.equal(Y, want_fwd) and torch.equal(dW, want_wgrad)
+    eager = (Y.clone(), dW.clone())
+    for t in (Y, dW):
+        t.fill_(float("nan"))
+    with torch.cuda.stream(stream):
+        step()  # the recompute
+    stream.synchronize()
+    assert torch.equal(Y, eager[0]) and torch.equal(dW, eager[1])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step()
+    for _ in range(3):
+        for t in (Y, dW):
+            t.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(Y, eager[0]) and torch.equal(dW, eager[1])
 
 
 def test_gpu_router_binding_pdl_waits_for_an_early_producer():
