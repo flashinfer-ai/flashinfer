@@ -156,7 +156,11 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # run on a caller-owned ``workspace_buffer``, which others may write between
 # runs -- except where the call always takes the static fast path
 # (``ticket_static_path``: the scan never touches the word) or runs a program of
-# ``static_scan_kinds``.
+# ``static_scan_kinds``.  A scan program whose registry record lists the
+# architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
+# instead and never reads this tail (the eager entry hands it the tail's first
+# 16 bytes); every plan still carries the tail, so the size does not depend on
+# the program.
 TICKET_TAIL_BYTES = 8 * (16 + 1024)
 
 

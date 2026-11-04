@@ -131,7 +131,11 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 # scalars are ``parameter``; ``grid_x/y/z`` are ``grid``; ``zero_region`` (kind
 # ``zero``, scan only) is the byte range the scan binding zeroes on the launch
 # stream right before its launch: the caller-owned ticket tail, else empty.
-ABI_CONTRACT = "dsa_indexer_v3"
+# ``TicketWord`` (scan only, right before ``zero_region``) is the 16-byte block
+# a scan program draws its work units from where its registry record lists the
+# architecture in ``ticket_arg_arches``; every other scan program takes it and
+# never reads it.
+ABI_CONTRACT = "dsa_indexer_v4"
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 CONTRACT_TENSORS = (
     "Q",  # q viewed as [T * 32, 128] (TMA source)
@@ -145,6 +149,7 @@ CONTRACT_TENSORS = (
     "Cand",  # the workspace viewed as packed int64 candidate entries (buffers, then the split staging)
     "Staging",  # the split staging [T, n_split, top_k] behind the candidate buffers (merge stage only)
     "zero_region",  # the scan's caller-owned ticket tail, zeroed by its binding before the launch, or an empty view
+    "TicketWord",  # the scan's 16-byte ticket block (uint32 view): its own, or a zeroed placeholder it never reads
 )
 SCAN_SCALARS = (
     "num_segments",
@@ -248,6 +253,14 @@ def ticket_tail_skips(arch: str) -> Optional[frozenset]:
     if arch not in TICKET_TAIL_ARCHES:
         return None
     return frozenset(policy_for(arch).static_scan_kinds)
+
+
+@functools.cache
+def reads_ticket_word(program: str, arch: str) -> bool:
+    """Whether the scan ``program`` draws its work units on ``arch`` from its ``TicketWord`` argument (the registry
+    record's ``ticket_arg_arches``, which the exporter writes from the program's source build) instead of the
+    workspace's ticket tail."""
+    return arch in PROGRAMS[program].get("ticket_arg_arches", ())
 
 
 def program_for(arch: str, key: str) -> str:
@@ -714,6 +727,11 @@ def bind_program(
 
 _FFI_DEVICES: dict[int, Any] = {}
 _EMPTY_REGIONS: dict[int, Any] = {}
+_TICKET_PLACEHOLDERS: dict[int, Any] = {}
+# the ticket block a ``TicketWord`` argument points at: the ticket word (the low u32 of its first 8 bytes) and padding
+TICKET_BLOCK_BYTES = 16
+# the bytes a binding's ``zero_region`` zeroes to restore the ticket word of a block
+TICKET_WORD_ZERO_BYTES = 8
 
 
 def _empty_region(index: int) -> Any:
@@ -725,6 +743,20 @@ def _empty_region(index: int) -> Any:
             torch.empty(0, dtype=torch.uint8, device=f"cuda:{index}")
         )
     return region
+
+
+def _ticket_placeholder(index: int) -> Any:
+    """The ``TicketWord`` of a scan launch that never reads it (a program drawing from the workspace's tail, a
+    ``static_scan_kinds`` program, a static call): one zeroed 16-byte block per device, made on first use and never
+    written (a program that reads its ``TicketWord`` never gets it)."""
+    block = _TICKET_PLACEHOLDERS.get(index)
+    if block is None:
+        block = _TICKET_PLACEHOLDERS[index] = tvm_ffi.from_dlpack(
+            torch.zeros(
+                TICKET_BLOCK_BYTES, dtype=torch.uint8, device=f"cuda:{index}"
+            ).view(torch.uint32)
+        )
+    return block
 
 
 def _ffi_stream_context(index: int):
@@ -793,12 +825,24 @@ class DSAIndexerDetRunner:
     # left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes it
     # first (static or not).  The view (``ticket_tail``) is made on first use: a static call
     # that never zeroes its tail makes none on the launch path.
+    # A scan program that reads its ``TicketWord`` argument on this architecture (``reads_ticket_word``) has no
+    # ticket tail: a drawing call gets a 16-byte block of the runner's own (``ticket_block``), which no other work
+    # writes, zeroed once here; every completed scan launch leaves it 0, so neither kind of workspace adds a memset
+    # to ``run()``.  After a run that raised while launching, the next ``run()`` launches the scan through a binding
+    # call whose ``zero_region`` is the block's ticket word (8 bytes), on the run's stream.  The eager entry draws from
+    # the first 16 bytes of the workspace's tail instead, which its scan binding zeroes (8 bytes) right before the
+    # launch.  Any other scan launch (static, or a program drawing from the tail) gets the device's zeroed
+    # placeholder, which it never reads.
     # byte offset of the tail in the workspace; -1: no tail
     _tail_at: int = field(default=-1, repr=False)
     _tail_view: Optional[torch.Tensor] = field(default=None, repr=False)
     _tail_shared: bool = field(default=False, repr=False)
     _tail_static: bool = field(default=False, repr=False)
     _tail_dirty: bool = field(default=False, repr=False)
+    # the bytes a TicketWord-reading drawing scan draws from (uint8); None: the call draws from no ticket block
+    _ticket_block: Optional[torch.Tensor] = field(default=None, repr=False)
+    # the scan launch that zeroes the ticket block's word first (a prepared TicketWord runner after a failed run)
+    _ticket_restore: Optional[_Launch] = field(default=None, repr=False)
 
     @property
     def ticket_tail(self) -> Optional[torch.Tensor]:
@@ -809,6 +853,11 @@ class DSAIndexerDetRunner:
                 self._tail_at : self._tail_at + TICKET_TAIL_BYTES
             ]
         return self._tail_view
+
+    @property
+    def ticket_block(self) -> Optional[torch.Tensor]:
+        """The 16 bytes the scan draws its tickets from where its program reads ``TicketWord`` and the call draws."""
+        return self._ticket_block
 
     @property
     def indices(self) -> torch.Tensor:
@@ -832,16 +881,23 @@ class DSAIndexerDetRunner:
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         with _ffi_stream_context(self.device_index):
-            if self._tail_at >= 0 and self._tail_dirty:
+            launches = self.launches
+            if self._tail_dirty:
                 # a previous run raised while launching: restore the ticket word before the scan
-                # (a caller-owned tail is zeroed by the scan binding anyway)
-                self.ticket_tail.zero_()
+                if self._ticket_restore is not None:
+                    # the scan binding zeroes the block's word on this stream right before the scan launch
+                    launches = (self._ticket_restore, *launches[1:])
+                elif self._tail_at >= 0:
+                    # (a caller-owned tail is zeroed by the scan binding anyway)
+                    self.ticket_tail.zero_()
                 self._tail_dirty = False
             try:
-                for launch in self.launches:
+                for launch in launches:
                     launch()
             except BaseException:
-                self._tail_dirty = self._tail_at >= 0
+                self._tail_dirty = (
+                    self._tail_at >= 0 or self._ticket_restore is not None
+                )
                 raise
         return self.tensors["Indices"], self.tensors["Scores"]
 
@@ -865,7 +921,7 @@ def _padded_outputs(
     return indices, scores
 
 
-def prepare_dsa_indexer_det_topk(
+def _prepare_runner(
     q: torch.Tensor,
     k: torch.Tensor,
     w: torch.Tensor,
@@ -889,37 +945,11 @@ def prepare_dsa_indexer_det_topk(
     far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
+    one_shot: bool = False,
 ) -> DSAIndexerDetRunner:
-    """Validate one binding, decide its programs and prepare its launches.
-
-    Missing outputs and the workspace are allocated here (the only allocations
-    of the backend).  Pass ``workspace_buffer`` of at least
-    :func:`dsa_indexer_det_workspace_size` bytes for the call's geometry (same
-    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls.
-    A caller-owned buffer may be written by other runners or kernels between
-    two runs of the returned runner, so on the ticket architectures the runner
-    zeroes the buffer's ticket word before every run (one small memset on the
-    current stream, captured into a CUDA graph with the launches); the
-    backend-owned workspace is zeroed once, here.  ``indices`` / ``scores`` may
-    be caller-owned ``[T, top_k]`` int32 / float32 tensors.
-
-    The keyword-only knobs ``grid_ctas`` (persistent CTA count; default: the SM
-    count), ``candidate_multiplier`` (candidate buffer per query in multiples
-    of ``top_k``), ``check_period`` (key tiles between selection-trigger
-    checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
-    threshold; ``0`` disables sampling and sizes the candidate buffers by the
-    record's unsampled capacity values; the shift defaults to the record's
-    value for the call's ``top_k``, ``sample_shift_rule`` where the record sets
-    one), ``far_sample`` (``1``: the sampled first threshold of the
-    ascending-tile-order scan programs ranks the far sample tiles only,
-    leaving out the sample tile nearest the diagonal; ``0``: every sample
-    tile; the descending-order and wide programs ignore it) and
-    ``finalize_threads`` (an admissible registered finalize program) change
-    only the internal partition and scheduling of the work: results are
-    bitwise identical for every admissible value.  ``T == 0`` returns a runner
-    whose launches are empty; a call without keys (``Tkv == 0``) fills the
-    outputs with padding instead of launching.
-    """
+    """:func:`prepare_dsa_indexer_det_topk`; ``one_shot``: the runner runs once (the eager entry), so a scan program
+    that reads its ``TicketWord`` draws from the first bytes of the workspace's tail, which its scan binding zeroes,
+    instead of a block of its own."""
     if backend != "cake":
         raise ValueError("DSA indexer top-k supports backend='cake'")
     if softmax_scale is None:
@@ -988,16 +1018,22 @@ def prepare_dsa_indexer_det_topk(
     workspace_bytes = int(choice.workspace_bytes)
     # the ticket-tail decision (see the comment where the tail is passed) is host arithmetic only: it is made here,
     # before the call's first device operation, so an eager call does not hold the stream for it
-    tail_at, tail_static = -1, False
+    tail_at, tail_static, drawing = -1, False, False
     tail_skips = ticket_tail_skips(arch)
+    # the scan program draws from its TicketWord argument instead of the tail (registry ``ticket_arg_arches``)
+    reads_word = (
+        num_queries > 0 and num_keys > 0 and reads_ticket_word(programs["scan"], arch)
+    )
     if (
         num_queries > 0
         and num_keys > 0
         and tail_skips is not None
         and choice.physical_kind not in tail_skips
     ):
-        tail_at = workspace_bytes - TICKET_TAIL_BYTES
         tail_static = ticket_static_path(choice)
+        drawing = not tail_static
+        if not reads_word:
+            tail_at = workspace_bytes - TICKET_TAIL_BYTES
     caller_owned_workspace = workspace_buffer is not None
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
@@ -1066,12 +1102,42 @@ def prepare_dsa_indexer_det_topk(
     zero_region = (
         flat[tail_at:workspace_bytes] if shared_tail else _empty_region(device_index)
     )
+    # the scan's TicketWord: a program that reads it and draws gets a block no other work writes -- the runner's own
+    # (zeroed here, once) or, for the eager entry's one launch, the first bytes of the workspace's tail, whose ticket
+    # word the scan binding zeroes right before the launch; any other launch gets the device's placeholder
+    ticket_block: Optional[torch.Tensor] = None
+    ticket_word = _ticket_placeholder(device_index)
+    if reads_word and drawing:
+        if one_shot:
+            block_at = workspace_bytes - TICKET_TAIL_BYTES
+            ticket_block = flat[block_at : block_at + TICKET_BLOCK_BYTES]
+            zero_region = ticket_block[:TICKET_WORD_ZERO_BYTES]
+        else:
+            ticket_block = torch.zeros(
+                TICKET_BLOCK_BYTES, dtype=torch.uint8, device=device
+            )
+        ticket_word = ticket_block.view(torch.uint32)
+    if reads_word and drawing and ticket_word is _ticket_placeholder(device_index):
+        raise RuntimeError(
+            f"{programs['scan']} ({arch}) draws from its TicketWord argument but was given the shared placeholder"
+        )
+    ticket_restore: Optional[_Launch] = None
     if num_queries > 0 and num_keys > 0:
         values: dict[str, Any] = dict(t)
         values.update(scalars)
         values["zero_region"] = zero_region
+        values["TicketWord"] = ticket_word
         launches.append(bind_program(programs["scan"], arch, "scan", values, grid))
         stages.append("scan")
+        if ticket_block is not None and not one_shot:
+            # the scan launch of the run after a failed one: its binding zeroes the block's ticket word first
+            ticket_restore = bind_program(
+                programs["scan"],
+                arch,
+                "scan",
+                {**values, "zero_region": ticket_block[:TICKET_WORD_ZERO_BYTES]},
+                grid,
+            )
         if "merge" in programs:
             launches.append(
                 bind_program(programs["merge"], arch, "merge", values, row_grid)
@@ -1096,6 +1162,8 @@ def prepare_dsa_indexer_det_topk(
     # grid, so every scan launch takes the static fast path and never touches the word) is
     # zeroed neither here nor per run.  A program of the record's ``static_scan_kinds`` (the
     # sm_107a l6 programs) keeps the static enumeration on every call: no tail view, nothing zeroed.
+    # A program that reads its TicketWord argument (``reads_ticket_word``) has no tail here: it draws from its
+    # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it.
     # (``tail_at`` / ``tail_static`` were decided above, before the first device operation; a call launches
     # iff it has queries and keys.)
     tail_view = zero_region if shared_tail else None
@@ -1119,6 +1187,91 @@ def prepare_dsa_indexer_det_topk(
         _tail_view=tail_view,
         _tail_shared=caller_owned_workspace and tail_at >= 0,
         _tail_static=tail_static,
+        _ticket_block=ticket_block,
+        _ticket_restore=ticket_restore,
+    )
+
+
+def prepare_dsa_indexer_det_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    softmax_scale: Optional[float] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
+    ratio: int = 1,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    workspace_buffer: Optional[torch.Tensor] = None,
+    indices: Optional[torch.Tensor] = None,
+    scores: Optional[torch.Tensor] = None,
+    grid_ctas: Optional[int] = None,
+    candidate_multiplier: Optional[int] = None,
+    check_period: Optional[int] = None,
+    sample_tiles_max: Optional[int] = None,
+    sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
+    finalize_threads: Optional[int] = None,
+    backend: str = "cake",
+) -> DSAIndexerDetRunner:
+    """Validate one binding, decide its programs and prepare its launches.
+
+    Missing outputs and the workspace are allocated here (the only allocations
+    of the backend).  Pass ``workspace_buffer`` of at least
+    :func:`dsa_indexer_det_workspace_size` bytes for the call's geometry (same
+    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls.
+    A caller-owned buffer may be written by other runners or kernels between
+    two runs of the returned runner, so where the scan program draws from the
+    buffer's ticket tail the scan binding zeroes it before every run (one small
+    memset on the current stream, captured into a CUDA graph with the
+    launches); the backend-owned workspace is zeroed once, here.  A scan
+    program that reads its ``TicketWord`` argument draws from a 16-byte block
+    of the runner's own instead, zeroed once, here, on either workspace.  ``indices`` / ``scores`` may
+    be caller-owned ``[T, top_k]`` int32 / float32 tensors.
+
+    The keyword-only knobs ``grid_ctas`` (persistent CTA count; default: the SM
+    count), ``candidate_multiplier`` (candidate buffer per query in multiples
+    of ``top_k``), ``check_period`` (key tiles between selection-trigger
+    checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
+    threshold; ``0`` disables sampling and sizes the candidate buffers by the
+    record's unsampled capacity values; the shift defaults to the record's
+    value for the call's ``top_k``, ``sample_shift_rule`` where the record sets
+    one), ``far_sample`` (``1``: the sampled first threshold of the
+    ascending-tile-order scan programs ranks the far sample tiles only,
+    leaving out the sample tile nearest the diagonal; ``0``: every sample
+    tile; the descending-order and wide programs ignore it) and
+    ``finalize_threads`` (an admissible registered finalize program) change
+    only the internal partition and scheduling of the work: results are
+    bitwise identical for every admissible value.  ``T == 0`` returns a runner
+    whose launches are empty; a call without keys (``Tkv == 0``) fills the
+    outputs with padding instead of launching.
+    """
+    return _prepare_runner(
+        q,
+        k,
+        w,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        top_k=top_k,
+        softmax_scale=softmax_scale,
+        q_causal_offsets=q_causal_offsets,
+        ratio=ratio,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        workspace_buffer=workspace_buffer,
+        indices=indices,
+        scores=scores,
+        grid_ctas=grid_ctas,
+        candidate_multiplier=candidate_multiplier,
+        check_period=check_period,
+        sample_tiles_max=sample_tiles_max,
+        sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
+        finalize_threads=finalize_threads,
+        backend=backend,
     )
 
 
@@ -1152,11 +1305,13 @@ def dsa_indexer_det_topk(
     See :func:`prepare_dsa_indexer_det_topk` for the arguments.  The call allocates
     the outputs (unless given) and the workspace (unless given) through the
     caching allocator and performs no host synchronization, so it may be
-    captured into a CUDA graph like any allocation-free launch sequence.  With
-    a caller-owned ``workspace_buffer`` the ticket tail is zeroed once per
-    call, by the scan binding right before the scan launch.
+    captured into a CUDA graph like any allocation-free launch sequence.  The
+    ticket word the scan draws from is zeroed once per call by the scan
+    binding, right before the scan launch: the ticket tail of a caller-owned
+    ``workspace_buffer``, or the first 8 bytes of the tail of either workspace
+    where the scan program reads its ``TicketWord`` argument.
     """
-    runner = prepare_dsa_indexer_det_topk(
+    runner = _prepare_runner(
         q,
         k,
         w,
@@ -1179,6 +1334,7 @@ def dsa_indexer_det_topk(
         far_sample=far_sample,
         finalize_threads=finalize_threads,
         backend=backend,
+        one_shot=True,
     )
     return runner.run()
 
@@ -1215,6 +1371,7 @@ __all__ = [
     "policy_for",
     "prepare_dsa_indexer_det_topk",
     "program_for",
+    "reads_ticket_word",
     "record_zero_sign_policy",
     "registry_abi",
     "validate_dsa_indexer_det_inputs",

@@ -53,9 +53,12 @@ from . import cake_build
 # fixed in its host binding.  A scan binding takes ``zero_region`` (slot kind
 # ``zero``) right before the grid: a byte range of the workspace it zeroes on
 # the launch stream right before the launch, or an empty tensor (nothing).
+# Every scan program takes ``TicketWord`` (a 16-byte block) right before it; a
+# program's record lists in ``ticket_arg_arches`` the architectures on which it
+# draws its work units from that block instead of the workspace's ticket tail.
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
-ABI: str = "dsa_indexer_v3"
+ABI: str = "dsa_indexer_v4"
 NUMERICS: dict[str, str] = {"zero_sign_policy": "positive_accumulator"}
 FFI_ENTRY: str = "run"
 ARG_PLANS: dict[str, list[list[str]]] = {
@@ -82,6 +85,7 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "grid_ctas"],
         ["parameter", "softmax_scale"],
         ["parameter", "n_split"],
+        ["buffer", "TicketWord"],
         ["zero", "zero_region"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
@@ -118,10 +122,13 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_z"],
     ],
 }
-# The architectures whose scan programs draw every work unit from the workspace's
-# ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every scan program on every
-# architecture but the physical kinds of ``POLICY[arch]["static_scan_kinds"]``
-# (the sm_107a l6 programs), which keep the static enumeration.  Every completed
+# The architectures whose scan programs draw every work unit from a ticket word
+# (``cake_policy.TICKET_TAIL_BYTES``): every scan program on every architecture
+# but the physical kinds of ``POLICY[arch]["static_scan_kinds"]`` (the sm_107a
+# l6 programs), which keep the static enumeration.  A program whose record lists
+# the architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
+# (``cake_backend`` gives a prepared runner one of its own, zeroed once); every
+# other drawing program draws from the workspace's ticket tail.  Every completed
 # scan launch leaves the ticket word at 0; the host (``cake_backend``) zeroes the
 # tail once when it prepares a runner on its own workspace, and on a caller-owned
 # ``workspace_buffer`` (others may write that buffer between runs) passes it as
