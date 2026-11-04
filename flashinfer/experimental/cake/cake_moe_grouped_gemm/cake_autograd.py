@@ -168,6 +168,11 @@ class CakeGroupedMm(torch.autograd.Function):
     the backward add the weight gradient into ``w.main_grad`` instead
     (:func:`cake_grouped_mm`); ``forward`` then keeps the Python object ``w``
     on ``ctx`` (a saved tensor unpacked under a checkpoint has no attributes).
+    ``forward`` runs with grad mode off and cannot tell whether autograd
+    records the call, so it does not check ``main_grad``:
+    :func:`cake_grouped_mm` checks it before ``apply`` when autograd records
+    the call, and the backward checks it again (the only check of a direct
+    ``apply``).
     """
 
     @staticmethod
@@ -184,8 +189,6 @@ class CakeGroupedMm(torch.autograd.Function):
         _require_flag(
             fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedMm"
         )
-        if fuse_wgrad_accumulation and w.requires_grad and not _in_backward():
-            _main_grad(w, "CakeGroupedMm")
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
         if _launch is not _DEFER_FWD:
@@ -273,8 +276,11 @@ def cake_grouped_mm(
         ``True`` (Megatron's ``gradient_accumulation_fusion``): ``w.main_grad``
         must be an fp32 or bf16 tensor of ``w``'s shape on its device with unit
         stride along the last dimension (``ValueError``, checked at the forward
-        call when ``w`` requires grad and again at the backward, which reads
-        ``w.main_grad`` then).  The backward adds ``dW`` into it in place
+        call when autograd records it: ``w`` requires grad, grad mode is on and
+        the call is not a checkpoint recompute inside a backward; and again at
+        the backward, which reads ``w.main_grad`` then).  Under
+        ``torch.no_grad()`` or inference mode the forward needs no
+        ``main_grad``.  The backward adds ``dW`` into it in place
         (``main_grad[e] += G[e].T @ X[e]``, the package's accumulate mode, fused
         into the weight-gradient kernel where the route serves it) and returns
         for ``w`` a fresh ``torch.empty`` of ``w``'s shape and dtype when ``w``
@@ -319,6 +325,17 @@ def cake_grouped_mm(
         # A trace records ``apply`` only, and Dynamo cannot lift the deferred
         # launch out of a checkpointed region: keep the launch inside ``forward``.
         return CakeGroupedMm.apply(x, w, offs, deterministic)
+    # Only a call that autograd records needs ``main_grad`` before the backward, so it is
+    # checked here, where grad mode is the caller's (``forward`` runs with it off): not
+    # under ``no_grad`` or inference mode, and not in a checkpoint recompute inside a
+    # backward, whose ``w`` may lack ``main_grad`` (the original forward's backward checks).
+    if (
+        fuse_wgrad_accumulation
+        and w.requires_grad
+        and torch.is_grad_enabled()
+        and not _in_backward()
+    ):
+        _main_grad(w, "cake_grouped_mm")
     # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
     if fuse_wgrad_accumulation:
         y = CakeGroupedMm.apply(x, w, offs, deterministic, _DEFER_FWD, True)

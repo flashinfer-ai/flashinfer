@@ -158,8 +158,10 @@ Numerical contract:
 `cake_grouped_mm(x, w, offs, deterministic=False, fuse_wgrad_accumulation=True)`
 follows Megatron and Transformer Engine: `w.main_grad` must be an fp32 or bf16
 tensor of `w`'s shape on its device with unit stride along the last dimension
-(checked at the forward call when `w` requires grad, and again at the
-backward, which reads `w.main_grad` then, so a re-pointed buffer is honoured).
+(checked at the forward call when autograd records it, that is when `w`
+requires grad and grad mode is on, so not under `torch.no_grad()`; and again
+at the backward, which reads `w.main_grad` then, so a re-pointed buffer is
+honoured).
 The backward adds into it (fused for an fp32 `main_grad` where the route
 serves it, composed for a bf16 one) and returns for `w` a fresh `torch.empty`
 of `w`'s shape and dtype when `w` has the attribute `grad_added_to_main_grad`

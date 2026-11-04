@@ -861,7 +861,8 @@ def test_fuse_flag_refusals_on_the_host():
     """``fuse_wgrad_accumulation`` must be a bool; with it, a ``w`` that requires grad
     needs a ``main_grad`` tensor of its shape, fp32 or bf16, on its device, with unit
     stride along the last dimension (``ValueError`` at the forward call, before any
-    launch); a ``w`` that does not require grad needs none."""
+    launch); a ``w`` that does not require grad needs none, and neither does a call
+    under ``torch.no_grad()`` or inference mode, which autograd does not record."""
     e, n, k = 2, 256, 64
     x = torch.zeros(4, k, dtype=torch.bfloat16)
     offs = torch.tensor([2, 4], dtype=torch.int32)
@@ -894,6 +895,11 @@ def test_fuse_flag_refusals_on_the_host():
     ) as info:  # CPU operands: the device check, not main_grad
         call(frozen)
     assert "main_grad" not in str(info.value)
+    bare = torch.zeros(e, n, k, dtype=torch.bfloat16, requires_grad=True)
+    for mode in (torch.no_grad, torch.inference_mode):
+        with mode(), pytest.raises(ValueError) as info:  # the device check again
+            call(bare)
+        assert "main_grad" not in str(info.value), mode.__name__
 
 
 @pytest.mark.parametrize("mode", ["trace", "compile"])
