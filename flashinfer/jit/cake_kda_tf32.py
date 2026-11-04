@@ -4268,7 +4268,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_d986b68088b8ad9bf45c": {
         "sources": [
@@ -5426,7 +5426,9 @@ _RENDERED_WORK_BIN_TURN_SHORT_ROUTES: dict[str, dict[str, str]] = {
 # ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks; every other bin-mix launch
 # keeps the bin-mix build.
 _RENDERED_WORK_BIN_MIX_LONG_ROUTES: dict[str, dict[str, str]] = {
-    "sm_100a": {},
+    "sm_100a": {
+        "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_d692d2b532922f2ee845",
+    },
     "sm_103a": {},
 }
 
