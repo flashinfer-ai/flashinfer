@@ -187,12 +187,20 @@ def _json_sidecar(path: Path, suffix: str) -> dict[str, Any]:
         return {}
 
 
-def _max_memory(samples: list[dict[str, float]]) -> tuple[float, float]:
-    if not samples:
-        return 0.0, 0.0
+_MemoryPeak = tuple[float, float | None]
+
+
+def _max_memory(samples: list[dict[str, float]]) -> _MemoryPeak:
     return (
-        max(sample["host_rss_mib"] for sample in samples),
-        max(sample["gpu_memory_mib"] for sample in samples),
+        max((sample["host_rss_mib"] for sample in samples), default=0.0),
+        max(
+            (
+                sample["gpu_memory_mib"]
+                for sample in samples
+                if sample["gpu_memory_available"]
+            ),
+            default=None,
+        ),
     )
 
 
@@ -206,12 +214,12 @@ class _SummaryScan:
     shard_finalized: Counter[int] = field(default_factory=Counter)
     pending: list[str] = field(default_factory=list)
     synthetic_count: int = 0
-    batch_memory: dict[str, tuple[float, float]] = field(default_factory=dict)
-    node_memory: dict[str, tuple[float, float]] = field(default_factory=dict)
-    unit_memory: dict[str, list[tuple[float, float]]] = field(
+    batch_memory: dict[str, _MemoryPeak] = field(default_factory=dict)
+    node_memory: dict[str, _MemoryPeak] = field(default_factory=dict)
+    unit_memory: dict[str, list[_MemoryPeak]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    shard_memory: dict[int, list[tuple[float, float]]] = field(
+    shard_memory: dict[int, list[_MemoryPeak]] = field(
         default_factory=lambda: defaultdict(list)
     )
 
@@ -229,13 +237,11 @@ def _record_pending(scan: _SummaryScan, unit: Unit, batch: Batch) -> None:
     scan.shard_pending[unit.shard_index] += len(batch.nodeids)
 
 
-def _case_memory(
-    samples: list[dict[str, float]], phase: dict[str, Any]
-) -> tuple[float, float]:
+def _case_memory(samples: list[dict[str, float]], phase: dict[str, Any]) -> _MemoryPeak:
     started_at = phase.get("started_at")
     finished_at = phase.get("finished_at")
     if started_at is None or finished_at is None:
-        return 0.0, 0.0
+        return 0.0, None
     return _max_memory(
         [
             sample
@@ -322,30 +328,27 @@ def _write_memory_csv(junit_dir: Path, scan: _SummaryScan) -> None:
     memory_stream = io.StringIO(newline="")
     memory_writer = csv.writer(memory_stream, lineterminator="\n")
     memory_writer.writerow(["level", "id", "max_host_rss_mib", "max_gpu_memory_mib"])
+
+    def write(level: str, identity: str, memory: _MemoryPeak) -> None:
+        host, gpu = memory
+        memory_writer.writerow(
+            [level, identity, f"{host:.3f}", "" if gpu is None else f"{gpu:.3f}"]
+        )
+
     for nodeid, memory in sorted(scan.node_memory.items()):
-        memory_writer.writerow(["node", nodeid, f"{memory[0]:.3f}", f"{memory[1]:.3f}"])
+        write("node", nodeid, memory)
     for batch_id, memory in sorted(scan.batch_memory.items()):
-        memory_writer.writerow(
-            ["batch", batch_id, f"{memory[0]:.3f}", f"{memory[1]:.3f}"]
-        )
-    for unit_id, memories in sorted(scan.unit_memory.items()):
-        memory_writer.writerow(
-            [
-                "unit",
-                unit_id,
-                f"{max(value[0] for value in memories):.3f}",
-                f"{max(value[1] for value in memories):.3f}",
-            ]
-        )
-    for shard_index, memories in sorted(scan.shard_memory.items()):
-        memory_writer.writerow(
-            [
-                "shard",
-                shard_index,
-                f"{max(value[0] for value in memories):.3f}",
-                f"{max(value[1] for value in memories):.3f}",
-            ]
-        )
+        write("batch", batch_id, memory)
+    for level, groups in (("unit", scan.unit_memory), ("shard", scan.shard_memory)):
+        for identity, memories in sorted(groups.items()):
+            write(
+                level,
+                str(identity),
+                (
+                    max(host for host, _ in memories),
+                    max((gpu for _, gpu in memories if gpu is not None), default=None),
+                ),
+            )
     atomic_write_text(junit_dir / "memory_summary.csv", memory_stream.getvalue())
 
 
@@ -425,7 +428,8 @@ def _source_and_failure_summaries(
             samples = _memory_samples(path)
             memory = _max_memory(samples)
             row["max_host_rss_mib"] = max(row["max_host_rss_mib"], memory[0])
-            row["max_gpu_memory_mib"] = max(row["max_gpu_memory_mib"], memory[1])
+            if memory[1] is not None:
+                row["max_gpu_memory_mib"] = max(row["max_gpu_memory_mib"], memory[1])
             row["memory_samples"] += len(samples)
             launched = telemetry.get("process_launch", meta.get("launched_at"))
             exited = telemetry.get("process_exit", meta.get("exited_at"))

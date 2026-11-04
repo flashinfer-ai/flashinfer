@@ -235,6 +235,10 @@ The sampler uses `resource_monitor.py`, with sampling, CSV persistence,
 and summary aggregation kept separate. Allocation and batch monitors share host
 CPU readers in `scripts/test_sharding/host_cpu.py`. Unavailable per-process GPU
 memory stays unknown in snapshots and marks source resource summaries partial.
+`memory_summary.csv` leaves GPU maxima blank when no valid observation exists.
+Host CSV rows are flushed before GPU queries; query costs are in `sampler.csv`.
+Nested runners reuse a sampler only while its exported owner PID is alive.
+Namespace-relative cgroup paths require membership evidence before attribution.
 
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.

@@ -86,20 +86,29 @@ def cgroup_paths(proc: Path = Path("/proc")) -> list[tuple[int, Path]]:
         root = PurePosixPath(fields[3].replace("\\040", " "))
         mount = Path(fields[4].replace("\\040", " "))
         member = memberships[version]
+        namespace_relative = False
         try:
             relative = member.relative_to(root)
         except ValueError:
-            # A cgroup namespace presents membership relative to its own root.
             relative = member.relative_to("/")
+            namespace_relative = True
         if ".." in relative.parts:
             continue
         current = mount / relative
+        if namespace_relative:
+            # Namespaced membership can be relative to a bind mount's root.
+            # Require direct evidence before attributing that subtree to us.
+            try:
+                if str(os.getpid()) not in _read(current / "cgroup.procs").split():
+                    continue
+            except OSError:
+                continue
+        memory_file = "memory.current" if version == 2 else "memory.usage_in_bytes"
+        if not current.is_dir():
+            continue
         result = []
         while current.is_relative_to(mount):
-            if (
-                current
-                / ("memory.current" if version == 2 else "memory.usage_in_bytes")
-            ).exists():
+            if (current / memory_file).exists():
                 result.append((version, current))
             if current == mount:
                 break
@@ -304,6 +313,8 @@ class ResourceMonitor:
         except OSError:
             loads = (None, None, None)
         host.update(zip(["load1", "load5", "load15"], loads, strict=True))
+        # Flush observations before a slow driver query can delay or lose them.
+        yield "host", host
         for version, path in self.groups:
             try:
                 yield "cgroup", {"timestamp": timestamp, **cgroup_memory(version, path)}
@@ -331,11 +342,16 @@ class ResourceMonitor:
                 "error": str(error),
             }
         _atomic_json(self.output / "gpu-processes.json", snapshot)
-        host["sample_wall_seconds"] = time.monotonic() - tick
-        # Thread time excludes pytest workers even for direct Python
-        # runner calls. Driver subprocess cost is in sample_wall_seconds.
-        host["sampler_cpu_seconds"] = time.thread_time() - self.started_cpu
-        yield "host", host
+        # Thread time excludes pytest workers even for direct Python calls.
+        # Driver subprocess cost is included in sample_wall_seconds.
+        yield (
+            "sampler",
+            {
+                "timestamp": timestamp,
+                "sample_wall_seconds": time.monotonic() - tick,
+                "sampler_cpu_seconds": time.thread_time() - self.started_cpu,
+            },
+        )
 
     def run(self, parent_pid: int | None = None) -> None:
         self.output.mkdir(parents=True, exist_ok=True)
@@ -408,7 +424,13 @@ def monitor_from_env(junit_dir: Path) -> ResourceMonitor | None:
     if os.environ.get("MONITOR_TEST_MEMORY", "true").lower() in {"0", "false", "no"}:
         return None
     if os.environ.get("FLASHINFER_RESOURCE_SNAPSHOT"):
-        return None
+        try:
+            owner_pid = int(os.environ.get("FLASHINFER_RESOURCE_MONITOR_PID", "0"))
+            if owner_pid > 0:
+                os.kill(owner_pid, 0)
+                return None
+        except (OSError, ValueError):
+            pass  # Recover from an inherited sampler that exited during setup.
     interval = float(os.environ.get("RESOURCE_MONITOR_INTERVAL", "5"))
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("RESOURCE_MONITOR_INTERVAL must be positive and finite")
@@ -418,6 +440,8 @@ def monitor_from_env(junit_dir: Path) -> ResourceMonitor | None:
     output = Path(tempfile.mkdtemp(prefix="run-", dir=root))
     monitor = ResourceMonitor(output, interval)
     os.environ["FLASHINFER_RESOURCE_SNAPSHOT"] = str(output / "gpu-processes.json")
+    # Direct Python runs own a sampler thread rather than a child process.
+    os.environ["FLASHINFER_RESOURCE_MONITOR_PID"] = str(os.getpid())
     return monitor
 
 

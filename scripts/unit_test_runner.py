@@ -584,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if monitor is not None:
                 os.environ.pop("FLASHINFER_RESOURCE_SNAPSHOT", None)
+                os.environ.pop("FLASHINFER_RESOURCE_MONITOR_PID", None)
     except CollectionTimeoutError as error:
         pending = "unknown" if error.pending_nodes is None else str(error.pending_nodes)
         deadline_fields = (

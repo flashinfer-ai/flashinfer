@@ -103,3 +103,91 @@ def test_gpu_snapshot_preserves_unknown_readings(
     )
     monkeypatch.setenv("FLASHINFER_RESOURCE_SNAPSHOT", str(snapshot))
     assert workers._gpu_mib({123}) == expected
+
+
+@pytest.mark.parametrize(
+    ("mount_root", "membership", "contains_self", "expected"),
+    [
+        ("/", "/job", False, ["job", ""]),
+        ("/job", "/job", False, [""]),
+        ("/host/job", "/", True, [""]),
+        ("/host/job", "/child", True, ["child", ""]),
+        ("/other", "/job", False, []),
+        ("/", "/missing", False, []),
+        ("/", "/uncounted", False, [""]),
+    ],
+)
+def test_cgroup_paths_require_membership_evidence(
+    tmp_path: Path,
+    mount_root: str,
+    membership: str,
+    contains_self: bool,
+    expected: list[str],
+) -> None:
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    mount = tmp_path / "cgroup"
+    for relative in ("", "job", "child"):
+        path = mount / relative
+        path.mkdir(exist_ok=True)
+        (path / "memory.current").write_text("1")
+        (path / "cgroup.procs").write_text(
+            str(os.getpid())
+            if contains_self and relative == membership.lstrip("/")
+            else ""
+        )
+    # A valid leaf need not have memory accounting delegated to it.
+    (mount / "uncounted").mkdir()
+    (mount / "uncounted/cgroup.procs").write_text(str(os.getpid()))
+    (proc / "self/cgroup").write_text(f"0::{membership}\n")
+    (proc / "self/mountinfo").write_text(
+        f"1 0 0:1 {mount_root} {mount} rw - cgroup2 cgroup rw\n"
+    )
+    assert telemetry.cgroup_paths(proc) == [(2, mount / path) for path in expected]
+
+
+@pytest.mark.parametrize("owner", ["alive", "dead", "missing", "invalid"])
+def test_inherited_sampler_requires_live_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+) -> None:
+    monkeypatch.setenv("MONITOR_TEST_MEMORY", "true")
+    monkeypatch.setenv("FLASHINFER_RESOURCE_SNAPSHOT", str(tmp_path / "old.json"))
+    monkeypatch.delenv("RESOURCE_MONITOR_INTERVAL", raising=False)
+    if owner == "missing":
+        monkeypatch.delenv("FLASHINFER_RESOURCE_MONITOR_PID", raising=False)
+    else:
+        monkeypatch.setenv(
+            "FLASHINFER_RESOURCE_MONITOR_PID",
+            "invalid" if owner == "invalid" else "123",
+        )
+
+    def check_owner(pid: int, signum: int) -> None:
+        assert pid == 123 and signum == 0
+        if owner == "dead":
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(telemetry.os, "kill", check_owner)
+    monitor = telemetry.monitor_from_env(tmp_path)
+    if owner == "alive":
+        assert monitor is None
+    else:
+        assert monitor is not None
+        assert os.environ["FLASHINFER_RESOURCE_SNAPSHOT"] != str(tmp_path / "old.json")
+        assert os.environ["FLASHINFER_RESOURCE_MONITOR_PID"] == str(os.getpid())
+
+
+def test_host_sample_is_flushed_before_gpu_query_interrupts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupted():
+        raise RuntimeError("GPU query interrupted")
+
+    monkeypatch.setattr(telemetry, "gpu_samples", interrupted)
+    with pytest.raises(RuntimeError, match="GPU query interrupted"):
+        telemetry.ResourceMonitor(tmp_path).run()
+    host = list(csv.DictReader((tmp_path / "host.csv").open()))
+    assert len(host) == 1
+    assert float(host[0]["memory_used_bytes"]) > 0
