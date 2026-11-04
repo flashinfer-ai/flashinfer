@@ -247,6 +247,8 @@ if args[:2] == ['pr', 'view']:
 elif args[:2] == ['pr', 'edit']:
     if os.getenv('LABEL_REMOVE_FAIL') and '--remove-label' in args: sys.exit(124)
     if os.getenv('LABEL_ADD_FAIL') and '--add-label' in args: sys.exit(124)
+elif args[:2] == ['pr', 'comment']:
+    if os.getenv('COMMENT_FAIL'): sys.exit(1)
 elif args[:1] == ['api'] and any('/pulls/' in arg for arg in args):
     print('main')
 elif args[:1] == ['api'] and any('/git/ref/' in arg for arg in args):
@@ -441,6 +443,13 @@ class BotWorkflowTests(unittest.TestCase):
         self.assertFalse(any("/statuses/" in arg for args in calls for arg in args))
         self.assertFalse(any(args[:2] == ["pr", "edit"] for args in calls))
 
+    def test_failed_advisory_comment_still_reacts_without_starting_ci(self):
+        calls, _ = self.run_workflow(SCOPE_MODE="advisory", COMMENT_FAIL="1")
+        self.assertTrue(any("content=confused" in args for args in calls))
+        self.assertFalse(any("content=+1" in args for args in calls))
+        self.assertFalse(any("/statuses/" in arg for args in calls for arg in args))
+        self.assertFalse(any(args[:2] == ["pr", "edit"] for args in calls))
+
     def test_full_run_clears_all_old_scope_chunks(self):
         calls, _ = self.run_workflow("@flashinfer-bot run all", SCOPE_MODE="full")
         published = [args for args in calls if any("/statuses/" in arg for arg in args)]
@@ -512,9 +521,11 @@ class BotWorkflowTests(unittest.TestCase):
         self.assertEqual("@flashinfer-bot run", command)
         self.assertTrue(any("--add-label" in args for args in calls))
 
-    def test_key_is_only_exposed_to_the_authorized_run_step(self):
+    def test_job_excludes_its_own_posting_account(self):
         job_guard = WORKFLOW_TEXT.split("    if: |\n", 1)[1].split("    runs-on:", 1)[0]
         self.assertIn("github.event.comment.user.login != 'flashinfer-bot'", job_guard)
+
+    def test_key_is_only_exposed_to_the_authorized_run_step(self):
         handler = step_block("Handle @flashinfer-bot run")
         self.assertIn("authorized == 'true'", handler)
         self.assertIn("INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }}", handler)

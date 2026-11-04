@@ -568,19 +568,21 @@ class PytestTargetSelector:
             "ci_files": ci_files,
         }
 
+        secrets = (
+            os.getenv("GH_TOKEN"),
+            os.getenv("GITHUB_TOKEN"),
+            os.getenv("INFERENCE_API_KEY"),
+            self.inference.api_key,
+        )
+
         def infer(task):
             encoded = json.dumps(context)
             if len(encoded) > MAX_CONTEXT_CHARS:
                 raise TargetSelectionError(
                     "PR evidence exceeds the automatic selection context limit"
                 )
-            # Include repository evidence only, never client configuration or auth headers.
-            secrets = (
-                os.getenv("GH_TOKEN"),
-                os.getenv("GITHUB_TOKEN"),
-                self.inference.api_key,
-            )
 
+            # Include repository evidence only, never client configuration or auth headers.
             def scrub(value):
                 if isinstance(value, str):
                     return _redact_credentials(value, secrets)
@@ -630,12 +632,6 @@ class PytestTargetSelector:
                 continue
             inspect(path)
         result = infer(SELECTION_PROMPT)
-        secrets = (
-            os.getenv("GH_TOKEN"),
-            os.getenv("GITHUB_TOKEN"),
-            os.getenv("INFERENCE_API_KEY"),
-            self.inference.api_key,
-        )
         outcome, raw = result.get("outcome"), result.get("targets")
         if outcome not in (
             "selected",

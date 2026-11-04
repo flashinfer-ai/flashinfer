@@ -126,6 +126,12 @@ main() {
         CURRENT_PHASE="dependency-setup"
         echo "📋 DETERMINISTIC SHARD MODE - finalized batches resume automatically"
 
+        # Workflow integration tests need jq; support CI images built before it was added.
+        if ! command -v jq >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends jq
+        fi
+
         # nvshmem4py-cu12 pins cuda-python<=12.9. The CI image already carries
         # compatible cuda-python and NVIDIA NVSHMEM libraries, so avoid allowing
         # pip to replace the CUDA flavor while filling this one missing module.

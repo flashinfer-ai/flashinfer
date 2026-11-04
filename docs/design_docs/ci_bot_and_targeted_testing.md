@@ -131,8 +131,6 @@ Bare `run` asks NVIDIA Inference Hub for a recommendation using the current targ
 branch merged with the pinned PR head. The trusted selector reads that isolated
 tree, inspected test bodies, and current CI routing; it never imports, collects or
 executes PR code. Source hooks and external Git configuration are disabled.
-Recommendations are available through authorized comments on PRs; opening or
-updating a PR alone does not request an AI recommendation.
 
 The two model calls request evidence files, then a structured decision:
 `selected` (up to ten focused targets), `full_suite`, `no_pytest_change`, or

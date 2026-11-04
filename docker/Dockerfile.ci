@@ -10,6 +10,7 @@ ENV FLASHINFER_PYTHON_ENV=flashinfer
 RUN apt-get update && apt-get install -y \
     curl \
     git \
+    jq \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
