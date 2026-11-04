@@ -121,6 +121,22 @@ def _few_cpu_threads():
         torch.set_num_threads(threads)
 
 
+def _size_rule_at(kcp, monkeypatch, rows: int) -> None:
+    """The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` at ``rows`` on every architecture
+    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default)."""
+    table = {arch: rows for arch in kcp.GRAPH_RECOMPUTE_MIN_ROWS}
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS", table)
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT", rows)
+
+
+@pytest.fixture(autouse=True)
+def _graph_recompute_at_any_size(monkeypatch):
+    """The test problems hold far fewer rows than the size rule of ``reuse_recompute_tapes="auto"`` under
+    ``graph="replay"``, so every test runs with the rule at 0 rows (the recompute decides at any size); the rule's own
+    test sets it around its problem."""
+    _size_rule_at(_package("cake_kcp"), monkeypatch, 0)
+
+
 def _evidence(name: str, record: dict) -> None:
     if not EVIDENCE_DIR:
         return
@@ -5291,6 +5307,117 @@ def test_graph_replay_checkpoint_runs_the_eager_checkpoint_programs(
         "graph checkpoint vs direct",
         _ckpt_reference_l2n() if l2n else None,
     )
+
+
+def test_graph_replay_auto_size_rule_is_one_table_per_architecture(monkeypatch) -> None:
+    """The size rule's rows per architecture (``GRAPH_RECOMPUTE_MIN_ROWS``, the shipped values: the module's own,
+    without this suite's rule at 0): the B200 crossover on sm_100a, none on sm_103a and sm_107a (GB300 and R200 gain
+    at the smallest measured rank), sm_100a's value on any other device; the rule reads the kernel backend's
+    architecture only."""
+    monkeypatch.undo()
+    kcp = _package("cake_kcp")
+    assert kcp.GRAPH_RECOMPUTE_MIN_ROWS == {
+        "sm_100a": 61440,
+        "sm_103a": 0,
+        "sm_107a": 0,
+    }
+    assert kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT == 61440
+    assert (
+        kcp._graph_recompute_arch(kcp.get_backend("fake"), torch.device("cpu")) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "arch,l2n",
+    [("sm_100a", False), ("sm_103a", False), ("sm_107a", False), ("sm_100a", True)],
+)
+def test_graph_replay_auto_size_rule_keys_a_small_recompute_as_the_original_forward(
+    arch, l2n, monkeypatch
+) -> None:
+    """The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` (``GRAPH_RECOMPUTE_MIN_ROWS`` of the
+    device's architecture): a checkpoint recompute whose rank holds fewer token x value-head rows (``T_r * HV``)
+    reads no checkpoint frame, looks up the original forward's key (flags ``(save,)``) and runs its form -- no
+    hand-off, #5 launched, reasons ``"small"`` -- so its backward replays #1 (three prep launches) and no entry is
+    put; at exactly that many rows the recompute decides as before (on a verified torch its own key, the hand-off and
+    two prep launches).  The rule reads the row of the architecture (the other rows and the default at 0).  ``True``
+    still hands off below the rule and ``False`` still reads the frame for #5.  Out and the five gradients are the
+    same bits in every arm."""
+    kcp, ctx, ops = _ckpt_setup()
+    _refuse_captures(kcp, monkeypatch)
+    monkeypatch.setattr(kcp, "_graph_recompute_arch", lambda backend, device: arch)
+    base = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    rows = int(ctx.T_r) * CKPT_HEADS[1]
+    keys: list[tuple] = []
+    reads: list[int] = []
+    original_entry, original_dead = kcp._graph_entry, kcp._recompute_output_dead
+
+    def spy_entry(kind, ctx_, ws, backend, opts, scale, tensors, flags):
+        if kind == "fwd":
+            keys.append(tuple(flags))
+        return original_entry(kind, ctx_, ws, backend, opts, scale, tensors, flags)
+
+    def spy_dead(n_saved):
+        reads.append(n_saved)
+        return original_dead(n_saved)
+
+    monkeypatch.setattr(kcp, "_graph_entry", spy_entry)
+    monkeypatch.setattr(kcp, "_recompute_output_dead", spy_dead)
+    prep = "fwd_prep_l2n" if l2n else "fwd_prep"
+
+    def step(min_rows: int, **kw):
+        _size_rule_at(kcp, monkeypatch, 0)
+        monkeypatch.setitem(kcp.GRAPH_RECOMPUTE_MIN_ROWS, arch, min_rows)
+        keys.clear()
+        reads.clear()
+        before = dict(kcp.KEPT_STATS)
+        kcp.graph_cache_clear()
+        res, seen = _recorded_step(
+            kcp,
+            ctx,
+            ops,
+            ckpt=True,
+            workspace=kcp.WorkspaceKcp(),
+            graph="replay",
+            **base,
+            **kw,
+        )
+        return {
+            "res": res,
+            "prep": sum(1 for n, _, _ in seen if n == prep),
+            "keys": list(keys),
+            "reads": len(reads),
+            "recompute": dict(kcp.LAST_CALL["fwd"]),
+            "source": kcp.LAST_CALL["bwd"]["tapes_source"],
+            "delta": _stats_delta(kcp, before),
+        }
+
+    small = step(rows + 1)
+    assert small["keys"] == [(True,), (True,)], small["keys"]
+    assert small["reads"] == 0
+    rc = small["recompute"]
+    assert rc["hand_off"] is False and rc["fwd_o"] != "skipped", rc
+    assert rc["hand_off_reason"] == rc["fwd_o_reason"] == "small", rc
+    assert small["prep"] == 3 and small["source"] == "replay"
+    assert small["delta"]["put"] == small["delta"]["take"] == 0, small["delta"]
+    at = step(rows)
+    forced = step(rows + 1, reuse_recompute_tapes=True)
+    off = step(rows + 1, reuse_recompute_tapes=False)
+    assert at["reads"] > 0 and off["reads"] > 0
+    assert off["recompute"]["hand_off"] is False and off["prep"] == 3
+    assert kcp.kept_registry_size() == 0
+    if _verified_torch(kcp):
+        assert at["keys"] == [(True,), (True, True, False)], at["keys"]
+        assert at["recompute"]["hand_off"] is True and at["prep"] == 2
+        assert at["source"] == "kept" and at["delta"]["put"] == 1, at["delta"]
+        assert forced["recompute"]["hand_off"] is True and forced["prep"] == 2
+        assert forced["recompute"]["hand_off_reason"] == "always"
+        assert off["recompute"]["fwd_o"] == "skipped"
+    else:  # no frame proof on this torch: "auto" decides the replay form, True still hands off
+        assert at["keys"] == [(True,), (True,)] and at["prep"] == 3
+        assert forced["recompute"]["hand_off"] is True
+    for arm in (at, forced, off):
+        for n in ("out",) + CKPT_GRADS:
+            assert torch.equal(arm["res"][n], small["res"][n]), n
 
 
 @pytest.mark.parametrize("l2n", [False, True])

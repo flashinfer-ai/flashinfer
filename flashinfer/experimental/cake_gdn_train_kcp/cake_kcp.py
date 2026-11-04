@@ -85,7 +85,9 @@ torch's checkpoint frame proves its output dead (below
 ``_recompute_output_dead``).  Under ``graph="replay"`` both decisions are part
 of the recompute's CUDA-graph key and the kept tapes are the workspace arena's
 own (below ``_kept_stale``), so a captured checkpoint step launches the eager
-step's programs.
+step's programs -- from ``GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per
+rank under the default ``"auto"``; a smaller recompute decides nothing and
+replays the original forward's graph (the size rule, below ``_fwd_entry``).
 
 Tapes (padded rows ``R = 64 * NC_pad``; token ``t`` of chunk ``c`` sits in row
 ``64 c + (t - chunk_bos[c])``): ``w, u, v_new, do_g, dv_intra`` BF16
@@ -4144,10 +4146,10 @@ def _record(kind: str, call: CallKcp) -> None:
         ),  # forward: "launched" | "skipped" (recompute_output="auto": the recompute's dead #5) | "fused" (kcp_fwdh_out)
         "fwd_o_reason": call.scratch.get(
             "fwd_o_reason"
-        ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank)
+        ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank) | "small" (graph="replay", the size rule)
         "hand_off_reason": call.scratch.get(
             "hand_off_reason"
-        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept)
+        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept) | "small" (graph="replay": the recompute below GRAPH_RECOMPUTE_MIN_ROWS, no decision)
         "recompute_handle": call.scratch.get(
             "recompute_handle"
         ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
@@ -5208,7 +5210,8 @@ GRAPH_STATS: dict[str, int] = {
     "reset": 0,
 }
 # Keys kept per process, least recently used first out when a new key arrives beyond this.  A checkpointed layer holds
-# three keys (the original forward, torch's recompute in its hand-off form, the kept backward), so 256 keeps 85 such
+# three keys (the original forward, torch's recompute in its hand-off form, the kept backward; two below the size rule
+# GRAPH_RECOMPUTE_MIN_ROWS, where the recompute replays the original forward's graph), so 256 keeps 85 such
 # layers; each captured graph holds its own memory pool with its static results (out, the saved set, the gradients)
 # besides the workspace arena, released with the entry (or by ``graph_cache_clear()``).
 GRAPH_CACHE_MAX = 256
@@ -5229,6 +5232,7 @@ class _GraphEntry:
         "digest",
         "arena",
         "reset",
+        "used",
     )
 
     def __init__(self, key: tuple, pins: tuple) -> None:
@@ -5246,6 +5250,8 @@ class _GraphEntry:
         self.reset: str | None = (
             None  # why the last replay candidate ran eagerly instead
         )
+        # the key's last use (the cache drops the least recently used first)
+        self.used = next(_GRAPH_USES)
 
     def replayable(self, ws: Any) -> bool:
         """The graph exists and the arena it baked is intact; otherwise the entry is reset (an eager call follows,
@@ -5262,6 +5268,8 @@ class _GraphEntry:
 
 
 _GRAPHS: dict[tuple, _GraphEntry] = {}
+# the use order of the cached keys (one hash of the key per lookup: a hit stamps its entry instead of re-inserting)
+_GRAPH_USES = iter(range((1 << 63) - 1))
 
 
 def _sig(t: Any) -> tuple:
@@ -5310,13 +5318,19 @@ def _graph_entry(
         flags,
         tuple(_sig(t) for t in tensors),
     )
-    e = _GRAPHS.pop(key, None)
+    e = _GRAPHS.get(key)
     if e is None:
         while len(_GRAPHS) >= GRAPH_CACHE_MAX:
-            del _GRAPHS[next(iter(_GRAPHS))]
-        e = _GraphEntry(key, (ctx, ws, backend))
-    _GRAPHS[key] = e  # (re-)inserted last: the dict's order is the use order
+            # the least recently used key first out
+            del _GRAPHS[min(_GRAPHS.values(), key=_graph_use).key]
+        e = _GRAPHS[key] = _GraphEntry(key, (ctx, ws, backend))
+    else:
+        e.used = next(_GRAPH_USES)  # a hit makes the key the most recently used
     return e
+
+
+def _graph_use(e: _GraphEntry) -> int:
+    return e.used
 
 
 def _graph_capture(kind: str, entry: _GraphEntry, call: CallKcp, body: Any) -> Any:
@@ -5623,31 +5637,44 @@ def _fwd_entry(
     requiring grad) -- ``False`` launches #5 unconditionally.  Under ``graph="replay"`` the autograd node's forward
     inside a backward pass (torch's recompute) decides the hand-off and #5 before the CUDA-graph lookup
     (:func:`_fwd_decision`): a decision other than (no hand-off, #5 launched) is part of the key, so the hand-off form
-    is captured and replayed as its own graph."""
+    is captured and replayed as its own graph.  Under the size rule of ``reuse_recompute_tapes="auto"``
+    (:data:`GRAPH_RECOMPUTE_MIN_ROWS`, a caller-held workspace) no forward of the node decides: torch's recompute looks
+    up the original forward's key and runs its form (no hand-off, #5 launched; the reasons read ``"small"``)."""
+    # with reuse_recompute_tapes the request is the Function's graph-task test (read once, there)
+    in_task = bool(hand_off) if opts.reuse_recompute_tapes else None
     save = bool(save_for_backward) and opts.boundary_mode == "saved"
     hand_off = bool(hand_off) and save and opts.save_mode == "light"
     entry = None
     decision = None
+    small = False
     if opts.graph != "off":
         if isinstance(workspace, WorkspaceKcp):
             workspace.calls += 1
-            if autograd_node and _graph_task_id() != -1:
+            if autograd_node:
                 T_r = int(ctx.T_r)
-                P = workspace.tables(
-                    ctx,
-                    int(v.shape[-2]),
-                    fused_walks=int(opts.knob("fused_walks")),
-                    P=None if opts.segments is None else int(opts.segments),
-                ).P
-                decision = _fwd_decision(
-                    _saved_count_of(
-                        opts, P, T_r, bool(opts.use_qk_l2norm_in_kernel), save
-                    ),
-                    hand_off=hand_off and T_r > 0,
-                    autograd_node=autograd_node,
-                    executable=executable,
-                    opts=opts,
-                )
+                HV = int(v.shape[-2])
+                # the size rule of reuse_recompute_tapes="auto" (GRAPH_RECOMPUTE_MIN_ROWS): below it no forward of
+                # the node decides -- torch's recompute keys and replays the original forward's graph (no graph task
+                # read, no frame read, no hand-off)
+                small = _graph_recompute_small(opts, v.device, T_r, HV)
+                if not small and (
+                    in_task if in_task is not None else _graph_task_id() != -1
+                ):
+                    P = workspace.tables(
+                        ctx,
+                        HV,
+                        fused_walks=int(opts.knob("fused_walks")),
+                        P=None if opts.segments is None else int(opts.segments),
+                    ).P
+                    decision = _fwd_decision(
+                        _saved_count_of(
+                            opts, P, T_r, bool(opts.use_qk_l2norm_in_kernel), save
+                        ),
+                        hand_off=hand_off and T_r > 0,
+                        autograd_node=autograd_node,
+                        executable=executable,
+                        opts=opts,
+                    )
         flags = (
             (save,)
             if decision is None or (not decision[0] and decision[2])
@@ -5673,6 +5700,8 @@ def _fwd_entry(
             LAST_CALL["fwd"].update(
                 hand_off_reason=decision[1], fwd_o_reason=decision[3]
             )
+        elif small:
+            LAST_CALL["fwd"].update(hand_off_reason="small", fwd_o_reason="small")
         return _ranked(out.detach(), batched), _with_stamped_kept(saved)
     call, batched = _prepare(
         q,
@@ -5687,6 +5716,10 @@ def _fwd_entry(
         backward=False,
         fresh_pools=_fwd_fresh_pools(opts, save),
     )
+    if small:
+        # the size rule's form for the eager run and the capture under the original forward's key: no hand-off, #5
+        # launched, no frame read
+        decision = (False, "small", True, "small", _saved_count(call, save))
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         res = _graph_capture(
             "fwd",
@@ -5824,6 +5857,58 @@ def _saved_count_of(opts: OptionsKcp, P: int, T_r: int, l2n: bool, save: bool) -
     if l2n:  # qk_rstd, at T_r = 0 too (an empty [2, 0, H_qk] tensor: the flags agree across ranks)
         n += 1
     return _SAVED_OPERANDS + n
+
+
+# The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` (a caller-held workspace): a checkpoint
+# recompute decides the hand-off and #5 only when the rank holds at least this many token x value-head rows
+# (``T_r * HV``), per architecture of the device.  Below it no forward of the node decides -- no graph-task or
+# checkpoint-frame read, no arena hand-off to stamp and check -- the recompute replays the original forward's graph
+# (the output walk, #5 inside) and its backward replays #1 and the tape walk.  On a small rank the checkpointed graph
+# step is host-bound: the hand-off form launches less GPU work (one B200, 8192 tokens, (2, 6) heads: 356 instead of
+# 451 us of kernels) but adds host time per layer and step (the frame read, the stamp, the backward's checks: about
+# 48 us there), and the step ends later.  Crossover of one checkpointed layer (CUDA events per step, both forms in one
+# process, five rounds): one B200 previous / hand-off 0.953 at 49152 rows, 1.016 / 1.039 / 1.09 at 61440 / 73728 /
+# 86016 rows; one GB300 1.013 at 49152 rows, 1.10 at 73728 rows, 1.07-1.13 at 98304 rows; one R200 (208 SMs) 1.07 at
+# 49152 rows (the benchmark's checkpointed graph step, L2 flushed).  ``True`` / ``False`` and ``graph="off"`` decide
+# at every size.
+GRAPH_RECOMPUTE_MIN_ROWS: dict[str, int] = {
+    "sm_100a": 61440,
+    "sm_103a": 0,
+    "sm_107a": 0,
+}
+# any other device (the fake backend's CPU emulation included)
+GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = 61440
+_GRAPH_RECOMPUTE_ARCH: dict[tuple, str | None] = {}
+
+
+def _graph_recompute_arch(backend: Any, device: torch.device) -> str | None:
+    """The architecture the size rule reads: the kernel backend's exported architecture of the CUDA device, ``None``
+    for any other backend or device; cached per (backend kind, device)."""
+    kernels = isinstance(backend, KernelBackend) and device.type == "cuda"
+    key = (kernels, device.type, device.index)
+    if key not in _GRAPH_RECOMPUTE_ARCH:
+        arch = None
+        if kernels:
+            index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            arch = backend.launcher().device_arch(index)
+        _GRAPH_RECOMPUTE_ARCH[key] = arch
+    return _GRAPH_RECOMPUTE_ARCH[key]
+
+
+def _graph_recompute_small(
+    opts: OptionsKcp, device: torch.device, T_r: int, HV: int
+) -> bool:
+    """Whether a forward under ``graph="replay"`` falls under the size rule: ``reuse_recompute_tapes="auto"`` and
+    fewer ``T_r * HV`` rows than :data:`GRAPH_RECOMPUTE_MIN_ROWS` of the device's architecture."""
+    if opts.reuse_recompute_tapes != "auto":
+        return False
+    arch = _graph_recompute_arch(get_backend(opts.backend), device)
+    rows = GRAPH_RECOMPUTE_MIN_ROWS.get(arch, GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT)
+    return T_r * HV < rows
 
 
 def _reads_frame(opts: OptionsKcp) -> bool:
@@ -6455,7 +6540,20 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         packed_grads=True,
     ):
         boundary = None if handle is None else _handle_lookup(handle)
-        gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
+        # the graph task (the hand-off's condition), not read where no hand-off can follow: reuse_recompute_tapes=False
+        # or the size rule of "auto" (graph="replay" on a caller-held workspace, the CUDA-graph path)
+        gid = (
+            _graph_task_id()
+            if opts.reuse_recompute_tapes
+            and not (
+                opts.graph != "off"
+                and isinstance(workspace, WorkspaceKcp)
+                and _graph_recompute_small(
+                    opts, v.device, int(ctx.T_r), int(v.shape[-2])
+                )
+            )
+            else -1
+        )
         out, saved = _fwd_entry(
             q,
             k,
@@ -6530,16 +6628,17 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             object.__setattr__(saved, "release_in_backward", True)
         # the set above holds the only Python references to the saved tensors
         del tensors
+        # under "auto" an empty registry has no entry for this node (no graph task to read, no key to build: a direct
+        # backward, or a recompute that did not hand off)
         if (
             saved is not None
             and opts.reuse_recompute_tapes
             and saved.save_mode == "light"
+            and (opts.reuse_recompute_tapes is True or _KEPT)
         ):
             gid = _graph_task_id()
             kept = None
-            # under "auto" an empty registry has no entry for this node (no key to build: a direct backward, or a
-            # recompute that did not hand off)
-            if gid != -1 and (opts.reuse_recompute_tapes is True or _KEPT):
+            if gid != -1:
                 key = _kept_key(
                     gid, q, k, v, g, beta, saved.S_in, saved.T_r, saved.H_qk, saved.HV
                 )

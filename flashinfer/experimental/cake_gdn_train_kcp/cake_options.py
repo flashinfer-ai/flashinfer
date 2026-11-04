@@ -59,7 +59,10 @@ Public fields (defaults are the shipped behaviour)::
                                             has used that workspace since the recompute (else the replay form runs);
                                             a forward outside a backward pass, the direct autograd path and every
                                             other mode are unchanged; one kept set is live at a time, so in a
-                                            segment of several layers only the last one skips the replay
+                                            segment of several layers only the last one skips the replay; under
+                                            graph="replay" "auto" decides only from GRAPH_RECOMPUTE_MIN_ROWS
+                                            (cake_kcp) token x value-head rows per rank (smaller: the recompute
+                                            replays the original forward's graph)
     recompute_output  "auto" | "always"    under torch.utils.checkpoint(use_reentrant=False) torch re-runs the forward
                                             inside .backward() only to re-save its tensors and discards that run's
                                             return value; when this module's autograd node is the last saver of the

@@ -441,7 +441,9 @@ def chunk_gdn_kcp(
     earlier layers replay as before).  On the deterministic route it is not available with ``graph="replay"`` (the
     default resolves to ``False`` and an explicit ``True`` / ``"auto"`` is refused); on the non-deterministic route a
     caller-held workspace keeps its own tapes under ``graph="replay"`` and the backward binds them only while the
-    workspace made no other call in between (else the replay form).
+    workspace made no other call in between (else the replay form); there ``"auto"`` decides only from
+    ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per rank (a smaller recompute replays the original
+    forward's graph: its host-bound step gains nothing from the hand-off).
 
     ``recompute_output`` (keyword-only, ``"auto"`` default | ``"always"``): torch's recompute of a checkpointed
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
