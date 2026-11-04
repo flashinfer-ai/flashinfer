@@ -1201,10 +1201,15 @@ ROUTER_RULES: dict[
     # threads, one wave on 152 SMs; at 256 tokens it was 6 to 12 % slower than the deterministic plan in CUDA graphs
     # next to a resident kernel holding 32 SMs, which leaves 120 SMs for its 128 CTAs), the 64 x 64 tile from 1 to 256
     # tokens at hidden 5120 and 6144 (320 and 384 CTAs of 128 threads; the 128 x 64 tile gives 160 and 192 CTAs
-    # there, more than one per SM, and was 20 to 26 % slower alone).
+    # there, more than one per SM, and was 20 to 26 % slower alone).  Few tokens on 152-SM sm_103a parts: the SIMT
+    # program with the 64 x 64 tile in two slices at every hidden size (measured from 1 to 320 tokens at hidden 4096
+    # and 6144 and from 1 to 192 at hidden 5120, against the deterministic plan and at hidden 5120 against "waves"),
+    # from 1 to 288 tokens at hidden 4096, 1 to 192 at hidden 5120 and 1 to 256 at hidden 6144; one step more (320
+    # tokens at hidden 4096, 288 at hidden 6144) it was more than 3 % slower than the deterministic plan in CUDA
+    # graphs next to a resident kernel.
     # Hidden 5120: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens, and on sm_103a at
     # 192; more than 3 % slower than it next to a resident kernel at every measured count from 224 to 10240 tokens;
-    # on 152-SM sm_100a parts the SIMT window before it takes these token counts),
+    # on 152-SM sm_100a and sm_103a parts the SIMT window before it takes these token counts),
     # then the head/tail program with one head unit per CTA pair over half of the steps and three tail units per pair
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
@@ -1228,9 +1233,9 @@ ROUTER_RULES: dict[
     ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
     ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
-    ("sm_103a", "nn_t", 4096, 256): ((20480, 49152, "H1x4p44"),),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): ((16172, 20480, "H1x5p44"),),
+    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
+    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16172, 32768, "H0.5x3")),
+    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16172, 20480, "H1x5p44")),
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
@@ -1239,10 +1244,14 @@ ROUTER_RULES: dict[
     # hidden 4096 and at 128 at hidden 6144): the SIMT program with the 32 x 64 tile in four slices (128 threads, one
     # CTA per 32 tokens and 64 hidden columns) up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144;
     # next to a resident kernel it was more than 3 % slower than the deterministic program from 192 tokens (from 128 at
-    # hidden 6144).  sm_103a and 216-SM sm_107a parts keep the deterministic program (not measured)
+    # hidden 6144).  152-SM GB300 (sm_103a) parts take the same tile and windows (measured there at the same token
+    # counts inside the windows, on two parts).  216-SM sm_107a parts keep the deterministic program (not measured)
     ("sm_100a", "kn", 4096, 256): ((1, 128, "simt_n64m32s4"),),
     ("sm_100a", "kn", 5120, 256): ((1, 128, "simt_n64m32s4"),),
     ("sm_100a", "kn", 6144, 256): ((1, 64, "simt_n64m32s4"),),
+    ("sm_103a", "kn", 4096, 256): ((1, 128, "simt_n64m32s4"),),
+    ("sm_103a", "kn", 5120, 256): ((1, 128, "simt_n64m32s4"),),
+    ("sm_103a", "kn", 6144, 256): ((1, 64, "simt_n64m32s4"),),
 })
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
