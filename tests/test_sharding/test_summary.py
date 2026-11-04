@@ -55,7 +55,7 @@ def test_summary_publication_waits_for_the_state_lock(
         executor.shutdown()
 
     assert summary["complete"] is True
-    assert summary["schema_version"] == 3
+    assert summary["schema_version"] == 4
 
 
 def test_failure_exit_code_wins_over_incomplete() -> None:
