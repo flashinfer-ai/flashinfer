@@ -4957,8 +4957,8 @@ def test_kept_form_at_two_segments_follows_the_arena_and_the_hand_off(
     handed: list[int] = []
 
     class Recorded(kcp._KeptTapes):
-        def __init__(self, tapes, stage_m, geometry, gid, qk=None):
-            super().__init__(tapes, stage_m, geometry, gid, qk)
+        def __init__(self, tapes, stage_m, geometry, gid, qk=None, **kw):
+            super().__init__(tapes, stage_m, geometry, gid, qk, **kw)
             held = [*tapes.values(), *(qk or {}).values()]
             held += [stage_m] if stage_m is not None else []
             storages = {t.untyped_storage().data_ptr(): t for t in held}
@@ -6779,10 +6779,121 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
                 assert fwd > eager["forward"], (r, steps[r])
 
 
+@pytest.mark.parametrize(
+    "segments,save_transfer,l2n",
+    [
+        (1, True, False),
+        (2, True, False),
+        (2, False, False),
+        (2, True, True),
+        (2, False, True),
+    ],
+)
+def test_workspace_layout_follows_the_arena_of_the_graph_replay_kept_form(
+    monkeypatch, segments, save_transfer, l2n
+) -> None:
+    """``graph="replay"`` under ``torch.utils.checkpoint(use_reentrant=False)`` on a caller-held workspace created
+    empty (the first call of each key runs eagerly and releases nothing): the forward binds
+    ``gdn_workspace_layout_kcp(graph="replay")["forward"]`` exactly and the backward that follows -- the recompute
+    forward and the GDN backward -- its ``backward`` exactly, with every pool at its term: ``True`` (the recompute's
+    arena hand-off, the backward binds the kept tapes) the kept figure, ``False`` the replay form's, and ``"auto"``
+    the kept figure at the rule's 0 rows on a verified torch (the hand-off) and the replay form's above the rank's
+    rows (the size rule).  The query's ``"auto"`` (the replay form) bounds the call: equal on the replay side,
+    larger by the backward's arena ``qk_rstd`` (0 without the norm) on the kept side."""
+    from torch.utils.checkpoint import checkpoint
+
+    kcp, ctx, ops = _ckpt_setup()
+    _refuse_captures(kcp, monkeypatch)
+    H_qk, HV = CKPT_HEADS
+    rows = int(ctx.T_r) * HV
+    call = dict(
+        segments=segments,
+        save_transfer=save_transfer,
+        graph="replay",
+        use_qk_l2norm_in_kernel=l2n,
+    )
+
+    def measure(reuse) -> dict:
+        ws = _pool_peak_workspace(kcp)
+        kcp.graph_cache_clear()
+        leaves = [ops[n].detach().clone().requires_grad_(True) for n in LEAVES]
+
+        def fn(*a):
+            return kcp.chunk_gdn_kcp(
+                *a,
+                ctx,
+                workspace=ws,
+                backend="fake",
+                deterministic=False,
+                reuse_recompute_tapes=reuse,
+                **call,
+            )
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+        got = {"forward": ws.peak, "fwd_pools": dict(ws.pool_max)}
+        ws.peak, ws.pool_max = 0, {}
+        out.backward(ops["dout"])
+        got.update(
+            backward=ws.peak,
+            bwd_pools=dict(ws.pool_max),
+            source=kcp.LAST_CALL["bwd"]["tapes_source"],
+        )
+        kcp.graph_cache_clear()
+        return got
+
+    def layout(reuse) -> dict:
+        return gb.gdn_workspace_layout_kcp(
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            P=segments,
+            save_transfer=save_transfer,
+            with_conv=False,
+            graph="replay",
+            reuse_recompute_tapes=reuse,
+            use_qk_l2norm_in_kernel=l2n,
+        )
+
+    lay = {reuse: layout(reuse) for reuse in (True, False, "auto")}
+    assert lay["auto"] == lay[False]
+    arms = {True: measure(True), False: measure(False)}
+    assert arms[True]["source"] == "kept" and arms[False]["source"] == "replay"
+    if _verified_torch(kcp):
+        arms["auto"] = measure("auto")
+        assert arms["auto"]["source"] == "kept"
+    _size_rule_at(kcp, monkeypatch, rows + 1)
+    arms["auto_small"] = measure("auto")
+    assert arms["auto_small"]["source"] == "replay"
+    for arm, got in arms.items():
+        form = lay[True] if got["source"] == "kept" else lay[False]
+        assert got["forward"] == form["forward"], (arm, got["forward"], form)
+        rec, want = (
+            _recorded_pool_terms(got["fwd_pools"]),
+            _layout_pool_terms(form, "fwd"),
+        )
+        assert {k: v for k, v in rec.items() if not k.startswith("b")} == {
+            k: v for k, v in want.items() if not k.startswith("b")
+        }, (arm, "fwd")
+        assert got["backward"] == form["backward"], (arm, got["backward"], form)
+        assert _recorded_pool_terms(got["bwd_pools"]) == _layout_pool_terms(
+            form, "bwd"
+        ), (arm, "bwd")
+        if arm in ("auto", "auto_small"):
+            # "auto" reports the replay form: an upper bound, equal on the replay side, larger by the backward's
+            # arena qk_rstd on the kept side
+            bound = lay["auto"]
+            assert got["forward"] == bound["forward"], arm
+            gap = bound["backward"] - got["backward"]
+            if got["source"] == "kept":
+                assert gap == lay[False].get("bwd.qk_rstd", 0), (arm, gap)
+            else:
+                assert gap == 0, (arm, gap)
+
+
 def test_workspace_layout_option_checks() -> None:
-    """The workspace queries refuse a ``graph`` value outside ``("off", "replay")``, the kept-tape form under
-    ``graph="replay"`` (as the call's options do; the default there is the replay form) and a non-bool
-    ``save_for_backward``.  ``save_for_backward=False`` with a backward reports the replay a ``saved=None`` backward
+    """The workspace queries refuse a ``graph`` value outside ``("off", "replay")`` and a non-bool
+    ``save_for_backward``; under ``graph="replay"`` the default and ``"auto"`` report the replay form and ``True`` the
+    arena hand-off (the replay form's terms without the backward's arena ``qk_rstd``, no hand-off tensor).  ``save_for_backward=False`` with a backward reports the replay a ``saved=None`` backward
     runs: the replay boundary's backward terms, in either ``save_mode`` and ``reuse_recompute_tapes`` form, except
     the replayed forward after the fused (light, saved boundary) forward, which finds no ``h`` / ``v_new``; the
     forward is the call's."""
@@ -6791,16 +6902,29 @@ def test_workspace_layout_option_checks() -> None:
     assert gb.GRAPH_MODES == _package("cake_options").GRAPH_MODES
     with pytest.raises(ValueError, match="graph"):
         gb.gdn_workspace_layout_kcp(ctx, graph="on", **q)
-    for reuse in (True, "auto"):
-        with pytest.raises(ValueError, match="needs graph='off'"):
-            gb.gdn_workspace_bytes_kcp(
-                ctx, graph="replay", reuse_recompute_tapes=reuse, **q
-            )
-    assert gb.gdn_workspace_layout_kcp(
-        ctx, graph="replay", **q
-    ) == gb.gdn_workspace_layout_kcp(
-        ctx, graph="replay", reuse_recompute_tapes=False, **q
-    )
+    for l2n in (False, True):
+        g = dict(graph="replay", use_qk_l2norm_in_kernel=l2n, **q)
+        replay = gb.gdn_workspace_layout_kcp(ctx, reuse_recompute_tapes=False, **g)
+        assert gb.gdn_workspace_layout_kcp(ctx, **g) == replay
+        assert (
+            gb.gdn_workspace_layout_kcp(ctx, reuse_recompute_tapes="auto", **g)
+            == replay
+        )
+        kept = gb.gdn_workspace_layout_kcp(ctx, reuse_recompute_tapes=True, **g)
+        rstd = replay.get("bwd.qk_rstd", 0)
+        assert (rstd > 0) == l2n
+        assert kept == {
+            **replay,
+            **({"bwd.qk_rstd": 0} if l2n else {}),
+            "bwd.phase.graph": replay["bwd.phase.graph"] - rstd,
+            "backward": replay["backward"] - rstd,
+            "backward_transient": replay["backward_transient"] - rstd,
+            "workspace": max(replay["forward"], replay["backward"] - rstd),
+        }
+        assert (
+            gb.gdn_workspace_bytes_kcp(ctx, reuse_recompute_tapes=True, **g)
+            == kept["workspace"]
+        )
     for save_mode, reuse in itertools.product(("light", "full"), (True, False)):
         lay = gb.gdn_workspace_layout_kcp(
             ctx,

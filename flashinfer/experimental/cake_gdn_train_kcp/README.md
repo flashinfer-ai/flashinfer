@@ -469,7 +469,12 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     so the forward is every forward pool and tape it writes (no tape with save_mode="full" and a saved set) and the
     backward every backward pool, the ten light tapes (none with save_mode="full" and a saved set) and every
     backward tape; with use_qk_l2norm_in_kernel both add qn / kn and the arena qk_rstd where #1 writes it (a
-    forward without a saved set, a backward that re-runs #1).
+    forward without a saved set, a backward that re-runs #1).  There `reuse_recompute_tapes=True` gives the arena
+    hand-off's figure exactly: the recompute's tapes, M_seg^T plane and qn / kn stay arena tensors, so it is the
+    replay form's less the backward's arena qk_rstd (`bwd.kept_tapes` 0). The default (`"auto"`) gives the replay
+    form's figure at every size, an upper bound of the call: equal when the call takes the replay form (below
+    cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS, or with a later saver in the region), larger by the arena qk_rstd (with
+    use_qk_l2norm_in_kernel; else equal) when it keeps the tapes.
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); graph=,
     save_for_backward= and fused_walks= are keywords of this package's query only (the deterministic twin's query
