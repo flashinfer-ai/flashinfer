@@ -654,11 +654,10 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "NHD", backend="cute-dsl", batch_invariant=True
         )
-    # a workspace too small for the split partials names the needed size instead of launching anything
+    # a workspace too small for the split-KV partials plans fused units instead (every chunk of a request in one CTA): the same bits
+    # as the split plan of a large workspace (R3), and no partials at all
     tiny = torch.empty(4096, dtype=torch.uint8, device=pr.device)
     big = Problem([1] * 4, [32768] * 4, 32, 8, 128, 16, seed=11)
-    wd = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        tiny, "NHD", batch_invariant=True
-    )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bytes"):
-        wd.plan(big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **kw)
+    out_big, _ = run_decode(big)
+    out_tiny, _ = run_decode(big, ws=tiny)
+    assert torch.equal(bits(out_big), bits(out_tiny))
