@@ -27,7 +27,6 @@ except ImportError:  # the PyTorch path below quantizes the same bytes
 # bytes (verified with 3.5.1, 3.6.0, 3.7.1 and 3.8.0); older releases use the
 # Triton dual kernel.
 _GLUON_MIN_TRITON = (3, 5)
-gluon = None
 if triton is not None and (
     tuple(int(part) for part in triton.__version__.split(".")[:2]) >= _GLUON_MIN_TRITON
 ):
@@ -36,6 +35,8 @@ if triton is not None and (
         from triton.experimental.gluon import language as gl
     except ImportError:
         gluon = None
+else:
+    gluon = None
 
 _BLOCK = 32
 # The FP32 ``1 / 448`` factor of the recipe.
@@ -466,7 +467,7 @@ def _quantize_both_gluon(matrices, outputs):
 
 
 # (count, E, M, N) of the matrices whose Gluon kernel has compiled and run.
-_gluon_shapes = set()
+_gluon_shapes: set[tuple[int, ...]] = set()
 
 
 def _quantize_both(*matrices):
