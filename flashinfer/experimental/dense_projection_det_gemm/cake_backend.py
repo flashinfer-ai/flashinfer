@@ -1447,6 +1447,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 48, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, False, False, 4096, 16384, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, False, False, 4096, 16384, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
     ('sm_107a', True, True, True, True, False, 32, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 48, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},

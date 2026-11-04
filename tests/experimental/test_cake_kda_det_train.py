@@ -201,9 +201,13 @@ FUSED_L2N_RECORDS = {
     "bwd_prep_g8_noqg_nokb_l2n": "bwd_prep_g8_noqg_nokb_raw_l2n",
     "glm_intra_l2n": "glm_intra_raw_l2n",
 }
-# The fused class's sm_103a forward intra program (fwd_intra v37: v35 with the norm in one pass over both tiles, every
-# output v35's bit for bit): a g record of its own with no raw twin, selected where its sibling is on sm_103a alone
-FUSED_L2N_SM103 = {"fwd_intra_v37_l2n": "fwd_intra_l2n"}
+# The fused class's sm_103a programs (fwd_intra v37: v35 with the norm in one pass over both tiles, every output v35's
+# bit for bit; glm_intra v30: v27 with the norm's pullback eight lanes per row, every output v27's bit for bit): each a
+# g record of its own with no raw twin, selected where its sibling is on sm_103a alone
+FUSED_L2N_SM103 = {
+    "fwd_intra_v37_l2n": "fwd_intra_l2n",
+    "glm_intra_v30_l2n": "glm_intra_l2n",
+}
 RAW_GLM_INTRA = "glm_intra_raw"
 RAW_FINALIZE = "param_finalize"
 # the raw operands the raw records bind in place of the activated gate g (the TMA reader of the forward takes the
@@ -385,6 +389,7 @@ RECORD_ARCHES = {
     "glm_intra_v18": ("sm_107a",),
     "gate_epilogue": ("sm_100a",),
     "fwd_intra_v37_l2n": ("sm_103a",),
+    "glm_intra_v30_l2n": ("sm_103a",),
     "dqkg_davq_nohint": ("sm_107a",),
     "dqkg_int_davq_nohint": ("sm_107a",),
 }
@@ -481,10 +486,10 @@ def _route_rule(route: str) -> dict:
 def test_registry_records_are_well_formed() -> None:
     # the 67 g-mode records, the 8 raw-gate ones (each raw record its own library), the 3 programs of the
     # in-kernel Q/K L2 norm's fallback route and its 2 GLM intra capture forms (g, raw), and the 14 records of its
-    # fused class (FUSED_L2N_RECORDS: 7 g, 7 raw, each its own library) and its sm_103a forward intra form
-    # (FUSED_L2N_SM103)
-    assert len(cake_jit.MODULES) == 95
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 93
+    # fused class (FUSED_L2N_RECORDS: 7 g, 7 raw, each its own library) and its sm_103a forward intra and GLM intra
+    # forms (FUSED_L2N_SM103)
+    assert len(cake_jit.MODULES) == 96
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 94
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert frozenset(cake_jit.GATE_STAGES) == GATE_STAGES
@@ -3687,16 +3692,16 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 93 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs, the 5 of the Q/K L2 norm's
-    # fallback route and the 15 of its fused class), each built for the architectures its record delivers (86 on
-    # all three, the seven of RECORD_ARCHES on one each: 265 libraries); the KCP programs have their own package.
+    # The 94 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs, the 5 of the Q/K L2 norm's
+    # fallback route and the 16 of its fused class), each built for the architectures its record delivers (86 on
+    # all three, the eight of RECORD_ARCHES on one each: 266 libraries); the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 265
-    assert len(names) == len(set(names)) == 265
+    assert len(train_libraries) == 266
+    assert len(names) == len(set(names)) == 266
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"

@@ -492,10 +492,9 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
                     : "=f"(frag3[0]), "=f"(frag3[1]), "=f"(frag3[2]), "=f"(frag3[3]), "=f"(frag3[4]), "=f"(frag3[5]), "=f"(frag3[6]), "=f"(frag3[7]), "=f"(frag3[8]), "=f"(frag3[9]), "=f"(frag3[10]), "=f"(frag3[11]), "=f"(frag3[12]), "=f"(frag3[13]), "=f"(frag3[14]), "=f"(frag3[15]), "=f"(frag3[16]), "=f"(frag3[17]), "=f"(frag3[18]), "=f"(frag3[19]), "=f"(frag3[20]), "=f"(frag3[21]), "=f"(frag3[22]), "=f"(frag3[23]), "=f"(frag3[24]), "=f"(frag3[25]), "=f"(frag3[26]), "=f"(frag3[27]), "=f"(frag3[28]), "=f"(frag3[29]), "=f"(frag3[30]), "=f"(frag3[31])
                     : "r"(m_base_1 + snap_sel + 96));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                int snap_arrive_stage = p_1 & 1;
                 if (elect_sync()) {
                     asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(snap_done_addr + (snap_arrive_stage) * 8);
+                    mbarrier_arrive(snap_done_addr + ((int)((unsigned int)p_1 % 2)) * 8);
                 }
                 if (epilogue_local_warp == 0) {
                     asm volatile("cp.async.bulk.wait_group.read 0;");

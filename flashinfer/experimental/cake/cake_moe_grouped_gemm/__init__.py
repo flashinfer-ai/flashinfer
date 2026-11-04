@@ -157,6 +157,7 @@ def grouped_gemm_wgrad(
     num_groups: Optional[int] = None,
     *,
     deterministic: bool = True,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
@@ -172,6 +173,14 @@ def grouped_gemm_wgrad(
     non-determinism alert.  ``N % 256 == 0`` and ``K`` a
     multiple of the selected k tile (256, or 512 when chosen) are required.
     See ``grouped_gemm_fwd`` for the prepared form.
+
+    ``accumulate=True`` adds into ``out`` instead, ``out[e] += G[e].T @ X[e]``
+    (Megatron's gradient-accumulation fusion; ``out`` required, bf16 or fp32,
+    ``out_dtype`` None or its dtype), and returns ``out``: fused into the
+    512-wide k tile's epilogue where the route serves that stage's accumulate
+    build, else the overwrite into a scratch followed by ``out.add_``
+    (``prepare_grouped_gemm_wgrad`` and the package README give the routes and
+    the numerical contract).
     """
     from .cake_backend import (
         _alert_not_deterministic,
@@ -181,7 +190,9 @@ def grouped_gemm_wgrad(
 
     _require_deterministic_false(deterministic, "grouped_gemm_wgrad")
     _alert_not_deterministic("grouped_gemm_wgrad")
-    return _prepare_wgrad(g, x, offs, out, out_dtype, num_groups)._run()
+    return _prepare_wgrad(
+        g, x, offs, out, out_dtype, num_groups, accumulate=accumulate
+    )._run()
 
 
 def __getattr__(name: str) -> Any:

@@ -59,8 +59,14 @@ NUM_SLOT_SETS = 3
 # A prefill merge runs the prefill program (``merge_prefill``: one exchange,
 # no spin).  A legacy decode merge of at least this many tokens runs one token
 # per CTA (``merge_legacy``); every other decode merge (tagged rows, fewer
-# tokens) runs 4 per CTA (``merge``).
+# tokens) runs 4 per CTA (``merge``), and the facade's tagged decode merge at
+# world 4 runs ``merge_tagged`` (4 per CTA; it polls its rows before it waits
+# on its predecessor, see ``MSAIcpIndexerPlan.decode``).
 LEGACY_MERGE_MIN_TOKENS = 8
+# The facade's tagged decode merge runs ``merge_tagged`` only at these world
+# sizes.  In serving it shortens the decode step at world 4 (P128 and P256)
+# and does not at world 2, so world 2 keeps ``merge``.
+POLL_FIRST_WORLD_SIZES = (4,)
 # The merge ranks at most this many B128 blocks per token.
 MAX_BLOCKS = 8192
 # Upper bound (exclusive) of the score-row width the selectors accept.
@@ -1411,12 +1417,18 @@ def decode_score_publish(
     )
 
 
-def merge_role(*, prefill: bool, tagged: bool, num_tokens: int) -> str:
+def merge_role(
+    *, prefill: bool, tagged: bool, num_tokens: int, poll_first: bool = False
+) -> str:
     """The merge role of one call (launch metadata only, every arch):
-    ``merge_prefill`` for a prefill merge, ``merge_legacy`` for a legacy decode
-    merge of at least ``LEGACY_MERGE_MIN_TOKENS`` tokens, else ``merge``."""
+    ``merge_prefill`` for a prefill merge, ``merge_tagged`` for a tagged decode
+    merge with ``poll_first`` (the facade's decode chain), ``merge_legacy`` for
+    a legacy decode merge of at least ``LEGACY_MERGE_MIN_TOKENS`` tokens, else
+    ``merge``."""
     if prefill:
         return "merge_prefill"
+    if tagged and poll_first:
+        return "merge_tagged"
     if not tagged and num_tokens >= LEGACY_MERGE_MIN_TOKENS:
         return "merge_legacy"
     return "merge"
@@ -1436,10 +1448,14 @@ def merge_candidates(
     prefill: bool = False,
     token_count: Optional[torch.Tensor] = None,
     _trusted: bool = False,
+    _poll_first: bool = False,
 ) -> None:
     # ``_trusted``: the caller (MSAIcpIndexerPlan.decode) passes one slot of
     # receive rows and counters its ``check_comm`` validated, and its own
     # validated scalars; only the per-call tensors are checked here.
+    # ``_poll_first``: the caller (MSAIcpIndexerPlan.decode) meets the
+    # precondition of a merge that reads before it waits; a tagged merge of a
+    # by-value token count then runs ``merge_tagged``.
     # ``token_count`` (int32 [1]): only the rows below token_count[0] (read on
     # the device, at most T) are merged; the record follows T, as without it.
     tagged = expected_generations is not None
@@ -1507,7 +1523,9 @@ def merge_candidates(
     if t == 0:
         return
     arch = cake_jit.device_arch(dev)
-    role = merge_role(prefill=prefill, tagged=tagged, num_tokens=t)
+    role = merge_role(
+        prefill=prefill, tagged=tagged, num_tokens=t, poll_first=_poll_first and not dc
+    )
     name = cake_jit.route(role + dc, None, arch)
     # One program reads both row forms through int32 words: a tagged row is
     # its 32 int64 words viewed as 64 int32 words (strides in int32 elements).
