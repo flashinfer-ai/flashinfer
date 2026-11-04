@@ -337,3 +337,56 @@ The inherited async-copy racecheck reports are **still unresolved**. This
 integration is a development-branch substitution requested for continued work,
 not a claim of racecheck-clean production readiness. Workspace artifacts are
 under `results/direct/prefill_integrated/`.
+
+## NVFP4 cache prefill specialization
+
+`kernels/dsv4_nvfp4/prefill_mega.cuh` keeps the native block-scaled FP4 MMA
+implementation, with BF16 RoPE arithmetic. It is a separate prefill body with
+no split-KV bookkeeping. `Mega=true/false` compiles its Q RoPE and output
+inverse-RoPE/FP8 quantization in or out. Both consume the entire selected
+context per query/head tile. The original decode body is unchanged by this
+integration. Empty selections and positive/negative infinite sinks have
+explicit final normalization behavior.
+
+This is **not a CuTe rewrite of native FP4 MMA**. A v22-derived loader that
+expanded NVFP4 into FP8 micro-stages was evaluated and rejected: 31.245 ms,
+or 30.475 ms after eliminating its spills, versus 2.792 ms for the native
+unfused pipeline. Its sources and measurements remain in workspace
+`results/direct/prefill_integrated/nvfp4/` for diagnosis; it is not dispatched.
+
+The native specialization, on the same canonical workload as FP8:
+
+- Mega: 2.2425 ms, one kernel launch.
+- Specialized non-fused pipeline: 2.8180 ms.
+- Archived original non-fused pipeline: 2.7920 ms.
+- Independent raw-Q FP64 relative L2: 0.08610; max LSE error: 0.17657.
+  The canonical NVFP4 gates remain 0.20 / 0.20.
+
+Seven new tests cover heads 16/32/64, CP ranks 0/3, changing sparse inputs on
+replay, empty selections, invalid indices and infinite sinks. Fused output,
+scales and LSE match the non-fused specialization bitwise. One edge case
+(single candidate, rank3/H64) has raw-Q LSE error 0.215605 in **both** the
+archived original and new kernel, with bitwise-identical results. The edge
+suite checks attention LSE against independently quantized NVFP4 Q and FP64
+attention with absolute tolerance 0.02, accounting for the native route's
+specified Q rounding; it does not raise the canonical raw-Q tolerance.
+
+Reproduce either format from the repository root:
+
+```bash
+PYTHONPATH=. CUTE_PREFILL_ARTIFACT_DIR=/tmp/prefill-result \
+python benchmarks/sparse_mla_sm120_cute_prefill/benchmark_integrated.py \
+  --format nvfp4 --baseline-module /path/to/archived/sparse_mla_sm120.so
+```
+
+Use `--format v41_fp8` for the CuTe FP8 path. The benchmark records full shapes,
+independent-reference metrics, CUDA kernel names, alternating graph samples
+and medians. Packing and reference computation are outside timed regions.
+
+Integration validation: 15 new tests pass under focused memcheck and synccheck
+(`--kernel-name kns=prefill`, zero device errors). `--report-api-errors no`
+excludes the host cuBLAS IMEX capability-probe errors seen in the unfiltered
+run; it does not suppress device memory/synchronization diagnostics. Twenty-one
+upstream NVFP4 head-count, dual-page and prefill-workspace tests also pass.
+A one-launch native NVFP4 racecheck probe reports zero hazards; this is not
+full racecheck coverage and does not resolve the FP8 path's known reports.
