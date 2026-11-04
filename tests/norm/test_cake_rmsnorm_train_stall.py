@@ -13,41 +13,54 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Stall regression of the Cake BF16 RMSNorm training backward (issue #7038).
+Stall regression of the Cake BF16 RMSNorm training backward with the
+non-deterministic weight gradient (``deterministic=False``; issues #7038,
+#7548 item 2, #8066).
 
-The backward is a main kernel whose persistent CTAs claim row chunks, followed
-by a dw reduce kernel under programmatic dependent launch; neither needs the
-whole device.  Beside a long-resident one-thread kernel on another stream the
-backward must keep its speed: per hidden size (the residual route included)
-and per token count of the issue's list, the median of seven event-timed
-calls with the side kernel resident is at most ``MAX_RATIO`` times the median
-of seven calls alone, or at most ``MAX_EXTRA_MS`` above it.  The alone and
-busy calls alternate in pairs (alone, busy, alone, busy, ...), so host launch
-gaps and clock drift hit both arms alike.  The bounds sit well above the
-slowdown a resident kernel causes (up to 13 % at large token counts, where the
-CTA sharing its SM runs slower through the chunk it holds; a few microseconds
-at small ones) and well below the stall this test guards against, a wait of
-milliseconds behind the resident kernel.  ``dw`` is deterministic:
-bitwise equal across the alone and busy calls, a fresh-workspace call and
-launch grids other than the production one (a CTA count that is not the slot
-count claims the same chunk table), and the workspace counters are zero after
-every call.
+The backward runs, per token-count window, one kernel whose persistent CTAs
+claim row chunks from a counter and add their per-column ``dw`` sums into FP64
+workspace sums (the CTA that finishes last stores ``dw``), or the deterministic
+package's pair (main kernel and dw reduce) rendered into this package.  Neither
+waits for the whole device: a CTA that becomes resident late finds the chunk
+table exhausted.  Beside a
+long-resident one-thread kernel on another stream the backward must keep its
+speed: per hidden size (the residual route included) and per token count of
+the issue's list, the median of seven event-timed calls with the side kernel
+resident is at most ``MAX_RATIO`` times the median of seven calls alone, or at
+most ``MAX_EXTRA_MS`` above it (the alone and busy calls alternate in pairs).
+``dx`` is bitwise equal across the alone and busy calls, a fresh-workspace
+call and launch grids other than the production one; ``dw`` stays within the
+package's budget against the first call in every one of them; after every
+call the workspace is at rest: every counter and FP64 sum zero (a det pair's
+partial rows are scratch).
 
-The backward beside a kernel resident on every SM (issue #7548, item 2): a
-backward main kernel needs a large shared-memory carveout, so a side kernel
-holding every SM with the default carveout delays its start until the side
-kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_train`).  The
-documented remedy is checked here: with the side kernel's preferred carveout
-set to the maximum shared memory, the backward and the forward start beside it
-and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side
-kernel's ``ALL_SM_SPIN_MS`` lifetime.  The residual route and the programs in
-``WHOLE_SM_ABOVE`` need a whole SM and are not checked.  Every side CTA records its SM, and a run counts
-only when the side kernel holds every SM.
+Beside a kernel resident on every SM (#7548 item 2): with the side kernel's
+preferred carveout set to the maximum shared memory, the backward starts beside
+it and costs at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side
+kernel's ``ALL_SM_SPIN_MS`` lifetime.  Every side CTA records its SM, and a run
+counts only when the side kernel holds every SM.  A token count in a
+``cake_windows.WHOLE_SM`` range (the deterministic package's whole-SM programs,
+which this package runs in some det-pair windows) is not measured
+(det-inherited): the test checks that the call runs the deterministic package's
+program and that the docstrings list the range with the remedy, then skips.  The
+forward programs are the deterministic package's, whose stall test covers them.
+
+Beside a kernel holding shared memory on every SM (review R3, C3): one CTA per
+SM with each of ``cake_windows.SMEM_SIDE_KB`` KB of dynamic shared memory
+(max-shared carveout).  For every shipped backward window -- every route,
+residual and FP32-weight routes included -- the smallest of those sizes beside
+which the call waits is at least the package's documented
+``cake_windows.SMEM_WAITS`` entry.  The list covers every window; its entry is
+the most restrictive level measured on the architecture's boards (the smallest
+size beside which any of them waits), so a board waits at that size or only at
+a larger one, never at a smaller one.  The deterministic program the window
+replaces is measured for reference.
 """
 
 from __future__ import annotations
 
 import ctypes
+import functools
 import statistics
 
 import pytest
@@ -57,13 +70,23 @@ from tests.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_train")
 loader = cake_package("cake_rmsnorm_train", "cake_jit")
-cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
-cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
-cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
-is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
+windows = cake_package("cake_rmsnorm_train", "cake_windows")
+backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
+workspace_for = functools.partial(
+    pkg.cake_rmsnorm_train_backward_workspace, deterministic=False
+)
+forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
+WIDTHS = (
+    (6144, 1e-5),
+    (5120, 1e-5),
+    (4096, 1e-5),
+    (2048, 1e-6),
+    (1536, 1e-6),
+    (512, 1e-6),
+    (256, 1e-6),
+)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 # (hidden, residual): every backward route of the package.
 ROUTES = tuple((hidden, False) for hidden, _eps in WIDTHS) + ((6144, True),)
@@ -83,6 +106,9 @@ RUNS = 7
 MAX_RATIO = 1.5
 MAX_EXTRA_MS = 0.020
 SEED = 760
+# dw of a call against the first alone call's: both are FP32 roundings of FP64
+# sums taken in a scheduling-dependent order.
+DW_REL_L2 = 1e-6
 
 
 def _device() -> torch.device:
@@ -97,13 +123,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and is_cake_rmsnorm_train_supported(_device())
+        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_train(deterministic=False) needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -117,7 +143,7 @@ def warmup_jit():
 
 
 def _skip_unless_route(hidden: int, residual: bool) -> None:
-    if not is_cake_rmsnorm_train_supported(_device(), hidden):
+    if not pkg.is_cake_rmsnorm_train_supported(_device(), hidden, deterministic=False):
         pytest.skip(f"hidden={hidden} has no exported route on this device")
     if residual and not loader.route_applies(
         device_capability=_capability(), hidden=hidden, kind="bwd", residual=True
@@ -134,7 +160,7 @@ def _inputs(rows: int, hidden: int, residual: bool):
     w = (1 + 0.1 * torch.randn(hidden, **kwargs)).to(torch.bfloat16)
     g = torch.randn(rows, hidden, **kwargs).to(torch.bfloat16)
     g_h = torch.randn(rows, hidden, **kwargs).to(torch.bfloat16) if residual else None
-    _y, rstd = cake_rmsnorm_train_forward(x, w, EPS[hidden])
+    _y, rstd = forward(x, w, EPS[hidden])
     return x, w, g, g_h, rstd
 
 
@@ -142,10 +168,27 @@ def _backward(x, w, g, g_h, rstd, workspace):
     kwargs = {"workspace": workspace}
     if g_h is not None:
         kwargs["g_residual"] = g_h
-    return cake_rmsnorm_train_backward(g, x, w, rstd, **kwargs)
+    return backward(g, x, w, rstd, **kwargs)
 
 
-def _timed(call, *, side: torch.cuda.Stream | None) -> tuple[float, torch.Tensor]:
+def _rel_l2(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    a, b = actual.double(), reference.double()
+    den = b.norm().item()
+    return (a - b).norm().item() / den if den > 0 else (a - b).norm().item()
+
+
+def _workspace_clean(ws: torch.Tensor, hidden: int, residual: bool = False) -> bool:
+    """The workspace's documented rest state after a call (any hidden size or
+    residual flag): every counter and FP64 sum zero -- every byte before the det
+    pair's partial rows (``cake_jit.PAIR_ROWS_OFFSET``), which are scratch."""
+    del hidden, residual  # one layout serves every family
+    torch.cuda.synchronize()
+    return not bool(ws[: loader.PAIR_ROWS_OFFSET].any())
+
+
+def _timed(
+    call, *, side: torch.cuda.Stream | None
+) -> tuple[float, tuple[torch.Tensor, torch.Tensor]]:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
@@ -154,10 +197,10 @@ def _timed(call, *, side: torch.cuda.Stream | None) -> tuple[float, torch.Tensor
             torch.cuda._sleep(SIDE_SLEEP_CYCLES)
     torch.cuda._sleep(PRE_SLEEP_CYCLES)
     start.record()
-    _dx, dw = call()
+    dx, dw = call()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end), dw.clone()
+    return start.elapsed_time(end), (dx.clone(), dw.clone())
 
 
 def _keeps_its_speed(alone_ms: float, busy_ms: float) -> bool:
@@ -173,9 +216,7 @@ def test_backward_keeps_its_speed_beside_a_resident_kernel(
 ) -> None:
     _skip_unless_route(hidden, residual)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
-    workspace = cake_rmsnorm_train_backward_workspace(
-        rows, hidden, _device(), residual=residual
-    )
+    workspace = workspace_for(rows, hidden, _device(), residual=residual)
     side = torch.cuda.Stream()
 
     def call():
@@ -196,18 +237,21 @@ def test_backward_keeps_its_speed_beside_a_resident_kernel(
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} ratio={ratio:.3f} "
         f"extra_ms={extra_ms:.4f}"
     )
-    # R2: dw is a pure function of the inputs, never of the scheduling the side kernel imposes.
-    reference = alone[0][1]
-    assert torch.isfinite(reference).all()
-    for _t, dw in alone[1:] + busy:
-        assert torch.equal(dw, reference), (
-            f"hidden={hidden} rows={rows}: dw differs across calls"
+    # dx is a pure function of the inputs; dw stays within its budget whatever the side kernel imposes.
+    dx_ref, dw_ref = alone[0][1]
+    assert torch.isfinite(dw_ref).all()
+    for _t, (dx, dw) in alone[1:] + busy:
+        assert torch.equal(dx, dx_ref), (
+            f"hidden={hidden} rows={rows}: dx differs across calls"
         )
-    fresh = _backward(x, w, g, g_h, rstd, None)[1]
-    assert torch.equal(fresh, reference), "a fresh workspace changed dw"
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(workspace[: loader.COUNTERS_BYTES]) == 0, (
-        "the counters are not reset"
+        assert _rel_l2(dw, dw_ref) <= DW_REL_L2, (
+            f"hidden={hidden} rows={rows}: dw rel-L2 {_rel_l2(dw, dw_ref):.3e} across calls"
+        )
+    dx_fresh, dw_fresh = _backward(x, w, g, g_h, rstd, None)
+    assert torch.equal(dx_fresh, dx_ref), "a fresh workspace changed dx"
+    assert _rel_l2(dw_fresh, dw_ref) <= DW_REL_L2, "a fresh workspace moved dw"
+    assert _workspace_clean(workspace, hidden, residual), (
+        "the workspace is not the kernels' state"
     )
     assert _keeps_its_speed(alone_ms, busy_ms), (
         f"hidden={hidden} residual={residual} rows={rows}: backward alone {alone_ms:.4f} ms, "
@@ -218,18 +262,17 @@ def test_backward_keeps_its_speed_beside_a_resident_kernel(
 
 @pytest.mark.parametrize("rows", (129, 4096, 16384))
 @pytest.mark.parametrize("hidden,residual", ROUTES, ids=lambda v: str(v))
-def test_dw_is_bitwise_independent_of_the_launch_grid(
+def test_outputs_do_not_depend_on_the_launch_grid(
     hidden: int, residual: bool, rows: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The chunk table depends on ``(rows, slots, rows_per_issue)`` only: launching fewer CTAs than
-    slots (they claim more chunks each) leaves every partial row, and so ``dw``, bitwise unchanged."""
+    slots (they claim more chunks each) leaves ``dx`` bitwise unchanged and ``dw`` within its budget,
+    and the CTA that finishes last still finds every other CTA counted."""
 
     _skip_unless_route(hidden, residual)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
-    workspace = cake_rmsnorm_train_backward_workspace(
-        rows, hidden, _device(), residual=residual
-    )
-    reference = _backward(x, w, g, g_h, rstd, workspace)[1].clone()
+    workspace = workspace_for(rows, hidden, _device(), residual=residual)
+    dx_ref, dw_ref = (t.clone() for t in _backward(x, w, g, g_h, rstd, workspace))
     production = loader.launch_grid
 
     def at(divisor: int):
@@ -241,19 +284,21 @@ def test_dw_is_bitwise_independent_of_the_launch_grid(
 
         return launch_grid
 
-    begin = loader.COUNTERS_BYTES
     for divisor in (2, 3) + (
         (10**9,) if rows <= 4096 else ()
     ):  # half, a third, one CTA
         monkeypatch.setattr(loader, "launch_grid", at(divisor))
-        # the first partial row: every chunk read must be rewritten
-        workspace[begin : begin + 4 * hidden].view(torch.float32).fill_(float("nan"))
-        dw = _backward(x, w, g, g_h, rstd, workspace)[1]
+        dx, dw = _backward(x, w, g, g_h, rstd, workspace)
         torch.cuda.synchronize()
-        assert torch.equal(dw, reference), (
-            f"hidden={hidden} rows={rows}: dw changed at grid / {divisor}"
+        assert torch.equal(dx, dx_ref), (
+            f"hidden={hidden} rows={rows}: dx changed at grid / {divisor}"
         )
-        assert torch.count_nonzero(workspace[: loader.COUNTERS_BYTES]) == 0
+        assert _rel_l2(dw, dw_ref) <= DW_REL_L2, (
+            f"hidden={hidden} rows={rows}: dw moved at grid / {divisor}"
+        )
+        assert _workspace_clean(workspace, hidden, residual), (
+            f"the workspace is not the kernels' state at grid / {divisor}"
+        )
     monkeypatch.setattr(loader, "launch_grid", production)
 
 
@@ -271,27 +316,85 @@ MAX_ALL_SM_EXTRA_MS = 1.0
 # cudaSharedmemCarveoutMaxShared
 CARVEOUT_MAX_SHARED = 100
 # Programs that need a whole SM wait beside a kernel resident on every SM
-# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_train`):
-# (capability, kind, hidden) -> the token counts above which the call does.
-WHOLE_SM_ABOVE = {
-    ((10, 7), "bwd", 1536): 1024,
-    ((10, 7), "bwd", 2048): 256,
-    ((10, 7), "bwd", 4096): 1024,
-    ((10, 7), "fwd", 6144): 4096,
-}
+# whatever its carveout: ``cake_windows.WHOLE_SM`` lists, per architecture and
+# route, the token-count ranges where this package runs the deterministic
+# package's whole-SM programs (its det-pair windows and forward); the backward
+# sections of the docstrings list them with the deterministic facade's remedy
+# (``cake_windows.WHOLE_SM_REMEDY``).  A call there is not measured
+# (det-inherited): the test checks that the call runs the deterministic
+# package's program and that the docstrings list the range, then skips.
 
 
-def _skip_if_whole_sm(kind: str, hidden: int, rows: int) -> None:
-    above = WHOLE_SM_ABOVE.get((_capability(), kind, hidden))
-    if above is not None and rows > above:
-        pytest.skip(
-            f"the {kind} of hidden={hidden} above {above} rows needs a whole SM"
-        )
+def _program_id(name: str) -> str:
+    """The program part of a module name (the digits after the package prefix,
+    without the ``__<above>_<at_most>`` window suffix of a record that splits a
+    det window)."""
+    return name.split("__", 1)[0].rsplit("_", 1)[1]
+
+
+def _skip_det_inherited_whole_sm(
+    kind: str, hidden: int, residual: bool, rows: int
+) -> None:
+    """Skip as not measured (det-inherited) when the call's token count is in a
+    ``WHOLE_SM`` range of its route, after checking that the call runs the
+    deterministic package's program (program-id equality of the main module) and
+    that the docstring section of ``kind`` lists the range with the remedy."""
+    arch = loader.arch_for_capability(_capability())
+    route = loader.route_key(hidden, kind, residual)
+    span = next(
+        (
+            (above, at_most)
+            for above, at_most in windows.WHOLE_SM.get(arch, {}).get(route, ())
+            if rows > above and (at_most is None or rows <= at_most)
+        ),
+        None,
+    )
+    if span is None:
+        return
+    det = _det_backend()
+    assert det is not None, (
+        f"{route} at {rows} rows is listed in WHOLE_SM: checking that it runs the "
+        "deterministic package's program needs that package"
+    )
+    mine = [
+        n
+        for n in loader.selected_modules(arch, hidden, kind, residual, rows=rows)
+        if loader.MODULES[n]["role"] != "bwd_reduce"
+    ]
+    theirs = [
+        n
+        for n in det.cake_jit.selected_modules(arch, hidden, kind, residual, rows=rows)
+        if det.cake_jit.MODULES[n]["role"] != "bwd_reduce"
+    ]
+    assert [_program_id(n) for n in mine] == [_program_id(n) for n in theirs], (
+        f"{route} at {rows} rows is listed in WHOLE_SM but runs {mine}, not the "
+        f"deterministic package's {theirs}"
+    )
+    section = " ".join(windows.SECTIONS[kind].split())
+    cells = ", ".join(
+        f"({low}, {'inf)' if high is None else f'{high}]'}"
+        for low, high in windows.WHOLE_SM[arch][route]
+    )
+    assert windows.WHOLE_SM_REMEDY in section, "the remedy is not documented"
+    assert f"* ``{arch}`` ``{route}``: {cells}" in section, (
+        f"the {kind} docstring section does not list {arch} {route} {cells}"
+    )
+    print(
+        f"ALL_SM_NOT_MEASURED det-inherited {arch} {route} rows={rows} "
+        f"range={span} program={_program_id(mine[0])}"
+    )
+    pytest.skip(
+        f"not measured (det-inherited): {arch} {route} at {rows} rows runs the "
+        f"deterministic package's whole-SM program {_program_id(mine[0])} "
+        f"(WHOLE_SM {span})"
+    )
 
 
 _SPIN_KERNEL = "cake_rmsnorm_train_stall_spin"
 _SPIN_SOURCE = r"""
 extern "C" __global__ void cake_rmsnorm_train_stall_spin(unsigned long long ns, int* smids) {
+    // The launch's dynamic shared memory (possibly none) is held for the CTA's
+    // lifetime without being touched.
     if (threadIdx.x == 0) {
         unsigned int smid;
         asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
@@ -315,9 +418,10 @@ def _checked(result):
 
 class _AllSmSpin:
     """A side kernel of one CTA per SM (NVRTC + driver API, so the preferred
-    shared-memory carveout can be set on it)."""
+    shared-memory carveout can be set on it), holding ``smem_bytes`` of dynamic
+    shared memory per CTA."""
 
-    def __init__(self, carveout: int) -> None:
+    def __init__(self, carveout: int, smem_bytes: int = 0) -> None:
         from cuda.bindings import driver, nvrtc
 
         self._driver = driver
@@ -346,6 +450,15 @@ class _AllSmSpin:
                 carveout,
             )
         )
+        self.smem_bytes = int(smem_bytes)
+        if self.smem_bytes:
+            _checked(
+                driver.cuFuncSetAttribute(
+                    self._func,
+                    driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    self.smem_bytes,
+                )
+            )
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.smids = torch.full((self.sms,), -1, dtype=torch.int32, device=device)
 
@@ -364,7 +477,7 @@ class _AllSmSpin:
                 ALL_SM_THREADS,
                 1,
                 1,
-                0,
+                self.smem_bytes,
                 self._driver.CUstream(stream.cuda_stream),
                 params,
                 0,
@@ -407,8 +520,8 @@ def _alone(call):
     return start.elapsed_time(end), out
 
 
-def _all_sm_medians(call, carveout: int):
-    spin = _AllSmSpin(carveout)
+def _all_sm_medians(call, carveout: int, smem_bytes: int = 0):
+    spin = _AllSmSpin(carveout, smem_bytes)
     side = torch.cuda.Stream()
     for _ in range(WARMUP):
         _alone(call)
@@ -437,25 +550,27 @@ def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     hidden: int, residual: bool, rows: int
 ) -> None:
     _skip_unless_route(hidden, residual)
-    _skip_if_whole_sm("bwd", hidden, rows)
+    _skip_det_inherited_whole_sm("bwd", hidden, residual, rows)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
-    workspace = cake_rmsnorm_train_backward_workspace(
-        rows, hidden, _device(), residual=residual
-    )
+    workspace = workspace_for(rows, hidden, _device(), residual=residual)
 
     def call():
-        return _backward(x, w, g, g_h, rstd, workspace)[1].clone()
+        return tuple(t.clone() for t in _backward(x, w, g, g_h, rstd, workspace))
 
     alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
     print(
         f"ALL_SM hidden={hidden} rows={rows} carveout=max_shared "
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
     )
-    reference = alone[0][1]
-    for _t, dw in alone[1:] + busy:
-        assert torch.equal(dw, reference), (
-            f"hidden={hidden} rows={rows}: dw differs beside the all-SM kernel"
+    dx_ref, dw_ref = alone[0][1]
+    for _t, (dx, dw) in alone[1:] + busy:
+        assert torch.equal(dx, dx_ref), (
+            f"hidden={hidden} rows={rows}: dx differs beside the all-SM kernel"
         )
+        assert _rel_l2(dw, dw_ref) <= DW_REL_L2, (
+            f"hidden={hidden} rows={rows}: dw moved beside the all-SM kernel"
+        )
+    assert _workspace_clean(workspace, hidden, residual)
     assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
         f"hidden={hidden} rows={rows}: backward alone {alone_ms:.4f} ms, beside an all-SM "
         f"kernel with the max-shared carveout {busy_ms:.4f} ms (at most "
@@ -463,27 +578,172 @@ def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     )
 
 
-@pytest.mark.parametrize("rows", ALL_SM_TOKENS)
-@pytest.mark.parametrize("hidden", [h for h, _eps in WIDTHS], ids=lambda v: str(v))
-def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
-    hidden: int, rows: int
-) -> None:
-    _skip_unless_route(hidden, False)
-    _skip_if_whole_sm("fwd", hidden, rows)
-    x, w, _g, _g_h, _rstd = _inputs(rows, hidden, False)
+# R3 C3: side kernels holding shared memory on every SM (one CTA per SM, the
+# max-shared carveout), KB of dynamic shared memory per CTA: the sizes of the
+# package's measured list (``cake_windows.SMEM_SIDE_KB`` / ``SMEM_WAITS``).
 
-    def call():
-        return cake_rmsnorm_train_forward(x, w, EPS[hidden])[0]
 
-    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
-    print(
-        f"ALL_SM_FWD hidden={hidden} rows={rows} carveout=max_shared "
-        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
+def _instances() -> list[tuple[str, int, bool, str, int, int | None, int, str]]:
+    """``(route, hidden, residual, w dtype token, above, at_most, rows, form)``
+    of every window of every backward route of the device (``rows`` the middle
+    token count of the window), ``form`` "single" or "pair"."""
+    arch = loader.arch_for_capability(_capability())
+    out = []
+    for route, names in loader.ROUTES.get(arch, {}).items():
+        if not route.startswith("bwd"):
+            continue
+        hidden = int(route.rsplit("_h", 1)[1])
+        residual = "_residual" in route
+        token = "f32" if "_w32" in route else "bf16"
+        for name in names:
+            record = loader.MODULES[name]
+            rule = record["workspace_rule"]
+            if rule is None:
+                continue  # a dw reduce: launched with its main record
+            window = record["select_rule"]
+            above = 0 if window is None else int(window["above"])
+            at_most = None if window is None else window["at_most"]
+            rows = (
+                max(above + 1, min(2 * above, 65536))
+                if at_most is None
+                else (above + 1 + int(at_most)) // 2
+            )
+            form = "single" if rule["kind"] == "claim_sum_f64" else "pair"
+            out.append((route, hidden, residual, token, above, at_most, rows, form))
+    return sorted(set(out), key=lambda item: (item[0], item[4]))
+
+
+def _det_backend():
+    try:
+        return cake_package("cake_rmsnorm_det_train")
+    except Exception:  # noqa: BLE001 - a vendored run has no det package
+        return None
+
+
+def _det_serves(det, hidden: int, residual: bool) -> bool:
+    return det is not None and det.cake_jit.route_applies(
+        device_capability=_capability(),
+        hidden=hidden,
+        kind="bwd",
+        residual=residual,
     )
-    reference = alone[0][1]
-    for _t, y in alone[1:] + busy:
-        assert torch.equal(y, reference)
-    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
-        f"hidden={hidden} rows={rows}: forward alone {alone_ms:.4f} ms, beside an all-SM "
-        f"kernel with the max-shared carveout {busy_ms:.4f} ms (at most {MAX_ALL_SM_EXTRA_MS} ms more)"
+
+
+def _waits_beside(call, smem_kb: int) -> tuple[bool, float]:
+    """Whether ``call`` waits for an all-SM kernel holding ``smem_kb`` KB per
+    CTA, and its extra time (ms) beside it over alone."""
+    alone_ms, busy_ms, _alone, _busy = _all_sm_medians(
+        call, CARVEOUT_MAX_SHARED, smem_kb * 1024
+    )
+    extra = busy_ms - alone_ms
+    return extra > MAX_ALL_SM_EXTRA_MS, extra
+
+
+def _waits_below(measured: int | None, listed: int | None) -> bool:
+    """Whether a window measured to wait from ``measured`` KB waits beside a
+    smaller side allocation than its ``listed`` level allows (None: no wait at
+    any measured size)."""
+    return measured is not None and (listed is None or measured < listed)
+
+
+def test_backward_beside_an_all_sm_kernel_holding_shared_memory() -> None:
+    """R3 C3 (see the module docstring): per shipped backward window, the
+    smallest of ``SMEM_SIDE_KB`` beside which the call waits (extra time above
+    ``MAX_ALL_SM_EXTRA_MS``; the side kernel lives ``ALL_SM_SPIN_MS``) is not
+    below the package's documented ``SMEM_WAITS`` entry (the most restrictive
+    level over the architecture's measured boards; a board that waits only at a
+    larger size prints ``SMEM_WAITS_LOOSER``), and every window of the device's
+    architecture has one.  The deterministic program the window replaces (for an
+    FP32-weight twin: its BF16 owner's, called with the BF16 weight; where the
+    det package serves the call) is measured beside it for reference."""
+    optin = torch.cuda.get_device_properties(_device()).shared_memory_per_block_optin
+    sizes = tuple(kb for kb in windows.SMEM_SIDE_KB if kb * 1024 <= optin)
+    if not sizes:
+        pytest.skip(f"no side size of {windows.SMEM_SIDE_KB} KB fits {optin} B per CTA")
+    arch = loader.arch_for_capability(_capability())
+    listed = {
+        (route, above, at_most): kb
+        for route, spans in windows.SMEM_WAITS.get(arch, {}).items()
+        for above, at_most, kb in spans
+    }
+    det = _det_backend()
+    instances = _instances()
+    assert instances
+    report, mismatched, looser, unmeasured, regressions = [], [], [], [], []
+    for route, hidden, residual, token, above, at_most, rows, form in instances:
+        x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
+        if token == "f32":
+            w = w.float()
+        workspace = workspace_for(rows, hidden, _device(), residual=residual)
+
+        def call():
+            return tuple(t.clone() for t in _backward(x, w, g, g_h, rstd, workspace))
+
+        level, extras = None, []
+        for kb in sizes:
+            waited, extra = _waits_beside(call, kb)
+            extras.append(extra)
+            if waited and level is None:
+                level = kb
+        assert _workspace_clean(workspace, hidden, residual)
+        det_level, det_extras = None, []
+        if _det_serves(det, hidden, residual):
+            w_det = w.to(torch.bfloat16)
+            det_ws = det.cake_rmsnorm_det_train_backward_workspace(
+                rows, hidden, _device(), residual=residual
+            )
+            kwargs = {"workspace": det_ws}
+            if g_h is not None:
+                kwargs["g_residual"] = g_h
+
+            def det_call():
+                out = det.cake_rmsnorm_det_train_backward(g, x, w_det, rstd, **kwargs)
+                return tuple(t.clone() for t in out)
+
+            for kb in sizes:
+                waited, extra = _waits_beside(det_call, kb)
+                det_extras.append(extra)
+                if waited and det_level is None:
+                    det_level = kb
+        key = (route, above, at_most)
+        if key not in listed:
+            unmeasured.append((key, level))
+        elif _waits_below(level, listed[key]):
+            mismatched.append((key, listed[key], level))
+        elif listed[key] != level:
+            looser.append((key, listed[key], level))
+        if (
+            level is not None
+            and det_extras
+            and (det_level is None or det_level > level)
+        ):
+            regressions.append((key, level, det_level))
+        report.append(
+            f"SMEM_SIDE {arch} {route} ({above}, {at_most}] rows={rows} form={form} "
+            f"waits_from_kb={level} extra_ms="
+            + "/".join(f"{e:.4f}" for e in extras)
+            + " det_waits_from_kb="
+            + (
+                f"{det_level} det_extra_ms=" + "/".join(f"{e:.4f}" for e in det_extras)
+                if det_extras
+                else "n/a"
+            )
+        )
+    # a leading newline: under pytest -s the progress dots precede the first line
+    print("\n" + "\n".join(report))
+    for key, listed_kb, level in looser:
+        print(
+            f"SMEM_WAITS_LOOSER {arch} {key[0]} ({key[1]}, {key[2]}) "
+            f"listed={listed_kb} measured={level}"
+        )
+    for key, level in unmeasured:
+        print(f"SMEM_WAITS_MEASURED {arch} {key[0]} ({key[1]}, {key[2]}, {level})")
+    print(f"SMEM_REGRESSIONS_VS_DET {regressions}")
+    assert not mismatched, (
+        f"windows that wait beside less shared memory than their SMEM_WAITS entry "
+        f"allows (key, listed KB, measured KB): {mismatched}"
+    )
+    assert not unmeasured, (
+        f"{len(unmeasured)} backward windows of {arch} have no SMEM_WAITS entry "
+        f"(measured levels printed as SMEM_WAITS_MEASURED): {unmeasured[:6]}"
     )

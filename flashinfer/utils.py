@@ -271,6 +271,49 @@ def _get_cache_buf(
     return buf
 
 
+_stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
+# Per-device private pools keep these long-lived buffers out of CUDA graph pools.
+_stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
+
+
+def _get_stream_cache_buf(
+    name: str, num_bytes: int, device: torch.device, zero_init: bool = False
+) -> torch.Tensor:
+    """Return the ``name`` scratch buffer owned by ``device``'s current CUDA stream.
+
+    Same contract as :func:`_get_cache_buf`, keyed additionally by the raw
+    ``cudaStream_t`` handle of the current stream. Launches on one stream are
+    ordered, so a kernel that leaves the buffer in a known state at exit can
+    reuse it on the next launch without re-initialising it; launches on
+    different streams are not ordered, so each stream gets its own buffer
+    (flashinfer-ai/flashinfer#3618). PyTorch draws stream handles from a fixed
+    per-device pool, which bounds the number of buffers.
+
+    Under CUDA graph capture the key is the capture stream, so graphs captured
+    on one stream share the buffer. That is safe only for stateless scratch and
+    only if those graphs never replay concurrently.
+    """
+    key = (name, device, torch.cuda.current_stream(device).cuda_stream)
+    buf = _stream_cache_buf.get(key)
+    if buf is None or buf.size(0) < num_bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        pool = _stream_cache_mem_pools.get(index)
+        if pool is None:
+            with torch.cuda.device(index):
+                pool = _stream_cache_mem_pools[index] = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool, device=index):
+            if zero_init:
+                buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+            else:
+                buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+        _stream_cache_buf[key] = buf
+    return buf
+
+
 # find the least power of 2 that is greater than or equal to x
 def _ceil_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
@@ -319,6 +362,16 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
         raise ValueError("device must be a cuda device")
     properties = get_device_properties(device)
     return properties.major, properties.minor
+
+
+def _check_block_scale_quantization_support(device: torch.device, op_name: str) -> None:
+    # The CUDA quantization kernels have no implementation below SM100.
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                f"{op_name} requires SM100 or newer; got SM{major}{minor}"
+            )
 
 
 # trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the

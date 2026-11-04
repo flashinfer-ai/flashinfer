@@ -27,25 +27,31 @@ PROCESS_CLEANUP_TIMEOUT_S = 30.0
 # from TWO_SHOT_MIN_TOKENS[4] tokens and at world size 8 from TWO_SHOT_MIN_TOKENS[8]
 # tokens, in its deferred form from TWO_SHOT_DEFER_MIN_TOKENS tokens except at world
 # size 8 for top_k 4 without a shared expert and without the NVFP4 epilogue (output
-# profile 110). Other batches of up to SMALL_TOKEN_MAX tokens run the small-token
-# program, which still runs up to SMALL_TOKEN_EXTENDED_MAX tokens at world sizes 2 and 4
-# except for top_k 4 without a shared expert (while the device holds that many
-# small-token clusters). Above that, the two-shot program runs at world size 8, the
-# large-token program at world size 2 for top_k 4 above LARGE_TOKEN_MIN_TOKENS tokens
-# (LARGE_TOKEN_MIN_TOKENS_SHARED with a shared expert) and the persistent program
-# otherwise.
+# profile 110), and otherwise in its early form up to TWO_SHOT_EARLY_MAX_TOKENS
+# tokens. Other batches of up to SMALL_TOKEN_MAX tokens run the small-token
+# program, which still runs up to SMALL_TOKEN_EXTENDED_MAX tokens at world size 4, and
+# at world size 2 except for top_k 4 without a shared expert (while the device holds
+# that many small-token clusters). Above that, the two-shot program runs at world
+# size 8, the large-token program at world size 2 for top_k 4 above
+# LARGE_TOKEN_MIN_TOKENS tokens (LARGE_TOKEN_MIN_TOKENS_SHARED with a shared expert),
+# the quad program at world size 2 up to W2_QUAD_MAX_TOKENS tokens and the persistent
+# program otherwise.
 SMALL_TOKEN_EXTENDED_MAX = 71
 TWO_SHOT_MIN_TOKENS = {4: 72, 8: 56}
 TWO_SHOT_DEFER_MIN_TOKENS = {4: 1536, 8: 768}
+TWO_SHOT_EARLY_MAX_TOKENS = {4: 128, 8: 128}
 LARGE_TOKEN_MIN_TOKENS = 512
 LARGE_TOKEN_MIN_TOKENS_SHARED = 1280
+W2_QUAD_MAX_TOKENS = 142
 # SM count at which the small-token program holds SMALL_TOKEN_EXTENDED_MAX clusters (B200, B300).
 SMALL_TOKEN_EXTENDED_MIN_SMS = 148
 _PROGRAM_SUFFIX = {
     "small": "_small",
     "two_shot": "_ts",
     "two_shot_defer": "_tsd",
+    "two_shot_early": "_tse",
     "large_token": "_lt",
+    "quad": "_quad",
     "persistent": "",
 }
 
@@ -180,6 +186,8 @@ def _token_counts(world_size: int) -> tuple[int, ...]:
             TWO_SHOT_MIN_TOKENS[world_size],
             TWO_SHOT_DEFER_MIN_TOKENS[world_size] - 1,
             TWO_SHOT_DEFER_MIN_TOKENS[world_size],
+            TWO_SHOT_EARLY_MAX_TOKENS[world_size],
+            TWO_SHOT_EARLY_MAX_TOKENS[world_size] + 1,
         }
     if world_size == 2:
         tokens |= {
@@ -187,6 +195,8 @@ def _token_counts(world_size: int) -> tuple[int, ...]:
             LARGE_TOKEN_MIN_TOKENS + 1,
             LARGE_TOKEN_MIN_TOKENS_SHARED,
             LARGE_TOKEN_MIN_TOKENS_SHARED + 1,
+            W2_QUAD_MAX_TOKENS,
+            W2_QUAD_MAX_TOKENS + 1,
         }
     return tuple(sorted(tokens))
 
@@ -217,6 +227,9 @@ def _expected_program(
             and not use_shared
             and output_profile == "110"
         )
+        else "two_shot_early"
+        if world_size in TWO_SHOT_EARLY_MAX_TOKENS
+        and tokens <= TWO_SHOT_EARLY_MAX_TOKENS[world_size]
         else "two_shot"
     )
     if world_size in TWO_SHOT_MIN_TOKENS and tokens >= TWO_SHOT_MIN_TOKENS[world_size]:
@@ -224,10 +237,8 @@ def _expected_program(
     if tokens <= SMALL_TOKEN_MAX:
         return "small"
     if (
-        world_size != 8
-        and (top_k != 4 or use_shared)
-        and tokens <= SMALL_TOKEN_EXTENDED_MAX
-    ):
+        world_size == 4 or (world_size == 2 and (top_k != 4 or use_shared))
+    ) and tokens <= SMALL_TOKEN_EXTENDED_MAX:
         return "small"
     if world_size == 8:
         return two_shot
@@ -236,6 +247,8 @@ def _expected_program(
     )
     if world_size == 2 and top_k == 4 and tokens > large_token_min:
         return "large_token"
+    if world_size == 2 and tokens <= W2_QUAD_MAX_TOKENS:
+        return "quad"
     return "persistent"
 
 

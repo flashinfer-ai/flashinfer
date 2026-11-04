@@ -46,6 +46,20 @@ alone for a ``fold`` build; a ``persistent`` build launches ``min_blocks``
 CTAs per SM per KV head (at most one per item) on the x axis, each striding
 over the request and row items of its KV head.
 
+Every stage shipped on SM100 / SM103 has a *pdl twin* ``<stage>_pdl``: the
+same build with ``pdl`` set, whose kernel waits for the preceding kernel on
+the stream (``griddepcontrol.wait``) before it reads ``qkv`` and before any
+store, launched with the programmatic-stream-serialization attribute.  A call
+that asks for programmatic dependent launch (``stage_for(...,
+enable_pdl=True)``) takes a twin when :func:`pdl_knobs` admits the problem
+(``PDL_POLICY``): the selected stage's, or for the single-KV-head clearing
+class the prefetching stage's; every other call, and every call on SM90,
+launches the plain stage.  The twins of the prefetching stages take one more
+launch argument, ``max_ctas_per_sm`` (:func:`cta_cap`): when it is positive,
+the binding launches at the smallest dynamic shared memory that holds the
+kernel to that many CTAs per SM, so CTAs that start while the preceding
+kernel still holds SMs do not pile up on the SMs it has already left.
+
 The program name ``cake_fused_qk_rope_fp8_append_<20 hex>`` is the first
 twenty hex digits of the SHA-256 of the compact JSON ``{"build": <build
 keywords, sorted>, "module": <dotted kernel module>}`` of the kernel the
@@ -124,6 +138,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": False,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_ddc461f6feaaa3960c3c",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ddc461f6feaaa3960c3c",
@@ -231,6 +246,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": True,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
@@ -337,6 +353,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": False,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_4bf37605f76680f21880",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_4bf37605f76680f21880",
@@ -441,6 +458,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": True,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
@@ -548,6 +566,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": True,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
@@ -654,6 +673,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": False,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f",
@@ -759,6 +779,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": False,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_343d43791fe5ef7ca3fe",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_343d43791fe5ef7ca3fe",
@@ -864,6 +885,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": True,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
@@ -970,6 +992,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": True,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
@@ -1074,6 +1097,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 256,
             "clear_tie": False,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_d2029163a92958e54025",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_d2029163a92958e54025",
@@ -1179,6 +1203,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 256,
             "clear_tie": False,
             "persistent": False,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_79aed55694e2358f81b9",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_79aed55694e2358f81b9",
@@ -1285,6 +1310,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "zero_store_width": 128,
             "clear_tie": False,
             "persistent": True,
+            "pdl": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
@@ -1333,6 +1359,1172 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fp8_e4m3_min_blocks10_persistent1",
         "workspace_rule": None,
     },
+    "fp8_e4m3_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": False,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_e73f28eebd75e81c4e5a",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_e73f28eebd75e81c4e5a",
+        # The pdl twin of ``fp8_e4m3``: it waits for the preceding kernel before it
+        # reads ``qkv`` and before any store; launched with the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_e73f28eebd75e81c4e5a",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_early_rt21_fold1_clear_tie1_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": True,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": True,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": True,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_2b22148a1adbe7bd7243",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_2b22148a1adbe7bd7243",
+        # The pdl twin of ``fp8_e4m3_early_rt21_fold1_clear_tie1``: it waits for the
+        # preceding kernel before it reads ``qkv`` and before any store; launched with
+        # the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_2b22148a1adbe7bd7243",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_early_rt21_fold1_clear_tie1_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_min_blocks10_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 10,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": False,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_970b1eca3d270b6b5295",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_970b1eca3d270b6b5295",
+        # The pdl twin of ``fp8_e4m3_min_blocks10``: it waits for the preceding kernel
+        # before it reads ``qkv`` and before any store; launched with the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_970b1eca3d270b6b5295",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_min_blocks10_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1_pdl": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["parameter", "max_ctas_per_sm"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 9,
+            "scan_rounds": 1,
+            "early_rt2": True,
+            "page_prefetch": True,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": True,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_9d2f3fca109ad1967f88",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9d2f3fca109ad1967f88",
+        # The pdl twin of ``fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1``:
+        # it waits for the preceding kernel before it reads ``qkv`` and before any
+        # store; launched with the PDL attribute and, where ``cta_cap`` asks for it,
+        # with the dynamic shared memory that holds the kernel to ``max_ctas_per_sm``
+        # CTAs per SM.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_9d2f3fca109ad1967f88",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_ctas_per_sm": "max_ctas_per_sm",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_grid_order2_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "kv_heads_by_rows_plus_requests",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 2,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": False,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_c6cfda2693fa25567a7c",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_c6cfda2693fa25567a7c",
+        # The pdl twin of ``fp8_e4m3_grid_order2``: it waits for the preceding kernel
+        # before it reads ``qkv`` and before any store; launched with the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_c6cfda2693fa25567a7c",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_grid_order2_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_grid_order3_pdl": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 3,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": False,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_e7f3a1b5240591767419",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_e7f3a1b5240591767419",
+        # The pdl twin of ``fp8_e4m3_grid_order3``: it waits for the preceding kernel
+        # before it reads ``qkv`` and before any store; launched with the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_e7f3a1b5240591767419",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_grid_order3_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["parameter", "max_ctas_per_sm"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": True,
+            "page_prefetch": True,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": True,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_371b6c27760107c6590c",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_371b6c27760107c6590c",
+        # The pdl twin of ``fp8_e4m3_early_rt21_page_prefetch1_clear_tie1``: it waits
+        # for the preceding kernel before it reads ``qkv`` and before any store;
+        # launched with the PDL attribute and, where ``cta_cap`` asks for it, with the
+        # dynamic shared memory that holds the kernel to ``max_ctas_per_sm`` CTAs per
+        # SM.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_371b6c27760107c6590c",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_ctas_per_sm": "max_ctas_per_sm",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_scan_rounds3_clear_tie1_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 3,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": True,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_6536a9a12938a3d1cf29",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_6536a9a12938a3d1cf29",
+        # The pdl twin of ``fp8_e4m3_scan_rounds3_clear_tie1``: it waits for the
+        # preceding kernel before it reads ``qkv`` and before any store; launched with
+        # the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_6536a9a12938a3d1cf29",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_scan_rounds3_clear_tie1_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_clear_heads_per_cta2_zero_store_width256_pdl": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 2,
+            "zero_store_width": 256,
+            "clear_tie": False,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_fb3739e5bca806f31d58",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_fb3739e5bca806f31d58",
+        # The pdl twin of ``fp8_e4m3_clear_heads_per_cta2_zero_store_width256``: it
+        # waits for the preceding kernel before it reads ``qkv`` and before any store;
+        # launched with the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_fb3739e5bca806f31d58",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_clear_heads_per_cta2_zero_store_width256_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_grid_order3_zero_store_width256_pdl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "rows_plus_requests_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 0,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 3,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 256,
+            "clear_tie": False,
+            "persistent": False,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_2ef375faed8ade7ff55f",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_2ef375faed8ade7ff55f",
+        # The pdl twin of ``fp8_e4m3_grid_order3_zero_store_width256``: it waits for the
+        # preceding kernel before it reads ``qkv`` and before any store; launched with
+        # the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_2ef375faed8ade7ff55f",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_grid_order3_zero_store_width256_pdl",
+        "workspace_rule": None,
+    },
+    "fp8_e4m3_min_blocks10_persistent1_pdl": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "persistent_items_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 10,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": False,
+            "persistent": True,
+            "pdl": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_9814c5c125cf36cb2f85",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9814c5c125cf36cb2f85",
+        # The pdl twin of ``fp8_e4m3_min_blocks10_persistent1``: it waits for the
+        # preceding kernel before it reads ``qkv`` and before any store; launched with
+        # the PDL attribute.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_9814c5c125cf36cb2f85",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_min_blocks10_persistent1_pdl",
+        "workspace_rule": None,
+    },
 }
 
 # One verified build per architecture: H100 / H200 (``sm_90a``), B200
@@ -1355,7 +2547,8 @@ FP8_MAX = 448.0
 SUPPORTED_HEADS = ((8, 1), (64, 8))
 # The build keywords a record's ``knobs`` carry, in the kernel file's ``build``
 # signature order: what the policy, the launch grid and the kernel's own symbol
-# are derived from.
+# are derived from.  The last, ``pdl``, is the programmatic-dependent-launch
+# build of a pdl twin.
 KNOB_KEYS = (
     "min_blocks",
     "scan_rounds",
@@ -1368,6 +2561,7 @@ KNOB_KEYS = (
     "zero_store_width",
     "clear_tie",
     "persistent",
+    "pdl",
 )
 # The Cake stage policy: the per-card constants and the rule of this round
 # (``version`` is the policy table's).  ``policy_knobs`` is the executable form.
@@ -1387,6 +2581,7 @@ STAGE_POLICY: dict[str, Any] = {
         "b300_er2pp9_min_ctas": 512,
         "persistent_max_requests": 16,
         "persistent_min_waves": 4.0,
+        "gb300_persistent_min_rows_per_request": 64,
     },
     "rule": (
         "num_requests == 0 -> the default build (every card: the early_rt2 "
@@ -1407,7 +2602,11 @@ STAGE_POLICY: dict[str, Any] = {
         "prefill beyond one wave -> grid_order=3 if order_ok else min_blocks=10; "
         "one-wave prefill -> s3. u2z = clear_heads_per_cta=2, "
         "zero_store_width=256; u2z_class = decode and Hkv == 1 and u2z_ctas[0] <= "
-        "(num_rows + num_requests) * Hkv <= u2z_ctas[1]. gb300: u2z_class -> u2z; "
+        "(num_rows + num_requests) * Hkv <= u2z_ctas[1]. gb300: is_prefill and 1 "
+        "<= num_requests <= persistent_max_requests and waves > "
+        "persistent_min_waves and num_rows >= "
+        "gb300_persistent_min_rows_per_request * num_requests -> min_blocks=10, "
+        "persistent; u2z_class -> u2z; "
         "prefetch_ok and (decode or Hkv == 1) -> er2pp9; not order_ok -> the "
         "default build; is_prefill and Hkv >= fold_min_kv_heads and num_requests "
         ">= swap_min_requests and num_rows + num_requests <= 65535 -> "
@@ -1430,7 +2629,53 @@ STAGE_POLICY: dict[str, Any] = {
         "prefetch_ok and (decode or Hkv == 1) -> early_rt2, page_prefetch, "
         "clear_tie; else the default build"
     ),
-    "version": "round3-v13-2026-10-29",
+    "version": "round3-v14-2026-10-29",
+}
+# The suffix of a pdl twin's record name (``stage_name`` of knobs with ``pdl``).
+PDL_SUFFIX = "_pdl"
+# Which calls that ask for programmatic dependent launch take which pdl twin,
+# and the CTA cap of a prefetching twin's launch; ``pdl_knobs`` and ``cta_cap``
+# are the executable form.  The twin overlaps the kernel's metadata prologue
+# (and, behind a kernel that triggers its dependents early, its launch) with the
+# preceding kernel; the problems the rule keeps plain are those where no twin
+# ran faster, and the stage it swaps in is the twin that ran fastest behind the
+# QKV projection.  CTAs that start while the preceding kernel still holds SMs
+# pile up on the SMs it has already left; the cap holds the prefetching kernel
+# to the CTAs per SM its grid needs where that ran faster.
+PDL_POLICY: dict[str, Any] = {
+    "arches": ("sm_100a", "sm_103a"),
+    "constants": {
+        "hq8_decode_off_requests": {"sm_100a": (129, 223), "sm_103a": (187, 223)},
+        "hq64_off_min_rows": 240,
+        "gb200_sms": 152,
+        "cap_min_ctas_per_sm": 2,
+        "hq8_decode_cap_min_requests": {
+            "b200": 129,
+            "gb200": 177,
+            "b300": 187,
+            "gb300": 187,
+        },
+    },
+    "rule": (
+        "enable_pdl and arch in arches and not off -> the pdl twin of the pdl "
+        "stage, else the plain stage. pdl card = gb200 (sm_100a and num_sms == "
+        "gb200_sms) else the stage policy's card; decode = (num_rows == "
+        "num_requests and not is_prefill); prefetch_ok as in the stage policy; "
+        "prefetching stage = early_rt2 and page_prefetch. pdl stage = the plain "
+        "stage, except (Hq, Hkv) == (8, 1) with the plain stage clear_heads_per_cta=2, "
+        "zero_store_width=256 or grid_order=3, zero_store_width=256 (the clearing "
+        "class) and (pdl card != gb300 or prefetch_ok) -> early_rt2, "
+        "page_prefetch, clear_tie. off = (Hq, Hkv) == (64, 8) and num_rows >= "
+        "hq64_off_min_rows, or (Hq, Hkv) == (8, 1) and decode and lo <= "
+        "num_requests <= hi for (lo, hi) = hq8_decode_off_requests[arch] and the "
+        "pdl stage is no prefetching stage, or any other head configuration. "
+        "max_ctas_per_sm of a prefetching twin's launch = k = ceil(grid CTAs / "
+        "num_sms) when (Hq, Hkv) == (8, 1), k >= cap_min_ctas_per_sm and (not "
+        "decode or num_requests >= hq8_decode_cap_min_requests[pdl card]), else 0; "
+        "a positive k launches at the smallest dynamic shared memory that holds "
+        "the kernel to k CTAs per SM (none when it already holds at most k)"
+    ),
+    "version": "pdl2-2026-10-31",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -1585,6 +2830,17 @@ def policy_knobs(
         and int(low_ctas) <= (rows + requests) * kv_heads <= int(high_ctas)
     )
     if which == "gb300":
+        if (
+            prefill
+            and requests <= int(constants["persistent_max_requests"])
+            and waves > constants["persistent_min_waves"]
+            and rows
+            >= int(constants["gb300_persistent_min_rows_per_request"]) * requests
+        ):
+            # Round three (r11): prefill of a few requests beyond four waves
+            # with at least 64 rows per request takes the persistent build;
+            # shorter requests keep the swapped order.
+            return {"min_blocks": 10, "persistent": True}
         if u2z_class:
             return u2z
         if prefetch_ok and (decode or kv_heads == 1):
@@ -1674,12 +2930,172 @@ def policy_knobs(
     return {}
 
 
+def pdl_card(arch: str, num_sms: int) -> str:
+    """The PDL policy's card: the stage policy's :func:`card`, with ``gb200``
+    for sm_100a with ``gb200_sms`` SMs."""
+
+    if arch == "sm_100a" and int(num_sms) == PDL_POLICY["constants"]["gb200_sms"]:
+        return "gb200"
+    return card(arch, num_sms)
+
+
+def prefetching(knobs: dict[str, int | bool]) -> bool:
+    """Whether a stage is the early request guess with the page-row prefetch:
+    its pdl twin takes the per-call CTA cap (:func:`cta_cap`)."""
+
+    return bool(knobs.get("early_rt2", False)) and bool(
+        knobs.get("page_prefetch", False)
+    )
+
+
+def pdl_knobs(
+    num_q_heads: int,
+    num_kv_heads: int,
+    knobs: dict[str, int | bool],
+    *,
+    arch: str,
+    num_rows: int,
+    num_requests: int,
+    num_sms: int,
+    is_prefill: bool,
+    max_pages_per_request: int,
+    has_out_kv: bool,
+) -> dict[str, int | bool] | None:
+    """The knobs of the pdl twin a call that asks for programmatic dependent
+    launch takes, given the ``knobs`` the stage policy selected for it
+    (``PDL_POLICY``), or ``None`` when the call launches the plain stage.
+
+    The single-KV-head clearing class (two KV heads per clearing CTA, or B200's
+    clear-first order, with 256-bit zero stores) takes the prefetching stage's
+    twin, on GB300 only where the prefetch serves the page row; the twin of a
+    prefetching stage also serves the single-KV-head decode window that keeps
+    every other stage plain.  Decode is ``num_rows == num_requests`` without
+    ``is_prefill``, as in the stage policy.
+    """
+
+    if arch not in PDL_POLICY["arches"]:
+        return None
+    constants = PDL_POLICY["constants"]
+    heads = (int(num_q_heads), int(num_kv_heads))
+    if heads == (64, 8):
+        if int(num_rows) >= int(constants["hq64_off_min_rows"]):
+            return None
+        return {**knobs, "pdl": True}
+    if heads != (8, 1):
+        return None
+    clearing = (
+        {"clear_heads_per_cta": 2, "zero_store_width": 256},
+        {"grid_order": 3, "zero_store_width": 256},
+    )
+    if knobs in clearing:
+        prefetch_ok = int(max_pages_per_request) <= int(
+            STAGE_POLICY["constants"]["prefetch_max_pages"]
+        ) and not bool(has_out_kv)
+        if pdl_card(arch, num_sms) != "gb300" or prefetch_ok:
+            knobs = {"early_rt2": True, "page_prefetch": True, "clear_tie": True}
+    low, high = constants["hq8_decode_off_requests"][arch]
+    decode = int(num_rows) == int(num_requests) and not bool(is_prefill)
+    if decode and int(low) <= int(num_requests) <= int(high) and not prefetching(knobs):
+        return None
+    return {**knobs, "pdl": True}
+
+
+def pdl_enabled(
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    arch: str,
+    num_rows: int,
+    num_requests: int,
+    page_size: int,
+    num_sms: int,
+    is_prefill: bool,
+    max_pages_per_request: int,
+    has_out_kv: bool,
+    quant_policy: int | None = None,
+) -> bool:
+    """Whether a call that asks for programmatic dependent launch takes a pdl
+    twin (:func:`pdl_knobs` of the stage the policy selects)."""
+
+    knobs = policy_knobs(
+        num_q_heads,
+        num_kv_heads,
+        arch=arch,
+        num_rows=num_rows,
+        num_requests=num_requests,
+        page_size=page_size,
+        num_sms=num_sms,
+        is_prefill=is_prefill,
+        max_pages_per_request=max_pages_per_request,
+        has_out_kv=has_out_kv,
+        quant_policy=quant_policy,
+    )
+    return (
+        pdl_knobs(
+            num_q_heads,
+            num_kv_heads,
+            knobs,
+            arch=arch,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            num_sms=num_sms,
+            is_prefill=is_prefill,
+            max_pages_per_request=max_pages_per_request,
+            has_out_kv=has_out_kv,
+        )
+        is not None
+    )
+
+
+def cta_cap(
+    record: dict[str, Any],
+    *,
+    arch: str,
+    num_sms: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_rows: int,
+    num_requests: int,
+    is_prefill: bool,
+    grid: tuple[int, int, int],
+) -> int:
+    """``max_ctas_per_sm`` of one launch of a prefetching stage's pdl twin
+    (``PDL_POLICY``): the grid's CTAs per SM, rounded up, for a single-KV-head
+    call from ``cap_min_ctas_per_sm`` of them (decode from the card's
+    ``hq8_decode_cap_min_requests``), else 0 (no cap).  The binding launches a
+    positive cap at the smallest dynamic shared memory that holds the kernel to
+    that many CTAs per SM, and plainly when the kernel already holds at most
+    that many.
+    """
+
+    knobs = record["knobs"]
+    if not (knobs.get("pdl", False) and prefetching(knobs)):
+        return 0
+    if (int(num_q_heads), int(num_kv_heads)) != (8, 1):
+        return 0
+    constants = PDL_POLICY["constants"]
+    ctas = int(grid[0]) * int(grid[1]) * int(grid[2])
+    cap = -(-ctas // int(num_sms))
+    if cap < int(constants["cap_min_ctas_per_sm"]):
+        return 0
+    decode = int(num_rows) == int(num_requests) and not bool(is_prefill)
+    if decode:
+        floor = constants["hq8_decode_cap_min_requests"][pdl_card(arch, num_sms)]
+        if int(num_requests) < int(floor):
+            return 0
+    return cap
+
+
 def stage_name(knobs: dict[str, int | bool]) -> str:
     """Stage name of one policy outcome: ``fp8_e4m3`` (the default build) plus
-    ``_<knob><int>`` per knob set, in ``KNOB_KEYS`` order."""
+    ``_<knob><int>`` per knob set, in ``KNOB_KEYS`` order, then ``_pdl`` for a
+    pdl twin."""
 
-    return STAGE + "".join(
-        f"_{key}{int(knobs[key])}" for key in KNOB_KEYS if key in knobs
+    suffix = PDL_SUFFIX if knobs.get("pdl", False) else ""
+    return (
+        STAGE
+        + "".join(f"_{key}{int(knobs[key])}" for key in KNOB_KEYS[:-1] if key in knobs)
+        + suffix
     )
 
 
@@ -1696,10 +3112,12 @@ def stage_for(
     max_pages_per_request: int,
     has_out_kv: bool,
     quant_policy: int | None = None,
+    enable_pdl: bool = False,
 ) -> str:
     """The module record the policy selects for one problem on ``arch`` with
     ``num_sms`` SMs; a stage the package does not ship for the architecture is an
-    error, never a silent fallback."""
+    error, never a silent fallback.  ``enable_pdl`` asks for a pdl twin, which
+    the call takes when :func:`pdl_knobs` admits the problem."""
 
     knobs = policy_knobs(
         num_q_heads,
@@ -1714,6 +3132,21 @@ def stage_for(
         has_out_kv=has_out_kv,
         quant_policy=quant_policy,
     )
+    if enable_pdl:
+        twin = pdl_knobs(
+            num_q_heads,
+            num_kv_heads,
+            knobs,
+            arch=arch,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            num_sms=num_sms,
+            is_prefill=is_prefill,
+            max_pages_per_request=max_pages_per_request,
+            has_out_kv=has_out_kv,
+        )
+        if twin is not None:
+            knobs = twin
     name = stage_name(knobs)
     shipped = stages_for(arch)
     if name not in shipped:
@@ -1842,20 +3275,37 @@ def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
 
     ``values`` maps the logical names in ``LOGICAL_TENSORS`` / ``LOGICAL_SCALARS``
     to tensors and Python scalars; the grid is :func:`launch_grid` of the record
-    for the problem the scalars describe, and the kernel runs on the current
-    torch stream.
+    for the problem the scalars describe, ``max_ctas_per_sm`` (a prefetching
+    pdl twin's) is :func:`cta_cap` of that launch, and the kernel runs on the
+    current torch stream.
     """
 
     record = MODULES[name]
     logical = record["logical"]
+    num_sms = sm_count(device_index)
     grid = launch_grid(
         record,
         num_rows=int(values["num_rows"]),
         num_requests=int(values["num_requests"]),
         num_kv_heads=int(values["num_kv_heads"]),
-        num_sms=sm_count(device_index),
+        num_sms=num_sms,
     )
     grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+    if "max_ctas_per_sm" in logical:
+        values = {
+            **values,
+            "max_ctas_per_sm": cta_cap(
+                record,
+                arch=device_arch(device_index),
+                num_sms=num_sms,
+                num_q_heads=int(values["num_q_heads"]),
+                num_kv_heads=int(values["num_kv_heads"]),
+                num_rows=int(values["num_rows"]),
+                num_requests=int(values["num_requests"]),
+                is_prefill=bool(values["is_prefill"]),
+                grid=grid,
+            ),
+        }
     args = []
     for kind, key in record["arg_plan"]:
         if kind == "grid":
@@ -1881,17 +3331,24 @@ __all__ = [
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MODULES",
+    "PDL_POLICY",
+    "PDL_SUFFIX",
     "STAGE",
     "STAGE_POLICY",
     "SUPPORTED_HEADS",
     "THREADS",
     "arch_for_capability",
     "card",
+    "cta_cap",
     "device_arch",
     "launch_grid",
     "library_name",
     "load",
+    "pdl_card",
+    "pdl_enabled",
+    "pdl_knobs",
     "policy_knobs",
+    "prefetching",
     "run_module",
     "sm_count",
     "specs_for_arch",

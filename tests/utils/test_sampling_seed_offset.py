@@ -34,11 +34,18 @@ SAMPLERS = [
     "top_k_top_p_logits",
 ]
 RNG_SHAPES = [(4, 4), (1, 4), (4, 1), (1, 1)]
+# 32000 and 151936 reach the SM90 split-row kernel with 4- and 8-CTA clusters.
+SPLIT_ROW_SAMPLERS = ["top_k", "top_p", "top_k_top_p"]
+SAMPLER_VOCAB_SIZES = [(name, 257) for name in SAMPLERS] + [
+    (name, vocab_size) for name in SPLIT_ROW_SAMPLERS for vocab_size in [32000, 151936]
+]
 
 
-def _sampler(name, indexed):
+def _sampler(name, indexed, vocab_size=257):
     generator = torch.Generator(device="cuda").manual_seed(42)
-    logits = torch.randn(3 if indexed else 4, 257, device="cuda", generator=generator)
+    logits = torch.randn(
+        3 if indexed else 4, vocab_size, device="cuda", generator=generator
+    )
     probs = torch.softmax(logits, dim=-1)
     # RNG arrays describe output rows, including repeated/gathered input rows.
     indices = (
@@ -101,12 +108,14 @@ def _assert_scalar_reference(sample, actual, seed, offset):
             torch.testing.assert_close(output[row], reference[row], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("name", SAMPLERS)
+@pytest.mark.parametrize("name,vocab_size", SAMPLER_VOCAB_SIZES)
 @pytest.mark.parametrize("indexed", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("seed_size,offset_size", RNG_SHAPES)
-def test_sampling_row_seed_offset(name, indexed, dtype, seed_size, offset_size):
-    sample = _sampler(name, indexed)
+def test_sampling_row_seed_offset(
+    name, vocab_size, indexed, dtype, seed_size, offset_size
+):
+    sample = _sampler(name, indexed, vocab_size)
     seed, offset = _rng_tensors(seed_size, offset_size, dtype)
     actual = sample(seed=seed, offset=offset)
     _assert_scalar_reference(sample, actual, seed, offset)

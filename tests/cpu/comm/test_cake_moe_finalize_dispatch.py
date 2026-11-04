@@ -218,6 +218,8 @@ def _program_table(binding: str, name: str) -> list[str | None]:
         ("kLargeTokenKernels", "_lt", (2,)),
         ("kTwoShotKernels", "_ts", (4, 8)),
         ("kTwoShotDeferKernels", "_tsd", (4, 8)),
+        ("kTwoShotEarlyKernels", "_tse", (4, 8)),
+        ("kW2QuadKernels", "_quad", (2,)),
     ],
 )
 def test_program_tables_list_one_program_kind(
@@ -254,6 +256,8 @@ def test_program_tables_cover_the_module_records() -> None:
             "kLargeTokenKernels",
             "kTwoShotKernels",
             "kTwoShotDeferKernels",
+            "kTwoShotEarlyKernels",
+            "kW2QuadKernels",
         )
         for kernel in _program_table(binding, table)
         if kernel is not None
@@ -262,3 +266,268 @@ def test_program_tables_cover_the_module_records() -> None:
     assert set(tabled) == {
         record["kernel"] for record in cake_moe_finalize_comm.MODULES.values()
     }
+
+
+def _small_token_test(binding: str) -> tuple[str, str]:
+    """The binding's small_token_extended class term and the condition of the branch
+    that runs the small-token program, as Python expressions over the call's world_size,
+    top_k, v_has_shared_expert, tokens and small_token_max, the binding's constant
+    kSmallTokenExtendedMax and the device's small-token cluster capacity (capacity)."""
+    extended = re.search(r"const bool small_token_extended =\s*([^;]+);", binding)
+    branch = re.search(
+        r"\} else if \((tokens <= small_token_max \|\|.*?)\) \{", binding, re.S
+    )
+    assert extended is not None and branch is not None
+    expressions = tuple(
+        " ".join(match.group(1).split())
+        .replace("cluster_capacity(small_token)", "capacity")
+        .replace("&&", "and")
+        .replace("||", "or")
+        for match in (extended, branch)
+    )
+    names = {
+        "world_size",
+        "top_k",
+        "v_has_shared_expert",
+        "tokens",
+        "small_token_max",
+        "small_token_extended",
+        "kSmallTokenExtendedMax",
+        "capacity",
+        "and",
+        "or",
+    }
+    for expression in expressions:
+        assert set(re.findall(r"[A-Za-z_]\w*", expression)) <= names, expression
+        assert set(re.sub(r"[\w\s]|==|!=|<=|\(|\)", "", expression)) == set()
+    return expressions
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_small_token_extension_covers_every_class_at_world_size_4(
+    small_token_max: int,
+) -> None:
+    """Above small_token_max, up to kSmallTokenExtendedMax tokens within the small-token
+    program's cluster capacity run the small-token program at world size 4 for every
+    class, at world size 2 for every class but top_k 4 without a shared expert, and
+    never at world size 8."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    extended_max = re.findall(
+        r"^constexpr int64_t kSmallTokenExtendedMax = (\d+);$", binding, re.M
+    )
+    assert extended_max == ["71"]
+    extended_expression, branch_expression = _small_token_test(binding)
+    extended_code = compile(extended_expression, "small_token_extended", "eval")
+    branch_code = compile(branch_expression, "small_token_branch", "eval")
+    for world_size in (2, 4, 8):
+        for top_k in (4, 8):
+            for use_shared in (False, True):
+                scope: dict[str, object] = {
+                    "world_size": world_size,
+                    "top_k": top_k,
+                    "v_has_shared_expert": int(use_shared),
+                    "small_token_max": small_token_max,
+                    "kSmallTokenExtendedMax": 71,
+                }
+                extended = world_size == 4 or (
+                    world_size == 2 and (top_k != 4 or use_shared)
+                )
+                scope["small_token_extended"] = eval(
+                    extended_code, {"__builtins__": {}}, scope
+                )
+                assert scope["small_token_extended"] == extended
+                for capacity in (0, small_token_max + 1, 70, 71, 148):
+                    for tokens in range(1, 80):
+                        scope.update(tokens=tokens, capacity=capacity)
+                        expected = tokens <= small_token_max or (
+                            extended and tokens <= 71 and tokens <= capacity
+                        )
+                        assert (
+                            eval(branch_code, {"__builtins__": {}}, scope) == expected
+                        ), (world_size, top_k, use_shared, capacity, tokens)
+
+
+def _as_python(expression: str) -> str:
+    """A selection expression of the binding as Python: its (world_size == 8 ? A : B)
+    choices, an outer (C) ? A : B, the null tests and the logical operators."""
+    expression = " ".join(expression.split())
+    expression = re.sub(
+        r"\(world_size == 8 \? (\w+) : (\w+)\)",
+        r"(\1 if world_size == 8 else \2)",
+        expression,
+    )
+    outer = re.fullmatch(r"\((.*)\) \? (\w+) : (\w+)", expression)
+    if outer is not None:
+        expression = f"({outer.group(2)} if ({outer.group(1)}) else {outer.group(3)})"
+    return (
+        expression.replace(" != nullptr", " is not None")
+        .replace("&&", "and")
+        .replace("||", "or")
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_two_shot_early_program_runs_up_to_128_tokens(world_size: int) -> None:
+    """At small_token_max 16, the binding runs a two-shot batch of up to 128 tokens on
+    the two-shot early program and one of 129 tokens on the two-shot program, at world
+    sizes 4 and 8 (and the world size 8 batches above small_token_max that the
+    small-token program does not take, from 17 tokens); the choice reads the token count
+    and the world size alone."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (kTwoShot\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kTwoShotEarlyMaxTokensWorldSize4"] == 128
+    assert constants["kTwoShotEarlyMaxTokensWorldSize8"] == 128
+    early_now = re.search(r"const void\* two_shot_now =(.*?);", binding, re.S)
+    first = re.search(r"if \((two_shot != nullptr &&.*?)\) \{", binding, re.S)
+    above_small = re.search(
+        r"\} else if \((two_shot != nullptr && world_size == 8)\) \{", binding
+    )
+    assert early_now is not None and first is not None and above_small is not None
+    two_shot_kernel = "kernel = two_shot_deferred ? two_shot_defer : two_shot_now;"
+    assert binding.count(two_shot_kernel) == 2
+    _, branch_expression = _small_token_test(binding)
+    codes = {
+        name: compile(_as_python(expression), name, "eval")
+        for name, expression in (
+            ("two_shot_now", early_now.group(1)),
+            ("two_shot_first", first.group(1)),
+            ("two_shot_above_small", above_small.group(1)),
+            ("small_token", branch_expression),
+        )
+    }
+
+    def program(tokens: int) -> str:
+        scope: dict[str, object] = {
+            **constants,
+            "world_size": world_size,
+            "top_k": 8,
+            "v_has_shared_expert": 1,
+            "tokens": tokens,
+            "small_token_max": 16,
+            "small_token_extended": world_size == 4,
+            "kSmallTokenExtendedMax": 71,
+            "capacity": 0,
+            "two_shot": "_ts",
+            "two_shot_early": "_tse",
+        }
+        if eval(codes["two_shot_first"], {"__builtins__": {}}, scope):
+            return eval(codes["two_shot_now"], {"__builtins__": {}}, scope)
+        if eval(codes["small_token"], {"__builtins__": {}}, scope):
+            return "_small"
+        if eval(codes["two_shot_above_small"], {"__builtins__": {}}, scope):
+            return eval(codes["two_shot_now"], {"__builtins__": {}}, scope)
+        return "persistent"
+
+    assert program(128) == "_tse"
+    assert program(129) == "_ts"
+    assert program(16) == "_small"
+    assert program(17) == ("_tse" if world_size == 8 else "persistent")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_world_size_2_quad_program_runs_up_to_142_tokens(small_token_max: int) -> None:
+    """At world size 2, a batch the small-token program does not take runs the quad
+    program up to 142 tokens and the persistent program from 143 tokens, below the
+    large-token program's range; the choice reads the token count and the world size
+    alone. World sizes 4 and 8 have no quad program."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (k\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kW2QuadMaxTokens"] == 142
+    quad = re.search(
+        r"\} else if \((w2_quad != nullptr && tokens <= kW2QuadMaxTokens)\) \{", binding
+    )
+    large = re.search(
+        r"\} else if \((large_token != nullptr &&.*?)\) \{", binding, re.S
+    )
+    assert quad is not None and large is not None
+    # The quad test follows the large-token test and precedes the persistent default.
+    assert large.start() < quad.start()
+    assert re.search(
+        r"kernel = w2_quad;\s*\} else \{\s*kernel = kKernels\[", binding[quad.start() :]
+    )
+    _, branch_expression = _small_token_test(binding)
+    shared_choice = re.compile(r"\(v_has_shared_expert != 0 \? (\w+) : (\w+)\)")
+    codes = {
+        name: compile(
+            _as_python(
+                shared_choice.sub(
+                    r"(\1 if v_has_shared_expert != 0 else \2)",
+                    " ".join(expression.split()),
+                )
+            ),
+            name,
+            "eval",
+        )
+        for name, expression in (
+            ("quad", quad.group(1)),
+            ("large_token", large.group(1)),
+            ("small_token", branch_expression),
+        )
+    }
+
+    def program(world_size: int, tokens: int, top_k: int, use_shared: bool) -> str:
+        scope: dict[str, object] = {
+            **constants,
+            "world_size": world_size,
+            "top_k": top_k,
+            "v_has_shared_expert": int(use_shared),
+            "tokens": tokens,
+            "small_token_max": small_token_max,
+            "small_token_extended": world_size == 4
+            or (world_size == 2 and (top_k != 4 or use_shared)),
+            "capacity": 71,
+            "large_token": "_lt" if world_size == 2 else None,
+            "w2_quad": "_quad" if world_size == 2 else None,
+        }
+        if eval(codes["small_token"], {"__builtins__": {}}, scope):
+            return "_small"
+        if eval(codes["large_token"], {"__builtins__": {}}, scope):
+            return "_lt"
+        if eval(codes["quad"], {"__builtins__": {}}, scope):
+            return "_quad"
+        return "persistent"
+
+    for top_k in (4, 8):
+        for use_shared in (False, True):
+            extended = top_k != 4 or use_shared
+            for tokens in (64, 65, 71, 72):
+                expected = (
+                    "_small"
+                    if tokens <= small_token_max or (extended and tokens <= 71)
+                    else "_quad"
+                )
+                assert program(2, tokens, top_k, use_shared) == expected, (
+                    top_k,
+                    use_shared,
+                    tokens,
+                )
+            assert program(2, 141, top_k, use_shared) == "_quad"
+            assert program(2, 142, top_k, use_shared) == "_quad"
+            assert program(2, 143, top_k, use_shared) == "persistent"
+            assert program(2, small_token_max + 1, top_k, use_shared) == (
+                "_small" if extended and small_token_max < 71 else "_quad"
+            )
+            for world_size in (4, 8):
+                assert program(world_size, 100, top_k, use_shared) != "_quad"

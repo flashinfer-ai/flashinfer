@@ -17,11 +17,13 @@ limitations under the License.
 # Experimental Cake backend: deterministic GDN (Gated DeltaNet) chunked
 # training (head dimension 128, chunk 64) on SM100 / SM103 / SM107, with FLA's
 # ``chunk_gated_delta_rule`` signature and no context parallelism.  The
-# public entry point is ``chunk_gated_delta_rule``; the chunk and segment
-# tables, the scan planner, the launch order and the autograd chain live in
-# ``cake_chain``, the registry in ``cake_jit`` and the loader in
-# ``cake_backend``.  Every plan pin is an explicit keyword argument; the
-# package reads no environment variable.
+# public entry point is ``chunk_gated_delta_rule_det``; the former names
+# ``chunk_gated_delta_rule``, ``ChunkGatedDeltaRuleFunction``,
+# ``gdn_chunk_forward`` and ``gdn_chunk_backward`` stay as aliases of the det
+# names.  The chunk and segment tables, the scan planner, the launch order and
+# the autograd chain live in ``cake_chain``, the registry in ``cake_jit`` and
+# the loader in ``cake_backend``.  Every plan pin is an explicit keyword
+# argument; the package reads no environment variable.
 
 from .cake_chain import (
     CHUNK,
@@ -31,6 +33,7 @@ from .cake_chain import (
     PRESCAN_CONFIGS,
     REG_SCAN_CONFIGS,
     ChainOptions,
+    ChunkGatedDeltaRuleDetFunction,
     ChunkGatedDeltaRuleFunction,
     ChunkMeta,
     ScanPlan,
@@ -41,14 +44,18 @@ from .cake_chain import (
     build_chunk_meta_from_cu_seqlens,
     choose_scan_plan,
     chunk_gated_delta_rule,
+    chunk_gated_delta_rule_det,
     dhu_tc_pricing,
     finalize_stage,
     gdn_chunk_backward,
+    gdn_chunk_det_backward,
+    gdn_chunk_det_forward,
     gdn_chunk_forward,
     lpt_sequence_order,
     lpt_walk,
     make_options,
     scan_plans,
+    sdt_pricing,
     sequence_groups,
     stage_set,
     two_stream_split,
@@ -63,6 +70,7 @@ __all__ = [
     "PRESCAN_CONFIGS",
     "REG_SCAN_CONFIGS",
     "ChainOptions",
+    "ChunkGatedDeltaRuleDetFunction",
     "ChunkGatedDeltaRuleFunction",
     "ChunkMeta",
     "ScanPlan",
@@ -73,14 +81,18 @@ __all__ = [
     "build_chunk_meta_from_cu_seqlens",
     "choose_scan_plan",
     "chunk_gated_delta_rule",
+    "chunk_gated_delta_rule_det",
     "dhu_tc_pricing",
     "finalize_stage",
     "gdn_chunk_backward",
+    "gdn_chunk_det_backward",
+    "gdn_chunk_det_forward",
     "gdn_chunk_forward",
     "lpt_sequence_order",
     "lpt_walk",
     "make_options",
     "scan_plans",
+    "sdt_pricing",
     "sequence_groups",
     "stage_set",
     "two_stream_split",

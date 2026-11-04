@@ -538,19 +538,19 @@ kernel_cake_kimi_k3_fp8_projection_12bc0d7938b4dae5d828(const __grid_constant__ 
                 _phase_mainloop_done ^= 1;
                 unsigned int epi_base = smem_epi_addr + (unsigned int)(epi_group * 16384);
                 if (split == 1) {
-                    unsigned int slot_rel = (unsigned int)(epi_group * 16384);
-                    unsigned int slot_addr = smem_epi_addr + slot_rel;
+                    unsigned int slot_rel_0 = (unsigned int)(epi_group * 16384);
+                    unsigned int slot_addr_0 = smem_epi_addr + slot_rel_0;
                     if (epi_warp == 0) {
                         asm volatile("cp.async.bulk.wait_group.read 0;");
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync %0, 128;" :: "r"(2 + epi_group) : "memory");
                     #pragma unroll
-                    for (int t = 0; t < 32; t++) {
+                    for (int t_0 = 0; t_0 < 32; t_0++) {
                         {
-                            __nv_bfloat16 _bval_0 = __float2bfloat16_rn(_tmem_load_0[t]);
+                            __nv_bfloat16 _bval_0 = __float2bfloat16_rn(_tmem_load_0[t_0]);
                             uint16_t _bits_0 = *(uint16_t*)&_bval_0;
-                            uint32_t _addr_0 = static_cast<uint32_t>(smem_epi_addr + (slot_rel + (unsigned int)(t * 256 + lane_row * 2)));
+                            uint32_t _addr_0 = static_cast<uint32_t>(smem_epi_addr + (slot_rel_0 + (unsigned int)(t_0 * 256 + lane_row * 2)));
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_0), "h"(_bits_0) : "memory");
                         }
                     }
@@ -558,15 +558,15 @@ kernel_cake_kimi_k3_fp8_projection_12bc0d7938b4dae5d828(const __grid_constant__ 
                     asm volatile("barrier.sync %0, 128;" :: "r"(2 + epi_group) : "memory");
                     if (epi_warp == 0) {
                         if (elect_sync()) {
-                            tma_store_2d((&OUT), n_tile_e * 128, tok0 + tok_g0, slot_addr);
+                            tma_store_2d((&OUT), n_tile_e * 128, tok0 + tok_g0, slot_addr_0);
                             asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                 } else {
                     unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_2) * 4096 + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128;
                     #pragma unroll
-                    for (int t_1 = 0; t_1 < 32; t_1++) {
-                        partials[pbase + (unsigned long long)(t_1 * 128)] = _tmem_load_0[t_1];
+                    for (int t = 0; t < 32; t++) {
+                        partials[pbase + (unsigned long long)(t * 128)] = _tmem_load_0[t];
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 1, 128;" ::: "memory");

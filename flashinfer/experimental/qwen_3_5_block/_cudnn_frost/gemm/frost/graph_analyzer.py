@@ -9,7 +9,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from math import isfinite
+from math import isfinite, prod
 from typing import Any
 
 import flashinfer.experimental.qwen_3_5_block._cudnn_frost as cudnn
@@ -33,6 +33,8 @@ from .fusion_ir import (
 )
 
 # Dtype + op tables
+
+from .layouts import fold_batch_layout
 
 from .dtypes import CUDNN_FROM_DTYPE as _CUDNN_FROM_DTYPE
 from .dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -133,6 +135,7 @@ class _RecordedOp:
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
     group_offset: int | None = None
+    permutation: tuple[int, ...] = ()
 
 
 @dataclass
@@ -149,6 +152,8 @@ class _TensorMeta:
     output_index: int | None = None
     explicit_dtype: Any = None
     dim_override: tuple[int, ...] | None = None
+    mn_transposed: bool | None = None  # None for ordinary bindings; bool for a normalized caller-axis view
+    matrix_batch: tuple[int, ...] | None = None  # original leading axes before rank normalization
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -168,6 +173,12 @@ class GemmBinding:
     token_index: Any = None
     token_ks: Any = None
     top_k_scores: Any = None
+    # Empty: historical graph/kernel-order binding. Nonempty: original graph axes,
+    # with the recorded M/N parity (including False when transposes cancel).
+    a_transposed: tuple[bool, ...] = ()
+    b_transposed: tuple[bool, ...] = ()
+    aux_transposed: tuple[bool, ...] = ()
+    matrix_batches: tuple[tuple[Any, tuple[int, ...]], ...] = ()
 
     def bound_tensors(self) -> list[Any]:
         """List tensors bound by this GEMM plan."""
@@ -187,7 +198,8 @@ class GemmBinding:
             ts.append(self.token_ks)
         if self.top_k_scores is not None:
             ts.append(self.top_k_scores)
-        return [t for t in ts if t is not None]
+        # A shared input can occupy different roles/views but has one caller binding.
+        return list({id(t): t for t in ts if t is not None}.values())
 
 
 def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
@@ -205,6 +217,10 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         token_index=binding.token_index,
         token_ks=binding.token_ks,
         top_k_scores=binding.top_k_scores,
+        a_transposed=binding.b_transposed,
+        b_transposed=binding.a_transposed,
+        aux_transposed=binding.aux_transposed,
+        matrix_batches=binding.matrix_batches,
     )
 
 
@@ -221,6 +237,7 @@ def _make_multi_binding(
     token_index=None,
     token_ks=None,
     top_k_scores=None,
+    aux_refs=(),
 ) -> GemmBinding:
     """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE):
     the cuDNN tensor per distinct A/B slot (+ its SF for block-scale) from ``meta``."""
@@ -233,6 +250,12 @@ def _make_multi_binding(
                 objs.append(meta[sid].tensor)
         return objs
 
+    def _transpose_flags(ids):
+        """Collect prepared transpose flags for bound tensors in caller coordinates."""
+        return tuple(bool(meta[i].mn_transposed) for i in ids) if any(meta[i].mn_transposed is not None for i in ids) else ()
+
+    views = {(m.name, id(m.tensor)): bool(m.mn_transposed) for m in meta.values() if m.mn_transposed is not None}
+    matrix_batches = {id(m.tensor): (m.tensor, m.matrix_batch) for m in meta.values() if m.matrix_batch is not None}
     return GemmBinding(
         a_operands=[meta[i].tensor for i in a_ids],
         b_operands=[meta[i].tensor for i in b_ids],
@@ -244,6 +267,10 @@ def _make_multi_binding(
         token_index=token_index,
         token_ks=token_ks,
         top_k_scores=top_k_scores,
+        a_transposed=_transpose_flags(a_ids),
+        b_transposed=_transpose_flags(b_ids),
+        aux_transposed=tuple(views.get((ref.name, id(tensor)), False) for ref, tensor in zip(aux_refs, aux_objs)) if views else (),
+        matrix_batches=tuple(matrix_batches.values()),
     )
 
 
@@ -354,6 +381,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
         return _RecordedOp("matmul", name, [id(A), id(B)], id(out), out, compute_dtype=compute)
+    if node_type == "TRANSPOSE":
+        inp, out = node.inputs["input"], node.outputs["OUT_0"]
+        return _RecordedOp("transpose", name, [id(inp)], id(out), out, permutation=tuple(node.params.get("permutation") or ()))
     if node_type == "MOE_GROUPED_MATMUL":
         tok = node.inputs["token"]
         weight = node.inputs["weight"]
@@ -1151,8 +1181,12 @@ def _output_layouts(dense_entries, quant_recs, meta):
 
     for _di in range(len(dense_entries)):
         _spec_i, _obj_i = dense_entries[_di]
-        _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
-        _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
+        _m_i = meta.get(id(_obj_i))
+        if _m_i is not None and _m_i.matrix_batch is not None:
+            _d_i, _s_i = _m_i.dim, _m_i.stride
+        else:
+            _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
+            _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
         if (not _d_i or not _s_i) and _spec_i.quant_idx is not None:
             _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
             if _meta_i is not None:
@@ -1498,6 +1532,169 @@ def _build_multi_moe_chain(
         top_k_scores=scores_meta.tensor if scores_meta is not None else None,
     )
     return chain, binding
+
+
+def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
+    """Resolve logical shapes, project operand transposes, then fold the kernel ABI.
+
+    One immutable producer map and one logical-shape cache serve both steps.
+    Only the analysis snapshot changes; original tensors, pointwise dtypes and
+    observable epilogue branches retain their caller coordinates.
+    """
+    transposes = [op for op in ops if op.cudnn_name == "transpose"]
+    matmuls = [op for op in ops if op.cudnn_name == "matmul"]
+    if len(matmuls) != 1 or any(op.cudnn_name in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops):
+        if transposes:
+            raise ValueError("operand transpose fusion requires one plain matmul (no MoE or block-scale dequantize)")
+        return ops
+    # Specialized graph families keep their existing lowering and support gates.
+    fold_batches = all(op.cudnn_name in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "matmul", "transpose") for op in ops)
+    if not transposes and not fold_batches:
+        return ops
+    mm = matmuls[0]
+    producers = {op.output: op for op in ops}
+    used_transposes, projected_ops = set(), []
+    names = {m.name for m in meta.values()}
+
+    @lru_cache(maxsize=None)
+    def shape(tid):
+        """Infer logical dimensions before transpose projection or batch folding."""
+        m, op = meta[tid], producers.get(tid)
+        if op is None:
+            return m.dim
+        dims = [shape(i) for i in op.inputs]
+        if op.cudnn_name == "transpose":
+            dim = dims[0]
+            identity = tuple(range(len(dim)))
+            swap = (*identity[:-2], len(dim) - 1, len(dim) - 2)
+            if len(dim) < 2 or op.permutation not in (identity, swap):
+                raise ValueError(f"operand transpose {op.op_name!r}: only identity or last-two matrix axes may be permuted; batch axes must stay fixed")
+            expected = tuple(dim[i] for i in op.permutation)
+        elif op.cudnn_name == "matmul":
+            a, b = dims
+            if len(a) != len(b) or len(a) < 2 or a[-1] != b[-2]:
+                raise ValueError(f"matrix rank or contraction mismatch: A={a}, B={b}")
+            if any(x != y and x != 1 and y != 1 for x, y in zip(a[:-2], b[:-2])):
+                raise ValueError(f"matrix batch dimensions do not broadcast: A={a}, B={b}")
+            expected = (*map(max, zip(a[:-2], b[:-2])), a[-2], b[-1])
+        elif op.cudnn_name in (*_UNARY_OP_MAP, *_BINARY_OP_MAP):
+            rank = max(map(len, dims))
+            padded = [(1,) * (rank - len(d)) + d for d in dims]
+            if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*padded)):
+                raise ValueError(f"operand pointwise {op.op_name!r}: incompatible broadcast shapes {dims}")
+            expected = tuple(map(max, zip(*padded)))
+        else:
+            return m.dim  # specialized outputs are handled by their own lowerer
+        if m.dim and m.dim != expected:
+            raise ValueError(f"operand node {op.op_name!r}: expected output shape {expected}, got {m.dim}")
+        return expected
+
+    @lru_cache(maxsize=None)
+    def dtype(tid):
+        """Resolve each node dtype while rejecting conversion through a transpose."""
+        op, m = producers.get(tid), meta[tid]
+        if op is not None and op.cudnn_name == "transpose":
+            expected = dtype(op.inputs[0])
+            declared = _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta) if m.dtype is not None else expected
+            if declared != expected:
+                raise ValueError(f"operand transpose {op.op_name!r}: dtype changes are unsupported ({expected} -> {declared})")
+            return expected
+        return m.dtype if op is None else _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta)
+
+    def alias(tid, transposed):
+        """Create private view metadata without changing the original graph tensor."""
+        m, dim = meta[tid], shape(tid)
+        if transposed and len(dim) < 2:
+            if dim and all(d == 1 for d in dim):
+                return tid  # a scalar broadcast is invariant under the permutation
+            raise ValueError(f"operand transpose input {m.name!r}: expected matrix rank >= 2, got {dim}")
+        stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+        if transposed:
+            dim, stride = (*dim[:-2], dim[-1], dim[-2]), (*stride[:-2], stride[-1], stride[-2])
+        name = f"{m.name}_mn_view"
+        while name in names:
+            name += "_"
+        names.add(name)
+        view = replace(m, name=name, dim=dim, stride=stride, dtype=dtype(tid), mn_transposed=transposed)
+        meta[id(view)] = view
+        return id(view)
+
+    @lru_cache(maxsize=None)
+    def project(tid, transposed=False):
+        """Push a matrix permutation through an unobservable operand pointwise DAG."""
+        op = producers.get(tid)
+        if op is None:
+            return alias(tid, transposed)
+        if op.cudnn_name not in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "transpose"):
+            raise ValueError(f"operand transpose path {op.op_name!r}: unsupported producer {op.cudnn_name!r}")
+        if meta[tid].output_index is not None:
+            raise ValueError(f"operand transpose path {op.op_name!r}: materialized intermediate outputs cannot be absorbed")
+        if op.cudnn_name == "transpose":
+            shape(tid)
+            dtype(tid)
+            used_transposes.add(tid)
+            return project(op.inputs[0], transposed ^ (op.permutation != tuple(range(len(op.permutation)))))
+        inputs = [project(i, transposed) for i in op.inputs]
+        output = alias(tid, transposed)
+        projected_ops.append(replace(op, inputs=inputs, output=output))
+        return output
+
+    if transposes:
+        inputs = [project(i) for i in mm.inputs]
+        if len(used_transposes) != len(transposes):
+            raise ValueError("transpose fusion is operand-only; epilogue or unrelated transposes are unsupported")
+        # Original branches can still reference these logical outputs after the
+        # operand-only rewrite removes their transpose producers.
+        for op in transposes:
+            tid = op.output
+            if not meta[tid].dim:
+                meta[tid] = replace(meta[tid], dim=shape(tid))
+        ops = [replace(op, inputs=inputs) if op is mm else op for op in ops if op.cudnn_name != "transpose"] + projected_ops
+    if fold_batches:
+        batch_shape = shape(mm.output)[:-2]
+        ranked_shapes = {tid: shape(tid) for tid in meta}
+        output_dim = ranked_shapes[mm.output]
+        matrix_views_required = bool(transposes) or output_dim != (prod(batch_shape), *output_dim[-2:])
+        # Index attributes describe the original logical tensor, not the kernel
+        # ABI. Only the final two axes have a one-to-one folded coordinate.
+        normalized_ops = []
+        for op in ops:
+            if op.cudnn_name == "gen_index":
+                rank = len(ranked_shapes[op.inputs[0]])
+                axis = dict(op.op_attrs).get("axis")
+                if axis not in (rank - 2, rank - 1):
+                    raise NotImplementedError(
+                        f"gen_index {op.op_name!r}: batch axis {axis} is unsupported; "
+                        f"only logical matrix axes {rank - 2} (M) and {rank - 1} (N) are supported"
+                    )
+                attrs = tuple((key, axis - rank + 3 if key == "axis" else value) for key, value in op.op_attrs)
+                op = replace(op, op_attrs=attrs)
+            normalized_ops.append(op)
+        ops = normalized_ops
+        for tid, m in list(meta.items()):
+            dim = ranked_shapes[tid]
+            if len(dim) < 2:
+                continue  # rank-one/scalar auxiliary ABI is already supported
+            prefix = dim[:-2]
+            width = max(len(prefix), len(batch_shape))
+            padded = (1,) * (width - len(prefix)) + prefix
+            expected_batch = (1,) * (width - len(batch_shape)) + batch_shape
+            if padded != expected_batch and any(d != 1 for d in padded):
+                raise ValueError(
+                    f"matrix input {m.name!r}: partial/crossed batch broadcasting cannot be represented by one batch stride; got {prefix}, output {batch_shape}"
+                )
+            stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+            layout_dim, layout_stride = fold_batch_layout(dim, stride, writable=_is_output(meta, tid), allow_identity_broadcast=not matrix_views_required)
+            meta[tid] = replace(
+                m,
+                dim=layout_dim,
+                stride=layout_stride,
+                # Identity geometry already binds through the existing ABI checks.
+                # Only prepare runtime views when the graph or this slot needs one.
+                matrix_batch=prefix if matrix_views_required or dim != layout_dim else None,
+                mn_transposed=False if m.is_input and m.mn_transposed is None and dim != layout_dim else m.mn_transposed,
+            )
+    return ops
 
 
 def _walk_mainloop_chain(
@@ -1913,6 +2110,7 @@ def _build_multi_gemm_chain(
         output_objs,
         aux_objs,
         block_scale_spec is not None,
+        aux_refs=aux_tensors,
     )
     return chain, binding
 
@@ -1947,9 +2145,11 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     """Lower one graph metadata snapshot."""
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
+    meta = dict(state["tensor_meta"])
+    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
     return _build_chain(
-        state["ops"],
-        state["tensor_meta"],
+        ops,
+        meta,
         state["io_dtype"],
         state["intermediate_dtype"],
         state["compute_dtype"],

@@ -2573,7 +2573,15 @@ class CuteDslConfig:
     """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    ``swap_ab=True`` selects the Blackwell activations-on-B implementation and
+    its 16-row gated weight layout. Prepare weights with the same option.
+    ``prepare_weights`` is static: even when called through a config instance,
+    pass ``swap_ab=True`` explicitly to select that layout.
+    W4A16 always uses activations on B; False selects its in-kernel transpose
+    for compatibility with the original 64-row layout.
     """
+
+    swap_ab: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -2592,12 +2600,14 @@ class CuteDslConfig:
         activation: Optional[ActivationConfig] = None,
         device=None,
         nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+        swap_ab: bool = False,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
         (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
+        ``swap_ab`` must match the layer's ``CuteDslConfig.swap_ab``.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2616,6 +2626,7 @@ class CuteDslConfig:
             activation=activation,
             device=device,
             nvfp4_4over6=nvfp4_4over6,
+            swap_ab=swap_ab,
         )
 
     @staticmethod
@@ -2637,6 +2648,8 @@ class CuteDslConfig:
         return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
+        if self.swap_ab:
+            return "CuteDslConfig(swap_ab=True)"
         return "CuteDslConfig()"
 
 
@@ -3455,6 +3468,14 @@ class MoEConfig:
         # Not in check_support(): MoELayer swallows its exceptions to filter
         # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
+        if (
+            len({c.swap_ab for c in self.backend if isinstance(c, CuteDslConfig)}) > 1
+            and self.activation.is_gated
+        ):
+            raise ValueError(
+                "Mixed CuteDslConfig swap_ab modes need separate gated weight "
+                "views; use a separate MoELayer for each mode."
+            )
 
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
@@ -3796,8 +3817,8 @@ class MoEWeightPack:
     ``get_view(key)``.
 
     Holding multiple materializations is intentional — that's the memory cost
-    the user pays for cross-backend autotune.  Each view is the exact kwargs
-    dict that runner's ``forward`` expects for weight-side arguments.
+    the user pays for cross-backend autotune.  Each view contains the weight
+    tensors and layout metadata consumed by its runner.
 
     Every ``XxxConfig.prepare_weights`` takes the same canonical source
     layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
@@ -3806,14 +3827,14 @@ class MoEWeightPack:
     want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "
