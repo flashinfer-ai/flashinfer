@@ -1503,10 +1503,11 @@ def test_graph_replay_checkpoint_replays_the_eager_checkpoint_programs(
 
 def _size_rule_at(kcp, monkeypatch, rows: int) -> None:
     """The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` at ``rows`` on every architecture
-    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default)."""
+    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default), with an empty architecture cache."""
     table = {arch: rows for arch in kcp.GRAPH_RECOMPUTE_MIN_ROWS}
     monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS", table)
     monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT", rows)
+    monkeypatch.setattr(kcp, "_GRAPH_RECOMPUTE_ARCH", {})
 
 
 @pytest.mark.parametrize("l2n", [False, True], ids=["raw", "l2n"])

@@ -5624,6 +5624,7 @@ def _fwd_entry(
     hand_off: bool,
     autograd_node: bool = False,
     executable: bool = True,
+    small: bool = False,
     boundary: dict[str, Any] | None = None,
     handle_mode: str | None = None,
 ) -> tuple[torch.Tensor, SavedKcp | None]:
@@ -5638,43 +5639,44 @@ def _fwd_entry(
     inside a backward pass (torch's recompute) decides the hand-off and #5 before the CUDA-graph lookup
     (:func:`_fwd_decision`): a decision other than (no hand-off, #5 launched) is part of the key, so the hand-off form
     is captured and replayed as its own graph.  Under the size rule of ``reuse_recompute_tapes="auto"``
-    (:data:`GRAPH_RECOMPUTE_MIN_ROWS`, a caller-held workspace) no forward of the node decides: torch's recompute looks
-    up the original forward's key and runs its form (no hand-off, #5 launched; the reasons read ``"small"``)."""
+    (:data:`GRAPH_RECOMPUTE_MIN_ROWS`, a caller-held workspace; ``small``, decided by the Function's forward) no
+    forward of the node decides: torch's recompute looks up the original forward's key and runs its form (no hand-off,
+    #5 launched; the reasons read ``"small"``)."""
     # with reuse_recompute_tapes the request is the Function's graph-task test (read once, there)
     in_task = bool(hand_off) if opts.reuse_recompute_tapes else None
     save = bool(save_for_backward) and opts.boundary_mode == "saved"
     hand_off = bool(hand_off) and save and opts.save_mode == "light"
     entry = None
     decision = None
-    small = False
+    # the size rule of reuse_recompute_tapes="auto" (GRAPH_RECOMPUTE_MIN_ROWS), decided once by the Function's
+    # forward: below it no forward of the node decides -- torch's recompute keys and replays the original forward's
+    # graph (no frame read, no hand-off)
+    small = bool(small) and autograd_node
     if opts.graph != "off":
         if isinstance(workspace, WorkspaceKcp):
             workspace.calls += 1
-            if autograd_node:
+            if (
+                autograd_node
+                and not small
+                and (in_task if in_task is not None else _graph_task_id() != -1)
+            ):
                 T_r = int(ctx.T_r)
                 HV = int(v.shape[-2])
-                # the size rule of reuse_recompute_tapes="auto" (GRAPH_RECOMPUTE_MIN_ROWS): below it no forward of
-                # the node decides -- torch's recompute keys and replays the original forward's graph (no graph task
-                # read, no frame read, no hand-off)
-                small = _graph_recompute_small(opts, v.device, T_r, HV)
-                if not small and (
-                    in_task if in_task is not None else _graph_task_id() != -1
-                ):
-                    P = workspace.tables(
-                        ctx,
-                        HV,
-                        fused_walks=int(opts.knob("fused_walks")),
-                        P=None if opts.segments is None else int(opts.segments),
-                    ).P
-                    decision = _fwd_decision(
-                        _saved_count_of(
-                            opts, P, T_r, bool(opts.use_qk_l2norm_in_kernel), save
-                        ),
-                        hand_off=hand_off and T_r > 0,
-                        autograd_node=autograd_node,
-                        executable=executable,
-                        opts=opts,
-                    )
+                P = workspace.tables(
+                    ctx,
+                    HV,
+                    fused_walks=int(opts.knob("fused_walks")),
+                    P=None if opts.segments is None else int(opts.segments),
+                ).P
+                decision = _fwd_decision(
+                    _saved_count_of(
+                        opts, P, T_r, bool(opts.use_qk_l2norm_in_kernel), save
+                    ),
+                    hand_off=hand_off and T_r > 0,
+                    autograd_node=autograd_node,
+                    executable=executable,
+                    opts=opts,
+                )
         flags = (
             (save,)
             if decision is None or (not decision[0] and decision[2])
@@ -5702,6 +5704,8 @@ def _fwd_entry(
             )
         elif small:
             LAST_CALL["fwd"].update(hand_off_reason="small", fwd_o_reason="small")
+        if saved is None or saved.kept is None:
+            return _ranked(out.detach(), batched), saved
         return _ranked(out.detach(), batched), _with_stamped_kept(saved)
     call, batched = _prepare(
         q,
@@ -5861,8 +5865,9 @@ def _saved_count_of(opts: OptionsKcp, P: int, T_r: int, l2n: bool, save: bool) -
 
 # The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` (a caller-held workspace): a checkpoint
 # recompute decides the hand-off and #5 only when the rank holds at least this many token x value-head rows
-# (``T_r * HV``), per architecture of the device.  Below it no forward of the node decides -- no graph-task or
-# checkpoint-frame read, no arena hand-off to stamp and check -- the recompute replays the original forward's graph
+# (``T_r * HV``), per architecture of the device.  The node's forward reads the rule once, and only inside a backward
+# pass (where a hand-off can follow).  Below it no forward of the node decides -- no checkpoint-frame read, no arena
+# hand-off to stamp and check -- the recompute replays the original forward's graph
 # (the output walk, #5 inside) and its backward replays #1 and the tape walk.  On a small rank the checkpointed graph
 # step is host-bound: the hand-off form launches less GPU work (one B200, 8192 tokens, (2, 6) heads: 356 instead of
 # 451 us of kernels) but adds host time per layer and step (the frame read, the stamp, the backward's checks: about
@@ -5878,37 +5883,38 @@ GRAPH_RECOMPUTE_MIN_ROWS: dict[str, int] = {
 }
 # any other device (the fake backend's CPU emulation included)
 GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = 61440
-_GRAPH_RECOMPUTE_ARCH: dict[tuple, str | None] = {}
+# the architecture of each (backend name, device index) the size rule has read (index -1: a CPU tensor)
+_GRAPH_RECOMPUTE_ARCH: dict[tuple[str, int], str | None] = {}
 
 
 def _graph_recompute_arch(backend: Any, device: torch.device) -> str | None:
     """The architecture the size rule reads: the kernel backend's exported architecture of the CUDA device, ``None``
-    for any other backend or device; cached per (backend kind, device)."""
-    kernels = isinstance(backend, KernelBackend) and device.type == "cuda"
-    key = (kernels, device.type, device.index)
-    if key not in _GRAPH_RECOMPUTE_ARCH:
-        arch = None
-        if kernels:
-            index = (
-                device.index
-                if device.index is not None
-                else torch.cuda.current_device()
-            )
-            arch = backend.launcher().device_arch(index)
-        _GRAPH_RECOMPUTE_ARCH[key] = arch
-    return _GRAPH_RECOMPUTE_ARCH[key]
+    for any other backend or device."""
+    if not (isinstance(backend, KernelBackend) and device.type == "cuda"):
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return backend.launcher().device_arch(index)
 
 
 def _graph_recompute_small(
-    opts: OptionsKcp, device: torch.device, T_r: int, HV: int
+    opts: OptionsKcp, v: torch.Tensor, T_r: int, HV: int
 ) -> bool:
-    """Whether a forward under ``graph="replay"`` falls under the size rule: ``reuse_recompute_tapes="auto"`` and
-    fewer ``T_r * HV`` rows than :data:`GRAPH_RECOMPUTE_MIN_ROWS` of the device's architecture."""
+    """Whether a forward of ``v``'s device under ``graph="replay"`` falls under the size rule:
+    ``reuse_recompute_tapes="auto"`` and fewer ``T_r * HV`` rows than :data:`GRAPH_RECOMPUTE_MIN_ROWS` of the
+    device's architecture (read once per backend name and device index: the check runs in every graph-mode
+    recompute)."""
     if opts.reuse_recompute_tapes != "auto":
         return False
-    arch = _graph_recompute_arch(get_backend(opts.backend), device)
-    rows = GRAPH_RECOMPUTE_MIN_ROWS.get(arch, GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT)
-    return T_r * HV < rows
+    key = (opts.backend, v.get_device())
+    try:
+        arch = _GRAPH_RECOMPUTE_ARCH[key]
+    except KeyError:
+        arch = _GRAPH_RECOMPUTE_ARCH[key] = _graph_recompute_arch(
+            get_backend(opts.backend), v.device
+        )
+    return T_r * HV < GRAPH_RECOMPUTE_MIN_ROWS.get(
+        arch, GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT
+    )
 
 
 def _reads_frame(opts: OptionsKcp) -> bool:
@@ -6319,7 +6325,11 @@ def _bwd_entry(
         held = () if saved is None else saved.tensors()
         # the kept recompute tapes are part of the key: their backward is its own graph (no #1, no tape walk), and a
         # replay binds the very tensors the capture did (:func:`_kept_key_part`)
-        handed, hand = _kept_key_part(None if saved is None else saved.kept, workspace)
+        handed, hand = (
+            ((), ())
+            if saved is None or saved.kept is None
+            else _kept_key_part(saved.kept, workspace)
+        )
         entry = _graph_entry(
             "bwd",
             ctx,
@@ -6540,20 +6550,18 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         packed_grads=True,
     ):
         boundary = None if handle is None else _handle_lookup(handle)
-        # the graph task (the hand-off's condition), not read where no hand-off can follow: reuse_recompute_tapes=False
-        # or the size rule of "auto" (graph="replay" on a caller-held workspace, the CUDA-graph path)
-        gid = (
-            _graph_task_id()
-            if opts.reuse_recompute_tapes
-            and not (
-                opts.graph != "off"
-                and isinstance(workspace, WorkspaceKcp)
-                and _graph_recompute_small(
-                    opts, v.device, int(ctx.T_r), int(v.shape[-2])
-                )
-            )
-            else -1
+        # the graph task (the hand-off's condition), not read where no hand-off can follow (reuse_recompute_tapes=False)
+        gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
+        # the size rule of "auto" (graph="replay" on a caller-held workspace, the CUDA-graph path), decided once and
+        # only where a hand-off could follow (torch's recompute, inside a backward pass); below it no hand-off
+        small = (
+            gid != -1
+            and opts.graph != "off"
+            and isinstance(workspace, WorkspaceKcp)
+            and _graph_recompute_small(opts, v, int(ctx.T_r), v.size(-2))
         )
+        if small:
+            gid = -1
         out, saved = _fwd_entry(
             q,
             k,
@@ -6568,6 +6576,7 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             hand_off=gid != -1,
             autograd_node=True,
             executable=bool(executable),
+            small=small,
             boundary=boundary,
             handle_mode=None
             if handle is None

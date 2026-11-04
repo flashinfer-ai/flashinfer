@@ -123,10 +123,11 @@ def _few_cpu_threads():
 
 def _size_rule_at(kcp, monkeypatch, rows: int) -> None:
     """The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` at ``rows`` on every architecture
-    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default)."""
+    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default), with an empty architecture cache."""
     table = {arch: rows for arch in kcp.GRAPH_RECOMPUTE_MIN_ROWS}
     monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS", table)
     monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT", rows)
+    monkeypatch.setattr(kcp, "_GRAPH_RECOMPUTE_ARCH", {})
 
 
 @pytest.fixture(autouse=True)
@@ -5418,6 +5419,74 @@ def test_graph_replay_auto_size_rule_keys_a_small_recompute_as_the_original_forw
     for arm in (at, forced, off):
         for n in ("out",) + CKPT_GRADS:
             assert torch.equal(arm["res"][n], small["res"][n]), n
+
+
+def test_graph_replay_auto_size_rule_is_read_once_per_recompute(monkeypatch) -> None:
+    """The node's forward reads the size rule once, and only where a hand-off can follow: torch's recompute inside the
+    backward pass (one read per checkpointed step, below and above the rule); the original forward and a step without
+    a checkpoint read none.  The read sees the rank's rows (``T_r * HV``)."""
+    kcp, ctx, ops = _ckpt_setup()
+    _refuse_captures(kcp, monkeypatch)
+    rows = int(ctx.T_r) * CKPT_HEADS[1]
+    reads: list[int] = []
+    original = kcp._graph_recompute_small
+
+    def spy(opts, v, T_r, HV):
+        reads.append(T_r * HV)
+        return original(opts, v, T_r, HV)
+
+    monkeypatch.setattr(kcp, "_graph_recompute_small", spy)
+    for min_rows in (0, rows + 1):
+        _size_rule_at(kcp, monkeypatch, min_rows)
+        for ckpt in (True, False):
+            reads.clear()
+            kcp.graph_cache_clear()
+            _ckpt_autograd(
+                kcp,
+                ctx,
+                ops,
+                ckpt=ckpt,
+                workspace=kcp.WorkspaceKcp(),
+                graph="replay",
+            )
+            assert reads == ([rows] if ckpt else []), (min_rows, ckpt, reads)
+    assert kcp.kept_registry_size() == 0
+
+
+def test_graph_replay_auto_size_rule_reads_each_device_architecture_once(
+    monkeypatch,
+) -> None:
+    """The size rule caches the architecture per (backend name, device index): two devices whose architectures
+    differ never share an entry and give their own answers, each device is read once, and a request other than
+    ``"auto"`` reads nothing."""
+    kcp = _package("cake_kcp")
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS", {"sm_100a": 100, "sm_103a": 0})
+    archs = {0: "sm_100a", 1: "sm_103a"}
+    read: list[int] = []
+
+    def arch_of(backend, device):
+        read.append(device.index)
+        return archs[device.index]
+
+    monkeypatch.setattr(kcp, "_graph_recompute_arch", arch_of)
+
+    class Operand:  # what the rule reads of v: its device index and its device
+        def __init__(self, index: int) -> None:
+            self.device = torch.device("cuda", index)
+
+        def get_device(self) -> int:
+            return self.device.index
+
+    auto = types.SimpleNamespace(reuse_recompute_tapes="auto", backend="fake")
+    for _ in range(3):
+        assert kcp._graph_recompute_small(auto, Operand(0), 10, 5) is True
+        assert kcp._graph_recompute_small(auto, Operand(1), 10, 5) is False
+    assert read == [0, 1], read
+    assert kcp._GRAPH_RECOMPUTE_ARCH == {("fake", 0): "sm_100a", ("fake", 1): "sm_103a"}
+    for reuse in (True, False):
+        req = types.SimpleNamespace(reuse_recompute_tapes=reuse, backend="fake")
+        assert kcp._graph_recompute_small(req, Operand(2), 10, 5) is False
+    assert read == [0, 1], read
 
 
 @pytest.mark.parametrize("l2n", [False, True])
