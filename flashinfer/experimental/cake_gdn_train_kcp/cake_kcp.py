@@ -1075,9 +1075,9 @@ def _launch_stream(device: torch.device | None) -> int:
 
 
 def _kept_stamped(kept: _KeptTapes) -> _KeptTapes:
-    """A fresh arena hand-off entry on the tensors of ``kept`` (an eager hand-off's own entry, or the template a
-    captured hand-off forward stored with its result), stamped with this backward pass's task id, the workspace's call
-    count and the launch stream now (right after the hand-off forward of this call)."""
+    """A fresh arena hand-off entry on the tensors of ``kept`` (the hand-off forward's own entry), stamped with this
+    backward pass's task id, the workspace's call count and the launch stream now (right after the hand-off forward of
+    this call)."""
     out = _KeptTapes(
         dict(kept.tapes),
         kept.stage_m,
@@ -1088,6 +1088,44 @@ def _kept_stamped(kept: _KeptTapes) -> _KeptTapes:
     )
     out.calls = int(kept.ws.calls)
     out.stream = _launch_stream(kept.ws.device)
+    return out
+
+
+class _KeptLayout:
+    """An arena hand-off as a captured hand-off forward's cached result keeps it (the template of every replay's
+    entry): the workspace, the arena names of the tapes and the ``qn`` / ``kn`` rows, the ``stage_m`` plane's length
+    and the geometry -- no tensor, so the graph cache pins no arena buffer after the workspace drops it.
+    :func:`_kept_rebound` binds the arena's tensors again at each replay (which found the arena signature of the
+    capture: the very buffers the captured graph wrote)."""
+
+    __slots__ = ("names", "qk", "stage_m", "geometry", "ws")
+
+    def __init__(self, kept: _KeptTapes) -> None:
+        self.names = tuple(kept.tapes)
+        self.qk = tuple(kept.qk)
+        self.stage_m = None if kept.stage_m is None else int(kept.stage_m.numel())
+        self.geometry = kept.geometry
+        self.ws = kept.ws
+
+
+def _kept_rebound(layout: _KeptLayout) -> _KeptTapes | None:
+    """A fresh arena hand-off entry of ``layout`` on the arena's current tensors, stamped as :func:`_kept_stamped`
+    stamps; ``None`` (no hand-off: the backward runs the replay form) when the arena binds a name no longer."""
+    ws = layout.ws
+    arena = ws._tapes
+    tapes = {n: arena.get(TAPE_ALIASES.get(n, n)) for n in layout.names}
+    qk = {n: arena.get(TAPE_ALIASES.get(n, n)) for n in layout.qk}
+    stage_m = None
+    if layout.stage_m is not None:
+        pool = ws._pools.get("stage_m")
+        if pool is None or pool.numel() < layout.stage_m:
+            return None
+        stage_m = pool if pool.numel() == layout.stage_m else pool[: layout.stage_m]
+    if any(t is None for t in (*tapes.values(), *qk.values())):
+        return None
+    out = _KeptTapes(tapes, stage_m, layout.geometry, _graph_task_id(), qk, ws=ws)
+    out.calls = int(ws.calls)
+    out.stream = _launch_stream(ws.device)
     return out
 
 
@@ -5169,7 +5207,11 @@ GRAPH_STATS: dict[str, int] = {
     "fallback": 0,
     "reset": 0,
 }
-GRAPH_CACHE_MAX = 64  # keys kept per process; the oldest entry goes when a new key arrives beyond this
+# Keys kept per process, least recently used first out when a new key arrives beyond this.  A checkpointed layer holds
+# three keys (the original forward, torch's recompute in its hand-off form, the kept backward), so 256 keeps 85 such
+# layers; each captured graph holds its own memory pool with its static results (out, the saved set, the gradients)
+# besides the workspace arena, released with the entry (or by ``graph_cache_clear()``).
+GRAPH_CACHE_MAX = 256
 
 
 class _GraphEntry:
@@ -5268,11 +5310,12 @@ def _graph_entry(
         flags,
         tuple(_sig(t) for t in tensors),
     )
-    e = _GRAPHS.get(key)
+    e = _GRAPHS.pop(key, None)
     if e is None:
         while len(_GRAPHS) >= GRAPH_CACHE_MAX:
             del _GRAPHS[next(iter(_GRAPHS))]
-        e = _GRAPHS[key] = _GraphEntry(key, (ctx, ws, backend))
+        e = _GraphEntry(key, (ctx, ws, backend))
+    _GRAPHS[key] = e  # (re-)inserted last: the dict's order is the use order
     return e
 
 
@@ -5661,8 +5704,8 @@ def _fwd_entry(
             ),
         )
         if res is not None:
-            # a hand-off form keeps its kept set as the template of every replay's stamped entry
-            entry.result = (res[0], res[1], batched)
+            # a hand-off form keeps its kept set's layout as the template of every replay's stamped entry
+            entry.result = (res[0], _kept_template(res[1]), batched)
             return _ranked(res[0].detach(), batched), _with_stamped_kept(res[1])
         call, batched = _prepare(
             q,
@@ -5728,15 +5771,32 @@ def _fwd_entry(
 
 
 def _with_stamped_kept(saved: SavedKcp | None) -> SavedKcp | None:
-    """``saved`` with a freshly stamped arena hand-off (:func:`_kept_stamped`) when it carries one; else ``saved``
-    as it is (no hand-off, or the eager hand-off whose fresh tensors the entry owns).  A shallow copy with the one
-    field set (frozen dataclass, hence ``object.__setattr__``): a replayed graph's saved set is the template of every
-    replay and keeps its own entry."""
-    if saved is None or saved.kept is None or saved.kept.ws is None:
+    """``saved`` with a freshly stamped arena hand-off when it carries one -- :func:`_kept_stamped` of the hand-off
+    forward's entry, or :func:`_kept_rebound` of a replayed graph's template layout (:func:`_kept_template`) --; else
+    ``saved`` as it is (no hand-off, or the eager hand-off whose fresh tensors the entry owns).  A shallow copy with the
+    one field set (frozen dataclass, hence ``object.__setattr__``): the template stays as it is."""
+    kept = None if saved is None else saved.kept
+    if kept is None or kept.ws is None:
         return saved
     out = object.__new__(SavedKcp)
     out.__dict__.update(saved.__dict__)
-    object.__setattr__(out, "kept", _kept_stamped(saved.kept))
+    object.__setattr__(
+        out,
+        "kept",
+        _kept_rebound(kept) if type(kept) is _KeptLayout else _kept_stamped(kept),
+    )
+    return out
+
+
+def _kept_template(saved: SavedKcp | None) -> SavedKcp | None:
+    """The saved set a captured forward caches as the template of its replays: an arena hand-off's entry becomes its
+    :class:`_KeptLayout` (no tensor of the arena stays referenced by the graph cache); else ``saved`` as it is."""
+    kept = None if saved is None else saved.kept
+    if kept is None or kept.ws is None:
+        return saved
+    out = object.__new__(SavedKcp)
+    out.__dict__.update(saved.__dict__)
+    object.__setattr__(out, "kept", _KeptLayout(kept))
     return out
 
 
@@ -6212,12 +6272,15 @@ def _bwd_entry(
     if saved is not None:
         _check_saved(saved, call)
     if entry is not None and entry.seen > 0 and entry.disabled is None:
+        kept_fields = _kept_fields(None if saved is None else saved.kept)
         res = _graph_capture(
             "bwd", entry, call, lambda: _in_launch_scope(call, _bwd_body, call, saved)
         )
         if res is not None:
             entry.result = (res, batched)
             return tuple(_ranked(t.detach(), batched) for t in res)
+        # a capture that failed after the body's #8 released the kept set: the eager form binds it again
+        _kept_restore(saved.kept if saved is not None else None, kept_fields)
         call, batched = _prepare(
             q,
             k,
@@ -6242,6 +6305,28 @@ def _bwd_entry(
         _graph_eager("bwd", entry)
     call.backend.end_call(call)
     return tuple(_ranked(t, batched) for t in grads)
+
+
+def _kept_fields(kept: _KeptTapes | None) -> tuple | None:
+    """The fields of ``kept`` that its release (:func:`_kept_release`) clears, and the release count, before a
+    backward capture (:func:`_kept_restore`); ``None`` without a kept set."""
+    if kept is None:
+        return None
+    return (
+        dict(kept.tapes),
+        kept.stage_m,
+        dict(kept.qk),
+        kept.ws,
+        KEPT_STATS["released"],
+    )
+
+
+def _kept_restore(kept: _KeptTapes | None, fields: tuple | None) -> None:
+    """``kept`` as :func:`_kept_fields` found it, after a capture that ran the body (its #8 released the kept set)
+    and failed: the eager form that follows binds and releases it once."""
+    if kept is None or fields is None:
+        return
+    kept.tapes, kept.stage_m, kept.qk, kept.ws, KEPT_STATS["released"] = fields
 
 
 def _kept_tensors(kept: _KeptTapes | None) -> tuple[torch.Tensor, ...]:

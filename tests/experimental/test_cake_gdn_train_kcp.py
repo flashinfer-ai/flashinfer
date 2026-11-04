@@ -5623,6 +5623,185 @@ def test_graph_replay_kept_backward_never_replays_on_stale_memory(
         assert torch.equal(result[n], clean[n]), n
 
 
+def _same_leaf_steps(kcp, ctx, ops, ws, o):
+    """A step function of :func:`torch.utils.checkpoint` steps of one layer on ``ws`` with the same leaf tensors in
+    every step (a graph key holds their addresses); each step returns copies of out and the five gradients (a replay
+    returns the capture's static results) and the backward's record."""
+    leaves = [ops[n].detach().clone().requires_grad_(True) for n in LEAVES]
+
+    def step() -> tuple[dict, dict]:
+        from torch.utils.checkpoint import checkpoint
+
+        for lf in leaves:
+            lf.grad = None
+        out = checkpoint(
+            lambda *a: kcp.chunk_gdn_kcp(
+                *a, ctx, workspace=ws, **o, deterministic=False
+            ),
+            *leaves,
+            use_reentrant=False,
+        )
+        out.backward(ops["dout"])
+        return {
+            "out": out.detach().clone(),
+            **{n: lf.grad.clone() for n, lf in zip(CKPT_GRADS, leaves, strict=True)},
+        }, dict(kcp.LAST_CALL["bwd"])
+
+    return step
+
+
+def test_graph_replay_kept_backward_capture_failing_after_its_body_runs_the_kept_eager_form(
+    monkeypatch,
+) -> None:
+    """A backward capture that fails after its body ran (the body's #8 released the kept set) falls back to the eager
+    form on the very kept set: the fallback binds the kept tapes (``tapes_source`` ``"kept"``, one release counted),
+    and out and the gradients are the bits of the eager step.  CPU captures: the forwards' succeed
+    (:func:`_fake_captures`), every backward capture runs its body and then fails."""
+    kcp, ctx, ops = _ckpt_setup()
+    if not _verified_torch(kcp):
+        pytest.skip("no hand-off without the frame proof on this torch")
+    captured = _fake_captures(kcp, monkeypatch)
+    fake_capture = kcp._graph_capture
+    failed: list = []
+
+    def capture(kind, entry, call, body):
+        if kind == "fwd":
+            return fake_capture(kind, entry, call, body)
+        # the captured body ran (its #8 released the kept set), then the capture failed
+        body()
+        entry.disabled = "RuntimeError: capture failed after its body (test)"
+        kcp.GRAPH_STATS["fallback"] += 1
+        failed.append(entry)
+        return None
+
+    monkeypatch.setattr(kcp, "_graph_capture", capture)
+    ws = kcp.WorkspaceKcp()
+    step = _same_leaf_steps(
+        kcp,
+        ctx,
+        ops,
+        ws,
+        dict(backend="fake", graph="replay", reuse_recompute_tapes=True),
+    )
+    kcp.graph_cache_clear()
+    reference, _ = step()  # the eager step (no entry seen yet)
+    for _ in range(5):
+        before = dict(kcp.KEPT_STATS)
+        result, bwd = step()
+        if failed:
+            break
+    # the kept backward's capture failed (its key flags end with the hand-off layout)
+    assert failed and len(failed[-1].key[6]) > 2, (failed, captured)
+    assert bwd["tapes_source"] == "kept" and bwd["graph_event"] == "eager", bwd
+    assert str(bwd["graph_fallback"]).startswith("RuntimeError: capture failed"), bwd
+    delta = _stats_delta(kcp, before)
+    assert (delta["take"], delta["miss"], delta["released"]) == (1, 0, 1), delta
+    for n in ("out",) + CKPT_GRADS:
+        assert torch.equal(result[n], reference[n]), n
+    kcp.graph_cache_clear()
+
+
+def test_graph_replay_cached_hand_off_holds_no_arena_tensor(monkeypatch) -> None:
+    """A captured hand-off forward caches its saved set as the template of its replays with the kept set's layout
+    only: once the workspace drops its tapes and pools, no tensor of the arena stays alive through the graph cache
+    (the cached graphs are still there).  CPU captures (:func:`_fake_captures`)."""
+    import gc
+    import weakref
+
+    kcp, ctx, ops = _ckpt_setup()
+    if not _verified_torch(kcp):
+        pytest.skip("no hand-off without the frame proof on this torch")
+    captured = _fake_captures(kcp, monkeypatch)
+    ws = kcp.WorkspaceKcp()
+    step = _same_leaf_steps(
+        kcp,
+        ctx,
+        ops,
+        ws,
+        dict(backend="fake", graph="replay", reuse_recompute_tapes=True),
+    )
+    kcp.graph_cache_clear()
+    events = []
+    for _ in range(6):
+        _, bwd = step()
+        events.append(bwd["graph_event"])
+        if bwd["graph_event"] == "replay" and bwd["tapes_source"] == "kept":
+            break
+    assert events[-1] == "replay", events
+    hand_off = []
+    for kind, e in captured:
+        cached = None if e.result is None else e.result[1]
+        if kind == "fwd" and cached is not None and cached.kept is not None:
+            hand_off.append(e)
+    assert hand_off, captured
+    # the context's own constants (the identity plane ``eye``) are bound into the pools but owned by the context,
+    # which the graph keys pin; every other pool and every tape is the workspace's arena
+    constants = [c for c in ctx._caches.values() if isinstance(c, torch.Tensor)]
+    arena = [
+        (n, weakref.ref(t))
+        for n, t in (*ws._tapes.items(), *ws._pools.items())
+        if not any(t is c for c in constants)
+    ]
+    assert {n for n, _ in arena} >= {*ws._tapes, "stage_m"}, sorted(ws._pools)
+    for n in list(ws._tapes):
+        ws.release_tape(n)
+    for n in list(ws._pools):
+        ws.release_pool(n)
+    gc.collect()
+    assert all(e.key in kcp._GRAPHS for e in hand_off)
+    alive = [(n, tuple(r().shape)) for n, r in arena if r() is not None]
+    assert not alive, alive
+    kcp.graph_cache_clear()
+
+
+def test_graph_cache_keeps_the_keys_of_24_checkpointed_layers_and_drops_the_least_recently_used(
+    monkeypatch,
+) -> None:
+    """The graph cache keeps the three keys of each of 24 checkpointed layers (72 keys, cycled every step): after the
+    eager and the capture step every lookup replays (CPU stand-in captures: the entry gets a :class:`_FakeGraph` as
+    the forward / backward entries do).  Beyond its bound the least recently used key goes first (a hit refreshes)."""
+    kcp, ctx, _ = _ckpt_setup()
+    opt = _package("cake_options")
+    ws = kcp.WorkspaceKcp()
+    backend = kcp.get_backend("fake")
+    opts = opt.OptionsKcp(backend="fake", graph="replay").check()
+    kinds = (
+        ("fwd", (True,)),
+        ("fwd", (True, True, False)),
+        ("bwd", (True, True, True)),
+    )
+    layers = [tuple(torch.empty(1) for _ in range(5)) for _ in range(24)]
+    kcp.graph_cache_clear()
+    replays = []
+    for _ in range(4):
+        n = 0
+        for tensors in layers:
+            for kind, flags in kinds:
+                e = kcp._graph_entry(kind, ctx, ws, backend, opts, None, tensors, flags)
+                if e.replayable(ws):
+                    n += 1
+                elif e.seen > 0:  # the capture
+                    e.graph, e.arena = _FakeGraph(), kcp._arena_sig(ws)
+                    e.seen += 1
+                else:  # the eager call
+                    e.seen += 1
+        replays.append(n)
+    assert replays == [0, 0, 72, 72], replays
+    monkeypatch.setattr(kcp, "GRAPH_CACHE_MAX", 3)
+    kcp.graph_cache_clear()
+    keep = [torch.empty(1) for _ in range(4)]
+
+    def entry(i):
+        return kcp._graph_entry("fwd", ctx, ws, backend, opts, None, (keep[i],), (i,))
+
+    a, b, _c = entry(0), entry(1), entry(2)
+    assert entry(0) is a  # a hit: key 0 becomes the most recently used
+    entry(3)  # beyond the bound: key 1 (least recently used) goes, key 0 stays
+    assert a.key in kcp._GRAPHS and b.key not in kcp._GRAPHS, list(kcp._GRAPHS)
+    assert len(kcp._GRAPHS) == 3
+    kcp.graph_cache_clear()
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Recompute handle (issue #7818): the checkpoint recompute reads the original forward's incoming states from the
 # handle instead of exchanging them again.  These CPU rows run one rank (no crossing fragment, ``S_in`` empty): they

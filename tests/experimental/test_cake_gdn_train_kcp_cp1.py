@@ -1503,11 +1503,12 @@ def test_graph_replay_checkpoint_replays_the_eager_checkpoint_programs(
 def test_graph_replay_kept_tapes_are_refused_after_another_call_on_the_workspace(
     device,
 ) -> None:
-    """``graph="replay"``, ``reuse_recompute_tapes=True`` and a later saver: once the step replays, one step runs an
-    explicit forward of OTHER operands on the same workspace in the later saver's backward -- between the recompute
-    (whose kept tapes are the arena's own) and the GDN backward.  The entry is stale (``KEPT_STALE_STATS["calls"]``),
-    the GDN backward replays #1 and the tape walk instead of binding the rewritten tapes, and every step's out and
-    gradients are the bits of the steps without the intervening call; the next step binds the kept tapes again."""
+    """``graph="replay"``, ``reuse_recompute_tapes=True`` and a later saver: once the step replays, three consecutive
+    steps run an explicit forward of OTHER operands on the same workspace in the later saver's backward -- between the
+    recompute (whose kept tapes are the arena's own) and the GDN backward.  Each of them finds the entry stale
+    (``KEPT_STALE_STATS["calls"]``) and the GDN backward replays #1 and the tape walk instead of binding the rewritten
+    tapes, while that backward's own graph goes eager -> capture -> replay (the last hooked step replays it); every
+    step's out and gradients are the bits of step 0, and the next step binds the kept tapes again."""
     kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
     H, HV = 2, 6
     cu = _cu((300, 777))
@@ -1528,7 +1529,7 @@ def test_graph_replay_kept_tapes_are_refused_after_another_call_on_the_workspace
             deterministic=False,
         )
 
-    steps, intervene = 6, 4
+    steps, hooked = 8, (4, 5, 6)
     stale_before = dict(kcp.KEPT_STALE_STATS)
     results, records, _ = _ckpt_steps(
         kcp,
@@ -1538,17 +1539,19 @@ def test_graph_replay_kept_tapes_are_refused_after_another_call_on_the_workspace
         steps=steps,
         ws=ws,
         later=True,
-        hooks={intervene: hook},
+        hooks=dict.fromkeys(hooked, hook),
         graph="replay",
         reuse_recompute_tapes=True,
     )
     sources = [rec[2]["tapes_source"] for rec in records]
-    assert calls == ["explicit forward"]
-    last_clean = records[intervene - 1][2]
+    events = [rec[2]["graph_event"] for rec in records]
+    assert calls == ["explicit forward"] * len(hooked)
+    last_clean = records[hooked[0] - 1][2]
     assert last_clean["graph_event"] == "replay", last_clean
-    assert sources[intervene] == "replay", sources
-    assert sources[intervene - 1] == sources[intervene + 1] == "kept", sources
-    assert kcp.KEPT_STALE_STATS["calls"] - stale_before["calls"] == 1
+    assert [sources[i] for i in hooked] == ["replay"] * len(hooked), sources
+    assert [events[i] for i in hooked] == ["eager", "capture", "replay"], events
+    assert sources[hooked[0] - 1] == sources[hooked[-1] + 1] == "kept", sources
+    assert kcp.KEPT_STALE_STATS["calls"] - stale_before["calls"] == len(hooked)
     for i in range(steps):
         for n in TENSORS:
             assert torch.equal(results[i][n], results[0][n]), (i, n)

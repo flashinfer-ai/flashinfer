@@ -34,7 +34,9 @@ The mode is never stored in the context: a context, a partition and the byte
 queries of either route describe the same plan.  A saved set is read only by
 the backward of the route that produced it, and an options instance is
 converted to the routed package's options type (mappings and keywords work for
-both).  Thin experimental entry points: the partition / context plan, the host
+both; on the deterministic route an ``OptionsKcp`` with ``graph="replay"`` and
+the default ``reuse_recompute_tapes="auto"`` takes that route's own default,
+``False`` under replay).  Thin experimental entry points: the partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
 live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
@@ -132,13 +134,24 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
     (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
-    routes take every field, ``use_qk_l2norm_in_kernel`` included."""
+    routes take every field, ``use_qk_l2norm_in_kernel`` included.  On the deterministic route a non-deterministic
+    instance whose ``reuse_recompute_tapes`` is the default ``"auto"`` under CUDA-graph replay (``graph`` not
+    ``"off"``) maps that field to ``None``: the deterministic package resolves it to its own default (``False`` under
+    replay), while an explicit ``True`` passes and is refused there."""
     if options is None or isinstance(options, dict):
         return options
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
     if isinstance(options, own) or not dataclasses.is_dataclass(options):
         return options
-    return {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    fields = {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    if (
+        det
+        and fields.get("graph", "off") != "off"
+        and isinstance(fields.get("reuse_recompute_tapes"), str)
+        and fields["reuse_recompute_tapes"] == "auto"
+    ):
+        fields["reuse_recompute_tapes"] = None
+    return fields
 
 
 @flashinfer_experimental_api(feature=_FEATURE)

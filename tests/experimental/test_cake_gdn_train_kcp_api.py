@@ -1334,6 +1334,63 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
         calls["chunk_gdn_kcp"](deterministic=None)
 
 
+def test_facade_maps_the_replay_auto_tape_option_onto_the_deterministic_default(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``OptionsKcp(graph="replay")`` (``reuse_recompute_tapes`` defaults to ``"auto"``) on the deterministic route --
+    the default ``deterministic=True``, and ``deterministic=False`` under ``torch.use_deterministic_algorithms(True)``
+    -- reaches the twin with ``reuse_recompute_tapes=None`` on every compute entry, which the twin's ``make_options``
+    resolves to its own default (``False`` under replay) and accepts; an explicit ``True`` passes on and the twin
+    refuses it; ``graph="off"`` passes ``"auto"`` on unchanged; the non-deterministic route gets the instance."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    seen = _route_recorders(monkeypatch)
+    # no fallback warning in this test
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    t = torch.zeros(1)
+    calls = {
+        "chunk_gdn_kcp": lambda **m: facade.chunk_gdn_kcp(t, t, t, t, t, object(), **m),
+        "chunk_gdn_fwd_kcp": lambda **m: facade.chunk_gdn_fwd_kcp(
+            t, t, t, t, t, object(), **m
+        ),
+        "chunk_gdn_bwd_kcp": lambda **m: facade.chunk_gdn_bwd_kcp(
+            t, t, t, t, t, object(), t, **m
+        ),
+    }
+    replay = OptionsKcp(graph="replay")
+    assert replay.reuse_recompute_tapes == "auto"
+    explicit = OptionsKcp(graph="replay", reuse_recompute_tapes=True)
+    off = OptionsKcp(graph="off")
+    for deterministic_mode in (False, True):
+        torch.use_deterministic_algorithms(deterministic_mode)
+        routes = (
+            ({"deterministic": False},)
+            if deterministic_mode
+            else ({}, {"deterministic": True})
+        )
+        for entry, call in calls.items():
+            for kw in routes:
+                seen.clear()
+                assert call(options=replay, **kw).startswith("det:"), (entry, kw)
+                got = seen[-1][1]["options"]
+                assert isinstance(got, dict) and got["graph"] == "replay", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes is False
+                call(options=explicit, **kw)
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got)
+                call(options=off, **kw)
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] == "auto", (entry, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes == "auto"
+    torch.use_deterministic_algorithms(False)
+    for entry, call in calls.items():
+        assert call(options=replay, deterministic=False) == f"nondet:{entry}"
+        assert seen[-1][1]["options"] is replay
+
+
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
