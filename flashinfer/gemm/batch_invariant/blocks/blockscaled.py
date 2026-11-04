@@ -89,10 +89,15 @@ SF_ATOM_BYTES = (
 )  # one scale-factor atom: 128 rows x 4 K-blocks
 TMEM_COLS = 512  # the sm_100 TMEM budget
 TMEM_COLS_SM107 = 576  # the sm_107 TMEM (cute.arch.get_max_tmem_alloc_cols("sm_107"))
-#: The A operand ring stays below 256 KB (a placement bound: the stage count it caps is not a numeric parameter). Beyond it
-#: the narrow tiles -- whose B stage is 1-2 KB, so the smem budget would admit 16-17 stages of the 16 KB A tile -- read
-#: wrong scale factors; at or below it every tile is bit-identical to the wide tiles. FlashInfer's own block-scaled kernels
-#: plan against the sm_100 budget of 228 KB and never reach it.
+#: The A operand ring ends below 256 KB (a placement bound: the stage count it caps is not a numeric parameter). It is
+#: empirical: on SM107 (327 KB of shared memory) the narrow tiles, whose B stage is 1-2 KB so the budget admits 16-17 stages
+#: of the 16 KB A tile, gave wrong bits once the A ring crossed 256 KB, and are bit-identical to the wide tiles at or below
+#: it. The 14-bit start address of the shared-memory descriptors (16-byte units: a 256 KB window) would be a mechanism, but
+#: it does not fit the rest of the evidence: the B and scale-factor rings are allocated after A and, for the 128-row 64-wide
+#: records at 12 stages, end near 301 KB, and those records are bit-exact in the suite (`tests/gemm/test_batch_invariant_mm_mxfp8.py`,
+#: configuration agreement and the split implementations), so the window does not bind the B ring or the `tcgen05.cp`
+#: source. The bound therefore covers the A ring, the one buffer the evidence implicates. FlashInfer's own block-scaled
+#: kernels plan against the sm_100 budget of 228 KB and never reach it.
 A_RING_MAX_BYTES = 1 << 18
 
 

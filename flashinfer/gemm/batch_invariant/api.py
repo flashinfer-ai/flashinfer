@@ -903,7 +903,9 @@ def prepare_mxfp8_operands(
     architecture, e4m3 A and B, 2-D shapes with matching K, K a multiple of 32 (one whole scale block, hence 16-byte TMA
     rows) and N of 8, A's row placement, B the transpose of a row-major (N, K) weight (the block-scaled instruction takes
     K-major operands only), the two scale-factor buffers, the output's dtype / shape / layout (allocated when absent).
-    Returns ``(a, sfa, sfb, out, M, N, K)`` with the scale buffers as flat uint8 views."""
+    Returns ``(a, sfa, sfb, out, M, N, K)`` with the scale buffers as flat uint8 views. K is a multiple of 32; where it is not a multiple of the class's step (64 on SM107) the last step is partial: its
+    padded values are TMA zero fill, its scales are read from the scale buffers' padding, so those bytes must be finite
+    (the quantizer writes zeros; a NaN or Inf there poisons the row)."""
     cls = CLASS_MXFP8
     check_device(a.device, cls, MM_MXFP8_ARCHS)
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:

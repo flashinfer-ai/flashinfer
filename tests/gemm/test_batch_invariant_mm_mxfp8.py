@@ -292,6 +292,34 @@ def test_block_scaled_spaces():
     assert mx_class_for("mxfp8", "sm_103") == "mxfp8"
 
 
+def test_in_cluster_split_is_not_a_placement_beyond_the_grid_z_limit():
+    """The in-cluster split launches one cluster per output tile on grid.z, which the hardware caps at 65535: above that
+    tile count the record is not accepted for the shape and the dispatcher's pick is the workspace split (the same class,
+    the same bits), with no M-dependence in the class itself."""
+    from flashinfer.gemm.batch_invariant.blocks.operands import MAX_GRID_Z
+
+    N, K = 512, 16384
+    for fmt in MX_FMTS:
+        C = chunks_for(N, K, fmt)
+        assert C == 2
+        ck = next(
+            k
+            for k in enumerate_space(64, N, K, chunks=C, b_major="k", in_fmt=fmt)
+            if k.cluster_k == C
+        )
+        small = (MAX_GRID_Z // -(-N // ck.tile_n)) * ck.tile_m  # the largest M whose tile count fits
+        assert can_implement(ck, small, N, K, "k", C, fmt)
+        assert not can_implement(ck, small + ck.tile_m, N, K, "k", C, fmt)
+        for M in (2_000_000, 2_200_000):
+            for family, sm in PARTS:
+                if mx_class_for("mxfp8", family) != fmt:
+                    continue
+                pick = default_config(M, N, K, C, "k", sm, family, fmt)
+                assert can_implement(pick, M, N, K, "k", C, fmt), (M, pick.describe())
+                tiles = -(-M // pick.tile_m) * -(-N // pick.tile_n)
+                assert pick.cluster_k == 1 or tiles <= MAX_GRID_Z, (M, pick.describe())
+
+
 @pytest.mark.parametrize("family,sm_count", PARTS)
 def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """R3 membership: every configuration the dispatcher or the tuner's candidate list returns for the part's MXFP8 class is
@@ -391,6 +419,32 @@ def test_matches_flashinfer_backends(M, N, K, od):
         assert torch.equal(bits(ours), bits(refs["cute-dsl"])), (
             "the CuTe-DSL kernel's bits differ"
         )
+
+
+@needs_device
+def test_partial_last_step_reads_finite_scale_padding():
+    """K a multiple of 32 but not of the SM107 class's 64-wide step: the last step is partial, its values TMA zero fill and
+    its scales the scale buffers' padding bytes (zero here, as the quantizer writes them), so the fold equals the exact
+    product (on the 32-wide step's class every step is whole)."""
+    M, N, K = 37, 256, 4128
+    a, sfa = adv_mx(M, K, 141, span=3)
+    b, sfb = weight(N, K, 142, span=3)
+    out = bi_mm(a, b, sfa, sfb)
+    assert torch.isfinite(out.float()).all()
+    assert norm_rel_err(out, a, sfa, b.t(), sfb) <= 2.0**-8
+    f32 = mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=torch.float32)
+    assert torch.equal(bits(f32.to(torch.bfloat16)), bits(out))
+
+
+def test_flag_bypasses_the_operator_backend_selection():
+    """Under ``batch_invariant=True`` the operator's auto-backend heuristic yields a non-empty list whatever the backends'
+    availability: the flag path runs the class, so a missing MXFP8 backend never turns into a backend error."""
+    from flashinfer.gemm.gemm_base import _heuristic_func_mm_mxfp8
+
+    a = torch.zeros(4, 128).to(E4)
+    b = torch.zeros(128, 128).to(E4).t()
+    sf = torch.zeros(512, dtype=torch.uint8)
+    assert _heuristic_func_mm_mxfp8([], a, b, sf, sf, batch_invariant=True)
 
 
 @needs_device
