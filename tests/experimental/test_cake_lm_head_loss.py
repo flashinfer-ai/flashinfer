@@ -7338,6 +7338,93 @@ def _one_chunk_skip_inputs(W, T, kind, tau):
     return inp, zero
 
 
+@pytest.mark.parametrize("slices", ["one", "default"])
+@pytest.mark.parametrize("warm", [1, 2])
+@pytest.mark.parametrize("tau", [None, "distinct"])
+def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
+    glm_weight, monkeypatch, tau, warm, slices
+):
+    """A one-chunk log-probability backward under the zero-gradient row skip (plain and with a distinct per-token
+    temperature) captured in a CUDA graph through its remembered binding -- after one warm-up the captured call is the
+    binding's first call, after two a later call -- replays with other ``dlogp`` values written into the captured input
+    (other zero rows and live counts, none, a single live row and every row zero) and gives the eager backward's bits
+    on those values: ``dW`` bitwise; ``dX`` bitwise with one dX slice pinned and, with the default slices (an
+    unordered split-K reduction), exact ``+0`` on the zero and ignored rows and the eager values within the reduction
+    order on the live rows.  The replays leave the forward's ``lse`` bits unchanged, and every captured and eager call
+    ran the partition over every valid row."""
+    _require_zero_dlogp_skip()
+    if tau is not None:
+        _require_tau_program()
+    inp, _zero = _one_chunk_skip_inputs(glm_weight, 2048, "none", tau)
+    kw = dict(chunk_size=4096, **ND)
+    if tau is None:
+        fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, **kw)
+        entry, extra = cake_backend.backward_logprob, {}
+    else:
+        fr = cake_backend.forward_logprob_temperature(
+            inp.X, inp.W, inp.labels, temperature=inp.temperature, **kw
+        )
+        form = cake_backend._resolve_temperature(
+            inp.temperature, int(inp.labels.numel()), inp.X.device
+        )
+        entry = cake_backend.backward_logprob_temperature
+        extra = dict(temperature=form, temperature_rows=fr.temperature_rows)
+    if slices == "one":
+        extra.update(_TAU_ONE)
+    torch.cuda.synchronize()
+    assert fr.row_index is not None
+    lse_bits = _bits(fr.lse).clone()
+    dlogp = inp.dlogp.clone()
+
+    def backward(d):
+        return entry(
+            inp.X, inp.W, inp.labels, fr.lse, d, row_index=fr.row_index, **extra, **kw
+        )
+
+    valid = inp.labels >= 0
+    rows = int(valid.sum())
+    calls = _counted_partition(monkeypatch)
+    with _zero_dlogp_floor(0):
+        cake_backend.BINDING_CACHE.clear()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warm):
+                backward(dlogp)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dx_g, dw_g = backward(dlogp)
+        for kind in (("random", 0.166), ("random", 0.5), "none", "single", "all"):
+            zero = _zero_dlogp_set(inp, kind)
+            new = _with_zero_dlogp(inp, zero).dlogp
+            dlogp.copy_(new)
+            graph.replay()
+            torch.cuda.synchronize()
+            got_dx, got_dw = dx_g.clone(), dw_g.clone()
+            want_dx, want_dw = backward(new.clone())
+            torch.cuda.synchronize()
+            assert _same_bits(got_dw, want_dw), kind
+            assert not bool(_bits(got_dx[zero | ~valid]).any()), kind
+            if slices == "one":
+                assert _same_bits(got_dx, want_dx), kind
+                continue
+            live = valid & ~zero
+            if bool(live.any()):
+                scale = float(want_dx[live].float().abs().max())
+                err = float((got_dx[live].float() - want_dx[live].float()).abs().max())
+                assert err <= scale * 2**-7, (kind, err, scale)
+    assert calls == [rows] * (warm + 6), calls
+    bindings = [
+        b
+        for k, b in cake_backend.BINDING_CACHE._bindings.items()
+        if k[:2] == ("bwd", "logprob") and b.plan.dcnt
+    ]
+    assert len(bindings) == 1
+    assert bindings[0].holds_no_tensor()
+    assert torch.equal(_bits(fr.lse), lse_bits)
+
+
 @pytest.mark.parametrize("tau", [None, "distinct"])
 def test_device_logprob_backward_reuses_the_forward_problem(
     glm_weight, monkeypatch, tau
