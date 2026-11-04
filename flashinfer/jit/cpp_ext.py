@@ -401,20 +401,37 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _cgroup_inactive_file_bytes(stat_path: str, key: str) -> int:
+    """Inactive page cache in a cgroup ``memory.stat``, or 0 if unreadable."""
+    try:
+        with open(stat_path) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
 def _cgroup_available_memory_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
     """Bytes left under the cgroup memory limit, or None if
     unlimited/unreadable.
 
     Inside containers /proc/meminfo reports *host* memory, so the cgroup
     limit is what actually prevents an OOM kill.
-    cgroup's memory.current is profiled here to estimate the headroom.
+    cgroup's memory.current is profiled here to estimate the headroom, less
+    the inactive page cache the kernel reclaims before an OOM kill (the
+    working set kubelet uses), since reading weights fills that cache.
     """
     try:
         with open(f"{root}/memory.max") as f:
             limit = f.read().strip()
         if limit != "max":
             with open(f"{root}/memory.current") as f:
-                current = int(f.read())
+                current = int(f.read()) - _cgroup_inactive_file_bytes(
+                    f"{root}/memory.stat", "inactive_file"
+                )
             return max(0, int(limit) - current)
     except (OSError, ValueError):
         pass
@@ -424,7 +441,9 @@ def _cgroup_available_memory_bytes(root: str = "/sys/fs/cgroup") -> Optional[int
             limit_v1 = int(f.read())
         if limit_v1 < 1 << 60:  # values near 2**63 mean "unlimited"
             with open(f"{root}/memory/memory.usage_in_bytes") as f:
-                usage = int(f.read())
+                usage = int(f.read()) - _cgroup_inactive_file_bytes(
+                    f"{root}/memory/memory.stat", "total_inactive_file"
+                )
             return max(0, limit_v1 - usage)
     except (OSError, ValueError):
         pass
@@ -458,7 +477,7 @@ def _read_mem_available_gb() -> Optional[int]:
 def _cgroup_cpu_quota(root: str = "/sys/fs/cgroup") -> Optional[int]:
     """Whole CPUs the cgroup CPU quota allows, or ``None`` without a quota.
 
-    ninja lowers its default parallelism to this quota (``GetProcessorCount``).
+    ninja 1.11+ lowers its default parallelism to this quota (``GetProcessorCount``).
     """
     try:
         with open(f"{root}/cpu.max") as f:
@@ -477,6 +496,15 @@ def _cgroup_cpu_quota(root: str = "/sys/fs/cgroup") -> Optional[int]:
     except (OSError, ValueError):
         pass
     return None
+
+
+def _ninja_default_jobs(cpu_count: int) -> int:
+    """ninja's GuessParallelism: 2 for <=1 core, 3 for 2 cores, else N + 2."""
+    if cpu_count <= 1:
+        return 2
+    if cpu_count == 2:
+        return 3
+    return cpu_count + 2
 
 
 @functools.cache
@@ -504,33 +532,29 @@ def _memory_aware_job_cap() -> Optional[int]:
     if mem_available_gb is None:
         return None
 
-    # ninja counts the CPUs this process may run on (sched_getaffinity), lowered
-    # to the cgroup CPU quota when there is one.
+    # ninja counts the CPUs this process may run on (sched_getaffinity).
     if hasattr(os, "sched_getaffinity"):
         cpu_count = len(os.sched_getaffinity(0))
     else:
         cpu_count = os.cpu_count() or 1
-    cpu_quota = _cgroup_cpu_quota()
-    if cpu_quota is not None:
-        cpu_count = min(cpu_count, cpu_quota)
-    # ninja's GuessParallelism: 2 for <=1 core, 3 for 2 cores, else N + 2.
-    if cpu_count <= 1:
-        ninja_default = 2
-    elif cpu_count == 2:
-        ninja_default = 3
-    else:
-        ninja_default = cpu_count + 2
 
     try:
-        nvcc_threads = max(1, int(os.environ.get("FLASHINFER_NVCC_THREADS", "1")))
+        nvcc_threads = int(os.environ.get("FLASHINFER_NVCC_THREADS", "1"))
     except ValueError:
         nvcc_threads = 1
+    # The 8 GiB floor also covers zero or negative thread counts.
     mem_per_job_gb = max(8, nvcc_threads * 2)
 
     mem_cap = max(1, mem_available_gb // mem_per_job_gb)
-    if mem_cap >= ninja_default:
-        # Plenty of memory for the default parallelism; don't intervene.
+    if mem_cap >= _ninja_default_jobs(cpu_count):
+        # No ninja version runs more jobs than fit; don't intervene.
         return None
+    # ninja 1.11+ also lowers its default to the cgroup CPU quota. Never pass
+    # more than that default, while an older ninja, which ignores the quota,
+    # still gets a -j that fits memory.
+    cpu_quota = _cgroup_cpu_quota()
+    if cpu_quota is not None:
+        mem_cap = min(mem_cap, _ninja_default_jobs(min(cpu_count, cpu_quota)))
     _warn_job_cap(mem_cap, mem_per_job_gb)
     return mem_cap
 
