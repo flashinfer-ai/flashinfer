@@ -40,52 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_S_OFFSET 0
-#define TMEM_TMEM_O_OFFSET 256
-#define NUM_KV_RING_STAGES 9
-#define NUM_S_RING_STAGES 2
-#define NUM_P_RING_STAGES 4
-#define NUM_ITEM_RING_STAGES 2
-#define SMEM_SMEM_EXCH_OFF 1024
-#define SMEM_SMEM_EXCH_STAGE_BYTES 4096
-#define SMEM_SMEM_EXCH_STRIDE 4096
-#define SMEM_SMEM_SUM_OFF 5120
-#define SMEM_SMEM_SUM_STAGE_BYTES 1024
-#define SMEM_SMEM_SUM_STRIDE 1024
-#define SMEM_SMEM_BLOCK_OFF 6144
-#define SMEM_SMEM_BLOCK_STAGE_BYTES 400
-#define SMEM_SMEM_BLOCK_STRIDE 400
-#define SMEM_SMEM_PAGE_OFF 6544
-#define SMEM_SMEM_PAGE_STAGE_BYTES 400
-#define SMEM_SMEM_PAGE_STRIDE 400
-#define SMEM_SMEM_TOKMASK_OFF 6944
-#define SMEM_SMEM_TOKMASK_STAGE_BYTES 400
-#define SMEM_SMEM_TOKMASK_STRIDE 400
-#define SMEM_SMEM_NPAIRS_OFF 7344
-#define SMEM_SMEM_NPAIRS_STAGE_BYTES 8
-#define SMEM_SMEM_NPAIRS_STRIDE 8
-#define SMEM_SMEM_KVLEN_OFF 7352
-#define SMEM_SMEM_KVLEN_STAGE_BYTES 8
-#define SMEM_SMEM_KVLEN_STRIDE 8
-#define SMEM_SMEM_ISSUE_OFF 7360
-#define SMEM_SMEM_ISSUE_STAGE_BYTES 16
-#define SMEM_SMEM_ISSUE_STRIDE 16
-#define SMEM_SMEM_QT_OFF 8192
-#define SMEM_SMEM_QT_STAGE_BYTES 8192
-#define SMEM_SMEM_QT_STRIDE 8192
-#define SMEM_SMEM_P_OFF 16384
-#define SMEM_SMEM_P_STAGE_BYTES 8192
-#define SMEM_SMEM_P_STRIDE 8192
-#define SMEM_SMEM_KV_OFF 81920
-#define SMEM_SMEM_KV_STAGE_BYTES 16384
-#define SMEM_SMEM_KV_STRIDE 16384
-#define SMEM_SMEM_V_OFF 81920
-#define SMEM_SMEM_V_STAGE_BYTES 16384
-#define SMEM_SMEM_V_STRIDE 16384
-#define SMEM_TOTAL 229376
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -249,7 +203,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+kernel_cake_blackwell_msa_4cdd9bffd43dd3233723(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -493,7 +447,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     }
                     mbarrier_wait(s_full_addr + (s_stage) * 8, _phase_s_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int s_addr = taddr + (unsigned int)(s_stage * 128) + 0 + (unsigned int)lane_base;
+                    int s_addr = taddr + (unsigned int)(s_stage * 128) + (unsigned int)lane_base;
                     float sv0[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -512,55 +466,55 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (elect_sync()) {
                         mbarrier_arrive(s_empty_addr + (s_stage) * 8);
                     }
-                    int blk_t = smem_block[meta_base + pair * 2 + 0];
-                    unsigned int tm_t = (unsigned int)smem_tokmask[meta_base + pair * 2 + 0];
+                    int blk_t = smem_block[meta_base + pair * 2];
+                    unsigned int tm_t = (unsigned int)smem_tokmask[meta_base + pair * 2];
                     int vbase = kvlen - 7 - blk_t * 128;
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[0] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[0] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[1] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[1] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[2] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[2] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[3] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[3] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[4] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[4] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[5] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[5] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[6] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[6] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase + 0) {
+                    if (key_row >= vbase) {
                         sv0[7] = -CUDART_INF_F;
                     }
-                    if ((tm_t >> 0 & 1) == 0) {
+                    if ((tm_t & 1) == 0) {
                         sv0[7] = -CUDART_INF_F;
                     }
                     if (key_row >= vbase + 1) {
@@ -868,57 +822,57 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (lane == 31) {
                         hold = mx_31;
                     }
-                    int exch_slot = ((0 + pair % 2) * 2 + 0) * 4 * 32 + warp_in_role * 32;
+                    int exch_slot = pair % 2 * 2 * 4 * 32 + warp_in_role * 32;
                     smem_exch[exch_slot + lane] = hold;
                     int blk_t_0 = smem_block[meta_base + pair * 2 + 1];
                     unsigned int tm_t_0 = (unsigned int)smem_tokmask[meta_base + pair * 2 + 1];
                     int vbase_0 = kvlen - 7 - blk_t_0 * 128;
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[0] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[0] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[1] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[1] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[2] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[2] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[3] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[3] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[4] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[4] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[5] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[5] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[6] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[6] = -CUDART_INF_F;
                     }
-                    if (key_row >= vbase_0 + 0) {
+                    if (key_row >= vbase_0) {
                         sv1[7] = -CUDART_INF_F;
                     }
-                    if ((tm_t_0 >> 0 & 1) == 0) {
+                    if ((tm_t_0 & 1) == 0) {
                         sv1[7] = -CUDART_INF_F;
                     }
                     if (key_row >= vbase_0 + 1) {
@@ -1226,7 +1180,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (lane == 31) {
                         hold_0 = mx_63;
                     }
-                    int exch_slot_0 = ((0 + pair % 2) * 2 + 1) * 4 * 32 + warp_in_role * 32;
+                    int exch_slot_0 = (pair % 2 * 2 + 1) * 4 * 32 + warp_in_role * 32;
                     smem_exch[exch_slot_0 + lane] = hold_0;
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     int grow_any = 0;
@@ -1240,7 +1194,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     grown_mask[2] = 0;
                     alpha[3] = 1.0f;
                     grown_mask[3] = 0;
-                    int base_0 = ((0 + pair % 2) * 2 + 0) * 4 * 32 + 0;
+                    int base_0 = pair % 2 * 2 * 4 * 32;
                     float m_s_0;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_0) : "f"(smem_exch[base_0 + lane]), "f"(smem_exch[base_0 + 32 + lane]));
                     float cand_0;
@@ -1264,7 +1218,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (grown_mask[0] != 0) {
                         grow_any = 1;
                     }
-                    int base_1 = ((0 + pair % 2) * 2 + 0) * 4 * 32 + 64;
+                    int base_1 = pair % 2 * 2 * 4 * 32 + 64;
                     float m_s_1;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_1) : "f"(smem_exch[base_1 + lane]), "f"(smem_exch[base_1 + 32 + lane]));
                     float cand_1;
@@ -1288,7 +1242,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (grown_mask[1] != 0) {
                         grow_any = 1;
                     }
-                    int base_2 = ((0 + pair % 2) * 2 + 1) * 4 * 32 + 0;
+                    int base_2 = (pair % 2 * 2 + 1) * 4 * 32;
                     float m_s_2;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_2) : "f"(smem_exch[base_2 + lane]), "f"(smem_exch[base_2 + 32 + lane]));
                     float cand_2;
@@ -1312,7 +1266,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (grown_mask[2] != 0) {
                         grow_any = 1;
                     }
-                    int base_3 = ((0 + pair % 2) * 2 + 1) * 4 * 32 + 64;
+                    int base_3 = (pair % 2 * 2 + 1) * 4 * 32 + 64;
                     float m_s_3;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_3) : "f"(smem_exch[base_3 + lane]), "f"(smem_exch[base_3 + 32 + lane]));
                     float cand_3;
@@ -2017,8 +1971,8 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                                                "f"(sv0[30]), "f"(sv0[31]));
                         words[7] = _packed;
                     }
-                    int p_base = smem_p_addr + (unsigned int)((p_stage * 2 + 0) * 8192);
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base + (key_row * 64 + 0 ^ (key_row * 64 + 0 >> 7 & 3) << 4))), "r"(words[0]), "r"(words[1]), "r"(words[2]), "r"(words[3]) : "memory");
+                    int p_base = smem_p_addr + (unsigned int)(p_stage * 2 * 8192);
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base + (key_row * 64 ^ (key_row * 64 >> 7 & 3) << 4))), "r"(words[0]), "r"(words[1]), "r"(words[2]), "r"(words[3]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base + (key_row * 64 + 16 ^ (key_row * 64 + 16 >> 7 & 3) << 4))), "r"(words[4]), "r"(words[5]), "r"(words[6]), "r"(words[7]) : "memory");
                     float ms_sel_0 = ((own_half == 0) ? ms_hold[2] : ms_hold[3]);
                     float _shfl_sync_265 = __shfl_sync(0xFFFFFFFF, ms_sel_0, 0);
@@ -2255,7 +2209,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                         words_0[7] = _packed;
                     }
                     int p_base_0 = smem_p_addr + (unsigned int)((p_stage * 2 + 1) * 8192);
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base_0 + (key_row * 64 + 0 ^ (key_row * 64 + 0 >> 7 & 3) << 4))), "r"(words_0[0]), "r"(words_0[1]), "r"(words_0[2]), "r"(words_0[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base_0 + (key_row * 64 ^ (key_row * 64 >> 7 & 3) << 4))), "r"(words_0[0]), "r"(words_0[1]), "r"(words_0[2]), "r"(words_0[3]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base_0 + (key_row * 64 + 16 ^ (key_row * 64 + 16 >> 7 & 3) << 4))), "r"(words_0[4]), "r"(words_0[5]), "r"(words_0[6]), "r"(words_0[7]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -2680,11 +2634,11 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 if (npairs == 0) {
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                 }
-                smem_sum[(0 + warp_in_role) * 32 + lane] = xs;
+                smem_sum[warp_in_role * 32 + lane] = xs;
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float head_sum = 0.0f;
-                head_sum = head_sum + smem_sum[0 + lane];
+                head_sum = head_sum + smem_sum[lane];
                 head_sum = head_sum + smem_sum[32 + lane];
                 head_sum = head_sum + smem_sum[64 + lane];
                 head_sum = head_sum + smem_sum[96 + lane];
@@ -3043,7 +2997,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 }
                 int q_row0 = request * 8 * num_q_heads + head0;
                 if (warp_in_role == 0) {
-                    int gc = 0 + lane;
+                    int gc = lane;
                     int lse_row = q_row0 + gc / 8 * num_q_heads + gc % 8;
                     float lse = -CUDART_INF_F;
                     if (head_sum > 0.0f) {
@@ -3053,55 +3007,55 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     }
                     *(reinterpret_cast<float*>(msa_lse + lse_row) + (0)) = lse;
                 }
-                int row_c_0 = q_row0 + 0 * num_q_heads + 0;
+                int row_c_0 = q_row0;
                 float _shfl_sync_557 = __shfl_sync(0xFFFFFFFF, inv, 0);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_0 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[0] * _shfl_sync_557);
-                int row_c_1 = q_row0 + 0 * num_q_heads + 1;
+                int row_c_1 = q_row0 + 1;
                 float _shfl_sync_558 = __shfl_sync(0xFFFFFFFF, inv, 1);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_1 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[1] * _shfl_sync_558);
-                int row_c_2 = q_row0 + 0 * num_q_heads + 2;
+                int row_c_2 = q_row0 + 2;
                 float _shfl_sync_559 = __shfl_sync(0xFFFFFFFF, inv, 2);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_2 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[2] * _shfl_sync_559);
-                int row_c_3 = q_row0 + 0 * num_q_heads + 3;
+                int row_c_3 = q_row0 + 3;
                 float _shfl_sync_560 = __shfl_sync(0xFFFFFFFF, inv, 3);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_3 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[3] * _shfl_sync_560);
-                int row_c_4 = q_row0 + 0 * num_q_heads + 4;
+                int row_c_4 = q_row0 + 4;
                 float _shfl_sync_561 = __shfl_sync(0xFFFFFFFF, inv, 4);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_4 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[4] * _shfl_sync_561);
-                int row_c_5 = q_row0 + 0 * num_q_heads + 5;
+                int row_c_5 = q_row0 + 5;
                 float _shfl_sync_562 = __shfl_sync(0xFFFFFFFF, inv, 5);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_5 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[5] * _shfl_sync_562);
-                int row_c_6 = q_row0 + 0 * num_q_heads + 6;
+                int row_c_6 = q_row0 + 6;
                 float _shfl_sync_563 = __shfl_sync(0xFFFFFFFF, inv, 6);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_6 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[6] * _shfl_sync_563);
-                int row_c_7 = q_row0 + 0 * num_q_heads + 7;
+                int row_c_7 = q_row0 + 7;
                 float _shfl_sync_564 = __shfl_sync(0xFFFFFFFF, inv, 7);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_7 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[7] * _shfl_sync_564);
-                int row_c_8 = q_row0 + 1 * num_q_heads + 0;
+                int row_c_8 = q_row0 + num_q_heads;
                 float _shfl_sync_565 = __shfl_sync(0xFFFFFFFF, inv, 8);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_8 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[8] * _shfl_sync_565);
-                int row_c_9 = q_row0 + 1 * num_q_heads + 1;
+                int row_c_9 = q_row0 + num_q_heads + 1;
                 float _shfl_sync_566 = __shfl_sync(0xFFFFFFFF, inv, 9);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_9 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[9] * _shfl_sync_566);
-                int row_c_10 = q_row0 + 1 * num_q_heads + 2;
+                int row_c_10 = q_row0 + num_q_heads + 2;
                 float _shfl_sync_567 = __shfl_sync(0xFFFFFFFF, inv, 10);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_10 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[10] * _shfl_sync_567);
-                int row_c_11 = q_row0 + 1 * num_q_heads + 3;
+                int row_c_11 = q_row0 + num_q_heads + 3;
                 float _shfl_sync_568 = __shfl_sync(0xFFFFFFFF, inv, 11);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_11 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[11] * _shfl_sync_568);
-                int row_c_12 = q_row0 + 1 * num_q_heads + 4;
+                int row_c_12 = q_row0 + num_q_heads + 4;
                 float _shfl_sync_569 = __shfl_sync(0xFFFFFFFF, inv, 12);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_12 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[12] * _shfl_sync_569);
-                int row_c_13 = q_row0 + 1 * num_q_heads + 5;
+                int row_c_13 = q_row0 + num_q_heads + 5;
                 float _shfl_sync_570 = __shfl_sync(0xFFFFFFFF, inv, 13);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_13 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[13] * _shfl_sync_570);
-                int row_c_14 = q_row0 + 1 * num_q_heads + 6;
+                int row_c_14 = q_row0 + num_q_heads + 6;
                 float _shfl_sync_571 = __shfl_sync(0xFFFFFFFF, inv, 14);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_14 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[14] * _shfl_sync_571);
-                int row_c_15 = q_row0 + 1 * num_q_heads + 7;
+                int row_c_15 = q_row0 + num_q_heads + 7;
                 float _shfl_sync_572 = __shfl_sync(0xFFFFFFFF, inv, 15);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_15 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[15] * _shfl_sync_572);
-                int row_c_16 = q_row0 + 2 * num_q_heads + 0;
+                int row_c_16 = q_row0 + 2 * num_q_heads;
                 float _shfl_sync_573 = __shfl_sync(0xFFFFFFFF, inv, 16);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_16 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[16] * _shfl_sync_573);
                 int row_c_17 = q_row0 + 2 * num_q_heads + 1;
@@ -3125,7 +3079,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 int row_c_23 = q_row0 + 2 * num_q_heads + 7;
                 float _shfl_sync_580 = __shfl_sync(0xFFFFFFFF, inv, 23);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_23 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[23] * _shfl_sync_580);
-                int row_c_24 = q_row0 + 3 * num_q_heads + 0;
+                int row_c_24 = q_row0 + 3 * num_q_heads;
                 float _shfl_sync_581 = __shfl_sync(0xFFFFFFFF, inv, 24);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_24 * 128 + key_row)) + (0)) = (__nv_bfloat16)(o_epi[24] * _shfl_sync_581);
                 int row_c_25 = q_row0 + 3 * num_q_heads + 1;
@@ -3296,8 +3250,8 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (elect_sync()) {
                         mbarrier_arrive(s_empty_addr + (s_stage_1) * 8);
                     }
-                    int blk_t_1 = smem_block[meta_base_1 + pair_1 * 2 + 0];
-                    unsigned int tm_t_1 = (unsigned int)smem_tokmask[meta_base_1 + pair_1 * 2 + 0];
+                    int blk_t_1 = smem_block[meta_base_1 + pair_1 * 2];
+                    unsigned int tm_t_1 = (unsigned int)smem_tokmask[meta_base_1 + pair_1 * 2];
                     int vbase_1 = kvlen_1 - 7 - blk_t_1 * 128;
                     if (key_row_1 >= vbase_1 + 4) {
                         sv0_1[0] = -CUDART_INF_F;
@@ -3652,7 +3606,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (lane == 31) {
                         hold_1 = mx_95;
                     }
-                    int exch_slot_1 = ((2 + pair_1 % 2) * 2 + 0) * 4 * 32 + warp_in_role_1 * 32;
+                    int exch_slot_1 = (2 + pair_1 % 2) * 2 * 4 * 32 + warp_in_role_1 * 32;
                     smem_exch[exch_slot_1 + lane] = hold_1;
                     int blk_t_1_1 = smem_block[meta_base_1 + pair_1 * 2 + 1];
                     unsigned int tm_t_1_1 = (unsigned int)smem_tokmask[meta_base_1 + pair_1 * 2 + 1];
@@ -4024,7 +3978,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     grown_mask_1[2] = 0;
                     alpha_1[3] = 1.0f;
                     grown_mask_1[3] = 0;
-                    int base_4 = ((2 + pair_1 % 2) * 2 + 0) * 4 * 32 + 0;
+                    int base_4 = (2 + pair_1 % 2) * 2 * 4 * 32;
                     float m_s_4;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_4) : "f"(smem_exch[base_4 + lane]), "f"(smem_exch[base_4 + 32 + lane]));
                     float cand_4;
@@ -4048,7 +4002,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (grown_mask_1[0] != 0) {
                         grow_any_1 = 1;
                     }
-                    int base_5 = ((2 + pair_1 % 2) * 2 + 0) * 4 * 32 + 64;
+                    int base_5 = (2 + pair_1 % 2) * 2 * 4 * 32 + 64;
                     float m_s_5;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_5) : "f"(smem_exch[base_5 + lane]), "f"(smem_exch[base_5 + 32 + lane]));
                     float cand_5;
@@ -4072,7 +4026,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     if (grown_mask_1[1] != 0) {
                         grow_any_1 = 1;
                     }
-                    int base_6 = ((2 + pair_1 % 2) * 2 + 1) * 4 * 32 + 0;
+                    int base_6 = ((2 + pair_1 % 2) * 2 + 1) * 4 * 32;
                     float m_s_6;
                     asm("max.f32 %0, %1, %2;" : "=f"(m_s_6) : "f"(smem_exch[base_6 + lane]), "f"(smem_exch[base_6 + 32 + lane]));
                     float cand_6;
@@ -4801,7 +4755,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                                                "f"(sv0_1[30]), "f"(sv0_1[31]));
                         words_1[7] = _packed;
                     }
-                    int p_base_1 = smem_p_addr + (unsigned int)((p_stage_1 * 2 + 0) * 8192);
+                    int p_base_1 = smem_p_addr + (unsigned int)(p_stage_1 * 2 * 8192);
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base_1 + (key_row_1 * 64 + 32 ^ (key_row_1 * 64 + 32 >> 7 & 3) << 4))), "r"(words_1[0]), "r"(words_1[1]), "r"(words_1[2]), "r"(words_1[3]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((p_base_1 + (key_row_1 * 64 + 48 ^ (key_row_1 * 64 + 48 >> 7 & 3) << 4))), "r"(words_1[4]), "r"(words_1[5]), "r"(words_1[6]), "r"(words_1[7]) : "memory");
                     float ms_sel_1_1 = ((own_half_1 == 0) ? ms_hold_1[2] : ms_hold_1[3]);
@@ -5837,7 +5791,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     }
                     *(reinterpret_cast<float*>(msa_lse + lse_row_1) + (0)) = lse_1;
                 }
-                int row_c_32 = q_row0_1 + 4 * num_q_heads + 0;
+                int row_c_32 = q_row0_1 + 4 * num_q_heads;
                 float _shfl_sync_557_1 = __shfl_sync(0xFFFFFFFF, inv_1, 0);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_32 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[0] * _shfl_sync_557_1);
                 int row_c_33 = q_row0_1 + 4 * num_q_heads + 1;
@@ -5861,7 +5815,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 int row_c_39 = q_row0_1 + 4 * num_q_heads + 7;
                 float _shfl_sync_564_1 = __shfl_sync(0xFFFFFFFF, inv_1, 7);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_39 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[7] * _shfl_sync_564_1);
-                int row_c_40 = q_row0_1 + 5 * num_q_heads + 0;
+                int row_c_40 = q_row0_1 + 5 * num_q_heads;
                 float _shfl_sync_565_1 = __shfl_sync(0xFFFFFFFF, inv_1, 8);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_40 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[8] * _shfl_sync_565_1);
                 int row_c_41 = q_row0_1 + 5 * num_q_heads + 1;
@@ -5885,7 +5839,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 int row_c_47 = q_row0_1 + 5 * num_q_heads + 7;
                 float _shfl_sync_572_1 = __shfl_sync(0xFFFFFFFF, inv_1, 15);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_47 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[15] * _shfl_sync_572_1);
-                int row_c_48 = q_row0_1 + 6 * num_q_heads + 0;
+                int row_c_48 = q_row0_1 + 6 * num_q_heads;
                 float _shfl_sync_573_1 = __shfl_sync(0xFFFFFFFF, inv_1, 16);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_48 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[16] * _shfl_sync_573_1);
                 int row_c_49 = q_row0_1 + 6 * num_q_heads + 1;
@@ -5909,7 +5863,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 int row_c_55 = q_row0_1 + 6 * num_q_heads + 7;
                 float _shfl_sync_580_1 = __shfl_sync(0xFFFFFFFF, inv_1, 23);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_55 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[23] * _shfl_sync_580_1);
-                int row_c_56 = q_row0_1 + 7 * num_q_heads + 0;
+                int row_c_56 = q_row0_1 + 7 * num_q_heads;
                 float _shfl_sync_581_1 = __shfl_sync(0xFFFFFFFF, inv_1, 24);
                 *(reinterpret_cast<__nv_bfloat16*>(O + (row_c_56 * 128 + key_row_1)) + (0)) = (__nv_bfloat16)(o_epi_1[24] * _shfl_sync_581_1);
                 int row_c_57 = q_row0_1 + 7 * num_q_heads + 1;
@@ -5977,7 +5931,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                 unsigned int my_lo = 0;
                 unsigned int my_hi = 0;
                 unsigned int one = 1;
-                int slot_0 = lane % 4 + 0;
+                int slot_0 = lane % 4;
                 int blk_0 = task_kind[(kv_head_2 * total_q + query) * 16 + slot_0];
                 if (blk_0 >= 0) {
                     if (blk_0 * 128 <= qpos) {
@@ -6307,7 +6261,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     unsigned int my_lo_1 = 0;
                     unsigned int my_hi_1 = 0;
                     unsigned int one_1 = 1;
-                    int slot_4 = lane % 4 + 0;
+                    int slot_4 = lane % 4;
                     int blk_4 = task_kind[(kv_head_0 * total_q + query_1) * 16 + slot_4];
                     if (blk_4 >= 0) {
                         if (blk_4 * 128 <= qpos_1) {
@@ -6767,7 +6721,7 @@ kernel_cake_blackwell_msa_fe77fa3c3c80567ee5c4(const __grid_constant__ CUtensorM
                     mbarrier_wait(p_full_addr + (pf_stage_v) * 8, _phase_p_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_0_1 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v0) * 1024);
-                    int _mma_b_lo_0_1 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x2000000) + (pf_stage_v * 2 + 0) * 512);
+                    int _mma_b_lo_0_1 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x2000000) + (pf_stage_v * 2) * 512);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
