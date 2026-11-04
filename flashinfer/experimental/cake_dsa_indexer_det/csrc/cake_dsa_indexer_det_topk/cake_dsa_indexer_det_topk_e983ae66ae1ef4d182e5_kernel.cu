@@ -228,7 +228,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, unsigned int* __restrict__ TicketWord)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -355,14 +355,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             int tk_limit_0 = n_total_0 + grid_ctas - 1;
             s_tk[2] = tk_limit_0;
             s_tk[3] = n_total_0;
-            long long tk_off_0 = (long long)grid_ctas * (long long)(8 * cand_cap);
             if (n_total_0 <= grid_ctas) {
                 s_tk[0] = (int)bid;
                 s_tk[1] = n_total_0;
             } else {
                 uint32_t _atomic_fetch_inc_0;
                 asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
-                    : "=r"(_atomic_fetch_inc_0) : "l"(reinterpret_cast<unsigned int*>(Cand + tk_off_0)), "r"(static_cast<uint32_t>((unsigned int)tk_limit_0)) : "memory");
+                    : "=r"(_atomic_fetch_inc_0) : "l"(TicketWord), "r"(static_cast<uint32_t>((unsigned int)tk_limit_0)) : "memory");
                 s_tk[0] = (int)_atomic_fetch_inc_0;
             }
         }
@@ -389,7 +388,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                 unsigned int tk_limit_q = (unsigned int)s_tk[2];
                 int n_tot_q = s_tk[3];
                 int g_units_q = grid_ctas;
-                long long tk_off_q = (long long)grid_ctas * (long long)(8 * cand_cap);
                 unsigned int ack_q = 0;
                 ack_q += 1;
                 if (ack_q == 2) { ack_q = 0; _phase_tk_ack ^= 1; }
@@ -441,7 +439,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     if (n_tot_q > g_units_q) {
                                         uint32_t _atomic_fetch_inc_1;
                                         asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
-                                            : "=r"(_atomic_fetch_inc_1) : "l"(reinterpret_cast<unsigned int*>(Cand + tk_off_q)), "r"(static_cast<uint32_t>(tk_limit_q)) : "memory");
+                                            : "=r"(_atomic_fetch_inc_1) : "l"(TicketWord), "r"(static_cast<uint32_t>(tk_limit_q)) : "memory");
                                         int drawn_q = (int)_atomic_fetch_inc_1;
                                         s_tk[tkp_q ^ 1] = drawn_q;
                                         tk_q = drawn_q;
