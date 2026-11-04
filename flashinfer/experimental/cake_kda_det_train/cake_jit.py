@@ -7024,6 +7024,90 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "bwd_prep",
         "variant": "g8_replay_l2n",
     },
+    # The saved-rstd twin of bwd_prep_g8_replay_l2n (glm_bwd_prep v11_g8, FlashInfer #7817): the same plan, run
+    # in its place by the KCP backward's launch that reads the saved rstd (read_rstd = 1) on the twin's
+    # architectures; its rule ``saved_rstd_twin`` admits no problem, so no plan selects it.
+    "bwd_prep_g8_replay_saved_l2n": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "g"],
+            ["buffer", "beta"],
+            ["buffer", "do"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "do_int"],
+            ["buffer", "beta_int"],
+            ["buffer", "v_new"],
+            ["buffer", "dv2"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "group"],
+            ["buffer", "q_raw"],
+            ["buffer", "k_raw"],
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "qk_rstd"],
+            ["parameter", "num_tokens"],
+            ["parameter", "q_raw_row_stride"],
+            ["parameter", "q_raw_head_stride"],
+            ["parameter", "k_raw_row_stride"],
+            ["parameter", "k_raw_head_stride"],
+            ["parameter", "read_rstd"],
+            ["parameter", "write_rstd"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_det_train_50721aa4cea4ff2fe68f",
+        "l2n": ["fused"],
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 53248,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_50721aa4cea4ff2fe68f",
+        "logical": {
+            "beta": "beta",
+            "beta_int": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "do": "dout",
+            "do_int": "do_int",
+            "dv2": "dv2",
+            "g": "g",
+            "gk_out": "gk",
+            "group": "group",
+            "k_raw": "k_raw",
+            "k_raw_head_stride": "k_raw_head_stride",
+            "k_raw_row_stride": "k_raw_row_stride",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "kn": "kn",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "num_tokens": "num_tokens",
+            "q_raw": "q_raw",
+            "q_raw_head_stride": "q_raw_head_stride",
+            "q_raw_row_stride": "q_raw_row_stride",
+            "qg_out": "qg",
+            "qk_rstd": "qk_rstd",
+            "qn": "qn",
+            "read_rstd": "read_rstd",
+            "v_new": "v_new",
+            "write_rstd": "write_rstd",
+        },
+        "select_rule": {"kind": "saved_rstd_twin"},
+        "stage": "bwd_prep",
+        "variant": "g8_replay_saved_l2n",
+    },
     "bwd_prep_g8_noqg_l2n": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -8564,6 +8648,9 @@ def _admits(
         return path in rule["paths"]
     if kind == "l2n_in":
         return l2n in rule["modes"]
+    if kind == "saved_rstd_twin":
+        # a saved-rstd twin: launched by name in place of its record, never selected
+        return False
     raise ValueError(f"unknown Cake KDA training selection rule: {kind!r}")
 
 
@@ -8719,6 +8806,8 @@ def select_record(
     of the mode is refused (the architecture's records do not serve it).  The
     ``l2n_in`` rule reads the mode (``modes``): a record serving several modes
     (a plain record the l2n route keeps on some paths) narrows its rule there.
+    ``saved_rstd_twin`` admits no problem: the record is the saved-rstd twin a
+    launch names in place of another record, never a plan's selection.
 
     ``ctas = num_chunks_pad * num_heads`` is the chunk-shaped CTA count the
     preparation stages switch on (``ctas_at_least`` / ``ctas_below`` /
