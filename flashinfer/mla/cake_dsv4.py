@@ -925,9 +925,35 @@ _RAGGED_ONLY_ROUTES = frozenset(
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
 
+# Per architecture, (fewest query rows, longest request, topk4x items only)
+# entries: launches that reach an entry's row count and whose requests hold at
+# most its query rows keep the uniform-gather route past the lane-gather floor.
+# On SM107 that route runs its K=64 sibling, which led the lane-issued program
+# on these short-query decode launches (VR200, one process, eight calls per
+# CUDA graph).  It trailed it at almost every measured row count on topk4x and
+# topk128x prefill, with 16 or more query rows per request on topk4x items (8
+# at 160 rows), with 8 or more on topk128x items, and with 4 on topk128x items
+# 1152 wide (2 at 160 rows); it was mixed with 4 query rows on narrower
+# topk128x and on SWA-only items.
+_FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
+    "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True)),
+}
 
-def _fp8_persistent_program(num_query_tokens: int) -> str:
+
+def _fp8_persistent_program(
+    num_query_tokens: int,
+    *,
+    max_q_len: Optional[int] = None,
+    topk4x: bool = False,
+    arch: Optional[str] = None,
+) -> str:
     if num_query_tokens < _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+        return "fp8_h128_prefill_source_persistent_uniform"
+    entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
+    if max_q_len is not None and any(
+        num_query_tokens >= rows and max_q_len <= longest and (topk4x or not only4x)
+        for rows, longest, only4x in entries
+    ):
         return "fp8_h128_prefill_source_persistent_uniform"
     return "fp8_h128_prefill_source_persistent"
 
@@ -1163,7 +1189,9 @@ def _route(
             # work feed over T x 2 CTAs, runtime q_lens) matched or beat the
             # former per-(token, split) cluster producer on the 12-token
             # decode rows and beat trtllm-gen 1.12-1.75x on the MTP rows.
-            return _fp8_persistent_program(num_query_tokens)
+            return _fp8_persistent_program(
+                num_query_tokens, max_q_len=max_q_len, topk4x=is_topk4x, arch=arch
+            )
         if num_heads not in (8, 16, 32, 64):
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
         if (
@@ -1782,6 +1810,38 @@ _NO_PDL_TWIN_MIN_TOKENS = {"sm_103a": 384}
 _NO_PDL_TWIN_MIN_QUERY_LEN = {"sm_100a": 257}
 
 
+# The routes with a K=64 sibling ``<route>_k64`` on an architecture whose FP8
+# MMA runs at K=64 only as a one-CTA M128 tile (SM107): a program whose every
+# MMA is that tile, where the route's pair-M128 MMAs run at K=32, with the
+# route's arguments, grid and launch.
+_K64_SIBLING_ROUTES = frozenset({"fp8_h128_prefill_source_persistent_uniform"})
+
+# The fewest query rows a launch needs to take the K=64 sibling, per
+# architecture.  VR200, eight back-to-back calls per CUDA graph: the sibling
+# led the K=32 program from 48 rows on (FP8/H128 and FP8/H64, widths 128-1152)
+# and trailed it by up to 4 % below.
+_K64_SIBLING_MIN_TOKENS = {"sm_107a": 48}
+
+
+def _k64_variant(route: str, *, arch: str, num_query_tokens: int) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows runs:
+    its K=64 sibling when ``arch`` has a floor in ``_K64_SIBLING_MIN_TOKENS``,
+    the launch meets it and ``arch`` routes the sibling to a program other than
+    the route's, else ``route``."""
+    if route not in _K64_SIBLING_ROUTES:
+        return route
+    min_tokens = _K64_SIBLING_MIN_TOKENS.get(arch)
+    if min_tokens is None or num_query_tokens < min_tokens:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{route}_k64"
+    if programs.get(sibling, programs.get(route)) == programs.get(route):
+        return route
+    return sibling
+
+
 def _pdl_variant(
     route: str,
     *,
@@ -2333,7 +2393,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     ):
         parts = L.partials(1)
         program = _pdl_variant(
-            route,
+            _k64_variant(route, arch=L.arch, num_query_tokens=T),
             arch=L.arch,
             enable_pdl=v["enable_pdl"],
             num_query_tokens=T,

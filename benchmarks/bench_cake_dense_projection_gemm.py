@@ -364,6 +364,13 @@ def plan_record(prepared):
         )
     elif isinstance(prepared, cake_backend.PreparedAtomicRouterGemm):
         p = prepared.plan
+        # the rule key's (hidden, experts) of the launched GEMM, as _router_rule_spec reads them
+        if p.layout == "kk":
+            hidden, experts = p.K, p.N
+        elif p.layout == "kn":
+            hidden, experts = p.N, p.K
+        else:
+            hidden, experts = p.M, p.N
         record.update(
             units=p.units,
             head_spans=p.head_spans,
@@ -372,14 +379,16 @@ def plan_record(prepared):
             k_iters=p.k_iters,
             part_tiles=p.part_tiles,
             reproducible=p.reproducible,
-            rule_key=[
-                prepared.arch,
-                p.layout,
-                p.K if p.layout == "kk" else p.M,
-                p.N,
-            ],
+            rule_key=[prepared.arch, p.layout, hidden, experts],
             rule_value=p.units,
         )
+        if getattr(p, "simt", None) is not None:
+            # the SIMT program: one CTA per output tile (m_tiles x n_tiles), the window spec of its tile
+            record.update(
+                simt=list(p.simt),
+                tiles=p.m_tiles * p.n_tiles,
+                rule_value="simt_n{}m{}s{}".format(*p.simt),
+            )
     elif hasattr(prepared, "splits"):
         record["splits"] = prepared.splits
     return record

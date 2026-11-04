@@ -129,7 +129,7 @@ GitHub PR Test GPU jobs keep a different, per-runner cache: they set
 `ci/bash.sh` namespaces it by runner and the pulled image's immutable ID.
 `CI_COMPILE_CACHE_MODE=read-only` (the default) mounts a read-only seed and runs
 against a private writable copy, discarded even after test failures. The PR Test
-workflow selects `read-write` only for pushes to `main`. A stable per-runner lock
+workflow selects `read-write` only for scheduled runs on `main`. A stable per-runner lock
 protects maintenance and execution, including accidentally shared workspaces.
 Other `ci/bash.sh` callers leave caching unset and run cold.
 Before each trusted writable job its runner's cache is cleared when it exceeds
@@ -143,6 +143,22 @@ since a fresh checkout rebuilds nvcc modules anyway. Each test job's
 `scripts/summarize_jit_builds.py` in the job summary.
 See [`ci/COMPILE_CACHE.md`](ci/COMPILE_CACHE.md) for lifecycle tests and trust
 boundaries.
+
+A shared S3 layer sits under it (`ci/compile_cache_s3.sh`), so new EC2 leases and
+new runners do not start cold: one tarball per image ID, GPU and lane under
+`s3://<SCCACHE_BUCKET>/compile-cache/main/`, readable anonymously by every job.
+Pull request jobs keep a per-runner mirror of it (refreshed by ETag); the job's
+entrypoint copies the mirror first and fills its gaps from the seed, taking a
+CuTe-DSL module whole when absent and adding objects only when its `meta.json` is
+identical. Only scheduled runs on `main` write, through the OIDC role in the
+`COMPILE_CACHE_S3_ROLE_ARN` repository variable, whose IAM trust policy accepts
+only `refs/heads/main`; until it is set they update seeds as before. A writer
+retires its runner's seeds, compiles in a new `runner.temp` directory on top of
+the S3 tarball alone (without the shared pip cache), then uploads it as one
+object, so concurrent writers never interleave a module. It skips the upload when
+it built nothing new or its restore failed. A tarball over
+`CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to that job's own builds,
+dropping kernels it reused. Restore and upload failures only warn.
 
 ## cuDNN linear attention
 
@@ -228,6 +244,17 @@ cache conditions when changing a CI lane's concurrency policy.
 Capacity reports include the serial floor from host-heavy and node-exclusive
 work. They remain optimistic about GPU contention because the estimator uses
 worker counts without GPU topology or measured memory capacity.
+
+Allocation telemetry defaults to a 5-second interval (`RESOURCE_MONITOR_INTERVAL`);
+per-batch sampling defaults to 2 seconds (`MEMORY_MONITOR_INTERVAL`).
+The sampler uses `resource_monitor.py`, with sampling, CSV persistence,
+and summary aggregation kept separate. Allocation and batch monitors share host
+CPU readers in `scripts/test_sharding/host_cpu.py`. Unavailable per-process GPU
+memory stays unknown in snapshots and marks source resource summaries partial.
+`memory_summary.csv` leaves GPU maxima blank when no valid observation exists.
+Host CSV rows are flushed before GPU queries; query costs are in `sampler.csv`.
+Nested runners reuse a sampler only while its exported owner PID is alive.
+Namespace-relative cgroup paths require membership evidence before attribution.
 
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
@@ -993,7 +1020,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS` | unset (per EP size and shape) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `direct_place_min_tokens` keyword when it is `None` (unset = at the EP sizes in `DIRECT_PLACE_DEFAULTS` the larger of the listed bound `513` and `ceil(DIRECT_PLACE_MIN_ROUTE_ELEMS / (top_k * hidden_size))` with `DIRECT_PLACE_MIN_ROUTE_ELEMS = 2**25`: `586` at hidden 7168 / top-k 8, `781` at 7168 / 6, `1366` at 4096 / 6; else the grid-dispatch bound `513`): the smallest local token count of a grid-dispatch round that takes the direct placement (with `FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`); a rank below it makes the whole round take the inbox path. Must be `>= 0`. Bit-identical outputs. |
 | `FLASHINFER_GDN_SM107_PREFILL_KERNEL` | `sm107` | `flashinfer/gdn_kernels/blackwell/gdn_prefill.py` | `sm100` makes `chunk_gated_delta_rule` on SM107 (Rubin) run the Blackwell chunked-prefill kernel class instead of the Rubin subclass. For A/B measurements and bisection. |
 | `FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Launch path of the fused QKV exchange session: `1` the producer with the folded cross-rank rendezvous (two launches per call), `0` the separate barrier kernel before the producer (three launches), `auto` the architecture default (folded on SM90 / SM100 / SM103 / SM107). The `fold_barrier` keyword takes precedence. Every rank of a group must use the same value. |
-| `FLASHINFER_QKV_EXCHANGE_SHAPE_GATES` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Row-count gates of the session's host plan: `auto` the per-(architecture, world size) default, `off` every gate off, or `gate=value` pairs over `words_capacity_small_m`, `reserved_sms_large_m`, `per_dest_large_m` and `pair_off_large_m` (`0` = never, `auto` = that gate's default, `all` = every row for `words_capacity_small_m`). The first three change the host plan only; `pair_off_large_m` (off everywhere) runs the rows it fires on with the single-CTA producer, which no delivered Blackwell route ships today; SM90 with 8 ranks and SM107 with 2 or 4 ranks ship `words_capacity_small_m=all`; no gate changes the stored bits. Every rank of a group must use the same value. |
+| `FLASHINFER_QKV_EXCHANGE_SHAPE_GATES` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Row-count gates of the session's host plan: `auto` the per-(architecture, world size) default, `off` every gate off, or `gate=value` pairs over `words_capacity_small_m`, `reserved_sms_large_m`, `per_dest_large_m` and `pair_off_large_m` (`0` = never, `auto` = that gate's default, `all` = every row for `words_capacity_small_m`). The first three change the host plan only; `pair_off_large_m` (off everywhere) runs the rows it fires on with the single-CTA producer, which no delivered Blackwell route ships today; SM90 with 8 ranks and SM107 with 2 or 4 ranks ship `words_capacity_small_m=all`. `per_dest_k_table` (`0`, `1` or `auto`) switches the per-hidden-size `per_dest_large_m` thresholds of SM100 / SM103 (an explicit `per_dest_large_m` replaces them); `xband_min_m` (a row count or `auto`) sets the row count from which an eligible call runs the 256-column pair tile across band edges (SM103 with 8 ranks ships 4096, `0` = off). No gate changes the stored bits. Every rank of a group must use the same value. |
 | `FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Producer build of the session: `auto` the per-(architecture, world size) default (`bulk_ow256` on SM100 with 8 ranks, `ow256` on SM100 with 4 ranks and on SM103 with 8 or 4 ranks, `bulk` on SM107 with 4 ranks, the baseline build otherwise), `shipped` the baseline build, or a delivered build name; a build that is not delivered for the session's tile width raises and names the delivered ones. Every build stores identical bits. Every rank of a group must use the same value. |
 | `FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Group scaling of the session's host plan: `auto` the per-(architecture, world size) default (`2` on SM100 with 4 or 2 ranks and on SM103, `1` otherwise), or `1` / `2` / `4`; applies to grouped rows with a hidden size of at least 6144 and changes the tile order only. Every rank of a group must use the same value. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |

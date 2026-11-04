@@ -180,17 +180,19 @@ the shipped route never reads.
 
 With `s = HV * 128 * 128 * 4` bytes (3 MiB at `HV = 48`), `n_in(r)` the
 rank's fragments with a predecessor on another rank and `n_out(r)` those with
-a successor:
+a successor (bytes per token at `HV = 48`):
 
 | item | `save_mode="full"` | `save_mode="light"` | bytes per rank |
 |---|---|---|---|
 | inputs `q, k, v, g, beta` (references) | yes | yes | 0 extra |
 | `S_in` (incoming boundary states) FP32 | yes | yes | `n_in * s` |
 | received summary pairs (owner, `save_transfer=True`) | yes | yes | `2 * s_owner * n_owned_fragments` |
-| `M_seg` (segment transfers, `P > 1`) | yes | yes | `(P - 1) * n_frag * s` |
+| `M_seg` (segment transfers, `P > 1`) | yes | `save_transfer=True` only (else rebuilt by the replay) | `P * n_frag * s` |
 | convolution history rows | yes | yes | `<= 3 * n_in * C * 2` |
-| `gamma`, `gcum`, `Akk` | yes | yes | about 6,339 B per token |
+| `gamma`, `gcum`, `Akk` (chunk-preparation outputs) | yes | **no** (the chunk preparation re-runs in the backward) | about 6,339 B per token |
+| `rowscale`, `qscale` (chunk-preparation FP32 row factors) | yes | **no** (the chunk preparation re-runs in the backward) | 384 B per token |
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
+| `qk_rstd` (`use_qk_l2norm_in_kernel=True`) FP32 | yes | yes | `8 * T_r * H_qk` |
 
 Everything is attached through the autograd `save_for_backward` only, so a
 `torch.utils.checkpoint(use_reentrant=False)` forward retains 0 B per entry

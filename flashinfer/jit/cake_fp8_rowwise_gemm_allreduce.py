@@ -46,6 +46,7 @@ from .core import (
     JitSpec,
     gen_jit_spec,
     sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
 )
 
 # Filled mechanically from the program bundle.
@@ -56,7 +57,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a_kernel.cu",
             "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a_binding.cu",
         ],
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [384, 1, 1],
         "cluster": [2, 1, 1],
         "dynamic_smem_bytes": 197632,
@@ -132,6 +133,47 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
     },
+    "cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408": {
+        "family": "blackwell",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [384, 1, 1],
+        "cluster": [2, 1, 1],
+        "dynamic_smem_bytes": 222208,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "pair_tiles",
+            "K_tiles",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
 }
 ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
@@ -139,10 +181,18 @@ ROUTES: dict[str, dict[str, str]] = {
         "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_43c80d0e40bf111ee438",
         "main_ws8_nvls": "cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a",
     },
+    "sm_103a": {
+        "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408",
+        "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408",
+        "main_ws8_nvls": "cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a",
+    },
 }
 COMPILE_FLAGS: list[str] = []
 # Per architecture: the exchange carrier of each delivered world size.
-COMM_MODES: dict[str, dict[int, str]] = {"sm_100a": {2: "p2p", 4: "p2p", 8: "nvls"}}
+COMM_MODES: dict[str, dict[int, str]] = {
+    "sm_100a": {2: "p2p", 4: "p2p", 8: "nvls"},
+    "sm_103a": {2: "p2p", 4: "p2p", 8: "nvls"},
+}
 # Frozen trace-time choices per architecture and carrier (documentation, never knobs).
 FROZEN: dict[str, dict[str, dict[str, Any]]] = {
     "sm_100a": {
@@ -151,6 +201,16 @@ FROZEN: dict[str, dict[str, dict[str, Any]]] = {
             "chunk_groups": 8,
             "num_stages": 4,
             "p2p_reduce_wave": 2,
+            "timeout_cycles_log2": 34,
+            "transport": "pull",
+        },
+    },
+    "sm_103a": {
+        "nvls": {"g1_sched": "static", "num_stages": 4, "timeout_cycles_log2": 34},
+        "p2p": {
+            "chunk_groups": 8,
+            "num_stages": 4,
+            "p2p_reduce_wave": 4,
             "timeout_cycles_log2": 34,
             "transport": "pull",
         },
@@ -178,16 +238,38 @@ GEOMETRY: dict[str, dict[str, Any]] = {
         "THREADS": {"p2p": 384, "nvls": 384},
         "PAIR_TILE_M": 256,
     },
+    "sm_103a": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 128,
+        "CHUNK_ROWS": 128,
+        "CLUSTER_DIMS": [2, 1, 1],
+        "OUT_BYTES": 2,
+        "TILE_BYTES": 65536,
+        "FLAG_WORD_BYTES_PER_CHUNK": 8,
+        "MAX_CTAS": 1024,
+        "CTL_EXTRA_WORDS": 2,
+        "CTL_STEAL_WORDS": True,
+        "CTL_SCHED_WORDS": True,
+        "S_ROWS_OWNED_ONLY_UNDER_PULL": False,
+        "GRID_RULE": "persistent_cluster_pairs",
+        "TILE_ARG": "pair_tiles",
+        "MAX_DYNAMIC_SMEM_BYTES": 232448,
+        "THREADS": {"p2p": 384, "nvls": 384},
+        "PAIR_TILE_M": 256,
+    },
 }
 # Per architecture: ``[world_size, rows_capacity, suffix]`` rows naming the program variant a
 # prepared capacity of exactly ``rows_capacity`` rows selects (empty when every capacity shares one program).
-CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {"sm_100a": []}
+CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {"sm_100a": [], "sm_103a": []}
 # Exact-architecture compile flags (``flashinfer.jit.core``) and the capability -> architecture table.
 ARCH_FLAGS: dict[str, list[str]] = {
     "sm_100a": sm100a_nvcc_flags,
+    "sm_103a": sm103a_nvcc_flags,
 }
 CAPABILITY_ARCH: dict[tuple[int, int], str] = {
     (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
 }
 SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
 

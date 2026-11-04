@@ -46,7 +46,10 @@ Every entry point takes ``deterministic`` (default ``True``):
   the windows the backward docstring's notes name, a twosum single kernel keeps
   each thread's ``dw`` column sums exact (error-free FP32 products, TwoSum
   compensation) before the FP64 additions, so its ``dw`` error does not grow
-  with ``T``.  Every other window runs
+  with ``T``; a kblock single kernel adds the ``dw`` products of each block of
+  8 rows in FP32 and keeps the block sums as FP32 TwoSum pairs before
+  the FP64 additions, so its ``dw`` error grows slowly with ``T``.  Every other
+  window runs
   the deterministic package's backward pair (main kernel and fixed-order
   reduce), rendered into this package.  This path also accepts ``[..., H]`` inputs whose leading dimensions collapse into
   rows (for example a ``[T, heads, 256]`` per-head view sharing one ``w[256]``)

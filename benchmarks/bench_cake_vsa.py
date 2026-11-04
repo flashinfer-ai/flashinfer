@@ -113,21 +113,13 @@ ROUTES = ("served", "per-head", "balanced")
 def blk64_route(route: str):
     """Plan under one block-64 route: ``served`` keeps the plan's own choice,
     ``per-head`` never selects the balanced program, ``balanced`` selects it
-    without the minimum tile count and the comparison with the per-head
-    programs."""
-    saved = cake_vsa._BLK64_BALANCED_MIN_WAVES
+    without the comparison with the per-head programs."""
     saved_beats = cake_vsa._blk64_balanced_beats_per_head
-    cake_vsa._BLK64_BALANCED_MIN_WAVES = {
-        "served": saved,
-        "per-head": float("inf"),
-        "balanced": 0,
-    }[route]
-    if route == "balanced":
-        cake_vsa._blk64_balanced_beats_per_head = lambda **_: True
+    if route != "served":
+        cake_vsa._blk64_balanced_beats_per_head = lambda **_: route == "balanced"
     try:
         yield
     finally:
-        cake_vsa._BLK64_BALANCED_MIN_WAVES = saved
         cake_vsa._blk64_balanced_beats_per_head = saved_beats
 
 
