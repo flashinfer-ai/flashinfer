@@ -258,7 +258,10 @@ The mode runs on the replay local arena (``local_arena="lean"`` is refused).
 The local programs of the mode are the single-rank backend's (its plan mode
 ``l2n``: ``"fused"`` for the flag; ``"fallback"``, the separate normalization
 and pullback programs, through a test workspace); the records select them,
-:mod:`.cake_kcp_plan` lists the ones this route needs.  Until the single-rank
+:mod:`.cake_kcp_plan` lists the ones this route needs.  The first q / k reader
+of a saved-mode backward, which reads the saved rstd, runs the record's
+saved-rstd twin where one ships for the device's architecture
+(:func:`cake_kcp_plan.saved_rstd_record`).  Until the single-rank
 registry serves them on the device's architecture with an exported library
 and its layouts carry the normalized slot views
 (:func:`cake_kcp_plan.qk_l2norm_missing`), a call, a workspace or a byte query
@@ -1049,8 +1052,15 @@ class KernelBackend(Backend):
         values: dict[str, Any],
     ) -> None:
         """A record of the existing backend's registry on the local arena: the trimmed launch, or the arena's
-        launcher (a diagnostics launcher keeps the base path)."""
+        launcher (a diagnostics launcher keeps the base path).  A launch that reads the saved rstd (``read_rstd =
+        1``) runs the record's saved-rstd twin where it ships for the arena's architecture
+        (:func:`cake_kcp_plan.saved_rstd_record`)."""
         local = call.local
+        if values.get("read_rstd") and record in cake_kcp_plan.SAVED_RSTD_TWINS:
+            twin = cake_kcp_plan.saved_rstd_record(record, local.arch)
+            if twin != record:
+                call.scratch["l2n_twin"] = (record, twin)
+                record = twin
         if call.host_trim and local.launcher is cake_jit.run_module:
             _launch_record_trim(local, record, grid, values)
         else:
@@ -3479,8 +3489,9 @@ class WorkspaceDetKcp:
                 'WorkspaceDetKcp: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
                 "is not supported with the in-kernel Q/K L2 norm yet"
             )
-        # the architectures whose check of the mode passed (_require_l2n)
+        # the architectures whose check of the mode passed, and the indexed CUDA devices of those (_require_l2n)
         self._l2n_ok: set[str | None] = set()
+        self._l2n_dev_ok: set[torch.device] = set()
         self._require_l2n(
             device if device is not None else getattr(ctx, "device", None)
         )
@@ -3667,13 +3678,20 @@ class WorkspaceDetKcp:
         """With the flag on, refuse the mode where the single-rank programs of the workspace's form cannot run on
         ``device``'s architecture (:func:`cake_kcp_plan.require_qk_l2norm`, rank-independent inputs only, so every
         rank raises alike before any arena, plan or collective); a passed architecture is kept, so later calls
-        check nothing again.  Nothing with the flag off."""
-        if not self.qk_l2norm:
+        check nothing again, and so is a passed indexed CUDA device, whose architecture is not looked up again.
+        Nothing with the flag off."""
+        if not self.qk_l2norm or device in self._l2n_dev_ok:
             return
         arch = cake_kcp_plan.qk_l2norm_arch(device)
         if arch not in self._l2n_ok:
             cake_kcp_plan.require_qk_l2norm(self.l2n, self.gate, arch)
             self._l2n_ok.add(arch)
+        if (
+            isinstance(device, torch.device)
+            and device.type == "cuda"
+            and device.index is not None
+        ):
+            self._l2n_dev_ok.add(device)
 
     def _check_device(self, device: torch.device) -> None:
         if self.device is None:
@@ -4656,6 +4674,8 @@ def _record(kind: str, call: CallDetKcp) -> None:
         # without local stages of the mode, as on a rank without tokens)
         LAST_CALL[kind]["l2n"] = call.l2n_mode
         LAST_CALL[kind]["l2n_rstd"] = call.scratch.get("l2n_rstd")
+        # (record, saved-rstd twin) where this call's launches ran the twin in the record's place, else None
+        LAST_CALL[kind]["l2n_twin"] = call.scratch.get("l2n_twin")
     CACHE_CONFIG_STATS[LAST_CALL[kind]["cache_config"]] += 1
 
 
@@ -5210,7 +5230,8 @@ def _bwd_rows(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
     programs read) and the WY program.  In-kernel Q / K L2 norm: the fallback form's separate normalization first;
     in the fused form the plan's first q / k reader first (its intra program where the existing backend runs that
     before the prep, :func:`cake_kcp_plan.qk_l2norm_intra_first`: the prep then reads the normalized rows; the two
-    programs read none of each other's rows)."""
+    programs read none of each other's rows).  The outputs :func:`_bwd_body` deferred are allocated right after the
+    first of the two (:func:`_late_grads`)."""
     if call.l2n:
         _qk_l2norm_stage(call)
     if (
@@ -5219,9 +5240,11 @@ def _bwd_rows(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
         and cake_kcp_plan.qk_l2norm_intra_first(call.local.plan)
     ):
         call.stage("fwd_intra")
+        _late_grads(call)
         call.stage("bwd_prep", saved=saved)
     else:
         call.stage("bwd_prep", saved=saved)
+        _late_grads(call)
         call.stage("fwd_intra")
     call.stage("wy")
 
@@ -6285,10 +6308,24 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
     launches nothing and returns zero parameter gradients.  In-kernel Q / K L2 norm: the saved set's rstd or, in
     replay mode, a fresh one, and the normalized q / k (:func:`_qk_l2norm_begin`), in the arena where the replay
     layout's ``v_new`` / ``dv2`` ride on the outputs' bytes (:func:`_l2n_row_hosts`; dq / dk are then the two halves
-    of one tensor); the outputs are the same."""
+    of one tensor); the outputs are the same.  A flag-on saved-mode backward of the fused form allocates the outputs
+    and scratch its first local stage binds none of (:func:`_l2n_late_grads`) once that stage is launched
+    (:func:`_late_grads`): the host work before the first launch is not hidden behind queued device work."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     hosts = _l2n_row_hosts(call) if call.l2n else {}
+    late = (
+        _l2n_late_grads(call, hosts) if call.l2n and saved is not None else frozenset()
+    )
+    # (name, shape, dtype) of the outputs allocated after the first local stage's launch
+    pending: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+
+    def grad(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+        if name in late:
+            pending.append((name, shape, dtype))
+        else:
+            call.grads[name] = _alloc(shape, dtype, call.device)
+
     # the moved arena buffer -> the output tensor whose bytes carry it
     moved: dict[str, torch.Tensor] = {}
     if "dv2" in hosts:
@@ -6297,35 +6334,116 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
     else:
         dq = _alloc((T, H, D), dt["dq"], call.device)
         dk = _alloc((T, H, D), dt["dk"], call.device)
-    call.grads = {"dq": dq, "dk": dk, "dv": _alloc((T, H, D), dt["dv"], call.device)}
+    call.grads = {"dq": dq, "dk": dk}
+    grad("dv", (T, H, D), dt["dv"])
     if call.gate == "raw":
         names: tuple[str, ...] = _RAW_GRADS
-        call.grads["dg_raw"] = _alloc((T, H, D), dt["dg_raw"], call.device)
-        call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+        grad("dg_raw", (T, H, D), dt["dg_raw"])
+        grad("dbeta", (T, H), dt["dbeta"])
         if call.local is not None and T > 0:
             nc_pad = int(call.local.plan.NC_pad)
             for name in ("dA_part", "db_part"):
-                call.grads[name] = _alloc((nc_pad, H, D, 2), dt["dA_log"], call.device)
+                grad(name, (nc_pad, H, D, 2), dt["dA_log"])
             # param_finalize's per-call scratch: the second-stage partials and the per-head ticket
-            fin = cake_backend._raw_finalize_scratch(nc_pad, H, call.device)
-            call.grads["part2"] = fin["part2"]
-            call.grads["ticket"] = fin["ticket"]
-            call.scratch["seg_cap"] = int(fin["seg_cap"])
-            call.grads["dA_log"] = _alloc((H,), dt["dA_log"], call.device)
-            call.grads["ddt_bias"] = _alloc((H * D,), dt["ddt_bias"], call.device)
+            if "part2" in late and "ticket" in late:
+                call.scratch["late_finalize"] = nc_pad
+            else:
+                _finalize_scratch(call, nc_pad)
+            grad("dA_log", (H,), dt["dA_log"])
+            grad("ddt_bias", (H * D,), dt["ddt_bias"])
         else:  # no local stage runs on this rank: its tokens contribute nothing
             call.grads["dA_log"] = _zeros((H,), dt["dA_log"], call.device)
             call.grads["ddt_bias"] = _zeros((H * D,), dt["ddt_bias"], call.device)
     else:
         names = ("dq", "dk", "dv", "dbeta", "dg")
-        call.grads["dg"] = _alloc((T, H, D), dt["dg"], call.device)
-        call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+        grad("dg", (T, H, D), dt["dg"])
+        grad("dbeta", (T, H), dt["dbeta"])
+    if pending or "late_finalize" in call.scratch:
+        call.scratch["late_grads"] = pending
     if "v_new" in hosts:
         moved["v_new"] = call.grads[hosts["v_new"][0]]
     if call.l2n:
         _qk_l2norm_begin(call, None if saved is None else saved.qk_rstd, hosts=moved)
     _backward(call, saved)
+    _late_grads(call)  # nothing left once the first local stage ran
     return tuple(call.grads[n] for n in names)
+
+
+def _finalize_scratch(call: CallDetKcp, nc_pad: int) -> None:
+    """``param_finalize``'s per-call scratch (``cake_backend._raw_finalize_scratch``) into the call."""
+    fin = cake_backend._raw_finalize_scratch(nc_pad, call.H, call.device)
+    call.grads["part2"] = fin["part2"]
+    call.grads["ticket"] = fin["ticket"]
+    call.scratch["seg_cap"] = int(fin["seg_cap"])
+
+
+def _late_grads(call: CallDetKcp) -> None:
+    """Allocate the outputs and scratch :func:`_bwd_body` deferred (:func:`_l2n_late_grads`); nothing when none is
+    pending.  :func:`_bwd_rows` calls it right after the backward's first local stage."""
+    pending = call.scratch.pop("late_grads", None)
+    if pending is None:
+        return
+    for name, shape, dtype in pending:
+        call.grads[name] = _alloc(shape, dtype, call.device)
+    nc_pad = call.scratch.pop("late_finalize", None)
+    if nc_pad is not None:
+        _finalize_scratch(call, nc_pad)
+
+
+# The outputs and scratch a flag-on backward may allocate after its first local stage (:func:`_l2n_late_grads`)
+_L2N_LATE_GRADS = (
+    "dv",
+    "dbeta",
+    "dg",
+    "dg_raw",
+    "dA_part",
+    "db_part",
+    "part2",
+    "ticket",
+    "dA_log",
+    "ddt_bias",
+)
+# The logical names the first local stage of a fused flag-on backward binds, per plan: {id(plan): (a weak reference
+# to it, the registry it read, the names or None)}
+_L2N_FIRST_BOUND: dict[int, tuple[Any, Any, frozenset[str] | None]] = {}
+
+
+def _l2n_late_grads(
+    call: CallDetKcp, hosts: dict[str, tuple[str, ...]]
+) -> frozenset[str]:
+    """The outputs and scratch of :data:`_L2N_LATE_GRADS` a flag-on saved-mode backward allocates once its first
+    local stage is launched: those the record of that stage (the plan's first q / k reader of the fused form,
+    :func:`cake_kcp_plan.qk_l2norm_intra_first`) binds none of, and that carry no moved arena buffer
+    (:func:`_l2n_row_hosts`: the first reader writes ``qn`` / ``kn`` into those buffers' arena bytes and may bind the
+    buffers).  Nothing deferred for the fallback form, a rank without local stages or tokens, another backend, a
+    first stage without a plan record, or the SPEC-3 probe (its forward rows run before the prep)."""
+    if (
+        call.l2n_mode != "fused"
+        or call.local is None
+        or call.T_r == 0
+        or not isinstance(call.backend, KernelBackend)
+        or call.opts.spec3_probe != "off"
+    ):
+        return frozenset()
+    p = call.local.plan
+    kept = _L2N_FIRST_BOUND.get(id(p))
+    if kept is None or kept[0]() is not p or kept[1] is not cake_jit.MODULES:
+        for stale in [k for k, v in _L2N_FIRST_BOUND.items() if v[0]() is None]:
+            del _L2N_FIRST_BOUND[stale]
+        stage = "fwd_intra" if cake_kcp_plan.qk_l2norm_intra_first(p) else "bwd_prep"
+        bound: frozenset[str] | None = None
+        if stage not in KCP_LOCAL_RECORDS and p.dispatched(stage, LOCAL_PATH_BWD):
+            record = p.record(stage, LOCAL_PATH_BWD)
+            bound = frozenset(cake_jit.MODULES[record]["logical"].values())
+        kept = (weakref.ref(p), cake_jit.MODULES, bound)
+        _L2N_FIRST_BOUND[id(p)] = kept
+    bound = kept[2]
+    if bound is None:
+        return frozenset()
+    carriers = {out for outs in hosts.values() for out in outs}
+    return frozenset(
+        name for name in _L2N_LATE_GRADS if name not in bound and name not in carriers
+    )
 
 
 # The in-kernel Q / K L2 norm's backward keeps its token-layout normalized rows in the local arena where it can (issue
@@ -6504,7 +6622,10 @@ def _l2n_bwd_rows(
                 continue
             arena = getattr(views, buf)
             rows[out] = arena[:T]
-            there = host.view(-1).view(arena.dtype)[: arena.numel()].view(arena.shape)
+            # the buffer's contiguous shape on the host's leading bytes (the host is a fresh contiguous output)
+            if host.dtype != arena.dtype:
+                host = host.view(arena.dtype)
+            there = host.as_strided(arena.shape, _contiguous_strides(arena.shape))
             setattr(moved, buf, there)
             call.local_values[buf] = there
         call.scratch["views"] = moved
@@ -6515,6 +6636,16 @@ def _l2n_bwd_rows(
         if out not in rows:
             rows[out] = _alloc((T, H, D), dt["q" if out == "qn" else "k"], call.device)
     return rows["qn"], rows["kn"]
+
+
+@functools.lru_cache(maxsize=64)
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The row-major strides of ``shape`` (elements)."""
+    strides, step = [], 1
+    for n in reversed(shape):
+        strides.append(step)
+        step *= max(int(n), 1)
+    return tuple(reversed(strides))
 
 
 # ----------------------------------------------------------------------------------------------------------------

@@ -430,6 +430,19 @@ TEMPERATURE_STAGE_TENSORS = {
         "d_in",
         "temperature",
     ),
+    # the counted form (the zero-gradient row skip): the twin ``gemm_logits_dz_dcnt``'s tensors plus the temperature
+    "gemm_logits_dz_dcnt_tau": (
+        "A",
+        "B",
+        "C",
+        "STATS_OUT",
+        "WS",
+        "labels",
+        "lse",
+        "d_in",
+        "temperature",
+        "CNT",
+    ),
     "gemm_logits_lbl_tau": ("A", "B", "C", "STATS_OUT", "WS", "labels", "temperature"),
     "row_finalize_tau": (
         "stats",
@@ -577,12 +590,16 @@ TEMPERATURE_FORM_BASES = (
     "row_finalize",
 )
 LOGPROB_DZ_TAU_STAGE = "gemm_logits_dz_tau"
+# the ``dz`` arm's temperature form bounded by the device count of the chunk's live rows: the zero-gradient row skip's
+# ``dz`` recompute of a call with a temperature (:data:`DCNT_BASES`; the one counted temperature form)
+LOGPROB_DZ_DCNT_TAU_STAGE = "gemm_logits_dz_dcnt_tau"
 LOGPROB_LBL_TAU_STAGE = "gemm_logits_lbl_tau"
 HIDDEN_LOGITS_TAU_STAGE = "gemm_logits_mcnt_tau"
 ROW_FINALIZE_TAU_STAGE = "row_finalize_tau"
 TEMPERATURE_STAGES = (
     HIDDEN_LOGITS_TAU_STAGE,
     LOGPROB_DZ_TAU_STAGE,
+    LOGPROB_DZ_DCNT_TAU_STAGE,
     LOGPROB_LBL_TAU_STAGE,
     ROW_FINALIZE_TAU_STAGE,
 )
@@ -827,20 +844,20 @@ def stage_form(base: str, *, temperature: bool = False, **knobs: Any) -> str:
     """Stage name of one structural form of ``base`` over every knob of :data:`STAGE_KNOBS` (the inverse of
     :func:`parse_stage`): :func:`stage_variant` of ``knobs``, then ``temperature``: the temperature form
     (:data:`TEMPERATURE_STAGES`, suffix ``_tau`` last) of the log-probability entry's logits GEMM arms, of the
-    device-count logits GEMM with the statistics and of ``row_finalize`` -- none of them in a ``_dcnt`` form (under
-    the zero-gradient row skip a call with a temperature runs the uncounted ``dz`` arm's temperature form beside the
-    counted dX / dW forms, :func:`make_plan_temperature`).  The default path names its stages with
+    device-count logits GEMM with the statistics and of ``row_finalize`` -- of these only the ``dz`` arm in a ``_dcnt``
+    form (:data:`LOGPROB_DZ_DCNT_TAU_STAGE`: under the zero-gradient row skip a call with a temperature runs it beside
+    the counted dX / dW forms, :func:`make_plan_temperature`).  The default path names its stages with
     :func:`stage_variant` alone."""
     name = stage_variant(base, **knobs)
     if temperature:
         if (
             base not in TEMPERATURE_FORM_BASES
             or (base == "gemm_logits" and name != "gemm_logits_mcnt")
-            or knobs.get("dcnt")
+            or (knobs.get("dcnt") and base != LOGPROB_DZ_STAGE)
         ):
             raise ValueError(
-                f"{base}: the temperature form exists for gemm_logits_lbl, gemm_logits_dz, the device-count "
-                f"gemm_logits (count=True) and row_finalize only, none counted (_dcnt), got {name!r}"
+                f"{base}: the temperature form exists for gemm_logits_lbl, gemm_logits_dz (also counted, _dcnt), the "
+                f"device-count gemm_logits (count=True) and row_finalize only, got {name!r}"
             )
         name += "_tau"
     return name
@@ -2937,6 +2954,29 @@ def set_zero_dlogp_min_rows(rows: Optional[int]) -> Optional[int]:
     return previous
 
 
+# Whether a log-probability backward with a temperature under the zero-gradient row skip runs the counted temperature
+# form of the ``dz`` arm (:data:`LOGPROB_DZ_DCNT_TAU_STAGE`, where the record registers it) or the uncounted one over
+# every row (the mixed plan of :func:`make_plan_temperature`; :func:`set_zero_dlogp_temperature_dz_counted`).
+_ZERO_DLOGP_TAU_DZ: dict[str, bool] = {"counted": True}
+
+
+def zero_dlogp_temperature_dz_counted() -> bool:
+    """Whether the zero-gradient row skip of a call with a temperature runs the counted temperature form of the ``dz``
+    arm (default) or the uncounted one (:func:`set_zero_dlogp_temperature_dz_counted`)."""
+    return _ZERO_DLOGP_TAU_DZ["counted"]
+
+
+def set_zero_dlogp_temperature_dz_counted(counted: bool) -> bool:
+    """Set whether the zero-gradient row skip of the following calls with a temperature runs the counted temperature
+    form of the ``dz`` arm (``True``, the default) or the uncounted one over every row (``False``: the mixed plan, the
+    same outputs) and return the previous value.  Read once per call; the binding key holds it."""
+    if not isinstance(counted, bool):
+        raise ValueError(f"counted must be a bool, got {counted!r}")
+    previous = _ZERO_DLOGP_TAU_DZ["counted"]
+    _ZERO_DLOGP_TAU_DZ["counted"] = counted
+    return previous
+
+
 # Per device index (:func:`_skip_record`): the record :func:`record_for` selects and whether it registers the partition
 # kernel and the whole zero-gradient row skip (the partition kernel and the counted dz arm).  The registry is fixed at
 # import and a device keeps its architecture, so each device resolves this once; the skip path's per-call host work
@@ -3912,19 +3952,22 @@ class _TemperaturePlan(Plan):
     arms): the forward's logits GEMM, chunk 0's device-count GEMM, ``row_finalize`` and the backward's ``dz``
     recompute run their ``_tau`` forms.  The reference path keeps the plan without them and reads the temperature
     from the host values (:attr:`Problem.temperature`).  Under the zero-gradient row skip (:attr:`Plan.dcnt`,
-    :func:`make_plan_temperature`) the plan is mixed: the ``dz`` recompute runs its uncounted temperature form over
-    every row of the chunk (a zero-gradient row's ``dz`` is zero: ``RN(0 / tau) = 0``), the K-sliced dX reductions
-    and the weight-gradient GEMMs their ``_dcnt`` forms."""
+    :func:`make_plan_temperature`) this plan is the mixed one: the ``dz`` recompute runs its uncounted temperature form
+    over every row of the chunk (a zero-gradient row's ``dz`` is zero: ``RN(0 / tau) = 0``), the K-sliced dX
+    reductions and the weight-gradient GEMMs their ``_dcnt`` forms; :class:`_CountedTemperaturePlan` counts the
+    ``dz`` recompute too."""
 
     temperature: ClassVar[bool] = True
     # the plan class without the temperature forms (:meth:`without_temperature`)
     plain: ClassVar[type] = Plan
+    # whether the ``dz`` recompute runs its counted temperature form under the skip (:class:`_CountedTemperaturePlan`)
+    counted_dz: ClassVar[bool] = False
 
     def without_temperature(self) -> Plan:
         """The same plan without the temperature forms: the twin on which :func:`stage_values_temperature` checks a
-        temperature form.  The twin of the ``dz`` arm's temperature form is the uncounted ``gemm_logits_dz`` (a
-        temperature form has no counted one), so the twin keeps :attr:`Plan.dcnt` off; the counted dX / dW forms of a
-        plan under the zero-gradient row skip are checked on the plan itself."""
+        temperature form.  The twin of the mixed plan's uncounted ``dz`` temperature form is the uncounted
+        ``gemm_logits_dz``, so the twin keeps :attr:`Plan.dcnt` off; the counted dX / dW forms of a plan under the
+        zero-gradient row skip are checked on the plan itself (:class:`_CountedTemperaturePlan` keeps it on)."""
         values = {f.name: getattr(self, f.name) for f in fields(self)}
         values["dcnt"] = False
         return self.plain(**values)
@@ -3945,11 +3988,16 @@ class _TemperaturePlan(Plan):
         return LOGPROB_LBL_TAU_STAGE
 
     def recompute_stage(self, index: int) -> str:
-        """The temperature form of the ``dz`` arm (:attr:`logprob_dz`)."""
+        """The temperature form of the ``dz`` arm (:attr:`logprob_dz`): the counted one under the skip of a
+        :class:`_CountedTemperaturePlan`."""
         self.logits_stage(index, stats=False)  # the chunk exists
         if not self.logprob_dz:
             raise ValueError("a temperature plan runs the dz arm")
-        return LOGPROB_DZ_TAU_STAGE
+        return (
+            LOGPROB_DZ_DCNT_TAU_STAGE
+            if self.counted_dz and self.dcnt
+            else LOGPROB_DZ_TAU_STAGE
+        )
 
     @property
     def row_finalize_stage(self) -> str:
@@ -3993,6 +4041,19 @@ class _TemperaturePlan(Plan):
             # recount, which a call with a temperature never takes (no temperature form of ``row_grad``)
             used.discard("row_grad")
         return tuple(s for s in STAGES_WITH_TEMPERATURE if s in used)
+
+
+class _CountedTemperaturePlan(_TemperaturePlan):
+    """A :class:`_TemperaturePlan` under the zero-gradient row skip (:attr:`Plan.dcnt`) whose ``dz`` recompute runs
+    the counted temperature form (:data:`LOGPROB_DZ_DCNT_TAU_STAGE`): no work on the chunk's rows past its count,
+    the same ``dz`` bits on the rows before it.  Its twin without the temperature forms keeps :attr:`Plan.dcnt` (the
+    twin of the counted temperature form is ``gemm_logits_dz_dcnt``)."""
+
+    counted_dz: ClassVar[bool] = True
+
+    def without_temperature(self) -> Plan:
+        """The same plan without the temperature forms, :attr:`Plan.dcnt` kept (the counted twin)."""
+        return self.plain(**{f.name: getattr(self, f.name) for f in fields(self)})
 
 
 class _KeptPlan(Plan):
@@ -4171,13 +4232,17 @@ def make_plan(
     )
 
 
-def make_plan_temperature(problem: Problem, **kw: Any) -> Plan:
+def make_plan_temperature(
+    problem: Problem, *, counted_dz: bool = True, **kw: Any
+) -> Plan:
     """:func:`make_plan` of a log-probability call with a temperature (:attr:`Problem.temperature`) on a registered
     program (``arch``) running both logits GEMM arms (``logprob_dz`` and ``logprob_lbl``): the plan runs the
     temperature forms (:class:`_TemperaturePlan`).  ``dcnt`` (the zero-gradient row skip, :func:`make_plan`'s rule
-    and fallbacks): the mixed plan -- the ``dz`` recompute keeps its uncounted temperature form (no temperature form
-    is counted; a zero-gradient row's ``dz`` is ``RN(0 / tau) * (...) = 0``), the K-sliced dX reductions and the
-    weight-gradient GEMMs run their ``_dcnt`` forms over the rows the call ordered first.  No kept-logits plan."""
+    and fallbacks): the K-sliced dX reductions and the weight-gradient GEMMs run their ``_dcnt`` forms over the rows
+    the call ordered first, and the ``dz`` recompute its counted temperature form (``counted_dz``,
+    :class:`_CountedTemperaturePlan`: no work past the chunk's count) or, with ``counted_dz=False``, the uncounted one
+    over every row (the mixed plan: a zero-gradient row's ``dz`` is ``RN(0 / tau) * (...) = 0``).  No kept-logits
+    plan."""
     if not (
         problem.temperature
         and kw.get("arch") is not None
@@ -4193,7 +4258,8 @@ def make_plan_temperature(problem: Problem, **kw: Any) -> Plan:
             "the temperature forms have no kept-logits plan (logprob_keep)"
         )
     plan = make_plan(problem, **kw)
-    return _TemperaturePlan(**{f.name: getattr(plan, f.name) for f in fields(plan)})
+    kind = _CountedTemperaturePlan if counted_dz and plan.dcnt else _TemperaturePlan
+    return kind(**{f.name: getattr(plan, f.name) for f in fields(plan)})
 
 
 # ---------------------------------------------------------------------------
@@ -5654,11 +5720,16 @@ def _slot_values_temperature(
 ) -> dict[str, Any]:
     """:func:`_slot_values` of a binding with the temperature forms (:class:`_TemperatureBinding`): the role's views
     (a temperature form's role is its base stage: ``row_finalize_tau`` is ``row_finalize``'s temperature
-    form, ``gemm_logits_dz_tau`` the ``dz`` arm's) plus the compact ``temperature`` rows, which every
-    temperature form reads (:meth:`_Launch.arguments_for` slots the names of its own argument plan only)."""
-    values = _slot_values(
-        base_stage(stage) if stage in TEMPERATURE_STAGES else stage, t, plan, index
-    )
+    form, ``gemm_logits_dz_tau`` the ``dz`` arm's; the counted ``gemm_logits_dz_dcnt_tau`` takes the role of
+    ``gemm_logits_dz_dcnt``, whose views include the count cell) plus the compact ``temperature`` rows, which
+    every temperature form reads (:meth:`_Launch.arguments_for` slots the names of its own argument plan only)."""
+    if stage == LOGPROB_DZ_DCNT_TAU_STAGE:
+        role = LOGPROB_DZ_DCNT_STAGE
+    elif stage in TEMPERATURE_STAGES:
+        role = base_stage(stage)
+    else:
+        role = stage
+    values = _slot_values(role, t, plan, index)
     values["temperature"] = t["temperature"]
     return values
 
@@ -5902,8 +5973,9 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
 def _recompute_keys_temperature(plan: Plan) -> tuple[tuple[str, Any], ...]:
     """Launch keys of the log-probability backward of a plan with the temperature forms (the ``dX_acc`` fill of a
     K-sliced dX plan, :func:`_dx_fill_keys`; then recompute the logits and run the gradient GEMMs per chunk).  No
-    kept-logits plan.  Under the zero-gradient row skip (:attr:`Plan.dcnt`) the plan names the uncounted ``dz``
-    temperature form and the counted dX / dW forms (:class:`_TemperaturePlan`)."""
+    kept-logits plan.  Under the zero-gradient row skip (:attr:`Plan.dcnt`) the plan names the counted dX / dW forms
+    and the counted ``dz`` temperature form (:class:`_CountedTemperaturePlan`) or the uncounted one (the mixed
+    :class:`_TemperaturePlan`)."""
     keys: list[tuple[str, Any]] = _dx_fill_keys(plan)
     if plan.compact:
         keys.append(("gather_rows", "d_in"))
@@ -6988,9 +7060,10 @@ def prepare_lm_head_loss_temperature(
     record without them raises ``NotImplementedError``); the reference backend reads it in the same stages.
 
     ``dcnt`` (log-probability entry, compacted rows ordered by :func:`zero_dlogp_partition`): the int32 per-chunk
-    counts of live rows, as in :func:`prepare_lm_head_loss`; with a temperature the plan is the mixed plan of
-    :func:`make_plan_temperature` (the uncounted ``dz`` temperature form, the counted dX / dW forms) where the
-    record registers every form it needs, and the shipped forms otherwise.
+    counts of live rows, as in :func:`prepare_lm_head_loss`; with a temperature the plan of
+    :func:`make_plan_temperature` whose forms the record registers: the counted ``dz`` temperature form
+    (:func:`zero_dlogp_temperature_dz_counted`), else the mixed plan (the uncounted ``dz`` temperature form), each
+    with the counted dX / dW forms, and the shipped forms otherwise.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -7126,10 +7199,26 @@ def prepare_lm_head_loss_temperature(
         dx_slice_policy=slice_policy,
         dx_red_min_rows=red_min_rows,
     )
+    # under the skip, the first plan whose stages the record registers: the counted temperature dz arm
+    # (:func:`zero_dlogp_temperature_dz_counted`), then the uncounted one (the mixed plan), each with the counted TMA
+    # cast, then with the shipped cast's counted form; else the shipped plan, every row computed
+    dz_forms: tuple[dict[str, bool], ...] = ({},)
+    if problem.temperature and record is not None:
+        dz_forms = tuple(
+            {"counted_dz": counted}
+            for counted in (
+                (True, False) if zero_dlogp_temperature_dz_counted() else (False,)
+            )
+        )
     plan = plan_of(dcnt=dcnt is not None)
-    if plan.dcnt and any(s not in stages for s in plan.stages):
-        # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
-        plan = plan_of(dcnt=True, counted_tma_cast=False)
+    if plan.dcnt:
+        for dz_form in dz_forms:
+            for cast_form in ({}, {"counted_tma_cast": False}):
+                plan = plan_of(dcnt=True, **dz_form, **cast_form)
+                if not plan.dcnt or all(s in stages for s in plan.stages):
+                    break
+            if not plan.dcnt or all(s in stages for s in plan.stages):
+                break
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
         plan = plan_of(dcnt=False)
@@ -10071,9 +10160,11 @@ def backward_logprob_temperature(
     same eligibility and floor, run when the call's plan has the counted forms): the chunk loop takes the live rows
     first (:func:`zero_dlogp_partition`) and the temperature rows follow that order -- a per-token temperature is
     gathered from the caller's ``[T]`` tensor by the reordered row index (one gather, as the forward's), a scalar's
-    rows are the same in any order.  The ``dz`` recompute runs its uncounted temperature form over every row of the
-    chunk (a zero-gradient row's ``dz`` is ``RN(0 / tau) * (...) = 0``), the K-sliced dX reductions and the
-    weight-gradient GEMMs their counted forms (:func:`make_plan_temperature`).  ``logp`` and ``dX`` of a live row are
+    rows are the same in any order.  The ``dz`` recompute runs its counted temperature form (no work on the rows past
+    the chunk's count; the uncounted form over every row where the record lacks it or
+    :func:`set_zero_dlogp_temperature_dz_counted` turns it off: a zero-gradient row's ``dz`` is ``RN(0 / tau) * (...)
+    = 0``), the K-sliced dX reductions and the weight-gradient GEMMs their counted forms
+    (:func:`make_plan_temperature`).  ``logp`` and ``dX`` of a live row are
     the same as without the skip; ``dW`` sums the live rows in the new row order (FP32), so its bits may differ when a
     row is zero.  The skip needs the temperature itself: the call's ``temperature``, or with ``temperature_rows`` the
     forward's resolved temperature (the autograd Function passes both); ``temperature_rows`` alone runs the backward
@@ -10265,7 +10356,10 @@ def backward_logprob_temperature(
             dx_rule=rule,
             zero_dlogp=skip,
         )
-        key = temperature_binding_key(key)
+        # an eligible call's key also holds which temperature form of the dz arm its plan may take
+        key = temperature_binding_key(key) + (
+            (zero_dlogp_temperature_dz_counted(),) if skip else ()
+        )
         binding = cache.lookup(key)
         if binding is not None:
             # the key of an eligible call remembers the plan it took (counted, or the shipped one)

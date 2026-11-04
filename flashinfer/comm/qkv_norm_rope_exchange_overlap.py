@@ -338,11 +338,20 @@ class QkvNormRopeExchangeOverlap:
     refuses at construction when a 256-column call can reach the gate, ``max_tokens >= N``, naming the gate; SM90
     builds no pair tile and refuses the gate).  The environment variable
     ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
-    ``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``, ``0`` = never)
+    ``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N,``
+    ``per_dest_k_table=0|1,xband_min_m=N``, ``0`` = never)
     overrides them for a session, rank-uniformly (``words_capacity_small_m=4096`` on SM90 with 8 ranks and
     ``words_capacity_small_m=0`` on SM107 restore the previous plans).
+    On SM100 and SM103 the per-destination launch gate reads its threshold by hidden size
+    (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``; ``per_dest_k_table=0`` in the same variable restores the one-band
+    threshold, an explicit ``per_dest_large_m`` replaces the table).  SM103 groups of 8 ranks run a call whose
+    destination band is not a multiple of 256 columns while every Q / K / V group is (e.g. hidden 3072) with the
+    256-column pair tile across band edges from 4096 rows per rank on, as one persistent launch
+    (``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; ``xband_min_m=N`` in the same variable sets the
+    threshold, ``xband_min_m=0`` switches it off).  Neither changes the stored bits.
     ``describe()`` reports the resolved build (``producer_variant``), scale
-    (``group_m_scale``) and gates (``shape_gates``), each with its value, source, environment variable and default,
+    (``group_m_scale``), gates (``shape_gates``, ``shape_gate_k_table``, ``xband_min_m``), each with its value, source,
+    environment variable and default,
     and every prepared row's verdict (``prepared_row_plans``, including ``reserved_sms`` and ``part_grids``).  The
     first three gates change the host plan only -- neither the tile table nor the stored bits; the pair-tile gate
     changes the producer program and the tile table (no lockstep pads) of the rows it selects; no gate changes the

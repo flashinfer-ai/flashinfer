@@ -176,7 +176,7 @@ kernel_cake_gdn_train_48f2bbfe1482cf86506c(const __grid_constant__ CUtensorMap q
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_s_addr = smem + 1024;
     __nv_bfloat16* h_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -195,6 +195,8 @@ kernel_cake_gdn_train_48f2bbfe1482cf86506c(const __grid_constant__ CUtensorMap q
     const int vn_mn_addr = smem + 58368;
     unsigned int* tk_s = reinterpret_cast<unsigned int*>(smem_raw + 222208);
     const int tk_s_addr = smem + 222208;
+
+    // Kernel setup ops
     int nc_k = seq_chunk_start[num_seqs];
     int num_tiles = nc_k * num_heads;
     int grid_k = num_bids;
@@ -209,8 +211,7 @@ kernel_cake_gdn_train_48f2bbfe1482cf86506c(const __grid_constant__ CUtensorMap q
         dynamic = 1;
     }
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -260,11 +261,9 @@ kernel_cake_gdn_train_48f2bbfe1482cf86506c(const __grid_constant__ CUtensorMap q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_qh = taddr;
-    const int tmem_acc_av = taddr + 256;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_qh = taddr;
+    const unsigned int tmem_acc_av = taddr + 256;
 
     // ---- Role: epilogue ----
     if (warp <= 3) {
