@@ -1094,7 +1094,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "19bb53cd64734c4426604fce1f650444be92dd808a6a46fb92cf4e07c33638a2",
+            "sm_107a": "2e58ed8124bfd29a752aa92a4c14c016f557a81fcfb7caf1f63b0e23ccccbae5",
         },
     },
     "cake_dsv4_88757d413062636b5640": {
