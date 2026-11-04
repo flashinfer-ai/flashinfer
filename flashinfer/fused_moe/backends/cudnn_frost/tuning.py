@@ -61,8 +61,9 @@ class _StageRunner(TunableRunner):
             tactic = next(iter(self.plans))
         plan = self.plans[tactic]
         if do_preparation:
-            # Every plan in this runner shares one routing layout. Recreate
-            # it before profiling: FC2's output aliases FC1's gathered input.
+            # Native layouts keep routing metadata before variable scratch,
+            # so every plan in this mode group shares its routing offsets.
+            # Recreate it: FC2's output aliases FC1's grouped input.
             # This runs outside timing/capture, entirely on the device.
             plan["prepare_stages"](*inputs, self.state.workspace)
             return

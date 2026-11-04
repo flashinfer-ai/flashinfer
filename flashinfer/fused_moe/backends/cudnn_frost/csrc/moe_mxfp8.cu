@@ -360,8 +360,9 @@ class CudnnFrostMxfp8MoeRunner final : public tvm::ffi::ModuleObj {
     layout.mapping = reserve(fma_ ? 0 : s * 4);
     layout.row_experts = reserve(fma_ ? 0 : s * 4);
     layout.scale = reserve(fma_ ? 0 : 3 * sizeof(float));
-    layout.scratch = reserve(std::max(scratch1_, scratch2_));
+    // Routing metadata must not move with a stage candidate's scratch size.
     layout.token_index = reserve(gather_ ? s * sizeof(int32_t) : 0);
+    layout.scratch = reserve(std::max(scratch1_, scratch2_));
     layout.bytes = pos;
     return layout;
   }

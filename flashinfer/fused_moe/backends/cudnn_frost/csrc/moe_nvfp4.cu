@@ -372,8 +372,9 @@ class CudnnFrostNvfp4MoeRunner final : public tvm::ffi::ModuleObj {
     result.scale = reserve(fma_ ? 0 : 3 * sizeof(float));
     result.combine_slots = reserve(combine_ ? result.rows * sizeof(int32_t) : 0);
     result.combine_scores = reserve(combine_ ? result.rows * sizeof(float) : 0);
-    result.scratch = reserve(std::max(scratch1_, scratch2_));
+    // Routing metadata must not move with a stage candidate's scratch size.
     result.token_index = reserve(gather_ ? result.rows * sizeof(int32_t) : 0);
+    result.scratch = reserve(std::max(scratch1_, scratch2_));
     result.workspace_size = pos;
     return result;
   }

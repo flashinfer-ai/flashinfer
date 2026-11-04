@@ -457,7 +457,10 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
                     for root in _artifact_roots()
                     for quantized in (False, True)
                     for kernel in runtime.discover(
-                        root, quantized_output=quantized, include_gather=True
+                        root,
+                        quantized_output=quantized,
+                        include_combine=True,
+                        include_gather=True,
                     )
                     if kernel.arch == arch
                     and (not kernel.fc1 or kernel.activation == name)

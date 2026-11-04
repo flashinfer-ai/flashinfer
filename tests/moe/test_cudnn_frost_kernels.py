@@ -1365,6 +1365,8 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
                         grouped = tuple(k for k in first if not k.gathers_input)
                         assert tuple(k.artifact_id for k in grouped) == fc1
                         assert len(first) - len(grouped) <= 2
+                        if arch == "sm_107a":
+                            assert any(k.gathers_input for k in first)
                     assert tuple(k.artifact_id for k in second) == fc2
                     assert all(k.arch == arch and k.activation == name for k in first)
                     assert all(k.arch == arch for k in second)
@@ -3615,6 +3617,20 @@ def test_nvfp4_packaged_shortlists_resolve_all_profiles(
     )
 
     _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch)
+
+    monkeypatch.setattr(moe.common, "_arch_for", lambda _: "sm_107a")
+    snapshot = moe._capture_selection(moe._artifact_roots(), "sm_107a", 128, SwiGLU())
+    for topk in (8, 9, 1024):
+        shape = (1, 128, 128, 1024, topk)
+        live = moe._selected_kernels(*shape, "cpu", SwiGLU())
+        captured = snapshot.select_kernels(shape)
+        assert tuple(tuple(k.artifact_id for k in pool) for pool in live) == tuple(
+            tuple(k.artifact_id for k in pool) for pool in captured
+        )
+        for first, second in (live, captured):
+            assert first and second
+            combined = {k.swap_ab for k in second if k.combines_output}
+            assert combined == ({False, True} if topk == 8 else set())
 
 
 def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):

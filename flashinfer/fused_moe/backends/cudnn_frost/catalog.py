@@ -8,6 +8,7 @@ from typing import Any
 
 _DIMENSIONS = ("s", "n", "k", "experts", "groups")
 _DTYPES = ("bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4")
+_MAX_BF16_COMBINE_TOP_K = 8
 
 
 def dimension_matches(value: int, rule: Any) -> bool:
@@ -128,6 +129,14 @@ def select_kernels(
     from .heuristics import select_stages
     from .shortlist import CompleteChoices, select_profiles
 
+    # BF16 atomics round after every contribution. Keep COMBINE within the
+    # validated fan-out; larger reductions retain ordinary FC2 + FP32 finalize.
+    second = tuple(
+        kernel
+        for kernel in second
+        if topk <= _MAX_BF16_COMBINE_TOP_K
+        or not getattr(kernel, "combines_output", False)
+    )
     if not first or not second:
         return (), ()
     choices = None

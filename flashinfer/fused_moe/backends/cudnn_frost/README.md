@@ -551,6 +551,12 @@ including CUDA Graph replay; no extra metadata conversion kernel is needed.
 Top-k is specialized during plan preparation, so one frozen recipe serves all
 supported routing configurations without a runtime cuDNN dependency.
 
+COMBINE candidates are limited to the validated range `1 <= top_k <= 8`.
+Larger top-k values remain supported through ordinary FC2 and FP32 finalization.
+This bound applies to both live and captured selection, including complete
+shortlist profiles. BF16 accumulation can lose substantial contributions at
+large fan-out; changing the atomic order does not prevent that loss.
+
 COMBINE rounds each weighted contribution to BF16 and accumulates in BF16,
 instead of materializing each expert's BF16 result before FP32 weighting and
 reduction. It therefore has a distinct numerical contract and ABI

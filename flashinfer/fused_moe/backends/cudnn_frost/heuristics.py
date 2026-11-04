@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import re
 
-POLICY_VERSION = "frost-stage-heuristic-v10"
+POLICY_VERSION = "frost-stage-heuristic-v12"
 STAGE_BUDGET = 4
 FUSED_BUDGET = 2
 _ELEMENT_BYTES = {"bfloat16": 2, "float8_e4m3fn": 1, "float4_e2m1fn_x2": 0.5}
