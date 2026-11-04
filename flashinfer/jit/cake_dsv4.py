@@ -1019,7 +1019,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "4df6d4127c7dd6a4a503a154fde8a3b5be4c70984801f66534a2fef3d0e4ceff",
+            "sm_107a": "a0e4753bb2aa54fad60d5a502c50dd47e36154fa6478fe9b44e5ba277b7cf816",
         },
     },
     "cake_dsv4_750835d54fe97cfc7ad4": {
