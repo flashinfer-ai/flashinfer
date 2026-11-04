@@ -701,10 +701,32 @@ def _eight_warp_program(cake_template, plan, arch):
     )
 
 
+def _unserved_sync_store(arch, cake_template, plan):
+    """The FlashInfer-only synchronised TMA-store gate (``cake_backend._serves``): the launcher's plan is a
+    synchronised stream-K bf16 TMA-store program (``_tma<slots>_sks``) whose epilogue the row's rule does not name
+    (the bf16 short-K default), which the registry does not serve; ``plan`` is the FlashInfer plan of the same row."""
+    knobs = cake_backend._template_knobs(cake_template)
+    if not knobs or not (knobs["sk_sync"] and knobs["epi"] == "tma") or plan.out_f32:
+        return False
+    rule = cake_backend.row_rule(
+        arch,
+        plan.a_mn,
+        plan.b_mn,
+        plan.out_f32,
+        plan.transposed_out,
+        plan.L > 1,
+        plan.N,
+        plan.K,
+        plan.M,
+    )
+    return "epi" not in rule
+
+
 def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
     """The plan is the Cake launcher's plan when that instance is a generated program of ``arch``; otherwise (the
     batched small-M swap on a tiny T outside the export contract, a measured rule whose template exists only for
-    the contract's T, or a default tail-T instance no contract row of this architecture produced -- all of which
+    the contract's T, a synchronised TMA-store program the row reaches through the short-K epilogue default
+    (``_unserved_sync_store``), or a default tail-T instance no contract row of this architecture produced -- all of which
     the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program.  A rule that
     pins ``htail`` names its ``_ht`` program on every device and T (``_rule_program``); a rule of record that carries
     the eight-warp CTA form names its eight-warp program (``_eight_warp_program``: the launcher's plans carry no
@@ -716,7 +738,9 @@ def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
         arch,
         sorted(registered - EXPORTED_TEMPLATES),
     )
-    if cake_template in registered:
+    if cake_template in registered and not _unserved_sync_store(
+        arch, cake_template, plan
+    ):
         assert plan.template == cake_template, (*where, plan.template)
         assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), (
             where
@@ -2066,12 +2090,18 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     # s = ceil((7 x kb + 62) / 8) = 230 K steps (kb = 253 / 254 K blocks at T 16172 / 16231) + 10 collectors, one slab
     # per tail tile; bf16 reads the slab back
     # through the dead mainloop stages (sb2), fp32 reduce-adds into the output through the TMA-store path (sb3)
-    v = _views("proj", "indexer_q", "wgrad", "bf16", T)
+    # (the bf16 row one token off the GB T-exact keys at T 16172 / 16231:
+    # test_gb_t_exact_sks_wgrad_rules_plan_their_programs)
+    v = _views("proj", "indexer_q", "wgrad", "bf16", T + 1)
     assert not v["transposed"]
     bf16, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
     assert bf16.sk_sync and bf16.sk_slab == 2
     assert _nopro(bf16.template) == "dense_proj_det_gemm_nn_n256_m256_sks_sb2"
-    assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (64, -(-T // BLOCK_K), 74)
+    assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (
+        64,
+        -(-(T + 1) // BLOCK_K),
+        74,
+    )
     assert (
         bf16.num_full,
         bf16.tail_tiles,
@@ -3147,11 +3177,12 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # weight gradients add 34 sm_107a keys (17 ragged, 17 T-exact weight-gradient keys at T 16231 / 16384); the GB
     # T-exact forward / input-gradient rules add 8 sm_100a and 8 sm_103a keys (test_gb_t_exact_rules_plan_their_programs);
     # their round 2 adds 4 sm_100a and 6 sm_103a keys (the q_b input gradient: test_gb_t_exact_rules_plan_their_programs;
-    # the 17408 x 5120 weight gradients: test_gb_t_exact_wgrad_rules_plan_their_programs)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4
+    # the 17408 x 5120 weight gradients: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 3 adds
+    # 2 sm_100a and 2 sm_103a keys (the indexer_q weight gradient: test_gb_t_exact_sks_wgrad_rules_plan_their_programs)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34
-    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6
+    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
         "sm_100a": {"pro": 7},
@@ -8455,7 +8486,11 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
     exact = sorted(
         key
         for key in ROW_RULES
-        if key[0] == arch and key[1] and key[7] is not None and key[8] is not None
+        if key[0] == arch
+        and key[1]
+        and key[7] is not None
+        and key[8] is not None
+        and key not in GB_T_EXACT_SKS_WGRAD_ROWS
     )
     assert exact == sorted(key for key in GB_T_EXACT_WGRAD_ROWS if key[0] == arch)
     registered = _registered(arch)
@@ -8547,6 +8582,213 @@ def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(
         plain.template,
     )
     cake_backend.clear_convenience_caches()
+
+
+# The GB T-exact weight-gradient rules of round 3: ROW_RULES key -> the program it plans at its T (K = T, in the direct
+# orientation the row plans without it), the ragged rule's synchronised two-partial stream-K plan with its bf16 tiles
+# through the one-slot TMA store: the same per-tile K partitions (the same stream-K units, slabs and two-addend fixup) as
+# the row's plan without it, so every output is bitwise equal to that plan's.
+GB_T_EXACT_SKS_WGRAD_ROWS = {
+    (
+        "sm_100a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        2048,
+        16172,
+        4096,
+    ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
+    (
+        "sm_100a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        2048,
+        16231,
+        4096,
+    ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        2048,
+        16172,
+        4096,
+    ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        2048,
+        16231,
+        4096,
+    ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
+}
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_gb_t_exact_sks_wgrad_rules_plan_their_programs(arch, monkeypatch):
+    """The GB T-exact weight-gradient rules of round 3 (the indexer_q 2048 -> 4096 weight gradient) plan their
+    program at their T on every SM count of the architecture's parts, in the direct orientation, with the plan of the
+    row without the key in every field but the program (the epilogue path and the staging slot): the same tiles,
+    stream-K units, K ranges and slab path; one token more or less plans that plan."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(key for key in GB_T_EXACT_SKS_WGRAD_ROWS if key[0] == arch)
+    registered = _registered(arch)
+
+    def plan_at(N, T, M, kw):
+        G, X, out = _gb_wgrad_views(N, T, M)
+        A, B, transposed = wgrad_views(G, X, arch=arch)
+        assert not transposed, (N, T, M)
+        plan, *_ = plan_dense_projection_det_gemm(A, B, out, **kw)
+        return plan
+
+    for key in keys:
+        _arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+        template = GB_T_EXACT_SKS_WGRAD_ROWS[key]
+        assert template in registered, (key, template)
+        # the ragged rule of the row (sm_100a's; sm_103a reads it through RULE_PARENT) + the TMA-store epilogue
+        assert ROW_RULES[key] == {
+            **ROW_RULES[("sm_100a", True, True, False, False, False, N, None, M)],
+            "epi": "tma",
+            "slots": 1,
+        }, key
+        for sm_count in (148, 152, 160) if arch == "sm_103a" else (148, 152):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
+            plans = {t: plan_at(N, t, M, kw) for t in (T - 1, T, T + 1)}
+            with monkeypatch.context() as m:
+                for k in _gb_t_exact_keys_of(key):
+                    m.delitem(ROW_RULES, k)
+                without = {t: plan_at(N, t, M, kw) for t in (T - 1, T, T + 1)}
+            for t in (T - 1, T + 1):
+                assert _plan_signature(plans[t]) == _plan_signature(without[t]), (
+                    key,
+                    t,
+                )
+            plan, ragged = plans[T], without[T]
+            assert plan.template == template, (key, sm_count, plan.template)
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert plan.sk_sync and plan.sk_slab == 2 and plan.sk_units, (key, sm_count)
+            assert (plan.epi, plan.slots, ragged.epi, ragged.slots) == (
+                "tma",
+                1,
+                "reg",
+                0,
+            )
+            sig, plain = _plan_signature(plan), _plan_signature(ragged)
+            assert {f for f in sig if sig[f] != plain[f]} == {
+                "template",
+                "epi",
+                "slots",
+            }, (
+                key,
+                sm_count,
+            )
+
+
+@pytest.mark.parametrize(
+    "key",
+    sorted(GB_T_EXACT_SKS_WGRAD_ROWS),
+    ids=lambda key: f"{key[0]}-nn-{key[6]}x{key[8]}-T{key[7]}",
+)
+def test_gb_t_exact_sks_wgrad_rows_match_fp64_and_their_plan_without_the_key(
+    key, monkeypatch
+):
+    """Each round-3 GB T-exact weight-gradient row of the device's architecture runs its program at its T against the
+    FP64 reference of the exact BF16 operands (the package tolerance), and its output is bitwise equal to the output
+    of the plan the row has without the key (the synchronised stream-K plan through the register epilogue: the rule
+    changes the store path, never a K sum).  A key of another architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    template = GB_T_EXACT_SKS_WGRAD_ROWS[key]
+    _require_program(template)
+    out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=device)
+    cake_backend.clear_convenience_caches()
+    prepared = prepare_projection_det_wgrad(G, X, out)
+    assert prepared.template == template, prepared.template
+    assert not prepared.plan.transposed_out and prepared.plan.sk_sync
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(G.double().t(), X.double()))
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        for k in _gb_t_exact_keys_of(key):
+            m.delitem(ROW_RULES, k)
+        cake_backend.clear_convenience_caches()
+        plain = prepare_projection_det_wgrad(G, X, plain_out)
+    assert plain.template != template and plain.plan.sk_sync, plain.template
+    plain.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), plain_out.view(torch.int16)), (
+        key,
+        plain.template,
+    )
+    cake_backend.clear_convenience_caches()
+
+
+def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
+    """The synchronised TMA-store gate (``cake_backend._serves``): on sm_103a at 160 SMs the 12288 -> 6144 weight
+    gradient at T 1001 plans the ragged rule's synchronised stream-K program with the short-K TMA-store default (the
+    launcher's plan); the registry does not serve it there, so the row plans exactly what it plans without that
+    program; a caller-forced ``epi="tma"`` is served."""
+    arch = "sm_103a"
+    template = "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7"
+    if template not in _registered(arch):
+        pytest.skip(f"{template} is not registered for {arch}")
+    N, M, T = 12288, 6144, 1001
+    kw = dict(sm_count=160, l2_bytes=L2_BYTES, arch=arch)
+    v = _class_views("nn", False, False, M, N, T)
+    mirror, *_ = plan_dense_projection_det_gemm(
+        v["A"], v["B"], v["out"], _fallback=False, **kw
+    )
+    assert mirror.template == template, mirror.template
+    assert mirror.sk_sync and mirror.epi == "tma"
+    assert "epi" not in cake_backend.row_rule(
+        arch, True, True, False, False, False, N, T, M
+    )
+    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    assert plan.template != template and plan.template in _registered(arch), (
+        plan.template
+    )
+    assert plan.rule_fallback or plan.knob_fallback, plan.template
+    without = {
+        a: {k: x for k, x in table.items() if not (a == arch and k == template)}
+        for a, table in cake_jit.KERNELS.items()
+    }
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(cake_backend, "KERNELS", without)
+        before, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    assert _plan_signature(plan) == _plan_signature(before), (
+        plan.template,
+        before.template,
+    )
+    forced, *_ = plan_dense_projection_det_gemm(
+        v["A"], v["B"], v["out"], epi="tma", **kw
+    )
+    assert forced.template == template, forced.template
+    assert not (forced.rule_fallback or forced.knob_fallback), forced.template
 
 
 def _n224_rule_rows():
