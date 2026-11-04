@@ -15,7 +15,8 @@
 """Cake DeepSeek-V4 NVFP4 sparse-MLA prefill on SM100 / SM103.
 
 ``trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake", kv_cache_format="nvfp4")``
-runs the NVFP4 prefill bodies from 128 metadata rows on: the query-block bodies
+runs the NVFP4 prefill bodies on a query packed to the NVFP4 row format
+(``cake_dsv4_nvfp4_pack_query``; the call packs nothing): the query-block bodies
 (16 / 32 heads on window-only rows, one item per block of 64 / H tokens), the
 per-token builds ``nvfp4_h64_*`` (8 to 64 heads) and ``nvfp4_h128_prefill`` (128
 heads, one two-CTA cluster per token). Every case checks the BF16 output and the
@@ -31,6 +32,7 @@ import torch
 
 from flashinfer.jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
 from flashinfer.mla import (
+    cake_dsv4_nvfp4_pack_query,
     get_cake_dsv4_workspace_bytes,
     nvfp4_quantize_pack_sparse_mla_cache,
     trtllm_batch_decode_sparse_mla_dsv4,
@@ -277,8 +279,24 @@ def _oracle(case, *, main_lens="given", extra_lens="given", chunk: int = 32):
     return out, lse
 
 
-def _run(case, *, out=None, main_lens="given", extra_lens="given", dense: bool = False):
-    query = case["query"]
+def _packs(case) -> bool:
+    """The route's call takes the packed query from 128 metadata rows on (the
+    NVFP4 prefill bodies); below that the BF16 query runs the decode family."""
+    return case["rows"] >= cake._NVFP4_PREFILL_MIN_TOKENS
+
+
+def _run(
+    case,
+    *,
+    out=None,
+    main_lens="given",
+    extra_lens="given",
+    dense: bool = False,
+    packed=None,
+):
+    packed = _packs(case) if packed is None else packed
+    query = cake_dsv4_nvfp4_pack_query(case["query"]) if packed else case["query"]
+    width = query.shape[-1]
     kwargs = dict(
         compressed_kv_cache=case["extra_cache"],
         sparse_topk_lens=case["main_lens"] if main_lens == "given" else main_lens,
@@ -297,7 +315,7 @@ def _run(case, *, out=None, main_lens="given", extra_lens="given", dense: bool =
     )
     if dense:
         batch = len(case["q_lens"])
-        q_in = query.reshape(batch, -1, case["heads"], _HEAD_DIM)
+        q_in = query.reshape(batch, -1, case["heads"], width)
         if out is not None:
             kwargs["out"] = out.reshape(q_in.shape)
     else:
@@ -311,10 +329,11 @@ def _run(case, *, out=None, main_lens="given", extra_lens="given", dense: bool =
     return result.reshape(case["rows"], case["heads"], _HEAD_DIM)
 
 
-def _route_layout(rows: int, heads: int, topk: int, extra_topk: int):
+def _route_layout(rows: int, heads: int, topk: int, extra_topk: int, prefill=None):
     """The workspace carve of one route call: one split for the prefill bodies
-    (they write the final O and LSE), the decode plan's splits below 128 rows."""
-    prefill = rows >= cake._NVFP4_PREFILL_MIN_TOKENS
+    (they write the final O and LSE), the decode plan's splits for the decode
+    family."""
+    prefill = rows >= cake._NVFP4_PREFILL_MIN_TOKENS if prefill is None else prefill
     if prefill:
         splits = 1
     else:
@@ -603,7 +622,10 @@ def test_nvfp4_query_block_takes_a_padded_index_pitch(monkeypatch):
     _check(case, out)
 
 
-def test_nvfp4_route_switches_to_the_prefill_bodies_at_128_rows(monkeypatch):
+def test_nvfp4_query_format_selects_the_family(monkeypatch):
+    """A packed query runs the prefill bodies at any row count; a BF16 query
+    runs the decode family below 128 rows and is refused from 128 rows on (the
+    call packs nothing)."""
     _require_cake_arch()
     calls = []
     original = cake._nvfp4_prefill
@@ -614,19 +636,75 @@ def test_nvfp4_route_switches_to_the_prefill_bodies_at_128_rows(monkeypatch):
 
     monkeypatch.setattr(cake, "_nvfp4_prefill", recording)
     small = _case(seed=5, heads=16, topk=128, q_lens=(64, 63))
-    _run(small)
+    out = _run(small, packed=False)
     assert calls == []
+    _check(small, out)
+    out = _run(small, packed=True)
+    assert calls == [127]
+    torch.cuda.synchronize()
+    ref_out, _ = _oracle(small)
+    torch.testing.assert_close(out.float(), ref_out, **_O_TOL)
     large = _case(seed=5, heads=16, topk=128, q_lens=(64, 64))
+    with pytest.raises(ValueError, match="cake_dsv4_nvfp4_pack_query"):
+        _run(large, packed=False)
     out = _run(large)
-    assert calls == [128]
+    assert calls == [127, 128]
     _check(large, out)
+
+
+def test_nvfp4_pack_query_helper_is_the_cache_row_format():
+    """The helper writes, per (token, head), the cache pack kernel's token
+    record (codes, then the E4M3 scale factors), into ``out`` when given."""
+    _require_cake_arch()
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    query = (torch.randn((300, 16, _HEAD_DIM), generator=gen, device="cuda") * 0.7).to(
+        torch.bfloat16
+    )
+    packed = cake_dsv4_nvfp4_pack_query(query)
+    assert packed.dtype == torch.uint8 and packed.shape == (300, 16, 384)
+    want = nvfp4_quantize_pack_sparse_mla_cache(query.reshape(300 * 16, 1, _HEAD_DIM))
+    assert torch.equal(packed.reshape(-1), want.reshape(-1))
+    out = torch.empty_like(packed)
+    assert cake_dsv4_nvfp4_pack_query(query, out=out) is out
+    assert torch.equal(out, packed)
+    dense = cake_dsv4_nvfp4_pack_query(query.reshape(3, 100, 16, _HEAD_DIM))
+    assert torch.equal(dense.reshape(packed.shape), packed)
+    with pytest.raises(ValueError, match="out must be"):
+        cake_dsv4_nvfp4_pack_query(query, out=torch.empty_like(packed)[:-1])
+    with pytest.raises(ValueError, match="BF16"):
+        cake_dsv4_nvfp4_pack_query(query.float())
+
+
+def test_nvfp4_packed_query_round_trip_default_out():
+    """helper -> call with no ``out``: the call allocates BF16 [..., 512] rows."""
+    _require_cake_arch()
+    case = _case(seed=8, heads=32, topk=512, q_lens=(100, 156))
+    packed = cake_dsv4_nvfp4_pack_query(case["query"])
+    out = trtllm_batch_decode_sparse_mla_dsv4(
+        packed,
+        case["main_cache"],
+        case["workspace"],
+        case["main_idx"],
+        sparse_topk_lens=case["main_lens"],
+        seq_lens=case["seq_lens"],
+        bmm1_scale=_SCALE,
+        sinks=case["sinks"],
+        kv_layout=case["layout"],
+        cum_seq_lens_q=case["cum_seq_lens_q"],
+        max_q_len=case["max_q_len"],
+        backend="cake",
+        kv_cache_format="nvfp4",
+    )
+    assert out.dtype == torch.bfloat16 and out.shape == (256, 32, _HEAD_DIM)
+    _check(case, out)
 
 
 @pytest.mark.parametrize("heads", [16, 64, 128])
 @pytest.mark.parametrize("rows", [128, 4096, 65536, 1 << 20])
 def test_nvfp4_prefill_workspace_has_no_split_regions(rows, heads):
-    """The prefill carve is one split: no partial_O, and only the packed query
-    grows with the head count beyond the per-(token, head) LSE regions."""
+    """The prefill carve is one split: no partial_O, and nothing beyond the
+    per-(token, head) LSE regions grows with the head count (the call takes
+    the query packed)."""
     layout = cake.cake_dsv4_workspace_layout(
         rows, heads, 1, with_lse=True, with_prefill=True
     )
@@ -637,7 +715,6 @@ def test_nvfp4_prefill_workspace_has_no_split_regions(rows, heads):
         layout.partial_lse[0]
         + cake._align_up(per_row * 4)  # partial_lse of the one split
         + cake._align_up(per_row * 4)  # final LSE
-        + cake._align_up(per_row * 384)  # packed NVFP4 query
         + 2 * cake._align_up(rows * 4)  # filled length vectors
     )
     assert layout.total_bytes == expected

@@ -388,7 +388,6 @@ def test_workspace_layout_lse_region_is_opt_in():
     assert with_lse.lse[1] == -(-(32 * 128 * 4) // 128) * 128
     assert with_lse.total_bytes == base.total_bytes + with_lse.lse[1]
     assert with_lse.lse[0] % 128 == 0
-    assert with_lse.packed_query == (with_lse.total_bytes, 0)
     assert with_lse.prefill_lens == (with_lse.total_bytes, 0)
 
 
@@ -451,13 +450,10 @@ def test_workspace_layout_prefill_regions_are_opt_in():
     base = cake_dsv4_workspace_layout(256, 64, 1, with_lse=True)
     prefill = cake_dsv4_workspace_layout(256, 64, 1, with_lse=True, with_prefill=True)
     assert (base.partial_lse, base.lse) == (prefill.partial_lse, prefill.lse)
-    assert prefill.packed_query == (base.total_bytes, 256 * 64 * 384)
-    assert prefill.prefill_lens == (
-        base.total_bytes + 256 * 64 * 384,
-        2 * (-(-(256 * 4) // 128) * 128),
-    )
+    # The call takes the query packed: the prefill regions are the two length vectors alone.
+    assert prefill.prefill_lens == (base.total_bytes, 2 * (-(-(256 * 4) // 128) * 128))
     assert prefill.total_bytes == prefill.prefill_lens[0] + prefill.prefill_lens[1]
-    assert prefill.packed_query[0] % 128 == 0 and prefill.prefill_lens[0] % 128 == 0
+    assert prefill.prefill_lens[0] % 128 == 0
 
 
 @pytest.mark.cpu_only
@@ -491,7 +487,7 @@ def test_workspace_bytes_nvfp4_bound():
             32, 128, 2, with_lse=True, with_prefill=True
         ).total_bytes
     )
-    with pytest.raises(ValueError, match="BF16 query"):
+    with pytest.raises(ValueError, match="torch.bfloat16"):
         get_cake_dsv4_workspace_bytes(
             32, 128, 512, torch.float8_e4m3fn, kv_cache_format="nvfp4"
         )

@@ -139,7 +139,10 @@ an unexported variant raises ``NotImplementedError``. Splits write
 workspace; the final base-2 LSE lives in an extra ``lse`` region appended
 after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 
-From 128 metadata rows on, the route runs the NVFP4 prefill bodies instead
+A query packed to the NVFP4 row format (``uint8 [rows, H, 384]``: per row the
+352 bytes of E2M1 NoPE codes and BF16 RoPE dims, then its 28 E4M3 scale factors
+and 4 pad bytes, the cache's token record; :func:`cake_dsv4_nvfp4_pack_query`
+packs a BF16 query) runs the NVFP4 prefill bodies instead, at any row count
 (Cake ``cake_dsv4_nvfp4_query_block_prefill`` and
 ``flashinfer_blackwell_trtllm_sparse_mla_dsv4_nvfp4_{h64,h128}_prefill``,
 chosen by :func:`_nvfp4_prefill_route`): the query-block bodies
@@ -148,10 +151,10 @@ tokens than SMs: one item per block of ``64 / H`` consecutive tokens, whose
 shifted windows are gathered and transformed once), the per-token builds
 ``nvfp4_h64_*`` (``H <= 64``, one item per query token, the heads duplicated on
 the two 64-row halves of a block-scaled M128 QK) and ``nvfp4_h128_prefill``
-(``H128``, one two-CTA cluster per token, 64 heads per CTA). They take the
-query in the cache's NVFP4 row format, so the host packs it
-into the workspace with the NVFP4 cache pack kernel first (``packed_query``
-region, :func:`cake_dsv4_workspace_layout` ``with_prefill=True``), read the
+(``H128``, one two-CTA cluster per token, 64 heads per CTA). As the FP8
+route takes an E4M3 query, they take the query packed by the caller: the call
+packs nothing. A BF16 query runs the decode family, below 128 metadata rows;
+from 128 rows on it is refused (pack it first). The prefill bodies read the
 pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
 final BF16 output and base-2 LSE directly (no split, no merge), so their
 workspace carve has one split (no ``partial_O`` region); the LSE lands in the
@@ -262,9 +265,8 @@ _NVFP4_PV_PLAN_MERGE_US = 1.5
 # Split merge (Cake MERGE_HEADS_PER_CTA / merge_heads_per_cta): 16 warps per CTA, one (token, head) per warp;
 # heads_per_cta is the smallest power of two whose grid T x ceil(H / hpc) stays within one CTA per SM (round 45).
 _NVFP4_MERGE_HEADS_PER_CTA = 16
-# NVFP4 prefill bodies: from _NVFP4_PREFILL_MIN_TOKENS metadata rows on, the route
-# runs one CTA (H <= 64) or one two-CTA cluster (H128) per query token over the
-# caller-packed NVFP4 query instead of the decode family (see the module docstring).
+# NVFP4 prefill bodies: a caller-packed NVFP4 query runs them (see the module docstring);
+# the decode family takes a BF16 query of fewer than _NVFP4_PREFILL_MIN_TOKENS metadata rows.
 _NVFP4_PREFILL_MIN_TOKENS = 128
 # The per-token body takes up to 64 heads, the two-CTA body 128. Its builds (``_nvfp4_prefill_route``):
 # ``tmem_v`` keeps V^T in TMEM (at most 32 heads); ``early_gather`` gathers a CTA's first item before
@@ -619,10 +621,9 @@ class WorkspaceLayout:
     # Final base-2 LSE f32 [T * H]; only carved for the NVFP4 route
     # (``with_lse=True``), otherwise an empty region at the layout end.
     lse: tuple[int, int] = (0, 0)
-    # NVFP4 prefill bodies (``with_prefill=True``): the packed NVFP4 query
-    # uint8 [T * H, 384] and two int32 [T] length vectors the host fills when
-    # the caller passes none; otherwise empty regions at the layout end.
-    packed_query: tuple[int, int] = (0, 0)
+    # NVFP4 prefill bodies (``with_prefill=True``): two int32 [T] length
+    # vectors the host fills when the caller passes none; otherwise an empty
+    # region at the layout end.
     prefill_lens: tuple[int, int] = (0, 0)
 
 
@@ -643,8 +644,7 @@ def cake_dsv4_workspace_layout(
     row-tiled chunk after the first, else 0) sizes the int32 region after
     ``partial_lse`` that holds the chunk's shifted ``cum_seq_lens_q``.
     ``with_lse`` appends the NVFP4 route's final-LSE region after that, and
-    ``with_prefill`` the NVFP4 prefill bodies' packed-query and length regions
-    after the LSE; the default layout is unchanged.
+    ``with_prefill`` the NVFP4 prefill bodies' length regions after the LSE; the default layout is unchanged.
     """
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
@@ -672,11 +672,7 @@ def cake_dsv4_workspace_layout(
     final_lse_bytes = (
         _align_up(tokens * heads * torch.float32.itemsize) if with_lse else 0
     )
-    packed_query_offset = final_lse_offset + final_lse_bytes
-    packed_query_bytes = (
-        _align_up(tokens * heads * _NVFP4_TOKEN_BYTES) if with_prefill else 0
-    )
-    lens_offset = packed_query_offset + packed_query_bytes
+    lens_offset = final_lse_offset + final_lse_bytes
     lens_bytes = 2 * _align_up(tokens * torch.int32.itemsize) if with_prefill else 0
     return WorkspaceLayout(
         descriptor_slab=(_DESCRIPTOR_SLAB_OFFSET, _DESCRIPTOR_SLAB_BYTES),
@@ -686,7 +682,6 @@ def cake_dsv4_workspace_layout(
         query_offsets=(offsets_offset, offsets_bytes),
         total_bytes=lens_offset + lens_bytes,
         lse=(final_lse_offset, final_lse_bytes),
-        packed_query=(packed_query_offset, packed_query_bytes),
         prefill_lens=(lens_offset, lens_bytes),
     )
 
@@ -724,11 +719,10 @@ def get_cake_dsv4_workspace_bytes(
     ceil(extra_topk / 128), 12)`` (the plan never exceeds the candidate tile
     count or the kernel's 12-split cap), and a final-LSE region
     ``align128(num_query_tokens * num_heads * 4)`` is appended, then the
-    prefill bodies' packed-query region ``align128(num_query_tokens * num_heads
-    * 384)`` and two ``align128(num_query_tokens * 4)`` length regions (the
-    bound covers the decode family and the prefill bodies alike). A call with
-    ``num_query_tokens >= 128`` runs the prefill bodies, which write the final
-    output and LSE directly and need only the one-split carve
+    prefill bodies' two ``align128(num_query_tokens * 4)`` length regions (the
+    bound covers the decode family and the prefill bodies alike). A call with a
+    packed NVFP4 query runs the prefill bodies, which write the final output and
+    LSE directly and need only the one-split carve
     ``cake_dsv4_workspace_layout(num_query_tokens, num_heads, 1, with_lse=True,
     with_prefill=True).total_bytes``.
     """
@@ -737,7 +731,10 @@ def get_cake_dsv4_workspace_bytes(
     topk = _positive_int(sparse_topk, "sparse_topk")
     if kv_cache_format == "nvfp4":
         if dtype != torch.bfloat16:
-            raise ValueError("the CAKE DSv4 NVFP4 route takes a BF16 query")
+            raise ValueError(
+                "the CAKE DSv4 NVFP4 route sizes its workspace with dtype "
+                "torch.bfloat16 (a BF16 or a packed NVFP4 query)"
+            )
         if (
             isinstance(extra_topk, bool)
             or not isinstance(extra_topk, int)
@@ -3059,7 +3056,10 @@ def run_cake_dsv4_nvfp4(
     compressed_page_size: Optional[int] = None,
     lse_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Launch the CAKE DSv4 NVFP4 decode for ``query [rows, num_heads, 512]`` BF16.
+    """Launch the CAKE DSv4 NVFP4 route for ``query``: BF16 ``[rows, num_heads, 512]``
+    (the decode family, fewer than 128 metadata rows) or packed NVFP4 ``uint8
+    [rows, num_heads, 384]`` (the prefill bodies; see the module docstring and
+    :func:`cake_dsv4_nvfp4_pack_query`).
 
     ``sparse_indices [T, topk]`` (int32, unit inner stride) indexes
     ``swa_kv_cache``; ``sparse_topk_lens`` (optional, int32 ``>= T``) clamps its
@@ -3072,9 +3072,10 @@ def run_cake_dsv4_nvfp4(
     are untouched. ``cum_seq_lens_q`` and ``seq_lens`` are accepted for surface
     parity with :func:`run_cake_dsv4` but unused, and ``max_q_len`` is only a
     work-mapping constant of the prefill bodies: the kernels consume flat token
-    coordinates. Calls with ``T >= 128`` rows run the NVFP4 prefill bodies
-    (:func:`_nvfp4_prefill`), smaller ones the decode family. The base-2 LSE is
-    written to the workspace (not returned). No device memory is allocated.
+    coordinates. A packed query runs the NVFP4 prefill bodies
+    (:func:`_nvfp4_prefill`); a BF16 query runs the decode family and is
+    refused from 128 metadata rows on. The base-2 LSE is written to the
+    workspace (not returned). No device memory is allocated.
     """
     if backend != "cake":
         raise ValueError(f"expected backend='cake', got {backend!r}")
@@ -3083,12 +3084,19 @@ def run_cake_dsv4_nvfp4(
             f"query must be [num_tokens, num_heads, {_HEAD_DIM}], got shape {tuple(query.shape)}"
         )
     query_capacity, num_heads, head_dim = (int(d) for d in query.shape)
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
-    if query.dtype != torch.bfloat16:
+    packed_query = query.dtype == torch.uint8
+    if packed_query:
+        if head_dim != _NVFP4_TOKEN_BYTES:
+            raise ValueError(
+                f"a packed NVFP4 query has {_NVFP4_TOKEN_BYTES}-byte rows, got {head_dim}"
+            )
+    elif query.dtype != torch.bfloat16:
         raise ValueError(
-            f"the CAKE DSv4 NVFP4 route takes a BF16 query, got {query.dtype}"
+            "the CAKE DSv4 NVFP4 route takes a BF16 query or a packed NVFP4 "
+            f"query (uint8, cake_dsv4_nvfp4_pack_query), got {query.dtype}"
         )
+    elif head_dim != _HEAD_DIM:
+        raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
     if not query.is_contiguous():
         raise ValueError("query must be contiguous; backend='cake' makes no host copy")
     if num_heads not in _NVFP4_HEAD_COUNTS:
@@ -3205,7 +3213,13 @@ def run_cake_dsv4_nvfp4(
             f"workspace_buffer must be on {device}, got {workspace_buffer.device}"
         )
     raw = _workspace_bytes(workspace_buffer)
-    prefill = num_query_tokens >= _NVFP4_PREFILL_MIN_TOKENS
+    prefill = packed_query
+    if not prefill and num_query_tokens >= _NVFP4_PREFILL_MIN_TOKENS:
+        raise ValueError(
+            f"{num_query_tokens} metadata rows run the NVFP4 prefill bodies, which take "
+            "the query packed to the NVFP4 row format: pass "
+            "cake_dsv4_nvfp4_pack_query(query) (uint8 [rows, heads, 384])"
+        )
     # The prefill bodies write the final O and LSE directly, so their carve has one
     # split (no partial_O) whatever the decode plan would split into.
     layout = cake_dsv4_workspace_layout(
@@ -3358,22 +3372,51 @@ def _nvfp4_pool_geometry(
     )
 
 
-def _nvfp4_pack_query(query_rows: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
-    """Quantize the BF16 query rows ``[T, H, 512]`` into ``packed`` (uint8, ``T * H * 384`` bytes of the workspace)
-    with the NVFP4 cache pack kernel, one row per page of one token: a row is exactly the cache ABI's token record
-    (352 data bytes, 32 scale bytes), which is what the prefill bodies read.  Returns the ``[T, H, 384]`` view."""
+def cake_dsv4_nvfp4_pack_query(
+    query: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Pack a BF16 query ``[..., num_heads, 512]`` to the NVFP4 row format the
+    NVFP4 prefill bodies take: ``uint8 [..., num_heads, 384]``, each (token,
+    head) row the cache's token record (224 bytes of E2M1 NoPE codes, 128 bytes
+    of BF16 RoPE dims, then the 28 E4M3 scale factors of the 16-dim NoPE groups,
+    ``e4m3(amax / 6)``, and 4 pad bytes), the same quantizer as
+    :func:`nvfp4_quantize_pack_sparse_mla_cache`. ``out`` (contiguous uint8 of
+    that shape on the query's device) receives the rows; without it a tensor is
+    allocated. One kernel launch, capturable in a CUDA graph with ``out``.
+    """
     from ._sparse_mla_sm120._execution import (
         get_sparse_mla_dsv4_nvfp4_cache_ops_module,
     )
 
-    tokens, heads = int(query_rows.shape[0]), int(query_rows.shape[1])
-    rows = tokens * heads
-    latent = query_rows.reshape(rows, 1, _HEAD_DIM)
-    cache = packed.view(rows, 1, 1, _NVFP4_TOKEN_BYTES)
-    get_sparse_mla_dsv4_nvfp4_cache_ops_module().sparse_mla_sm120_nvfp4_quantize_pack(
-        latent, cache
-    )
-    return packed.view(tokens, heads, _NVFP4_TOKEN_BYTES)
+    if query.dtype != torch.bfloat16 or query.ndim < 2:
+        raise ValueError(
+            f"query must be BF16 [..., num_heads, {_HEAD_DIM}], got {query.dtype} "
+            f"{tuple(query.shape)}"
+        )
+    if int(query.shape[-1]) != _HEAD_DIM or not query.is_contiguous():
+        raise ValueError(
+            f"query must be contiguous [..., num_heads, {_HEAD_DIM}], got shape "
+            f"{tuple(query.shape)}"
+        )
+    shape = (*query.shape[:-1], _NVFP4_TOKEN_BYTES)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.uint8, device=query.device)
+    elif (
+        out.dtype != torch.uint8
+        or tuple(out.shape) != shape
+        or not out.is_contiguous()
+        or out.device != query.device
+    ):
+        raise ValueError(
+            f"out must be a contiguous uint8 {shape} tensor on {query.device}, "
+            f"got {out.dtype} {tuple(out.shape)} on {out.device}"
+        )
+    rows = query.numel() // _HEAD_DIM
+    if rows:
+        get_sparse_mla_dsv4_nvfp4_cache_ops_module().sparse_mla_sm120_nvfp4_quantize_pack(
+            query.reshape(rows, 1, _HEAD_DIM), out.view(rows, 1, 1, _NVFP4_TOKEN_BYTES)
+        )
+    return out
 
 
 def _nvfp4_prefill(
@@ -3402,8 +3445,8 @@ def _nvfp4_prefill(
     """Launch one of the NVFP4 prefill bodies on ``num_query_tokens`` rows.
 
     :func:`_nvfp4_prefill_route` picks the body and its build. Every body
-    reads the query packed to the NVFP4 row format in the workspace
-    (:func:`_nvfp4_pack_query`), the pools through 32-byte-pitch data and scale
+    reads the caller's packed NVFP4 query ``query_rows`` (uint8 ``[T, H,
+    384]``) through a data map and a scale-factor map, the pools through 32-byte-pitch data and scale
     row views, and writes the final BF16 output and base-2 LSE directly. A
     table without a caller length vector gets one filled in the workspace
     (every entry the table width).
@@ -3419,12 +3462,7 @@ def _nvfp4_prefill(
     )
     _require_nvfp4_variant(variant, arch=arch)
 
-    packed_offset, packed_bytes = layout.packed_query
-    packed = raw[
-        packed_offset : packed_offset
-        + num_query_tokens * num_heads * _NVFP4_TOKEN_BYTES
-    ]
-    q_packed = _nvfp4_pack_query(query_rows, packed)
+    q_packed = query_rows
 
     lens_offset, lens_bytes = layout.prefill_lens
     half = lens_bytes // 2
