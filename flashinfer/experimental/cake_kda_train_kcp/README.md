@@ -46,12 +46,17 @@ backend are experimental: no compatibility guarantee.
   checkpoint-replay backwards run the same programs (bitwise equal, as in the
   deterministic package).  `out`, `dq`, `dk`, `dv` and `dbeta` are bitwise the
   deterministic package's; `dg` differs from it by FP32 rounding on the `S1`
-  rows (the same FP64-referenced accuracy budget).  No path launches an
-  unordered reduction, so no entry raises torch's deterministic-algorithms
-  alert.
+  rows (the same FP64-referenced accuracy budget).  The one unordered
+  reduction is the raw gate mode's parameter-gradient reduce on `sm_100a` /
+  `sm_103a` (below): only that backward raises torch's
+  deterministic-algorithms alert, on every rank before any exchange.
 * A partition, a context and the byte queries hold no mode: they describe the
   same plan in both packages, and a context of either package serves the calls
-  of both (each package keeps its own launch tables on it).  The autograd node
+  of both (each package keeps its own launch tables on it).  The workspace
+  query of a raw gate mode backward on `sm_100a` / `sm_103a` here also counts
+  the local arena's FP64 parameter-gradient accumulators (`param_acc`, 2 KiB
+  per head; 16 KiB per head on `sm_100a` from 32 heads), which the
+  deterministic package does not hold.  The autograd node
   records its forward's mode and its backward runs it; a saved set is read by
   the backward of the package that wrote it (`SavedKcp` here, the other
   package's set raises `ValueError`), and a workspace (`WorkspaceKcp`) serves
@@ -59,9 +64,12 @@ backend are experimental: no compatibility guarantee.
 * The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and
   `lower_bound`, FlashInfer #7816) runs on this package too ("Raw gate mode"
   below): the rank's local stages take the single-rank package's raw records,
-  the deterministic programs on every row (no `S1` row runs in this mode), so
-  every output, the raw gate's gradient and the per-rank parameter partial
-  sums are bitwise those of the deterministic package.  The in-kernel q / k
+  the deterministic programs on every row (no `S1` row runs in this mode) but
+  for the parameter-gradient reduce, so every output and the raw gate's
+  gradient are bitwise those of the deterministic package.  On `sm_107a` the
+  per-rank parameter partial sums are bitwise too; on `sm_100a` / `sm_103a`
+  they come from the `R1c` pairs (an unordered FP64 sum rounded once to FP32)
+  and can differ by about one FP32 ulp from run to run (below).  The in-kernel q / k
   L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
   entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
   `ValueError` for it, naming `deterministic=True`.  Its off value
@@ -496,25 +504,48 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
 
 * The local stages run the raw records of the rank's plan
   (`cake_backend.plan(..., gate="raw")` of the single-rank package: copies of
-  the deterministic raw programs; the intra and prep programs activate the
-  gate, the raw GLM intra program writes `draw` and the per-chunk partials,
-  one `param_finalize` launch reduces them; no gate epilogue, no `S1` pair).
+  the deterministic raw programs but for the parameter-gradient reduce; the
+  intra and prep programs activate the gate, the raw GLM intra program writes
+  `draw`; no gate epilogue, no `S1` pair).  On `sm_107a` `glm_intra_raw` also
+  writes the per-chunk partials and one `param_finalize` launch reduces them
+  in a fixed order.  On `sm_100a` / `sm_103a` the `R1c` GLM intra program
+  (`glm_intra_v20c`, on `sm_100a` from 32 heads `glm_intra_v20c_r8`) adds
+  them in FP64 into the local arena's accumulators `param_acc` and its cast
+  rounds them once and zeroes the accumulators.
   The `gk` rows the K1 / K2 / K3 walks read are the explicit path's bits for
   the same activated gate, so every KCP program, collective and exchanged
   byte is the explicit path's; no full-size FP32 gate or gate gradient exists
-  on the route.  Every output, `draw` and the parameter partial sums are
-  bitwise those of `chunk_kda_det_bwd_kcp` on the same rank.
+  on the route.  Every output and `draw` are bitwise those of
+  `chunk_kda_det_bwd_kcp` on the same rank, and so are the parameter partial
+  sums on `sm_107a`.  On `sm_100a` / `sm_103a` the FP64 additions arrive in no
+  fixed order, so the partial sums can differ from run to run and from the
+  deterministic route: from run to run by one FP32 ulp at most while the FP64
+  sum's order error stays below half an FP32 ulp of the result (only per-chunk
+  terms that nearly cancel exceed it), and their error against the FP64
+  reference stays within the deterministic route's plus the FP64 sum's own
+  error.  Such
+  a backward raises torch's
+  non-determinism alert under `torch.use_deterministic_algorithms(True)`
+  (`RuntimeError`; a `UserWarning` with `warn_only=True`) on every rank before
+  it allocates, exchanges or launches anything: the decision reads the
+  architecture and `H` alone, so a rank without tokens alerts too.
 * `dA_log` / `ddt_bias` of a rank are its partial sums: the gradients through
-  its own tokens, reduced on the rank in an order fixed by its local chunks
-  (bitwise repeatable, the same under every exchange, schedule, graph replay
-  and recompute).  The full gradient is their sum over `ctx.group`; a
+  its own tokens, reduced on the rank.  On `sm_107a` the order is fixed by its
+  local chunks: bitwise repeatable, the same under every exchange, schedule,
+  graph replay and recompute.  On the `R1c` rows the unordered FP64 sum makes
+  each partial sum vary from run to run by about one FP32 ulp of itself.  The
+  full gradient is their sum over `ctx.group`; a
   training framework sums them as it sums the gradients of any parameter
   replicated across the context-parallel ranks.  An NCCL all-reduce gives
   that sum to FP32 rounding but does not fix its summation order, so it is
   not bitwise reproducible; `reduce_gate_param_grads_kcp(ctx, dA_log,
-  ddt_bias)` is: one `all_gather_into_tensor` of the `H + 128 H` values, then
-  an FP32 sum in rank order on every rank (the same bits everywhere, and the
-  same bits as the deterministic package's `reduce_gate_param_grads_det_kcp`).
+  ddt_bias)` is, from the same partials: one `all_gather_into_tensor` of the
+  `H + 128 H` values, then an FP32 sum in rank order on every rank (the same
+  bits everywhere, and the same bits as the deterministic package's
+  `reduce_gate_param_grads_det_kcp` from the same partials).  On the `R1c`
+  rows the partials vary from run to run, so that sum does too: by a few FP32
+  ulps that grow with the world size `W` (each partial by about one ulp, each
+  of the `W - 1` additions rounding either way).
 * The mode is fixed per workspace (`WorkspaceKcp(use_gate_in_kernel=True)`:
   its local arena is the replay arena planned in raw mode, whose backward
   layouts carry no gate epilogue buffers; the KCP pools do not change;
@@ -522,15 +553,24 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   (`SavedKcp.gate`, `.lower_bound`) and in a recompute handle's fingerprint;
   a call in the other mode, a backward with another `lower_bound` and a
   recompute of another mode are refused with `ValueError`.
-  `kda_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)` sizes it;
+  `kda_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)` sizes it
+  (the `R1c` accumulators included: 2 KiB per head with one replica, 16 KiB
+  per head with 8);
   `kda_saved_bytes_kcp` and `kda_comm_bytes_kcp` do not depend on the mode.
+* The `R1c` accumulators are one buffer of the local arena, shared by its
+  plan views.  A pack of more heads than the buffer holds grows it before its
+  backward and drops the cached graphs of the arena, whose launches add into
+  the old buffer; `reserve` sizes it for its contexts, and `bytes` counts it
+  once.  A backward that stops between the GLM intra launches and the cast
+  leaves sums in it; the next backward, or a `graph="replay"` replay, zeroes
+  the whole buffer first.
 * The checkpoint hand-off does not engage in raw mode (its tape set is
   verified on the explicit gate only): a raw call keeps the light set under
   every `checkpoint_handoff` value and records no decision.
-* The backward allocates the raw gate's BF16 gradient, the partials (two FP32
-  `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for the duration of the
-  call) and the two parameter gradients; a rank without tokens returns zero
-  parameter gradients.
+* The backward allocates the raw gate's BF16 gradient, on `sm_107a` the
+  partials (two FP32 `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for
+  the duration of the call) and the two parameter gradients; a rank without
+  tokens returns zero parameter gradients.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
