@@ -646,3 +646,164 @@ def test_wide_tail_plan(clusters, max_seq_len, sm_count, expected):
 
     assert plan_wide_work(clusters, max_seq_len, sm_count) == expected
     assert plan_wide_work(clusters, max_seq_len, sm_count, forced_split=3) == (0, 3)
+
+
+# ---------------------------------------------------------------------------
+# Persistent wide route (main_wide_persistent + reduce_w<N>_tile_flags)
+# ---------------------------------------------------------------------------
+
+# (batch, q_len, num_heads, kv): wide tail plans on both sides of the item-length bound and a
+# uniform plan.  On 148 SMs: (1, 1024, 12, 8192) and (7, 256, 12, 12288) take the persistent
+# route; (5, 256, 24, 24576) streams items longer than PERSISTENT_MAX_ITEM_KV and
+# (1, 1024, 12, 16384) is a uniform plan (no unsplit item), so both keep the shipped kernels.
+PERSISTENT_CASES = [
+    (1, 1024, 12, 8192),
+    (7, 256, 12, 12288),
+    (5, 256, 24, 24576),
+    (1, 1024, 12, 16384),
+]
+
+
+def _sm_count() -> int:
+    return int(
+        torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+    )
+
+
+def _persistent_route(batch, q_len, num_heads, kv, sm_count):
+    from flashinfer.mla.cake_kimi_k3_mla import plan_attention, use_persistent_route
+
+    plan = plan_attention(
+        batch=batch,
+        max_q_len=q_len,
+        num_heads=num_heads,
+        max_seq_len=kv,
+        sm_count=sm_count,
+    )
+    return plan, use_persistent_route(plan, sm_count, kv)
+
+
+def test_persistent_route_predicate():
+    from flashinfer.mla.cake_kimi_k3_mla import PERSISTENT_MAX_ITEM_KV
+
+    assert PERSISTENT_MAX_ITEM_KV[148] == 16384
+    # Tail plans (unsplit full waves, split last wave) with a second round and idle pairs.
+    for shape in ((4, 1024, 12, 8192), (1, 1024, 12, 8192), (13, 256, 12, 16384)):
+        plan, routed = _persistent_route(*shape, 148)
+        assert plan.wide and plan.n_full_items > 0 and 2 <= plan.num_split <= 32
+        assert routed, shape
+    # Items longer than the bound, uniform plans, row tiles and an SM count without a bound keep
+    # the shipped kernels.
+    for shape, sm_count in (
+        ((5, 256, 24, 24576), 148),
+        ((1, 1024, 12, 16384), 148),
+        ((8, 2, 96, 342305), 148),
+        ((1, 1, 12, 40000), 148),
+        ((4, 1024, 12, 8192), 160),
+    ):
+        assert not _persistent_route(*shape, sm_count)[1], (shape, sm_count)
+
+
+def test_persistent_cases_cover_both_paths_on_this_device():
+    _skip_unless_sm100_family()
+    from flashinfer.mla.cake_kimi_k3_mla import PERSISTENT_MAX_ITEM_KV
+
+    sm_count = _sm_count()
+    if PERSISTENT_MAX_ITEM_KV.get(sm_count) is None:
+        pytest.skip(f"no persistent wide route on {sm_count} SMs")
+    routes = [_persistent_route(*case, sm_count)[1] for case in PERSISTENT_CASES]
+    assert any(routes) and not all(routes), routes
+
+
+@pytest.mark.parametrize("batch,q_len,num_heads,kv", PERSISTENT_CASES)
+def test_persistent_route_is_bitwise_the_shipped_kernels(
+    batch, q_len, num_heads, kv, monkeypatch
+):
+    """The persistent route keeps the split plan, per-item code and fold order: its output must
+    equal the shipped kernels' bit for bit, on eager launches and on CUDA-Graph replays (the
+    launcher's flag words carry the launch epoch from one launch to the next)."""
+    _skip_unless_sm100_family()
+    import flashinfer.mla.cake_kimi_k3_mla as host
+
+    device = torch.device("cuda")
+    sm_count = _sm_count()
+    plan, expected = _persistent_route(batch, q_len, num_heads, kv, sm_count)
+    case = _make_case(
+        batch, [q_len] * batch, [kv] * batch, num_heads, seed=645501, device=device
+    )
+    total_q = case["query"].shape[0]
+
+    def launcher():
+        out = torch.full(
+            (total_q, num_heads, LATENT),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        workspace = torch.zeros(
+            host.workspace_bytes(plan.rows_max, plan.num_split),
+            dtype=torch.uint8,
+            device=device,
+        )
+        attention = host.KimiK3MlaFp8PagedAttention(
+            query=case["query"],
+            kv_cache=case["kv_cache"],
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=out,
+            workspace_buffer=workspace,
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=q_len,
+            max_seq_len=kv,
+        )
+        return attention, out
+
+    attention, out = launcher()
+    arch = attention.arch
+    assert attention.plan == plan
+    assert attention.route_metadata["persistent"] == expected
+    if expected:
+        assert (
+            attention.route_metadata["main_module"]
+            == get_cake_kimi_k3_mla_kernel("main_wide_persistent", arch=arch)["name"]
+        )
+        assert attention.route_metadata["reducer"] == f"{plan.reduce_kind}_tile_flags"
+    else:
+        assert (
+            attention.route_metadata["main_module"]
+            == get_cake_kimi_k3_mla_kernel(plan.main_kind, arch=arch)["name"]
+        )
+        assert attention.route_metadata["reducer"] == plan.reduce_kind
+    attention.launch()
+    torch.cuda.synchronize()
+    eager = out.clone()
+    _check(eager, _reference(case), atol=1e-2, rtol=2e-2)
+    # A second eager launch on the same launcher (the flag epoch advances).
+    out.fill_(float("nan"))
+    attention.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+    # CUDA-Graph capture and three replays.
+    g = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.cuda.graph(g, stream=stream):
+        attention.launch()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager)
+    # The shipped kernels of the same plan (no persistent route on any SM count).
+    monkeypatch.setattr(host, "PERSISTENT_MAX_ITEM_KV", {})
+    shipped, shipped_out = launcher()
+    assert not shipped.route_metadata["persistent"]
+    assert (
+        shipped.route_metadata["main_module"]
+        == get_cake_kimi_k3_mla_kernel(plan.main_kind, arch=arch)["name"]
+    )
+    shipped.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(shipped_out, eager)
