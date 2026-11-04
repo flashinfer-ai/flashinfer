@@ -230,8 +230,9 @@ shim checks that grid.
 
 The K-major (nontranspose) fp32-state T=1 row (`gated_delta_rule_decode`,
 H=16 / HV=32) follows the batch size on SM107a
-(`cake_gdn_nontranspose_fp32_t1_route`): `mid4_rc_kq128` below 32 rows and,
-from 32 rows on (the whole large band, which formerly ran `tilev32_x2` for
+(`cake_gdn_nontranspose_fp32_t1_route`): `mid4_rc_kq128` below 21 rows and,
+from 21 rows on (the upper small band 21-31, which formerly ran
+`mid4_rc_kq128`, and the whole large band, which formerly ran `tilev32_x2` for
 32-36 and `hqsplit` from 37), `gdn_decode_nontranspose_fp32_t1_hqsplit_tma3`:
 the `hqsplit` statements and
 accumulation order (bitwise-identical output and state) with each 32-wide V
@@ -247,8 +248,12 @@ the pointer template does (FP32, contiguous `[B, HV, 128, 128]`) plus a
 CUDA graph captures it with the launch, so a replay addresses the state
 tensor the capture saw, exactly as the pointer ABI's captured pointer does; a
 different state tensor needs its own capture (or the eager path, which
-encodes per call). Nothing is cached by pointer. SM100a/SM103a keep the
-shipped bodies.
+encodes per call). Nothing is cached by pointer. The TMA-state records cover
+H=16 / HV=32 only; the H=4 / HV=8 trace row keeps `mid4_rc_kq128` in the
+upper small band. The H=16 / HV=32 B=28 row at scale 1.0 also keeps
+`mid4_rc_kq128` (`hqsplit_tma3` ran it at 0.996x on a 216-SM R200; the same
+row at scale K^-0.5 takes `hqsplit_tma3`). SM100a/SM103a keep the shipped
+bodies.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

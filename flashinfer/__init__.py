@@ -361,16 +361,22 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
 )
 
-# Compatibility names of the causal conv1d entry points, bound to the same objects as the det names.
-CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
-cake_causal_conv1d = cake_causal_conv1d_det
-cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
-cake_causal_conv1d_train_backward_workspace_bytes = (
-    cake_causal_conv1d_det_train_backward_workspace_bytes
+# Use import aliases so strict JIT keys treat these as re-exports, not setup code.
+from .cake_causal_conv1d_det_train import (
+    CakeCausalConv1dDetFunction as CakeCausalConv1dFunction,
 )
-cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
-cake_causal_conv1d_train_forward_workspace_bytes = (
-    cake_causal_conv1d_det_train_forward_workspace_bytes
+from .cake_causal_conv1d_det_train import cake_causal_conv1d_det as cake_causal_conv1d
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
 
 from .cake_mhc_det_train import (

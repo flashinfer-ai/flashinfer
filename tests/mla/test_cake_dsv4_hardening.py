@@ -421,13 +421,30 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
         pytest.param(64, BATCH, 4, id="h64-persistent"),
         pytest.param(64, 64, 4, id="h64-m64"),
         pytest.param(128, BATCH, 4, id="h128-persistent"),
+        # 64 requests of 6-12 tokens: 576 rows, the twin's range on SM103.
+        pytest.param(128, 64, 12, id="h128-persistent-twin"),
+        # 2 requests of up to 257 tokens: the twin's range on SM100.
+        pytest.param(128, 2, 257, id="h128-persistent-prefill"),
     ],
 )
-def test_enable_pdl_matches_and_waits_for_the_query_producer(h_q, batch, s_q):
+def test_enable_pdl_matches_and_waits_for_the_query_producer(
+    monkeypatch, h_q, batch, s_q
+):
     """FP8 programs launched as programmatic dependents: bitwise equal to the
-    plain launch, and inside a graph they read the query the kernel before them
-    writes (the copy that fills it in place)."""
+    plain launch (the H128 persistent route's PDL-free twin on SM103 from 384
+    rows, on SM100 from a 257-token request), and inside a graph they read the
+    query the kernel before them writes (the copy that fills it in place)."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
     dtype = torch.float8_e4m3fn
     p, tc = _make_case(h_q, dtype, s_q, varlen=True, batch=batch)
     static = _Inputs(p, tc)
@@ -435,9 +452,18 @@ def test_enable_pdl_matches_and_waits_for_the_query_producer(h_q, batch, s_q):
     plain = _out_like(static, fill=0.0)
     pdl = _out_like(static, fill=0.0)
     static.run(out=plain, workspace=workspace)
+    plain_variants, launched[:] = list(launched), []
     static.run(out=pdl, workspace=workspace, enable_pdl=True)
     torch.cuda.synchronize()
     assert torch.equal(plain, pdl)
+    (route,) = set(launched)
+    capability = tuple(get_compute_capability(torch.device("cuda")))
+    rows = static.swa_indices.shape[0]
+    twin = route in cake._NO_PDL_TWIN_ROUTES and (
+        (capability == (10, 3) and rows >= 384)
+        or (capability == (10, 0) and static.max_q_len >= 257)
+    )
+    assert set(plain_variants) == {f"{route}_no_pdl" if twin else route}
 
     p2, tc2 = _make_case(h_q, dtype, s_q, varlen=True, seed=p.seed + 7_000, batch=batch)
     mutated = _Inputs(p2, tc2)
@@ -1462,6 +1488,49 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(for
     assert torch.equal(out.reshape(plain.shape), plain)
 
 
+def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
+    monkeypatch,
+):
+    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program on
+    SM100/SM103; as a programmatic dependent it is bitwise equal to the plain
+    launch and, inside a graph, reads the query the copy right before it writes."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    case = _build_case(
+        num_heads=64,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(3)],
+        q_lens=[5, 4, 3],
+        layout="ragged",
+        compressed_width=132,
+        compressed_page=2,
+    )
+    workspace = _workspace_128mib()
+    plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert {route for route, _ in calls} == {"fp8_lowhead_h64"}, calls
+    assert torch.isfinite(plain).all()
+    _assert_valid(plain, case)
+    pdl = case.run(
+        workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain.view(torch.int16), pdl.view(torch.int16))
+
+    source = case.query.clone()
+    case.query.zero_()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(workspace=workspace, out=out, float_scales=True, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out.reshape(plain.shape).view(torch.int16), plain.view(torch.int16)
+    )
+
+
 @pytest.mark.parametrize("h_q", _SGLANG_HEADS)
 @pytest.mark.parametrize("form", ["decode", "mtp-flat", "prefill"])
 def test_sglang_compressed_c4_convention(h_q, form):
@@ -1731,6 +1800,8 @@ _OUT_ALIGN_CASES = [
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [4] * 3, width=256, form="q4"),
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [1] * 3, width=256, form="q1"),
     _align_case("fp8_lowhead_prefill", 32, _FP8, [4] * 3),
+    # 12 tokens, sparse_topk 260: two complete tiles and a partial third.
+    _align_case("fp8_lowhead_h64", 64, _FP8, [5, 4, 3], "ragged", 132, page=2),
     _align_case("fp8_h64_prefill_source_persistent_m64", 32, _FP8, [257]),
     _align_case(
         "fp8_h64_prefill_source_persistent_m64_multi_tile", 32, _FP8, [257], width=256
