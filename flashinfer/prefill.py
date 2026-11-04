@@ -9775,6 +9775,30 @@ def nvfp4_attention_workspace_bytes(batch, heads, seqlen, device):
 
 
 @flashinfer_experimental_api
+def prepare_nvfp4_ptilemax_attention(q, k, v, out, *, backend="cake"):
+    """Prepare NVFP4 attention with per-tile-max probability scales from BF16
+    ``[B, H, S, 128]`` tensors.
+
+    The experimental Cake backend requires SM103: dense, noncausal, ``D = 128``,
+    equal query and key heads, ``S`` divisible by 512 and the softmax scale
+    ``128 ** -0.5``.  ``q``, ``k`` and ``v`` may have any strides; ``out`` is
+    contiguous.  Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
+    NVFP4PtilemaxAttentionRunner.  Calling the runner executes QK, softmax and PV
+    attention and writes the caller-owned BF16 output without CUDA allocation;
+    the kernel's probability scales reuse the maximum of each score tile.
+    Prepare a new runner after changing input values or bindings.  CUDA Graph
+    ownership remains with the caller.
+    """
+    if backend != "cake":
+        raise ValueError("NVFP4 ptilemax attention currently supports backend='cake'")
+    from .experimental.cake_nvfp4_ptilemax_attention.cake_backend import (
+        prepare_nvfp4_ptilemax_attention as prepare,
+    )
+
+    return prepare(q, k, v, out, backend="cake")
+
+
+@flashinfer_experimental_api
 def prepare_fp8_attention(
     q, k, v, out, *, backend="cake", softmax_scale=None, workspace=None
 ):
