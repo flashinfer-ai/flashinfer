@@ -187,6 +187,9 @@ _BF16_TOPK128X_MAX_WIDTH = 388
 # One FP8 low-head producer partition owns up to three sparse tiles; mirrors
 # the producer's FP8_ONE_PARTITION_MAX_TILES = 3.
 _FP8_ONE_PARTITION_MAX_WIDTH = 384
+# The M64 bindings take items of at most 1152 sparse slots (SWA 128 + 1024);
+# mirrors their ``sparse_topk <= 1152`` check.
+_FP8_M64_MAX_WIDTH = 1152
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 # Workspaces whose split-merge counter region is known to be zero:
@@ -1017,6 +1020,32 @@ def _fp8_h64_uses_cluster_body(
     )
 
 
+# Architectures where two more kinds of FP8 rows leave the low-head prefill
+# producer for the single-CTA M64 body: the 8-head prefill rows (``_route``)
+# and the 8/16/32-head SWA-only decode rows past one wave
+# (``_fp8_lowhead_swa_uses_m64_body``).  Measured on SM107 only; SM100, SM103
+# and ``arch=None`` keep the producer on those rows.
+_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_107a"})
+
+
+def _fp8_lowhead_swa_uses_m64_body(
+    num_query_tokens: int, sm_count: int, arch: Optional[str]
+) -> bool:
+    """FP8 SWA-only decode rows (``max_q_len < 257``) of 8, 16 or 32 heads
+    whose low-head prefill producer no longer fits one wave.
+
+    The producer launches two CTAs per token (one per work item); once
+    ``2 * tokens`` exceeds the SM count its second wave costs more than the
+    single-CTA M64 body (one CTA per token) saves.  R200 (sm_107a, 216 SMs),
+    q_len 4, CUDA graph + PDL, per call: 112-256 tokens 6.71-10.45 us ->
+    4.06-5.69 us (1.56-1.85x) at 8, 16 and 32 heads; 96 and 108 tokens (one
+    wave) 0.98-1.01x, which keep the producer.  A rule of its own, kept apart
+    from the 64-head one (``_fp8_h64_uses_m64_body``), and on the
+    architectures of ``_FP8_LOWHEAD_M64_ARCHES`` only.
+    """
+    return arch in _FP8_LOWHEAD_M64_ARCHES and 2 * num_query_tokens > sm_count
+
+
 def canonical_arg_name(kind: str, name: str) -> str:
     """Map a registration ``arg_plan`` entry onto the host value vocabulary."""
     if kind == "tma_buffer":
@@ -1175,8 +1204,9 @@ def _route(
     arch: Optional[str] = None,
 ) -> str:
     """The variant one call runs; ``sm_count`` is the device's SM count (the
-    FP8/H64 decode rows pick their body by the waves of its grid) and ``arch``
-    its ``sm_XYa`` target (``None``: the architecture-independent choice, which
+    FP8/H64 decode rows, and on SM107 the FP8 8/16/32-head SWA-only decode
+    rows, pick their body by the waves of its grid) and ``arch`` its
+    ``sm_XYa`` target (``None``: the architecture-independent choice, which
     SM107 may not build: it has no BF16 programs)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
@@ -1211,6 +1241,17 @@ def _route(
                 # contract on GB300: 2.1-5.2x on the 512-8192-token rows
                 # (widths 128-1024, single and dual caches), with the same
                 # oracle.  Two programs, selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
+            if arch in _FP8_LOWHEAD_M64_ARCHES and sparse_topk <= _FP8_M64_MAX_WIDTH:
+                # 8-head prefill rows take the same M64 body on SM107: R200
+                # (sm_107a, 216 SMs), CUDA graph + PDL, per call, measured at
+                # (tokens x width) 257 x 128, 386 x 640, 1024 x 128 / 640 /
+                # 1152 and 2048 x 128 / 640 / 1152: 1.87-4.66x (one
+                # 257-token request at width 128: 10.50 -> 5.61 us; two
+                # 1024-token requests at width 1152: 318.4 -> 68.4 us), with
+                # the same oracle.  Wider items, which the M64 bindings
+                # reject, and other architectures (unmeasured there) keep the
+                # low-head prefill producer for 8-head prefill rows.
                 return _fp8_h64_m64_program(sparse_topk)
             return "fp8_lowhead_prefill"
         if (
@@ -1251,6 +1292,10 @@ def _route(
             # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
             return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
+            if _fp8_lowhead_swa_uses_m64_body(num_query_tokens, sm_count, arch):
+                # 8/16/32-head SWA-only rows past one wave of the low-head
+                # prefill producer: the single-tile M64 program (width 128).
+                return _fp8_h64_m64_program(sparse_topk)
             return "fp8_lowhead_prefill"
         # One producer partition owns up to three sparse tiles (widths up to
         # 384) and writes final O directly (one partition measured 1.18-1.26x
