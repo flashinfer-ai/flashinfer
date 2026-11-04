@@ -895,3 +895,48 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert dec._batch_invariant._config.split_policy == "auto"
     q_last = big.q[[int(big.qo_indptr[i + 1]) - 1 for i in range(4)]].contiguous()
     assert torch.equal(bits(dec.run(q_last, big.cache("NHD"))), bits(out_big))
+
+
+@needs_device
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and torch.cuda.get_device_properties(0).total_memory < (60 << 30),
+    reason="needs ~12 GB of device memory",
+)
+def test_output_beyond_2_31_elements():
+    """An output of more than 2^31 elements: the kernels' output and workspace offsets are 64-bit. R2 gives the check: the
+    last requests of the large batch, run alone, give the same bits (prefill: the row body; decode: the Swaps body)."""
+    n, ql, Hq, Hkv, D = (
+        4160,
+        64,
+        64,
+        8,
+        128,
+    )  # 266,240 rows x 64 heads x 128 > 2^31 output elements
+    pr = Problem([ql] * n, [ql] * n, Hq, Hkv, D, 16, seed=12)
+    out = run_paged_prefill(pr)
+    assert out.numel() > 2**31
+    tail = 3
+    sub = Problem([ql] * tail, [ql] * tail, Hq, Hkv, D, 16, seed=13)
+    sub.q = pr.q[-tail * ql :].contiguous()
+    sub.k_rag, sub.v_rag = pr.k_rag[-tail * ql :], pr.v_rag[-tail * ql :]
+    rows = (-tail * ql, None)
+    # the sub-batch's paged cache: the tail requests' pages of the large pool, in the large pool (same page indices)
+    sub.k_nhd, sub.v_nhd = pr.k_nhd, pr.v_nhd
+    sub.kv_indices = pr.kv_indices[int(pr.kv_indptr[-tail - 1]) :].contiguous()
+    sub.kv_indptr = (pr.kv_indptr[-tail - 1 :] - pr.kv_indptr[-tail - 1]).contiguous()
+    sub.kv_last = pr.kv_last[-tail:].contiguous()
+    assert torch.equal(bits(run_paged_prefill(sub)), bits(out[rows[0] :]))
+    del out
+    n_dec = 262_200  # 262,200 rows x 64 heads x 128 > 2^31
+    dec = Problem([1] * n_dec, [1] * n_dec, Hq, Hkv, D, 1, seed=14)
+    out, _ = run_decode(dec)
+    assert out.numel() > 2**31
+    sub = Problem([1] * tail, [1] * tail, Hq, Hkv, D, 1, seed=15)
+    sub.q = dec.q[-tail:].contiguous()
+    sub.k_nhd, sub.v_nhd = dec.k_nhd, dec.v_nhd
+    sub.kv_indices = dec.kv_indices[int(dec.kv_indptr[-tail - 1]) :].contiguous()
+    sub.kv_indptr = (dec.kv_indptr[-tail - 1 :] - dec.kv_indptr[-tail - 1]).contiguous()
+    sub.kv_last = dec.kv_last[-tail:].contiguous()
+    small, _ = run_decode(sub)
+    assert torch.equal(bits(small), bits(out[-tail:]))

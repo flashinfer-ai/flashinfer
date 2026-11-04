@@ -218,9 +218,9 @@ def fold_row(
     inv = CuteF32.div(Float32(1.0), l)
     out_row = (q_base + token) * Hq + kv_head * g + r % g
     for e in cutlass.range_constexpr(VEC):
-        mO[(out_row, d0 + e)] = CuteF32.add(CuteF32.mul(o[e], inv), Float32(0.0)).to(
-            mO.element_type
-        )
+        mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
+            CuteF32.mul(o[e], inv), Float32(0.0)
+        ).to(mO.element_type)
 
 
 WIDE_PF = 32  # the fixup kernel's batch of chunks loaded before their merges (the wide thread mapping below)
@@ -536,7 +536,7 @@ class SplitKVFixup:
                 + rr % g
             )
             for e in cutlass.range_constexpr(V):
-                mO[(out_row, d0 + e)] = CuteF32.add(
+                mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
                     CuteF32.mul(o[e], inv), Float32(0.0)
                 ).to(mO.element_type)
 

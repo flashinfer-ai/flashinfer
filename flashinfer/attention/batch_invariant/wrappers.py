@@ -257,6 +257,7 @@ class BatchInvariantAttention:
                 "one KV range per request",
             )
         kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
+        last_host = None
         if self.kind == "ragged":
             kv_lens = kv_spans.tolist()
         else:
@@ -307,12 +308,11 @@ class BatchInvariantAttention:
             # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103)
             slots = 4 if arch_smem_cap(self.device) >= (300 << 10) else 3
             config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
-        last = kv_last_page_len if self.kind != "ragged" else None
         try:
             planned = engine.plan_attention(
-                qo_indptr,
-                kv_indptr,
-                last,
+                qo_host,
+                kv_indptr_host,
+                last_host,
                 num_qo_heads,
                 num_kv_heads,
                 D,
@@ -331,9 +331,9 @@ class BatchInvariantAttention:
             config = replace(config, split_policy="fused")
             try:
                 planned = engine.plan_attention(
-                    qo_indptr,
-                    kv_indptr,
-                    last,
+                    qo_host,
+                    kv_indptr_host,
+                    last_host,
                     num_qo_heads,
                     num_kv_heads,
                     D,

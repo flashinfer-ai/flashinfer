@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
@@ -233,7 +233,7 @@ def merge_global_pipelined(
                     cute.autovec_copy(
                         rOut,
                         cute.make_tensor(
-                            mO.iterator + (out_row * D + i * CT),
+                            mO.iterator + (out_row.to(Int64) * D + i * CT),
                             cute.make_layout((cute.size(rO),)),
                         ),
                     )
@@ -263,7 +263,7 @@ def merge_global_pipelined(
                     cute.autovec_copy(
                         rOut,
                         cute.make_tensor(
-                            mO.iterator + (out_row * D + i * CT),
+                            mO.iterator + (out_row.to(Int64) * D + i * CT),
                             cute.make_layout((cute.size(rO),)),
                         ),
                     )
@@ -402,7 +402,7 @@ def epilogue(
                             cute.autovec_copy(
                                 rOut,
                                 cute.make_tensor(
-                                    mO.iterator + (out_row * D + i * CT),
+                                    mO.iterator + (out_row.to(Int64) * D + i * CT),
                                     cute.make_layout((cute.size(rO),)),
                                 ),
                             )
@@ -438,7 +438,7 @@ def epilogue(
                         cute.autovec_copy(
                             rOut,
                             cute.make_tensor(
-                                mO.iterator + (out_row * D + i * CT),
+                                mO.iterator + (out_row.to(Int64) * D + i * CT),
                                 cute.make_layout((cute.size(rO),)),
                             ),
                         )
@@ -452,13 +452,13 @@ def epilogue(
                     cute.autovec_copy(
                         rO,
                         cute.make_tensor(
-                            mWs.iterator + ((slot_base + row) * WS + i * CT),
+                            mWs.iterator + ((slot_base + row).to(Int64) * WS + i * CT),
                             cute.make_layout((cute.size(rO),)),
                         ),
                     )
             if row_valid:
-                mWs[(slot_base + row) * WS + D] = m_r
-                mWs[(slot_base + row) * WS + D + 1] = l_r
+                mWs[(slot_base + row).to(Int64) * WS + D] = m_r
+                mWs[(slot_base + row).to(Int64) * WS + D + 1] = l_r
     cute.arch.fence_view_async_tmem_load()
     oh.release()
     return o_cons

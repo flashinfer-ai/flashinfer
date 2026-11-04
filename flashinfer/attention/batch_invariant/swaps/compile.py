@@ -30,7 +30,10 @@ def get_compiled_swaps(D: int, g: int, page: int, n_pad: int, ragged: bool = Fal
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
         s_hq, s_tq, s_npages, s_nunits, s_hkv = (cute.sym_int(32) for _ in range(5))
-        s_ws, s_nb1, s_nidx = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
+        s_ws = (
+            cute.sym_int64()
+        )  # fp32 elements of the workspace: beyond 2^31 on large batches
+        s_nb1, s_nidx = cute.sym_int(32), cute.sym_int(32)
         q_fake = cute.runtime.make_fake_tensor(
             bf16,
             (D, s_hq, s_tq),

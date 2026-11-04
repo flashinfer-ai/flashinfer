@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
@@ -202,8 +202,8 @@ def correction_loop(
         inv = CuteF32.div(Float32(1.0), l_r)
         s_inv[thread_idx] = inv
         if (mode != 0) & (thread_idx < rows_valid):
-            mWs[(slot_base + thread_idx) * WS + D] = m_r
-            mWs[(slot_base + thread_idx) * WS + D + 1] = l_r
+            mWs[(slot_base + thread_idx).to(Int64) * WS + D] = m_r
+            mWs[(slot_base + thread_idx).to(Int64) * WS + D + 1] = l_r
     cute.arch.barrier(barrier_id=BAR_COEF, number_of_threads=128)
     load_coefs(s_ab, Int32(0), tLDc, rA)
     load_coefs(s_ab, Int32(1), tLDc, rB)
@@ -229,7 +229,7 @@ def correction_loop(
                 d = tLDc[e][0] + sl * st.slot_dims
                 if n < rows_valid:
                     out_row = (q_base + q_tok0 + n // g) * Hq + kv_head * g + n % g
-                    mO[(out_row, d)] = CuteF32.add(
+                    mO[(out_row.to(Int64), d)] = CuteF32.add(
                         CuteF32.mul(rM[e], s_inv[n]), Float32(0.0)
                     ).to(IN_DTYPE)
         else:
@@ -237,7 +237,7 @@ def correction_loop(
                 n = tLDc[e][1]
                 d = tLDc[e][0] + sl * st.slot_dims
                 if n < rows_valid:
-                    mWs[(slot_base + n) * WS + d] = rO[e]
+                    mWs[(slot_base + n).to(Int64) * WS + d] = rO[e]
     cute.arch.fence_view_async_tmem_load()
     oh.release()
     return o_cons, stats_cons
