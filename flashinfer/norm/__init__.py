@@ -152,6 +152,11 @@ def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool
 
     CUDA binary compatibility: a cubin compiled for sm_X.Y can run on sm_X.Z
     when Z >= Y (forward compatibility within the same major architecture).
+    Architecture-specific ``a``-suffixed targets (e.g. ``sm_100a``, ``sm_103a``)
+    are the exception: CUDA ``a`` targets run only on their exact compute
+    capability, so a captured ``sm_100a`` cubin cannot run on an ``sm_103``
+    device. Forward compatibility (``>=``) applies only to plain and ``f``
+    (family-portable) targets.
 
     Args:
         captured_arch: DSL's compile target (e.g., "sm_100a", "sm_89")
@@ -165,6 +170,10 @@ def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool
         return False
 
     arch_str = captured_arch[3:]  # Remove "sm_" prefix
+    # Architecture-specific targets carry an 'a' suffix (e.g. sm_100a, sm_103a).
+    # CUDA 'a' cubins run only on their exact compute capability, so keep the
+    # flag before stripping variant suffixes below.
+    arch_specific = arch_str.endswith("a")
     # Remove trailing 'a' or 'f' (architecture variants like sm_100a, sm_100f)
     arch_str = arch_str.rstrip("af")
 
@@ -183,8 +192,13 @@ def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool
 
     device_major, device_minor = device_cap
 
-    # Same major architecture: forward compatibility (minor >= captured)
+    # Same major architecture
     if captured_major == device_major:
+        if arch_specific:
+            # 'a' targets require an exact minor-version match: sm_100a cubins
+            # do not run on sm_103, even within the same major architecture.
+            return device_minor == captured_minor
+        # Plain and 'f' targets keep forward compatibility (minor >= captured).
         return device_minor >= captured_minor
 
     # Different major architecture: incompatible
