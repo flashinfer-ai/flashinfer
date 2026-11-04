@@ -86,12 +86,15 @@ _kill_process_tree() {
   kill "$pid" 2>/dev/null || true
 }
 
+# The pool's polling runs with xtrace off: callers use `set -x`, and a trace of
+# every 0.2 s check would bury the build output. Restoring is done by each helper.
+#
 # Collect the status of items that have finished, without blocking. Works on the
 # caller's `pids` (items still counted as running) and `failed` variables: bash
 # forgets finished jobs in `jobs`, so the pids are tracked here. A pid is waited
 # for exactly once, so its status is never lost or read twice.
 _reap_finished_items() {
-  local pid alive=()
+  { local pid alive=() xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
   for pid in ${pids[@]+"${pids[@]}"}; do
     if kill -0 "$pid" 2>/dev/null; then
       alive+=("$pid")
@@ -100,6 +103,32 @@ _reap_finished_items() {
     fi
   done
   pids=(${alive[@]+"${alive[@]}"})
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until a slot is free or an item has failed (`failed` is set then).
+# Uses the caller's `limit`, `pids` and `failed`.
+_wait_for_free_slot() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while :; do
+    _reap_finished_items
+    if (( failed || ${#pids[@]} < limit )); then break; fi
+    sleep 0.2
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until every item has finished or one has failed.
+_wait_for_all_items() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while (( ${#pids[@]} > 0 && ! failed )); do
+    sleep 0.2
+    _reap_finished_items
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
 }
 
 # Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
@@ -116,20 +145,13 @@ run_bounded_parallel() {
   shift 2
   local item pid failed=0 pids=()
   for item in "$@"; do
-    while :; do
-      _reap_finished_items
-      (( failed )) && break 2
-      (( ${#pids[@]} < limit )) && break
-      sleep 0.2
-    done
+    _wait_for_free_slot
+    if (( failed )); then break; fi
     "$fn" "$item" &
     pids+=($!)
   done
   # Drain what is still running, stopping it at the first failure.
-  while (( ${#pids[@]} > 0 && ! failed )); do
-    sleep 0.2
-    _reap_finished_items
-  done
+  _wait_for_all_items
   if (( failed )); then
     for pid in ${pids[@]+"${pids[@]}"}; do _kill_process_tree "$pid"; done
   fi

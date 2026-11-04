@@ -223,8 +223,13 @@ if ! [[ "${AOT_PROVIDER_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: AOT_PROVIDER_CONCURRENCY must be a positive integer, got '${AOT_PROVIDER_CONCURRENCY}'"
     exit 1
 fi
+# No more builds than providers, and no more than MAX_JOBS: every build needs at
+# least one ninja job, so more would exceed the total parallelism.
 if (( AOT_PROVIDER_CONCURRENCY > ${#PROVIDER_ARCHITECTURE_LIST[@]} )); then
     AOT_PROVIDER_CONCURRENCY=${#PROVIDER_ARCHITECTURE_LIST[@]}
+fi
+if (( AOT_PROVIDER_CONCURRENCY > MAX_JOBS )); then
+    AOT_PROVIDER_CONCURRENCY=${MAX_JOBS}
 fi
 TOTAL_MAX_JOBS=${MAX_JOBS}
 PER_PROVIDER_MAX_JOBS=$(( TOTAL_MAX_JOBS / AOT_PROVIDER_CONCURRENCY ))
@@ -263,7 +268,7 @@ build_provider_wheel() {
 
 # The pool runs each build in a subshell, whose additions to the report list would
 # be lost, so the expected report paths are registered here.
-for provider_architecture in "${BUILD_ARCHITECTURE_LIST[@]}"; do
+for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do
     report_label=$(python3 "${AOT_MEMORY_MONITOR_SCRIPT}" safe-label \
         "build_jit_cache_provider_${provider_architecture}")
     AOT_MEMORY_REPORT_FILES+=("${AOT_MEMORY_REPORT_DIR}/${report_label}.memory.csv")
