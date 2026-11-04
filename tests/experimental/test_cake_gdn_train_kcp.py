@@ -1637,16 +1637,30 @@ def test_byte_queries(W) -> None:
                         3 * 256 + 2 * 128 + 3 * 4
                     )
                     # the kept-tape form exists for the light form of a saved boundary only (no hand-off under a
-                    # replay boundary)
+                    # replay boundary); at P > 1 without save_transfer it also hands the M_seg^T plane over
                     light_saved = save_mode == "light" and boundary_mode == "saved"
-                    assert kept_ws["bwd.kept_tapes"] == (tapes if light_saved else 0)
+                    stage_plane = (
+                        ctx.n_frag * hp.P * s
+                        if (light_saved and hp.P > 1 and not save_transfer)
+                        else 0
+                    )
+                    assert kept_ws["bwd.kept_tapes"] == (
+                        tapes + stage_plane if light_saved else 0
+                    )
                     if not light_saved:
                         assert kept_ws == replay_ws
                     assert replay_ws["bwd.kept_tapes"] == 0
-                    assert (
-                        kept_ws["backward_transient"]
-                        == replay_ws["backward_transient"]
-                        == replay_ws["backward"]
+                    assert replay_ws["backward_transient"] == replay_ws["backward"]
+                    # both forms need the same transient bytes besides the saved set, but the kept form holds the
+                    # handed-over plane through the adjoint tape walk and #8 (the replay drops its staging before)
+                    assert kept_ws["backward_transient"] == (
+                        max(
+                            replay_ws["bwd.phase.exchange"],
+                            max(replay_ws["bwd.phase.walk"], replay_ws["bwd.phase.end"])
+                            + stage_plane,
+                        )
+                        if light_saved
+                        else replay_ws["backward"]
                     )
                     assert (
                         ws["bwd.dv_new"] == 0 and ws["bwd.dv_intra"] == ctx.R * HV * 256
@@ -2932,10 +2946,29 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
                 rf"(about )?{row_bytes // ctx.R:,} B per token", bytes_cell
             ), (item, row_bytes, bytes_cell)
     assert n_per_token == 3
-    # the formula cells: qk_rstd = 8 T_r H_qk (saved boundary), M_seg = P n_frag s (P > 1), S_in = n_in s
+    # the formula cells: qk_rstd = 8 T_r H_qk (saved boundary), M_seg = P n_frag s (P > 1), S_in = n_in s_pad, the
+    # owner's pairs = 2 s_owner N_out
     assert rows["`qk_rstd`"][2] == "`8 * T_r * H_qk`"
     assert rows["`M_seg`"][2] == "`P * n_frag * s`"
-    assert rows["`S_in`"][2] == "`n_in * s`"
+    assert rows["`S_in`"][2] == "`n_in * s_pad`"
+    assert rows["received summary pairs"][2] == "`2 * s_owner * N_out`"
+    # a padded owner (HV = 48 on five ranks: Hg = 10, five owners, the last holds 8 heads and 2 padding tiles): S_in
+    # is n_in s_pad (s_pad = n_owners s_owner, above s) and every owner receives 2 s_owner per crossing-out fragment
+    # of the group
+    part5 = gp.partition_kcp(
+        torch.tensor([0, 4096], dtype=torch.int64), 5, "contiguous"
+    )
+    ctxs5 = [gp.build_context_kcp(part5, None, r, CPU) for r in range(5)]
+    assert all(c.N_out > 0 for c in ctxs5) and any(c.n_in > 0 for c in ctxs5)
+    for c in ctxs5:
+        hp = c.heads(48)
+        assert (hp.Hg, hp.n_owners, hp.pad_tiles) == (10, 5, 2)
+        s_owner = hp.Hg * gp.STATE_TILE_BYTES
+        s_pad = hp.n_owners * s_owner
+        assert s_pad == (48 + 2) * gp.STATE_TILE_BYTES
+        lay5 = gb.gdn_saved_layout_kcp(c, H_qk=16, HV=48, save_transfer=True)
+        assert lay5["S_in"] == c.n_in * s_pad, (c.rank, lay5)
+        assert lay5["c1_recv"] == 2 * s_owner * c.N_out, (c.rank, lay5)
     for c in ctxs:
         s = 6 * gp.STATE_TILE_BYTES
         lay2 = gb.gdn_saved_layout_kcp(
@@ -4865,6 +4898,113 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes")
 
 
+@pytest.mark.parametrize(
+    "save_transfer,l2n",
+    [(False, False), (True, False), (False, True)],
+    ids=["no_save_transfer", "save_transfer", "no_save_transfer-norm"],
+)
+def test_kept_form_at_two_segments_follows_the_arena_and_the_hand_off(
+    monkeypatch, save_transfer, l2n
+) -> None:
+    """The kept-tape form at ``P = 2`` under a non-reentrant checkpoint, measured on a caller-held workspace: without
+    ``save_transfer`` the recompute forward hands its ``M_seg^T`` staging plane over with the ten tapes, so the
+    backward's workspace sizes ``stage_b`` only (one staging plane, as with the saved ``M_seg``); ``bwd.kept_tapes``
+    is every byte the hand-off holds (with the norm also ``qn`` / ``kn``); the backward binds ``backward`` (its
+    recompute forward or a later phase); the workspace's most before the re-adoption plus the hand-off is
+    ``backward_transient`` -- the replay form's figure, plus the handed-over plane through the adjoint tape walk and
+    #8, less the arena ``qk_rstd`` the kept form does not need -- and the end state is ``bwd.phase.end``."""
+    from torch.utils.checkpoint import checkpoint
+
+    kcp, ctx, ops = _ckpt_setup()
+    H_qk, HV = CKPT_HEADS
+    q = dict(
+        H_qk=H_qk,
+        HV=HV,
+        P=2,
+        save_transfer=save_transfer,
+        with_conv=False,
+        use_qk_l2norm_in_kernel=l2n,
+    )
+    layout = gb.gdn_workspace_layout_kcp(ctx, reuse_recompute_tapes=True, **q)
+    replay = gb.gdn_workspace_layout_kcp(ctx, reuse_recompute_tapes=False, **q)
+    handed: list[int] = []
+
+    class Recorded(kcp._KeptTapes):
+        def __init__(self, tapes, stage_m, geometry, gid, qk=None):
+            super().__init__(tapes, stage_m, geometry, gid, qk)
+            held = [*tapes.values(), *(qk or {}).values()]
+            held += [stage_m] if stage_m is not None else []
+            storages = {t.untyped_storage().data_ptr(): t for t in held}
+            handed.append(sum(t.untyped_storage().nbytes() for t in storages.values()))
+
+    peaks: dict[str, int] = {}
+    real_backward, real_release = kcp._backward, kcp._kept_release
+
+    def backward(call, saved):
+        # the recompute forward and the backward's ensure are done: the backward proper starts here
+        peaks["recompute"] = call.ws.peak
+        call.ws.peak, call.ws.pool_max = 0, {}
+        call.ws._upd()
+        real_backward(call, saved)
+
+    def release(call, kept):
+        peaks["before_release"] = call.ws.peak
+        real_release(call, kept)
+
+    monkeypatch.setattr(kcp, "_KeptTapes", Recorded)
+    monkeypatch.setattr(kcp, "_backward", backward)
+    monkeypatch.setattr(kcp, "_kept_release", release)
+    ws = _pool_peak_workspace(kcp)
+    leaves = [ops[n].detach().clone().requires_grad_(True) for n in LEAVES]
+
+    def fn(q_, k_, v_, g_, beta_):
+        return kcp.chunk_gdn_kcp(
+            q_,
+            k_,
+            v_,
+            g_,
+            beta_,
+            ctx,
+            workspace=ws,
+            backend="fake",
+            segments=2,
+            save_transfer=save_transfer,
+            reuse_recompute_tapes=True,
+            use_qk_l2norm_in_kernel=l2n,
+            deterministic=False,
+        )
+
+    out = checkpoint(fn, *leaves, use_reentrant=False)
+    assert ws.peak == layout["forward"], (ws.peak, layout["forward"])
+    ws.peak = 0
+    out.backward(ops["dout"])
+    assert kcp.kept_registry_size() == 0
+    plane = ctx.n_frag * 2 * HV * gp.STATE_TILE_BYTES
+    ten = sum(replay[f"bwd.{n}"] for n in FULL_TAPE_TERMS)
+    qk = sum(replay.get(f"bwd.{n}", 0) for n in ("qn", "kn"))
+    assert (
+        layout["bwd.staging"]
+        == plane
+        == replay["bwd.staging"] - (0 if save_transfer else plane)
+    )
+    assert layout["bwd.kept_tapes"] == ten + qk + (0 if save_transfer else plane)
+    assert handed == [layout["bwd.kept_tapes"]], (handed, layout["bwd.kept_tapes"])
+    assert _recorded_pool_terms(ws.pool_max) == _layout_pool_terms(layout, "bwd")
+    assert max(peaks["recompute"], ws.peak) == layout["backward"], (peaks, ws.peak)
+    assert peaks["before_release"] + handed[0] == layout["backward_transient"], peaks
+    assert ws.bytes == layout["bwd.phase.end"]
+    rstd = 8 * ctx.T_r * H_qk if l2n else 0
+    assert (
+        layout["backward_transient"]
+        == max(
+            replay["bwd.phase.exchange"],
+            max(replay["bwd.phase.walk"], replay["bwd.phase.end"])
+            + (0 if save_transfer else plane),
+        )
+        - rstd
+    )
+
+
 # --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"
 # The recompute's tapes are kept only when the GDN node closes the checkpointed region (the frame proof); with a later saver the
 # kept set would live through that operation's backward and raise the region's peak by the full tape set, so "auto" replays there.
@@ -5501,7 +5641,8 @@ _ARENA_ROWS = (
         (2, 2, {"graph": "replay", **o}, 1)
         for o in ({}, _FULL_NO_ST, {"boundary_mode": "replay"})
     ]
-    # forward-only calls (no saved set) and the in-kernel norm (the arena r of a forward without a saved set)
+    # calls without a saved set (the backward: the saved=None replay) and the in-kernel norm (the arena r of a
+    # forward without a saved set)
     + [
         (2, 2, {"save_for_backward": False}, 1),
         (2, 2, {"save_for_backward": False, "save_mode": "full"}, 1),
@@ -5509,6 +5650,13 @@ _ARENA_ROWS = (
         (1, 2, {"boundary_mode": "replay", **_L2N}, 1),
         (1, 2, _L2N, 1),
     ]
+    # graph="replay" with the norm: the arena r held through the forward, the norm's rows in the graph backward
+    + [
+        (1, 2, {"graph": "replay", **o, **_L2N}, 1)
+        for o in ({}, {"boundary_mode": "replay"}, {"save_for_backward": False})
+    ]
+    # four ranks: the middle ranks' fragments cross in and out (carry: max(n_in, n_out) slots, the b1 split forms)
+    + [(4, 2, o, fw) for o in ({}, _FULL_NO_ST) for fw in (1, 0)]
 )
 # a short pack (rank 0: a 2-chunk document and one chunk crossing out, NC_pad = 4): there the split forward peaks at
 # #1 (the c1 send pool outweighs h / v_new) and the replay boundary's backward at its replayed forward
@@ -5533,10 +5681,13 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
     and, with the fused walks, the carry slots of the crossing fragments; the b1 pools at their larger split form; the
     forward exchange pools the backward sizes again; the eager forward's fresh c2 send plane and its c1 send pool
     released before the tape walk -- in the light form with and without ``save_transfer`` and the full form,
-    ``fused_walks`` 1 and 0; the replay boundary on one and two ranks (``save_mode="full"`` keeps no tape and binds
-    the light form's arena; ``reuse_recompute_tapes=True`` reports the same figures); ``graph="replay"`` (the first
-    call of a key: no buffer is released); forward-only calls; the in-kernel norm with and without a saved set; a
-    short pack where the split forward peaks at #1 and the replay boundary's backward at its replayed forward."""
+    ``fused_walks`` 1 and 0, on two ranks and on four (whose middle ranks hold fragments that cross in and out: the
+    carry plane's ``max(n_in, n_out)`` slots); the replay boundary on one and two ranks (``save_mode="full"`` keeps
+    no tape and binds the light form's arena; ``reuse_recompute_tapes=True`` reports the same figures);
+    ``graph="replay"`` (the first call of a key: no buffer is released), also with the norm; calls without a saved
+    set (``save_for_backward=False``) and the ``saved=None`` replay backward after them; the in-kernel norm with and
+    without a saved set; a short pack where the split forward peaks at #1 and the replay boundary's backward at its
+    replayed forward."""
     kcp = _package("cake_kcp")
     H_qk, HV = CKPT_HEADS
     part = gp.partition_kcp(torch.tensor(list(cu), dtype=torch.int64), W, "contiguous")
@@ -5544,6 +5695,8 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
         gp.build_context_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT) for r in range(W)
     ]
     assert W == 1 or sum(c.n_in for c in ctxs) == sum(c.n_out for c in ctxs) > 0
+    # four ranks: some rank's fragments cross in and out, so max(n_in, n_out) and n_in + n_out differ there
+    assert W < 4 or any(min(c.n_in, c.n_out) > 0 for c in ctxs)
     ops = _inputs(list(cu), H_qk, HV)
     knobs = {"test_knobs": {"fused_walks": 0}} if not fused_walks else {}
     call_opts = {k: v for k, v in opts.items() if k != "save_for_backward"}
@@ -5573,8 +5726,7 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             if saved is None
             else sum(t.numel() * t.element_size() for t in saved.tensors()),
         }
-        if not with_set:
-            return
+        # without a saved set (saved=None) the backward is the replay
         ws.peak, ws.pool_max, ws.walk_bytes = 0, {}, None
         kcp.chunk_gdn_bwd_kcp(*args, ctxs[r], loc["dout"], saved=saved, **kw)
         got[r].update(
@@ -5608,7 +5760,6 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             fused_walks=fused_walks,
             graph=opts.get("graph", "off"),
             save_for_backward=with_set,
-            backward=with_set,
             **q,
             **l2n,
         )
@@ -5620,16 +5771,16 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
         assert {k: v for k, v in rec.items() if not k.startswith("b")} == {
             k: v for k, v in want.items() if not k.startswith("b")
         }, (r, "fwd")
+        assert got[r]["backward"] == lay["backward"], (r, got[r]["backward"], lay)
+        assert _recorded_pool_terms(got[r]["bwd_pools"]) == _layout_pool_terms(
+            lay, "bwd"
+        ), (r, "bwd")
+        if opts.get("graph", "off") == "off":
+            # the adjoint tape walk's moment and the end state (the norm's rows go after #8)
+            norm = sum(lay.get(f"bwd.{k}", 0) for k in ("qn", "kn", "qk_rstd"))
+            assert got[r]["walk"] == lay["bwd.phase.walk"], (r, got[r]["walk"])
+            assert got[r]["end"] == lay["bwd.phase.end"] - norm, (r, "end")
         if with_set:
-            assert got[r]["backward"] == lay["backward"], (r, got[r]["backward"], lay)
-            assert _recorded_pool_terms(got[r]["bwd_pools"]) == _layout_pool_terms(
-                lay, "bwd"
-            ), (r, "bwd")
-            if opts.get("graph", "off") == "off":
-                # the adjoint tape walk's moment and the end state (the norm's rows go after #8)
-                norm = sum(lay.get(f"bwd.{k}", 0) for k in ("qn", "kn", "qk_rstd"))
-                assert got[r]["walk"] == lay["bwd.phase.walk"], (r, got[r]["walk"])
-                assert got[r]["end"] == lay["bwd.phase.end"] - norm, (r, "end")
             assert got[r]["saved"] == gb.gdn_saved_bytes_kcp(c, **q, **l2n), (r, got[r])
         else:
             assert got[r]["saved"] == 0
@@ -5673,8 +5824,8 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
 ) -> None:
     """Three forward + backward steps of the explicit entries on one caller-held workspace per rank (two ranks, a
     crossing fragment, ``P = 2``): the first step binds the ``graph="off"`` figures; the arena keeps the tapes the
-    backward bound, so every later backward binds the ``graph="replay"`` figure exactly and every later forward
-    less."""
+    backward bound, so every later backward binds the ``graph="replay"`` figure exactly and every later forward more
+    than the first forward and less than that figure."""
     kcp = _package("cake_kcp")
     H_qk, HV = CKPT_HEADS
     part = gp.partition_kcp(torch.tensor(CKPT_CU, dtype=torch.int64), 2, "contiguous")
@@ -5713,8 +5864,10 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
 
 def test_workspace_layout_option_checks() -> None:
     """The workspace queries refuse a ``graph`` value outside ``("off", "replay")``, the kept-tape form under
-    ``graph="replay"`` (as the call's options do; the default there is the replay form), a backward without a saved
-    set (``save_for_backward=False`` describes a forward-only call) and a non-bool ``save_for_backward``."""
+    ``graph="replay"`` (as the call's options do; the default there is the replay form) and a non-bool
+    ``save_for_backward``.  ``save_for_backward=False`` with a backward reports the replay a ``saved=None`` backward
+    runs: the replay boundary's backward terms, in either ``save_mode`` and ``reuse_recompute_tapes`` form, beside
+    the forward of the call."""
     _, ctx, _ = _ckpt_setup()
     q = dict(H_qk=2, HV=6)
     assert gb.GRAPH_MODES == _package("cake_options").GRAPH_MODES
@@ -5730,8 +5883,24 @@ def test_workspace_layout_option_checks() -> None:
     ) == gb.gdn_workspace_layout_kcp(
         ctx, graph="replay", reuse_recompute_tapes=False, **q
     )
-    with pytest.raises(ValueError, match="forward-only"):
-        gb.gdn_workspace_layout_kcp(ctx, save_for_backward=False, **q)
+    for save_mode, reuse in itertools.product(("light", "full"), (True, False)):
+        lay = gb.gdn_workspace_layout_kcp(
+            ctx,
+            save_for_backward=False,
+            save_mode=save_mode,
+            reuse_recompute_tapes=reuse,
+            P=2,
+            **q,
+        )
+        rep = gb.gdn_workspace_layout_kcp(ctx, boundary_mode="replay", P=2, **q)
+        only_fwd = gb.gdn_workspace_layout_kcp(
+            ctx, save_for_backward=False, save_mode=save_mode, backward=False, P=2, **q
+        )
+        bwd_terms = {k: v for k, v in lay.items() if k.startswith("bwd.")}
+        assert bwd_terms == {k: v for k, v in rep.items() if k.startswith("bwd.")}
+        assert "bwd.phase.replay_forward" in bwd_terms and lay["bwd.kept_tapes"] == 0
+        assert lay["backward"] == rep["backward"] == lay["backward_transient"]
+        assert lay["forward"] == only_fwd["forward"] and only_fwd["backward"] == 0
     with pytest.raises(TypeError, match="save_for_backward"):
         gb.gdn_workspace_layout_kcp(ctx, save_for_backward=0, backward=False, **q)
 
