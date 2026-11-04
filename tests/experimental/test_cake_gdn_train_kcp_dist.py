@@ -24,7 +24,8 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   with zero mismatches; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of the deterministic
   package's ``cake_gdn_det_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of
   |ref| at the worst element).  No budget is derived from this package's output.
-* every arm (repeat, saved / replay, light / full, autograd / explicit, checkpoint / direct with its kept-tape and
+* every arm (repeat, saved / replay, light / full, the full form's split twin (test knob ``fused_o_tape=0``; each full
+  forward's launch log names the walk it ran), autograd / explicit, checkpoint / direct with its kept-tape and
   recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay, and the
   checkpointed CUDA-graph replay steps of the recompute's tape hand-off: the shipped ``"auto"``, ``"auto"`` with the
   size rule between the ranks, ``True``) within the FP64 budgets on its own and, against its partner arm, within the
@@ -1469,6 +1470,7 @@ def _kept_record(T_r: int) -> dict:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "fwd_o",
     }
     first_local = next(
@@ -1599,7 +1601,38 @@ def _run_rank(
     for i in range(1, N_REPEAT):
         arm(f"run{i}", saved_pass(), res, "run0")
     arm("replay", saved_pass(boundary_mode="replay"), res, "run0")
-    arm("full", saved_pass(save_mode="full"), res, "run0")
+    res_full = saved_pass(save_mode="full")
+    full_fwd = dict(kcp.LAST_CALL["fwd"])
+    arm("full", res_full, res, "run0")
+    # the full forward writes its output and the saved h / v_new tapes in one walk per launch list
+    # (kcp_fwdh_out_tape) where the registry ships it for this architecture; test knob fused_o_tape = 0 is the
+    # split form (the tape walk, then #5): within the budgets of the shipped form, bitwise recorded, each forward's
+    # launch log and fwd_o evidence naming the form it ran (a rank without tokens runs neither walk)
+    res_full_split = saved_pass(save_mode="full", test_knobs={"fused_o_tape": 0})
+    split_fwd = dict(kcp.LAST_CALL["fwd"])
+    arm("full_split", res_full_split, res_full, "full")
+    full_arch = (
+        None if backend == "fake" else _mod("cake_backend").device_arch(device.index)
+    )
+    fused_tape = int(q.shape[0]) > 0 and kcp.fused_o_tape_shipped(full_arch)
+    full_seq, split_seq = list(full_fwd["sequence"]), list(split_fwd["sequence"])
+    info["full_fused_tape"] = {
+        "expected": bool(fused_tape),
+        "fwd_o": full_fwd.get("fwd_o"),
+        "split_fwd_o": split_fwd.get("fwd_o"),
+        "bitwise_vs_split": _bitwise(res_full, res_full_split),
+    }
+    want_fwd_o = "fused_tape" if fused_tape else "launched"
+    full_ok = (
+        full_fwd.get("fwd_o") == want_fwd_o
+        and ("kcp_fwdh_out_tape" in full_seq) == fused_tape
+        and ("fwd_o" in full_seq) == (not fused_tape)
+    )
+    split_ok = "kcp_fwdh_out_tape" not in split_seq
+    flags["full_forward_runs_the_tape_and_output_walk"] = bool(
+        (int(q.shape[0]) == 0 or full_ok) and split_ok
+    )
+    del res_full, res_full_split
     res_auto = autograd_pass(False)
     arm("autograd", res_auto, res, "run0")
     res_ckpt = autograd_pass(True)
@@ -2815,17 +2848,35 @@ def _spawn_entry(
             dist.destroy_process_group()
 
 
+# _free_port releases the port it finds before rank 0's rendezvous store binds it, so another socket of the node can
+# take it in between: rank 0 then fails in init_process_group with EADDRINUSE before the row runs.  Such a start is
+# retried on a fresh port, at most this many times in all.
+RENDEZVOUS_TRIES = 3
+
+
+def _rendezvous_port_taken(err: BaseException) -> bool:
+    """Whether a spawned start failed because rank 0's rendezvous port was taken (``EADDRINUSE`` from its store)."""
+    return "EADDRINUSE" in str(err)
+
+
 def _spawn_row(obj, backend: str, kind: str) -> None:
-    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides."""
+    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides.  A start
+    whose rendezvous port was taken is retried on a fresh port (:data:`RENDEZVOUS_TRIES`)."""
     with tempfile.TemporaryDirectory(prefix="cake_gdn_train_kcp_dist_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        mp.start_processes(
-            _spawn_entry,
-            args=(obj.W, obj, _free_port(), result_dir, backend, kind),
-            nprocs=obj.W,
-            join=True,
-            start_method="spawn",
-        )
+        for attempt in range(RENDEZVOUS_TRIES):
+            try:
+                mp.start_processes(
+                    _spawn_entry,
+                    args=(obj.W, obj, _free_port(), result_dir, backend, kind),
+                    nprocs=obj.W,
+                    join=True,
+                    start_method="spawn",
+                )
+                break
+            except mp.ProcessRaisedException as err:
+                if attempt + 1 == RENDEZVOUS_TRIES or not _rendezvous_port_taken(err):
+                    raise
         with open(os.path.join(result_dir, _report_file(obj, kind))) as fh:
             report = json.load(fh)
     assert report["pass"], json.dumps(
@@ -3068,6 +3119,54 @@ def test_poisoned_workspace_pairs(pair: PoisonPair, slurm) -> None:
         return
     _skip_unless_runnable(pair.W, backend)
     _spawn_row(pair, backend, "poison")
+
+
+def _fake_starts(monkeypatch, tmp_path, row: Row, failures: list[str]) -> list[int]:
+    """Replace the spawned start with one that raises ``failures`` in turn (a rank's error text) and then writes rank
+    0's passing report; returns the rendezvous port of every start."""
+    ports: list[int] = []
+    free = iter(range(41000, 41100))
+    monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: next(free))
+    monkeypatch.setenv("KCP_TEST_RESULT_DIR", str(tmp_path))
+
+    def start(fn, *, args, nprocs, join, start_method) -> None:
+        ports.append(args[2])
+        if len(ports) <= len(failures):
+            raise mp.ProcessRaisedException(failures[len(ports) - 1], 0, 0)
+        (tmp_path / _report_file(row, "full")).write_text(json.dumps({"pass": True}))
+
+    monkeypatch.setattr(mp, "start_processes", start)
+    return ports
+
+
+TAKEN = (
+    "DistNetworkError: The server socket has failed to listen on any local network address. port: 48409, "
+    "useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use"
+)
+
+
+def test_spawned_start_retries_a_taken_rendezvous_port(monkeypatch, tmp_path) -> None:
+    """A start whose rank 0 finds its rendezvous port taken (EADDRINUSE) runs again on a fresh port.  CPU-only."""
+    row = Row("Zz", (1,), (2, 6), 2, "contiguous")
+    ports = _fake_starts(monkeypatch, tmp_path, row, [TAKEN])
+    _spawn_row(row, "fake", "full")
+    assert ports == [41000, 41001]
+
+
+def test_spawned_start_does_not_retry_other_failures(monkeypatch, tmp_path) -> None:
+    """Any other rank failure is raised at once, and a port taken on every try is raised after
+    :data:`RENDEZVOUS_TRIES` starts.  CPU-only."""
+    row = Row("Zz", (1,), (2, 6), 2, "contiguous")
+    ports = _fake_starts(
+        monkeypatch, tmp_path, row, ["AssertionError: rank 0: out differs"]
+    )
+    with pytest.raises(mp.ProcessRaisedException, match="out differs"):
+        _spawn_row(row, "fake", "full")
+    assert ports == [41000]
+    ports = _fake_starts(monkeypatch, tmp_path, row, [TAKEN] * RENDEZVOUS_TRIES)
+    with pytest.raises(mp.ProcessRaisedException, match="EADDRINUSE"):
+        _spawn_row(row, "fake", "full")
+    assert len(ports) == RENDEZVOUS_TRIES
 
 
 def test_accuracy_budget_cells_cover_the_accuracy_rows() -> None:

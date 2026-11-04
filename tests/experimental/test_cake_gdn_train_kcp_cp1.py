@@ -1061,9 +1061,13 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.detach().contiguous().view(torch.uint8)
 
 
-def _fused_arm(device, cu, heads, form, fused_o: int, kcp, log: list) -> dict:
-    """One run of ``form`` with test knob ``fused_o``: ``out``, the five gradients (and ``dw`` of the later saver);
-    ``log`` receives ``(kind, sequence, fwd_o decision)`` of every recorded call."""
+def _fused_arm(
+    device, cu, heads, form, fused_o: int, kcp, log: list, *, knob: str = "fused_o"
+) -> dict:
+    """One run of ``form`` with test knob ``knob`` (``fused_o``; ``fused_o_tape`` for the ``save_mode="full"``
+    forms) set to ``fused_o``: ``out``, the five gradients (and ``dw`` of the later saver; the explicit entry of a
+    full form also the saved ``h_tape`` / ``v_new``); ``log`` receives ``(kind, sequence, fwd_o decision)`` of every
+    recorded call."""
     from torch.utils.checkpoint import checkpoint
 
     _fid, layers, ckpt, later, opts, knobs = form
@@ -1083,7 +1087,7 @@ def _fused_arm(device, cu, heads, form, fused_o: int, kcp, log: list) -> dict:
         deterministic=False,
         **({"graph_replay": True} if graph else {}),
     )
-    kw = {"test_knobs": {"fused_o": fused_o, **knobs}, **opts}
+    kw = {"test_knobs": {knob: fused_o, **knobs}, **opts}
     if graph:
         kw["workspace"] = gdn_api.WorkspaceKcp()
     dout = inputs["dout"].to(device)
@@ -1097,7 +1101,10 @@ def _fused_arm(device, cu, heads, form, fused_o: int, kcp, log: list) -> dict:
             q, k, v, g, beta, ctx, dout, saved=saved, deterministic=False, **kw
         )
         torch.cuda.synchronize(device)
-        return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+        res = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+        if saved.save_mode == "full" and saved.tapes is not None:
+            res.update({n: saved.tape(n) for n in ("h_tape", "v_new")})
+        return res
     w = None
     if later:
         gen = torch.Generator(device="cpu").manual_seed(6098)
@@ -1195,6 +1202,129 @@ def test_fused_output_walk_is_bitwise_the_split_forward(
                 elementwise=False,
             )
         assert bool(torch.isfinite(fused[n].float()).all()), n
+    assert kcp.kept_registry_size() == 0
+
+
+# --------------------------------------------------------------------------- the tape-and-output walk (one GPU)
+# A save_mode="full" forward that keeps its saved set and launches #5 runs the tape-and-output walk kcp_fwdh_out_tape in
+# place of the tape walk and #5 (test knob fused_o_tape = 1, the shipped form); fused_o_tape = 0 forces the split form.
+# Each form below runs both on the same build with the saved h / v_new tapes pre-filled with 0xFF bytes: ``out`` and
+# the saved tapes of the explicit entry are bitwise the split form's (a byte one form writes and the other leaves
+# shows); each gradient as in the output-walk matrix above.
+
+FULL_TAPE_FORMS = (
+    # id, layers, checkpoint, later saver, options (``explicit`` / ``handle`` select the entry form), test knobs
+    ("direct", 1, False, False, {}, {}),
+    ("explicit", 1, False, False, {"explicit": True}, {}),
+    ("explicit-segments-2", 1, False, False, {"explicit": True, "segments": 2}, {}),
+    ("explicit-vh64", 1, False, False, {"explicit": True}, {"fwdh_vh": 64}),
+    ("explicit-vh128", 1, False, False, {"explicit": True}, {"fwdh_vh": 128}),
+    ("ckpt-closes", 1, True, False, {}, {}),
+    ("ckpt-later-saver", 1, True, True, {}, {}),
+    ("ckpt-always", 1, True, False, {"recompute_output": "always"}, {}),
+    ("ckpt-3-layers-later-saver", 3, True, True, {}, {}),
+    ("ckpt-handle", 1, True, False, {"handle": True}, {}),
+    ("segments-2", 1, True, True, {"segments": 2}, {}),
+    (
+        "segments-2-no-save-transfer",
+        1,
+        True,
+        True,
+        {"segments": 2, "save_transfer": False},
+        {},
+    ),
+    ("vh64", 1, True, True, {}, {"fwdh_vh": 64}),
+    ("vh128", 1, True, True, {}, {"fwdh_vh": 128}),
+    ("l2n", 1, True, True, {"use_qk_l2norm_in_kernel": True}, {}),
+)
+
+
+@pytest.mark.parametrize("form", FULL_TAPE_FORMS, ids=[f[0] for f in FULL_TAPE_FORMS])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [s[1:] for s in FUSED_SHAPES],
+    ids=[s[0] for s in FUSED_SHAPES],
+)
+def test_fused_tape_walk_is_bitwise_the_split_full_forward(
+    device, monkeypatch, lengths, heads, form
+) -> None:
+    """The same-build matrix of the tape-and-output walk under ``save_mode="full"``: direct, explicit (with the saved
+    tapes; two segments, both value widths), checkpointed (the region closed by the node, a later saver,
+    ``recompute_output="always"``, three layers with a later saver, a recompute handle), two segments with and without
+    ``save_transfer``, both value widths and the in-kernel L2 norm, each with test knob ``fused_o_tape`` 1 and 0
+    (split twice).  Every full forward that writes the output runs ``kcp_fwdh_out_tape`` and neither the tape walk nor
+    #5; the split arm never runs it; the backward launches are the split form's."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    backend = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_train_kcp.cake_backend"
+    )
+    if not kcp.fused_o_tape_shipped(backend.device_arch(device.index)):
+        pytest.skip("the registry ships no tape-and-output walk for this architecture")
+    if form[4].get("use_qk_l2norm_in_kernel") and not kcp.l2n_records_shipped():
+        pytest.skip("the registry ships no in-kernel L2 norm records")
+    full_form = (*form[:4], {"save_mode": "full", **form[4]}, form[5])
+    cu = _cu(lengths)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        entry = kcp.LAST_CALL[kind]
+        log.append((kind, tuple(entry.get("sequence") or ()), entry.get("fwd_o")))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+    fresh_tapes = kcp.CallKcp.fresh_tapes
+
+    def filled_tapes(self, names):
+        fresh_tapes(self, names)
+        for n in ("h_tape", "v_new"):
+            if n in names:
+                self.tapes[n].view(torch.uint8).fill_(0xFF)
+
+    monkeypatch.setattr(kcp.CallKcp, "fresh_tapes", filled_tapes)
+    split = [
+        _fused_arm(device, cu, heads, full_form, 0, kcp, log, knob="fused_o_tape")
+        for _ in range(2)
+    ]
+    split_log = list(log)
+    fused = _fused_arm(device, cu, heads, full_form, 1, kcp, log, knob="fused_o_tape")
+    fused_log = list(log)
+    # the launch logs: the same calls; the fused arm's forwards that write the output run the tape-and-output walk
+    # (the first forward always: it is no recompute), a recompute that leaves #5 out keeps the tape walk, and the
+    # split arm never runs it
+    assert [k for k, _s, _o in fused_log] == [k for k, _s, _o in split_log]
+    fwd = [(s, o) for k, s, o in fused_log if k == "fwd"]
+    assert fwd and fwd[0][1] == "fused_tape", fwd[:1]
+    for seq, decision in fwd:
+        assert decision in ("fused_tape", "skipped"), (decision, seq)
+        assert ("kcp_fwdh_out_tape" in seq) == (decision == "fused_tape"), (
+            decision,
+            seq,
+        )
+        if decision == "fused_tape":
+            assert not {"kcp_fwdh_tape", "kcp_fwdh_out", "fwd_o"} & set(seq), seq
+    assert not any(
+        "kcp_fwdh_out_tape" in s or o == "fused_tape" for _k, s, o in split_log
+    )
+    assert [s for k, s, _o in fused_log if k == "bwd"] == [
+        s for k, s, _o in split_log if k == "bwd"
+    ]  # every backward is the split form's
+    assert set(fused) == set(split[0])
+    assert {"h_tape", "v_new"} <= set(fused) or not form[4].get("explicit")
+    for n in fused:
+        if n in ("out", "h_tape", "v_new"):
+            assert torch.equal(_bits(split[0][n]), _bits(split[1][n])), n
+        if torch.equal(_bits(split[0][n]), _bits(split[1][n])):
+            assert torch.equal(_bits(fused[n]), _bits(split[0][n])), (form[0], n)
+        else:
+            _within_budget(
+                fused[n],
+                split[0][n],
+                f"{form[0]} fused_tape vs split {n}",
+                elementwise=False,
+            )
+        if n not in ("h_tape", "v_new"):  # the tapes' pad rows keep the 0xFF fill
+            assert bool(torch.isfinite(fused[n].float()).all()), n
     assert kcp.kept_registry_size() == 0
 
 

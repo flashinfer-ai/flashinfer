@@ -544,8 +544,9 @@ def gdn_workspace_layout_kcp(
       wait(c1)).  The shipped light / saved forward is fused (the output walk ``kcp_fwdh_out`` where the registry
       ships it: no ``h`` / ``v_new`` tape), so its peak is #1; ``forward_split`` is the split form's (the
       ``fused_o=0`` test knob).  The eager forward binds its c2 send plane as a fresh tensor (``fwd.c2_send`` 0).
-      ``save_mode="full"`` with a saved set writes its tapes into fresh saved tensors (no tape term); without one
-      they are arena tapes of the split form.
+      ``save_mode="full"`` with a saved set writes its tapes into fresh saved tensors (no tape term; the shipped
+      full forward writes them from the tape-and-output walk ``kcp_fwdh_out_tape``, its output a fresh tensor too);
+      without one they are arena tapes of the split form.
     * ``backward``: the largest of its phases -- the adjoint exchange (the backward pools, without the c1 send pool
       that a replayed forward has already released, plus the forward tapes of the form and the tapes #6 wrote), the
       adjoint tape walk (``carry``, ``b2_recv`` unless the fused walks at ``P > 1`` dropped it, and ``dh``) and the
