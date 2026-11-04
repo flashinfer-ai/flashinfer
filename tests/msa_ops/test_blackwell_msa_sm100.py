@@ -786,6 +786,39 @@ CASES = [
         ),
         id="decode-paged-bf16-q8-gqa8-qpair-batch16",
     ),
+    # Paged BF16 decode on the union program: 64 Q heads over 4 KV heads,
+    # eight query tokens per request, 64 or 128 requests and contexts of
+    # 750-1250 tokens (a page table of at most 10 pages): the folded GQA-16
+    # union prefill program on compute capability 10.0 and 10.3, with a
+    # workspace, without one and under CUDA graph capture, against the same
+    # reference as the decode program.
+    *(
+        pytest.param(
+            _attention_case(
+                "sparse_decode",
+                q_dtype="bfloat16",
+                kv_dtype="bfloat16",
+                kv_layout="paged",
+                batch_size=batch_size,
+                seqlen_q=8,
+                kv_lens=[750 + (337 * i) % 501 for i in range(batch_size)],
+                num_q_heads=64,
+                num_kv_heads=4,
+                topk=16,
+                causal=True,
+                seed=seed,
+                cuda_graph=cuda_graph,
+                use_workspace=use_workspace,
+            ),
+            id=f"decode-paged-bf16-q8-gqa16-union-batch{batch_size}{suffix}",
+        )
+        for batch_size, seed, cuda_graph, use_workspace, suffix in (
+            (64, 113, False, True, ""),
+            (128, 127, False, True, ""),
+            (64, 131, False, False, "-no-workspace"),
+            (128, 137, True, True, "-graph"),
+        )
+    ),
     # Persistent K-major prefill route: paged GQA-16 above 64 pages, paged
     # GQA-8 at 64 pages (captured) and flat GQA-16 above 64 KV blocks, every
     # batch with a request below the long route's 8192-query threshold.
@@ -1749,3 +1782,222 @@ def test_uniform_fp8_two_split_on_a_second_device_uses_its_own_counter():
             counters.append(counter)
             assert torch.cuda.current_device() == 0
     assert counters[0].data_ptr() != counters[1].data_ptr()
+
+
+# Paged BF16 decode on the union program (``_use_decode_union``): 64 Q heads
+# over 4 KV heads, eight query tokens per request, 64 or 128 requests and a
+# page table of at most 10 pages.  The call launches the folded GQA-16 union
+# prefill program alone: its two int32 carriers (``cu_seqlens_q`` and the
+# all-zero ``cu_seqlens_k`` / ``q_offsets``) are written when they are created
+# and only re-bound afterwards.
+def _union_inputs(
+    device: torch.device, *, batch: int, seed: int, use_workspace: bool = True
+) -> dict[str, Any]:
+    case = _attention_case(
+        "sparse_decode",
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="paged",
+        batch_size=batch,
+        seqlen_q=8,
+        kv_lens=[750 + (337 * i) % 501 for i in range(batch)],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=seed,
+        use_workspace=use_workspace,
+    )
+    return _make_attention_inputs(case, device)
+
+
+def _assert_union_call(backend: Any, inputs: dict[str, Any]) -> None:
+    """``inputs`` is a call the dispatcher serves with the union program."""
+    q, k = inputs["q"], inputs["k"]
+    assert backend._use_decode_union(
+        target=backend._select_target(q.device),
+        paged=True,
+        causal=True,
+        derive_q_offset=True,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        v_dtype=inputs["v"].dtype,
+        seqlen_q=8,
+        num_q_heads=int(q.shape[1]),
+        num_kv_heads=int(k.shape[1]),
+        batch_size=int(q.shape[0]) // 8,
+        max_pages=int(inputs["page_table"].shape[1]),
+    )
+
+
+def _assert_bitwise(actual: tuple[torch.Tensor, ...], other: tuple[torch.Tensor, ...]):
+    assert len(actual) == len(other)
+    for left, right in zip(actual, other, strict=True):
+        assert torch.equal(left, right)
+
+
+@pytest.mark.parametrize("batch", [64, 128])
+def test_union_decode_matches_the_decode_program_within_its_tolerance(
+    batch, monkeypatch
+):
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    inputs = _union_inputs(device, batch=batch, seed=167 + batch)
+    _assert_union_call(backend, inputs)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    union = run()
+    # the same call with the box closed takes the M16 decode program
+    monkeypatch.setattr(backend, "_DECODE_UNION_BATCHES", ())
+    decode = run()
+    torch.cuda.synchronize()
+    expected = _reference_attention(inputs)
+    for actual in (union, decode):
+        torch.testing.assert_close(actual[0], expected[0], atol=0.01, rtol=0.01)
+        _assert_lse_close(actual[1], expected[1])
+    # the union program's natural LSE is the decode program's, within the
+    # decode LSE tolerance (same convention: natural log, -inf on empty rows)
+    torch.testing.assert_close(union[0], decode[0], atol=0.01, rtol=0.01)
+    _assert_lse_close(union[1], decode[1])
+
+
+def test_union_decode_graph_replay_is_the_eager_call_bitwise():
+    device = _current_device()
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_decode_attention,
+    )
+
+    inputs = _union_inputs(device, batch=128, seed=173)
+    # A workspace that took part in a capture is not reused eagerly: the eager
+    # calls compared against the replay run on a workspace of their own.
+    workspace = MSASparseAttentionWorkspace(device=device)
+    eager_workspace = MSASparseAttentionWorkspace(device=device)
+    run = lambda ws: _invoke_attention(  # noqa: E731
+        inputs, ws, None, msa_sparse_decode_attention
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run(workspace)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = run(workspace)
+    for scale in (1.0, 0.5):
+        inputs["q"].mul_(scale)
+        with torch.cuda.stream(stream):
+            graph.replay()
+            replayed = tuple(t.clone() for t in captured)
+            eager = tuple(t.clone() for t in run(eager_workspace))
+        stream.synchronize()
+        _assert_bitwise(replayed, eager)
+        expected = _reference_attention(inputs)
+        torch.testing.assert_close(replayed[0], expected[0], atol=0.01, rtol=0.01)
+        _assert_lse_close(replayed[1], expected[1])
+
+
+def test_union_decode_capture_with_an_unwarmed_carrier_raises(monkeypatch):
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_decode_attention,
+    )
+
+    inputs = _union_inputs(device, batch=64, seed=179)
+    workspace = MSASparseAttentionWorkspace(device=device)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, workspace, None, msa_sparse_decode_attention
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    # warm every other buffer of the call through the decode program
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_DECODE_UNION_BATCHES", ())
+        with torch.cuda.stream(stream):
+            run()
+        stream.synchronize()
+    assert not any(name.startswith("decode_union_") for name in workspace._buffers)
+    graph = torch.cuda.CUDAGraph()
+    refused = pytest.raises(RuntimeError, match="decode_union_cu_seqlens_q_b64_s8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the refused capture leaves an empty graph
+        with refused, torch.cuda.graph(graph, stream=stream):
+            run()
+    torch.cuda.synchronize()
+    assert not any(name.startswith("decode_union_") for name in workspace._buffers)
+
+
+def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
+    device = _current_device()
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    sets = [_union_inputs(device, batch=64, seed=181, use_workspace=False)]
+    sets.append(_union_inputs(device, batch=128, seed=191, use_workspace=False))
+    for inputs in sets:
+        _assert_union_call(backend, inputs)
+    expected = [_reference_attention(inputs) for inputs in sets]
+    run = lambda inputs: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    first = [run(inputs) for inputs in sets]  # creates the carriers
+    torch.cuda.synchronize()
+    calls = 40
+    outputs = []
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for call in range(calls):
+            outputs.append(run(sets[call % 2]))
+        torch.cuda.synchronize()
+    for call, actual in enumerate(outputs):
+        _assert_bitwise(actual, first[call % 2])
+        torch.testing.assert_close(
+            actual[0], expected[call % 2][0], atol=0.01, rtol=0.01
+        )
+        _assert_lse_close(actual[1], expected[call % 2][1])
+    kernels = [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert len(kernels) == calls, sorted(set(kernels))
+    assert len(set(kernels)) == 1, sorted(set(kernels))
+    for inputs in sets:
+        key = (backend._device_index(device), int(inputs["q"].shape[0]) // 8, 8)
+        cu_q, zeros = backend._decode_union_carriers_cache[key]
+        assert cu_q.tolist() == [8 * i for i in range(key[1] + 1)]
+        assert int(zeros.abs().sum()) == 0 and zeros.numel() == key[1] + 1
+
+
+def test_union_decode_carriers_created_on_one_stream_serve_another():
+    device = _current_device()
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    inputs = _union_inputs(device, batch=128, seed=193, use_workspace=False)
+    key = (backend._device_index(device), 128, 8)
+    backend._decode_union_carriers_cache.pop(key, None)
+    expected = _reference_attention(inputs)
+    run = lambda: _invoke_attention(  # noqa: E731
+        inputs, None, None, msa_sparse_decode_attention
+    )
+    streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(streams[0]):
+        torch.cuda._sleep(2_000_000)
+        created = run()
+    assert key in backend._decode_union_carriers_cache
+    with torch.cuda.stream(streams[1]):
+        reused = run()
+    torch.cuda.synchronize()
+    for actual in (created, reused):
+        torch.testing.assert_close(actual[0], expected[0], atol=0.01, rtol=0.01)
+        _assert_lse_close(actual[1], expected[1])

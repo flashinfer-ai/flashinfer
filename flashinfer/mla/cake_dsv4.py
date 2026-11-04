@@ -925,9 +925,35 @@ _RAGGED_ONLY_ROUTES = frozenset(
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
 
+# Per architecture, (fewest query rows, longest request, topk4x items only)
+# entries: launches that reach an entry's row count and whose requests hold at
+# most its query rows keep the uniform-gather route past the lane-gather floor.
+# On SM107 that route runs its K=64 sibling, which led the lane-issued program
+# on these short-query decode launches (VR200, one process, eight calls per
+# CUDA graph).  It trailed it at almost every measured row count on topk4x and
+# topk128x prefill, with 16 or more query rows per request on topk4x items (8
+# at 160 rows), with 8 or more on topk128x items, and with 4 on topk128x items
+# 1152 wide (2 at 160 rows); it was mixed with 4 query rows on narrower
+# topk128x and on SWA-only items.
+_FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
+    "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True)),
+}
 
-def _fp8_persistent_program(num_query_tokens: int) -> str:
+
+def _fp8_persistent_program(
+    num_query_tokens: int,
+    *,
+    max_q_len: Optional[int] = None,
+    topk4x: bool = False,
+    arch: Optional[str] = None,
+) -> str:
     if num_query_tokens < _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+        return "fp8_h128_prefill_source_persistent_uniform"
+    entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
+    if max_q_len is not None and any(
+        num_query_tokens >= rows and max_q_len <= longest and (topk4x or not only4x)
+        for rows, longest, only4x in entries
+    ):
         return "fp8_h128_prefill_source_persistent_uniform"
     return "fp8_h128_prefill_source_persistent"
 
@@ -1163,7 +1189,9 @@ def _route(
             # work feed over T x 2 CTAs, runtime q_lens) matched or beat the
             # former per-(token, split) cluster producer on the 12-token
             # decode rows and beat trtllm-gen 1.12-1.75x on the MTP rows.
-            return _fp8_persistent_program(num_query_tokens)
+            return _fp8_persistent_program(
+                num_query_tokens, max_q_len=max_q_len, topk4x=is_topk4x, arch=arch
+            )
         if num_heads not in (8, 16, 32, 64):
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
         if (

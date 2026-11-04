@@ -1213,15 +1213,19 @@ def test_decode_rebinds_sinks_without_repreparing(monkeypatch, strided):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-@pytest.mark.parametrize("kind", ["paged", "ragged"])
 @pytest.mark.parametrize(
-    "unsupported",
-    [
-        dict(window_left=4),
-        dict(pos_encoding_mode="ALIBI"),
-        dict(logits_soft_cap=2),
-        dict(packed_custom_mask=torch.ones(1, dtype=torch.uint8)),
-        dict(prefix_len_ptr=torch.ones(1, dtype=torch.int32)),
+    "kind,unsupported",
+    # Ragged cuDNN prefill supports windows; the paged wrapper still rejects them.
+    [("paged", dict(window_left=4))]
+    + [
+        (kind, unsupported)
+        for kind in ("paged", "ragged")
+        for unsupported in (
+            dict(pos_encoding_mode="ALIBI"),
+            dict(logits_soft_cap=2),
+            dict(packed_custom_mask=torch.ones(1, dtype=torch.uint8)),
+            dict(prefix_len_ptr=torch.ones(1, dtype=torch.int32)),
+        )
     ],
 )
 def test_prefill_rejects_unsupported_semantics(kind, unsupported):
