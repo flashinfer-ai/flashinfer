@@ -685,8 +685,10 @@ uses Prims-TS. NVFP4 and MXFP4 reuse ``TrtllmFp4Config``, BF16 reuses
 ``TrtllmBf16Config``, MXFP8 reuses ``TrtllmFp8BlockConfig``, and per-tensor FP8
 reuses ``TrtllmFp8PerTensorConfig``. DeepSeekFp8 activations and scales match
 ``TrtllmFp8BlockConfig``, but the weight payloads are shuffled with epilogue
-tile 64 and must not be registered under ``trtllm_fp8_block``. One shared view
-can be registered for both keys::
+tile 64 and must not be registered under ``trtllm_fp8_block``. Prims-TS also
+accepts 32x32 DeepSeekFp8 scale blocks (``hidden_states_scale`` of shape
+``[hidden_size / 32, num_tokens]`` with matching weight scales), which the
+TRT-LLM Gen path does not. One shared view can be registered for both keys::
 
     backend = PrimsTsConfig()
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)

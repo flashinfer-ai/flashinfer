@@ -60,13 +60,13 @@ def _validate_swap_ab_cluster_span(cfg, out_hidden: int) -> None:
     validated by the launch-capacity path.
     """
 
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _validate_swap_ab_out_hidden,
+    )
+
     if not cfg.is_swap_ab:
         return
-    if out_hidden % cfg.tile_m:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
     cluster_dim_x = int(cfg.preferred_cluster_shape[0])
     if cluster_dim_x <= int(cfg.umma_cta_count):
         return

@@ -69,6 +69,7 @@ from .config_mapper import (
 from .support import (
     is_prims_ts_bf16_supported,
     is_prims_ts_fp8_block_scale_supported,
+    deepseek_fp8_scale_block_size,
     is_prims_ts_fp8_per_tensor_supported,
     is_prims_ts_mxfp4_bf16_supported,
     is_prims_ts_mxfp4_mxfp8_supported,
@@ -3067,6 +3068,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 num_experts=common["num_experts"],
                 weight_layout=common["weight_layout"],
                 enable_pdl=common["enable_pdl"],
+                deepseek_fp8_block_size=deepseek_fp8_scale_block_size(
+                    self.hidden_size, moe_inputs.hidden_states_scale
+                ),
             )
         return map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
 
@@ -3315,6 +3319,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 self.intermediate_size,
                 int(self.activation_type),
                 kwargs["enable_pdl"],
+                fc1_cfg.deepseek_fp8_block_size,
             )
 
         fc2_io = build_fp8_block_scale_launch_io(

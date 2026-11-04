@@ -1269,6 +1269,10 @@ def create_mma_task(
     has_separate_sf = tmem_sfa is not None
     has_combined_sf = tmem_sfab is not None
     has_cast_a = tmem_cast_a is not None
+    # DeepSeek block 32: every K tile holds tile_k / block scale sub-blocks.
+    # Each one is issued into its own accumulator stage so the epilogue can
+    # scale it separately; block 128 keeps one sub-block per tile.
+    dsfp8_k_subblocks = cfg.dsfp8_k_subblocks_per_tile if cfg.use_deepseek_fp8 else 1
     active_sf_modes = [
         name
         for name, enabled in (
@@ -1542,13 +1546,20 @@ def create_mma_task(
             else:
                 if acquire_accumulator:
                     tmem_c_res.acquire()
-                tmem_c_res.mma(
-                    desc_a_mma_base=desc_a_mma_base,
-                    smem_a_stage_ptr=smem_a_stage_ptr,
-                    desc_b_mma_base=desc_b_mma_base,
-                    smem_b_stage_ptr=smem_b_stage_ptr,
-                    first_k_tile=first_k_tile,
-                )
+                for k_subblock in range(dsfp8_k_subblocks):
+                    if k_subblock > 0:
+                        tmem_c_res.try_acquire()
+                        tmem_c_res.acquire()
+                    tmem_c_res.mma(
+                        desc_a_mma_base=desc_a_mma_base,
+                        smem_a_stage_ptr=smem_a_stage_ptr,
+                        desc_b_mma_base=desc_b_mma_base,
+                        smem_b_stage_ptr=smem_b_stage_ptr,
+                        first_k_tile=first_k_tile,
+                        k_subblock=k_subblock if dsfp8_k_subblocks > 1 else None,
+                    )
+                    if k_subblock + 1 < dsfp8_k_subblocks:
+                        tmem_c_res.commit()
         if release_sources:
             _release_mma_sources(
                 smem_a_res,
@@ -1831,8 +1842,13 @@ def create_epilogue_task_dsfp8(
 
     This TS path uses a single TmemC accumulator drained once in the tail,
     matching the existing ``create_epilogue_task`` shape.
+
+    At block 32 each K tile carries ``tile_k / block`` scale sub-blocks, each
+    in its own accumulator stage: the SF stage is held across them and every
+    sub-block is drained and scaled before the next.
     """
     is_persistent = _is_persistent(cfg)
+    dsfp8_k_subblocks = cfg.dsfp8_k_subblocks_per_tile
 
     @schedule
     def epi_schedule(
@@ -1859,24 +1875,28 @@ def create_epilogue_task_dsfp8(
         ):
             gmem.init_epilogue_tile_state()
             with domain_loop(0, num_k_tiles, 1) as d:
-                tmem.try_wait()
-                sf.try_wait()
-                tmem.wait()
-                tok = tmem.consumer_work(subtile_idx=0)
-                tmem.release()
-                sf.wait()
-                sf.consume_sfab_tile()
-                scaled_tok = sf.apply_dequant_to_t2r(
-                    t2r_rmem=tok[0],
-                    t2r_rmem_1=tok[1],
-                    t2r_output_call_idx=tok[2],
-                )
-                acc_tok = sf.accumulate_scaled_t2r(
-                    t2r_rmem=scaled_tok[0],
-                    t2r_rmem_1=scaled_tok[1],
-                    t2r_output_call_idx=scaled_tok[2],
-                    t2r_dequant_scale=scaled_tok[3],
-                )
+                for k_subblock in range(dsfp8_k_subblocks):
+                    tmem.try_wait()
+                    if k_subblock == 0:
+                        sf.try_wait()
+                    tmem.wait()
+                    tok = tmem.consumer_work(subtile_idx=0)
+                    tmem.release()
+                    if k_subblock == 0:
+                        sf.wait()
+                        sf.consume_sfab_tile()
+                    scaled_tok = sf.apply_dequant_to_t2r(
+                        t2r_rmem=tok[0],
+                        t2r_rmem_1=tok[1],
+                        t2r_output_call_idx=tok[2],
+                        k_subblock=k_subblock,
+                    )
+                    acc_tok = sf.accumulate_scaled_t2r(
+                        t2r_rmem=scaled_tok[0],
+                        t2r_rmem_1=scaled_tok[1],
+                        t2r_output_call_idx=scaled_tok[2],
+                        t2r_dequant_scale=scaled_tok[3],
+                    )
                 sf.release()
                 with d.last_iter():
                     gmem.store_epilogue(
