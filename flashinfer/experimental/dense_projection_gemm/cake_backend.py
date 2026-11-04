@@ -792,8 +792,8 @@ def k1_plan(
             overrides = K1_SPLIT_OVERRIDES_BY_SM.get((arch, int(sm_count)), {})
             choice = overrides.get(key, choice)
         if _ceil_div(K, K1_BLOCK_K) % 2 == 0:
-            even = K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM.get((arch, int(sm_count)), {})
-            own = [v for lo, hi, v in even.get(key, ()) if lo <= int(K) <= hi]
+            even_part = K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM.get((arch, int(sm_count)), {})
+            own = [v for lo, hi, v in even_part.get(key, ()) if lo <= int(K) <= hi]
             if own:
                 choice = own[0]
     else:
