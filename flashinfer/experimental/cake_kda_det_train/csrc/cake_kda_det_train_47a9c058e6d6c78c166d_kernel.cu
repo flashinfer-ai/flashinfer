@@ -47,12 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_TOTALS_OFF 0
-#define SMEM_TOTALS_STAGE_BYTES 4096
-#define SMEM_TOTALS_STRIDE 4096
-#define SMEM_TOTAL 4096
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -80,9 +74,11 @@ kernel_cake_kda_det_train_47a9c058e6d6c78c166d(float* __restrict__ dg_in, float*
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* totals = reinterpret_cast<float*>(smem_raw + 0);
     const int totals_addr = smem + 0;
+
+    // Kernel setup ops
     int bx_s = blockIdx.x;
     int by_s = blockIdx.y;
     int nbx_s = (int)gridDim.x;

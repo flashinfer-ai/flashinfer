@@ -17,8 +17,26 @@ indexer").
 | Plan | `msa_icp_index_score_sharded_plan_device`, once per query window and step | -- |
 | Score | `msa_icp_index_score_sharded` per query chunk into caller score scratch | `msa_icp_decode_index_score_sharded` into caller score rows |
 | Local Top16 | `msa_icp_topk_select_prefill` into the caller's carrier `[H, T, 33]` | `msa_icp_topk_select_publish` into the owner ranks' receive rows |
+| Fused option | `msa_icp_prefill_score_select`: score and local Top16 in one chain, into the same carrier | `msa_icp_decode_score_publish` |
 | Exchange | the caller's one all-to-all per layer | (in the publish: peer stores) |
 | Merge | `msa_icp_merge_candidates(prefill=True)` | `msa_icp_merge_candidates` (legacy or tagged rows) |
+
+The prefill fused option replaces the score and local Top16 steps of one
+query window with `msa_icp_prefill_score_select`: a list scorer keeps the
+Top16 list of each plan work item in a caller-owned uint8 `pool`
+(`msa_icp_prefill_pool_bytes`, 32 KiB per list piece) and a list merger writes
+the carrier rows of `msa_icp_topk_select_prefill`, byte for byte, without the
+FP32 score scratch.  The facade runs it when `prefill_local(..., pool=...)` is
+given (`score_scratch` may then be `None`), except that a window of at most
+`prefill_short_tokens` tokens (`cake_backend.SHORT_PREFILL_MAX_TOKENS`, per
+layout) runs the score rows and the Top16 select in a scratch the facade
+allocates once (`[prefill_short_tokens, H, pitch]` float32 at the
+`max_model_len` pitch): for short windows the list merge costs more than the
+score rows it saves.  `prefill_pool_shape()` sizes the
+pool for windows of `prefill_window_tokens()` = `min(8192,
+max_num_batched_tokens)` tokens.  `MSAIcpIndexerPlan.fused_prefill` is the
+serving default per layout (`cake_backend.FUSED_PREFILL`) and is `False` on
+every layout in this version.
 
 The decode column is the default chain.  Its score plane cuts each request
 into one wave of the scorer (SMs x resident CTAs per SM / batch, at most 128
@@ -64,6 +82,43 @@ before CUDA Graph capture.  It builds or loads every program of the device's
 architecture and loads each kernel into the device's context.  Under CUDA lazy
 module loading, a kernel loaded at its first launch can stall behind a peer's
 merge that already spins on its rows, until the spin limit stops it.
+
+*Step prepare.*  Within one step, every sparse layer makes the same launches
+with the same arguments except the query and the layer's K shard.
+`MSAIcpIndexerPlan.prepare_prefill_step(windows, score_scratch,
+num_valid_pages, send, received, output)` and `prepare_decode_step(...)` (the
+arguments of `prefill_local` / `prefill_merge` / `decode`) return step objects
+whose `local(index_q, index_k)`, `merge()` and `run(index_q, index_k, slot=)`
+make exactly the facade's launches.  The first layer runs the facade's host
+checks and records the launches; later layers check only the query and K
+metadata, swap those two tensors and launch.  The host time per layer drops;
+the device work is unchanged.  `debug=True` runs the full per-call checks on
+every layer and raises if a launch differs from the prepared one.
+
+*Layer graphs.*  `MSAIcpIndexerPlan.layer_graphs(capture_after=1, max_keys=4)`
+captures each layer of a step in its own CUDA Graph and replays it in later
+steps whose launches are the same.  Per step,
+`begin_step(prefill=, decode=, exchange=, exchange_key=, decode_tokens=)`
+takes the step objects and the caller's exchange (one call per layer, from the
+prefill `send` into `received`); `run(layer, index_q, index_k, slot=)` runs
+one layer (decode rows first in `index_q`).  The key of a step is every launch
+argument except the query and K (tensor address and metadata, scalar value),
+the K shard of each layer, the query metadata and `exchange_key`.  A key's
+first `capture_after` steps run eagerly, the next one captures and replays,
+later ones only copy the query into a staging buffer and replay.  The
+exchange is captured inside each layer's graph, once per layer.  Device data
+(plans, block tables, lengths, K pages) may change between steps.  To keep
+one key over steps of different lengths, build every window plan with
+`max_seq_len` the model limit and size the score scratch with
+`prefill_scratch_shape()`; with the fused path the pool needs no change.
+
+*Device token count.*  The backend's `topk_select_prefill`,
+`topk_select_publish`, `decode_score_publish` (its publisher) and
+`merge_candidates` take an optional `token_count`, an int32 `[1]` device
+tensor.  With it the call launches the `_dc` record of its role over the
+grid of the passed tensors and only the rows below `token_count[0]` are
+selected, published or merged; the rows past it are not written.  One
+captured launch then serves every count up to its grid.
 
 The package is a vendorable Cake package: `build.json` lists every
 `<program>_<arch>` library with its sources and flags, `cake_build.py` builds

@@ -147,12 +147,19 @@ stream with a device-side assertion, `check_temperature=True` raises
 `temperature` other than `None`, so a call without one runs the entries
 without a temperature parameter).
 
-* `logp`, `lse` and `dW` are the deterministic entry's bits for the same call.
-  `dX` is formed from the same `dz` and the same products; a chunk of more than
-  one dX slice adds them in the unordered reduction below.
-* The zero-gradient row skip (below) does not run with a temperature: the
-  backward runs the uncounted forms over every row in the forward's order, as
-  a call without a temperature does below `zero_dlogp_min_rows`.
+* `logp` and `lse` are the deterministic entry's bits for the same call, and
+  so is `dW` when no valid row has a zero `dlogp`.  `dX` is formed from the
+  same `dz` and the same products; a chunk of more than one dX slice adds them
+  in the unordered reduction below.
+* The zero-gradient row skip (below) runs with a temperature too: the
+  temperature rows follow the skip's row order (a per-token temperature is
+  gathered from the caller's `[T]` tensor, which the autograd entry keeps for
+  the backward), the `dz` recompute runs `gemm_logits_dz_tau` over every row
+  of the chunk (a zero `dlogp` gives `dz = 0`; the temperature forms have no
+  counted form) and the K-sliced dX reductions and the weight-gradient GEMMs
+  run their `_dcnt` forms.  With zero-gradient rows `dW` sums the live rows
+  in the new row order (bits may differ from the deterministic entry's within
+  the accuracy budgets).
 * `memory_mode="budget"` and `num_valid_rows` take a temperature;
   `memory_mode="keep_logits"` takes none (`ValueError`), and
   `chunked_lm_head_loss` has no `temperature` keyword.
@@ -377,8 +384,9 @@ GEMM's last 64-row K step), and not elsewhere.  Its `dX` row is an exact zero
 either way.
 
 Not applied: `compact_rows=False`, a backward that recounts its valid rows,
-the kept-logits entry, `memory_mode="budget"`, a call with a temperature, the
-prepared runner and the reference backend.  The one-slice dX chunks (the plain store) compute every
+the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
+reference backend.  A call with a temperature takes the skip with its own
+plan (above): only the dX / dW GEMMs run counted forms.  The one-slice dX chunks (the plain store) compute every
 row of the chunk.
 
 ## Kernel structure of one token chunk

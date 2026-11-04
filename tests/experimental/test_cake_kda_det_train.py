@@ -377,13 +377,16 @@ GRID_KINDS = (
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
 # carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a, the fused
-# ones on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18)
+# ones on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18), and the fused gradient's hints-off builds on sm_107a,
+# the one architecture their rule admits
 RECORD_ARCHES = {
     "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
     "glm_intra_v18": ("sm_107a",),
     "gate_epilogue": ("sm_100a",),
     "fwd_intra_v37_l2n": ("sm_103a",),
+    "dqkg_davq_nohint": ("sm_107a",),
+    "dqkg_int_davq_nohint": ("sm_107a",),
 }
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -2033,14 +2036,14 @@ def test_the_fused_gradient_turns_its_l2_hints_off_on_the_large_sm107a_rows() ->
     # The fused gradient's L2 prefetch and evict-first hints cost about 6 % on the sm_107a rows from 16 heads, so
     # its dAqk-hosting forms ship a second build there with the hints off (the `_nohint` records: the same kernel,
     # launch and operands; the hint thresholds beyond any head count).  The registry dispatches them on sm_107a
-    # from 16 heads alone, on either route (its 16-head rows are segmented ones); the other architectures keep the
-    # hinted builds.
+    # from 16 heads alone, on either route (its 16-head rows are segmented ones), and ships them for sm_107a alone;
+    # the other architectures keep the hinted builds.
     for name in ("dqkg_davq_nohint", "dqkg_int_davq_nohint"):
         record = cake_jit.MODULES[name]
         hinted = cake_jit.MODULES[name[: -len("_nohint")]]
         assert record["stage"] == hinted["stage"] == "dqkg"
         assert record["library"] != hinted["library"]
-        assert record["arches"] == hinted["arches"] == list(ARCHES)
+        assert record["arches"] == ["sm_107a"] and hinted["arches"] == list(ARCHES)
         assert record["logical"] == hinted["logical"]
         assert record["arg_plan"] == hinted["arg_plan"]
         assert record["launch"] == hinted["launch"]
@@ -3685,15 +3688,15 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
     # The 93 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs, the 5 of the Q/K L2 norm's
-    # fallback route and the 15 of its fused class), each built for the architectures its record delivers (88 on
-    # all three, the five of RECORD_ARCHES on one each: 269 libraries); the KCP programs have their own package.
+    # fallback route and the 15 of its fused class), each built for the architectures its record delivers (86 on
+    # all three, the seven of RECORD_ARCHES on one each: 265 libraries); the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 269
-    assert len(names) == len(set(names)) == 269
+    assert len(train_libraries) == 265
+    assert len(names) == len(set(names)) == 265
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"

@@ -221,6 +221,9 @@ for _path in ("light", "light_states", "tape"):
         s for s in _PATH_STAGES["replay"] if s not in ("fwd_intra", "qk_l2norm")
     )
 del _path
+# Stages the replay path selects a record for but never launches (:meth:`Plan.stages`): the fallback's
+# ``qk_apply`` reads a saved rstd, which the replay recomputes with ``qk_l2norm`` instead.
+_REPLAY_UNLAUNCHED = ("qk_apply",)
 
 # A launcher takes a record name, the logical argument values, the plan grid and the device index and runs the
 # program (``cake_jit.run_module``).  The workspace holds one so a diagnostic harness can run the same composition
@@ -549,13 +552,18 @@ class Plan:
 
     def stages(self, path: str) -> tuple[str, ...]:
         """The stages ``path`` launches on this plan, in registry order (the tables included; ``seg_carry`` on the
-        segmented route)."""
+        segmented route).  The in-kernel Q/K L2 norm fallback's replay normalizes q / k with ``qk_l2norm`` (it
+        writes the rstd) and launches no ``qk_apply``: the plan keeps that record among the replay path's records (the
+        KCP's local backward plans on that path), but this module does not launch it there."""
         self._records(path)
         return tuple(
             stage
             for stage in _PATH_STAGES[path]
             if (stage == "seg_carry" and self.recur == "seg")
-            or self.dispatched(stage, path)
+            or (
+                self.dispatched(stage, path)
+                and not (path == "replay" and stage in _REPLAY_UNLAUNCHED)
+            )
         )
 
     def launch_count(self, path: str, *, tables: bool = True) -> int:

@@ -261,7 +261,7 @@ __device__ __forceinline__ void tmem_st_x8_u32(int addr, const uint32_t* src) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -313,7 +313,7 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_qd_addr = smem + 1024;
     __nv_bfloat16* smem_g_raw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -407,8 +407,7 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
     unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 227348);
     const int smem_work_item_resolved_addr = smem + 227348;
 
-    // Mbarrier init (22 pipeline groups, 0 ordered-sequence groups, 91 barriers)
-    // Mbarriers at smem_raw[0..728)
+    // Mbarrier init (91 barriers at smem_raw[0..728))
 
     if (warp == 10) {
         // --- pipeline 'chunk_pipe' ---
@@ -480,32 +479,32 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_0 = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_1 = taddr + 80;
+    const unsigned int tmem_tmem_state_decay_2 = taddr + 96;
+    const unsigned int tmem_tmem_state_decay_3 = taddr + 112;
+    const unsigned int tmem_tmem_state_decay_4 = taddr + 128;
+    const unsigned int tmem_tmem_state_decay_5 = taddr + 144;
+    const unsigned int tmem_tmem_state_decay_6 = taddr + 160;
+    const unsigned int tmem_tmem_state_decay_7 = taddr + 176;
+    const unsigned int tmem_tmem_state_inp = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_0 = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_1 = taddr + 8;
+    const unsigned int tmem_tmem_state_inp_decay_2 = taddr + 16;
+    const unsigned int tmem_tmem_state_inp_decay_3 = taddr + 24;
+    const unsigned int tmem_tmem_state_inp_decay_4 = taddr + 32;
+    const unsigned int tmem_tmem_state_inp_decay_5 = taddr + 40;
+    const unsigned int tmem_tmem_state_inp_decay_6 = taddr + 48;
+    const unsigned int tmem_tmem_state_inp_decay_7 = taddr + 56;
+    const unsigned int tmem_tmem_u_acc = taddr + 224;
+    const unsigned int tmem_tmem_u2_inp = taddr + 224;
+    const unsigned int tmem_tmem_u2_acc = taddr;
+    const unsigned int tmem_tmem_out = taddr + 192;
+    const unsigned int tmem_tmem_state_out = taddr + 64;
 
     // Kernel post-init ops
-    const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_decay_0 = taddr + 64;
-    const int tmem_tmem_state_decay_1 = taddr + 80;
-    const int tmem_tmem_state_decay_2 = taddr + 96;
-    const int tmem_tmem_state_decay_3 = taddr + 112;
-    const int tmem_tmem_state_decay_4 = taddr + 128;
-    const int tmem_tmem_state_decay_5 = taddr + 144;
-    const int tmem_tmem_state_decay_6 = taddr + 160;
-    const int tmem_tmem_state_decay_7 = taddr + 176;
-    const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_state_inp_decay_0 = taddr;
-    const int tmem_tmem_state_inp_decay_1 = taddr + 8;
-    const int tmem_tmem_state_inp_decay_2 = taddr + 16;
-    const int tmem_tmem_state_inp_decay_3 = taddr + 24;
-    const int tmem_tmem_state_inp_decay_4 = taddr + 32;
-    const int tmem_tmem_state_inp_decay_5 = taddr + 40;
-    const int tmem_tmem_state_inp_decay_6 = taddr + 48;
-    const int tmem_tmem_state_inp_decay_7 = taddr + 56;
-    const int tmem_tmem_u_acc = taddr + 224;
-    const int tmem_tmem_u2_inp = taddr + 224;
-    const int tmem_tmem_u2_acc = taddr;
-    const int tmem_tmem_out = taddr + 192;
-    const int tmem_tmem_state_out = taddr + 64;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -1291,14 +1290,14 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
                     tape_restore_factor[op_vec + 256] = smem_restore_factor_all[beta_stage_f32 + 128];
                     tape_restore_factor[op_vec + 289] = smem_gate_rate_all[beta_stage_f32];
                     {
-                        void* _cpbulk_dst_0 = reinterpret_cast<void*>(tape_qd + (op_slab * 4096));
+                        void* _cpbulk_dst_0 = reinterpret_cast<void*>(tape_qd + op_slab * 4096);
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_0), "r"(smem_qd_addr + (unsigned int)_chunk_idx % 5 * 41984), "r"((uint32_t)(8192))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_1 = reinterpret_cast<void*>(tape_kd + (op_slab * 4096));
+                        void* _cpbulk_dst_1 = reinterpret_cast<void*>(tape_kd + op_slab * 4096);
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_1), "r"(smem_kd_addr + (unsigned int)_chunk_idx % 5 * 41984), "r"((uint32_t)(8192))
@@ -1430,7 +1429,7 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
                 if (elect_sync()) {
                     long long op_chunk_1 = cu_chunk_offsets[seq_idx_2] + (long long)_chunk_idx;
                     {
-                        void* _cpbulk_dst_4 = reinterpret_cast<void*>(tape_j + ((op_chunk_1 * (long long)num_heads + (long long)head_idx_2) * 1024));
+                        void* _cpbulk_dst_4 = reinterpret_cast<void*>(tape_j + (op_chunk_1 * (long long)num_heads + (long long)head_idx_2) * 1024);
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_4), "r"(smem_inv_addr + (unsigned int)_chunk_idx % 5 * 41984), "r"((uint32_t)(2048))
@@ -1636,7 +1635,7 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
                         float unbounded_direct_log2;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2) : "f"(1.0f + unbounded_exponential));
                         float unbounded_softplus_log2 = ((unbounded_biased <= 20.0f) ? ((unbounded_biased < -4.0f) ? unbounded_series_log2 : unbounded_direct_log2) : unbounded_biased * 1.442695f);
-                        early_gate0 = (-early_gate_rate) * unbounded_softplus_log2;
+                        early_gate0 = -early_gate_rate * unbounded_softplus_log2;
                     }
                 }
                 int _parity_smem_free = (int)((unsigned int)prep_iter % 2) ^ 1;
@@ -1707,7 +1706,7 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
                         float unbounded_direct_log2_1;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2_1) : "f"(1.0f + unbounded_exponential_1));
                         float unbounded_softplus_log2_1 = ((unbounded_biased_1 <= 20.0f) ? ((unbounded_biased_1 < -4.0f) ? unbounded_series_log2_1 : unbounded_direct_log2_1) : unbounded_biased_1 * 1.442695f);
-                        float first_gate_value = (-gate_rate) * unbounded_softplus_log2_1;
+                        float first_gate_value = -gate_rate * unbounded_softplus_log2_1;
                         first_gate_log2 = ((first_gate_token < eos_3) ? first_gate_value : 0.0f);
                     }
                     unbounded_total_log2 = unbounded_total_log2 + first_gate_log2;
@@ -1760,7 +1759,7 @@ kernel_cake_kda_prefill_800b4d7695e48ad95305(__nv_bfloat16* __restrict__ q, cons
                     float unbounded_direct_log2_2;
                     asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2_2) : "f"(1.0f + unbounded_exponential_2));
                     float unbounded_softplus_log2_2 = ((unbounded_biased_2 <= 20.0f) ? ((unbounded_biased_2 < -4.0f) ? unbounded_series_log2_2 : unbounded_direct_log2_2) : unbounded_biased_2 * 1.442695f);
-                    float last_gate_value = (-gate_rate) * unbounded_softplus_log2_2;
+                    float last_gate_value = -gate_rate * unbounded_softplus_log2_2;
                     float last_gate_log2 = ((last_gate_token < eos_3) ? last_gate_value : 0.0f);
                     unbounded_total_log2 = unbounded_total_log2 + last_gate_log2;
                     prefix_log2 += max_noftz(last_gate_log2, -15.0f);

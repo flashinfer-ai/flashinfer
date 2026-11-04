@@ -110,10 +110,10 @@ of `"waves"` (the deterministic plan's last wave below 80 % full).  The measured
 | architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
 | `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 4096 `"H1x5p44"` and hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, and hidden 6144: deterministic (6 splits) |
-| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 5120 `"H0.5x3"` (the head/tail program with the BF16 parts of `A` in tensor memory); hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, hidden 4096 (`"H1x4p44"` up to 7.6 % slower when launched before a resident kernel) and hidden 6144: deterministic (6 splits) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 4096 `"H1x4p44"`, hidden 5120 `"H0.5x3"` and hidden 6144 `"H1x5p44"` (the head/tail program with the BF16 parts of `A` in tensor memory); hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count: deterministic (6 splits) |
 | `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1` (on exactly 216 SMs at 16172 to 16384 tokens: (192, 1) `p = 1`, the row-major-store program, 176 CTAs); `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table (the four FP32 rows with one split: from 40961 tokens up).  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the last table: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
 | `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024`, `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel the head/tail program missed at both hidden sizes on the parts at full SM clock |
-| `sm_107a` (212 SMs, 16172 to 16384 tokens and the ranges of the 212-SM K1 token-range table) | `4096 -> 32, 48, 64` FP32 (64, 3); `5120 -> 32, 48, 64` FP32 (64, 3); `8192 -> 128` (128, 2); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32: (192, 1) `p = 1` (row-major-store program, 176 CTAs); `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict, as on 208 SMs); `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed; `4096 -> 4096` FP32 against the deterministic package's 160-wide tiles of the row); `5120 -> 1024` BF16: (256, 1) `p = 1` at its range of the 212-SM K1 token-range table (`K1_SPLIT_RANGE_OVERRIDES_BY_SM`), deterministic at 16172 to 16384 tokens (1.3 to 2.5 % faster there, missed on 208 SMs) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel `"H0.5x4"` missed at hidden 4096 on all four parts and at hidden 6144 on two of them |
+| `sm_107a` (212 SMs, 16172 to 16384 tokens and the ranges of the 212-SM K1 token-range table) | `4096 -> 32, 48, 64` FP32 (64, 3); `5120 -> 32, 48, 64` FP32 (64, 3); `8192 -> 128` (128, 2); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32: (192, 1) `p = 1` (row-major-store program, 176 CTAs); `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict, as on 208 SMs); `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed; `4096 -> 4096` FP32 against the deterministic package's 160-wide tiles of the row); `5120 -> 1024` BF16: (256, 1) `p = 1` at its range of the 212-SM K1 token-range table (`K1_SPLIT_RANGE_OVERRIDES_BY_SM`), deterministic at 16172 to 16384 tokens (1.3 to 2.5 % faster there, missed on 208 SMs) | deterministic (4 splits) | 256 experts, hidden 5120 and 6144 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program with the BF16 parts of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES_BY_SM`).  Every other token count, and hidden 4096: deterministic (6 splits): next to a resident kernel `"H0.5x4"` missed at hidden 4096 with both head/tail programs, and at hidden 6144 with the three-chunk-buffer program |
 
 *Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
 holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens; on `sm_107a`,
@@ -299,8 +299,9 @@ K block) step) and 380 units at 16k tokens; on 148 SMs the deterministic plan's 
 runs the deterministic program.
 
 `"H<f>x<k>"` (`router_partition_of`, the weight gradient only) runs the head/tail program
-`router_fp32_gemm_atomic_nn_t_ht_c3_nreg` (on `sm_103a`: `router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg`, the same
-products, accumulators and part segments with the BF16 parts of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES`):
+`router_fp32_gemm_atomic_nn_t_ht_c3_nreg` (on `sm_103a` and on 212-SM `sm_107a` parts:
+`router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg`, the same products, accumulators and part segments with the BF16 parts
+of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES` / `ROUTER_HEAD_TAIL_TEMPLATES_BY_SM`):
 one head unit per CTA pair, whose spans share about the fraction `f` of
 the (row-tile pair, K block) steps, then `k` tail units per CTA pair over the rest (each count a multiple of the
 column tile count).  Every pair starts a long head span at once; the short tail spans go to the pairs that finish
@@ -310,7 +311,7 @@ and 228 tail units at 152 SMs; `"H0.5x4"` is 104 head and 416 tail units at 208 
 deterministic program.
 `"H<f>x<k>p<h>"` starts only `h` head units (at most one per CTA pair), each about `f` of a pair's even share of the
 steps; the other pairs start on the tail spans, so a kernel holding the SMs of up to `pairs - h` CTA pairs delays no
-head span.  At 152 SMs `"H1x5p44"` is 44 head and 380 tail units.
+head span.  At 152 SMs `"H1x4p44"` is 44 head and 304 tail units and `"H1x5p44"` 44 head and 380 tail units.
 
 | row of `ROUTER_RULES` (weight gradient, 256 experts) | token window | measured at (tokens) | part | time / deterministic plan, alone | worst next to a resident kernel: same launch order / router launched first |
 |---|---|---|---|---|---|
@@ -319,22 +320,33 @@ head span.  At 152 SMs `"H1x5p44"` is 44 head and 380 tail units.
 | `sm_100a` hidden 5120 `"H0.5x3"` | 10240 to 32768 | 10240, 12288, 16172, 16231, 16384, 32768 | GB200, 152 SMs | x0.750-0.883 | x1.003 / x1.011 |
 | `sm_103a` hidden 5120 `"waves"` | 1 to 192 | 64, 128, 192 | GB300, 152 SMs | x0.706-0.919 | x1.005 / x0.917 |
 | `sm_103a` hidden 5120 `"H0.5x3"` | 16172 to 32768 | 16172, 16231, 16384, 32768 | GB300, 152 SMs | x0.820-0.875 | x0.984 / x1.020 |
+| `sm_103a` hidden 4096 `"H1x4p44"` | 20480 to 49152 | 20480, 24576, 32768, 49152 | GB300, 152 SMs (four or five parts) | x0.862-0.952 | x1.011 / x1.008 |
+| `sm_103a` hidden 6144 `"H1x5p44"` | 16172 to 20480 | 16172, 16231, 16384, 20480 | GB300, 152 SMs (four parts) | x0.922-0.956 | x1.025 / x0.992 |
 | `sm_107a` hidden 5120 `"H0.5x4"` | 16172 to 16384 | 16172, 16231, 16384 | R200, 216 SMs (two parts) | x0.793-0.819 | x0.960 / x0.963 |
-| `sm_107a` hidden 5120 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 212 SMs) | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs (four parts) | x0.798-0.844 | x0.983 / x0.981 |
+| `sm_107a` hidden 5120 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 212 SMs, the head/tail program with the `A` parts in tensor memory) | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs (four parts in two nodes) | x0.735-0.770 | x0.922 / x0.925 |
+| `sm_107a` hidden 6144 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 212 SMs, the head/tail program with the `A` parts in tensor memory) | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs (four parts in two nodes) | x0.831-0.870 | x0.981 / x0.961 |
 | `sm_107a` hidden 5120 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 208 SMs) | 16172 to 16384 | 16172, 16231, 16384 | R200, 208 SMs (two parts, and a third at a lower SM clock) | x0.816-0.830 | x1.002 / x1.015 |
 
 *Table: the token windows of the router weight gradient (eager launches and CUDA graph replays, one long-lived process
 and a fresh process per token count; the resident kernel holds 8, 16 or 32 SMs).  The `"waves"` rows are the FI-main
 `"waves"` plan (same kernel text, measured on this package's host path).  On GB200 the rows from 10240 tokens up ran at
 the GPU's software power cap: after 21 of their 24 runs `nvidia-smi` read `clocks_throttle_reasons` 0x4, at SM clocks of
-1297-1912 MHz (2062 MHz maximum); on the R200 parts it read 0x4 after some rows as well.  The arms of each row
-were measured interleaved, in paired groups.  Inside the head/tail windows cuBLAS FP32 in
+1297-1912 MHz (2062 MHz maximum); on the R200 parts it read 0x4 after some rows as well (sampled every 200 ms only
+during 6 of the 12 runs at hidden 5120 and 6 of the 10 at hidden 6144, those on two of the four 212-SM parts: 0x4 in
+17-47 % of the non-idle samples, median SM clock
+2388-2400 MHz, no hardware slowdown or thermal reason), and during the GB300 hidden 4096 / 6144 runs in part of the
+500 ms samples (median SM clock 1830-2070 MHz of 2070 MHz).  The arms of each row were measured interleaved, in paired
+groups.  Inside the head/tail windows cuBLAS FP32 in
 `CUBLAS_FP32_EMULATED_BF16X9_MATH` (the benchmark's `bf16x9` arm) took x1.455-1.565 (GB200 hidden 4096), x1.516-1.594
-(GB200 hidden 5120), x1.534-1.610 (GB300), x1.630-1.715 (R200, 216 SMs), x1.647-1.728 (R200, 212 SMs) and
-x1.639-1.768 (R200, 208 SMs) of the partition's time: at least x1.455.  On the 208-SM and 212-SM parts at full SM
-clock `"H0.5x3"` was 0.9-2.1 % faster than `"H0.5x4"`, but on a 208-SM part at a lower SM clock (about 2000 MHz; there
-`"H0.5x4"` took x0.931-0.959 alone) it was up to 4.9 % slower than the deterministic plan when launched before a
-resident kernel, so both SM counts take `"H0.5x4"`.  The head/tail windows hold
+(GB200 hidden 5120), x1.500-1.640 (GB300), x1.630-1.715 (R200, 216 SMs), x1.809-1.915 (R200, 212 SMs, hidden 5120 and
+6144) and x1.639-1.768 (R200, 208 SMs) of the partition's time: at least x1.455.  On 212 SMs the head/tail program with
+the BF16 parts of `A` in tensor memory took x0.916-0.954 of the three-chunk-buffer program's time at hidden 5120 and
+x0.906-0.950 at hidden 6144 (same partition, alone); with the three-chunk-buffer program hidden 6144 was up to 9.2 %
+slower than the deterministic plan next to a resident kernel, so its window holds only with the tensor-memory program.
+On the 208-SM and 212-SM parts at full SM clock the three-chunk-buffer program with `"H0.5x3"` was 0.9-2.1 % faster
+than with `"H0.5x4"`, but on a 208-SM part at a lower SM clock (about 2000 MHz; there `"H0.5x4"` took x0.931-0.959
+alone) it was up to 4.9 % slower than the deterministic plan when launched before a resident kernel, so both SM counts
+take `"H0.5x4"`.  The head/tail windows hold
 only on the SM count of their part (`ROUTER_SM_COUNT`, or the part's own table in `ROUTER_RULES_BY_SM`), the
 `"waves"` windows on every SM count where `"waves"` applies (`router_waves`); every other token count and SM count runs
 the deterministic plan.
@@ -366,7 +378,8 @@ it through a cached binding of this package: the deterministic package's plan an
 arena, keyed by the entry point's own tensors.  A batched forward that the deterministic package runs on its swapped
 small-token program makes that package's call (with `enable_pdl` and `weights_static`).
 A cached K2 launch of the convenience path orders its arguments once per cache key
-and converts the arena's BF16x3 stack once per arena growth, so a call converts only the caller's views.  A K2 call
+and converts the arena's BF16x3 stack once per arena growth, so a call passes only the caller's views (each
+converted in its FFI call) and enters the arena's stream context, made once.  A K2 call
 that runs the deterministic program -- the input gradient, the forward without a split count, a call without a split
 count whose row has no verdict in the router table of the device's SM count (`ROUTER_RULES`, or the part's own table
 in `ROUTER_RULES_BY_SM`; not planned here) -- launches it through a cached binding of this package: the
@@ -375,7 +388,11 @@ partials in this package's arena, bound once per arena growth, and the entry poi
 views.  It issues the same launches as the deterministic package's convenience path in fewer host operations.  Whether a row has a verdict is kept per device and view geometry, and whether any
 router table gives the forward one is kept too, until a router table changes: the router tables count their changes,
 so a verdict set or removed at run time is seen at the next call (a table rebound to a plain `dict` is read on every
-call).
+call).  The router entry points (`router_forward`, `router_dgrad`, `router_wgrad`) cache each call once more by their
+own tensors, the operation, the split count and the PDL flag: a call goes from that key to the cached launch its
+route takes, without building the transposed operand, routing the row or building the launch's own key; the key is
+routed again when a router table or `ROUTES` changes (with a table rebound to a plain `dict`, every call takes the
+full path).
 
 ## Benchmark
 

@@ -64,6 +64,10 @@ CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_small)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_small)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o110_quad)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o110_lt)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lt)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_lt)
@@ -119,6 +123,19 @@ const void* const kKernels[2][3][2] = {
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111)},
      {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110),
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111)},
+     {nullptr, nullptr}},
+};
+
+// World-size-2 quad-gather programs (route quad rounds, one cluster per token), same order as
+// kKernels; world size 2 only.
+const void* const kW2QuadKernels[2][3][2] = {
+    {{reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws2_o110_quad),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad)},
+     {nullptr, nullptr},
+     {nullptr, nullptr}},
+    {{reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad)},
+     {nullptr, nullptr},
      {nullptr, nullptr}},
 };
 
@@ -222,6 +239,13 @@ static_assert(kTwoShotEarlyMaxTokensWorldSize8 >= kTwoShotMinTokensWorldSize8 &&
 // with the shared-expert operand; every other world-size-2 batch runs the persistent program.
 constexpr int64_t kLargeTokenMinTokens = 512;
 constexpr int64_t kLargeTokenMinTokensSharedExpert = 1280;
+
+// World size 2 runs the quad-gather program for batches above the small-token test up to this
+// token count (one wave: at most 142 resident clusters at 4 CTAs per SM).
+constexpr int64_t kW2QuadMaxTokens = 142;
+static_assert(kW2QuadMaxTokens > kSmallTokenExtendedMax && kW2QuadMaxTokens <= 142 &&
+                  kW2QuadMaxTokens < kLargeTokenMinTokens,
+              "the world size 2 quad-gather range must end inside one wave below the large-token range");
 
 int sm_count(int device_id) {
   TVM_FFI_CHECK(device_id >= 0 && device_id < kMaxDevices, ValueError)
@@ -481,6 +505,7 @@ void cake_moe_finalize_allreduce_fusion(
           ? two_shot_early
           : two_shot;
   const void* large_token = kLargeTokenKernels[dtype_index][ws_index][quant_index];
+  const void* w2_quad = kW2QuadKernels[dtype_index][ws_index][quant_index];
   const bool small_token_extended =
       world_size == 4 || (world_size == 2 && (top_k != 4 || v_has_shared_expert != 0));
   const void* kernel = nullptr;
@@ -502,6 +527,9 @@ void cake_moe_finalize_allreduce_fusion(
              tokens > (v_has_shared_expert != 0 ? kLargeTokenMinTokensSharedExpert
                                                 : kLargeTokenMinTokens)) {
     kernel = large_token;
+  } else if (w2_quad != nullptr && tokens <= kW2QuadMaxTokens) {
+    // Keyed on the token count and the world size alone (the table holds world size 2 only).
+    kernel = w2_quad;
   } else {
     kernel = kKernels[dtype_index][ws_index][quant_index];
   }
