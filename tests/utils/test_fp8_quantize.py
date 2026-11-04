@@ -147,6 +147,8 @@ def test_mxfp8_quantize_empty(sf_layout):
     q, sf = mxfp8_quantize(x, sf_swizzle_layout=sf_layout)
     assert q.shape == x.shape and q.dtype == torch.float8_e4m3fn
     assert sf.numel() == 0 and sf.dtype == torch.uint8
+    with pytest.raises(NotImplementedError, match="fp16/bf16"):
+        mxfp8_quantize(x.float(), sf_swizzle_layout=sf_layout)
     # A rejected zero-grid launch must not surface in the next CUDA operation.
     probe = torch.ones(16, device="cuda")
     torch.testing.assert_close(probe + 1, torch.full_like(probe, 2))

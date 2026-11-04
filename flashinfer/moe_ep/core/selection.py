@@ -122,9 +122,9 @@ class Collective:
 
         self.prepare(write)
 
-    def measure(self, fn, device, settings, *, warmups=3, repeats=10):
+    def measure(self, fn, device, settings, *, warmup=None, warmups=3, repeats=10):
         for _ in range(warmups):
-            fn()
+            (warmup or fn)()
         torch.cuda.synchronize()
         trial = SimpleNamespace(
             config=SimpleNamespace(world_size=self.world), device=device, launch=fn

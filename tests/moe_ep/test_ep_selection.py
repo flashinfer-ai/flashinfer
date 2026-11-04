@@ -25,7 +25,7 @@ class LocalCollective(Collective):
         self.rank, self.world = 0, 1
         self.measured = []
 
-    def measure(self, fn, device, settings):
+    def measure(self, fn, device, settings, **kwargs):
         result = fn()
         self.measured.append(result[0])
         return result[1]
@@ -164,6 +164,35 @@ def test_captured_plans_survive_replacement_until_handle_destruction():
     first.destroy.assert_called_once()
 
 
+def test_teardown_releases_other_plans_and_runtime_after_a_failure(monkeypatch):
+    from flashinfer.moe_ep.modes import auto_layer
+
+    owner = Mock()
+    workspace = MoEEpAutoWorkspace(owner, None, [])
+    first = Mock(destroy=Mock(side_effect=RuntimeError("plan teardown failed")))
+    retained = Mock()
+    workspace._plan, workspace._retained = first, [retained]
+    failed, prototype, runtime = Mock(), Mock(), object()
+    layer = SimpleNamespace(
+        _destroyed=False,
+        _workspaces=[workspace],
+        _failed_plans=[failed],
+        _prototypes={0: prototype},
+        _runtime=runtime,
+    )
+    release = Mock()
+    monkeypatch.setattr(auto_layer, "finalize_moe_ep_runtime", release)
+    with pytest.raises(RuntimeError, match="plan teardown failed"):
+        auto_layer.MoEEpAutoLayer.destroy(layer)
+    for item in (first, retained, failed, prototype):
+        item.destroy.assert_called_once()
+    release.assert_called_once_with(runtime)
+    assert workspace._destroyed and layer._destroyed
+    workspace.destroy()
+    auto_layer.MoEEpAutoLayer.destroy(layer)
+    release.assert_called_once()
+
+
 def test_bare_execution_generation_does_not_consult_cache_identity():
     class Context:
         scope = None
@@ -182,6 +211,33 @@ def test_record_contract_has_no_object_addresses():
     config = AutoConfig((SplitConfig(),))
     assert record_key(config) == record_key(AutoConfig((SplitConfig(),)))
     assert "0x" not in str(plain(config))
+
+
+def test_numerical_contract_distinguishes_activation_scaling():
+    import dataclasses
+    from flashinfer.moe_ep import (
+        FusedMoeKernelConfig,
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.modes.selection import numerical_contract
+    from tests.moe_ep.test_fused_moe_weights import _nvfp4_moe_config
+
+    cfg = _nvfp4_moe_config(
+        num_experts=8, local_num_experts=4, offset=0, intermediate=256
+    )
+    split = SplitConfig(kernel=FusedMoeKernelConfig(cfg))
+    contract = numerical_contract(split, None, None)
+    prototype = SimpleNamespace(
+        _kernel=SimpleNamespace(
+            ep_tuning_contract=lambda _: {"revision": 1, **contract}
+        )
+    )
+    mega = MegaConfig(Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 4))
+    assert numerical_contract(mega, prototype, None) == contract
+    split.kernel.moe_config = dataclasses.replace(
+        cfg, quant=dataclasses.replace(cfg.quant, per_token_scale=True)
+    )
+    assert numerical_contract(split, None, None) != contract
 
 
 def test_rank_local_expert_offset_does_not_change_common_configuration():
@@ -382,6 +438,60 @@ def test_optional_preparation_does_not_swallow_runtime_failures():
         c.prepare(failed, optional=True)
 
 
+@pytest.mark.parametrize("peer_failure", [False, True])
+@pytest.mark.parametrize("stage", ["quantize", "compute"])
+def test_split_warmup_coordinates_local_stages(monkeypatch, peer_failure, stage):
+    from flashinfer.moe_ep.modes import selection
+
+    c = LocalCollective()
+    c.gather = lambda value: [
+        value,
+        ("ValueError: peer setup failed", True) if peer_failure else value,
+    ]
+    monkeypatch.setattr(selection, "Collective", lambda _: c)
+    plan = object.__new__(selection.SplitPlan)
+    plan.layer = SimpleNamespace(_bootstrap=object())
+    if peer_failure:
+        with (
+            pytest.raises(RuntimeError, match="peer setup failed"),
+            plan._prepare_stage(stage),
+        ):
+            pass
+    else:
+        with (
+            pytest.raises(RuntimeError, match="local setup failed"),
+            plan._prepare_stage(stage),
+        ):
+            raise ValueError("local setup failed")
+
+
+def test_ineligible_split_plan_is_skipped_before_discovery_forward(monkeypatch):
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.modes import auto_layer, selection
+    from flashinfer.moe_ep.modes.split_layer import MoEEpSplitLayer
+
+    c = LocalCollective()
+    monkeypatch.setattr(selection, "Collective", lambda _: c)
+    plan = object.__new__(selection.SplitPlan)
+    plan.output = torch.empty(1)
+    plan.layer = SimpleNamespace(
+        _bootstrap=object(),
+        create_graph_state=Mock(side_effect=ValueError("cannot be captured")),
+        _forward_prepared=Mock(),
+    )
+    monkeypatch.setattr(auto_layer, "SplitPlan", Mock(return_value=plan))
+    plan.destroy = Mock()
+    layer = SimpleNamespace(
+        _prototypes={0: Mock(spec=MoEEpSplitLayer)}, _failed_plans=[], _collective=c
+    )
+    tensors = MoEEpTensors(torch.empty(1, 8), torch.zeros(1, 1), torch.ones(1, 1))
+    protocol = auto_layer._OuterProtocol(layer, SimpleNamespace(fleet=None), tensors)
+    assert protocol._new_plan(0) is None
+    plan.layer._forward_prepared.assert_not_called()
+    plan.destroy.assert_called_once()
+    assert not layer._failed_plans
+
+
 def test_failed_split_initialization_releases_its_runtime(monkeypatch):
     from flashinfer.moe_ep import BootstrapConfig, FleetParams
     from flashinfer.moe_ep.modes import split_layer
@@ -415,6 +525,24 @@ def test_workspace_rejects_inputs_on_another_device():
     )
     with pytest.raises(ValueError, match="layer's CUDA device"):
         MoEEpAutoLayer._validate_device(layer, t)
+
+
+def test_direct_split_rejects_zero_runtime_capacity_for_empty_batch(monkeypatch):
+    from flashinfer.moe_ep import FleetParams, MoEEpTensors
+    from flashinfer.moe_ep.modes import split_layer
+
+    monkeypatch.setattr(split_layer, "ensure_bootstrap_dist_validated", lambda _: None)
+    layer = SimpleNamespace(
+        _destroyed=False, _bootstrap=object(), _fleet_params=FleetParams(8, 64, 8)
+    )
+    tensors = MoEEpTensors(
+        torch.empty(0, 8),
+        torch.empty(0, 4, dtype=torch.int64),
+        torch.empty(0, 4),
+        runtime_max_tokens_per_rank=0,
+    )
+    with pytest.raises(ValueError, match=r"max\(num_tokens, 1\)"):
+        split_layer.MoEEpSplitLayer.forward(layer, tensors)
 
 
 def test_rubin_weight_preparation_converts_only_the_fc1_order():

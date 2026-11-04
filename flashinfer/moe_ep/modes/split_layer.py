@@ -593,11 +593,13 @@ class MoEEpSplitLayer(nn.Module):
         )
         runtime_max = t.runtime_max_tokens_per_rank
         if runtime_max is not None and not (
-            t.num_tokens <= runtime_max <= self._fleet_params.max_tokens_per_rank
+            max(t.num_tokens, 1)
+            <= runtime_max
+            <= self._fleet_params.max_tokens_per_rank
         ):
             raise MoEEpConfigError(
                 f"runtime_max_tokens_per_rank={runtime_max} must lie in "
-                f"[num_tokens={t.num_tokens}, "
+                f"[max(num_tokens, 1)={max(t.num_tokens, 1)}, "
                 f"max_tokens_per_rank={self._fleet_params.max_tokens_per_rank}]"
             )
 
