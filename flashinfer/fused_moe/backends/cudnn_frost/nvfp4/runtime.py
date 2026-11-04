@@ -402,6 +402,8 @@ class PreparedNvfp4GroupedGemm:
             raise ValueError(
                 "COMBINE kernels require the MoELayer routing/reduction ABI"
             )
+        if kernel.gathers_input:
+            raise ValueError("GATHER kernels require the MoELayer token-index ABI")
         if kernel.quantizes_output:
             raise ValueError("quantized FC1 kernels are launched by the MoE runner")
         if tokens.device.type != "cuda":

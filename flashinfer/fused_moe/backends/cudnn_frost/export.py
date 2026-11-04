@@ -593,6 +593,8 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
     combine_output = getattr(args, "combine_output", False)
     if quantize_output and (dtype == "bf16" or config.swap_ab):
         raise ValueError("fused output quantization requires normal block-scaled FC1")
+    if getattr(args, "gather_input", False) and arch != "sm_107a":
+        raise ValueError("GATHER export requires an SM107a GPU")
     graph = _build_graph(
         args.s,
         args.n,

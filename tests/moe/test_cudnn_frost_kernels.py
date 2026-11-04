@@ -3673,6 +3673,8 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                 first = tuple(k for k in first if not k.gathers_input)
                 assert len(gathered) <= 6
                 assert 2 <= len(first) <= 6 and len(regular) == 2 and len(combined) <= 2
+                if arch == "sm_107a" and moe.runtime is nvfp4:
+                    assert combined
                 assert tuple(k.artifact_id for k in first[:2]) == identities[0]
                 assert tuple(k.artifact_id for k in regular) == identities[1]
                 for kernel in first[2:]:
