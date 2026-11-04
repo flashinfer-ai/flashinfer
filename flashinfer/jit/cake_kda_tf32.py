@@ -16,7 +16,8 @@ device holds its grid, ``_RENDERED_OWNER_HELPER_POOL_ROUTES`` for its pooled bui
 module, ``_RENDERED_WORK_BIN_MIX_ROUTES`` for the bin-mix build of a module's
 work-bin turnover build, ``_RENDERED_WORK_BIN_POOL_ROUTES`` for the helper-pool build
 of its bin-mix build, ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` for the short-task build
-of its turnover build).
+of its turnover build, ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` for the long-task build of
+its bin-mix build).
 """
 
 from functools import cache
@@ -4267,7 +4268,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_d986b68088b8ad9bf45c": {
         "sources": [
@@ -5418,6 +5419,19 @@ _RENDERED_WORK_BIN_TURN_SHORT_ROUTES: dict[str, dict[str, str]] = {
     "sm_103a": {},
 }
 
+# architecture -> shipped module -> generated long-task build of the module's
+# bin-mix build (``_RENDERED_WORK_BIN_MIX_ROUTES``): the same bins, plan and
+# bits with the per-warp TMA final-state store.  The runtime takes it instead
+# of the bin-mix build on bin-mix launches whose longest task is longer than
+# ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks; every other bin-mix launch
+# keeps the bin-mix build.
+_RENDERED_WORK_BIN_MIX_LONG_ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_d692d2b532922f2ee845",
+    },
+    "sm_103a": {},
+}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -6509,6 +6523,7 @@ class PreparedKernel:
             or name in _RENDERED_WORK_BIN_MIX_ROUTES.get(arch, {}).values()
             or name in _RENDERED_WORK_BIN_POOL_ROUTES.get(arch, {}).values()
             or name in _RENDERED_WORK_BIN_TURN_SHORT_ROUTES.get(arch, {}).values()
+            or name in _RENDERED_WORK_BIN_MIX_LONG_ROUTES.get(arch, {}).values()
         )
         native = load(name, arch)
         entry = record["ffi_entry"]
