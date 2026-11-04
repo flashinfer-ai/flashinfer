@@ -88,6 +88,10 @@ CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tsd)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tse)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tse)
@@ -193,6 +197,20 @@ const void* const kTwoShotDeferKernels[2][3][2] = {
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd)},
      {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tsd),
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsd)}},
+};
+
+// Deferred two-shot programs that also prefetch the token's shared-expert row to L2, same order
+// as kKernels; world size 4 only. They run the same exchange as kTwoShotDeferKernels, so a rank
+// with a shared-expert operand may run them while another rank runs kTwoShotDeferKernels.
+const void* const kTwoShotDeferSharedKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsds),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsds)},
+     {nullptr, nullptr}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds)},
+     {nullptr, nullptr}},
 };
 
 // Two-shot early programs, same order as kKernels; world sizes 4 and 8 only.
@@ -490,6 +508,7 @@ void cake_moe_finalize_allreduce_fusion(
   const void* small_token = kSmallKernels[dtype_index][ws_index][quant_index];
   const void* two_shot = kTwoShotKernels[dtype_index][ws_index][quant_index];
   const void* two_shot_defer = kTwoShotDeferKernels[dtype_index][ws_index][quant_index];
+  const void* defer_shared = kTwoShotDeferSharedKernels[dtype_index][ws_index][quant_index];
   const bool defer_excluded =
       world_size == 8 && top_k == 4 && v_has_shared_expert == 0 && !quantize;
   const bool two_shot_deferred =
@@ -514,7 +533,7 @@ void cake_moe_finalize_allreduce_fusion(
     // Keyed on the token count and the world size alone, ahead of the small-token extension
     // (class-keyed at world size 2) and its device-local capacity term. All two-shot forms use
     // the same workspace and messages, so a rank may run any of them.
-    kernel = two_shot_deferred ? two_shot_defer : two_shot_now;
+    kernel = two_shot_deferred ? ((v_has_shared_expert != 0 && defer_shared != nullptr) ? defer_shared : two_shot_defer) : two_shot_now;
   } else if (tokens <= small_token_max ||
              (small_token_extended && tokens <= kSmallTokenExtendedMax &&
               tokens <= cluster_capacity(small_token))) {
@@ -522,7 +541,7 @@ void cake_moe_finalize_allreduce_fusion(
     // capacity term may differ between ranks.
     kernel = small_token;
   } else if (two_shot != nullptr && world_size == 8) {
-    kernel = two_shot_deferred ? two_shot_defer : two_shot_now;
+    kernel = two_shot_deferred ? ((v_has_shared_expert != 0 && defer_shared != nullptr) ? defer_shared : two_shot_defer) : two_shot_now;
   } else if (large_token != nullptr && top_k == 4 &&
              tokens > (v_has_shared_expert != 0 ? kLargeTokenMinTokensSharedExpert
                                                 : kLargeTokenMinTokens)) {

@@ -3182,13 +3182,17 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # their round 4 adds 2 sm_100a and 2 sm_103a keys (the 5120 -> 17408 input gradient:
     # test_gb_t_exact_rules_plan_their_programs); their round 5 adds 2 sm_100a keys (the 12288 -> 4096
     # forward: test_gb_t_exact_rules_plan_their_programs); their round 6 adds 2 sm_100a and 2 sm_103a keys
-    # (the 17408 -> 5120 forward: test_gb_t_exact_rules_plan_their_programs);
+    # (the 17408 -> 5120 forward: test_gb_t_exact_rules_plan_their_programs); their round 7 adds
+    # 2 sm_100a keys (the 5120 -> 17408 weight gradient: test_gb_t_exact_wgrad_rules_plan_their_programs);
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
     assert (
-        len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 1
+        len(ROW_RULES)
+        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 1
     )
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2
+    assert (
+        sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2
+    )
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2 + 2 + 2
     assert ARCH_RULE_DEFAULTS == {
@@ -8464,7 +8468,8 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
     )
 
 
-# The GB T-exact weight-gradient rules (round 2): ROW_RULES key -> the program it plans at its T (K = T, in the direct
+# The GB T-exact weight-gradient rules (round 2; round 7: the sm_100a 5120 -> 17408 weight gradient with the sm_103a
+# keys' rule of the row): ROW_RULES key -> the program it plans at its T (K = T, in the direct
 # orientation the row plans without it, G[T, M].T @ X[T, N]), with the per-tile K partitions of the row's plan without it
 # (whole K per output tile on both), so every output is bitwise equal to that plan's.
 GB_T_EXACT_WGRAD_ROWS = {
@@ -8489,6 +8494,28 @@ GB_T_EXACT_WGRAD_ROWS = {
         17408,
         16384,
         5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+    (
+        "sm_100a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        5120,
+        16231,
+        17408,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+    (
+        "sm_100a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        5120,
+        16384,
+        17408,
     ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
     (
         "sm_103a",
@@ -8547,8 +8574,9 @@ def _gb_wgrad_views(N, T, M):
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
-    """The GB T-exact weight-gradient rules (sm_100a: the 17408 -> 5120 weight gradient at T 16231 / 16384; sm_103a: the
-    5120 -> 17408 and 17408 -> 5120 weight gradients at T 16231 / 16384; all with the half-tail program through the
+    """The GB T-exact weight-gradient rules (sm_100a: the 17408 -> 5120 weight gradient at T 16231 / 16384 and, round
+    7, the 5120 -> 17408 weight gradient at T 16231 / 16384; sm_103a: the 5120 -> 17408 and 17408 -> 5120 weight
+    gradients at T 16231 / 16384; all with the half-tail program through the
     one-slot TMA store and 12-row raster groups) plan their program at their T on every SM count of the architecture's
     parts, in the direct orientation and with whole K per output tile like the row's plan without the key (on sm_103a
     without the sm_100a key it restates as well); one token more or less plans that plan."""
