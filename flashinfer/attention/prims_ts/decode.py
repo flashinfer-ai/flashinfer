@@ -1203,6 +1203,7 @@ def _decode_scratch_shapes(
         num_q_groups = cute.sym_int()
     else:
         num_q_groups = seq_len_q * geometry.head_ctas_per_token
+    partial_o_shape: tuple[int, ...]
     if cfg.uses_compact_split_grid:
         # Partials are packed by the launch fanout: slot (b * Hkv + h) *
         # requested + split. The slot count is a runtime extent, so the
