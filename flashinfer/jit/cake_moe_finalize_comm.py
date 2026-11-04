@@ -49,6 +49,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_lt",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws2_o110_small": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o110_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small",
@@ -62,6 +67,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_bfloat16_ws2_o111_lt": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o111_lt_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_bfloat16_ws2_o111_small": {
@@ -89,6 +99,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsd",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws4_o110_tse": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o110_tse_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tse",
@@ -112,6 +127,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_bfloat16_ws4_o111_tse": {
@@ -169,6 +189,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110_lt",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws2_o110_quad": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws2_o110_quad_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110_quad",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws2_o110_small": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws2_o110_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110_small",
@@ -182,6 +207,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_float16_ws2_o111_lt": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws2_o111_lt_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws2_o111_quad": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws2_o111_quad_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_float16_ws2_o111_small": {
@@ -209,6 +239,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsd",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws4_o110_tsds": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o110_tsds_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsds",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws4_o110_tse": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws4_o110_tse_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tse",
@@ -232,6 +267,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_float16_ws4_o111_tsd": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws4_o111_tsd_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsd",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws4_o111_tsds": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o111_tsds_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsds",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_float16_ws4_o111_tse": {

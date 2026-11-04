@@ -365,6 +365,66 @@ def test_kcp_facade_dispatch(kcp_recorded) -> None:
 
 
 @pytest.mark.cpu_only
+def test_kcp_facade_forwards_cooperative_when_given(kcp_recorded) -> None:
+    """``cooperative`` reaches the entry point that runs only when given: the deterministic one with either value,
+    the non-deterministic one with ``False`` (there ``None`` and ``False`` mean the same)."""
+
+    x, w, ctx = (object() for _ in range(3))
+    for entry, det_name in KCP_ENTRIES.items():
+        for coop in (True, False):
+            kcp_recorded.clear()
+            result, _ = _quiet(
+                lambda: getattr(kcp_facade, entry)(x, w, ctx, cooperative=coop)
+            )
+            assert result == f"det.{det_name}"
+            assert kcp_recorded == [
+                (
+                    f"det.{det_name}",
+                    (x, w, ctx),
+                    {"recompute_handle": None, "cooperative": coop},
+                )
+            ]
+        kcp_recorded.clear()
+        result, _ = _quiet(
+            lambda: getattr(kcp_facade, entry)(
+                x, w, ctx, cooperative=False, deterministic=False
+            )
+        )
+        assert result == f"nondet.{entry}"
+        assert kcp_recorded == [
+            (
+                f"nondet.{entry}",
+                (x, w, ctx),
+                {
+                    "recompute_handle": None,
+                    "deterministic": False,
+                    "cooperative": False,
+                },
+            )
+        ]
+
+
+@pytest.mark.cpu_only
+def test_kcp_package_refuses_a_cooperative_backward() -> None:
+    """The non-deterministic package's main backward is one ordinary launch: ``cooperative=True`` is a
+    ``ValueError`` and a non-``bool`` a ``TypeError``, both before anything runs."""
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as kcp_backend,
+    )
+
+    x, w, ctx = (object() for _ in range(3))
+    for entry in KCP_ENTRIES:
+        fn = getattr(kcp_backend, entry)
+        with pytest.raises(ValueError, match=f"{entry}: cooperative=True applies to"):
+            fn(x, w, ctx, cooperative=True, deterministic=False)
+        with pytest.raises(
+            TypeError, match=f"{entry}: cooperative must be None or a bool"
+        ):
+            fn(x, w, ctx, cooperative=1, deterministic=False)
+
+
+@pytest.mark.cpu_only
 def test_kcp_facade_falls_back_under_torch_deterministic_mode(
     kcp_recorded, torch_deterministic
 ) -> None:
@@ -438,10 +498,11 @@ def test_facade_signatures_mirror_the_packages() -> None:
 
     for entry, det_name in KCP_ENTRIES.items():
         mine = _parameters(getattr(kcp_facade, entry))
-        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
-            entry
-        )
-        assert mine[:-1] == _parameters(getattr(det_kcp_facade, det_name)), entry
+        assert mine[-2:] == [
+            ("deterministic", inspect.Parameter.KEYWORD_ONLY, True),
+            ("bwd_reserve_sms", inspect.Parameter.KEYWORD_ONLY, None),
+        ], entry
+        assert mine[:-2] == _parameters(getattr(det_kcp_facade, det_name)), entry
         theirs = {name for name, *_ in _parameters(getattr(kcp_backend, entry))}
         assert {name for name, *_ in mine} <= theirs, entry
 

@@ -279,8 +279,15 @@ def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> in
                         layout["total_bytes"]
                         >= layout["partial_offset"] + layout["partial_bytes"]
                     )
+                # a column-task single (no FP64 sums) runs its ``col_tasks`` tickets
+                # beside the chunks; no other record spells them
+                tasks = rule.get("col_tasks", 0)
+                column = single and record["workspace_rule"]["sum_bytes"] == 0
+                assert column == ("col_tasks" in rule), (name, rule)
+                if column:
+                    assert tasks > 0 and hidden % tasks == 0, (name, tasks)
                 grid = loader.launch_grid(record, rows, device_index=0)
-                assert grid == (min(slots, len(table)), 1, 1)
+                assert grid == (min(slots, len(table) + tasks), 1, 1)
     return singles
 
 
@@ -299,18 +306,22 @@ def test_chunk_tables_cover_the_rows(sms: int, monkeypatch: pytest.MonkeyPatch) 
 
 
 def _with_single(
-    monkeypatch: pytest.MonkeyPatch, route: str, at_most: int, sizes: tuple[int, ...]
+    monkeypatch: pytest.MonkeyPatch,
+    arch: str,
+    route: str,
+    at_most: int,
+    sizes: tuple[int, ...],
 ) -> tuple[str, int, bool]:
-    """Put single-kernel records into the first ``at_most`` tokens of an sm_100a
-    route (one per entry of ``sizes``, its ``sum_bytes`` that many FP64 rows of
+    """Put single-kernel records into the first ``at_most`` tokens of a route of
+    ``arch`` (one per entry of ``sizes``, its ``sum_bytes`` that many FP64 rows of
     ``hidden``, splitting that window; the det pair keeps the rest) of a copy of
     the registry, with the package's sums region resized as the registry sizes
     it; returns the family."""
 
     kind, hidden, residual, _w_dtype = _parse(route)
     modules = dict(loader.MODULES)
-    routes = {arch: dict(by_route) for arch, by_route in loader.ROUTES.items()}
-    names = list(routes["sm_100a"][route])
+    routes = {key: dict(by_route) for key, by_route in loader.ROUTES.items()}
+    names = list(routes[arch][route])
     pair = next(
         n for n in names if modules[n]["workspace_rule"]["kind"] == "chunk_partials"
     )
@@ -345,7 +356,7 @@ def _with_single(
         kept.append(name)
     mains = [n for n in kept if modules[n]["role"] != "bwd_reduce"]
     reduces = [n for n in kept if modules[n]["role"] == "bwd_reduce"]
-    routes["sm_100a"][route] = [*singles, *mains, *reduces]
+    routes[arch][route] = [*singles, *mains, *reduces]
     monkeypatch.setattr(loader, "MODULES", modules)
     monkeypatch.setattr(loader, "ROUTES", routes)
     sums = max(
@@ -361,46 +372,56 @@ def _with_single(
     monkeypatch.setattr(
         loader, "PAIR_ROWS_OFFSET", loader.SUMS_OFFSET + loader.SUMS_BYTES
     )
-    return "sm_100a", hidden, residual
+    return arch, hidden, residual
 
 
-def _pair_led_route() -> int:
-    """The hidden size of an sm_100a BF16-weight backward route without residual
-    whose windows at 1 and 257 tokens run the det pair (the mixed-form test
-    puts single kernels into its first 256 tokens)."""
+def _pair_led_route() -> tuple[str, int, int]:
+    """The architecture and hidden size of the first BF16-weight backward route
+    without residual (sm_100a, then sm_103a, then sm_107a) whose window at 257
+    tokens runs the det pair (the mixed-form test puts single kernels into its
+    first 256 tokens), and the number of single-kernel records the route runs
+    within its first 256 tokens (the records those single kernels replace)."""
 
-    for route in sorted(loader.ROUTES["sm_100a"]):
-        kind, hidden, residual, w_dtype = _parse(route)
-        if kind != "bwd" or residual or w_dtype != "bf16":
-            continue
-        forms = [
-            loader.MODULES[name]["workspace_rule"]["kind"]
-            for rows in (1, 257)
-            for name in loader.selected_modules(
-                "sm_100a", hidden, "bwd", False, rows=rows
-            )
-            if loader.MODULES[name]["workspace_rule"] is not None
-        ]
-        if forms == ["chunk_partials", "chunk_partials"]:
-            return hidden
-    raise AssertionError(
-        "no sm_100a BF16 backward route runs the det pair at 1 and 257 tokens"
-    )
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        for route in sorted(loader.ROUTES[arch]):
+            kind, hidden, residual, w_dtype = _parse(route)
+            if kind != "bwd" or residual or w_dtype != "bf16":
+                continue
+            forms = [
+                loader.MODULES[name]["workspace_rule"]["kind"]
+                for name in loader.selected_modules(
+                    arch, hidden, "bwd", False, rows=257
+                )
+                if loader.MODULES[name]["workspace_rule"] is not None
+            ]
+            if forms == ["chunk_partials"]:
+                replaced = sum(
+                    1
+                    for name in loader.ROUTES[arch][route]
+                    if loader.MODULES[name]["workspace_rule"] is not None
+                    and loader.MODULES[name]["workspace_rule"]["kind"]
+                    == "claim_sum_f64"
+                    and _window(loader.MODULES[name])[1] is not None
+                    and _window(loader.MODULES[name])[1] <= 256
+                )
+                return arch, hidden, replaced
+    raise AssertionError("no BF16 backward route runs the det pair at 257 tokens")
 
 
 @pytest.mark.parametrize("sizes", [(1,), (4,), (4, 4), (4, 2)])
 def test_a_family_mixing_both_forms_keeps_its_regions_apart(
     sizes: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The single-kernel layout on a copy of the registry whose first sm_100a
-    route that runs the det pair at 1 and 257 tokens runs single kernels up to
-    256 tokens: the single counters and sums at their constant offsets (the sums
-    region sized by the largest ``sum_bytes``), the pair counters before them
-    and the pair partial rows after them, for every token count of both forms."""
+    """The single-kernel layout on a copy of the registry whose first route
+    that runs the det pair at 257 tokens (:func:`_pair_led_route`) runs the
+    test's single kernels up to 256 tokens: the single counters and sums at
+    their constant offsets (the sums region sized by the largest ``sum_bytes``),
+    the pair counters before them and the pair partial rows after them, for
+    every token count of both forms."""
 
     monkeypatch.setattr(loader, "sm_count", lambda device_index: 148)
-    hidden = _pair_led_route()
-    shipped = _check_family_layout("sm_100a", hidden, False, 148)  # the registry's own
+    arch, hidden, replaced = _pair_led_route()
+    shipped = _check_family_layout(arch, hidden, False, 148)  # the registry's own
     largest = max(
         (
             record["workspace_rule"]["sum_bytes"]
@@ -410,14 +431,14 @@ def test_a_family_mixing_both_forms_keeps_its_regions_apart(
         ),
         default=0,
     )
-    family = _with_single(monkeypatch, f"bwd_h{hidden}", 256, sizes)
+    family = _with_single(monkeypatch, arch, f"bwd_h{hidden}", 256, sizes)
     assert list(loader.selected_modules(family[0], hidden, "bwd", False, rows=1)) == [
         "test_single_0"
     ]
     assert len(loader.selected_modules(family[0], hidden, "bwd", False, rows=257)) == 2
     expected = -(-max(largest, 8 * hidden * max(sizes)) // 256) * 256
     assert expected == loader.SUMS_BYTES
-    assert _check_family_layout(*family, 148) == shipped + len(sizes)
+    assert _check_family_layout(*family, 148) == shipped - replaced + len(sizes)
 
 
 def test_every_backward_route_ships_the_single_kernel_or_is_listed() -> None:

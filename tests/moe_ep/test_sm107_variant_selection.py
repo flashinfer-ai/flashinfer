@@ -3,7 +3,7 @@
 import dataclasses
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import DEFAULT, Mock
 
 import pytest
 import torch
@@ -300,22 +300,48 @@ def test_collective_cache_hits_reconcile_different_winners(protocol, monkeypatch
     }
     other = {"contract": contract, "variant": "inference", "knobs": {}}
     with autotune_v2(mode="replay", persistent_cache=False):
-        context = selection._context()
-        controls = (False, False, False, False, False, selection._identity(context)[1])
-        gather = Mock(
-            side_effect=[
-                [controls, controls],
+        responses = iter(
+            [
                 [contract, contract],
                 [first, other],
                 [[True, True], [True, True]],
                 [None, None],
             ]
         )
+        gather = Mock(
+            side_effect=lambda value: [value, value]
+            if gather.call_count == 1
+            else next(responses)
+        )
         monkeypatch.setattr(protocol.backend, "_gather", gather)
         selected = AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
     assert selected["variant"] == "genphase"
     assert selected["knobs"]["cluster_shape_mn"] == (4, 1)
     assert gather.call_count == 5
+
+
+@pytest.mark.parametrize(
+    "index,value",
+    [
+        pytest.param(6, {"inference": [{}]}, id="candidates"),
+        pytest.param(8, 11, id="timed_iters"),
+    ],
+)
+def test_collective_variant_controls_must_agree(protocol, monkeypatch, index, value):
+    protocol, _ = protocol
+
+    def gather(controls):
+        peer = list(controls)
+        peer[index] = value
+        return [controls, tuple(peer)]
+
+    monkeypatch.setattr(protocol.backend, "_gather", gather)
+    with (
+        autotune_v2(persistent_cache=False),
+        pytest.raises(ValueError, match="EP ranks disagree on variant tuning controls"),
+    ):
+        AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+    protocol._install.assert_not_called()
 
 
 @pytest.mark.parametrize("phase", ["selection", "settled", "capture"])
@@ -426,6 +452,7 @@ def forward_sweep(protocol, monkeypatch):
     }
     grid = [{"epi_flag_batches": (flag, 4)} for flag in (1, 2)]
     measured = []
+    staged_routing, measured_routing = [], []
     events = []
     buffers = []
     state = SimpleNamespace(
@@ -433,6 +460,7 @@ def forward_sweep(protocol, monkeypatch):
         contract=contract,
         grid=grid,
         measured=measured,
+        measured_routing=measured_routing,
         buffers=buffers,
         failure=None,
         rejected=set(),
@@ -498,6 +526,9 @@ def forward_sweep(protocol, monkeypatch):
 
         def stage_inputs(self, tensors, workspace, *, quantize_input):
             events.append("stage")
+            staged_routing.append(
+                (tensors.topk_ids.clone(), tensors.topk_weights.clone())
+            )
             workspace.note_staged_tokens(tensors.num_tokens)
 
         def compute(self, workspace, weights, *, output):
@@ -533,6 +564,7 @@ def forward_sweep(protocol, monkeypatch):
         assert events[-len(expected_events) :] == expected_events
         key = (trial.config.kernel_variant, trial.config.epi_flag_batches[0])
         measured.append(key)
+        measured_routing.append(staged_routing[-1])
         return [state.scores[key]] * repeats
 
     monkeypatch.setattr(backend, "_backend", Kernel)
@@ -649,6 +681,185 @@ def test_full_forward_sweep_selects_across_all_knobs(
         assert not any(buffer.destroyed for buffer in buffers)
 
 
+@pytest.mark.parametrize("skew", [None, 2.0])
+def test_offline_variants_search_afresh_and_publish_without_installing(
+    forward_sweep, monkeypatch, skew
+):
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        autotune as native,
+        tuning_protocol,
+    )
+
+    state = forward_sweep
+    protocol = state.protocol
+    args = tune._parse_args(
+        [
+            "--arch",
+            "sm107",
+            "--dtype",
+            "mxfp8_e4m3",
+            "--kernel-variant",
+            "auto",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "3",
+            "--max-tokens",
+            "128",
+            "--live-tokens",
+            "4",
+            "--max-candidates",
+            "1",
+            "--warmup-iters",
+            "1",
+            "--timed-iters",
+            "2",
+            *(["--skew", str(skew)] if skew is not None else []),
+        ]
+    )
+    monkeypatch.setattr(package, "sm107_candidates", native.sm107_candidates)
+    monkeypatch.setattr(
+        selection._VariantProtocol, "_contract", lambda *a: state.contract
+    )
+    install = Mock(side_effect=AssertionError("offline tuning installed a workspace"))
+    monkeypatch.setattr(selection._VariantProtocol, "_install", install)
+
+    with autotune_v2():
+        AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+        assert state.measured == [
+            (v, flag) for v in ("inference", "genphase") for flag in (1, 2)
+        ]
+        state.measured.clear()
+        state.measured_routing.clear()
+        protocol.owner._tuning_state = AutoTuningState()
+        sweep = Mock(wraps=native._sweep_sm107_block_scaled_mega_moe)
+        monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
+
+        def restage(workspace, live, topk, experts, ratio, seed):
+            assert (live, topk, experts, ratio, seed) == (4, 3, 8, skew, args.seed)
+            workspace.topk_idx[:live].fill_(2)
+            workspace.topk_weights[:live].fill_(0.25)
+
+        restage = Mock(side_effect=restage)
+        monkeypatch.setattr(tuning, "restage_skewed_routing", restage)
+        if skew is not None:
+            protocol.owner.workspace = protocol.owner.kernel._allocate_workspace(
+                protocol.owner.fleet
+            )
+
+        def check_routing(*args, **kwargs):
+            if skew is not None:
+                restage.assert_called_once()
+                assert torch.all(protocol.tensors.topk_ids == 2)
+                assert torch.all(protocol.tensors.topk_weights == 0.25)
+            return DEFAULT
+
+        sweep.side_effect = check_routing
+        winner = tuning._tune_variants(
+            args,
+            0,
+            1,
+            128,
+            "mxfp8_e4m3",
+            protocol.backend,
+            protocol.owner,
+            protocol.weights,
+            protocol.output,
+        )
+        assert winner == {"variant": "genphase", "knobs": state.grid[0]}
+        assert state.measured == [("inference", 1), ("genphase", 1)]
+        if skew is not None:
+            assert state.measured_routing
+            for ids, weights in state.measured_routing:
+                assert torch.all(ids == 2)
+                assert torch.all(weights == 0.25)
+        assert all(
+            c.kwargs["warmup_iters"] == 1 and c.kwargs["timed_iters"] == 2
+            for c in sweep.call_args_list
+        )
+        assert protocol.owner._tuning_state.winner is None
+        install.assert_not_called()
+        assert restage.call_count == (skew is not None)
+        records = AutoTuner.get().protocol_context(tuning_protocol.NAMESPACE).records()
+        assert len(records) == 2
+        assert all(
+            tuple(r["knobs"]["epi_flag_batches"]) == (1, 4) for r in records.values()
+        )
+        assert len(knob_cache._load_entries(knob_cache.knob_cache_path())) == 2
+        overall = AutoTuner.get().protocol_context(selection.NAMESPACE).records()
+        assert len(overall) == 1
+        assert next(iter(overall.values()))["knobs"]["epi_flag_batches"] == [1, 4]
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_offline_auto_schedule_requires_a_valid_base_for_each_variant(
+    forward_sweep, bulk
+):
+    import json
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+
+    state = forward_sweep
+    protocol = state.protocol
+    args = tune._parse_args(
+        [
+            "--arch",
+            "sm107",
+            "--dtype",
+            "mxfp8_e4m3",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "3",
+            "--max-tokens",
+            "128",
+            "--kernel-variant",
+            "auto",
+            "--sweep",
+            "schedule",
+            "--base-knobs",
+            json.dumps({"fc2_use_bulk": bulk, "epi_flag_batches": [1, 4]}),
+            "--max-candidates",
+            "1",
+        ]
+    )
+
+    def search():
+        return tuning._tune_variants(
+            args,
+            0,
+            1,
+            128,
+            "mxfp8_e4m3",
+            protocol.backend,
+            protocol.owner,
+            protocol.weights,
+            protocol.output,
+        )
+
+    with autotune_v2(persistent_cache=False):
+        if bulk:
+            assert search()["variant"] == "genphase"
+            assert state.measured == [("inference", 1), ("genphase", 1)]
+        else:
+            with pytest.raises(
+                ValueError, match="No valid genphase schedule candidates"
+            ):
+                search()
+            assert not state.measured
+
+
 def _fixed_forward_tune(protocol, variant, candidates):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
         ForwardExecution,
@@ -668,8 +879,86 @@ def _fixed_forward_tune(protocol, variant, candidates):
     return knobs
 
 
+@pytest.mark.parametrize("variant", [None, "inference", "genphase"])
+@pytest.mark.parametrize("cache", ["managed", "file"])
+def test_new_live_workload_searches_all_knobs(
+    forward_sweep, monkeypatch, tmp_path, variant, cache
+):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        NAMESPACE,
+    )
+
+    state, tuner = forward_sweep, AutoTuner.get()
+    protocol = state.protocol
+    monkeypatch.delattr(protocol, "_contract")
+    protocol.owner.fleet = dataclasses.replace(
+        protocol.owner.fleet, max_tokens_per_rank=256
+    )
+    protocol.owner.workspace.config = dataclasses.replace(
+        protocol.owner.workspace.config, max_tokens_per_rank=256
+    )
+    protocol.tensors = moe_ep.MoEEpTensors(
+        torch.empty(1, 512), torch.empty(1, 3, dtype=torch.int32), torch.empty(1, 3)
+    )
+    root = tmp_path / "seed-managed"
+    with autotune_v2(cache_root=root):
+        initial = tuner.choose_with_protocol(selection.NAMESPACE, protocol)
+        assert initial["variant"] == "genphase"
+        original = tuner.get_protocol_records(NAMESPACE)
+    assert len(original) == 2
+
+    tuner.clear_cache()
+    tuner._managed_cache = None
+    tuner._managed_stores.clear()
+    if cache == "managed":
+        monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    else:
+        root = tmp_path / "file-only-managed"
+    state.measured.clear()
+    protocol.owner._tuning_state = AutoTuningState()
+    protocol.tensors = moe_ep.MoEEpTensors(
+        torch.empty(256, 512),
+        torch.empty(256, 3, dtype=torch.int32),
+        torch.empty(256, 3),
+    )
+    state.scores[("inference", 1)] = 1
+    state.scores[("genphase", 1)] = 2
+
+    with autotune_v2(mode="replay", cache_root=root):
+        # Simulate an outer record saved by the previous fallback-only search.
+        context = tuner.protocol_context(selection.NAMESPACE)
+        old_contract = protocol._contract(["inference", "genphase"], context)
+        old_contract.pop("search_version", None)
+        old_key = hashlib.sha256(selection._json(old_contract).encode()).hexdigest()
+        context.publish(old_key, {**initial, "contract": old_contract})
+        assert tuner.choose_with_protocol(selection.NAMESPACE, protocol) is None
+        for name in ("inference", "genphase"):
+            assert _fixed_forward_tune(protocol, name, state.grid) == state.grid[1]
+    assert not state.measured
+
+    def choose():
+        if variant is not None:
+            return _fixed_forward_tune(protocol, variant, state.grid)
+        result = tuner.choose_with_protocol(selection.NAMESPACE, protocol)
+        assert result["variant"] == "inference"
+        return result["knobs"]
+
+    with autotune_v2(cache_root=root):
+        assert choose() == state.grid[0]
+        current = tuner.get_protocol_records(NAMESPACE)
+        expected = (variant,) if variant is not None else ("inference", "genphase")
+        assert state.measured == [(v, flag) for v in expected for flag in (1, 2)]
+        assert len(current) == 2 + len(expected)
+        assert all(current[key] == record for key, record in original.items())
+        # Exact results now satisfy another enabled tuning request.
+        state.measured.clear()
+        assert choose() == state.grid[0]
+    assert not state.measured
+    assert all(buffer.destroyed for buffer in state.buffers)
+
+
 @pytest.mark.parametrize("seed,live", [("outer", 128), ("fixed", 128), ("outer", 4)])
-def test_persisted_inner_winners_reused_at_new_capacity(
+def test_new_capacity_search_preserves_persisted_replay_fallback(
     forward_sweep, monkeypatch, seed, live
 ):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
@@ -730,15 +1019,11 @@ def test_persisted_inner_winners_reused_at_new_capacity(
         assert result["variant"] == "inference"
         assert result["contract"]["capacity"] == 256
         assert result["p50_us"] == 1
-        if live == 128:
-            assert result["knob_record"]["max_tokens"] == 128
-            assert result["knob_record"]["p50_us"] == 6
-            assert tuner.get_protocol_records(NAMESPACE) == records
-        else:
-            assert result["knob_record"]["max_tokens"] == 256
-            assert len(tuner.get_protocol_records(NAMESPACE)) == 4
-    flags = (2,) if live == 128 else (1, 2)
-    assert state.measured == [(v, f) for v in ("inference", "genphase") for f in flags]
+        assert result["knob_record"]["max_tokens"] == 256
+        current = tuner.get_protocol_records(NAMESPACE)
+        assert len(current) == 4
+        assert all(current[key] == record for key, record in records.items())
+    assert state.measured == [(v, f) for v in ("inference", "genphase") for f in (1, 2)]
     state.measured.clear()
     with autotune_v2(mode="replay"):
         assert (
@@ -783,13 +1068,11 @@ def test_inner_reuse_respects_rejection_and_tuning_controls(
     with autotune_v2(persistent_cache=False):
         tuner.choose_with_protocol(selection.NAMESPACE, protocol)
         records = tuner.get_protocol_records(tuning_protocol.NAMESPACE)
-    protocol.owner.fleet = dataclasses.replace(
-        protocol.owner.fleet, max_tokens_per_rank=256
-    )
+        # Reconsider the outer winner while retaining exact inner results.
+        context = tuner.protocol_context(selection.NAMESPACE)
+        for key in context.records():
+            context.publish(key, {})
     protocol.owner._tuning_state = AutoTuningState()
-    protocol.owner.workspace.config = dataclasses.replace(
-        protocol.owner.workspace.config, max_tokens_per_rank=256
-    )
     if mode == "rejected":
         state.rejected.add(("inference", 2))
     elif mode == "kernel-only":
@@ -818,7 +1101,9 @@ def test_inner_reuse_respects_rejection_and_tuning_controls(
         current = tuner.get_protocol_records(tuning_protocol.NAMESPACE)
     if mode == "rejected":
         assert calls == [("inference", 1), ("inference", 2), ("genphase", 1)]
-        new_records = [r for r in current.values() if r["max_tokens"] == 256]
+        new_records = [
+            r for r in current.values() if r["kernel_variant"] == "inference"
+        ]
         assert len(new_records) == 1
         assert new_records[0]["kernel_variant"] == "inference"
         assert tuple(new_records[0]["knobs"]["epi_flag_batches"]) == (1, 4)

@@ -58,7 +58,9 @@ Which program a call launches is a rule of the same kind (rounds
 2-7): :func:`fwd_map_program`, :func:`fwd_coef_program` and
 :func:`bwd_token_program` name the mapping-pass, coefficient-pass and
 token-owner forms of record per token count and board (the mapping pass's
-schedule form by its K units per CTA: ``FWD_MAP_CLAIM``), spelled on the records
+schedule form by its K units per CTA: ``FWD_MAP_CLAIM``; inside the token-count
+bands of ``FWD_MAP_XNRM`` the program's ``_xn`` form, whose X loads carry the
+L2 hint EVICT_NORMAL), spelled on the records
 as ``select_rule`` (``rows_between`` / ``units_fit`` / ``ctas_band`` /
 ``chunk_rows_band`` / ``program``); :func:`bwd_reduce_program` names the reduction form per
 token count and architecture (``BWD_REDUCE_PROGRAM`` / ``BWD_REDUCE_REGIMES``);
@@ -260,6 +262,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "fn"],
@@ -349,7 +352,66 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd_map",
         "select_rule": {
             "above": 0,
-            "at_most": 8191,
+            "at_most": 64,
+            "fit": True,
+            "kind": "units_fit",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 144384,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "above": 64,
+            "at_most": 6144,
             "fit": True,
             "kind": "units_fit",
         },
@@ -415,6 +477,63 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
+    "cake_mhc_det_train_fwd_map__nsx_xn": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__nsx_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "nsx_xn",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
     "cake_mhc_det_train_fwd_map__nsx__tk": {
         "arches": [
             "sm_103a",
@@ -472,6 +591,63 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
+    "cake_mhc_det_train_fwd_map__nsx_xn__tk": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__nsx_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "tk_nsx_ct_xn",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
     "cake_mhc_det_train_fwd_map__nsx_ct": {
         "arches": [
             "sm_103a",
@@ -522,6 +698,63 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "nsx_ct",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_det_train_fwd_map__nsx_ct_xn": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_ct_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_ct_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 114816,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__nsx_ct_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "nsx_ct_xn",
             "rule": "fwd_map_program",
         },
         "workspace_rule": {
@@ -750,7 +983,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd_map",
         "select_rule": {
             "above": 0,
-            "at_most": 8192,
+            "at_most": 64,
             "fit": True,
             "kind": "units_fit",
         },
@@ -816,6 +1049,63 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "ns96_g2_ol2l_xn",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": {
         "arches": [
             "sm_100a",
@@ -873,6 +1163,63 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn__tk": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "tk_ns96_g2_ol2l_ct_xn",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": {
         "arches": [
             "sm_100a",
@@ -923,6 +1270,63 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "ns96_g2_ol2l_ct",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 114816,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "ns96_g2_ol2l_ct_xn",
             "rule": "fwd_map_program",
         },
         "workspace_rule": {
@@ -7274,9 +7678,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "fwd_prepare_h4096": [
             "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
             "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn",
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn__tk",
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
             "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
             "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
@@ -7293,9 +7701,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "fwd_recompute_h4096": [
             "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
             "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct_xn",
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn",
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_xn__tk",
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
             "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
             "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
@@ -7427,9 +7839,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "fwd_prepare_h4096": [
             "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
             "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+            "cake_mhc_det_train_fwd_map__nsx_ct_xn",
             "cake_mhc_det_train_fwd_map__nsx_ct",
+            "cake_mhc_det_train_fwd_map__nsx_xn",
             "cake_mhc_det_train_fwd_map__nsx",
+            "cake_mhc_det_train_fwd_map__nsx_xn__tk",
             "cake_mhc_det_train_fwd_map__nsx__tk",
             "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
             "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
@@ -7445,9 +7861,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "fwd_recompute_h4096": [
             "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1_xn",
             "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+            "cake_mhc_det_train_fwd_map__nsx_ct_xn",
             "cake_mhc_det_train_fwd_map__nsx_ct",
+            "cake_mhc_det_train_fwd_map__nsx_xn",
             "cake_mhc_det_train_fwd_map__nsx",
+            "cake_mhc_det_train_fwd_map__nsx_xn__tk",
             "cake_mhc_det_train_fwd_map__nsx__tk",
             "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
             "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
@@ -7860,11 +8280,13 @@ FN_SPLIT_GRID = {"b16": 256, "tv128": 256, "tv128_t128": 512}
 # the forward). Measured on the checkpoint path (the carry against the two-launch route, CUPTI active, three
 # independent sessions per architecture): B200 1.024-1.025 at 1024, 1.021-1.022 at 2048, 1.012-1.013 at 4096; GB300
 # 1.022-1.024 at 1024, 1.015-1.017 at 2048, 1.005-1.011 at 4096. A band keeps the rows where every session reads at
-# least 1 % faster: sm_100a to 4096 tokens, sm_103a to 2048. sm_107a has no carry: its checkpoint replay keeps the
-# two-launch route.
+# least 1 % faster: sm_100a to 4096 tokens, sm_103a to 2048. sm_107a launches the same 256-thread form in place of
+# the b16 fnp split and the 128-thread tv128_t128 fnTp split; two sessions on 216-SM R200 boards read 1.026-1.027 at
+# 1024, 1.018-1.043 at 2048, 1.012-1.022 at 4096, so its band runs to 4096 tokens.
 FN_SPLIT_CARRY: dict[str, dict[str, Any]] = {
     "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
     "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
+    "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
 }
 # FWD_MAP_BANDS: (above, at_most, program) of the mapping pass by token count (at_most None = unbounded); outside every
 # band the production form FWD_MAP_PRODUCTION ("ss_st4": a_path="ss", 4 stages). Every form below is EXACT: the
@@ -7962,6 +8384,20 @@ FWD_MAP_CLAIM = {
     ),
     "sm_107a": (),
 }
+# FWD_MAP_XNRM: (above, at_most) token-count bands per architecture where the mapping pass loads X with the L2 priority
+# EVICT_NORMAL instead of EVICT_FIRST: the routed program's "_xn" form (x_l2="evict_normal"; bitwise the program, only
+# the cache-policy operand of the X TMA loads differs). X then stays in L2 for the collapse of the forward and for the
+# backward prepare after the forward recompute of the checkpoint path (T = 1024: the collapse reads 31.8 MB less from
+# DRAM on B200 and GB300). Path time against main (CUPTI active, L2 flushed before every call and between the forward's
+# prepare and finish, two sessions per board): B200 forward 0.958 / 0.958 at 4096, 0.974 / 0.974 at 5120, 0.976 / 0.973
+# at 6144, 0.986 / 0.985 at 7168, checkpoint 0.961 / 0.961, 0.973 / 0.973, 0.978 / 0.974, 0.994 / 0.991; GB300 forward
+# 0.964 / 0.965, 0.973 / 0.968, 0.975 / 0.970, 0.981 / 0.986, checkpoint 0.963 / 0.963, 0.974 / 0.976, 0.979 / 0.981,
+# 0.989 / 0.991; 0.998-1.002 at 8192, where X no longer fits L2 and the mapping pass writes back the dirty lines the
+# kept X displaces. A band keeps the rows where every path reads at least 1 % faster in both sessions: to 6144 tokens on
+# sm_100a and sm_103a. Below the band the form itself: to 64 tokens X is at most 2 MiB and the hint gains nothing
+# measurable (checkpoint path time against main at 64 tokens: B200 1.000 / 0.997, GB300 1.000 / 1.001; at 128: B200
+# 0.990 / 0.993, GB300 0.997 / 0.989). sm_107a is not routed (no 216-SM session).
+FWD_MAP_XNRM = {"sm_100a": ((64, 6144),), "sm_103a": ((64, 6144),), "sm_107a": ()}
 # FWD_COEF_REGIMES: the coefficient pass's dispatch per architecture, in grid units of the 8-token CTA (grid =
 # ceil(T / 8) = mhc_det_fwd_coef.grid_rule(T, tokens_per_cta=8); every form bitwise the production chain). "round5" =
 # the `form_overrides(T, sm_count, P_K)` of record on sm_103a (P_K = the host rule's K-unit
@@ -8321,7 +8757,7 @@ H_TABLE_NAMES = (
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "BWD_ROW_BANDS",
     "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES", "BWD_REDUCE_PARTS",
     "BWD_REDUCE_GRID", "K5_GRID_BANDS", "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS",
-    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM",
+    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM",
 )  # fmt: skip
 H_TABLES: dict[int, dict[str, Any]] = {
     5120: {
@@ -8344,6 +8780,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
         },
         "FWD_MAP_CLAIM": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "FWD_MAP_XNRM": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "FWD_COEF_REGIMES": {
             "sm_100a": "round7",
             "sm_103a": "round5",
@@ -8446,6 +8883,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
         },
         "FWD_MAP_CLAIM": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "FWD_MAP_XNRM": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "FWD_COEF_REGIMES": {
             "sm_100a": "round7",
             "sm_103a": "round5",
@@ -8593,6 +9031,9 @@ def fwd_map_program(
                 program = cap
             elif tail is not None and units <= grid:
                 program = tail
+    for above, at_most in _tab("FWD_MAP_XNRM", hidden)[arch]:  # the X loads hinted
+        if above < T <= at_most:
+            program += "_xn"
     return program
 
 
@@ -9715,6 +10156,7 @@ __all__ = [
     "FWD_MAP_CLAIM",
     "FWD_MAP_FIT",
     "FWD_MAP_PRODUCTION",
+    "FWD_MAP_XNRM",
     "K5_FORM_BANDS",
     "K5_FORM_ROWS",
     "K5_GRID_BANDS",

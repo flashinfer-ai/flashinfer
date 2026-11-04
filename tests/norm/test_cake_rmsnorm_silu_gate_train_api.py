@@ -828,8 +828,10 @@ def test_nondeterministic_flag_selects_this_package(
     dx, dz, dw = cake_rmsnorm_silu_gate_train_backward(
         dy, x, z, w, EPS, deterministic=False
     )
-    routes = loader.ROUTES[loader.device_arch(torch.cuda.current_device())]
-    assert launched == [routes["fwd"], routes["bwd_bf16"]], launched
+    arch = loader.device_arch(torch.cuda.current_device())
+    routes = loader.ROUTES[arch]
+    fwd = loader.module_for_rows(arch, "fwd", 257 * 48, _sm_count())
+    assert launched == [fwd, routes["bwd_bf16"]], launched
     for name in launched:
         assert name not in deterministic_loader.MODULES, name
     assert torch.equal(
@@ -1169,11 +1171,13 @@ def _sm_count() -> int:
     ).multi_processor_count
 
 
-# The rows per SM up to which sm_100a and sm_103a run the short forward, and
+# The rows per SM up to which each architecture runs the short forward, and
 # from which each architecture runs the mid and the long forward.
-SHORT_FORWARD_ROWS_PER_SM = 10
+SHORT_FORWARD_ROWS_PER_SM = {"sm_100a": 12, "sm_103a": 12, "sm_107a": 59}
 MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
 LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
+# The rows per SM from which an architecture runs the extra-long forward.
+XLONG_FORWARD_ROWS_PER_SM = {"sm_103a": 3000}
 # Forward inputs around and past the short, the mid and the long forward's
 # thresholds: (tokens, heads, layout); ``heads=None`` takes ``threshold * SMs
 # + tokens`` rows (the short threshold for ``flat-short``, the mid one for
@@ -1194,6 +1198,13 @@ LONG_FORWARD_CASES = [
     pytest.param(6000, 32, "contiguous", id="6000x32"),
     pytest.param(-1, None, "flat", id="threshold-1"),
     pytest.param(1, None, "flat", id="threshold+1"),
+    pytest.param(-1, None, "flat-xlong", id="xlong-threshold-1"),
+    pytest.param(0, None, "flat-xlong", id="xlong-threshold"),
+    pytest.param(1, None, "flat-xlong", id="xlong-threshold+1"),
+    pytest.param(9500, 48, "contiguous", id="9500x48"),
+    pytest.param(9500, 48, "projection", id="9500x48-projection"),
+    pytest.param(9500, 48, "head_major", id="9500x48-head_major"),
+    pytest.param(16384, 32, "contiguous", id="16384x32"),
     pytest.param(8192, 48, "contiguous", id="8192x48"),
     pytest.param(8192, 48, "projection", id="8192x48-projection"),
     pytest.param(8192, 48, "head_major", id="8192x48-head_major"),
@@ -1215,12 +1226,18 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     ``MID_FORWARD_ROWS_PER_SM * SMs`` rows below that, else the forward."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
+    short_end = SHORT_FORWARD_ROWS_PER_SM[arch]
     mid_start = MID_FORWARD_ROWS_PER_SM[arch]
     long_start = LONG_FORWARD_ROWS_PER_SM[arch]
+    xlong_start = XLONG_FORWARD_ROWS_PER_SM.get(arch)
+    if layout == "flat-xlong" and xlong_start is None:
+        pytest.skip(f"{arch} routes no fwd_xlong module")
     if heads is None:
-        start = {"flat-short": SHORT_FORWARD_ROWS_PER_SM, "flat-mid": mid_start}.get(
-            layout, long_start
-        )
+        start = {
+            "flat-short": short_end,
+            "flat-mid": mid_start,
+            "flat-xlong": xlong_start,
+        }.get(layout, long_start)
         x, z, w, _ = suite.make(start * sms + tokens, 1, layout="flat", seed=21)
     else:
         x, z, w, _ = suite.make(tokens, heads, layout=layout, seed=21)
@@ -1231,14 +1248,97 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     assert launched == [name], launched
     routes = loader.ROUTES[arch]
     want = loader.route_module(arch, "fwd")
-    if "fwd_short" in routes and rows <= SHORT_FORWARD_ROWS_PER_SM * sms:
+    if "fwd_short" in routes and rows <= short_end * sms:
         want = routes["fwd_short"]
+    elif "fwd_xlong" in routes and rows >= xlong_start * sms:
+        want = routes["fwd_xlong"]
     elif "fwd_long" in routes and rows >= long_start * sms:
         want = routes["fwd_long"]
     elif "fwd_mid" in routes and rows >= mid_start * sms:
         want = routes["fwd_mid"]
     assert name == want, (arch, rows, sms)
     assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
+
+
+# Gate inputs at and past the edges of the packed gate's range: below -41,
+# subnormal and zero, infinite and NaN, beside saturated and ordinary ones.
+GATE_EDGE_VALUES = [
+    -1e4,
+    -100.0,
+    -42.0,
+    -41.0,
+    -40.0,
+    -1e-30,
+    -1e-39,
+    -0.0,
+    0.0,
+    1e-39,
+    1e-30,
+    40.0,
+    100.0,
+    1e4,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+]
+# Forward inputs the short forward runs where the architecture routes it, and
+# those at its threshold on sm_100a and sm_103a, 12 rows per SM, on 148 SMs
+# (37x48, 253x7, 55x32) and on 152 SMs (38x48, 260x7, 57x32), and on sm_107a,
+# 59 rows per SM, on 212 SMs (260x48, 1786x7, 390x32) and one token past it
+# (261x48, 1787x7, 391x32).
+GATE_EDGE_CASES = [
+    pytest.param(1, 48, id="1x48"),
+    pytest.param(13, 48, id="13x48"),
+    pytest.param(30, 48, id="30x48"),
+    pytest.param(31, 48, id="31x48"),
+    pytest.param(33, 48, id="33x48"),
+    pytest.param(37, 48, id="37x48"),
+    pytest.param(38, 48, id="38x48"),
+    pytest.param(13, 7, id="13x7"),
+    pytest.param(217, 7, id="217x7"),
+    pytest.param(253, 7, id="253x7"),
+    pytest.param(260, 7, id="260x7"),
+    pytest.param(55, 32, id="55x32"),
+    pytest.param(57, 32, id="57x32"),
+    pytest.param(129, 48, id="129x48"),
+    pytest.param(260, 48, id="260x48"),
+    pytest.param(261, 48, id="261x48"),
+    pytest.param(1786, 7, id="1786x7"),
+    pytest.param(1787, 7, id="1787x7"),
+    pytest.param(390, 32, id="390x32"),
+    pytest.param(391, 32, id="391x32"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads", GATE_EDGE_CASES)
+def test_forward_gate_edges_match_the_deterministic_package(
+    tokens, heads, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With gate inputs at and past the packed gate's range in two of every
+    three rows (a quarter of their elements, so the range check fails for some
+    threads of a row and holds for others) and ordinary ones in the rest,
+    ``y`` is the deterministic package's bits, NaN included, and the forward
+    launches ``module_for_rows``' module."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    x, z, w, _ = suite.make(tokens, heads, seed=23)
+    g = torch.Generator(device=z.device).manual_seed(24)
+    values = torch.tensor(GATE_EDGE_VALUES, device=z.device).bfloat16()
+    pick = torch.randint(
+        0, len(GATE_EDGE_VALUES), z.shape, device=z.device, generator=g
+    )
+    edge = torch.rand(z.shape, device=z.device, generator=g) < 0.25
+    rows = torch.arange(tokens * heads, device=z.device).view(tokens, heads, 1)
+    edge &= rows % 3 != 0
+    z.copy_(torch.where(edge, values[pick], z))
+    launched = _spy_launches(monkeypatch)
+    y = nd_forward(x, z, w, EPS)
+    assert launched == [loader.module_for_rows(arch, "fwd", tokens * heads, sms)]
+    want = det_forward(x, z, w, EPS)
+    assert torch.equal(y.view(torch.int16), want.view(torch.int16)), (
+        "y vs the deterministic package"
+    )
 
 
 # The rows per SM from which each architecture runs the long backward.
@@ -1309,7 +1409,7 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
     assert launched == [name] * suite.REPEATS, launched
 
 
-# The most rows of the short backward on SM100 and SM103.
+# The most rows of the short backward.
 SHORT_BACKWARD_ROWS = 256
 # Backward inputs around the short backward's 256 rows: (tokens, heads,
 # layout); ``heads=None`` takes ``tokens`` rows as one flat [rows, 128] tensor.

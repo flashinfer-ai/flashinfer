@@ -46,6 +46,43 @@ rounding on the rows whose backward runs the S1 pair).  The JSON records the
 device, architecture, SM count, torch, CUDA and flash-linear-attention versions
 (the distribution's and ``fla.__version__``).
 
+``--gate`` selects the forget gate's form per row: ``g`` (the default) the
+activated FP32 gate the caller passes, ``raw`` the raw gate mode
+(``use_gate_in_kernel=True``: the BF16 raw gate, FP32 ``A_log`` /
+``dt_bias``, lower bound -5, activated in the kernels).  In the raw mode the
+three arms run their raw forms on the same operands: the deterministic
+package's and this package's raw mode (both workspaces of ``gate="raw"``;
+the ``ckpt`` leaves include ``A_log`` and ``dt_bias``) and
+flash-linear-attention's ``chunk_kda(use_gate_in_kernel=True, ...)``, whose
+``out`` the row compares with the non-deterministic arm's
+(``fla_raw_out_vs_nd``: the relative RMS difference; an adapter that drops a
+gate term shows here).  This package's raw mode runs the deterministic
+package's programs in the same order (no path runs an S1 pair) but for the
+parameter-gradient reduce: on ``sm_100a`` / ``sm_103a`` its backward runs an
+``R1c`` pair (the GLM intra program adds the per-chunk partials in FP64 into
+the workspace's accumulators, its cast rounds them once), on ``sm_107a`` the
+deterministic pair.  A raw row reports ``r1c`` (the pair's GLM intra and cast
+records and replica count; ``None`` on ``sm_107a``), ``param_acc_bytes`` (the
+nd workspace's FP64 accumulators, outside its arena ``workspace_bytes``),
+``raw_partials_bytes`` (the per-call partials and scratch the deterministic
+pair allocates on every backward, which an ``R1c`` backward does not) and
+``peak_drop_bytes`` (det minus nd ``peak_bytes`` per boundary).  In
+``nd_vs_det`` every result but ``dA_log`` / ``ddt_bias`` is bitwise; those two
+are bitwise on ``sm_107a`` and differ by FP32 rounding on the ``R1c`` rows
+(reported, not gated: ``param_max_ulp`` the largest distance in representable
+FP32 values, ``param_differing_elements`` how many differ).
+
+``--build-order`` sets which Cake arm allocates first: its workspace (with the
+accumulators of an ``R1c`` row), its saved set and its closures.  The arena
+placement this decides moves a few kernels by microseconds, so a det / nd ratio
+measured in one order carries a placement bias.  ``det-first`` (the default)
+is the order of the earlier runs; ``nd-first`` swaps it; ``both`` runs every
+row in both orders, prints both, and reports per arm and boundary the mean of
+the two orders' medians (``order_avg``), the ratios of those means
+(``ratio_det_over_nd``), each order's ratio (``ratio_det_over_nd_by_order``)
+and the boundaries where nd is slower in both orders
+(``nd_slower_both_orders``).
+
 Memory: per row, arm and boundary one untimed call after the warm-up, between
 ``torch.cuda.reset_peak_memory_stats()`` and the allocator's counters, gives
 ``peak_bytes`` (the peak allocation of the call beyond what was allocated
@@ -75,12 +112,15 @@ Example::
     python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64
     python benchmarks/bench_cake_kda_train.py --seqlen 261393 --docs 4 --heads 4 --rounds 5 --json out.json
     python benchmarks/bench_cake_kda_train.py --seqlen 65536 --docs 3 --heads 16 --side-stream
+    python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64 --gate g raw
+    python benchmarks/bench_cake_kda_train.py --seqlen 16384 --docs 1 3 --heads 4 64 --gate raw --build-order both
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import itertools
 import json
 import math
 import statistics
@@ -101,12 +141,21 @@ from flashinfer.experimental.cake_kda_det_train import (  # noqa: E402
     cake_backend as det_backend,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
+from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+    LOWER_BOUND,
+    make_inputs,
+    make_raw_inputs,
+)
 
 BOUNDARIES = ("fwd", "bwd", "ckpt", "replay")
 DEFAULT_BOUNDARIES = ("fwd", "bwd", "ckpt")
 ARMS = ("det", "nd", "fla")
 GRAD_ORDER = ("dq", "dk", "dv", "dbeta", "dg")  # the order the backward returns
+RAW_GRAD_ORDER = GRAD_ORDER + ("dA_log", "ddt_bias")  # the raw gate mode's
+GATES = ("g", "raw")
+# --build-order: which Cake arm allocates its workspace, saved set and closures first ("both": every row in each)
+ORDERS = ("det-first", "nd-first")
+BUILD_ORDERS = ORDERS + ("both",)
 # ``--side-stream``: a one-thread kernel resident on another stream while a Cake call runs.  It spins for at least
 # SIDE_MIN_CYCLES (about 5 ms at 2 GHz) and SIDE_CYCLES_PER_MS per ms of the call's slowest warm-up (twice the call at
 # 2 GHz); the call starts after PRE_SLEEP_CYCLES on its own stream, so the side kernel is resident first.
@@ -183,11 +232,37 @@ def _error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _gate_of(inputs: dict) -> str:
+    """The gate mode of a row's operands: ``"raw"`` for :func:`make_raw_inputs`' (with ``A_log``)."""
+    return "raw" if "A_log" in inputs else "g"
+
+
+def _raw_kw(inputs: dict, params=None) -> dict:
+    """The raw gate mode's keywords of a Cake call on ``inputs`` (``params``: the ``(A_log, dt_bias)`` leaves of an
+    autograd call), empty in the explicit gate mode."""
+    if _gate_of(inputs) == "g":
+        return {}
+    a_log, dt_bias = (inputs["A_log"], inputs["dt_bias"]) if params is None else params
+    return {
+        "use_gate_in_kernel": True,
+        "A_log": a_log,
+        "dt_bias": dt_bias,
+        "lower_bound": LOWER_BOUND,
+    }
+
+
+def _leaf_names(inputs: dict) -> tuple[str, ...]:
+    """The autograd leaves of a row: ``q, k, v, g, beta`` and in the raw gate mode ``A_log, dt_bias``."""
+    names = ("q", "k", "v", "g", "beta")
+    return names + (("A_log", "dt_bias") if _gate_of(inputs) == "raw" else ())
+
+
 def cake_boundaries(
     inputs: dict, ws, *, deterministic: bool
 ) -> dict[str, Callable[[], object]]:
     """The boundaries of one Cake arm on its workspace: the deterministic package's entries, or this package's
-    with ``deterministic=False``.  Each closure returns its results (the memory call holds them)."""
+    with ``deterministic=False``, in the gate mode of ``inputs``.  Each closure returns its results (the memory
+    call holds them)."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
@@ -201,42 +276,49 @@ def cake_boundaries(
         bwd_fn = nd_backend.chunk_kda_bwd
         autograd_fn = nd_backend.chunk_kda
         mode = {"deterministic": False}
+    raw = _raw_kw(inputs)
 
     def fwd() -> object:
         return fwd_fn(
-            q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode
+            q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode, **raw
         )
 
     _, saved = fwd_fn(
-        q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode
+        q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode, **raw
     )
 
     def bwd() -> object:
-        return bwd_fn(q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode)
+        return bwd_fn(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode, **raw
+        )
 
     def replay() -> object:
-        return bwd_fn(q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode)
+        return bwd_fn(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode, **raw
+        )
 
     leaves = [
-        inputs[n].detach().clone().requires_grad_(True)
-        for n in ("q", "k", "v", "g", "beta")
+        inputs[n].detach().clone().requires_grad_(True) for n in _leaf_names(inputs)
     ]
 
-    def ckpt() -> object:
-        o = checkpoint(
-            lambda *a: autograd_fn(*a, cu, workspace=ws, **mode),
-            *leaves,
-            use_reentrant=False,
+    def step(*a):
+        # the raw mode's A_log / dt_bias are leaves too (gradients to them)
+        return autograd_fn(
+            *a[:5], cu, workspace=ws, **mode, **_raw_kw(inputs, a[5:] or None)
         )
+
+    def ckpt() -> object:
+        o = checkpoint(step, *leaves, use_reentrant=False)
         return torch.autograd.grad(o, leaves, dout)
 
     return {"fwd": fwd, "bwd": bwd, "ckpt": ckpt, "replay": replay}
 
 
 def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
-    """flash-linear-attention's ``chunk_kda`` on the same preactivated operands (no in-kernel L2 norm, gate or
-    sigmoid), or ``None`` when the package is not installed.  The first call runs here: an exception from it
-    propagates to the caller (:func:`run_row` records it as ``fla_error``)."""
+    """flash-linear-attention's ``chunk_kda`` on the same operands (no in-kernel L2 norm or beta sigmoid; the
+    preactivated gate, or in the raw gate mode its in-kernel gate with ``A_log``, ``dt_bias`` and the lower bound),
+    or ``None`` when the package is not installed.  The first call runs here: an exception from it propagates to
+    the caller (:func:`run_row` records it as ``fla_error``)."""
     try:
         from fla.ops.kda import chunk_kda as fla_chunk_kda
     except Exception:
@@ -245,7 +327,19 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
 
-    def call(q_, k_, v_, g_, beta_):
+    raw_mode = _gate_of(inputs) == "raw"
+
+    def call(q_, k_, v_, g_, beta_, *params):
+        gate = (
+            {
+                "use_gate_in_kernel": True,
+                "A_log": params[0],
+                "dt_bias": params[1],
+                "lower_bound": LOWER_BOUND,
+            }
+            if raw_mode
+            else {"use_gate_in_kernel": False}
+        )
         o, _ = fla_chunk_kda(
             q_.unsqueeze(0),
             k_.unsqueeze(0),
@@ -256,16 +350,15 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
-            use_gate_in_kernel=False,
             use_beta_sigmoid_in_kernel=False,
             safe_gate=True,
             cu_seqlens=cu,
+            **gate,
         )
         return o.squeeze(0)
 
     leaves = [
-        inputs[n].detach().clone().requires_grad_(True)
-        for n in ("q", "k", "v", "g", "beta")
+        inputs[n].detach().clone().requires_grad_(True) for n in _leaf_names(inputs)
     ]
 
     def fwd() -> object:
@@ -284,18 +377,31 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
 
 
 def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
-    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's)."""
+    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's), in the gate mode of
+    ``inputs``."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
+    raw = _raw_kw(inputs)
     if deterministic:
-        out, saved = det_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=ws)
+        out, saved = det_backend.chunk_kda_det_fwd(
+            q, k, v, g, beta, cu, workspace=ws, **raw
+        )
         grads = det_backend.chunk_kda_det_bwd(
-            q, k, v, g, beta, cu, dout, saved=None if replay else saved, workspace=ws
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=None if replay else saved,
+            workspace=ws,
+            **raw,
         )
     else:
         out, saved = nd_backend.chunk_kda_fwd(
-            q, k, v, g, beta, cu, workspace=ws, deterministic=False
+            q, k, v, g, beta, cu, workspace=ws, deterministic=False, **raw
         )
         grads = nd_backend.chunk_kda_bwd(
             q,
@@ -308,10 +414,12 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
             saved=None if replay else saved,
             workspace=ws,
             deterministic=False,
+            **raw,
         )
+    order = RAW_GRAD_ORDER if raw else GRAD_ORDER
     return {
         "out": out.clone(),
-        **{n: t.clone() for n, t in zip(GRAD_ORDER, grads, strict=True)},
+        **{n: t.clone() for n, t in zip(order, grads, strict=True)},
     }
 
 
@@ -320,9 +428,25 @@ def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.contiguous().view(view), b.contiguous().view(view))
 
 
+def _ulp_distance(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int]:
+    """``(largest distance, differing elements)`` of two FP32 tensors of one shape, the distance counted in
+    representable FP32 values (``+0`` and ``-0`` one value)."""
+
+    def ordered(t: torch.Tensor) -> torch.Tensor:
+        i = t.contiguous().view(torch.int32).to(torch.int64)
+        return torch.where(i < 0, -(i & 0x7FFFFFFF), i)
+
+    d = (ordered(a) - ordered(b)).abs()
+    if d.numel() == 0:
+        return 0, 0
+    return int(d.max().item()), int((d > 0).sum().item())
+
+
 def _nd_vs_det(inputs: dict, det_ws, nd_ws) -> dict:
     """The non-deterministic results against the deterministic ones on the same inputs, from the saved set and from
-    the replay: the outputs that are bitwise, and ``dg``'s differing elements and largest difference."""
+    the replay: the outputs that are bitwise (in the raw gate mode every one but ``dA_log`` / ``ddt_bias`` of an
+    ``R1c`` row), ``dg``'s differing elements and largest difference, and in the raw gate mode the largest FP32 ulp
+    distance of ``dA_log`` / ``ddt_bias`` and their differing elements."""
     report = {}
     for label, replay in (("saved", False), ("replay", True)):
         det = _results(inputs, det_ws, deterministic=True, replay=replay)
@@ -330,10 +454,19 @@ def _nd_vs_det(inputs: dict, det_ws, nd_ws) -> dict:
         diff = (nd["dg"].double() - det["dg"].double()).abs()
         report[label] = {
             "bitwise": [name for name in det if _bits_equal(nd[name], det[name])],
+            "not_bitwise": [
+                name for name in det if not _bits_equal(nd[name], det[name])
+            ],
             "dg_differing_elements": int((diff > 0).sum().item()),
             "dg_max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
             "dg_max_abs": float(det["dg"].abs().max().item()) if diff.numel() else 0.0,
         }
+        if "dA_log" in det:
+            ulps = {n: _ulp_distance(nd[n], det[n]) for n in ("dA_log", "ddt_bias")}
+            report[label]["param_max_ulp"] = {n: u[0] for n, u in ulps.items()}
+            report[label]["param_differing_elements"] = {
+                n: u[1] for n, u in ulps.items()
+            }
     return report
 
 
@@ -345,6 +478,21 @@ def _nd_vs_det_or_error(inputs: dict, det_ws, nd_ws) -> dict:
         gc.collect()
         torch.cuda.empty_cache()
         return {"error": _error(exc)}
+
+
+def _r1c(ws) -> dict | None:
+    """The ``R1c`` pair a raw nd workspace's backward runs: its GLM intra and cast records and replica count
+    (``None`` on the deterministic pair's rows and in the g mode)."""
+    stripes = nd_backend._r1c_stripes(ws.plan)
+    if stripes is None:
+        return None
+    records = ws.records()
+    pair: dict = {
+        stage: sorted({by[stage] for by in records.values() if by.get(stage)})
+        for stage in ("glm_intra", "param_finalize")
+    }
+    pair["stripes"] = stripes
+    return pair
 
 
 def _s1_paths(ws) -> list[str]:
@@ -429,34 +577,54 @@ def run_row(
     lengths: tuple[int, ...] | None = None,
     fla_alone: bool = False,
     arms_alone: bool = False,
+    gate: str = "g",
+    build_order: str = "det-first",
 ) -> dict:
+    if build_order not in ORDERS:
+        raise ValueError(f"build_order must be one of {ORDERS}, got {build_order!r}")
     lengths = split_docs(seqlen, docs) if lengths is None else lengths
-    inputs = make_inputs(lengths, heads, device)
+    make = {"g": make_inputs, "raw": make_raw_inputs}[gate]
+    inputs = make(lengths, heads, device)
 
     def det_workspace():
-        ws = det_backend.KdaDetWorkspace.for_problem(seqlen, docs, heads, device)
+        ws = det_backend.KdaDetWorkspace.for_problem(
+            seqlen, docs, heads, device, gate=gate
+        )
         ws.load()
         return ws
 
     def nd_workspace():
         ws = nd_backend.KdaWorkspace.for_problem(
-            seqlen, docs, heads, device, deterministic=False
+            seqlen, docs, heads, device, gate=gate, deterministic=False
         )
         ws.load()
+        _ = (
+            ws.param_acc
+        )  # an R1c row's accumulators, allocated with the arena (None elsewhere)
         return ws
 
-    det_ws, nd_ws = det_workspace(), nd_workspace()
+    if build_order == "det-first":
+        det_ws, nd_ws = det_workspace(), nd_workspace()
+    else:
+        nd_ws, det_ws = nd_workspace(), det_workspace()
     row = {
         "seqlen": seqlen,
         "docs": docs,
         "lengths": list(lengths),
         "heads": heads,
+        "gate": gate,
+        "build_order": build_order,
         "arch": nd_ws.arch,
         "recurrence": nd_ws.plan.recur,
         "segments_per_doc": nd_ws.plan.P,
         "records": {"det": det_ws.records(), "nd": nd_ws.records()},
         "s1_paths": _s1_paths(nd_ws),
         "workspace_bytes": {"det": det_ws.bytes, "nd": nd_ws.bytes},
+        "r1c": _r1c(nd_ws),
+        "param_acc_bytes": nd_ws.param_acc_bytes,
+        "raw_partials_bytes": nd_backend._raw_partials_bytes(nd_ws.plan.NC_pad, heads)
+        if gate == "raw"
+        else 0,
         "saved_bytes": nd_backend.saved_bytes(
             seqlen, heads, docs, sm_count=nd_ws.plan.sm_count
         ),
@@ -473,14 +641,13 @@ def run_row(
         "ratio_fla_over_nd": {},
         "memory": {},
     }
-    arms: dict[str, dict[str, Callable[[], object]]] = (
-        {}
-        if arms_alone
-        else {
-            "det": cake_boundaries(inputs, det_ws, deterministic=True),
-            "nd": cake_boundaries(inputs, nd_ws, deterministic=False),
-        }
-    )
+    # the closures (and the saved sets they hold) in the build order too
+    arms: dict[str, dict[str, Callable[[], object]]] = {}
+    if not arms_alone:
+        for arm in ("det", "nd") if build_order == "det-first" else ("nd", "det"):
+            arms[arm] = cake_boundaries(
+                inputs, det_ws if arm == "det" else nd_ws, deterministic=arm == "det"
+            )
     samples: dict[str, dict[str, list[float]]] = {}
 
     def fla_failed(exc: Exception) -> None:
@@ -499,6 +666,12 @@ def run_row(
             fla_failed(exc)
         if fla is not None:
             arms["fla"] = fla
+    if gate == "raw" and "fla" in arms:
+        # flash-linear-attention's raw form against this package's out on the same operands
+        try:
+            row["fla_raw_out_vs_nd"] = _fla_raw_out_vs_nd(inputs, arms["fla"], nd_ws)
+        except Exception as exc:
+            fla_failed(exc)
     # warm every closure once (libraries loaded, the allocator primed) before the first timed round
     for arm in list(arms):
         try:
@@ -557,6 +730,8 @@ def run_row(
             "det": lambda: cake_boundaries(inputs, det_workspace(), deterministic=True),
             "nd": lambda: cake_boundaries(inputs, nd_workspace(), deterministic=False),
         }
+        if build_order == "nd-first":
+            builders = {"nd": builders["nd"], "det": builders["det"]}
         if baseline:
             builders["fla"] = lambda: fla_boundaries(inputs)
         for arm, build in builders.items():
@@ -628,6 +803,14 @@ def run_row(
             row["ratio_det_over_nd"][name] = row["ms"]["det"][name] / nd_ms
             if "fla" in row["ms"] and name in row["ms"]["fla"]:
                 row["ratio_fla_over_nd"][name] = row["ms"]["fla"][name] / nd_ms
+    if gate == "raw" and "det" in row["memory"] and "nd" in row["memory"]:
+        # the per-call partials the deterministic pair allocates and an R1c backward does not
+        row["peak_drop_bytes"] = {
+            name: row["memory"]["det"][name]["peak_bytes"]
+            - row["memory"]["nd"][name]["peak_bytes"]
+            for name in row["memory"]["nd"]
+            if name in row["memory"]["det"]
+        }
     if side_stream:
         row["side_stream"] = {
             arm: {
@@ -645,12 +828,73 @@ def run_row(
     return row
 
 
+def combine_orders(by_order: dict[str, dict]) -> dict:
+    """One row of ``--build-order both`` from its ``det-first`` and ``nd-first`` rows: per arm and boundary the mean
+    of the two orders' medians (``order_avg``, also ``ms``), the ratios of those means, each order's ``det / nd``,
+    and the boundaries where nd is slower than det in both orders."""
+    first = by_order[ORDERS[0]]
+    row = {
+        key: first[key]
+        for key in (
+            "seqlen",
+            "docs",
+            "lengths",
+            "heads",
+            "gate",
+            "arch",
+            "recurrence",
+            "segments_per_doc",
+            "s1_paths",
+            "r1c",
+        )
+    }
+    row["build_order"] = "both"
+    row["by_order"] = by_order
+    ms: dict[str, dict[str, float]] = {}
+    for arm in first["ms"]:
+        if all(arm in r["ms"] for r in by_order.values()):
+            ms[arm] = {
+                name: statistics.fmean(r["ms"][arm][name] for r in by_order.values())
+                for name in first["ms"][arm]
+                if all(name in r["ms"][arm] for r in by_order.values())
+            }
+    row["ms"] = row["order_avg"] = ms
+    row["ratio_det_over_nd"], row["ratio_fla_over_nd"] = {}, {}
+    for name, nd_ms in ms.get("nd", {}).items():
+        if "det" in ms and name in ms["det"]:
+            row["ratio_det_over_nd"][name] = ms["det"][name] / nd_ms
+        if "fla" in ms and name in ms["fla"]:
+            row["ratio_fla_over_nd"][name] = ms["fla"][name] / nd_ms
+    row["ratio_det_over_nd_by_order"] = {
+        order: r["ratio_det_over_nd"] for order, r in by_order.items()
+    }
+    row["nd_slower_both_orders"] = [
+        name
+        for name in row["ratio_det_over_nd"]
+        if all(r["ratio_det_over_nd"].get(name, 1.0) < 1.0 for r in by_order.values())
+    ]
+    errors = {o: r["fla_error"] for o, r in by_order.items() if "fla_error" in r}
+    if errors:
+        row["fla_error"] = "; ".join(f"{o}: {e}" for o, e in errors.items())
+    return row
+
+
+def _fla_raw_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
+    """The relative RMS difference of flash-linear-attention's raw-mode ``out`` from this package's on the same
+    operands (an FLA adapter that drops a gate term differs by far more than the two kernels' roundings)."""
+    out_fla = fla["fwd"]().detach().double()
+    out_nd = cake_boundaries(inputs, nd_ws, deterministic=False)["fwd"]()[0].double()
+    return float((out_fla - out_nd).pow(2).mean().sqrt() / out_nd.pow(2).mean().sqrt())
+
+
 def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
     cells = [
-        f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} {row['arch']} "
+        f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} gate={row['gate']} {row['arch']} "
         f"{row['recurrence']}{'/P' + str(row['segments_per_doc']) if row['recurrence'] == 'seg' else ''} "
-        f"S1[{','.join(row['s1_paths']) or '-'}]"
+        f"S1[{','.join(row['s1_paths']) or '-'}] order={row['build_order']}"
     ]
+    if row.get("r1c"):
+        cells[0] += f" R1c[{','.join(row['r1c']['glm_intra'])}]"
     for name in boundaries:
         if name not in row["ms"]["nd"]:
             continue
@@ -661,8 +905,14 @@ def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
         if name in row["ratio_fla_over_nd"]:
             cell += f" fla {row['ms']['fla'][name]:8.3f} fla/nd x{row['ratio_fla_over_nd'][name]:5.2f}"
         cells.append(cell)
+    if "fla_raw_out_vs_nd" in row:
+        cells.append(f"fla raw out vs nd rel RMS {row['fla_raw_out_vs_nd']:.2e}")
     if "fla_error" in row:
         cells.append(f"fla error: {row['fla_error'][:120]}")
+    if row.get("nd_slower_both_orders"):
+        cells.append(
+            f"nd slower in both orders: {','.join(row['nd_slower_both_orders'])}"
+        )
     print(" | ".join(cells))
     for name, ratio in row.get("side_stream_ratio_det_over_nd", {}).items():
         det, nd = row["side_stream"]["det"][name], row["side_stream"]["nd"][name]
@@ -701,6 +951,9 @@ def _write_json(
                 if args.side_stream
                 else None,
                 "boundaries": list(boundaries),
+                "gates": list(args.gate),
+                "build_order": args.build_order,
+                "lower_bound": LOWER_BOUND if "raw" in args.gate else None,
                 "rows": rows,
             },
             f,
@@ -713,6 +966,14 @@ def main() -> int:
     parser.add_argument("--seqlen", type=int, nargs="+", default=[16384, 65536])
     parser.add_argument("--docs", type=int, nargs="+", default=[3])
     parser.add_argument("--heads", type=int, nargs="+", default=[4])
+    parser.add_argument(
+        "--gate",
+        type=str,
+        nargs="+",
+        default=["g"],
+        choices=GATES,
+        help="the forget gate's forms per row: g (the activated FP32 gate) and / or raw (use_gate_in_kernel=True)",
+    )
     parser.add_argument(
         "--lengths",
         type=str,
@@ -752,6 +1013,13 @@ def main() -> int:
         help="time the flash-linear-attention arm after releasing the Cake arms (rows whose three arms do not fit)",
     )
     parser.add_argument(
+        "--build-order",
+        type=str,
+        default="det-first",
+        choices=BUILD_ORDERS,
+        help="which Cake arm allocates first (det-first, nd-first) or both orders per row (their mean)",
+    )
+    parser.add_argument(
         "--require-cupti",
         action="store_true",
         help="refuse to run when the timer would fall back to CUDA events",
@@ -784,9 +1052,11 @@ def main() -> int:
     else:
         packs = [split_docs(s, d) for s in args.seqlen for d in args.docs]
     rows = []
-    for lengths in packs:
-        for heads in args.heads:
-            row = run_row(
+    orders = ORDERS if args.build_order == "both" else (args.build_order,)
+    for lengths, heads, gate in itertools.product(packs, args.heads, args.gate):
+        by_order = {}
+        for order in orders:
+            by_order[order] = run_row(
                 sum(lengths),
                 len(lengths),
                 heads,
@@ -798,30 +1068,40 @@ def main() -> int:
                 lengths=lengths,
                 fla_alone=args.fla_alone,
                 arms_alone=args.arms_alone,
+                gate=gate,
+                build_order=order,
             )
+            _print_row(by_order[order], boundaries)
+            gc.collect()
+            torch.cuda.empty_cache()
+        row = by_order[orders[0]] if len(orders) == 1 else combine_orders(by_order)
+        if len(orders) > 1:
             _print_row(row, boundaries)
-            rows.append(row)
-            if args.json:
-                _write_json(
-                    args.json,
-                    rows,
-                    boundaries,
-                    device,
-                    arch,
-                    timer,
-                    fla_version,
-                    fla_module_version,
-                    args,
-                )
-    for name in boundaries:
+        rows.append(row)
+        if args.json:
+            _write_json(
+                args.json,
+                rows,
+                boundaries,
+                device,
+                arch,
+                timer,
+                fla_version,
+                fla_module_version,
+                args,
+            )
+    for gate, name in itertools.product(args.gate, boundaries):
         ratios = [
-            r["ratio_det_over_nd"][name] for r in rows if name in r["ratio_det_over_nd"]
+            r["ratio_det_over_nd"][name]
+            for r in rows
+            if r["gate"] == gate and name in r["ratio_det_over_nd"]
         ]
         if ratios:
             geo = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
             slower = sum(x < 1.0 for x in ratios)
             print(
-                f"# {name}: det / nd geomean x{geo:.4f} over {len(ratios)} rows; nd slower on {slower} rows"
+                f"# gate={gate} {name} ({args.build_order}): det / nd geomean x{geo:.4f} over {len(ratios)} "
+                f"rows; nd slower on {slower} rows"
             )
     if args.json:
         _write_json(

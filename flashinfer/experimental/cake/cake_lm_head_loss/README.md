@@ -40,6 +40,8 @@ loss = chunked_lm_head_loss(X, W, labels, objective="ce", loss_div=loss_div, det
 loss, logp = chunked_lm_head_loss(X, W, labels, objective="policy", infer_logp=infer_logp,
                                   loss_weights=loss_weights, return_logp=True, deterministic=False)
 logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096, deterministic=False)
+logp = chunked_lm_head_logprob(X, W, labels, temperature=0.7, deterministic=False)  # scalar temperature
+logp = chunked_lm_head_logprob(X, W, labels, temperature=tau, deterministic=False)  # FP32 [T] on X's device
 ```
 
 The det-free entries `chunked_lm_head_loss`, `chunked_lm_head_logprob`,
@@ -58,8 +60,9 @@ The det-free entries `chunked_lm_head_loss`, `chunked_lm_head_logprob`,
 
 The arguments, outputs, memory rule, switches, ignored-row semantics,
 compaction, the policy objective and its clip, the opt-in forms
-(`memory_mode`, `num_valid_rows`, `check_num_valid_rows`) and the returned
-dtypes are those of the deterministic entries (`chunked_lm_head_det_loss` /
+(`memory_mode`, `num_valid_rows`, `check_num_valid_rows`), the log-probability
+entry's `temperature` / `check_temperature` and the returned dtypes are those
+of the deterministic entries (`chunked_lm_head_det_loss` /
 `chunked_lm_head_det_logprob`).  Statements there that two forms of a call
 give "bitwise the same" output compare the same operations in one run; in
 this package the K-sliced dX reduction may round differently from one run to
@@ -69,8 +72,10 @@ The package's own entries (`cake_backend.forward_loss`, `backward_loss`,
 `forward_logprob`, `backward_logprob`, `forward_logprob_keep`,
 `backward_logprob_keep`, `prepare_lm_head_loss` and the runner,
 `chunked_lm_head_loss` / `chunked_lm_head_logprob` /
-`chunked_lm_head_logprob_keep`, the same in `cake_backend_opt_in`, and the
-candidate-support entries) take
+`chunked_lm_head_logprob_keep`, the temperature entries
+`chunked_lm_head_logprob_temperature`, `forward_logprob_temperature`,
+`backward_logprob_temperature` and `prepare_lm_head_loss_temperature`, the same
+in `cake_backend_opt_in`, and the candidate-support entries) take
 `deterministic` with the default `True` and raise `ValueError` for any value
 but `False`: a caller asks for this package's mode explicitly.  With
 `torch.use_deterministic_algorithms(True)` every entry that launches the
@@ -78,7 +83,8 @@ gradient GEMMs raises PyTorch's alert in PyTorch's wording (`RuntimeError`, or
 a `UserWarning` under `warn_only=True`) before it binds or launches anything:
 `forward_loss` with `need_dx` or `need_dw` (the forward runs the dX and dW
 GEMMs), the deferred last-chunk weight-gradient GEMM of `backward_loss` (and
-the budget form's recompute), `backward_logprob`, `backward_logprob_keep`, a
+the budget form's recompute), `backward_logprob`, `backward_logprob_keep`,
+`backward_logprob_temperature`, a
 runner's `forward()` /
 `backward()` that launch them, and the candidate-support backward.  The
 log-probability forward, a forward without trainable inputs and (gradient
@@ -121,6 +127,50 @@ explicit pair `forward_logprob_keep` / `backward_logprob_keep`
 * The dispatcher `chunked_lm_head_logprob` passes `memory_mode="keep_logits"`
   on unchanged: to the deterministic entry (`deterministic=True`, or the
   deterministic-algorithms fallback) or to this package (`deterministic=False`).
+
+## Temperature of the log-probability entry (`temperature=`)
+
+`chunked_lm_head_logprob(..., temperature=..., check_temperature=...)` is the
+deterministic entry's temperature (`chunked_lm_head_det_logprob`) under this
+package's names: the same contract (`None`, `1.0` or any scalar whose FP32
+value is 1.0 runs the path without a temperature; a positive Python number or a
+float32 `[T]` tensor on `X`'s device, not differentiable; `logp_t = q_y -
+logsumexp_v(q_v)` with `q = RN(f32(z) / tau_t)`, the upstream `dlogp_t` divided
+once per row, `dX` / `dW` reached only through `dz`; a bad value stops the
+stream with a device-side assertion, `check_temperature=True` raises
+`ValueError`), the same kernel forms under this package's prefix
+(`gemm_logits_lbl_tau`, `gemm_logits_dz_tau`, `gemm_logits_mcnt_tau`,
+`row_finalize_tau`) and the same separate entry points in both backend modules
+(`chunked_lm_head_logprob_temperature`, `forward_logprob_temperature`,
+`backward_logprob_temperature`, `prepare_lm_head_loss_temperature`,
+`memory_report_temperature`; the public entry calls them only for a
+`temperature` other than `None`, so a call without one runs the entries
+without a temperature parameter).
+
+* `logp` and `lse` are the deterministic entry's bits for the same call, and
+  so is `dW` when no valid row has a zero `dlogp`.  `dX` is formed from the
+  same `dz` and the same products; a chunk of more than one dX slice adds them
+  in the unordered reduction below.
+* The zero-gradient row skip (below) runs with a temperature too: the
+  temperature rows follow the skip's row order (a per-token temperature is
+  gathered from the caller's `[T]` tensor, which the autograd entry keeps for
+  the backward), the `dz` recompute runs the counted temperature form
+  `gemm_logits_dz_dcnt_tau` (no work on the rows past the chunk's count; the
+  same `dz` bits as `gemm_logits_dz_tau` on the rows before it) and the
+  K-sliced dX reductions and the weight-gradient GEMMs run their `_dcnt`
+  forms.  A record without the counted temperature form, or
+  `set_zero_dlogp_temperature_dz_counted(False)`, runs `gemm_logits_dz_tau`
+  over every row of the chunk instead (a zero `dlogp` gives `dz = 0`).  With
+  zero-gradient rows `dW` sums the live rows in the new row order (bits may
+  differ from the deterministic entry's within the accuracy budgets).
+* `memory_mode="budget"` and `num_valid_rows` take a temperature;
+  `memory_mode="keep_logits"` takes none (`ValueError`), and
+  `chunked_lm_head_loss` has no `temperature` keyword.
+* `deterministic=True` (or the deterministic-algorithms fallback) passes the
+  temperature to the deterministic entry unchanged.
+* `chunked_lm_head_preload(deterministic=False, temperature=True)` also loads
+  the temperature forms; without it a process that never passes a temperature
+  loads (or JIT-builds) no temperature library.
 
 ## Candidate-support entry points (`cake_support.py`)
 
@@ -216,8 +266,9 @@ the previous value; an entry call reads them once):
 | `cake_backend.set_dx_slice_policy` | `"det"` | the dX slice rule (see "Kernel structure of one token chunk"); part of every binding key |
 | `cake_backend.set_dx_red_min_rows` | `0` | a chunk of fewer rows keeps one K slice (the plain store); part of every binding key |
 | `cake_backend.set_zero_weight_min_rows` | `4096` | a call of fewer rows `T` keeps its zero-weight rows in the chunk loop (see "Zero-weight policy rows") |
-| `cake_backend.set_zero_dlogp_min_rows` | `4097` | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; `None` turns the skip off (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
-| `cake_backend.set_gradient_placement` | `"auto"` | where the loss entries (`chunked_lm_head_loss` of both modules, every form) run the dX / dW GEMMs. `"auto"`: a call no backward can follow (grad mode off, or neither `X` nor `W` trainable) computes the loss (and `logp`) only; inside a non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks innermost) the checkpointed forward computes the loss only and saves its inputs, and the recomputation in the backward runs the fused forward and hands the gradient accumulators to the checkpointed call's backward, so a checkpointed step forms them once and keeps no FP32 accumulator from the forward to the backward (paired per checkpoint frame and graph by call order and checked against the inputs' metadata and the call's options; without a handed result the backward runs the fused forward itself, with a `RuntimeWarning`); other hooks innermost (CPU offload), torch's deterministic algorithms, or a torch whose checkpoint lacks those hooks keep the fused forward. Under selective activation checkpointing (`context_fn` of `create_selective_checkpoint_contexts`, whose recomputation replays the checkpointed forward's operators by position) every entry of this package -- the loss, log-probability (default, budget, kept logits) and candidate-support entries -- runs its forward with all active torch dispatch modes popped, the checkpoint's and any user mode on the stack (a `FlopCounterMode` does not see the entry's operators; a tracing mode such as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake inputs and fails loudly), and behaves as in a plain non-reentrant checkpoint; the per-device constant cells and the calling thread's count cells and `arange` constant are formed outside active dispatch modes. `"forward"`: every call with a trainable input forms the gradients in its forward (the previous behavior). The same kernels on the same operands either way: the same loss, `logp` and dW bits, and dX up to the order of its unordered K-slice reduction (the same bits with one dX slice) |
+| `cake_backend.set_zero_dlogp_min_rows` | per architecture: `1946` on sm_100a, `3891` on sm_103a, `4097` elsewhere (sm_107a included) | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; an integer or `None` (the skip off) applies to every architecture; with no override set the setter returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, which passed back restores the per-architecture default (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
+| `cake_backend.set_zero_dlogp_temperature_dz_counted` | `True` | under the zero-gradient row skip a call with a temperature runs the counted temperature form of the dz arm (`gemm_logits_dz_dcnt_tau`); `False` runs the uncounted one over every row (the same outputs); part of the backward binding key |
+| `cake_backend.set_gradient_placement` | `"auto"` | where the loss entries (`chunked_lm_head_loss` of both modules, every form) run the dX / dW GEMMs. `"auto"`: a call no backward can follow (grad mode off, or neither `X` nor `W` trainable) computes the loss (and `logp`) only; inside a non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks innermost) the checkpointed forward computes the loss only and saves its inputs, and the recomputation in the backward runs the fused forward and hands the gradient accumulators to the checkpointed call's backward, so a checkpointed step forms them once and keeps no FP32 accumulator from the forward to the backward (paired per checkpoint frame and graph by call order and checked against the inputs' metadata and the call's options; without a handed result the backward runs the fused forward itself, with a `RuntimeWarning`); other hooks innermost (CPU offload), torch's deterministic algorithms, or a torch whose checkpoint lacks those hooks keep the fused forward. Under selective activation checkpointing (`context_fn` of `create_selective_checkpoint_contexts`, whose recomputation replays the checkpointed forward's operators by position) every entry of this package -- the loss, log-probability (default, budget, kept logits, with a temperature) and candidate-support entries -- runs its forward with all active torch dispatch modes popped, the checkpoint's and any user mode on the stack (a `FlopCounterMode` does not see the entry's operators; a tracing mode such as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake inputs and fails loudly), and behaves as in a plain non-reentrant checkpoint; the per-device constant cells and the calling thread's count cells and `arange` constant are formed outside active dispatch modes. `"forward"`: every call with a trainable input forms the gradients in its forward (the previous behavior). The same kernels on the same operands either way: the same loss, `logp` and dW bits, and dX up to the order of its unordered K-slice reduction (the same bits with one dX slice) |
 | `cake_backend.set_dx_fill_side_stream` | `False` | `True`: a remembered binding issues the `-0.0` fill of `dX_acc` on the calling thread's fill stream (its own allocator pool, joined before the first dX GEMM), so it runs beside the queued chunk-0 logits GEMM; not under CUDA graph capture, not in the prepared runner; `True` keeps up to `T * H * 4` bytes more reserved in the fill stream's pool |
 
 The side streams, events, pinned count cells and the `arange` constant of the
@@ -317,14 +368,23 @@ it handles these rows on the device, without a host synchronization:
   (the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
   `dX`, the fused dX finalize, on a record that registers the `_dcnt` forms
   and the partition kernel, and of at least
-  `cake_backend.zero_dlogp_min_rows()` valid rows (default 4097, one row
-  above a default 4096-row chunk: a one-chunk backward is too short to repay
-  the partition launch; `set_zero_dlogp_min_rows`; `None` = never).  The
+  `cake_backend.zero_dlogp_min_rows(device)` valid rows, the floor of the
+  call's CUDA device index: the override of `set_zero_dlogp_min_rows` when
+  one is set (an integer, or `None` = never, on every architecture), else the
+  architecture's default floor -- `ZERO_DLOGP_MIN_ROWS_BY_ARCH` (the table
+  below), and `ZERO_DLOGP_MIN_ROWS_DEFAULT` = 4097 (one row above a default
+  4096-row chunk) elsewhere, sm_107a included.  With no override set the setter
+  returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`; passing it back (or a copy or
+  an unpickled copy of it) restores the per-architecture default, and
+  `zero_dlogp_min_rows()` without a device returns 4097.  The
   call's plan decides: under the skip the last chunk's bf16 fused cast runs
-  its counted form instead of the TMA-epilogue form (the same `dW` bits), and
-  a plan with a form that has no counted one (an explicitly pinned swapped dX
-  tile or weight-gradient TMA epilogue) runs the backward without the skip:
-  no partition launch, rows in the forward's order.
+  its counted form -- the counted TMA-epilogue form
+  (`gemm_dw_cast_bf16_tma_dcnt`) where the plan without the skip takes the
+  TMA-epilogue cast (`dw_cast_tma_rule`: two or more chunks and a last chunk
+  of 1 .. 1792 rows), else the counted per-thread form; the same `dW` bits
+  either way -- and a plan with a form that has no counted one (an explicitly
+  pinned swapped dX tile or weight-gradient TMA epilogue) runs the backward
+  without the skip: no partition launch, rows in the forward's order.
 
 Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
 in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row
@@ -333,10 +393,32 @@ the row falls within the 63 rows after a chunk's live rows (the weight-gradient
 GEMM's last 64-row K step), and not elsewhere.  Its `dX` row is an exact zero
 either way.
 
+Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
+
+| architecture | floor | chosen from |
+| --- | --- | --- |
+| sm_100a (B200) | 1946 (T = 2048 with 5 % ignored rows) | timing on B200 at 1946 and 3891 valid rows |
+| sm_103a (GB300) | 3891 (T = 4096 with 5 % ignored rows) | timing on GB300 at 1946 and 3891 valid rows |
+| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not timed below one default chunk |
+
+The per-architecture floors put one-chunk backwards from the floor (1946 valid
+rows on sm_100a, 3891 on sm_103a) to 4096 valid rows on the skip, which the
+generic 4097 floor keeps off it.  On those calls: the `dW` bits can differ
+from the call without the skip (the new row order; within the accuracy
+budgets, the same bits run to run); a
+non-finite `X` row of a zero-gradient row makes `dW` NaN only within the
+63-row window above, as for the skip at 4097 rows and more; and the call holds
+the partition's int32 outputs (12 bytes per valid row plus 4 per row of T,
+about 31 KB at T = 2048 with 1946 valid rows) for the whole backward, so its peak
+memory is that much higher than without the skip.
+`set_zero_dlogp_min_rows(4097)` keeps every architecture at the generic floor.
+
 Not applied: `compact_rows=False`, a backward that recounts its valid rows,
 the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
-reference backend.  The one-slice dX chunks (the plain store) compute every
-row of the chunk.
+reference backend.  A call with a temperature takes the skip with its own
+plan (above): the counted temperature form of the dz arm and the counted dX /
+dW GEMMs.  The one-slice dX chunks (the plain store) compute every row of the
+chunk.
 
 ## Kernel structure of one token chunk
 
@@ -392,6 +474,7 @@ shared by `cake_backend_opt_in.py`.
 | `flashinfer.experimental.cake.cake_lm_head_loss` | this package |
 | `cake_backend.{prepare_lm_head_loss, validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction, chunked_lm_head_loss, chunked_lm_head_logprob}` | this package's objects (the deterministic modules keep these names as aliases of their `det` objects) |
 | `cake_backend.{chunked_lm_head_logprob_keep, ChunkedLmHeadLogprobKeepFunction, forward_logprob_keep, backward_logprob_keep, KeptForwardResult, kept_memory_report}` | this package's kept-logits objects (the deterministic package's `chunked_lm_head_det_logprob_keep`, `ChunkedLmHeadDetLogprobKeepFunction` and the same eager names) |
+| `cake_backend.{chunked_lm_head_logprob_temperature, ChunkedLmHeadLogprobTemperatureFunction, forward_logprob_temperature, backward_logprob_temperature, prepare_lm_head_loss_temperature, memory_report_temperature}` | this package's temperature objects (the deterministic package's same names) |
 | `cake_support.{SupportLogprobFunction, chunked_lm_head_support_logprob, chunked_lm_head_support_kl}` | this package's objects |
 | `cake_jit.load_cake_lm_head_loss_module` | this package's loader |
 | libraries `cake_lm_head_loss_<20 hex>_<arch>`, symbols `kernel_cake_lm_head_loss_<20 hex>` | this package's programs (named from their current kernel modules; no name of the libraries the deterministic package shipped under this prefix before its `det` naming is reused) |
@@ -432,13 +515,19 @@ import is the JIT fallback of `cake_build.py`.
   reduction forms pass this package's support tests on GB300.
 * `sm_107a`: the `sm_107a` record registers every stage of the `sm_103a`
   record, each program built for `sm_107a` (the deterministic family's
-  `sm_107a` programs under this package's prefix and the `sm_103a` reduction
-  forms).  No per-architecture rule table lists `sm_107a`, so its rules reach
-  the device-count logits forms and the 256-wide dX tiles of the structural
-  forms, as on the deterministic package.
-* Temperature in the loss / log-probability entries
-  (https://github.com/flashinfer-ai/flashinfer/issues/7637): follows the
-  deterministic package when it lands there.
+  `sm_107a` programs under this package's prefix, the `sm_103a` reduction
+  forms and the zero-gradient row skip's counted forms and partition kernel).
+  The other per-architecture rule tables do not list `sm_107a`, so its
+  rules reach the device-count logits forms and the 256-wide dX tiles of the
+  structural forms, as on the deterministic package. `dw_cast_tma_rule`
+  bounds `sm_107a` as `sm_103a` (1792 rows): a short last chunk takes the
+  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.
+* Temperature of the log-probability entry
+  (https://github.com/flashinfer-ai/flashinfer/issues/7637): the
+  deterministic package's four temperature forms per architecture (the row
+  finalize one program for both) under this package's prefix, on `sm_100a`,
+  `sm_103a` and `sm_107a` (the `sm_103a` programs).  The loss entry takes no
+  temperature, as in the deterministic package.
 
 Tests: `tests/experimental/test_cake_lm_head_loss.py` (the backend: the mode
 contract and the alert, the reference backend, and on a registered device the
