@@ -122,8 +122,28 @@ setup_jit_cache_python_build() {
   export PIP_RETRIES="${PIP_RETRIES:-10}"
   export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-10}"
   export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
-  env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
-    "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
+  # The pre-baked builder image (docker/Dockerfile.aot-builder) already holds a
+  # new enough pip and build; skip the network round trip when it does.
+  if ! "${python_bin}" - <<'PY'
+import importlib.metadata as m
+import re
+
+pip_version = tuple(int(p) for p in re.findall(r"\d+", m.version("pip"))[:3])
+if pip_version < (26, 2, 1):
+    raise SystemExit(1)
+m.version("build")
+PY
+  then
+    env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+      "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
+  fi
+
+  if [ "${FLASHINFER_AOT_BUILDER_IMAGE:-}" = "1" ] &&
+    [ "${FLASHINFER_AOT_BUILDER_PYTORCH_INDEX:-}" != "${pytorch_index}" ]; then
+    echo "ERROR: builder image was baked for PyTorch index" \
+      "'${FLASHINFER_AOT_BUILDER_PYTORCH_INDEX:-}'; this job expects '${pytorch_index}'" >&2
+    return 1
+  fi
 
   if "${python_bin}" - "${expected_cuda_version}" <<'PY'
 import sys
@@ -137,6 +157,10 @@ raise SystemExit(0 if torch.version.cuda == sys.argv[1] else 1)
 PY
   then
     echo "Using preinstalled PyTorch for CUDA ${expected_cuda_version}"
+  elif [ "${FLASHINFER_AOT_BUILDER_IMAGE:-}" = "1" ]; then
+    echo "ERROR: pre-baked builder image has no PyTorch for CUDA" \
+      "${expected_cuda_version}; rebuild the image instead of installing at job time" >&2
+    return 1
   else
     local -a torch_install_args=(
       --upgrade torch --index-url "${pytorch_index_url}"

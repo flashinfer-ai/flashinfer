@@ -1,0 +1,20 @@
+apache-tvm-ffi==0.1.15.post1
+build
+ninja
+numpy
+nvidia-ml-py
+packaging>=24
+# Build tooling baked into the nightly/release flashinfer-jit-cache builder
+# image (docker/Dockerfile.aot-builder). Mirrors the build-system requires of
+# flashinfer-jit-cache-provider/pyproject.toml, minus torch, which is installed
+# from the matrix's PyTorch index in its own layers.
+#
+# Only apache-tvm-ffi is pinned exactly: its headers are sccache key inputs, so
+# it must not move between image rebuilds unless this file changes. The other
+# packages are frozen by the image itself (the resolved set is recorded in
+# /opt/flashinfer-aot-builder/freeze.txt).
+pip>=26.2.1
+requests
+setuptools>=77
+tqdm
+wheel

@@ -233,7 +233,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
           CUDA_VERSION: ${{ matrix.cuda_version }}
-          DOCKER_IMAGE: ${{ matrix.cpu_architecture == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda_version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda_version) }}
+          DOCKER_IMAGE: ${{ matrix.builder_image }}
           FLASHINFER_CI_CACHE: ${{ github.workspace }}/ci-cache
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
           FLASHINFER_JIT_CACHE_BUILD_TARGET: provider
@@ -287,7 +287,7 @@ jobs:
         env:
           ARCH: ${{ matrix.cpu_architecture }}
           CUDA_VERSION: ${{ matrix.cuda_version }}
-          DOCKER_IMAGE: ${{ matrix.cpu_architecture == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda_version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda_version) }}
+          DOCKER_IMAGE: ${{ matrix.builder_image }}
           FLASHINFER_CI_CACHE: ${{ github.workspace }}/ci-cache
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
           FLASHINFER_JIT_CACHE_BUILD_TARGET: shim

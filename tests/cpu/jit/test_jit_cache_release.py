@@ -123,9 +123,115 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
 
     subprocess.run(["bash", "-c", script], check=True)
 
-    assert invocation_log.read_text().splitlines()[0] == (
-        "-m pip install --upgrade pip>=26.2.1 build|unset|unset"
+    # The fake interpreter reports pip/build as already satisfied, so the
+    # network upgrade is skipped (pre-baked builder image).
+    assert not any(
+        "pip install" in line for line in invocation_log.read_text().splitlines()
     )
+
+
+def _fake_python_for_setup(tmp_path, *, tooling_ok, torch_ok):
+    """Fake interpreter: stdin probes succeed/fail by script content."""
+    log = tmp_path / "python-invocations"
+    fake = tmp_path / "python"
+    fake.write_text(
+        "#!/bin/bash\n"
+        f'echo "$*" >> "{log}"\n'
+        'if [ "${1:-}" = "-c" ]; then echo torch==2.9.0; exit 0; fi\n'
+        'if [ "${1:-}" = "-m" ]; then exit 0; fi\n'
+        "src=$(cat)\n"
+        'case "$src" in\n'
+        f"  *pip_version*) exit {0 if tooling_ok else 1} ;;\n"
+        f"  *torch.version.cuda\\ ==*) exit {0 if torch_ok else 1} ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    return fake, log
+
+
+@pytest.mark.cpu_only
+def test_jit_cache_python_setup_upgrades_pip_when_image_is_stale(tmp_path):
+    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    fake, log = _fake_python_for_setup(tmp_path, tooling_ok=False, torch_ok=True)
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+setup_jit_cache_python_build "{fake}" 13.0 cu130
+cleanup_jit_cache_python_build
+"""
+
+    subprocess.run(["bash", "-c", script], check=True)
+
+    assert "-m pip install --upgrade pip>=26.2.1 build" in log.read_text()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "image_index, torch_ok, message",
+    [
+        ("cu129", True, "baked for PyTorch index"),
+        ("cu130", False, "pre-baked builder image has no PyTorch"),
+    ],
+)
+def test_jit_cache_python_setup_fails_loudly_on_baked_image_mismatch(
+    tmp_path, image_index, torch_ok, message
+):
+    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    fake, log = _fake_python_for_setup(tmp_path, tooling_ok=True, torch_ok=torch_ok)
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+export FLASHINFER_AOT_BUILDER_IMAGE=1
+export FLASHINFER_AOT_BUILDER_PYTORCH_INDEX={image_index}
+setup_jit_cache_python_build "{fake}" 13.0 cu130
+"""
+
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "-m pip install" not in log.read_text()
+
+
+@pytest.mark.cpu_only
+def test_matrices_use_baked_builder_image_only_when_tagged(
+    cuda_config_module, tmp_path
+):
+    config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
+    tags = tmp_path / "tags.yml"
+    tags.write_text("flashinfer/flashinfer-aot-builder-cu130: 20261101-abc1234\n")
+
+    def images(matrix, label, arch):
+        return {
+            entry["builder_image"]
+            for entry in matrix
+            if entry["cuda_label"] == label and entry["cpu_architecture"] == arch
+        }
+
+    for build in (
+        cuda_config_module.build_jit_cache_provider_matrix,
+        cuda_config_module.build_jit_cache_shim_matrix,
+    ):
+        for tag_file in (None, tmp_path / "missing.yml"):
+            matrix = build(config, tag_file)
+            assert images(matrix, "cu130", "x86_64") == {
+                "pytorch/manylinux2_28-builder:cuda13.0"
+            }
+            assert images(matrix, "cu130", "aarch64") == {
+                "pytorch/manylinuxaarch64-builder:cuda13.0"
+            }
+        matrix = build(config, tags)
+        assert images(matrix, "cu130", "aarch64") == {
+            "flashinfer/flashinfer-aot-builder-cu130:arm64-20261101-abc1234"
+        }
+        assert images(matrix, "cu130", "x86_64") == {
+            "flashinfer/flashinfer-aot-builder-cu130:amd64-20261101-abc1234"
+        }
+        # A label the file does not list keeps the stock image.
+        assert images(matrix, "cu129", "x86_64") == {
+            "pytorch/manylinux2_28-builder:cuda12.9"
+        }
 
 
 @pytest.mark.cpu_only

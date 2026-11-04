@@ -1,0 +1,38 @@
+# Pre-baked manylinux builder for the nightly/release flashinfer-jit-cache
+# provider and shim wheels. The base stays a PyTorch manylinux_2_28 builder so
+# the wheels remain manylinux_2_28-compatible (do not use Dockerfile.ci: its
+# Ubuntu 24.04 glibc is too new). Everything the job used to download at run
+# time (pip upgrade, torch, its CUDA wheels, cuDNN, build requirements,
+# sccache) is installed here instead, most-stable layers first.
+#
+# Build (one image per CUDA version and architecture):
+#   docker build -f docker/Dockerfile.aot-builder \
+#     --build-arg BASE_IMAGE=pytorch/manylinux2_28-builder:cuda13.0 \
+#     --build-arg PYTORCH_INDEX=cu130 --build-arg CUDNN_VERSION=9.24.0.43 .
+ARG BASE_IMAGE=pytorch/manylinux2_28-builder:cuda13.0
+FROM ${BASE_IMAGE}
+
+ARG PYTORCH_INDEX=cu130
+ARG CUDNN_VERSION
+
+COPY .python-version /install/.python-version
+COPY docker/aot-builder-requirements.txt /install/aot-builder-requirements.txt
+COPY docker/install/install_aot_builder_packages.sh /install/install_aot_builder_packages.sh
+COPY scripts/jit_cache_build_common.sh /install/jit_cache_build_common.sh
+
+# sccache, same pinned version as the job-time installer, so no cold cache.
+RUN bash -c 'source /install/jit_cache_build_common.sh \
+    && install_sccache "${SCCACHE_VERSION}" "$(uname -m)"'
+
+RUN /install/install_aot_builder_packages.sh tooling "${PYTORCH_INDEX}"
+RUN /install/install_aot_builder_packages.sh torch-deps "${PYTORCH_INDEX}"
+RUN /install/install_aot_builder_packages.sh cuda-libs "${PYTORCH_INDEX}"
+RUN /install/install_aot_builder_packages.sh cudnn "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
+RUN /install/install_aot_builder_packages.sh torch "${PYTORCH_INDEX}"
+RUN /install/install_aot_builder_packages.sh finalize "${PYTORCH_INDEX}"
+
+# Lets setup_jit_cache_python_build fail loudly instead of installing at job
+# time when a job is routed to an image built for a different CUDA/index.
+ENV FLASHINFER_AOT_BUILDER_IMAGE=1
+ENV FLASHINFER_AOT_BUILDER_PYTORCH_INDEX="${PYTORCH_INDEX}"
+ENV FLASHINFER_AOT_BUILDER_CUDNN_VERSION="${CUDNN_VERSION}"

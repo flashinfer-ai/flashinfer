@@ -77,7 +77,33 @@ def _provider_tag(architecture: str) -> str:
     return f"sm{architecture.replace('.', '')}"
 
 
-def build_jit_cache_provider_matrix(config: dict[str, Any]) -> list[dict[str, str]]:
+_STOCK_BUILDER_IMAGES = {
+    "x86_64": ("amd64", "pytorch/manylinux2_28-builder:cuda{version}"),
+    "aarch64": ("arm64", "pytorch/manylinuxaarch64-builder:cuda{version}"),
+}
+
+
+def builder_image(
+    entry: dict[str, Any], cpu_architecture: str, tag_file: Path | None
+) -> str:
+    """Return the pre-baked AOT builder image, or the stock manylinux builder.
+
+    The baked image (docker/Dockerfile.aot-builder) is used once tag_file
+    (ci/aot-builder-tags.yml) lists a tag for the entry's CUDA label.
+    """
+    docker_arch, stock = _STOCK_BUILDER_IMAGES[cpu_architecture]
+    repository = f"flashinfer/flashinfer-aot-builder-{entry['label']}"
+    if tag_file is not None and tag_file.is_file():
+        for line in tag_file.read_text().splitlines():
+            name, _, tag = line.partition(":")
+            if name.strip() == repository and tag.strip():
+                return f"{repository}:{docker_arch}-{tag.strip()}"
+    return stock.format(version=entry["version"])
+
+
+def build_jit_cache_provider_matrix(
+    config: dict[str, Any], tag_file: Path | None = None
+) -> list[dict[str, str]]:
     matrix = []
     for entry in config["jit_cache"]:
         for cpu_architecture in ("x86_64", "aarch64"):
@@ -89,6 +115,9 @@ def build_jit_cache_provider_matrix(config: dict[str, Any]) -> list[dict[str, st
                         "cuda_version": entry["version"],
                         "pytorch_index": entry["pytorch_index"],
                         "cpu_architecture": cpu_architecture,
+                        "builder_image": builder_image(
+                            entry, cpu_architecture, tag_file
+                        ),
                         "provider_architecture": provider_architecture,
                         "provider_tag": _provider_tag(provider_architecture),
                     }
@@ -96,7 +125,9 @@ def build_jit_cache_provider_matrix(config: dict[str, Any]) -> list[dict[str, st
     return matrix
 
 
-def build_jit_cache_shim_matrix(config: dict[str, Any]) -> list[dict[str, str]]:
+def build_jit_cache_shim_matrix(
+    config: dict[str, Any], tag_file: Path | None = None
+) -> list[dict[str, str]]:
     matrix = []
     for entry in config["jit_cache"]:
         for cpu_architecture in ("x86_64", "aarch64"):
@@ -108,6 +139,7 @@ def build_jit_cache_shim_matrix(config: dict[str, Any]) -> list[dict[str, str]]:
                     "cuda_version": entry["version"],
                     "pytorch_index": entry["pytorch_index"],
                     "cpu_architecture": cpu_architecture,
+                    "builder_image": builder_image(entry, cpu_architecture, tag_file),
                     "provider_architectures": " ".join(provider_architectures),
                     "provider_tags": " ".join(
                         _provider_tag(architecture)
@@ -409,12 +441,20 @@ def main() -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
+    tag_file = args.repo_root / "ci" / "aot-builder-tags.yml"
     if args.matrix == "providers":
         print(
-            json.dumps(build_jit_cache_provider_matrix(config), separators=(",", ":"))
+            json.dumps(
+                build_jit_cache_provider_matrix(config, tag_file),
+                separators=(",", ":"),
+            )
         )
     elif args.matrix == "shims":
-        print(json.dumps(build_jit_cache_shim_matrix(config), separators=(",", ":")))
+        print(
+            json.dumps(
+                build_jit_cache_shim_matrix(config, tag_file), separators=(",", ":")
+            )
+        )
     else:
         print(
             "Validated CUDA configuration: "
