@@ -146,6 +146,12 @@ GPU_ROWS = [
     # that table's own form.
     ("tp8", "o_proj", 1536, 0),
     ("tp8", "o_proj", 2304, 0),
+    # Round 12: sm_100a rows whose cells take the early-first-stage twins (``_pre``) of the 16-token four-stage fused
+    # decode program (tp8:o_proj and tp1:kv_b at M = 1) and of the resident 64-token TMA-store one (tp1:f_b at M = 64;
+    # tp8:f_b M = 8 and tp1:f_b M = 256 above already run them); on sm_103a each row resolves to that table's own form.
+    ("tp8", "o_proj", 1, 0),
+    ("tp1", "kv_b", 1, 0),
+    ("tp1", "f_b", 64, 0),
 ]
 
 
@@ -1311,6 +1317,88 @@ def test_tns_entry_rules_and_required_keys(monkeypatch):
                 match=f"56,6,16384 carries gemm_tns together with {conflict}",
             ):
                 required_kernel_keys(arch, SM_COUNT)
+
+
+_PRE_CELLS = {
+    "decode:t16_p4_fused": (
+        "12,1,1",
+        "12,1,8",
+        "18,6,1",
+        "56,6,1",
+        "56,6,8",
+        "96,1,1",
+        "96,1,8",
+        "192,2,1",
+    ),
+    "decode:t64_p2_fused_res_tso": ("96,1,64", "96,1,256"),
+}
+_PRE_FAMILIES = {
+    "12,1": ("tp8", "f_b"),
+    "18,6": ("tp8", "q_b"),
+    "56,6": ("tp8", "o_proj"),
+    "96,1": ("tp1", "f_b"),
+    "192,2": ("tp1", "kv_b"),
+}
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_pre_twins_route_their_cells(monkeypatch, arch):
+    """Round 12: ``ROUTE_TWINS`` sends the sm_100a cells listed in ``_PRE_CELLS`` to the early-first-stage twin
+    (``_pre``) of the program the cell selects -- the 16-token four-stage fused decode program on the M = 1 and 8
+    buckets of five families, the resident 64-token TMA-store one on tp1:f_b's 64 and 256 buckets.  Every row of each
+    bucket launches the twin when its program is registered and the selected program otherwise; a register-epilogue
+    view of a resident cell keeps its plain program; sm_103a routes no ``_pre`` twin.  ``required_kernel_keys`` holds
+    both twins on sm_100a only."""
+    twins = route_twins(arch)
+    routed = {
+        (cell, key)
+        for cell, pairs in twins.items()
+        for key, twin in pairs.items()
+        if twin.endswith("_pre")
+    }
+    cases = [(cell, key) for key, cells in _PRE_CELLS.items() for cell in cells]
+    assert routed == (set(cases) if arch == "sm_100a" else set())
+    assert all(twins[cell][key] == key + "_pre" for cell, key in routed)
+    pre_keys = {key + "_pre" for key in _PRE_CELLS}
+    required = set(required_kernel_keys(arch, SM_COUNT))
+    assert required & pre_keys == (pre_keys if arch == "sm_100a" else set())
+    if MODULES:
+        on_arch = {key: route_available(arch, (key,)) for key in pre_keys}
+        assert on_arch == dict.fromkeys(pre_keys, arch == "sm_100a")
+    rows = []
+    for cell, key in cases:
+        n_tiles128, num_k_iters, bucket = (int(v) for v in cell.split(","))
+        weight = _family_weight(*_PRE_FAMILIES[f"{n_tiles128},{num_k_iters}"])
+        assert (weight.n_tiles128, weight.num_k_iters) == (n_tiles128, num_k_iters)
+        lo = cb._bucket_lower(bucket)
+        rows += [
+            (cell, key, weight, M) for M in sorted({lo, (lo + bucket) // 2, bucket})
+        ]
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    for registered in (True, False):
+        monkeypatch.setattr(
+            cb,
+            "route_available",
+            lambda arch, keys, on=registered: on or not set(keys) & pre_keys,
+        )
+        for cell, key, weight, M in rows:
+            cfg = decode_config(
+                M, weight.n_tiles128, weight.num_k_iters, arch, SM_COUNT
+            )
+            assert cfg is not None and cfg.fused and cfg.csplit == 1, (cell, M)
+            selected = cfg.kernel_key_for(True)
+            if arch == "sm_100a":
+                assert selected == key, (cell, M, selected)
+            launched = key + "_pre" if arch == "sm_100a" and registered else selected
+            plan = cb.route_plan(weight, M, arch, SM_COUNT, cfg)
+            assert tuple(plan.kernels) == (launched,), (arch, cell, M, plan.kernels)
+            if key.endswith("_tso"):
+                # the register-epilogue view keeps the cell's plain resident program
+                view = dict(gemm_tma_store=False, decode_tma_store=False)
+                rplan = cb.route_plan(weight, M, arch, SM_COUNT, cfg, **view)
+                plain = cfg.kernel_key_for(False)
+                assert tuple(rplan.kernels) == (plain,), (arch, cell, M, rplan.kernels)
+                assert not plain.endswith(("_tso", "_pre")), plain
 
 
 def test_padding_and_k_sets():
@@ -2674,7 +2762,8 @@ def test_route_twins_are_registered_hint_instances(arch):
     # form ``_prg`` of a TMA-store GEMM program, or (round 12 E) the early-TMEM-free form ``_tde`` of the two-stage
     # four-slot four-tile-prefetch TMA-store GEMM program or both, ``_ts3_tde_prg``, of the 192-wide 128-K
     # grid-stride program, or (round 12 F) both, ``_tde_prg``, of the two-stage four-slot 128-K TMA-store GEMM
-    # program -- on the architecture
+    # program, or the early-first-stage form ``_pre`` of the 16-token four-stage fused and the resident 64-token
+    # TMA-store decode programs -- on the architecture
     # the twin was measured on; the twin is a required key, its program is registered for that architecture once
     # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
@@ -2701,6 +2790,7 @@ def test_route_twins_are_registered_hint_instances(arch):
                 or (suffix == "_tde" and key == "gemm_tstore_s2_ts4_pf4")
                 or (suffix == "_ts3_tde_prg" and key == "gemm_tstore_n192_k128_gs")
                 or (suffix == "_tde_prg" and key == "gemm_tstore_k128_s2_ts4")
+                or (suffix == "_pre" and key in _PRE_CELLS)
             ), (cell, key, twin)
             if sko:
                 assert int(cell.split(",")[2]) <= int(sko.group(1)), (cell, twin)

@@ -22,6 +22,7 @@
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cub/cub.cuh>
@@ -422,8 +423,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
-    DType* logits, PartialSoftmaxResult* partial_results, DType* temperature_arr,
-    float temperature_val, uint32_t d, uint32_t num_slices) {
+    DType* logits, DType* partial_results_buffer, DType* temperature_arr, float temperature_val,
+    uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
@@ -500,7 +501,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
   running_denominator = temp_storage.shared_state.denominator;
 
   if (tx == 0) {
-    partial_results[bx * num_slices + by] = {running_max, running_denominator};
+    auto partial_results = reinterpret_cast<PartialSoftmaxResult*>(partial_results_buffer + bx * d);
+    partial_results[by] = {running_max, running_denominator};
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
@@ -509,7 +511,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
-    DType* logits, DType* output, PartialSoftmaxResult* partial_results, DType* temperature_arr,
+    DType* logits, DType* output, DType* partial_results_buffer, DType* temperature_arr,
     float temperature_val, uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
@@ -522,6 +524,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
   const Float2SoftmaxReduceOp reduce_op;
 
   float2 thread_aggregate = make_float2(-cuda::std::numeric_limits<float>::infinity(), 0.0f);
+  auto partial_results = reinterpret_cast<PartialSoftmaxResult*>(partial_results_buffer + bx * d);
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -530,7 +533,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   for (uint32_t i = tx; i < num_slices; i += BLOCK_THREADS) {
-    PartialSoftmaxResult partial = partial_results[bx * num_slices + i];
+    PartialSoftmaxResult partial = partial_results[i];
     float2 partial_pair = make_float2(partial.max_val, partial.denominator);
     thread_aggregate = reduce_op(thread_aggregate, partial_pair);
   }
@@ -1753,14 +1756,16 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
           // Path A: Vocab-Splitting Strategy for small-batch & large-vocab
           uint32_t num_slices = ceil_div(d, DEFAULT_SLICE_SIZE);
 
-          const size_t partial_buffer_size = batch_size * num_slices * sizeof(PartialSoftmaxResult);
-          if (workspace_buffer_size_in_bytes < partial_buffer_size) {
+          // Phase 1 uses the output rows as scratch while it is still reading logits.
+          const auto in = reinterpret_cast<std::uintptr_t>(logits);
+          const auto out = reinterpret_cast<std::uintptr_t>(output);
+          const auto distance = out > in ? out - in : in - out;
+          if (distance < size_t(batch_size) * d * sizeof(DType)) {
             return cudaErrorInvalidValue;
           }
 
-          AlignedAllocator allocator(workspace_buffer, workspace_buffer_size_in_bytes);
-          auto partial_results = allocator.aligned_alloc<PartialSoftmaxResult>(
-              partial_buffer_size, alignof(PartialSoftmaxResult), "softmax_workspace");
+          // Phase 2 reads all of a row's partials before overwriting that row.
+          auto partial_results_buffer = output;
 
           // Phase 1: Map-Reduce across vocab slices
           dim3 phase1_nblks(batch_size, num_slices);
@@ -1768,8 +1773,9 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
           size_t smem_size = sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>);
 
           auto phase1_kernel = OnlineSoftmaxMapKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-          void* phase1_args[] = {&logits, &partial_results, &temperature_arr, &temperature_val,
-                                 &d,      &num_slices};
+          void* phase1_args[] = {
+              &logits,    &partial_results_buffer, &temperature_arr, &temperature_val, &d,
+              &num_slices};
 
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
               phase1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1787,9 +1793,9 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
             config.attrs = attribute;
             config.numAttrs = 1;
 
-            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, logits, partial_results,
-                                                    temperature_arr, temperature_val, d,
-                                                    num_slices));
+            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, logits,
+                                                    partial_results_buffer, temperature_arr,
+                                                    temperature_val, d, num_slices));
           } else {
             FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
                                                   phase1_args, smem_size, stream));
@@ -1800,8 +1806,9 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
           dim3 phase2_nthrs(BLOCK_THREADS);
 
           auto phase2_kernel = OnlineSoftmaxReduceKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-          void* phase2_args[] = {&logits,          &output, &partial_results, &temperature_arr,
-                                 &temperature_val, &d,      &num_slices};
+          void* phase2_args[] = {&logits,          &output,          &partial_results_buffer,
+                                 &temperature_arr, &temperature_val, &d,
+                                 &num_slices};
 
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
               phase2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1820,7 +1827,7 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
             config.numAttrs = 1;
 
             FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase2_kernel, logits, output,
-                                                    partial_results, temperature_arr,
+                                                    partial_results_buffer, temperature_arr,
                                                     temperature_val, d, num_slices));
           } else {
             FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
