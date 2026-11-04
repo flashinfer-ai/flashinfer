@@ -477,7 +477,8 @@ def _read_mem_available_gb() -> Optional[int]:
 def _cgroup_cpu_quota(root: str = "/sys/fs/cgroup") -> Optional[int]:
     """Whole CPUs the cgroup CPU quota allows, or ``None`` without a quota.
 
-    ninja 1.11+ lowers its default parallelism to this quota (``GetProcessorCount``).
+    ninja lowers its default parallelism to this quota (``GetProcessorCount``):
+    the cgroup v1 quota since 1.11, the v2 ``cpu.max`` since 1.13.
     """
     try:
         with open(f"{root}/cpu.max") as f:
@@ -549,9 +550,9 @@ def _memory_aware_job_cap() -> Optional[int]:
     if mem_cap >= _ninja_default_jobs(cpu_count):
         # No ninja version runs more jobs than fit; don't intervene.
         return None
-    # ninja 1.11+ also lowers its default to the cgroup CPU quota. Never pass
-    # more than that default, while an older ninja, which ignores the quota,
-    # still gets a -j that fits memory.
+    # Newer ninja also lowers its default to the cgroup CPU quota (v1 since
+    # 1.11, v2 since 1.13). Never pass more than that default, while a ninja
+    # that ignores the quota still gets a -j that fits memory.
     cpu_quota = _cgroup_cpu_quota()
     if cpu_quota is not None:
         mem_cap = min(mem_cap, _ninja_default_jobs(min(cpu_count, cpu_quota)))
