@@ -50,10 +50,15 @@ from . import cake_build
 # architecture (see ``cake_policy``), ``POLICY`` the per-architecture host
 # dispatch record and ``NUMERICS`` the documented numerics of the programs.
 # The launch geometry of a program (block, cluster, dynamic shared memory) is
-# fixed in its host binding.
+# fixed in its host binding.  A scan binding takes ``zero_region`` (slot kind
+# ``zero``) right before the grid: a byte range of the workspace it zeroes on
+# the launch stream right before the launch, or an empty tensor (nothing).
+# Every scan program takes ``TicketWord`` (a 16-byte block) right before it; a
+# program's record lists in ``ticket_arg_arches`` the architectures on which it
+# draws its work units from that block instead of the workspace's ticket tail.
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
-ABI: str = "dsa_indexer_v2"
+ABI: str = "dsa_indexer_v4"
 NUMERICS: dict[str, str] = {"zero_sign_policy": "positive_accumulator"}
 FFI_ENTRY: str = "run"
 ARG_PLANS: dict[str, list[list[str]]] = {
@@ -80,6 +85,8 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "grid_ctas"],
         ["parameter", "softmax_scale"],
         ["parameter", "n_split"],
+        ["buffer", "TicketWord"],
+        ["zero", "zero_region"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -115,14 +122,18 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_z"],
     ],
 }
-# The architectures whose scan programs draw every work unit from the workspace's
-# ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every sm_100a / sm_103a scan
-# program.  Every completed scan launch leaves the ticket word at 0; the host
-# (``cake_backend``) zeroes the tail once when it prepares a runner on its own
-# workspace, and before every run on a caller-owned ``workspace_buffer`` (others
-# may write that buffer between runs).  sm_107a keeps the static unit
-# enumeration and leaves the tail unused.
-TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
+# The architectures whose scan programs draw every work unit from a ticket word
+# (``cake_policy.TICKET_TAIL_BYTES``): every scan program on every architecture
+# but the physical kinds of ``POLICY[arch]["static_scan_kinds"]`` (the sm_107a
+# l6 programs), which keep the static enumeration.  A program whose record lists
+# the architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
+# (``cake_backend`` gives a prepared runner one of its own, zeroed once); every
+# other drawing program draws from the workspace's ticket tail.  Every completed
+# scan launch leaves the ticket word at 0; the host (``cake_backend``) zeroes the
+# tail once when it prepares a runner on its own workspace, and on a caller-owned
+# ``workspace_buffer`` (others may write that buffer between runs) passes it as
+# the scan's ``zero_region``, which the scan binding zeroes before every launch.
+TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_det_topk_04db38446d526901fed3": {
         "role": "scan",
@@ -138,6 +149,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_0d38735ee8e81ae6f5e8",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_110194b650e766125f9f": {
         "role": "scan",
@@ -148,11 +160,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_1b6af9940d486a0832d9",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80",
         "arches": ["sm_103a", "sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_2581ee71bf5e5ecd2556": {
         "role": "finalize_rank",
@@ -168,6 +182,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_2de9f2d0467668d46463",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_31ea61c2c7a160221f01": {
         "role": "scan",
@@ -188,6 +203,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_3bd43d833b5d53e81dbe",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_3c6dc460295ddf3c44de": {
         "role": "scan",
@@ -218,6 +234,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_506cb2b2c57f0a514cde",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_521027e8563a9664acef": {
         "role": "scan",
@@ -248,6 +265,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_5c6e55c74de033e5f7af",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_607b85385dc2e298c030": {
         "role": "scan",
@@ -283,6 +301,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_74f132250e5e565dfcc9",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_75842ae0f80e05addeaa": {
         "role": "finalize_rank",
@@ -293,6 +312,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_763009af2c0de13ffc29",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_7891f3dffb0e0717f725": {
         "role": "scan",
@@ -323,6 +343,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_81ccb257c7338a468c3b",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_88619e22363515835efe": {
         "role": "scan",
@@ -358,6 +379,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_942797c60bc61df40715",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_96c30b1f33d2a094d9b9": {
         "role": "finalize_rank",
@@ -368,6 +390,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_99af5257f5e28006f79e",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_9b89c92489b0e60d8ee7": {
         "role": "finalize_rank",
@@ -378,11 +401,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_9c823649b35909199596",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_9f4b76cb713088f1285d": {
         "role": "scan",
@@ -403,6 +428,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_a64563a936f84ea4d9f5",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_aa0bedf1a5601a3c55be": {
         "role": "finalize_rank",
@@ -418,11 +444,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_af8d290aa9010d180ed0",
         "arches": ["sm_103a", "sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_afa89b4033e466d158b1": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_afa89b4033e466d158b1",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7": {
         "role": "merge",
@@ -493,11 +521,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_e7860bf225417a2a3b51",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_e983ae66ae1ef4d182e5": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_e983ae66ae1ef4d182e5",
         "arches": ["sm_107a"],
+        "ticket_arg_arches": ["sm_107a"],
     },
     "cake_dsa_indexer_det_topk_ec8a5e9e791c7fee7261": {
         "role": "scan",
@@ -746,6 +776,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -823,6 +854,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": [4096, 375],
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -916,6 +948,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": None,
         "lsf_programs": False,
+        "static_scan_kinds": ["l6", "pair_l6"],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,

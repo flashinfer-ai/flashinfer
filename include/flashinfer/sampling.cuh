@@ -624,7 +624,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
 
     bool greater_than_u_diff[VEC_SIZE];
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
+        .template SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
     __syncthreads();
 
 #pragma unroll

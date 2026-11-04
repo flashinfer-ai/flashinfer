@@ -38,7 +38,7 @@
 #define CAKE_BINDING_SMEM 221312
 #endif
 
-extern "C" __global__ void CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split);
+extern "C" __global__ void CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, unsigned int* __restrict__ TicketWord);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -102,6 +102,19 @@ cuuint64_t Stride(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value >= 0, ValueError)
       << KERNEL_NAME << ": a stride of descriptor '" << descriptor << "' resolves to " << value;
   return static_cast<cuuint64_t>(value);
+}
+
+void ZeroRegion(const TensorView& t, const DLDevice& dev, cudaStream_t stream) {
+  if (t.numel() == 0) return;
+  TVM_FFI_CHECK(t.device().device_type == kDLCUDA && t.device().device_id == dev.device_id, ValueError)
+      << KERNEL_NAME << ": 'zero_region' must be a CUDA tensor on device " << dev.device_id;
+  check_contiguous(t, "zero_region");
+  const DLDataType dtype = t.dtype();
+  const int64_t bits = static_cast<int64_t>(dtype.bits) * dtype.lanes;
+  TVM_FFI_CHECK(bits % 8 == 0, ValueError)
+      << KERNEL_NAME << ": 'zero_region' must hold whole bytes per element, got " << bits << " bits";
+  CheckCuda(cudaMemsetAsync(DataPtr(t), 0, static_cast<size_t>(t.numel() * (bits / 8)), stream),
+            "cudaMemsetAsync of 'zero_region'");
 }
 
 CUtensorMap EncodeTma_Q(const TensorView& t) {
@@ -204,7 +217,7 @@ CUtensorMap EncodeTma_W(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_q_offsets, TensorView a_Indices, TensorView a_Scores, TensorView a_Cand, int64_t a_num_segments, int64_t a_top_k, int64_t a_ratio, int64_t a_has_offsets, int64_t a_cand_cap, int64_t a_first_cap, int64_t a_sample_tiles_max, int64_t a_sample_shift_permille, int64_t a_far_sample, int64_t a_check_period, int64_t a_grid_ctas, double a_softmax_scale, int64_t a_n_split, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_q_offsets, TensorView a_Indices, TensorView a_Scores, TensorView a_Cand, int64_t a_num_segments, int64_t a_top_k, int64_t a_ratio, int64_t a_has_offsets, int64_t a_cand_cap, int64_t a_first_cap, int64_t a_sample_tiles_max, int64_t a_sample_shift_permille, int64_t a_far_sample, int64_t a_check_period, int64_t a_grid_ctas, double a_softmax_scale, int64_t a_n_split, TensorView a_TicketWord, TensorView a_zero_region, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_Q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_Q, "Q");
@@ -261,6 +274,8 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens
   TVM_FFI_CHECK(a_n_split >= -2147483648LL && a_n_split <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'n_split' = " << a_n_split
       << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_TicketWord, "TicketWord");
+  check_dtype(a_TicketWord, DLDataType{kDLUInt, 32, 1}, "TicketWord");
   check_same_device(a_K, a_Q, "K", "Q");
   check_same_device(a_W, a_Q, "W", "Q");
   check_contiguous(a_cu_seqlens_q, "cu_seqlens_q");
@@ -275,6 +290,8 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens
   check_same_device(a_Scores, a_Q, "Scores", "Q");
   check_contiguous(a_Cand, "Cand");
   check_same_device(a_Cand, a_Q, "Cand", "Q");
+  check_contiguous(a_TicketWord, "TicketWord");
+  check_same_device(a_TicketWord, a_Q, "TicketWord", "Q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -312,12 +329,14 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens
   int32_t v_grid_ctas = static_cast<int32_t>(a_grid_ctas);
   float v_softmax_scale = static_cast<float>(a_softmax_scale);
   int32_t v_n_split = static_cast<int32_t>(a_n_split);
-  void* kernel_args[] = {&v_Q, &v_K, &v_W, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_q_offsets, &v_Indices, &v_Scores, &v_Cand, &v_num_segments, &v_top_k, &v_ratio, &v_has_offsets, &v_cand_cap, &v_first_cap, &v_sample_tiles_max, &v_sample_shift_permille, &v_far_sample, &v_check_period, &v_grid_ctas, &v_softmax_scale, &v_n_split};
+  void* v_TicketWord = DataPtr(a_TicketWord);
+  void* kernel_args[] = {&v_Q, &v_K, &v_W, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_q_offsets, &v_Indices, &v_Scores, &v_Cand, &v_num_segments, &v_top_k, &v_ratio, &v_has_offsets, &v_cand_cap, &v_first_cap, &v_sample_tiles_max, &v_sample_shift_permille, &v_far_sample, &v_check_period, &v_grid_ctas, &v_softmax_scale, &v_n_split, &v_TicketWord};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(CAKE_BINDING_THREADS, 1, 1);
   config.dynamicSmemBytes = CAKE_BINDING_SMEM;
   config.stream = stream;
+  ZeroRegion(a_zero_region, dev, stream);
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_KERNEL_SYMBOL), kernel_args),
             "cudaLaunchKernelExC");
 }

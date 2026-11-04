@@ -100,6 +100,7 @@ POLICY_FIELDS = (
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
     "check_period_knob_max",  # cap on an explicit check period (tiles)
@@ -144,7 +145,8 @@ MERGE_KEY = "merge"
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
 # threshold is.
 SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
-# Global unit tickets (every sm_100a / sm_103a scan program): the CTAs draw every
+# Global unit tickets (every scan program but the kinds of a record's
+# ``static_scan_kinds``, on ``cake_jit.TICKET_TAIL_ARCHES``): the CTAs draw every
 # work unit from the low u32 word of the first int64 behind the candidate buffers
 # (and behind the split staging), the first of a tail every plan's workspace
 # carries: 16 int64 for the ticket word, then the longest-first segment order the
@@ -153,7 +155,12 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # zeroes the tail once at prepare on a backend-owned workspace and before every
 # run on a caller-owned ``workspace_buffer``, which others may write between
 # runs -- except where the call always takes the static fast path
-# (``ticket_static_path``: the scan never touches the word).  sm_107a leaves the tail unused.
+# (``ticket_static_path``: the scan never touches the word) or runs a program of
+# ``static_scan_kinds``.  A scan program whose registry record lists the
+# architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
+# instead and never reads this tail (the eager entry hands it the tail's first
+# 16 bytes); every plan still carries the tail, so the size does not depend on
+# the program.
 TICKET_TAIL_BYTES = 8 * (16 + 1024)
 
 
@@ -299,6 +306,7 @@ class DispatchPolicy:
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
     lsf_programs: bool
+    static_scan_kinds: list
     far_sample: int
     check_period_max: int
     check_period_knob_max: int
@@ -543,6 +551,15 @@ class DispatchPolicy:
                     f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}]"
                     f"{' and the floor of policy[' + repr(rule_name) + ']' if rule_name else ''}, got {ceiling!r}"
                 )
+        static_kinds = raw["static_scan_kinds"]
+        if (
+            not isinstance(static_kinds, (list, tuple))
+            or not all(isinstance(k, str) and k in PHYSICAL_KINDS for k in static_kinds)
+            or list(static_kinds) != sorted(set(static_kinds))
+        ):
+            raise ValueError(
+                f"policy['static_scan_kinds'] must be an ascending list of physical scan kinds {PHYSICAL_KINDS}, got {static_kinds!r}"
+            )
         fit_kinds = raw["sample_fit_kinds"]
         if (
             not isinstance(fit_kinds, (list, tuple))
@@ -598,6 +615,7 @@ class DispatchPolicy:
         ]
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
         values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
+        values["static_scan_kinds"] = [str(k) for k in values["static_scan_kinds"]]
         values["pair_units"] = [str(u) for u in values["pair_units"]]
         values["split_units"] = [str(u) for u in values["split_units"]]
         values["check_period_kind_overrides"] = {
