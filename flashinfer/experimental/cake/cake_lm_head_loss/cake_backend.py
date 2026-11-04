@@ -2927,30 +2927,75 @@ def set_zero_weight_min_rows(rows: int) -> int:
 # The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip
 # (:func:`set_zero_dlogp_min_rows`, no environment variable; ``None`` = never).  The skip orders the rows on the device
 # (one partition launch per call, no host synchronization) at the start of the backward, where the GPU waits for the
-# host; a backward of one default chunk is too short to repay that host time, so the default floor is one row above
-# one default chunk and a smaller call keeps the shipped backward.
+# host.  The generic floor is one row above one default chunk: a smaller call keeps the shipped backward on an
+# architecture without a floor of its own (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
 ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
-_ZERO_DLOGP_MIN_ROWS: dict[str, Optional[int]] = {"rows": ZERO_DLOGP_MIN_ROWS_DEFAULT}
+# Per-architecture default floors (valid rows); an architecture not listed uses :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`.
+# On B200 (sm_100a) and GB300 (sm_103a) a one-chunk call repays the partition's host time from 1946 valid rows on
+# (T = 2048 with 5 % ignored rows): with no zero-gradient row the backward, the step and the checkpointed step read
+# inside the A/A band against the call without the skip at 1946 and 3891 valid rows (plain and temperature
+# log-probability, cooled and after an idle gap), and with 16.6 % zero-gradient rows the step is 3.2 % to 10.9 % faster
+# (the CI above the band) at 1946 and 3891 valid rows.  At 1100 valid rows GB300 reads slower than the deterministic
+# package with no zero-gradient row, so the floor stays above it.  sm_107a keeps the generic floor until measured.
+ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 1946}
 
 
-def zero_dlogp_min_rows() -> Optional[int]:
+class _ArchDefaultFloor:
+    """The type of :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+
+# The floor setting "no override" (:func:`set_zero_dlogp_min_rows`): each device uses its architecture's default floor.
+# ``set_zero_dlogp_min_rows`` returns it when no override was set, and passing it back restores that state.
+ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT = _ArchDefaultFloor()
+_ZERO_DLOGP_MIN_ROWS: dict[str, Any] = {"rows": ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT}
+# Per CUDA device index: its architecture tag (:func:`arch_for`; ``""`` when unsupported), resolved once per device.
+_ZERO_DLOGP_ARCH: dict[int, str] = {}
+
+
+def zero_dlogp_min_rows(device: Optional[int] = None) -> Optional[int]:
     """The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip, ``None`` =
-    never (:func:`set_zero_dlogp_min_rows`; default :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`)."""
-    return _ZERO_DLOGP_MIN_ROWS["rows"]
+    never: the override of :func:`set_zero_dlogp_min_rows` when one is set, else the default floor -- of CUDA device
+    index ``device`` (its architecture's, :data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`), or the generic
+    :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT` without a device."""
+    rows = _ZERO_DLOGP_MIN_ROWS["rows"]
+    if rows is not ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT:
+        return rows
+    if device is None:
+        return ZERO_DLOGP_MIN_ROWS_DEFAULT
+    arch = _ZERO_DLOGP_ARCH.get(device)
+    if arch is None:
+        arch = _ZERO_DLOGP_ARCH.setdefault(
+            device, arch_for(torch.device("cuda", device)) or ""
+        )
+    return ZERO_DLOGP_MIN_ROWS_BY_ARCH.get(arch, ZERO_DLOGP_MIN_ROWS_DEFAULT)
 
 
-def set_zero_dlogp_min_rows(rows: Optional[int]) -> Optional[int]:
-    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip for the
-    following calls of this process (``0``: every eligible call; ``None``: never) and return the previous value.  Read
-    once per call; the binding key holds whether a call runs it."""
-    if rows is not None and (
-        isinstance(rows, bool) or int(rows) != rows or int(rows) < 0
+def set_zero_dlogp_min_rows(
+    rows: Union[Optional[int], _ArchDefaultFloor],
+) -> Union[Optional[int], _ArchDefaultFloor]:
+    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip on every
+    architecture for the following calls of this process (``0``: every eligible call; ``None``: never;
+    :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`: no override, each architecture's default floor) and return the previous
+    setting, which passed back restores it exactly.  Read once per call; the binding key holds whether a call runs
+    it."""
+    if (
+        rows is not None
+        and not isinstance(rows, _ArchDefaultFloor)
+        and (isinstance(rows, bool) or int(rows) != rows or int(rows) < 0)
     ):
         raise ValueError(
-            f"zero-dlogp min rows must be None or a non-negative integer, got {rows!r}"
+            "zero-dlogp min rows must be None, a non-negative integer or ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT, "
+            f"got {rows!r}"
         )
     previous = _ZERO_DLOGP_MIN_ROWS["rows"]
-    _ZERO_DLOGP_MIN_ROWS["rows"] = None if rows is None else int(rows)
+    _ZERO_DLOGP_MIN_ROWS["rows"] = (
+        rows if rows is None or isinstance(rows, _ArchDefaultFloor) else int(rows)
+    )
     return previous
 
 
@@ -9791,22 +9836,22 @@ def _zero_dlogp_skip(
     with the ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros),
     on a record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`) and the partition kernel
     (:data:`ZERO_DLOGP_PARTITION_STAGE`).  An eligible call runs the skip when its plan has the counted forms
-    (:attr:`Plan.dcnt`), and the backward without it otherwise."""
-    floor = zero_dlogp_min_rows()
+    (:attr:`Plan.dcnt`), and the backward without it otherwise.  The floor is the device's
+    (:func:`zero_dlogp_min_rows` of its index: the override, else its architecture's default)."""
     if (
-        floor is None
-        or row_index is None
-        or int(row_index.numel()) < floor
+        row_index is None
         or backend != "cake"
         or not dz_arm
         or (need_dx and not fused_dx)
         or device.type != "cuda"
     ):
         return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    floor = zero_dlogp_min_rows(index)
+    if floor is None or int(row_index.numel()) < floor:
+        return False
     # the device's record and its stages, resolved once per device (:func:`_skip_record`)
-    return _skip_record(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )[3]
+    return _skip_record(index)[3]
 
 
 def backward_logprob(
