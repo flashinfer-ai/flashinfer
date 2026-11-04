@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 from types import SimpleNamespace
 
@@ -62,35 +63,74 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
-@pytest.mark.cpu_only
-def test_ccbin_host_compiler_path_with_spaces_is_quoted(monkeypatch, tmp_path):
-    # A host-compiler path with spaces (typical on Windows, e.g.
-    # "C:\Program Files\...\cl.exe") must be quoted in the generated ninja
-    # command, otherwise the shell splits it and nvcc fails with
-    # "A single input file is required for a non-link phase". A value the user
-    # already quoted (single or double) must not end up double-quoted. See #3515.
+def _ninja_cuda_cflags(monkeypatch, tmp_path, cc):
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
     monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+    monkeypatch.setenv("CC", cc)
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+    (line,) = [
+        ln
+        for ln in ninja.replace(" $\n    ", " ").splitlines()
+        if ln.startswith("cuda_cflags = ")
+    ]
+    return line[len("cuda_cflags = ") :]
 
-    for cc_val in [
-        r"C:\Program Files\LLVM\bin\clang-cl.exe",
-        r'"C:\Program Files\LLVM\bin\clang-cl.exe"',
-        r"'C:\Program Files\LLVM\bin\clang-cl.exe'",
-    ]:
-        monkeypatch.setenv("CC", cc_val)
-        ninja = cpp_ext.generate_ninja_build_for_op(
-            name="test_module",
-            sources=[tmp_path / "generated" / "kernel.cu"],
-            extra_cflags=None,
-            extra_cuda_cflags=None,
-            extra_ldflags=None,
-            extra_include_dirs=None,
-        )
 
-        assert "-ccbin" in ninja
-        assert r'"C:\Program Files\LLVM\bin\clang-cl.exe"' in ninja
-        assert r'""C:\Program Files' not in ninja  # never double-quoted
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cc, expected",
+    [
+        (
+            r"C:\Program Files\LLVM\bin\clang-cl.exe",
+            r"C:\Program Files\LLVM\bin\clang-cl.exe",
+        ),
+        (
+            r'"C:\Program Files\LLVM\bin\clang-cl.exe"',
+            r"C:\Program Files\LLVM\bin\clang-cl.exe",
+        ),
+        (
+            r"'C:\Program Files\LLVM\bin\clang-cl.exe'",
+            r"C:\Program Files\LLVM\bin\clang-cl.exe",
+        ),
+        # nvcc also takes the compiler's directory; a trailing backslash must not
+        # escape the closing quote.
+        (
+            "C:\\Program Files\\VS\\bin\\Hostx64\\x64\\",
+            "C:\\Program Files\\VS\\bin\\Hostx64\\x64\\",
+        ),
+        ("/usr/bin/gcc-12", "/usr/bin/gcc-12"),
+    ],
+)
+def test_ccbin_host_compiler_path_reaches_nvcc_as_one_argument(
+    monkeypatch, tmp_path, cc, expected
+):
+    # A host-compiler path with spaces (typical on Windows) must reach nvcc as
+    # one argument after the generated ninja command is tokenized, or nvcc fails
+    # with "A single input file is required for a non-link phase". See #3515.
+    argv = shlex.split(_ninja_cuda_cflags(monkeypatch, tmp_path, cc))
+    assert argv[argv.index("-ccbin") + 1] == expected
+
+
+@pytest.mark.cpu_only
+def test_ccbin_path_without_spaces_is_emitted_unquoted(monkeypatch, tmp_path):
+    # Keeps the generated command, and so ninja's rebuild check, unchanged for
+    # the common case.
+    cflags = _ninja_cuda_cflags(monkeypatch, tmp_path, "/usr/bin/gcc-12")
+    assert "-ccbin /usr/bin/gcc-12 " in cflags
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cc", ["", "  "])
+def test_empty_cc_adds_no_ccbin(monkeypatch, tmp_path, cc):
+    assert "-ccbin" not in _ninja_cuda_cflags(monkeypatch, tmp_path, cc)
 
 
 @pytest.mark.cpu_only
