@@ -53,11 +53,20 @@ Public fields (defaults are the shipped behaviour)::
                                             projection and MLP: 9251 vs 6927 MiB, step 21.3 vs 22.7 ms on one GB300),
                                             so "auto" takes the replay form there; True = always; False = the replay
                                             form.
-                                            None = the default, which is False with graph="replay", the one mode that
-                                            excludes the kept tapes; an explicit True / "auto" with graph="replay" is
-                                            refused; a forward outside a backward pass, the direct autograd path and
-                                            every other mode are unchanged; one kept set is live at a time, so in a
-                                            segment of several layers only the last one skips the replay
+                                            None = the default ("auto", with graph="off" and graph="replay" alike);
+                                            with graph="replay" the kept tapes are the workspace arena's own tapes
+                                            (a captured graph bakes their addresses, so they add no memory), valid
+                                            only while no other call has used that workspace since the recompute
+                                            (else the replay form runs); the recompute's own hand-off graph holds its
+                                            static results like every graph key (one more saved set per checkpointed
+                                            layer and, when that recompute launches #5 -- recompute_output="always",
+                                            or True with a later saver -- a full static output, T_r * HV * 256 bytes);
+                                            a forward outside a backward pass, the direct autograd path and every
+                                            other mode are unchanged; one kept set is live at a time, so in a
+                                            segment of several layers only the last one skips the replay; under
+                                            graph="replay" "auto" decides only from GRAPH_RECOMPUTE_MIN_ROWS
+                                            (cake_kcp) token x value-head rows per rank (smaller: the recompute
+                                            replays the original forward's graph)
     recompute_output  "auto" | "always"    under torch.utils.checkpoint(use_reentrant=False) torch re-runs the forward
                                             inside .backward() only to re-save its tensors and discards that run's
                                             return value; when this module's autograd node is the last saver of the
@@ -67,7 +76,12 @@ Public fields (defaults are the shipped behaviour)::
                                             RECOMPUTE_OUTPUT_TORCH_VERSIONS) and launches as before whenever any
                                             step of it is unreachable, the node is not executable, a later saver
                                             follows or early stop is off (LAST_CALL["fwd"]["fwd_o_reason"] says
-                                            why); never skipped with graph="replay" or outside the autograd node;
+                                            why); never skipped outside the autograd node or, with graph="replay",
+                                            outside a backward pass (the decision is part of the CUDA-graph key);
+                                            with graph="replay" on a caller-held workspace and
+                                            reuse_recompute_tapes="auto", a rank below GRAPH_RECOMPUTE_MIN_ROWS
+                                            (cake_kcp) decides nothing and launches #5 (reason "small"), while an
+                                            explicit True / False reads the proof at every size;
                                             "always" = the unconditional launch
     backend         "kernels" | "fake"      the exported programs, or the torch emulation of the same ABI (tests)
     segments        None | int              segments per fragment (P): None = the context's plan; an int overrides it
@@ -117,8 +131,8 @@ GROUP_REDUCE_DEFAULT = "fused"
 GRAPH_MODES = ("off", "replay")
 GRAPH_DEFAULT = "off"
 REUSE_RECOMPUTE_TAPES = (True, False, "auto")
-# "auto" (the shipped default) = the checkpoint-aware light backward keeps the recompute's tapes only when the node
-# closes the checkpointed region; True = always; False = the replay form (the default with graph="replay")
+# "auto" (the shipped default, graph="off" and graph="replay" alike) = the checkpoint-aware light backward keeps the
+# recompute's tapes only when the node closes the checkpointed region; True = always; False = the replay form
 REUSE_RECOMPUTE_TAPES_DEFAULT: bool | str = "auto"
 RECOMPUTE_OUTPUTS = ("auto", "always")
 RECOMPUTE_OUTPUT_DEFAULT = "auto"  # the recompute's dead output program is skipped when torch's checkpoint frame proves it dead
@@ -212,7 +226,7 @@ class OptionsKcp:
     """The keyword-only options of ``chunk_gdn_kcp`` / ``chunk_gdn_fwd_kcp`` / ``chunk_gdn_bwd_kcp`` (module docstring).
 
     :meth:`check` validates the field values and the cross-field rules (ring needs ``save_transfer=False``;
-    ``reuse_recompute_tapes`` needs ``graph="off"``; ``use_qk_l2norm_in_kernel`` a bool; a
+    ``reuse_recompute_tapes`` a bool or ``"auto"``; ``use_qk_l2norm_in_kernel`` a bool; a
     test-only ``precision_mode`` / ``transfer_walk`` needs the same value in ``test_knobs``; a known ``save_mode`` /
     ``boundary_mode`` / ``offset_class`` / ``graph`` / ``layout`` / ``group_reduce`` / ``recompute_output`` /
     ``backend``; ``test_knobs``
@@ -230,7 +244,7 @@ class OptionsKcp:
     layout: str = LAYOUT_DEFAULT
     group_reduce: str = GROUP_REDUCE_DEFAULT
     graph: str = GRAPH_DEFAULT
-    # None = the shipped default, resolved in __post_init__ (REUSE_RECOMPUTE_TAPES_DEFAULT; False under graph="replay")
+    # None = the shipped default, resolved in __post_init__ (REUSE_RECOMPUTE_TAPES_DEFAULT under either graph mode)
     reuse_recompute_tapes: bool | str | None = None
     recompute_output: str = RECOMPUTE_OUTPUT_DEFAULT
     backend: str = BACKEND_DEFAULT
@@ -240,11 +254,9 @@ class OptionsKcp:
 
     def __post_init__(self) -> None:
         if self.reuse_recompute_tapes is None:
-            # the shipped default: the kept-tape backward, except under CUDA-graph replay (a captured graph bakes the
-            # arena addresses of its tapes while the kept tapes are fresh tensors), where the default is the replay form
-            self.reuse_recompute_tapes = (
-                REUSE_RECOMPUTE_TAPES_DEFAULT if self.graph == GRAPH_DEFAULT else False
-            )
+            # the shipped default: the kept-tape backward; under CUDA-graph replay the kept tapes are the arena's own
+            # (a captured graph bakes their addresses), guarded by the workspace's call count (cake_kcp._kept_stale)
+            self.reuse_recompute_tapes = REUSE_RECOMPUTE_TAPES_DEFAULT
 
     def check(self) -> OptionsKcp:
         if self.exchange not in EXCHANGES:
@@ -302,12 +314,6 @@ class OptionsKcp:
         ):
             raise TypeError(
                 f"reuse_recompute_tapes must be a bool or 'auto', got {self.reuse_recompute_tapes!r}"
-            )
-        if self.reuse_recompute_tapes and self.graph != "off":
-            raise ValueError(
-                f"reuse_recompute_tapes={self.reuse_recompute_tapes!r} needs graph='off': a captured graph bakes the "
-                "arena addresses of its tapes, while the kept tapes are fresh tensors handed from the recompute "
-                "forward to the backward"
             )
         if self.recompute_output not in RECOMPUTE_OUTPUTS:
             raise ValueError(
