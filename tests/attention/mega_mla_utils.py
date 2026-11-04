@@ -239,7 +239,10 @@ def reference(f):
     lse = torch.logsumexp(scores, -1)
     if f["sink"] is not None:
         lse = torch.logaddexp(lse, f["sink"].double()[None])
-    context = torch.exp(scores - lse[..., None]) @ kv
+    # An empty selection without a sink has LSE=-inf and zero context.
+    # Avoid -inf - -inf while preserving every finite-row probability.
+    normalization = torch.where(torch.isneginf(lse), torch.zeros_like(lse), lse)
+    context = torch.exp(scores - normalization[..., None]) @ kv
     return rope_reference(context, f["positions"], f["cs"], inverse=True), lse
 
 
