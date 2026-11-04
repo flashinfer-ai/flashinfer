@@ -40,99 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCW_OFFSET 0
-#define TMEM_DFB0_OFFSET 256
-#define TMEM_DFB1_OFFSET 320
-#define TMEM_DFS0_OFFSET 384
-#define TMEM_DFS1_OFFSET 448
-#define NUM_STAGE_PIPE_STAGES 2
-#define NUM_FN_PIPE_STAGES 1
-#define NUM_ACC_PIPE_STAGES 2
-#define SMEM_WTV_OFF 222208
-#define SMEM_WTV_STAGE_BYTES 10240
-#define SMEM_WTV_STRIDE 10240
-#define SMEM_X0_1_0_OFF 1024
-#define SMEM_X0_1_0_STAGE_BYTES 8192
-#define SMEM_X0_1_0_STRIDE 86016
-#define SMEM_DY0_1_0_OFF 33792
-#define SMEM_DY0_1_0_STAGE_BYTES 8192
-#define SMEM_DY0_1_0_STRIDE 86016
-#define SMEM_X0_1_1_OFF 9216
-#define SMEM_X0_1_1_STAGE_BYTES 8192
-#define SMEM_X0_1_1_STRIDE 86016
-#define SMEM_DY0_1_1_OFF 41984
-#define SMEM_DY0_1_1_STAGE_BYTES 8192
-#define SMEM_DY0_1_1_STRIDE 86016
-#define SMEM_X0_1_2_OFF 17408
-#define SMEM_X0_1_2_STAGE_BYTES 8192
-#define SMEM_X0_1_2_STRIDE 86016
-#define SMEM_DY0_1_2_OFF 50176
-#define SMEM_DY0_1_2_STAGE_BYTES 8192
-#define SMEM_DY0_1_2_STRIDE 86016
-#define SMEM_X0_1_3_OFF 25600
-#define SMEM_X0_1_3_STAGE_BYTES 8192
-#define SMEM_X0_1_3_STRIDE 86016
-#define SMEM_DY0_1_3_OFF 58368
-#define SMEM_DY0_1_3_STAGE_BYTES 8192
-#define SMEM_DY0_1_3_STRIDE 86016
-#define SMEM_DUS_OFF 66560
-#define SMEM_DUS_STAGE_BYTES 8192
-#define SMEM_DUS_STRIDE 86016
-#define SMEM_DZ0_1_0_OFF 74752
-#define SMEM_DZ0_1_0_STAGE_BYTES 4096
-#define SMEM_DZ0_1_0_STRIDE 86016
-#define SMEM_DZ0_1_1_OFF 78848
-#define SMEM_DZ0_1_1_STAGE_BYTES 4096
-#define SMEM_DZ0_1_1_STRIDE 86016
-#define SMEM_DZ0_1_2_OFF 82944
-#define SMEM_DZ0_1_2_STAGE_BYTES 4096
-#define SMEM_DZ0_1_2_STRIDE 86016
-#define SMEM_FN0_0_OFF 173056
-#define SMEM_FN0_0_STAGE_BYTES 8192
-#define SMEM_FN0_0_STRIDE 8192
-#define SMEM_FN0_1_OFF 181248
-#define SMEM_FN0_1_STAGE_BYTES 8192
-#define SMEM_FN0_1_STRIDE 8192
-#define SMEM_FN1_0_OFF 189440
-#define SMEM_FN1_0_STAGE_BYTES 8192
-#define SMEM_FN1_0_STRIDE 8192
-#define SMEM_FN1_1_OFF 197632
-#define SMEM_FN1_1_STAGE_BYTES 8192
-#define SMEM_FN1_1_STRIDE 8192
-#define SMEM_FN2_2_OFF 205824
-#define SMEM_FN2_2_STAGE_BYTES 8192
-#define SMEM_FN2_2_STRIDE 8192
-#define SMEM_FN2_3_OFF 214016
-#define SMEM_FN2_3_STAGE_BYTES 8192
-#define SMEM_FN2_3_STRIDE 8192
-#define SMEM_FNW0_1_0_OFF 173056
-#define SMEM_FNW0_1_0_STAGE_BYTES 16384
-#define SMEM_FNW0_1_0_STRIDE 16384
-#define SMEM_FNW0_1_1_OFF 189440
-#define SMEM_FNW0_1_1_STAGE_BYTES 16384
-#define SMEM_FNW0_1_1_STRIDE 16384
-#define SMEM_FNW0_1_2_OFF 205824
-#define SMEM_FNW0_1_2_STAGE_BYTES 16384
-#define SMEM_FNW0_1_2_STRIDE 16384
-#define SMEM_XA0_1_0_OFF 1024
-#define SMEM_XA0_1_0_STAGE_BYTES 16384
-#define SMEM_XA0_1_0_STRIDE 86016
-#define SMEM_XA0_1_1_OFF 17408
-#define SMEM_XA0_1_1_STAGE_BYTES 16384
-#define SMEM_XA0_1_1_STRIDE 86016
-#define SMEM_DZN0_OFF 74752
-#define SMEM_DZN0_STAGE_BYTES 4096
-#define SMEM_DZN0_STRIDE 86016
-#define SMEM_DZN1_OFF 78848
-#define SMEM_DZN1_STAGE_BYTES 4096
-#define SMEM_DZN1_STRIDE 86016
-#define SMEM_DZN2_OFF 82944
-#define SMEM_DZN2_STAGE_BYTES 4096
-#define SMEM_DZN2_STRIDE 86016
-#define SMEM_TOTAL 232448
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -249,7 +156,7 @@ __device__ __forceinline__ void tma_store_2d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -305,7 +212,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* wtv = reinterpret_cast<unsigned int*>(smem_raw + 222208);
     const int wtv_addr = smem + 222208;
     __nv_bfloat16* x0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -344,22 +251,24 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
     const int fn2_0_addr_1_0 = smem + 205824;
     __nv_bfloat16* fn2_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int fn2_0_addr_1_1 = smem + 214016;
-    __nv_bfloat16* fnw0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
-    const int fnw0_addr_1_0 = smem + 173056;
-    __nv_bfloat16* fnw0_1_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
-    const int fnw0_addr_1_1 = smem + 189440;
-    __nv_bfloat16* fnw0_1_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
-    const int fnw0_addr_1_2 = smem + 205824;
-    __nv_bfloat16* xa0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int xa0_addr_1_0 = smem + 1024;
-    __nv_bfloat16* xa0_1_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int xa0_addr_1_1 = smem + 17408;
+    __nv_bfloat16* fnw0_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
+    const int fnw0_addr_1 = smem + 173056;
+    __nv_bfloat16* fnw0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
+    const int fnw0_addr_1_0 = smem + 189440;
+    __nv_bfloat16* fnw0_1_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
+    const int fnw0_addr_1_1 = smem + 205824;
+    __nv_bfloat16* xa0_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int xa0_addr_1 = smem + 1024;
+    __nv_bfloat16* xa0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int xa0_addr_1_0 = smem + 17408;
     __nv_bfloat16* dzn0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
     const int dzn0_addr = smem + 74752;
     __nv_bfloat16* dzn1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 78848);
     const int dzn1_addr = smem + 78848;
     __nv_bfloat16* dzn2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int dzn2_addr = smem + 82944;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dY))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dU))) : "memory");
@@ -367,8 +276,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&fnTp))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dX))) : "memory");
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -422,14 +330,14 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accw = taddr;
+    const unsigned int tmem_dfb0 = taddr + 256;
+    const unsigned int tmem_dfb1 = taddr + 320;
+    const unsigned int tmem_dfs0 = taddr + 384;
+    const unsigned int tmem_dfs1 = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_accw = taddr;
-    const int tmem_dfb0 = taddr + 256;
-    const int tmem_dfb1 = taddr + 320;
-    const int tmem_dfs0 = taddr + 384;
-    const int tmem_dfs1 = taddr + 448;
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 72;");
     }
@@ -605,7 +513,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                         mbarrier_wait(stage_full_z_addr + (mm_stage) * 8, _phase_stage_full_z);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x3FFF);
+                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -631,7 +539,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accw + (acc_mm * 128))), "r"(0) : "memory");
                         int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
+                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x3FFF);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -657,7 +565,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
                         int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
+                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -763,7 +671,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                         int in_grp = tile_1 % 16;
                         int small_init = ((in_grp == 0) ? 1 : 0);
                         unsigned int sbuf = grp_mm % 2;
-                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
@@ -799,7 +707,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_3), "r"((tmem_dfb0 + (acc_mm * 32))), "r"(0) : "memory");
-                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
@@ -835,7 +743,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_4), "r"((tmem_dfs0 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
-                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
@@ -871,7 +779,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_5), "r"((tmem_dfs0 + (sbuf * 32))), "r"(1) : "memory");
-                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
@@ -907,7 +815,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_6), "r"((tmem_dfb1 + (acc_mm * 32))), "r"(0) : "memory");
-                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
@@ -943,7 +851,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_7), "r"((tmem_dfs1 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
-                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"

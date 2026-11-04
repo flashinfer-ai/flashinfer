@@ -828,8 +828,10 @@ def test_nondeterministic_flag_selects_this_package(
     dx, dz, dw = cake_rmsnorm_silu_gate_train_backward(
         dy, x, z, w, EPS, deterministic=False
     )
-    routes = loader.ROUTES[loader.device_arch(torch.cuda.current_device())]
-    assert launched == [routes["fwd"], routes["bwd_bf16"]], launched
+    arch = loader.device_arch(torch.cuda.current_device())
+    routes = loader.ROUTES[arch]
+    fwd = loader.module_for_rows(arch, "fwd", 257 * 48, _sm_count())
+    assert launched == [fwd, routes["bwd_bf16"]], launched
     for name in launched:
         assert name not in deterministic_loader.MODULES, name
     assert torch.equal(
@@ -1146,3 +1148,316 @@ def test_autograd_and_checkpoint_match_the_deterministic_package(
     )
     yc.backward(dy)
     check(yc, xc.grad, zc.grad, wc.grad, "checkpoint")
+
+
+# --------------------------------------------------------------------------- the short, long and mid modules' thresholds
+
+
+def _spy_launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    launched: list[str] = []
+    run_module = loader.run_module
+
+    def spy(name, values, *, rows, device_index):
+        launched.append(name)
+        return run_module(name, values, rows=rows, device_index=device_index)
+
+    monkeypatch.setattr(loader, "run_module", spy)
+    return launched
+
+
+def _sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+# The rows per SM up to which each architecture runs the short forward, and
+# from which each architecture runs the mid and the long forward.
+SHORT_FORWARD_ROWS_PER_SM = {"sm_100a": 12, "sm_103a": 12, "sm_107a": 59}
+MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
+LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
+# Forward inputs around and past the short, the mid and the long forward's
+# thresholds: (tokens, heads, layout); ``heads=None`` takes ``threshold * SMs
+# + tokens`` rows (the short threshold for ``flat-short``, the mid one for
+# ``flat-mid``, the long one for ``flat``) as one flat [rows, 128] tensor.
+LONG_FORWARD_CASES = [
+    pytest.param(1, 48, "contiguous", id="1x48"),
+    pytest.param(13, 7, "contiguous", id="13x7"),
+    pytest.param(13, 48, "projection", id="13x48-projection"),
+    pytest.param(21, 48, "head_major", id="21x48-head_major"),
+    pytest.param(0, None, "flat-short", id="short-threshold"),
+    pytest.param(1, None, "flat-short", id="short-threshold+1"),
+    pytest.param(-1, None, "flat-mid", id="mid-threshold-1"),
+    pytest.param(1, None, "flat-mid", id="mid-threshold+1"),
+    pytest.param(2048, 48, "contiguous", id="2048x48"),
+    pytest.param(4097, 48, "contiguous", id="4097x48"),
+    pytest.param(4097, 48, "projection", id="4097x48-projection"),
+    pytest.param(4097, 48, "head_major", id="4097x48-head_major"),
+    pytest.param(6000, 32, "contiguous", id="6000x32"),
+    pytest.param(-1, None, "flat", id="threshold-1"),
+    pytest.param(1, None, "flat", id="threshold+1"),
+    pytest.param(8192, 48, "contiguous", id="8192x48"),
+    pytest.param(8192, 48, "projection", id="8192x48-projection"),
+    pytest.param(8192, 48, "head_major", id="8192x48-head_major"),
+    pytest.param(32737, 48, "contiguous", id="32737x48"),
+    pytest.param(32737, 32, "contiguous", id="32737x32"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads,layout", LONG_FORWARD_CASES)
+def test_forward_around_the_long_threshold_matches_the_deterministic_package(
+    tokens, heads, layout, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``y`` is the deterministic package's bits on both sides of the mid and
+    the long forward's thresholds and past them, and the forward launches
+    ``module_for_rows``' module: where the architecture routes them, the short
+    forward up to ``SHORT_FORWARD_ROWS_PER_SM * SMs`` rows, the long forward
+    from ``LONG_FORWARD_ROWS_PER_SM * SMs`` rows and the mid forward from
+    ``MID_FORWARD_ROWS_PER_SM * SMs`` rows below that, else the forward."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    short_end = SHORT_FORWARD_ROWS_PER_SM[arch]
+    mid_start = MID_FORWARD_ROWS_PER_SM[arch]
+    long_start = LONG_FORWARD_ROWS_PER_SM[arch]
+    if heads is None:
+        start = {"flat-short": short_end, "flat-mid": mid_start}.get(layout, long_start)
+        x, z, w, _ = suite.make(start * sms + tokens, 1, layout="flat", seed=21)
+    else:
+        x, z, w, _ = suite.make(tokens, heads, layout=layout, seed=21)
+    rows = x.numel() // D
+    launched = _spy_launches(monkeypatch)
+    y = nd_forward(x, z, w, EPS)
+    name = loader.module_for_rows(arch, "fwd", rows, sms)
+    assert launched == [name], launched
+    routes = loader.ROUTES[arch]
+    want = loader.route_module(arch, "fwd")
+    if "fwd_short" in routes and rows <= short_end * sms:
+        want = routes["fwd_short"]
+    elif "fwd_long" in routes and rows >= long_start * sms:
+        want = routes["fwd_long"]
+    elif "fwd_mid" in routes and rows >= mid_start * sms:
+        want = routes["fwd_mid"]
+    assert name == want, (arch, rows, sms)
+    assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
+
+
+# Gate inputs at and past the edges of the packed gate's range: below -41,
+# subnormal and zero, infinite and NaN, beside saturated and ordinary ones.
+GATE_EDGE_VALUES = [
+    -1e4,
+    -100.0,
+    -42.0,
+    -41.0,
+    -40.0,
+    -1e-30,
+    -1e-39,
+    -0.0,
+    0.0,
+    1e-39,
+    1e-30,
+    40.0,
+    100.0,
+    1e4,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+]
+# Forward inputs the short forward runs where the architecture routes it, and
+# those at its threshold on sm_100a and sm_103a, 12 rows per SM, on 148 SMs
+# (37x48, 253x7, 55x32) and on 152 SMs (38x48, 260x7, 57x32), and on sm_107a,
+# 59 rows per SM, on 212 SMs (260x48, 1786x7, 390x32) and one token past it
+# (261x48, 1787x7, 391x32).
+GATE_EDGE_CASES = [
+    pytest.param(1, 48, id="1x48"),
+    pytest.param(13, 48, id="13x48"),
+    pytest.param(30, 48, id="30x48"),
+    pytest.param(31, 48, id="31x48"),
+    pytest.param(33, 48, id="33x48"),
+    pytest.param(37, 48, id="37x48"),
+    pytest.param(38, 48, id="38x48"),
+    pytest.param(13, 7, id="13x7"),
+    pytest.param(217, 7, id="217x7"),
+    pytest.param(253, 7, id="253x7"),
+    pytest.param(260, 7, id="260x7"),
+    pytest.param(55, 32, id="55x32"),
+    pytest.param(57, 32, id="57x32"),
+    pytest.param(129, 48, id="129x48"),
+    pytest.param(260, 48, id="260x48"),
+    pytest.param(261, 48, id="261x48"),
+    pytest.param(1786, 7, id="1786x7"),
+    pytest.param(1787, 7, id="1787x7"),
+    pytest.param(390, 32, id="390x32"),
+    pytest.param(391, 32, id="391x32"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads", GATE_EDGE_CASES)
+def test_forward_gate_edges_match_the_deterministic_package(
+    tokens, heads, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With gate inputs at and past the packed gate's range in two of every
+    three rows (a quarter of their elements, so the range check fails for some
+    threads of a row and holds for others) and ordinary ones in the rest,
+    ``y`` is the deterministic package's bits, NaN included, and the forward
+    launches ``module_for_rows``' module."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    x, z, w, _ = suite.make(tokens, heads, seed=23)
+    g = torch.Generator(device=z.device).manual_seed(24)
+    values = torch.tensor(GATE_EDGE_VALUES, device=z.device).bfloat16()
+    pick = torch.randint(
+        0, len(GATE_EDGE_VALUES), z.shape, device=z.device, generator=g
+    )
+    edge = torch.rand(z.shape, device=z.device, generator=g) < 0.25
+    rows = torch.arange(tokens * heads, device=z.device).view(tokens, heads, 1)
+    edge &= rows % 3 != 0
+    z.copy_(torch.where(edge, values[pick], z))
+    launched = _spy_launches(monkeypatch)
+    y = nd_forward(x, z, w, EPS)
+    assert launched == [loader.module_for_rows(arch, "fwd", tokens * heads, sms)]
+    want = det_forward(x, z, w, EPS)
+    assert torch.equal(y.view(torch.int16), want.view(torch.int16)), (
+        "y vs the deterministic package"
+    )
+
+
+# The rows per SM from which each architecture runs the long backward.
+LONG_BACKWARD_ROWS_PER_SM = {"sm_100a": 1280, "sm_103a": 1280, "sm_107a": 1024}
+# Backward inputs around and past the long backward's threshold: (tokens,
+# heads, layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one
+# flat [rows, 128] tensor.
+LONG_BACKWARD_CASES = [
+    pytest.param(-1, None, "flat", id="threshold-1"),
+    pytest.param(1, None, "flat", id="threshold+1"),
+    pytest.param(1031, 48, "contiguous", id="1031x48"),
+    pytest.param(2048, 48, "contiguous", id="2048x48"),
+    pytest.param(4097, 48, "projection", id="4097x48-projection"),
+    pytest.param(4097, 48, "head_major", id="4097x48-head_major"),
+    pytest.param(32737, 48, "contiguous", id="32737x48"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads,layout", LONG_BACKWARD_CASES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_backward_around_the_long_threshold_matches_the_deterministic_package(
+    tokens,
+    heads,
+    layout,
+    dw_dtype,
+    determinism_setting,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Around and past the long backward's threshold
+    (``LONG_BACKWARD_ROWS_PER_SM``): the module launched is
+    ``module_for_rows``' (the long backward from the threshold, the backward
+    below it), ``dx`` and ``dz`` are the deterministic package's bits and
+    ``dw`` lies within the budget of the deterministic ``dw`` on every repeat,
+    and the workspace is zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    long = loader.ROUTES[arch].get(f"{role}_long")
+    if long is None:
+        pytest.skip(f"{arch} routes no long backward")
+    start = LONG_BACKWARD_ROWS_PER_SM[arch]
+    assert loader.MODULES[long]["grid_rule"]["min_rows_per_sm"] == start
+    sms = _sm_count()
+    if heads is None:
+        x, z, w, dy = suite.make(start * sms + tokens, 1, layout="flat", seed=22)
+    else:
+        x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=22)
+    rows = x.numel() // D
+    mag = suite.magnitudes(dy, x, z, EPS)
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_launches(monkeypatch)
+    for _ in range(suite.REPEATS):
+        dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+        assert dw.dtype == dw_dtype
+        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
+        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
+        assert not bool(ws.any()), "the workspace is not zero"
+    name = long if rows >= start * sms else loader.route_module(arch, role)
+    assert loader.module_for_rows(arch, role, rows, sms) == name
+    assert launched == [name] * suite.REPEATS, launched
+
+
+# The most rows of the short backward.
+SHORT_BACKWARD_ROWS = 256
+# Backward inputs around the short backward's 256 rows: (tokens, heads,
+# layout); ``heads=None`` takes ``tokens`` rows as one flat [rows, 128] tensor.
+SHORT_BACKWARD_CASES = [
+    pytest.param(1, 48, "contiguous", id="1x48"),
+    pytest.param(5, 48, "projection", id="5x48-projection"),
+    pytest.param(13, 7, "head_major", id="13x7-head_major"),
+    pytest.param(255, None, "flat", id="threshold-1"),
+    pytest.param(256, None, "flat", id="threshold"),
+    pytest.param(257, None, "flat", id="threshold+1"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads,layout", SHORT_BACKWARD_CASES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_backward_around_the_short_threshold_matches_the_deterministic_package(
+    tokens,
+    heads,
+    layout,
+    dw_dtype,
+    determinism_setting,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Around the short backward's 256 rows: the module launched is
+    ``module_for_rows``' (where the architecture routes it, the short backward
+    up to ``SHORT_BACKWARD_ROWS`` rows, else the backward), ``dx`` and ``dz``
+    are the deterministic package's bits, ``dw`` lies within the budget of the
+    deterministic ``dw`` on every repeat (an accumulated one within the budget
+    of the FP64 reference), and the workspace is zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    sms = _sm_count()
+    if heads is None:
+        x, z, w, dy = suite.make(tokens, 1, layout="flat", seed=23)
+    else:
+        x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=23)
+    rows = x.numel() // D
+    mag = suite.magnitudes(dy, x, z, EPS)
+
+    def out(value=None):
+        if value is None:
+            return torch.empty(D, dtype=dw_dtype, device=x.device)
+        return torch.full((D,), value, dtype=dw_dtype, device=x.device)
+
+    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    dw64 = suite.fp64_reference(dy, x, z, w, EPS)[3]
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_launches(monkeypatch)
+    for _ in range(suite.REPEATS):
+        dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+        assert dw.dtype == dw_dtype
+        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
+        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
+        assert not bool(ws.any()), "the workspace is not zero"
+    acc = nd_backward(
+        dy, x, z, w, EPS, grad_weight=out(0.25), accumulate_grad_weight=True
+    )[2]
+    suite.assert_dw_within(acc, 0.25 + dw64, mag, what="accumulated dw vs FP64")
+    short = loader.ROUTES[arch].get(f"{role}_short")
+    want = loader.route_module(arch, role)
+    if short is not None and rows <= SHORT_BACKWARD_ROWS:
+        assert loader.MODULES[short]["grid_rule"]["max_rows"] == SHORT_BACKWARD_ROWS
+        want = short
+    assert loader.module_for_rows(arch, role, rows, sms) == want
+    assert launched == [want] * (suite.REPEATS + 1), launched

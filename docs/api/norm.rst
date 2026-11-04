@@ -60,7 +60,80 @@ fusion and an autograd wrapper.
     cake_rmsnorm_det_train_backward
     cake_rmsnorm_det_train_backward_workspace_bytes
     cake_rmsnorm_det_train_backward_workspace
+    program_windows
+    weight_dtypes
     CakeRMSNormDetFunction
+
+Training RMSNorm, opt-in non-deterministic weight gradient (Cake)
+-----------------------------------------------------------------
+
+The names the training RMSNorm had before the deterministic package took its
+``det`` names. Every entry point takes ``deterministic`` (default ``True``):
+
+* ``deterministic=True`` runs the deterministic package above and returns its
+  bits.
+* ``deterministic=False`` runs this package's backward in the form its
+  registry lists for each token-count window (the backward's docstring lists
+  the windows). In the windows that ship the single-kernel form, one kernel per
+  call computes ``dx`` row by row and adds the ``dw`` sums of its CTAs into
+  FP64 sums in the workspace, in the order the CTAs finish: ``dw`` is not
+  guaranteed bitwise reproducible; ``dx`` is, and it is within one BF16 ulp of
+  max(|dx|, rms(dx)) of the deterministic backward's ``dx`` (not always bitwise
+  equal to it). In the windows the backward's notes name, a twosum single kernel
+  keeps each thread's ``dw`` column sums exact (error-free FP32 products, TwoSum
+  compensation) before the FP64 additions, so its ``dw`` error does not grow
+  with the token count. The
+  other windows run the deterministic package's backward pair (main kernel and
+  fixed-order reduce), rendered into this package. The backward workspace
+  (``cake_rmsnorm_train_backward_workspace_bytes(..., deterministic=False)``)
+  has one layout with fixed offsets: the pair's counters, the single kernel's
+  counters and FP64 column sums and, for the pair windows, the partial rows.
+  Zeroed once, it serves any sequence of ``deterministic=False`` calls it is
+  large enough for with no host write: the kernels leave the counters at rest
+  and the sums at zero. It serves calls of one mode.
+* Under ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
+  raises ``RuntimeError``. With ``warn_only=True`` it warns; the forward runs
+  this package's (deterministic) forward programs and the backward runs the
+  deterministic package with its own workspace (a caller's ``workspace`` is
+  not used), or raises one ``RuntimeError`` when that package cannot serve the
+  call (``[..., H]`` inputs, an FP32 weight, a width or residual route it does
+  not export). The workspace helpers with ``deterministic=False`` warn and
+  return the deterministic package's workspace in that mode.
+
+.. currentmodule:: flashinfer.cake_rmsnorm_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_rmsnorm
+    cake_rmsnorm_train_forward
+    cake_rmsnorm_train_backward
+    cake_rmsnorm_train_backward_workspace_bytes
+    cake_rmsnorm_train_backward_workspace
+    CakeRMSNormFunction
+    is_cake_rmsnorm_train_supported
+
+.. list-table:: Names before the ``det`` rename and their deterministic names
+    :header-rows: 1
+
+    * - Name (``deterministic=True`` by default)
+      - Deterministic name (always deterministic)
+    * - ``flashinfer.cake_rmsnorm_train``
+      - ``flashinfer.cake_rmsnorm_det_train``
+    * - ``cake_rmsnorm``
+      - ``cake_rmsnorm_det``
+    * - ``cake_rmsnorm_train_forward``
+      - ``cake_rmsnorm_det_train_forward``
+    * - ``cake_rmsnorm_train_backward``
+      - ``cake_rmsnorm_det_train_backward``
+    * - ``cake_rmsnorm_train_backward_workspace_bytes``
+      - ``cake_rmsnorm_det_train_backward_workspace_bytes``
+    * - ``cake_rmsnorm_train_backward_workspace``
+      - ``cake_rmsnorm_det_train_backward_workspace``
+    * - ``CakeRMSNormFunction``
+      - ``CakeRMSNormDetFunction``
+    * - ``is_cake_rmsnorm_train_supported``
+      - ``is_cake_rmsnorm_det_train_supported``
 
 Training SiLU-gated RMSNorm (Cake)
 ----------------------------------
@@ -97,14 +170,21 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
 * ``deterministic=False`` runs the standalone non-deterministic package
   (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
   workspace entry points take ``deterministic=False`` only): the same forward
-  kernel and a one-kernel backward: ``dx`` and ``dz`` are the deterministic
-  backward's bits, and the CTAs take row blocks (each CTA its own block when
+  kernel (up to 12 rows per SM on SM100 and SM103 and up to 59 on SM107, a
+  forward with 16 threads to a row, and from 976 rows per SM on SM100 and
+  SM103 and from 800 on SM107,
+  a forward whose CTAs each walk several row blocks: the same bits) and a
+  one-kernel backward: ``dx`` and ``dz`` are the deterministic backward's
+  bits, and the CTAs take row blocks (each CTA its own block when
   the grid has a CTA for every block; past one wave of CTAs they claim the
   blocks in chunks from the workspace's claim counter) and add their FP64
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
   order depend on scheduling: the weight gradient can differ between calls,
-  always within the deterministic backward's error bound. The workspace
+  always within the deterministic backward's error bound. Up to 256 rows
+  the backward is one thread-block cluster of 16 CTAs that adds
+  the CTAs' partial sums in a fixed order on chip: the same bits on every
+  call, within the same bound, and no workspace. The workspace
   (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
   a few KiB whatever the token count) is zero after every call: zero it once
   and reuse it, one per concurrently running stream. A buffer that anything

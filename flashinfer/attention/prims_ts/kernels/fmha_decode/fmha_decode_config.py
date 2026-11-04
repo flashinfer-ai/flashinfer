@@ -662,7 +662,8 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Problem shape
     # ------------------------------------------------------------------
-    # Per-head embedding dimension D. Supported profiles use 64, 128, or 256.
+    # Per-head embedding dimension D. Generic profiles use 64, 128, 192, or 256;
+    # dense paged FP8-Q/NVFP4-KV additionally supports staged H512.
     headdim: int = 128
     # Number of KV tiles in the launch (= ceil(seq_len_kv / tile_size_kv)).
     # Populated by the launcher once seq_len_kv is known.
@@ -1226,15 +1227,14 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_sf_bytes_per_token(self) -> int:
-        """SMEM bytes for one staged K or V of a token."""
+        """SMEM bytes for one complete K or V scale row of a token."""
         if self.use_nvfp4_kv:
-            sf_bytes_per_token = self.head_dim_kv_stage // 16
-            if self.num_head_dim_stages_kv > 1:
-                # A split head-dimension stage cannot fold scale bytes from
-                # adjacent tokens because its slice is not contiguous in the
-                # source tensor. Keep its inner box at TMA's 16-byte minimum.
-                sf_bytes_per_token = max(sf_bytes_per_token, 16)
-            return sf_bytes_per_token
+            # Packed K/V still uses head_dim_kv_stage-column stages (two for
+            # H256, four for H512). Each stage's SF copy takes the complete
+            # D/16-byte row, because one stage's slice (8 B) is below TMA's
+            # 16-byte minimum box and is not contiguous across tokens. The
+            # transform then selects the 8-byte slice for its stage.
+            return self.headdim // 16
         return 0
 
     @property
@@ -5163,6 +5163,25 @@ def _select_auto_split_kv_reduction_mode(
     return _config_with_split_kv_mode(cfg, "gmem_reduction"), "gmem_reduction"
 
 
+def _validate_headdim_512(cfg: FmhaDecodeConfig) -> None:
+    """Reject H512 profiles other than dense paged FP8-Q/NVFP4-KV decode.
+
+    Other H512 combinations can be enabled here as they are qualified.
+    """
+    if cfg.headdim != 512:
+        return
+    if not (
+        cfg.q_dtype == Float8E4M3FN
+        and cfg.use_nvfp4_kv
+        and cfg.use_paged_kv
+        and not cfg.use_block_sparse
+    ):
+        raise ValueError(
+            "PrimTS head_dim=512 is currently supported only for dense paged "
+            "FP8-E4M3 Q with NVFP4 K/V"
+        )
+
+
 def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
     """Reject k_dtype != v_dtype profiles outside the supported combinations.
 
@@ -5198,6 +5217,7 @@ def _validate_profile_support(
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
     _validate_mixed_kv_dtype_profile(cfg)
+    _validate_headdim_512(cfg)
     if cfg.o_stages != cfg.num_insts_kv:
         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
@@ -5515,15 +5535,16 @@ def _validate_profile_support(
     # Keep the ungrouped one-token-per-CTA control available at the same tile Q
     # as grouped profiles so explicit ungrouped launches retain the MMA shape.
     effective_head_dim_stage = cfg.head_dim_per_stage_kv
-    if headdim in (192, 256):
+    if headdim in (192, 256, 512):
         if effective_head_dim_stage != 128:
             raise ValueError(
-                "fmha_decode SwapsMmaAb headDim=192/256 requires head_dim_per_stage_kv=128"
+                f"fmha_decode SwapsMmaAb headDim={headdim} requires "
+                "head_dim_per_stage_kv=128"
             )
     elif effective_head_dim_stage != 0:
         raise ValueError(
             "split head_dim_per_stage_kv SwapsMmaAb profiles are enabled only "
-            "for headDim=192 or 256"
+            "for headDim=192, 256 or 512"
         )
     if cfg.use_cluster_smem_reduction:
         # Single source of truth for structural eligibility plus dtype and
@@ -5569,10 +5590,10 @@ def _validate_profile_support(
         )
     if tile_size_q and tile_size_q not in (8, 16, 32):
         raise ValueError("fmha_decode SwapsMmaAb supports tile_size_q in {8,16,32}")
-    if headdim not in (64, 128, 192, 256):
+    if headdim not in (64, 128, 192, 256, 512):
         raise ValueError(
             "fmha_decode SwapsMmaAb supports headDim in "
-            "{64,128,192,256}. headDim=192/256 uses the staged profile with "
+            "{64,128,192,256,512}. headDim=192/256/512 use the staged profile with "
             "head_dim_per_stage_kv=128."
         )
     # Validate constraints imposed by mixed precision KV.

@@ -1205,7 +1205,10 @@ def _make_attention_ts_decode_trace(
             description="Semantic fragment size addressed by encoded locators.",
         )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -1432,7 +1435,10 @@ def _make_prims_ts_decode_wrapper_trace(
         }
     )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -4065,6 +4071,7 @@ def _trtllm_batch_decode_token_sparse_reference(
 def _trtllm_batch_decode_token_sparse_init(
     *,
     num_tokens: int,
+    batch_size: int | None = None,
     num_heads: int = 16,
     head_dim: int = 256,
     sparse_top_k: int = 512,
@@ -4077,7 +4084,10 @@ def _trtllm_batch_decode_token_sparse_init(
     Each query token is a request over one-token pages of one KV head. Its K
     and V slot lists are distinct random slots; the first token uses all
     ``sparse_top_k`` of them and the others a random count.
+    If provided, ``batch_size`` must equal ``num_tokens``.
     """
+    if batch_size is not None and batch_size != num_tokens:
+        raise ValueError("token-sparse decode requires batch_size == num_tokens")
     torch.manual_seed(seed)
     num_pages = max(num_pages, 4 * sparse_top_k)
     query = torch.randn(

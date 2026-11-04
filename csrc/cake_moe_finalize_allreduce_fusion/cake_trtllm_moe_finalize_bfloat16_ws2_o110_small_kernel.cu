@@ -40,19 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_REDUCE_SMEM_OFF 0
-#define SMEM_REDUCE_SMEM_STAGE_BYTES 132
-#define SMEM_REDUCE_SMEM_STRIDE 132
-#define SMEM_RMS_SCALAR_OFF 132
-#define SMEM_RMS_SCALAR_STAGE_BYTES 4
-#define SMEM_RMS_SCALAR_STRIDE 4
-#define SMEM_RMS_SLOTS_OFF 136
-#define SMEM_RMS_SLOTS_STAGE_BYTES 32
-#define SMEM_RMS_SLOTS_STRIDE 32
-#define SMEM_TOTAL 256
-#define THREADS 224
-
 #include <math_constants.h>
 
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
@@ -86,23 +73,15 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-namespace flashinfer_cake_moe_finalize_allreduce_fusion {
-__device__ inline unsigned int laneId()
-{
-    uint32_t id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(id));
-    return id;
-}
-} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
-
 extern "C" {
 
 __global__ __launch_bounds__(224) __cluster_dims__(4,1,1) void
 kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __nv_bfloat16* __restrict__ expert_scales, __nv_bfloat16* __restrict__ shared_expert_output, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ quant_out, __nv_bfloat16* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane = flashinfer_cake_moe_finalize_allreduce_fusion::laneId();
+    const uint32_t warp = __shfl_sync(0xFFFFFFFF, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -120,7 +99,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restric
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
     const int reduce_smem_addr = smem + 0;
     float* rms_scalar = reinterpret_cast<float*>(smem_raw + 132);
@@ -1159,7 +1138,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restric
         }
         unsigned int norm_weight_words[4];
         {
-            uint4 _uv4_20 = *reinterpret_cast<const uint4*>(norm_weight + (cluster_thread * 8) + 0);
+            uint4 _uv4_20 = *reinterpret_cast<const uint4*>(norm_weight + cluster_thread * 8 + 0);
             norm_weight_words[0 + 0] = _uv4_20.x;
             norm_weight_words[0 + 1] = _uv4_20.y;
             norm_weight_words[0 + 2] = _uv4_20.z;

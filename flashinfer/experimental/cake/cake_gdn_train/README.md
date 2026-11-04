@@ -12,6 +12,8 @@ partials, where the deterministic package rounds each partial.  The output and
 the final state have the deterministic package's bits.  `dv`, `dg`, `dbeta` and the initial-state
 gradient have them too, except where the backward takes the adjoint table
 priced for `dhu_tc2` (see Chain); they then match within the same budgets.
+On `sm_107a` a call may also take a deeper split table (see Chain); the
+outputs that depend on that table then match within the same budgets too.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
@@ -117,11 +119,23 @@ table (priced for the register scans) by the table priced for `dhu_tc2`
 itself: the serial table or a `(64, 1)` split table of any segment length,
 priced as the makespan of one CTA per (segment, value head) times the
 `dhu_tc2` step time plus the pre-scan and stitch terms.  It takes that table
-when it saves at least 10 us and 5 % of the priced adjoint pass, and runs it
-on `dhu_tc2`; a serial table that the two-stream rule groups keeps its form.
-The forward is unchanged.  A different adjoint table changes the bits of the
-backward outputs (other segment boundaries), so the deterministic package's
-bits need its table: pin `scan_config` / `segment_chunks`.  Then one of four
+when it saves at least 10 us and 5 % of the priced adjoint pass (on `sm_107a`
+at least 2 us, with no percentage floor, `TC_PLAN_SELECT`), and runs it on
+`dhu_tc2`; a serial table that the two-stream rule groups keeps its form.
+On `sm_107a` (`CHAIN_PLAN`) each direction may then take a deeper `(64, 1)`
+split table (more segments than the chosen table), priced for the chain that
+runs it (`fwd_ho` for the forward, `dhu_tc2` for the adjoint) with R200 step
+times and fitted split costs, when it saves at least 2 us and prices at most
+0.95 of the chosen table; a serial table that
+the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
+tables.  On `sm_107a` (`SPLIT_R_FORM`) a value-head group of three with the
+`tail_g3` tail also keeps the planner's `(64, 1)` split adjoint table when the
+`dhu_tc2` pricing runs its pass 2 and the two-stream rule groups its segments
+(the R form below; the deterministic package's table and groups).
+Elsewhere the forward table is the planner's.  A different table
+changes the bits of the outputs that depend on it (other segment boundaries),
+so the deterministic package's bits need its tables: pin `scan_config` /
+`segment_chunks`.  Then one of four
 tails computes `dq`, `dk`, `dv`, `dg` and `dbeta`.  The device's architecture,
 the call's value-head group `G = HV / H` and its (chunk, value head) CTAs
 select the fastest one measured on B200, GB300 and R200 (the production rows, packs,
@@ -192,7 +206,10 @@ order (longest first unless `lpt=False`).  The adjoint `dhu_tc2` scan of a
 value-head group of two runs the first `k` sequences on the caller's stream,
 then their fused tail while a side stream scans the rest.  The forward runs
 `wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream; once
-that `wy_tc` is done, the caller's stream runs those of the last `k`.  The side
+that `wy_tc` is done, the caller's stream runs those of the last `k`.  On
+`sm_107a` the `dhu_tc2` pass 2 of a split adjoint table beside `tail_g3` runs
+the same way over its segments (`n` segments, the first `k` on the caller's
+stream).  The side
 stream is a stream of PyTorch's pool with the device's greatest priority, one
 per caller stream; it is forked from the caller's stream with events and joined
 before the stage returns (also when a launch raises), so the call can be

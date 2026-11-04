@@ -28,14 +28,17 @@ def prepare_mega_gate(
     scratch=None,
     score_barriers=None,
     descriptor_workspace=None,
+    enable_pdl=None,
 ):
     """Prepare a reusable routing plan; plan.run() returns indices and weights.
 
     Inputs are BF16[M,K] and BF16[E,K]. Output is int64[M,topk+shared] plus
     FP32 weights. Plans preserve physical/logical expert mapping, unbiased
-    scoring, deterministic routing, and the current PyTorch CUDA stream.
-    Only the exported configurations are accepted. See MegaGatePlan for
-    optional metadata and reusable workspace layouts.
+    scoring, the token mask, the image bias, deterministic routing, and the
+    current PyTorch CUDA stream. ``enable_pdl`` (default: when the device
+    supports it) launches with programmatic dependent launch. Only the
+    exported configurations are accepted. See MegaGatePlan for optional
+    metadata and reusable workspace layouts.
     """
     from .experimental.deepgemm_mega_gate.mega_gate import MegaGatePlan
 
@@ -62,4 +65,5 @@ def prepare_mega_gate(
         scratch=scratch,
         score_barriers=score_barriers,
         descriptor_workspace=descriptor_workspace,
+        enable_pdl=enable_pdl,
     )

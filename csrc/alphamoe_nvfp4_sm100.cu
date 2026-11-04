@@ -54656,7 +54656,10 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_X_SF_STAGE_OFF 121088
 #define SMEM_SMEM_X_SF_STAGE_STAGE_BYTES 1024
 #define SMEM_SMEM_X_SF_STAGE_STRIDE 1024
-#define SMEM_TOTAL 122496
+#define SMEM_SMEM_LAND_OFF 122432
+#define SMEM_SMEM_LAND_STAGE_BYTES 3072
+#define SMEM_SMEM_LAND_STRIDE 3072
+#define SMEM_TOTAL 125568
 #define THREADS 192
 #define PACKED_SCALE_LOADS 1
 #define LAUNCH_MIN_BLOCKS 1
@@ -54694,6 +54697,21 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+        "DONE_CLUSTER_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
 __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs(
@@ -54830,7 +54848,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(192, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(192, LAUNCH_MIN_BLOCKS) __cluster_dims__(1,1,4) void
 kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constant__ CUtensorMap x, const __grid_constant__ CUtensorMap W1, uint8_t* __restrict__ x_scale, const __grid_constant__ CUtensorMap w1_scale_prepared, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ partial_workspace, int* __restrict__ topk_ids, unsigned int* __restrict__ merge_counters, unsigned int* __restrict__ act_ws, unsigned int* __restrict__ act_sf_ws, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, int M, int K, int top_k, int route_block_m)
 {
     const int tid = threadIdx.x;
@@ -54851,11 +54869,16 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
     #define up_free_addr (mbar_base + 24)
     #define up_ready_addr (mbar_base + 48)
     #define tmem_free_addr (mbar_base + 56)
+    #define merge_land_addr (mbar_base + 64)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 1;
+    const unsigned int cluster_id = (((blockIdx.z / 4) * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 1;
+    const unsigned int num_clusters = clusters_x * gridDim.y * (gridDim.z / 4);
 
-    const int cta_rank = 0;
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
     int* smem_sorted = reinterpret_cast<int*>(smem_raw + 122112);
@@ -54878,13 +54901,15 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
     const int smem_x_sf_addr = smem + 38912;
     unsigned int* smem_x_sf_stage = reinterpret_cast<unsigned int*>(smem_raw + 121088);
     const int smem_x_sf_stage_addr = smem + 121088;
+    float* smem_land = reinterpret_cast<float*>(smem_raw + 122432);
+    const int smem_land_addr = smem + 122432;
     int early_id = 0;
     if (tid < 8) {
         early_id = topk_ids[tid];
     }
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 9 barriers)
+    // Mbarriers at smem_raw[0..72)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -54903,6 +54928,8 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
             mbarrier_init(smem + 48, 1);
             // tmem_free: 1 barriers, init_count=4
             mbarrier_init(smem + 56, 4);
+            // merge_land: 1 barriers, init_count=1
+            mbarrier_init(smem + 64, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -54910,15 +54937,17 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
     __syncwarp();
 
     // TMEM alloc (64 columns, 64 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 64);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 72);
     if (warp == 0) {
-        int _tmem_hold = smem + 64;
+        int _tmem_hold = smem + 72;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(64) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
     __syncthreads();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
@@ -55217,60 +55246,71 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
                 int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, lane_pair_quant, token_slot_route_quant);
                 route_pairs_quant[token_slot_route_quant] = _shfl_sync_1;
             }
-            int partial_split_base = (workspace_record_c * 4 + blockIdx.z) * 2 * 8 * 128;
-            #pragma unroll
-            for (int token_slot_partial = 0; token_slot_partial < 8; token_slot_partial++) {
-                float partial_gate = 0.0f;
-                float partial_up = 0.0f;
-                if (route_pairs_quant[token_slot_partial] < M * top_k) {
-                    partial_gate = _tmem_load_0[token_slot_partial];
-                    partial_up = _tmem_load_1[token_slot_partial];
-                }
-                int partial_element = token_slot_partial * 128 + physical_feature;
-                partial_workspace[partial_split_base + partial_element] = partial_gate;
-                partial_workspace[partial_split_base + 1024 + partial_element] = partial_up;
+            float own_gate = 0.0f;
+            float own_up = 0.0f;
+            if (route_pairs_quant[0] < M * top_k) {
+                own_gate = _tmem_load_0[0];
+                own_up = _tmem_load_1[0];
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
-            asm volatile("barrier.sync 15, 128;" ::: "memory");
-            if (consumer_warp == 0 && lane == 0) {
-                unsigned int _atomic_fetch_add_2;
-                asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                    : "=r"(_atomic_fetch_add_2) : "l"(&merge_counters[workspace_record_c]), "r"(static_cast<uint32_t>(1)) : "memory");
-                smem_merge_flag[0] = (int)_atomic_fetch_add_2;
+            if (cta_rank != 0) {
+                uint32_t land_at;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(land_at) : "r"(smem_land_addr + (unsigned int)(((cta_rank - 1) * 256 + physical_feature) * 4)), "r"(0));
+                uint32_t _mbar_peer_2;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_2) : "r"(merge_land_addr), "r"(0));
+                asm volatile(
+                    "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                    :: "r"(land_at), "f"(own_gate), "r"(_mbar_peer_2) : "memory");
+                uint32_t _mbar_peer_3;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_3) : "r"(merge_land_addr), "r"(0));
+                asm volatile(
+                    "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                    :: "r"(land_at + 512), "f"(own_up), "r"(_mbar_peer_3) : "memory");
+            } else {
+                if (consumer_warp == 0) {
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(merge_land_addr, 3072);
+                    }
+                }
+                mbarrier_wait_cluster_hint(merge_land_addr, 0, 10000000);
             }
-            asm volatile("barrier.sync 15, 128;" ::: "memory");
-            if (smem_merge_flag[0] == 3) {
-                int merge_record_base = workspace_record_c * 8192;
-                float mg0 = partial_workspace[merge_record_base + physical_feature];
-                float mg1 = partial_workspace[merge_record_base + 2048 + physical_feature];
-                float mg2 = partial_workspace[merge_record_base + 4096 + physical_feature];
-                float mg3 = partial_workspace[merge_record_base + 6144 + physical_feature];
-                float mu0 = partial_workspace[merge_record_base + 1024 + physical_feature];
-                float mu1 = partial_workspace[merge_record_base + 3072 + physical_feature];
-                float mu2 = partial_workspace[merge_record_base + 5120 + physical_feature];
-                float mu3 = partial_workspace[merge_record_base + 7168 + physical_feature];
+            if (cta_rank == 0) {
+                float mg0 = own_gate;
+                float mg1 = smem_land[physical_feature];
+                float mg2 = smem_land[256 + physical_feature];
+                float mg3 = smem_land[512 + physical_feature];
+                float mu0 = own_up;
+                float mu1 = smem_land[128 + physical_feature];
+                float mu2 = smem_land[384 + physical_feature];
+                float mu3 = smem_land[640 + physical_feature];
                 float merged_gate = mg0 + mg1 + mg2 + mg3;
                 float merged_up = mu0 + mu1 + mu2 + mu3;
                 bool tail_live = route_pairs_quant[0] < M * top_k;
                 float act_value = 0.0f;
                 if (tail_live) {
-                    int _max_3 = ((expert_c) > (0) ? (expert_c) : (0));
-                    float gate_v = merged_gate * output1_scale_gate_scalar[_max_3];
                     int _max_4 = ((expert_c) > (0) ? (expert_c) : (0));
-                    float up_v = merged_up * output1_scale_scalar[_max_4];
-                    float _exp_6 = __expf(-gate_v);
-                    float _rcp_5 = approx_rcp(1.0f + _exp_6);
-                    act_value = gate_v * _rcp_5 * up_v;
+                    float gate_v = merged_gate * output1_scale_gate_scalar[_max_4];
+                    int _max_5 = ((expert_c) > (0) ? (expert_c) : (0));
+                    float up_v = merged_up * output1_scale_scalar[_max_5];
+                    float _exp_7 = __expf(-gate_v);
+                    float _rcp_6 = approx_rcp(1.0f + _exp_7);
+                    act_value = gate_v * _rcp_6 * up_v;
                 }
                 float tail_amax = fabsf(act_value);
-                float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 1);
-                tail_amax = max_noftz(tail_amax, _shfl_xor_sync_7);
-                float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 2);
+                float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 1);
                 tail_amax = max_noftz(tail_amax, _shfl_xor_sync_8);
-                float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 4);
+                float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 2);
                 tail_amax = max_noftz(tail_amax, _shfl_xor_sync_9);
-                float _shfl_xor_sync_10 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 8);
+                float _shfl_xor_sync_10 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 4);
                 tail_amax = max_noftz(tail_amax, _shfl_xor_sync_10);
+                float _shfl_xor_sync_11 = __shfl_xor_sync(0xFFFFFFFF, tail_amax, 8);
+                tail_amax = max_noftz(tail_amax, _shfl_xor_sync_11);
                 float tail_scale_value;
                 asm("max.f32 %0, %1, %2;" : "=f"(tail_scale_value) : "f"(tail_amax * 0.16666667f), "f"(1e-08f));
                 float tail_scale_src[4];
@@ -55299,21 +55339,21 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
                 if (tail_scale_exp == 0) {
                     tail_rounded_scale = (float)tail_scale_mant * 0.001953125f;
                 } else {
-                    float _exp2_11 = approx_exp2((float)tail_scale_exp - 7.0f);
-                    tail_rounded_scale = _exp2_11 * __fmaf_rn((float)tail_scale_mant, 0.125f, 1.0f);
+                    float _exp2_12 = approx_exp2((float)tail_scale_exp - 7.0f);
+                    tail_rounded_scale = _exp2_12 * __fmaf_rn((float)tail_scale_mant, 0.125f, 1.0f);
                 }
                 float tail_safe_scale = ((tail_rounded_scale == 0.0f) ? 1.0f : tail_rounded_scale);
-                float _rcp_12 = approx_rcp(tail_safe_scale);
-                float tail_q = act_value * _rcp_12;
+                float _rcp_13 = approx_rcp(tail_safe_scale);
+                float tail_q = act_value * _rcp_13;
                 int tail_leader = lane - lane % 16;
                 float tail_fp4_lo[8];
                 float tail_fp4_hi[8];
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    float _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, tail_q, tail_leader + j);
-                    tail_fp4_lo[j] = _shfl_sync_13;
-                    float _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, tail_q, tail_leader + 8 + j);
-                    tail_fp4_hi[j] = _shfl_sync_14;
+                    float _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, tail_q, tail_leader + j);
+                    tail_fp4_lo[j] = _shfl_sync_14;
+                    float _shfl_sync_15 = __shfl_sync(0xFFFFFFFF, tail_q, tail_leader + 8 + j);
+                    tail_fp4_hi[j] = _shfl_sync_15;
                 }
                 if (lane % 16 == 0) {
                     unsigned int tail_packed_lo[1];
@@ -55325,9 +55365,6 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
                     act_ws[act_word_base] = tail_packed_lo[0];
                     act_ws[act_word_base + 1] = tail_packed_hi[0];
                     act_sf_ws[blockIdx.x * (gridDim.y * 8) + act_block_index] = tail_scale_code;
-                }
-                if (consumer_warp == 0 && lane == 0) {
-                    merge_counters[workspace_record_c] = 0;
                 }
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -55342,7 +55379,7 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
 } // extern "C"
 
 constexpr int kGeneratedThreads = 192;
-constexpr int kGeneratedSmemTotal = 122496;
+constexpr int kGeneratedSmemTotal = 125568;
 #undef CAKE_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
@@ -55381,6 +55418,9 @@ constexpr int kGeneratedSmemTotal = 122496;
 #undef SMEM_SMEM_X_SF_STAGE_OFF
 #undef SMEM_SMEM_X_SF_STAGE_STAGE_BYTES
 #undef SMEM_SMEM_X_SF_STAGE_STRIDE
+#undef SMEM_SMEM_LAND_OFF
+#undef SMEM_SMEM_LAND_STAGE_BYTES
+#undef SMEM_SMEM_LAND_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
 #undef PACKED_SCALE_LOADS
@@ -55389,6 +55429,7 @@ constexpr int kGeneratedSmemTotal = 122496;
 #undef up_free_addr
 #undef up_ready_addr
 #undef tmem_free_addr
+#undef merge_land_addr
 #undef kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b
 }  // namespace nvfp4_s5_c208v3b_up
 
@@ -67080,9 +67121,10 @@ void RunCompleteRoutedImpl(
       TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(act_workspace.value().data_ptr()) % 16 == 0 &&
                      reinterpret_cast<uintptr_t>(sf_workspace.value().data_ptr()) % 16 == 0) << "act/sf workspaces must be 16-byte aligned";
       const CUtensorMap w1_scale_map_m1 = EncodePreparedScaleTma(w1_scale_prepared.value(), 16);
-      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up, 122496),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up, nvfp4_s5_c208v3b_up::kGeneratedSmemTotal),
                 "cudaFuncSetAttribute(S5 M=1 up)");
-      nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up<<<dim3(capacity, blocks, 4), dim3(192, 1, 1), 122496, stream>>>(
+      const dim3 cluster_up_grid(capacity, blocks, 4);
+      nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up<<<cluster_up_grid, dim3(nvfp4_s5_c208v3b_up::kGeneratedThreads, 1, 1), nvfp4_s5_c208v3b_up::kGeneratedSmemTotal, stream>>>(
           hidden_states_map,
           gemm1_map,
           static_cast<uint8_t*>(hidden_states_scale.data_ptr()),

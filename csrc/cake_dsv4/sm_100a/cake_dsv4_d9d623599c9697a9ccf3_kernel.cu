@@ -441,6 +441,8 @@ kernel_cake_dsv4_d9d623599c9697a9ccf3(const __grid_constant__ CUtensorMap tmap_q
     for (int k1_pre_row_i = 0; k1_pre_row_i < 4; k1_pre_row_i++) {
         k1_pre_rows[k1_pre_row_i] = -1;
     }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp >= 9 && warp <= 12 && bid < total_work_items) {
         int k1_pre_load_warp_rank = warp - 9;
         int k1_pre_query_idx = bid >> 1;

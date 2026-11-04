@@ -47,18 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_OFF 1024
-#define SMEM_RED_STAGE_BYTES 20480
-#define SMEM_RED_STRIDE 20480
-#define SMEM_REDC_OFF 21504
-#define SMEM_REDC_STAGE_BYTES 20480
-#define SMEM_REDC_STRIDE 20480
-#define SMEM_STAGE_BUF_OFF 41984
-#define SMEM_STAGE_BUF_STAGE_BYTES 65536
-#define SMEM_STAGE_BUF_STRIDE 65536
-#define SMEM_TOTAL 107520
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -1549,6 +1537,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
         red[i_9 * 128 + tid] = _sub_107;
     }
     __syncthreads();
+#if __CUDA_ARCH__ == 1000
     int c0_0 = (ct * ct_vec + v) * 8;
     if (sub == 0 && c0_0 < C) {
         float tot[32];
@@ -1565,10 +1554,24 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
         }
         #pragma unroll
         for (int j_10 = 0; j_10 < 8; j_10++) {
+#else
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
+#endif
             #pragma unroll
             for (int k_2 = 0; k_2 < 4; k_2++) {
+#if __CUDA_ARCH__ == 1000
                 asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (c0_0 + j_10) * 4 + k_2])), "d"((double)tot[j_10 * 4 + k_2]) : "memory");
+#else
+                t4[k_2] = red[(jq * 4 + k_2) * 128 + vq];
+#endif
             }
+#if __CUDA_ARCH__ == 1000
         }
         float totb[8];
         #pragma unroll
@@ -1580,15 +1583,37 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
             #pragma unroll
             for (int j_12 = 0; j_12 < 8; j_12++) {
                 totb[j_12] = totb[j_12] + red[(32 + j_12) * 128 + (s_8 * ct_vec + v)];
+#else
+            float tb_2[1];
+            tb_2[0] = red[(32 + jq) * 128 + vq];
+            #pragma unroll 1
+            for (int s_7 = 1; s_7 < n_sub; s_7++) {
+                int rq = s_7 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    t4[k_3] = t4[k_3] + red[(jq * 4 + k_3) * 128 + rq];
+                }
+                tb_2[0] = tb_2[0] + red[(32 + jq) * 128 + rq];
+#endif
             }
+#if __CUDA_ARCH__ == 1000
         }
         #pragma unroll
         for (int j_13 = 0; j_13 < 8; j_13++) {
             asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + C * 4 + c0_0 + j_13])), "d"((double)totb[j_13]) : "memory");
+#else
+            #pragma unroll
+            for (int k_4 = 0; k_4 < 4; k_4++) {
+                asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (cb0 + q) * 4 + k_4])), "d"((double)t4[k_4]) : "memory");
+            }
+            asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + C * 4 + cb0 + q])), "d"((double)tb_2[0]) : "memory");
+#endif
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#if __CUDA_ARCH__ == 1000
     __threadfence();
+#endif
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1603,82 +1628,177 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
+#if __CUDA_ARCH__ == 1000
         __threadfence();
+#endif
         int ch0 = ct * ct_vec * 8;
-        float a4[4];
-        float tb_2[1];
+        int lim = ((C) < (ch0 + ct_vec * 8) ? (C) : (ch0 + ct_vec * 8));
         float z4[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             z4[e] = 0.0f;
         }
-        double d4[4];
+        float a[8];
+#if __CUDA_ARCH__ == 1000
+        float tb_2[2];
+#else
+        float tb_3[2];
+#endif
+        double d[32];
+        double tbd[8];
         double zero64 = (double)0.0f;
-        double tbd[1];
         double zd[2];
         zd[0] = zero64;
         zd[1] = zero64;
-        double e4[4];
         #pragma unroll 1
-        for (int c = ch0 + tid; c < ch0 + ct_vec * 8; c += 128) {
-            if (c < C) {
-                long long c64_2 = (long long)c;
-                #pragma unroll
-                for (int e_1 = 0; e_1 < 4; e_1++) {
-                    {
-                        d4[e_1] = *reinterpret_cast<const double*>(dw_acc + (c64_2 * 4 + (long long)e_1));
-                    }
-                }
-                reinterpret_cast<int4*>(dw_acc + (c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
-                reinterpret_cast<int4*>(dw_acc + (c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
-                #pragma unroll
-                for (int s_9 = 1; s_9 < 4; s_9++) {
+#if __CUDA_ARCH__ == 1000
+        for (int c0_1 = ch0 + tid; c0_1 < ch0 + ct_vec * 8; c0_1 += 256) {
+#else
+        for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 256) {
+#endif
+            #pragma unroll
+#if __CUDA_ARCH__ == 1000
+            for (int j_14 = 0; j_14 < 2; j_14++) {
+                int cl = c0_1 + 128 * j_14;
+#else
+            for (int j_10 = 0; j_10 < 2; j_10++) {
+                int cl = c0_0 + 128 * j_10;
+#endif
+                if (cl < lim) {
+                    long long cl64 = (long long)cl;
                     #pragma unroll
-                    for (int e_2 = 0; e_2 < 4; e_2++) {
-                        {
-                            e4[e_2] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + c64_2 * 4 + (long long)e_2));
+#if __CUDA_ARCH__ == 1000
+                    for (int s_9 = 0; s_9 < 4; s_9++) {
+#else
+                    for (int s_8 = 0; s_8 < 4; s_8++) {
+#endif
+                        #pragma unroll
+                        for (int e_1 = 0; e_1 < 4; e_1++) {
+                            {
+#if __CUDA_ARCH__ == 1000
+                                d[(j_14 * 4 + s_9) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + cl64 * 4 + (long long)e_1));
+#else
+                                d[(j_10 * 4 + s_8) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_8 + cl64 * 4 + (long long)e_1));
+#endif
+                            }
                         }
                     }
-                    reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_9 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
-                    reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_9 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
+                    #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int s_10 = 0; s_10 < 4; s_10++) {
+#else
+                    for (int s_9 = 0; s_9 < 4; s_9++) {
+#endif
+                        {
+#if __CUDA_ARCH__ == 1000
+                            tbd[j_14 * 4 + s_10] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_10 + (long long)C * 4 + cl64));
+#else
+                            tbd[j_10 * 4 + s_9] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + (long long)C * 4 + cl64));
+#endif
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+#if __CUDA_ARCH__ == 1000
+            for (int j_15 = 0; j_15 < 2; j_15++) {
+                int c = c0_1 + 128 * j_15;
+#else
+            for (int j_11 = 0; j_11 < 2; j_11++) {
+                int c = c0_0 + 128 * j_11;
+#endif
+                if (c < lim) {
+                    long long c64_2 = (long long)c;
+                    long long bi = (long long)C * 4 + c64_2;
+                    #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int s_11 = 0; s_11 < 4; s_11++) {
+                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_11 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
+                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_11 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
+#else
+                    for (int s_10 = 0; s_10 < 4; s_10++) {
+                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_10 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
+                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_10 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
+#endif
+                    }
+                    #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int s_12 = 1; s_12 < 4; s_12++) {
+#else
+                    for (int s_11 = 1; s_11 < 4; s_11++) {
+#endif
+                        #pragma unroll
+                        for (int e_2 = 0; e_2 < 4; e_2++) {
+#if __CUDA_ARCH__ == 1000
+                            d[j_15 * 4 * 4 + e_2] = d[j_15 * 4 * 4 + e_2] + d[(j_15 * 4 + s_12) * 4 + e_2];
+#else
+                            d[j_11 * 4 * 4 + e_2] = d[j_11 * 4 * 4 + e_2] + d[(j_11 * 4 + s_11) * 4 + e_2];
+#endif
+                        }
+                    }
                     #pragma unroll
                     for (int e_3 = 0; e_3 < 4; e_3++) {
-                        d4[e_3] = d4[e_3] + e4[e_3];
+#if __CUDA_ARCH__ == 1000
+                        a[4 * j_15 + e_3] = (float)d[j_15 * 4 * 4 + e_3];
+#else
+                        a[4 * j_11 + e_3] = (float)d[j_11 * 4 * 4 + e_3];
+#endif
                     }
-                }
-                #pragma unroll
-                for (int e_4 = 0; e_4 < 4; e_4++) {
-                    a4[e_4] = (float)d4[e_4];
-                }
-                if ((flags & 2) != 0) {
                     #pragma unroll
-                    for (int e_5 = 0; e_5 < 4; e_5++) {
-                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_5)) = (__nv_bfloat16)a4[e_5];
+#if __CUDA_ARCH__ == 1000
+                    for (int s_13 = 0; s_13 < 4; s_13++) {
+                        *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_13 + bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
+#else
+                    for (int s_12 = 0; s_12 < 4; s_12++) {
+                        *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_12 + bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
+#endif
                     }
-                } else {
-                    {
-                        float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                        *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                    #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int s_14 = 1; s_14 < 4; s_14++) {
+                        tbd[j_15 * 4] = tbd[j_15 * 4] + tbd[j_15 * 4 + s_14];
+#else
+                    for (int s_13 = 1; s_13 < 4; s_13++) {
+                        tbd[j_11 * 4] = tbd[j_11 * 4] + tbd[j_11 * 4 + s_13];
+#endif
                     }
-                }
-                long long bi = (long long)C * 4 + c64_2;
-                {
-                    tbd[0] = *reinterpret_cast<const double*>(dw_acc + bi);
-                }
-                *reinterpret_cast<unsigned long long*>(dw_acc + (bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
-                #pragma unroll
-                for (int s_10 = 1; s_10 < 4; s_10++) {
-                    {
-                        e4[0] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_10 + bi));
+#if __CUDA_ARCH__ == 1000
+                    tb_2[j_15] = (float)tbd[j_15 * 4];
+#else
+                    tb_3[j_11] = (float)tbd[j_11 * 4];
+#endif
+                    if ((flags & 2) != 0) {
+                        #pragma unroll
+                        for (int e_4 = 0; e_4 < 4; e_4++) {
+#if __CUDA_ARCH__ == 1000
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_15 + e_4];
+#else
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_11 + e_4];
+#endif
+                        }
+                    } else {
+                        {
+#if __CUDA_ARCH__ == 1000
+                            float4 _v4 = make_float4(a[4 * j_15 + 0], a[4 * j_15 + 1], a[4 * j_15 + 2], a[4 * j_15 + 3]);
+#else
+                            float4 _v4 = make_float4(a[4 * j_11 + 0], a[4 * j_11 + 1], a[4 * j_11 + 2], a[4 * j_11 + 3]);
+#endif
+                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        }
                     }
-                    *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_10 + bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
-                    tbd[0] = tbd[0] + e4[0];
-                }
-                tb_2[0] = (float)tbd[0];
-                if ((flags & 8) != 0) {
-                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_2[0];
-                } else {
-                    *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_2[0];
+                    if ((flags & 8) != 0) {
+#if __CUDA_ARCH__ == 1000
+                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_2[j_15];
+#else
+                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[j_11];
+#endif
+                    } else {
+#if __CUDA_ARCH__ == 1000
+                        *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_2[j_15];
+#else
+                        *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[j_11];
+#endif
+                    }
                 }
             }
         }

@@ -5,7 +5,7 @@
 One ``DataPreprocess`` launch replaces the multi-kernel torch staging path
 (fp32 upcast + ~a dozen elementwise/reduce launches + per-tensor copies) that
 `stage_mega_moe_inputs` used per forward: the kernel reads the bf16 row once,
-quantizes it in smem (NVFP4 per-16 E4M3 scales or MXFP8 per-32 E8M0), and
+quantizes it in smem (NVFP4 per-16 E4M3 scales or MXFP4/MXFP8 per-32 E8M0), and
 repacks routing to the workspace's integer-ID/fp32 layout.
 
 Compiled stagers are cached by geometry, quantization mode and tensor types
@@ -26,7 +26,7 @@ import torch
 
 from .comm import ensure_not_capturing
 
-_QUANT_TYPES = ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2")
+_QUANT_TYPES = ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2")
 _MAX_FUSED_TAIL_ELEMENTS_PER_THREAD = 16
 
 
@@ -159,7 +159,17 @@ def _int32_routing_stager_class(
     if not mxfp8_normal_scales:
         return Int32RoutingDataPreprocess
 
-    class NormalScaleMxfp8DataPreprocess(Int32RoutingDataPreprocess):
+    class NormalScaleMxDataPreprocess(Int32RoutingDataPreprocess):
+        def __init__(self, topk, hidden, quant_type):
+            # MXFP4 shares the per-32 E8M0 launch layout with MXFP8.
+            super().__init__(
+                topk, hidden, "mxfp8_e4m3" if quant_type == "mxfp4" else quant_type
+            )
+            self.quant_type = quant_type
+            if quant_type == "mxfp4":
+                self.quant_dtype = cutlass.Float4E2M1FN
+                self._mxfp8_data_rcp_limit = 1.0 / 6.0
+
         @cute.kernel
         def mxfp8_quant_and_process_impl(
             self,
@@ -172,16 +182,13 @@ def _int32_routing_stager_class(
             topk_idx_output,
             topk_weights_output,
         ):
-            # Adjacent lanes jointly quantize one 32-element scale block. Each lane
-            # owns one contiguous 16-byte output vector, so every STG.128 is
-            # coalesced across the warp. The final scale block may contain only the
-            # even lane's 16 elements.
+            # Each lane stores 16 bytes: a full MXFP4 scale block or half an
+            # MXFP8 block. Only MXFP8 needs a reduction between adjacent lanes.
             threads: cutlass.Constexpr[int] = self._threads_per_cta
             hidden: cutlass.Constexpr[int] = self.hidden
             load_vec: cutlass.Constexpr[int] = 8  # 8 bf16 = 16 B per cp.async
-            quant_vec: cutlass.Constexpr[int] = (
-                16  # one coalesced 16 B fp8 store per lane
-            )
+            quant_vec: cutlass.Constexpr[int] = 128 // self.quant_dtype.width
+            chunks_per_scale: cutlass.Constexpr[int] = 32 // quant_vec
             load_rounds_per_quant_round: cutlass.Constexpr[int] = quant_vec // load_vec
             num_chunks: cutlass.Constexpr[int] = hidden // load_vec
             num_quant_chunks: cutlass.Constexpr[int] = hidden // quant_vec
@@ -214,8 +221,7 @@ def _int32_routing_stager_class(
                 cutlass.BFloat16,
                 num_bits_per_copy=load_vec * 16,
             )
-            # At most two load rounds provide one 16-element vector to every lane.
-            # Commit them as one group so group j feeds quant round j.
+            # Commit the loads for each output vector as one group.
             for i in cutlass.range_constexpr(chunks_per_thread):
                 c = tid + Int32(i * threads)
                 if c < Int32(num_chunks):
@@ -262,13 +268,15 @@ def _int32_routing_stager_class(
                             local_absmax, cute.arch.fmax(values[i], -values[i])
                         )
 
-                paired_absmax = Float32(
-                    cute.arch.shuffle_sync_bfly(local_absmax, offset=1)
-                )
-                block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
+                block_absmax = local_absmax
+                if cutlass.const_expr(chunks_per_scale == 2):
+                    paired_absmax = Float32(
+                        cute.arch.shuffle_sync_bfly(local_absmax, offset=1)
+                    )
+                    block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
                 if quant_chunk_idx < Int32(num_quant_chunks):
                     # Per-32 E8M0 (power-of-2) scale, rounded up (cvt.rp) so the block
-                    # never overflows the fp8 range; rcp is exact for a power of two.
+                    # fits the quantized range; rcp is exact for a power of two.
                     # The Rubin Torch quantizer clamps to normal FP32 scales.
                     unrounded_scale = cute.arch.fmax(
                         block_absmax * data_rcp_limit, Float32(2.0**-126)
@@ -291,13 +299,13 @@ def _int32_routing_stager_class(
                         store_atom,
                         data,
                         self._mark_alignment(
-                            q_quant_chunk[(None,), (quant_chunk_idx,)], quant_vec
+                            q_quant_chunk[(None,), (quant_chunk_idx,)], 16
                         ),
                     )
-                    if quant_chunk_idx % Int32(2) == Int32(0):
-                        activation_sf[token_idx, (0, quant_chunk_idx // Int32(2))] = (
-                            sf_e8m0
-                        )
+                    if quant_chunk_idx % Int32(chunks_per_scale) == Int32(0):
+                        activation_sf[
+                            token_idx, (0, quant_chunk_idx // Int32(chunks_per_scale))
+                        ] = sf_e8m0
 
             self._repack_routing(
                 token_idx,
@@ -309,7 +317,7 @@ def _int32_routing_stager_class(
                 topk_weights_output,
             )
 
-    return NormalScaleMxfp8DataPreprocess
+    return NormalScaleMxDataPreprocess
 
 
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
@@ -402,11 +410,12 @@ def fused_quant_stage(
     factor used by the caller's NVFP4 quantization contract.
     ``mxfp8_normal_scales`` clamps MXFP8 scales to the normal FP32 range,
     matching the block-scaled Torch quantizer; other callers retain the full E8M0 range.
+    MXFP4 always uses normal FP32 scales.
     ``num_experts`` optionally checks route bounds, uniqueness and finite
     unmasked scores in the same kernel, before narrowing IDs to int32.
     ``fuse_tail_mask`` additionally masks all trailing routing rows in that
     launch when the live CTAs have enough parallelism. Large tails retain a
-    separate fill. It requires NVFP4 or normal-scale MXFP8 with int32 routes.
+    separate fill. It requires NVFP4 or normal-scale MXFP4/MXFP8 with int32 routes.
     ``zero_masked_scores=False`` preserves scores for consumers that exclude
     masked routes before arithmetic.
     """
@@ -414,6 +423,7 @@ def fused_quant_stage(
         raise ValueError(
             f"quant_type must be one of {_QUANT_TYPES}, got {quant_type!r}"
         )
+    normal_scales = mxfp8_normal_scales or quant_type == "mxfp4"
     is_nvfp4 = quant_type == "nvfp4"
     if is_nvfp4 and mxfp8_normal_scales:
         raise ValueError("mxfp8_normal_scales is only supported for MXFP8")
@@ -429,12 +439,12 @@ def fused_quant_stage(
     num_tokens, hidden = hidden_states.shape
     capacity = x_out.shape[0]
     if fuse_tail_mask and (
-        not (is_nvfp4 or mxfp8_normal_scales)
+        not (is_nvfp4 or normal_scales)
         or topk_idx_out.dtype != torch.int32
         or topk_idx_out.shape[0] != capacity
     ):
         raise ValueError(
-            "fused tail masking requires NVFP4 or normal-scale MXFP8 "
+            "fused tail masking requires NVFP4 or normal-scale MXFP4/MXFP8 "
             "and full-capacity int32 routes"
         )
     if num_tokens == 0:
@@ -502,10 +512,10 @@ def fused_quant_stage(
 
         stager_class = (
             _int32_routing_stager_class(
-                mxfp8_normal_scales, num_experts, fuse_tail_mask, zero_masked_scores
+                normal_scales, num_experts, fuse_tail_mask, zero_masked_scores
             )
             if topk_idx_out.dtype == torch.int32
-            or mxfp8_normal_scales
+            or normal_scales
             or not zero_masked_scores
             else DataPreprocess
         )

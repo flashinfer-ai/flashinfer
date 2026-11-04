@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_WARP_TOT_OFF 0
-#define SMEM_WARP_TOT_STAGE_BYTES 32
-#define SMEM_WARP_TOT_STRIDE 32
-#define SMEM_CNT_TILE_OFF 64
-#define SMEM_CNT_TILE_STAGE_BYTES 1024
-#define SMEM_CNT_TILE_STRIDE 1024
-#define SMEM_TOTAL 1152
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -83,7 +72,7 @@ kernel_cake_kda_det_train_d7656e2b58b9bab49495(int* __restrict__ cu_seqlens, int
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* warp_tot = reinterpret_cast<int*>(smem_raw + 0);
     const int warp_tot_addr = smem + 0;
     int* cnt_tile = reinterpret_cast<int*>(smem_raw + 64);

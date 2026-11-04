@@ -46,6 +46,7 @@ extern "C" {
 __global__ __launch_bounds__(THREADS) __cluster_dims__(2,1,1) void
 kernel_cake_dense_projection_det_gemm_5e77ef909e88a99c4357(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -125,6 +126,8 @@ kernel_cake_dense_projection_det_gemm_5e77ef909e88a99c4357(const __grid_constant
 
     __syncwarp();
 
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 168);
     if (warp == 1) {
@@ -135,9 +138,8 @@ kernel_cake_dense_projection_det_gemm_5e77ef909e88a99c4357(const __grid_constant
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
 

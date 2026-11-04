@@ -40,18 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_REDUCE_SMEM_OFF 0
-#define SMEM_REDUCE_SMEM_STAGE_BYTES 132
-#define SMEM_REDUCE_SMEM_STRIDE 132
-#define SMEM_RMS_SCALAR_OFF 132
-#define SMEM_RMS_SCALAR_STAGE_BYTES 4
-#define SMEM_RMS_SCALAR_STRIDE 4
-#define SMEM_RMS_SLOTS_OFF 136
-#define SMEM_RMS_SLOTS_STAGE_BYTES 32
-#define SMEM_RMS_SLOTS_STRIDE 32
-#define SMEM_TOTAL 256
-#define THREADS 224
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -95,15 +83,6 @@ __device__ __forceinline__ float approx_rcp(float x) {
 
 
 namespace flashinfer_cake_moe_finalize_allreduce_fusion {
-__device__ inline unsigned int laneId()
-{
-    uint32_t id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(id));
-    return id;
-}
-} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
-
-namespace flashinfer_cake_moe_finalize_allreduce_fusion {
 __device__ __forceinline__ unsigned int cake_ag_esc_enc(unsigned int w)
 {
     unsigned int lo = w & 65535;
@@ -113,9 +92,7 @@ __device__ __forceinline__ unsigned int cake_ag_esc_enc(unsigned int w)
     unsigned int esc_word = lo | hi << 16;
     return esc_word;
 }
-} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
 
-namespace flashinfer_cake_moe_finalize_allreduce_fusion {
 __device__ __forceinline__ unsigned int cake_ag_esc_dec(unsigned int w)
 {
     unsigned int lo = w & 65535;
@@ -133,8 +110,9 @@ __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) voi
 kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __nv_bfloat16* __restrict__ expert_scales, __nv_bfloat16* __restrict__ shared_expert_output, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ quant_out, __nv_bfloat16* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane = flashinfer_cake_moe_finalize_allreduce_fusion::laneId();
+    const uint32_t warp = __shfl_sync(0xFFFFFFFF, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -152,7 +130,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
     const int reduce_smem_addr = smem + 0;
     float* rms_scalar = reinterpret_cast<float*>(smem_raw + 132);
@@ -287,7 +265,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                 int top_k_opaque = top_k;
                 asm("" : "+r"(top_k_opaque));
                 {
-                    long long expert_elem = (long long)(((route_index_qa < 0) ? 0 : route_index_qa)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem = (long long)((route_index_qa < 0) ? 0 : route_index_qa) * 7168 + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_8[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_8[0 + 0]), "+r"(_vec_load_8[0 + 1]), "+r"(_vec_load_8[0 + 2]), "+r"(_vec_load_8[0 + 3]) : "l"(allreduce_in + expert_elem + 0), "r"((int)(top_k_opaque > route_base)));
                     #pragma unroll
@@ -304,7 +282,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                     route_scales[0] = _vec_load_9[0];
                 }
                 {
-                    long long expert_elem_1 = (long long)(((route_index_qb < 0) ? 0 : route_index_qb)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_1 = (long long)((route_index_qb < 0) ? 0 : route_index_qb) * 7168 + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_10[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_10[0 + 0]), "+r"(_vec_load_10[0 + 1]), "+r"(_vec_load_10[0 + 2]), "+r"(_vec_load_10[0 + 3]) : "l"(allreduce_in + expert_elem_1 + 0), "r"((int)(top_k > route_base + 1)));
                     #pragma unroll
@@ -321,7 +299,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                     route_scales[1] = _vec_load_11[0];
                 }
                 {
-                    long long expert_elem_2 = (long long)(((route_index_qc < 0) ? 0 : route_index_qc)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_2 = (long long)((route_index_qc < 0) ? 0 : route_index_qc) * 7168 + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_12[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_12[0 + 0]), "+r"(_vec_load_12[0 + 1]), "+r"(_vec_load_12[0 + 2]), "+r"(_vec_load_12[0 + 3]) : "l"(allreduce_in + expert_elem_2 + 0), "r"((int)(top_k > route_base + 2)));
                     #pragma unroll
@@ -338,7 +316,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                     route_scales[2] = _vec_load_13[0];
                 }
                 {
-                    long long expert_elem_3 = (long long)(((route_index_qd < 0) ? 0 : route_index_qd)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_3 = (long long)((route_index_qd < 0) ? 0 : route_index_qd) * 7168 + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_14[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_14[0 + 0]), "+r"(_vec_load_14[0 + 1]), "+r"(_vec_load_14[0 + 2]), "+r"(_vec_load_14[0 + 3]) : "l"(allreduce_in + expert_elem_3 + 0), "r"((int)(top_k > route_base + 3)));
                     #pragma unroll
@@ -756,8 +734,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_0[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_14 = 0; j_14 < 8; j_14++) {
-                    sum_value[j_14] = sum_value[j_14] + unpack_bf16_5[j_14];
+                for (int j_0 = 0; j_0 < 8; j_0++) {
+                    sum_value[j_0] = sum_value[j_0] + unpack_bf16_5[j_0];
                 }
                 unsigned int scaled_f16_4_1[4];
                 #pragma unroll
@@ -787,8 +765,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_0[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_15 = 0; j_15 < 8; j_15++) {
-                    sum_value[j_15] = sum_value[j_15] + unpack_bf16_6[j_15];
+                for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
+                    sum_value[j_1_1] = sum_value[j_1_1] + unpack_bf16_6[j_1_1];
                 }
                 unsigned int scaled_f16_5_1[4];
                 #pragma unroll
@@ -834,8 +812,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[_pair]));
                 }
                 #pragma unroll
-                for (int j_16 = 0; j_16 < 8; j_16++) {
-                    sum_value[j_16] = sum_value[j_16] + unpack_bf16_7[j_16];
+                for (int j_14 = 0; j_14 < 8; j_14++) {
+                    sum_value[j_14] = sum_value[j_14] + unpack_bf16_7[j_14];
                 }
                 unsigned int scaled_f16_6_1[4];
                 #pragma unroll
@@ -865,8 +843,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[4 + _pair]));
                 }
                 #pragma unroll
-                for (int j_17 = 0; j_17 < 8; j_17++) {
-                    sum_value[j_17] = sum_value[j_17] + unpack_bf16_8[j_17];
+                for (int j_2_1 = 0; j_2_1 < 8; j_2_1++) {
+                    sum_value[j_2_1] = sum_value[j_2_1] + unpack_bf16_8[j_2_1];
                 }
                 unsigned int scaled_f16_7_1[4];
                 #pragma unroll
@@ -896,8 +874,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_18 = 0; j_18 < 8; j_18++) {
-                    sum_value[j_18] = sum_value[j_18] + unpack_bf16_9[j_18];
+                for (int j_3_1 = 0; j_3_1 < 8; j_3_1++) {
+                    sum_value[j_3_1] = sum_value[j_3_1] + unpack_bf16_9[j_3_1];
                 }
                 unsigned int scaled_f16_8[4];
                 #pragma unroll
@@ -927,8 +905,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_19 = 0; j_19 < 8; j_19++) {
-                    sum_value[j_19] = sum_value[j_19] + unpack_bf16_10[j_19];
+                for (int j_4_1 = 0; j_4_1 < 8; j_4_1++) {
+                    sum_value[j_4_1] = sum_value[j_4_1] + unpack_bf16_10[j_4_1];
                 }
                 unsigned int scaled_f16_9[4];
                 #pragma unroll
@@ -1035,7 +1013,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                 uint32_t _uv4_14_2;
                 uint32_t _uv4_14_3;
                 asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_14_0), "=r"(_uv4_14_1), "=r"(_uv4_14_2), "=r"(_uv4_14_3) : "l"((const void*)(residual + (access * 8) + (0))));
+                    : "=r"(_uv4_14_0), "=r"(_uv4_14_1), "=r"(_uv4_14_2), "=r"(_uv4_14_3) : "l"((const void*)(residual + access * 8 + (0))));
                 residual_words[0 + 0] = _uv4_14_0;
                 residual_words[0 + 1] = _uv4_14_1;
                 residual_words[0 + 2] = _uv4_14_2;
@@ -1079,7 +1057,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
             }
             float _vec_load_18[8];
             {
-                const uint4* _vptr_15 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
+                const uint4* _vptr_15 = reinterpret_cast<const uint4*>(norm_weight + access_in_token * 8 + 0);
                 uint4 _vld_15[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1098,8 +1076,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
                 }
             }
             #pragma unroll
-            for (int j_20 = 0; j_20 < 8; j_20++) {
-                _vec_load_17[j_20] = _vec_load_17[j_20] + sum_value_1[j_20];
+            for (int j_15 = 0; j_15 < 8; j_15++) {
+                _vec_load_17[j_15] = _vec_load_17[j_15] + sum_value_1[j_15];
             }
             unsigned int scaled_f16_10[4];
             #pragma unroll
@@ -1141,8 +1119,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
             reinterpret_cast<int4*>(residual_out + elem)[0] = reinterpret_cast<int4*>(_packed_0)[0];
             float square_sum = 0.0f;
             #pragma unroll
-            for (int j_21 = 0; j_21 < 8; j_21++) {
-                square_sum = __fmaf_rn(_vec_load_17[j_21], _vec_load_17[j_21], square_sum);
+            for (int j_16 = 0; j_16 < 8; j_16++) {
+                square_sum = __fmaf_rn(_vec_load_17[j_16], _vec_load_17[j_16], square_sum);
             }
             float _warp_reduce_16 = square_sum;
             #pragma unroll
@@ -1233,8 +1211,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
             float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
             float norm_value[8];
             #pragma unroll
-            for (int j_22 = 0; j_22 < 8; j_22++) {
-                norm_value[j_22] = _vec_load_17[j_22] * rstd * (_vec_load_18[j_22] + weight_bias);
+            for (int j_17 = 0; j_17 < 8; j_17++) {
+                norm_value[j_17] = _vec_load_17[j_17] * rstd * (_vec_load_18[j_17] + weight_bias);
             }
             unsigned int scaled_f16_10_1[4];
             #pragma unroll
@@ -1289,8 +1267,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts(__nv_bfloat16* __restrict__
             float _rcp_30 = approx_rcp(sf_rounded * _rcp_31);
             float output_scale = ((sf_rounded != 0.0f) ? _rcp_30 : 0.0f);
             #pragma unroll
-            for (int j_23 = 0; j_23 < 8; j_23++) {
-                unpack_bf16_11[j_23] = unpack_bf16_11[j_23] * output_scale;
+            for (int j_18 = 0; j_18 < 8; j_18++) {
+                unpack_bf16_11[j_18] = unpack_bf16_11[j_18] * output_scale;
             }
             unsigned int _fp4_0[1];
             asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(unpack_bf16_11[0]), "f"(unpack_bf16_11[1]), "f"(unpack_bf16_11[2]), "f"(unpack_bf16_11[3]), "f"(unpack_bf16_11[4]), "f"(unpack_bf16_11[5]), "f"(unpack_bf16_11[6]), "f"(unpack_bf16_11[7]));

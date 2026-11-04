@@ -504,6 +504,8 @@ def test_options_validate_their_pins() -> None:
     assert opts.lpt and opts.streams == 2
     assert cake_chain.make_options(lpt=False).lpt is False
     assert cake_chain.make_options(streams=1).streams == 1
+    # a call without pins shares these options (the entry skips the validation)
+    assert cake_chain.make_options() == cake_chain._DEFAULT_OPTIONS
     for bad in (
         {"scan_config": (32,)},
         {"scan_config": (32, 0)},
@@ -1149,6 +1151,71 @@ def test_two_streams_match_one_stream(
         _assert_close_to_reference(runs[0], ref, names)
 
 
+# a split adjoint table on dhu_tc2 beside tail_g3 (pins: (64, 1) tables of 4-chunk segments, pass 2 on dhu_tc2): 10
+# segments of HV 6 on 7 SMs group as 7 + 3, so on an architecture of SPLIT_R_FORM the adjoint runs the R form over the
+# segments (dhu_tc2 of the last 3 on the side stream); the same bits as one stream and as one dhu_tc2 launch
+SPLIT_R_PINS = {
+    "scan_config": (64, 1),
+    "segment_chunks": 4,
+    "dhu_scan": "tc",
+    "tail": "tail_g3",
+}
+
+
+@pytest.mark.parametrize("lpt", [True, False], ids=["lpt", "caller-order"])
+def test_split_r_form_matches_one_stream(lpt, device, monkeypatch) -> None:
+    seq_lens, heads = STREAM_LAYOUT, (2, 6)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    monkeypatch.setattr(cake_chain, "SPLIT_R_FORM", (arch,))
+    options = cake_chain.make_options(lpt=lpt, **SPLIT_R_PINS)
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+    meta = cake_chain._chunk_meta(
+        cu.to(device), cu, 1, sum(seq_lens), index, heads[1], options, 3
+    )
+    assert meta.bwd_segments.num_segments == 10 and meta.fwd_groups is None
+    assert meta.bwd_groups is not None and meta.bwd_groups.split == 7, meta.bwd_groups
+    kept = cake_chain._host_plans(seq_lens, heads[1], index, options, group=3)[2]
+    assert not kept  # a pinned table is not kept for the form, it takes it
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=71)
+    gen = torch.Generator().manual_seed(73)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    runs = []
+    for streams in (2, 1, 2):
+        start = len(launches)
+        runs.append(_run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, streams=streams,
+                         lpt=lpt, **SPLIT_R_PINS))  # fmt: skip
+        side = [stage for stage, stream in launches[start:] if stream != main]
+        assert side == (["dhu_tc2"] if streams == 2 else []), (
+            streams,
+            launches[start:],
+        )
+    monkeypatch.setattr(cake_chain, "SPLIT_R_FORM", ())
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    start = len(launches)
+    one = _run(
+        inputs,
+        seq_lens,
+        initial_state=h0,
+        output_final_state=True,
+        dht=dht,
+        lpt=lpt,
+        **SPLIT_R_PINS,
+    )
+    assert [stage for stage, _ in launches[start:]].count("dhu_tc2") == 1
+    for run in runs[1:] + [one]:
+        _assert_same_bits(run, runs[0], names)
+
+
 def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:
     # the caller's stream allocates, writes and frees between two-stream calls (pooled and fresh workspaces) and,
     # after every side-stream launch, while the side stream works: memory released before the join would be
@@ -1331,6 +1398,15 @@ def test_each_caller_stream_forks_its_own_side_stream(device) -> None:
     assert cake_chain._side_stream(index, b) not in (side, a, b)
     assert side not in (a, b)
     assert side.priority == torch.cuda.Stream.priority_range()[1]
+
+
+def test_workspaces_are_keyed_by_the_current_stream(device) -> None:
+    index = cake_chain._device_index(device)
+    for stream in (torch.cuda.current_stream(device), torch.cuda.Stream(device=device)):
+        with torch.cuda.stream(stream):
+            key = (index, stream.cuda_stream)
+            assert cake_chain._stream_key(index) == key
+            assert cake_chain._POOLED.table(index) is cake_chain._POOLED.tables[key]
 
 
 @pytest.mark.parametrize("route", ["host", "device"])
@@ -2281,9 +2357,10 @@ def test_tc_plan_rule(arch, monkeypatch) -> None:
             sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
         )
         rec = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, bwd)
+        gain, min_saving = cake_chain.tc_plan_thresholds(arch)
         if rec["select"]:
-            assert rec["saving"] >= cake_chain.TC_PLAN_MIN_SAVING, (row, rec)
-            assert rec["best"]["T"] <= cake_chain.TC_PLAN_GAIN * rec["plan_T"], (
+            assert rec["saving"] >= min_saving, (row, rec)
+            assert rec["best"]["T"] <= gain * rec["plan_T"], (
                 row,
                 rec,
             )
@@ -2297,13 +2374,15 @@ def test_tc_plan_rule(arch, monkeypatch) -> None:
 
 @pytest.mark.parametrize("heads", [(8, 16), (8, 24)], ids=["g2", "g3"])
 def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> None:
-    # one 16384-token sequence (the r07 form; gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor):
-    # the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats bitwise
+    # one 16384-token sequence (the r07 form; gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor; no
+    # CHAIN_PLAN tables): the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats bitwise
     # (fixed-order cluster tails) and stays within the budgets of the planner's table; a plan pin keeps the planner
     seq_lens = (16384,)
     index = cake_chain._device_index(device)
     monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     _fwd, bwd = cake_chain.scan_plans(16384, 1, heads[1], index, seq_lens)
     rec = cake_chain.tc_plan_pricing((256,), heads[1], index, bwd)
@@ -2329,6 +2408,279 @@ def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> N
     on = _run(inputs, seq_lens, **pins)
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     _assert_same_bits(on, _run(inputs, seq_lens, **pins), OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- deeper split tables (CHAIN_PLAN)
+
+# The layouts of the bench's rows, packs, head pairs and group shapes (benchmarks/bench_cake_gdn_train.py): (sequence
+# lengths, HV); the tables of host_plans do not depend on H, so the group shapes that repeat a row's layout and HV are
+# left out (the value-head group enters only through the split R form, SPLIT_R_FORM, tested with its group below).
+_PAIR_LAYOUT = (11000, 12000, 9768)
+BENCH_LAYOUTS = {
+    "r01": ((4096,) * 4, 16),
+    "r02": (_REAL_3, 16),
+    "r03": ((4096,) * 8, 16),
+    "r04": (_REAL_7, 16),
+    "r05": ((4096,) * 16, 16),
+    "r06": (_REAL_15, 16),
+    "r07": ((16384,), 16),
+    "r08": ((4096,) * 4, 32),
+    "r09": ((4096,) * 16, 32),
+    "r10": ((16384,), 32),
+    "64x4096": ((4096,) * 64, 6),
+    "A16": (_PAIR_LAYOUT, 48),
+    "P1": ((126565, 32714, 33696, 15081, 22979, 10782), 6),
+    "P3": ((128147, 131027), 6),
+    "issue": ((131071, 87531, 43385), 6),
+    "h8_hv24": (_PAIR_LAYOUT, 24),
+    "h4_hv12": (_PAIR_LAYOUT, 12),
+    "h2_hv6": (_PAIR_LAYOUT, 6),
+    "h1_hv3": (_PAIR_LAYOUT, 3),
+    "g1_16x4096_h8": ((4096,) * 16, 8),
+    "g3_4x4096_h8": ((4096,) * 4, 24),
+    "g3_16x4096_h1": ((4096,) * 16, 3),
+}
+# The layouts whose tables CHAIN_PLAN deepens on R200 (212 and 216 SMs): row -> (forward, adjoint) segment length of the
+# deeper table (None: the table without CHAIN_PLAN).  Every other layout keeps its tables.
+CHAIN_PLAN_ROWS = {
+    212: {
+        "r07": (20, 20),
+        "A16": (43, None),
+        "h2_hv6": (16, 16),
+        "h1_hv3": (16, 16),
+        "g3_16x4096_h1": (None, 16),
+    },
+    216: {
+        "r07": (20, 20),
+        "h2_hv6": (16, 15),
+        "h1_hv3": (16, 15),
+        "g3_16x4096_h1": (None, 16),
+    },
+}
+
+
+def _segments(chunks, plan) -> int:
+    if plan.segment_len <= 0 or max(chunks) <= plan.segment_len:
+        return len(chunks)
+    return sum(-(-n // plan.segment_len) for n in chunks)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count",
+    [("sm_100a", 148), ("sm_103a", 148), ("sm_103a", 152)],
+    ids=["B200", "B300", "GB300"],
+)
+def test_chain_plan_keeps_the_b200_b300_gb300_tables(
+    arch, sm_count, monkeypatch
+) -> None:
+    # CHAIN_PLAN lists sm_107a only: on B200, B300 and GB300 every bench layout keeps the tables (and the dhu_tc2
+    # pricing of its adjoint table) that it plans without CHAIN_PLAN, also with a saving floor of 0
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    assert arch not in cake_chain.CHAIN_PLAN
+    options = cake_chain.make_options()
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        for table in (
+            cake_chain.CHAIN_PLAN,
+            {
+                name: {**const, "min_saving": 0.0}
+                for name, const in cake_chain.CHAIN_PLAN.items()
+            },
+        ):
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "CHAIN_PLAN", table)
+                assert (
+                    cake_chain.host_plans(seq_lens, num_v_heads, 0, options) == want
+                ), row
+                for kind, plan in zip(("fwd", "bwd"), want[0], strict=True):
+                    rec = cake_chain.chain_plan_pricing(
+                        kind, chunks, num_v_heads, 0, plan
+                    )
+                    assert rec["select"] is False, (row, kind, rec)
+
+
+@pytest.mark.parametrize("sm_count", sorted(CHAIN_PLAN_ROWS))
+def test_chain_plan_rule_on_r200(sm_count, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_107a")
+    const = cake_chain.CHAIN_PLAN["sm_107a"]
+    cap = {
+        "fwd": cake_chain._prescan_capacity("fwd_h", cake_chain.SDT_CONFIG),
+        "bwd": cake_chain._prescan_capacity("dhu", cake_chain.SDT_CONFIG),
+    }
+    options = cake_chain.make_options()
+    deepened = {}
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        got, bwd_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want, want_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        lens = tuple(
+            None if new == old else new.segment_len
+            for new, old in zip(got, want, strict=True)
+        )
+        if lens != (None, None):
+            deepened[row] = lens
+        split = cake_chain.two_stream_split(len(chunks), num_v_heads, sm_count)
+        for kind, new, old in zip(("fwd", "bwd"), got, want, strict=True):
+            # a serial table that the two-stream rule groups keeps its form, whatever the pricing
+            grouped = _segments(chunks, old) == len(chunks) and split is not None
+            rec = cake_chain.chain_plan_pricing(kind, chunks, num_v_heads, 0, old)
+            assert (new != old) is (rec["select"] and not grouped), (row, kind, rec)
+            # a changed table: a deeper SDT_CONFIG split table within the pre-scan capacity, priced cheaper
+            if new != old:
+                assert tuple(new.config) == cake_chain.SDT_CONFIG, (row, kind, new)
+                assert 0 < new.segment_len <= cap[kind], (row, kind, new)
+                assert _segments(chunks, new) > _segments(chunks, old), (
+                    row,
+                    kind,
+                    new,
+                    old,
+                )
+                assert rec["saving"] >= const["min_saving"], (row, kind, rec)
+                assert rec["best"]["T"] <= const["gain"] * rec["plan_T"], (
+                    row,
+                    kind,
+                    rec,
+                )
+        assert bwd_tc is (want_tc or got[1] != want[1]), row
+    assert deepened == CHAIN_PLAN_ROWS[sm_count]
+    # plan pins (and a dhu_scan pin) keep the planner's tables
+    seq_lens = (16384,)
+    for pins in (
+        {"scan_config": (64, 1), "segment_chunks": 0},
+        {"segment_chunks": 64},
+        {"dhu_scan": "tc"},
+    ):
+        pinned = cake_chain.make_options(**pins)
+        planner = cake_chain.scan_plans(16384, 1, 16, 0, seq_lens, scan_config=pinned.scan_config,
+                                        segment_chunks=pinned.segment_chunks)  # fmt: skip
+        assert cake_chain.host_plans(seq_lens, 16, 0, pinned) == (
+            tuple(planner),
+            False,
+        ), pins
+
+
+# The split R form (SPLIT_R_FORM, sm_107a): the bench layouts of a value-head group of three whose planner adjoint
+# table it keeps, per R200 SM count -> (segment length, segments, adjoint group A in segments): the deterministic
+# package's table and groups.  B200, B300 and GB300 keep the tables of host_plans for every layout and group.
+SPLIT_R_ROWS = {212: {"A16": (94, 6, 4)}, 216: {}}
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count",
+    [
+        ("sm_100a", 148),
+        ("sm_103a", 148),
+        ("sm_103a", 152),
+        ("sm_107a", 212),
+        ("sm_107a", 216),
+    ],
+    ids=["B200", "B300", "GB300", "R200-212", "R200-216"],
+)
+def test_split_r_form_rule(arch, sm_count, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    options = cake_chain.make_options()
+    kept = {}
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        want = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        for group in (1, 2, 3):
+            if num_v_heads % group:
+                continue
+            plans, bwd_tc, keep = cake_chain._host_plans(
+                seq_lens, num_v_heads, 0, options, group=group
+            )
+            if not keep:
+                assert (plans, bwd_tc) == want, (row, group)
+                continue
+            assert group == 3 and arch in cake_chain.SPLIT_R_FORM, (row, group)
+            planner = cake_chain.scan_plans(
+                sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+            )
+            # the forward's table as without the form, the planner's adjoint table, priced for dhu_tc2 by sdt_pricing
+            assert plans == (want[0][0], planner[1]) and bwd_tc is False, row
+            chunks = tuple(-(-n // 64) for n in seq_lens)
+            assert cake_chain.sdt_pricing(
+                chunks, planner[1].segment_len, num_v_heads, 0
+            )["select"], row
+            meta = cake_chain.build_chunk_meta(
+                seq_lens, "cpu", scan_plans=plans, lpt=True
+            )
+            fwd_groups, bwd_groups = cake_chain.sequence_groups(
+                meta, num_v_heads, sm_count, split_adjoint=True
+            )
+            assert fwd_groups is None and bwd_groups is not None, row
+            kept[row] = (
+                plans[1].segment_len,
+                meta.bwd_segments.num_segments,
+                bwd_groups.split,
+            )
+            # the groups only beside the split R form's tail (a pin to another tail keeps the tables of host_plans)
+            assert not cake_chain._host_plans(seq_lens, num_v_heads, 0, cake_chain.make_options(tail="tail"),
+                                              group=3)[2]  # fmt: skip
+    assert kept == SPLIT_R_ROWS.get(sm_count if arch == "sm_107a" else 0, {})
+    # plan pins (and a dhu_scan pin) keep the planner's tables
+    for pins in ({"scan_config": (64, 1), "segment_chunks": 94}, {"dhu_scan": "tc"}):
+        assert not cake_chain._host_plans(
+            _PAIR_LAYOUT, 48, 0, cake_chain.make_options(**pins), group=3
+        )[2], pins
+
+
+@pytest.mark.parametrize(
+    "seq_lens, heads",
+    [((16384,), (8, 16)), (_PAIR_LAYOUT, (1, 3))],
+    ids=["r07", "h1-hv3"],
+)
+def test_chain_plan_tables_stay_within_the_budgets(
+    seq_lens, heads, device, monkeypatch
+) -> None:
+    # the deeper tables of CHAIN_PLAN (this architecture's constants, else sm_107a's; no saving floor): the forward runs
+    # the pre-scan, the stitch and fwd_ho on a deeper forward table, the backward the fused pre-scan and dhu_tc2 on a
+    # deeper adjoint table; the bits repeat run to run and stay within the budgets of the tables without CHAIN_PLAN;
+    # plan pins keep the planner's tables (the same bits with and without CHAIN_PLAN)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    const = cake_chain.CHAIN_PLAN.get(arch, cake_chain.CHAIN_PLAN["sm_107a"])
+    forced = {arch: {**const, "min_saving": 0.0}}
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=313)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    (fwd0, bwd0), _tc = cake_chain.host_plans(seq_lens, heads[1], index)
+    base = _run(inputs, seq_lens)
+    pins = {"scan_config": tuple(fwd0.config), "segment_chunks": fwd0.segment_len}
+    base_pinned = _run(inputs, seq_lens, **pins)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", forced)
+    (fwd, bwd), _tc = cake_chain.host_plans(seq_lens, heads[1], index)
+    stages = _record_launches(monkeypatch)
+    runs = [_run(inputs, seq_lens) for _ in range(2)]
+    _assert_same_bits(runs[1], runs[0], OUTPUT_NAMES)
+    _assert_within_budget(runs[0], base, OUTPUT_NAMES)
+    if (fwd, bwd) == (fwd0, bwd0):
+        _assert_same_bits(runs[0], base, OUTPUT_NAMES)
+    if fwd != fwd0:
+        assert _segments(tuple(-(-n // 64) for n in seq_lens), fwd) > _segments(
+            tuple(-(-n // 64) for n in seq_lens), fwd0
+        )
+        _stage, _vb, pre, _ = cake_chain._scan_stages(
+            "fwd_h", cake_chain.SDT_CONFIG, arch
+        )
+        assert all(x in stages for x in (pre, "stitch", "fwd_ho")), stages
+    if bwd != bwd0:
+        assert all(x in stages for x in (cake_chain.SDT_PRESCAN, "dhu_tc2")), stages
+        assert "dv_local" not in stages, stages
+    _assert_same_bits(_run(inputs, seq_lens, **pins), base_pinned, OUTPUT_NAMES)
 
 
 # #7038 / #7548 form: a one-thread sleep kernel resident on a side stream for the whole call; the gate is declared
