@@ -229,6 +229,17 @@ Capacity reports include the serial floor from host-heavy and node-exclusive
 work. They remain optimistic about GPU contention because the estimator uses
 worker counts without GPU topology or measured memory capacity.
 
+Allocation telemetry defaults to a 5-second interval (`RESOURCE_MONITOR_INTERVAL`);
+per-batch sampling defaults to 2 seconds (`MEMORY_MONITOR_INTERVAL`).
+The sampler uses `resource_monitor.py`, with sampling, CSV persistence,
+and summary aggregation kept separate. Allocation and batch monitors share host
+CPU readers in `scripts/test_sharding/host_cpu.py`. Unavailable per-process GPU
+memory stays unknown in snapshots and marks source resource summaries partial.
+`memory_summary.csv` leaves GPU maxima blank when no valid observation exists.
+Host CSV rows are flushed before GPU queries; query costs are in `sampler.csv`.
+Nested runners reuse a sampler only while its exported owner PID is alive.
+Namespace-relative cgroup paths require membership evidence before attribution.
+
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 

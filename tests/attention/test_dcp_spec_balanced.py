@@ -984,6 +984,22 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
             assert program(64, 8, 36, sm) == above
             assert program(256, 8, 36, sm) == above
         assert program(37, 4, 36, 148) == above and program(36, 4, 36, 148) == below
+        # below the grid, at least eight query rows where no request can split (8 x (b + 3 - 1 + 8) > grid): the
+        # program without the fold body; fewer rows, or a batch where a split fits, keep the planner program
+        assert variants["near_grid_regime"] == {"min_q_len": 8}
+        for sm in (148, 152):
+            b_split_free = sm // 8 - 9
+            # the agentx b16 q8 row (128 pairs) and the guard's edge
+            assert program(16, 8, 36, sm, q_len=8) == above
+            assert program(b_split_free, 8, 36, sm, q_len=8) == above
+            assert program(b_split_free, 8, 132, sm, q_len=8) == above
+            assert program(b_split_free - 1, 8, 36, sm, q_len=8) == below
+            assert program(16, 8, 36, sm, q_len=7) == below
+            assert program(16, 8, 36, sm) == below
+            # the one-wave b1 row keeps the static program at eight query rows
+            assert program(1, 8, 36, sm, q_len=8) == static
+        assert program(28, 4, 36, 148, q_len=8) == above
+        assert program(27, 4, 36, 148, q_len=8) == below
         # single KV head: nine requests of seven chunks fit (9 x 15 = 135), ten do not
         assert program(9, 1, 25, 148) == static and program(10, 1, 25, 148) == below
     with pytest.raises(ValueError, match="sm_count"):

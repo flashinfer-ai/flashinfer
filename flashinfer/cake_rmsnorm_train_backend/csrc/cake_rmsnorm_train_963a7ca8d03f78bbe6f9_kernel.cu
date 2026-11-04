@@ -47,21 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_FLAGS_OFF 0
-#define SMEM_FLAGS_STAGE_BYTES 32
-#define SMEM_FLAGS_STRIDE 32
-#define SMEM_DOTS_OFF 32
-#define SMEM_DOTS_STAGE_BYTES 48
-#define SMEM_DOTS_STRIDE 48
-#define SMEM_SUMS_OFF 80
-#define SMEM_SUMS_STAGE_BYTES 24576
-#define SMEM_SUMS_STRIDE 24576
-#define SMEM_DWBUF_OFF 80
-#define SMEM_DWBUF_STAGE_BYTES 6144
-#define SMEM_DWBUF_STRIDE 6144
-#define SMEM_TOTAL 24704
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -117,7 +102,7 @@ kernel_cake_rmsnorm_train_963a7ca8d03f78bbe6f9(__nv_bfloat16* __restrict__ g, __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* flags = reinterpret_cast<int*>(smem_raw + 0);
     const int flags_addr = smem + 0;
     float* dots = reinterpret_cast<float*>(smem_raw + 32);

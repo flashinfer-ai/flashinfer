@@ -23,9 +23,9 @@ Public fields (defaults are the shipped behaviour)::
 
     exchange        "a2a" | "ring"          cross-rank exchange scheme (ring: n_d_max - 1 <= 2 and save_transfer=False)
     save_transfer   True                    the merge owner keeps its c1 receive tensor (and M_seg at P > 1) for the backward
-    save_mode       "light" | "full"        saved set: S_in / c1_recv / M_seg + the cheap gate rows and WY inverse (the
-                                            backward replays #1 and the tape walk), or additionally every forward tape
-                                            ("full" is opt-in only; never the default)
+    save_mode       "light" | "full"        saved set: S_in (with save_transfer also c1_recv and M_seg) and no tape (the
+                                            backward re-runs #1 and the tape walk), or additionally M_seg and every
+                                            forward tape ("full" is opt-in only; never the default)
     boundary_mode   "saved" | "replay"      keep the saved set, or keep nothing and re-run the whole module forward
                                             (summaries, exchange, merge) inside the backward (checkpoint replay)
     precision_mode  0 | 1 | 2               transfer-walk build record (template numbering): 0 = shipped TF32 hi/lo (2-MMA,
@@ -70,14 +70,17 @@ Public fields (defaults are the shipped behaviour)::
                                             why); never skipped with graph="replay" or outside the autograd node;
                                             "always" = the unconditional launch
     backend         "kernels" | "fake"      the exported programs, or the torch emulation of the same ABI (tests)
-    segments        None | int              requested segments per fragment (P); must equal the context's plan
+    segments        None | int              segments per fragment (P): None = the context's plan; an int overrides it
+                                            within [1, min(MAX_SEGMENTS, chunks of the rank's longest fragment)] (the
+                                            context builds and caches the overridden plan apart; the byte queries' P=)
     use_qk_l2norm_in_kernel  False | True   per-token L2 norm of every 128-channel Q / K head inside the recurrence
                                             programs (q_hat = bf16(q * r), r = 1 / sqrt(sum q^2 + 1e-6), FTZ off; the
                                             FLA keyword of chunk_gated_delta_rule): q / k stay the raw operands, the
                                             saved set gains the FP32 r of q and k ([2, T_r, H_qk]) and the gradient is
                                             the exact derivative at the stored point; the backward needs the same value
     test_knobs      None | dict             private levers (schedule, fused_walks, cols_rule, debug_sequence,
-                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o) and the names of the
+                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o,
+                                            fused_o_tape) and the names of the
                                             test-only values above;
                                             keyword argument only, never an environment variable
 """
@@ -161,6 +164,10 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
     # 1 (shipped) = a forward whose h / v_new tapes have no reader runs the output walk kcp_fwdh_out (#2 with #5 folded
     # in, no tape written) wherever the registry ships its records (cake_kcp._fuse_o); 0 = the tape walk, then #5
     "fused_o": (0, 1),
+    # 1 (shipped) = a save_mode="full" forward that keeps its saved set and launches #5 runs the tape-and-output walk
+    # kcp_fwdh_out_tape (the output walk that also writes the saved h / v_new tapes) wherever the registry ships its
+    # records (cake_kcp._fuse_o_tape); 0 = the tape walk, then #5.  Light forwards (fused_o) are unaffected
+    "fused_o_tape": (0, 1),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -175,6 +182,7 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "record_qk": False,
     "walk_pair": None,
     "fused_o": 1,
+    "fused_o_tape": 1,
 }
 
 

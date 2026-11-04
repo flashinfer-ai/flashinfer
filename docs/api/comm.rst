@@ -88,7 +88,7 @@ collective runs. The delivered architectures and world sizes are recorded in
 the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
 a device or group outside them raises instead of falling back.
 Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
-delivered route's column tile (256 on SM100), ``K_l`` a
+delivered route's column tile (256 on SM100 / SM103), ``K_l`` a
 positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
 process's torch symmetric-memory backend being the default ``CUDA`` backend or
 ``NVSHMEM`` (the Cake backend never selects one itself). The symmetric

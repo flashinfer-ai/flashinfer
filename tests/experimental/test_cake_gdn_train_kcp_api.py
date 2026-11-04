@@ -336,6 +336,24 @@ def test_walk_pair_knob_defaults_to_auto() -> None:
         make_options(walk_pair=1)  # a test knob, never a public option
 
 
+@pytest.mark.parametrize("knob", ("fused_o", "fused_o_tape"))
+def test_output_walk_knobs_default_to_the_shipped_walks(knob: str) -> None:
+    """``fused_o`` (the light forward's output walk) and ``fused_o_tape`` (the ``save_mode="full"`` forward's
+    tape-and-output walk) are private levers: 1 (shipped) or 0 (the split tape walk and #5), part of the options key
+    (a captured graph of one form never replays for the other), never public options."""
+    assert opt.TEST_KNOBS[knob] == (0, 1)
+    assert opt.TEST_KNOB_DEFAULTS[knob] == 1
+    assert make_options().knob(knob) == 1
+    assert make_options(test_knobs={knob: 0}).knob(knob) == 0
+    for bad in (2, -1, True, False, None, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={knob: bad})
+    keys = {make_options(test_knobs={knob: v}).key() for v in (0, 1)}
+    assert len(keys) == 2
+    with pytest.raises(TypeError):
+        make_options(**{knob: 0})  # a test knob, never a public option
+
+
 @pytest.mark.parametrize(
     "knob, layout, world, capability, on",
     [
@@ -1339,7 +1357,16 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
-    (partition tables, byte queries)."""
+    (partition tables, segment plan, the comm byte query, the saved byte query at the default options on this
+    ``P = 1`` pack, and at ``P = 2`` with either ``save_mode`` and ``save_transfer``: both count ``M_seg`` as ``P
+    n_frag s`` with ``save_transfer`` or ``save_mode="full"``).  The saved queries differ (until the twin adopts this
+    package's rule, pinned here) under ``boundary_mode="replay"`` with ``save_mode="full"``: this package keeps no
+    tape (a replay boundary saves nothing) where the twin counts the ten full-mode tapes.  The workspace query is
+    not compared: on a rank with crossing fragments this package's counts pools the twin's query leaves out (the
+    ``M_f^T`` tiles and the fused walks' carry slots at ``P > 1``, the larger b1 split form, the forward exchange
+    pools of a saved backward on a caller-held workspace), and its ``graph`` / ``save_for_backward`` /
+    ``fused_walks`` keywords are this package's only: through the facade they need ``deterministic=False`` (the
+    default route raises ``TypeError``)."""
     facade = importlib.import_module(FACADE)
     det_pkg = importlib.import_module(DET_PACKAGE)
     pkg = _mod()
@@ -1356,14 +1383,59 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
         )
         assert isinstance(det_ctx, det_pkg.ContextDetKcp)
         assert isinstance(ctx, pkg.ContextKcp)
-        for query in (
-            "gdn_comm_bytes_kcp",
-            "gdn_saved_bytes_kcp",
-            "gdn_workspace_bytes_kcp",
-        ):
+        det_hp, hp = det_ctx.heads(6), ctx.heads(6)
+        assert (det_hp.P, det_hp.NSEG) == (hp.P, hp.NSEG), rank
+        for query in ("gdn_comm_bytes_kcp", "gdn_saved_bytes_kcp"):
             det_value = getattr(facade, query)(det_ctx, H_qk=2, HV=6)
             value = getattr(facade, query)(ctx, H_qk=2, HV=6, deterministic=False)
             assert det_value == value, (rank, query)
+        # the saved-query difference of today (the twin keeps its rule until it adopts this one)
+        full_tapes = sum(
+            v
+            for k, v in _mod("cake_bytes")
+            .gdn_saved_layout_kcp(ctx, H_qk=2, HV=6, save_mode="full")
+            .items()
+            if k not in ("S_in", "c1_recv", "M_seg", "hist")
+        )
+        assert full_tapes > 0
+        replay_full = dict(H_qk=2, HV=6, save_mode="full", boundary_mode="replay")
+        assert (
+            facade.gdn_saved_bytes_kcp(det_ctx, **replay_full)
+            - facade.gdn_saved_bytes_kcp(ctx, **replay_full, deterministic=False)
+            == full_tapes
+        ), rank
+        # the M_seg rule at P > 1 is shared (P n_frag s with save_transfer or save_mode="full")
+        assert ctx.n_frag > 0
+        for kw in (
+            {},
+            {"save_transfer": False},
+            {"save_mode": "full"},
+            {"save_mode": "full", "save_transfer": False},
+        ):
+            det_value = facade.gdn_saved_bytes_kcp(det_ctx, H_qk=2, HV=6, P=2, **kw)
+            value = facade.gdn_saved_bytes_kcp(
+                ctx, H_qk=2, HV=6, P=2, deterministic=False, **kw
+            )
+            assert det_value == value, (rank, kw)
+        # this package's workspace keywords: the non-deterministic route only
+        for kw in (
+            {"graph": "replay"},
+            {"save_for_backward": False},
+            {"fused_walks": 0, "P": 2, "backward": False},
+        ):
+            assert facade.gdn_workspace_bytes_kcp(
+                ctx, H_qk=2, HV=6, deterministic=False, **kw
+            ) == pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, **kw), (rank, kw)
+            with pytest.raises(TypeError, match=next(iter(kw))):
+                facade.gdn_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw)
+        # the facade passes fused_walks=0 on: at P = 2 its forward has no carry slots for the crossing fragments
+        assert max(ctx.n_in, ctx.n_out) > 0
+        split_walks = facade.gdn_workspace_bytes_kcp(
+            ctx, H_qk=2, HV=6, deterministic=False, fused_walks=0, P=2, backward=False
+        )
+        fused = pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, P=2, backward=False)
+        state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
+        assert fused - split_walks == max(ctx.n_in, ctx.n_out) * state, rank
 
 
 def test_the_context_holds_no_mode() -> None:
@@ -1572,6 +1644,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -1596,10 +1669,11 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
-    # the output walk is this package's own program: a det-neutral module that no deterministic twin ships
+    # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
     assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
-        if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
+        if name not in ("kcp_affine_merge", "kcp_fwdh_out", "kcp_fwdh_out_tape"):
             # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
             # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)
@@ -1629,6 +1703,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
     for prog in (
         "kcp_fwdh_offset",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_dhu_offset",
     ):
@@ -1658,6 +1733,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
     assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
     assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
+    # the tape-and-output walk: the output walk's arguments and the tape walk's h / v_new tapes, no final-state pool
+    fused_tape = kcp.PROGRAM_ARGS["kcp_fwdh_out_tape"]
+    assert set(fused_tape) == set(fused) | {"h_tape", "v_new"}
+    assert not {"out", "out_index", "ticket"} & set(fused_tape)
+    assert set(fused_tape) - {"q", "aqk", "qscale", "o"} <= set(
         kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
     )
     assert (
@@ -1727,7 +1809,12 @@ def test_fwdh_form_rule_follows_the_chain_clause() -> None:
     vh = 128; the test knob ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the
     fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
+    assert kcp.FWDH_PROGRAMS == (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+    )
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
     assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
     assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
@@ -2029,6 +2116,7 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
             "kcp_fwdh_out",
+            "kcp_fwdh_out_tape",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",

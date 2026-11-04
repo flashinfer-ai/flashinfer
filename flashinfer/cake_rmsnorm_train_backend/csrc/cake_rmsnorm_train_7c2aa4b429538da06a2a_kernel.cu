@@ -47,21 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_FLAGS_OFF 0
-#define SMEM_FLAGS_STAGE_BYTES 32
-#define SMEM_FLAGS_STRIDE 32
-#define SMEM_DOTS_OFF 32
-#define SMEM_DOTS_STAGE_BYTES 64
-#define SMEM_DOTS_STRIDE 64
-#define SMEM_SUMS_OFF 96
-#define SMEM_SUMS_STAGE_BYTES 16384
-#define SMEM_SUMS_STRIDE 16384
-#define SMEM_DWBUF_OFF 96
-#define SMEM_DWBUF_STAGE_BYTES 1024
-#define SMEM_DWBUF_STRIDE 1024
-#define SMEM_TOTAL 16512
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -122,7 +107,7 @@ kernel_cake_rmsnorm_train_7c2aa4b429538da06a2a(__nv_bfloat16* __restrict__ g, __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* flags = reinterpret_cast<int*>(smem_raw + 0);
     const int flags_addr = smem + 0;
     float* dots = reinterpret_cast<float*>(smem_raw + 32);
@@ -143,7 +128,7 @@ kernel_cake_rmsnorm_train_7c2aa4b429538da06a2a(__nv_bfloat16* __restrict__ g, __
     long long g_stride = g_stride_p0;
     long long x_stride = x_stride_p0;
     long long gh_stride = g_h_stride_p0;
-    int rg = warp / 1;
+    int rg = warp;
     int tir = tid - rg * 32;
     float ww[8];
     {
@@ -282,14 +267,14 @@ kernel_cake_rmsnorm_train_7c2aa4b429538da06a2a(__nv_bfloat16* __restrict__ g, __
         last_row = row_end - 1;
         if (tir == 0) {
             if (row_begin + 8 + rg < row_end) {
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + ((long long)(row_begin + 8 + rg) * g_stride))), "r"((uint32_t)(512)) : "memory");
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + ((long long)(row_begin + 8 + rg) * x_stride))), "r"((uint32_t)(512)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + (long long)(row_begin + 8 + rg) * g_stride)), "r"((uint32_t)(512)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + (long long)(row_begin + 8 + rg) * x_stride)), "r"((uint32_t)(512)) : "memory");
             }
         }
         if (tir == 0) {
             if (row_begin + 16 + rg < row_end) {
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + ((long long)(row_begin + 16 + rg) * g_stride))), "r"((uint32_t)(512)) : "memory");
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + ((long long)(row_begin + 16 + rg) * x_stride))), "r"((uint32_t)(512)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + (long long)(row_begin + 16 + rg) * g_stride)), "r"((uint32_t)(512)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + (long long)(row_begin + 16 + rg) * x_stride)), "r"((uint32_t)(512)) : "memory");
             }
         }
         if (n_iters > 0) {
@@ -323,8 +308,8 @@ kernel_cake_rmsnorm_train_7c2aa4b429538da06a2a(__nv_bfloat16* __restrict__ g, __
             if (n_iters > it0) {
                 if (tir == 0) {
                     if (row_begin + (it0 + 2 - 1 + 2) * 8 + rg < row_end) {
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + ((long long)(row_begin + (it0 + 2 - 1 + 2) * 8 + rg) * g_stride))), "r"((uint32_t)(512)) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + ((long long)(row_begin + (it0 + 2 - 1 + 2) * 8 + rg) * x_stride))), "r"((uint32_t)(512)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + (long long)(row_begin + (it0 + 2 - 1 + 2) * 8 + rg) * g_stride)), "r"((uint32_t)(512)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + (long long)(row_begin + (it0 + 2 - 1 + 2) * 8 + rg) * x_stride)), "r"((uint32_t)(512)) : "memory");
                     }
                 }
                 if (n_iters > it0 + 1) {
@@ -483,8 +468,8 @@ kernel_cake_rmsnorm_train_7c2aa4b429538da06a2a(__nv_bfloat16* __restrict__ g, __
             if (n_iters > it0 + 1) {
                 if (tir == 0) {
                     if (row_begin + (it0 + 1 + 2 - 1 + 2) * 8 + rg < row_end) {
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + ((long long)(row_begin + (it0 + 1 + 2 - 1 + 2) * 8 + rg) * g_stride))), "r"((uint32_t)(512)) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + ((long long)(row_begin + (it0 + 1 + 2 - 1 + 2) * 8 + rg) * x_stride))), "r"((uint32_t)(512)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(g + (long long)(row_begin + (it0 + 1 + 2 - 1 + 2) * 8 + rg) * g_stride)), "r"((uint32_t)(512)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<const uint8_t*>(x + (long long)(row_begin + (it0 + 1 + 2 - 1 + 2) * 8 + rg) * x_stride)), "r"((uint32_t)(512)) : "memory");
                     }
                 }
                 if (n_iters > it0 + 1 + 1) {
