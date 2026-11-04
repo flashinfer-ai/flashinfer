@@ -7620,6 +7620,49 @@ def check_kept_logits(plan: Plan, logits) -> tuple:
 # cache that holds the bindings takes no lock and skips a step whose entry another thread removed (:class:`BindingCache`).
 _OWNED_VALUES = ("workspace", "tma_descriptor_workspace")
 
+# The per-call scratch slots of a remembered binding (:meth:`_Binding._scratch`): the row vectors ``d`` / ``term`` and
+# the loss cells ``loss_acc`` / ``loss``.  A binding allocates per call only the slots its launch sequence binds
+# (:func:`_scratch_slots`): the log-probability forward binds ``d`` and ``term`` (``row_finalize``), its backward none
+# of them, the loss entry's forward all four.
+_SCRATCH_SLOTS = ("d", "term", "loss_acc", "loss")
+
+
+class _ReadRecorder(dict):
+    """A copy of a call's host values that records the names read from it (``t[name]`` / ``t.get(name)``)."""
+
+    def __init__(self, values: dict[str, Any]):
+        super().__init__(values)
+        self.read: set[str] = set()
+
+    def __getitem__(self, name):
+        self.read.add(name)
+        return super().__getitem__(name)
+
+    def get(self, name, default=None):
+        self.read.add(name)
+        return super().get(name, default)
+
+
+def _scratch_slots(
+    slot_values: Callable[..., dict[str, Any]],
+    keys: tuple,
+    t: dict[str, Any],
+    plan: Plan,
+    returned: tuple = (),
+) -> tuple[str, ...]:
+    """The scratch slots (:data:`_SCRATCH_SLOTS`, in that order) the launch sequence ``keys`` binds -- every name its
+    per-call host values read (``slot_values``: :func:`_slot_values` or its temperature form, which the binding's
+    launches and host steps take per call) -- plus ``returned`` (the slots the call returns).  Replayed once per binding
+    on the runner's own tensors (:meth:`_Binding.from_runner`); a replay that fails keeps every slot."""
+    recorder = _ReadRecorder(t)
+    try:
+        for key in keys:
+            slot_values(key[0], recorder, plan, key[1])
+    except Exception:  # fail safe: the shipped allocation of every slot
+        return _SCRATCH_SLOTS
+    read = recorder.read | set(returned)
+    return tuple(name for name in _SCRATCH_SLOTS if name in read)
+
 
 @dataclass
 class _Binding:
@@ -7649,6 +7692,10 @@ class _Binding:
     owned_bytes: int = 0
     layout: dict = field(default_factory=dict, repr=False)
     memory: dict = field(default_factory=dict, repr=False)
+    # the scratch slots (:data:`_SCRATCH_SLOTS`) a forward / backward call allocates: the ones its sequence binds or
+    # returns (:func:`_scratch_slots`)
+    forward_scratch: tuple = _SCRATCH_SLOTS
+    backward_scratch: tuple = _SCRATCH_SLOTS
 
     @classmethod
     def from_runner(
@@ -7700,6 +7747,7 @@ class _Binding:
             (i for i, key in enumerate(early) if _reads_labels(key[0])), len(early)
         )
         forward_late = tuple(key for key in forward_order if key not in early)
+        forward_run, backward_run = _unfilled(forward_order), _unfilled(backward_order)
         return cls(
             plan=plan,
             device=t["X"].device,
@@ -7714,14 +7762,23 @@ class _Binding:
             forward_early=early[:split],
             forward_early_labels=early[split:],
             forward_late=forward_late,
-            forward_run=_unfilled(forward_order),
-            backward_run=_unfilled(backward_order),
+            forward_run=forward_run,
+            backward_run=backward_run,
             forward_late_run=_unfilled(forward_late),
             fill_rows=plan.dx_fill_rows,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
             memory=memory,
+            # the loss entry's forward returns the finished-loss cell
+            forward_scratch=_scratch_slots(
+                _slot_values,
+                forward_run,
+                t,
+                plan,
+                ("loss",) if plan.problem.entry == "loss" else (),
+            ),
+            backward_scratch=_scratch_slots(_slot_values, backward_run, t, plan),
         )
 
     def holds_no_tensor(self) -> bool:
@@ -7737,12 +7794,15 @@ class _Binding:
         hidden: Optional[_HiddenCount] = None,
         *,
         chunk_buffers: bool = True,
+        backward: bool = False,
     ) -> None:
         """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones);
         with ``hidden`` the chunk buffers are the prologue's (chunk 0's logits / statistics / gathered rows already in
         them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue.
         ``chunk_buffers=False``: the chunk buffers are already bound (:meth:`_chunk_buffers`, the early launch of
-        :meth:`forward`) and the rest is allocated."""
+        :meth:`forward`) and the rest is allocated.  Of the scratch slots (:data:`_SCRATCH_SLOTS`) only the ones the
+        call's sequence binds or returns: ``backward`` selects the backward's (:attr:`backward_scratch`), else the
+        forward's (:attr:`forward_scratch`)."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
         if chunk_buffers and hidden is not None:
@@ -7756,10 +7816,15 @@ class _Binding:
                 dtype=torch.float32,
                 device=self.device,
             )
-        t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
-        t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
+        scratch = self.backward_scratch if backward else self.forward_scratch
+        if "d" in scratch:
+            t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
+        if "term" in scratch:
+            t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
+        if "loss_acc" in scratch:
+            t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
+        if "loss" in scratch:
+            t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
         t.update(
             _device_constants(self.device_index)
         )  # constant cells: no per-call fill launches
@@ -7969,7 +8034,7 @@ class _Binding:
             if fill_side and plan.need_dx
             else None
         )
-        self._scratch(t, hidden)
+        self._scratch(t, hidden, backward=True)
         if plan.need_dx:
             if join is None:
                 t["dx_acc"] = _filled_dx_acc(T, H, self.fill_rows, self.device)
@@ -8063,6 +8128,7 @@ class _TemperatureBinding(_Binding):
             len(early),
         )
         forward_late = tuple(key for key in forward_order if key not in early)
+        forward_run, backward_run = _unfilled(forward_order), _unfilled(backward_order)
         return (cls if tau else _Binding)(
             plan=plan,
             device=t["X"].device,
@@ -8077,14 +8143,22 @@ class _TemperatureBinding(_Binding):
             forward_early=early[:split],
             forward_early_labels=early[split:],
             forward_late=forward_late,
-            forward_run=_unfilled(forward_order),
-            backward_run=_unfilled(backward_order),
+            forward_run=forward_run,
+            backward_run=backward_run,
             forward_late_run=_unfilled(forward_late),
             fill_rows=plan.dx_fill_rows,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
             memory=memory,
+            forward_scratch=_scratch_slots(
+                slot_values,
+                forward_run,
+                t,
+                plan,
+                ("loss",) if plan.problem.entry == "loss" else (),
+            ),
+            backward_scratch=_scratch_slots(slot_values, backward_run, t, plan),
         )
 
     # the rows of the call in progress, per thread (set and cleared around the inherited sequence)
@@ -8309,7 +8383,7 @@ class _KeptBinding(_Binding):
         )
         if plan.compact:
             t["x_c"] = torch.empty((rows, H), dtype=torch.bfloat16, device=self.device)
-        self._scratch(t, chunk_buffers=False)
+        self._scratch(t, chunk_buffers=False, backward=True)
         t["logits_keep"] = logits
         if plan.need_dx:
             if join is None:
