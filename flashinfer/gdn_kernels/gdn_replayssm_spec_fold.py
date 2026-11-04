@@ -365,7 +365,8 @@ def commit_gdn_replayssm_fold_all_layers(
     Checkpoints have shape ``[layers, slots, HV, 128, 128]`` (FP32, K-last).
     Raw K/V windows have shape ``[layers, slots, H/HV, T, 128]`` (BF16);
     log-decay and beta have shape ``[layers, slots, HV, T]`` (FP32).
-    All tensors must be contiguous and on the same SM100/SM103 CUDA device.
+    All tensors must be contiguous and on the same SM100/SM103 or SM120 CUDA
+    device.
 
     ``ssm_state_indices`` and ``accept_lens`` are int32 vectors of length B.
     Each live slot must be unique and in range; accepted lengths must lie in
@@ -386,8 +387,8 @@ def commit_gdn_replayssm_fold_all_layers(
         raise ValueError("checkpoint_state must be [layers, slots, HV, V, K]")
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     target = gdn_device_target(checkpoint_state.device)
-    if target.major != 10:
-        raise ValueError("ReplaySSM commit currently requires SM100/SM103")
+    if target.major != 10 and (target.major, target.minor) != (12, 0):
+        raise ValueError("ReplaySSM commit requires SM100/SM103 or SM120")
     if num_layers < 1 or num_slots < 1 or max_cache_len < 1:
         raise ValueError("layers, slots, and max_cache_len must be positive")
     H = int(num_k_heads)
@@ -481,8 +482,13 @@ def commit_gdn_replayssm_fold_all_layers(
         if tensor.data_ptr() % 16:
             raise ValueError(f"{name} must have a 16-byte aligned base address")
 
+    if backend == "tcgen05" and target.major != 10:
+        raise ValueError("tcgen05 commit requires SM100/SM103")
     supports_tcgen = (
-        4 <= max_cache_len <= 8 and use_qk_l2norm_in_kernel and not has_track
+        target.major == 10
+        and 4 <= max_cache_len <= 8
+        and use_qk_l2norm_in_kernel
+        and not has_track
     )
     if backend == "tcgen05" and not supports_tcgen:
         raise ValueError("tcgen05 commit requires normalized T=4..8 without tracking")
