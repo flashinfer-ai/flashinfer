@@ -47,31 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 264
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_TMEM_SFB_OFFSET 256
-#define TMEM_TMEM_SFA_OFFSET 260
-#define NUM_TMA_PIPE_STAGES 8
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define NUM_EPI_TMA_PIPE_STAGES 2
-#define SMEM_EPI_STAGING_OFF 1024
-#define SMEM_EPI_STAGING_STAGE_BYTES 4096
-#define SMEM_EPI_STAGING_STRIDE 4096
-#define SMEM_SMEM_A_OFF 9216
-#define SMEM_SMEM_A_STAGE_BYTES 8192
-#define SMEM_SMEM_A_STRIDE 25600
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 25600
-#define SMEM_SMEM_SFA_OFF 33792
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 25600
-#define SMEM_SMEM_SFB_OFF 34304
-#define SMEM_SMEM_SFB_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_STRIDE 25600
-#define SMEM_TOTAL 214016
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -191,7 +166,7 @@ __device__ __forceinline__ void tma_store_3d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_batch_deepgemm_fp8_f239d5b14db9706be968(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -222,7 +197,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int epi_staging_addr = smem + 1024;
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 9216);
@@ -233,12 +208,13 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
     const int smem_sfa_addr = smem + 33792;
     uint8_t* smem_sfb = reinterpret_cast<uint8_t*>(smem_raw + 34304);
     const int smem_sfb_addr = smem + 34304;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&C_tma))) : "memory");
 
-    // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 28 barriers)
-    // Mbarriers at smem_raw[0..224)
+    // Mbarrier init (28 barriers at smem_raw[0..224))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -282,8 +258,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
         }
     }
 
-    __syncwarp();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 264 used)
@@ -298,12 +273,10 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_tmem_sfb = taddr + 256;
-    const int tmem_tmem_sfa = taddr + 260;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_tmem_sfb = taddr + 256;
+    const unsigned int tmem_tmem_sfa = taddr + 260;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -512,7 +485,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
                 unsigned int sfb_row = current_group_idx_2 * grid_n + n_block_1;
                 int sp_b[4];
                 {
-                    const int4* _ivptr_0 = reinterpret_cast<const int4*>(SFB_bits + (sfb_row * sf_cols) + 0);
+                    const int4* _ivptr_0 = reinterpret_cast<const int4*>(SFB_bits + sfb_row * sf_cols + 0);
                     int4 _ivld_0;
                     _ivld_0 = *_ivptr_0;
                     sp_b[0 + 0] = _ivld_0.x;
@@ -523,7 +496,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
                 int sp_a[16];
                 if (off_m_1 + (unsigned int)0 + sf_lane < shape_m) {
                     {
-                        const int4* _ivptr_1 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)0 + sf_lane) * sf_cols) + 0);
+                        const int4* _ivptr_1 = reinterpret_cast<const int4*>(SFA_bits + (sfa_row0 + (unsigned int)0 + sf_lane) * sf_cols + 0);
                         int4 _ivld_1;
                         _ivld_1 = *_ivptr_1;
                         sp_a[0 + 0] = _ivld_1.x;
@@ -534,7 +507,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
                 }
                 if (off_m_1 + (unsigned int)32 + sf_lane < shape_m) {
                     {
-                        const int4* _ivptr_2 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)32 + sf_lane) * sf_cols) + 0);
+                        const int4* _ivptr_2 = reinterpret_cast<const int4*>(SFA_bits + (sfa_row0 + (unsigned int)32 + sf_lane) * sf_cols + 0);
                         int4 _ivld_2;
                         _ivld_2 = *_ivptr_2;
                         sp_a[4 + 0] = _ivld_2.x;
@@ -545,7 +518,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
                 }
                 if (off_m_1 + (unsigned int)64 + sf_lane < shape_m) {
                     {
-                        const int4* _ivptr_3 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)64 + sf_lane) * sf_cols) + 0);
+                        const int4* _ivptr_3 = reinterpret_cast<const int4*>(SFA_bits + (sfa_row0 + (unsigned int)64 + sf_lane) * sf_cols + 0);
                         int4 _ivld_3;
                         _ivld_3 = *_ivptr_3;
                         sp_a[8 + 0] = _ivld_3.x;
@@ -556,7 +529,7 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
                 }
                 if (off_m_1 + (unsigned int)96 + sf_lane < shape_m) {
                     {
-                        const int4* _ivptr_4 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)96 + sf_lane) * sf_cols) + 0);
+                        const int4* _ivptr_4 = reinterpret_cast<const int4*>(SFA_bits + (sfa_row0 + (unsigned int)96 + sf_lane) * sf_cols + 0);
                         int4 _ivld_4;
                         _ivld_4 = *_ivptr_4;
                         sp_a[12 + 0] = _ivld_4.x;
@@ -577,30 +550,30 @@ kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUte
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_base + sf_lane * 16 + 4), "r"(sfb_word));
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_base + sf_lane * 16 + 8), "r"(sfb_word));
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_base + sf_lane * 16 + 12), "r"(sfb_word));
-                        unsigned int sf_row = (unsigned int)0 + sf_lane;
-                        unsigned int sfa_word = (unsigned int)2139062143;
-                        if (off_m_1 + sf_row < shape_m) {
-                            sfa_word = (unsigned int)sp_a[0] >> 23 & 255 | ((unsigned int)sp_a[1] >> 23 & 255) << 8 | ((unsigned int)sp_a[2] >> 23 & 255) << 16 | ((unsigned int)sp_a[3] >> 23 & 255) << 24;
+                        unsigned int sf_row_1_0 = (unsigned int)0 + sf_lane;
+                        unsigned int sfa_word_2_0 = (unsigned int)2139062143;
+                        if (off_m_1 + sf_row_1_0 < shape_m) {
+                            sfa_word_2_0 = (unsigned int)sp_a[0] >> 23 & 255 | ((unsigned int)sp_a[1] >> 23 & 255) << 8 | ((unsigned int)sp_a[2] >> 23 & 255) << 16 | ((unsigned int)sp_a[3] >> 23 & 255) << 24;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + sf_lane * 16), "r"(sfa_word));
-                        unsigned int sf_row_0 = (unsigned int)32 + sf_lane;
-                        unsigned int sfa_word_1 = (unsigned int)2139062143;
-                        if (off_m_1 + sf_row_0 < shape_m) {
-                            sfa_word_1 = (unsigned int)sp_a[4] >> 23 & 255 | ((unsigned int)sp_a[5] >> 23 & 255) << 8 | ((unsigned int)sp_a[6] >> 23 & 255) << 16 | ((unsigned int)sp_a[7] >> 23 & 255) << 24;
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + sf_lane * 16), "r"(sfa_word_2_0));
+                        unsigned int sf_row_1_1 = (unsigned int)32 + sf_lane;
+                        unsigned int sfa_word_2_1 = (unsigned int)2139062143;
+                        if (off_m_1 + sf_row_1_1 < shape_m) {
+                            sfa_word_2_1 = (unsigned int)sp_a[4] >> 23 & 255 | ((unsigned int)sp_a[5] >> 23 & 255) << 8 | ((unsigned int)sp_a[6] >> 23 & 255) << 16 | ((unsigned int)sp_a[7] >> 23 & 255) << 24;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 4 + sf_lane * 16), "r"(sfa_word_1));
-                        unsigned int sf_row_2 = (unsigned int)64 + sf_lane;
-                        unsigned int sfa_word_3 = (unsigned int)2139062143;
-                        if (off_m_1 + sf_row_2 < shape_m) {
-                            sfa_word_3 = (unsigned int)sp_a[8] >> 23 & 255 | ((unsigned int)sp_a[9] >> 23 & 255) << 8 | ((unsigned int)sp_a[10] >> 23 & 255) << 16 | ((unsigned int)sp_a[11] >> 23 & 255) << 24;
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 4 + sf_lane * 16), "r"(sfa_word_2_1));
+                        unsigned int sf_row_1_2 = (unsigned int)64 + sf_lane;
+                        unsigned int sfa_word_2_2 = (unsigned int)2139062143;
+                        if (off_m_1 + sf_row_1_2 < shape_m) {
+                            sfa_word_2_2 = (unsigned int)sp_a[8] >> 23 & 255 | ((unsigned int)sp_a[9] >> 23 & 255) << 8 | ((unsigned int)sp_a[10] >> 23 & 255) << 16 | ((unsigned int)sp_a[11] >> 23 & 255) << 24;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 8 + sf_lane * 16), "r"(sfa_word_3));
-                        unsigned int sf_row_4 = (unsigned int)96 + sf_lane;
-                        unsigned int sfa_word_5 = (unsigned int)2139062143;
-                        if (off_m_1 + sf_row_4 < shape_m) {
-                            sfa_word_5 = (unsigned int)sp_a[12] >> 23 & 255 | ((unsigned int)sp_a[13] >> 23 & 255) << 8 | ((unsigned int)sp_a[14] >> 23 & 255) << 16 | ((unsigned int)sp_a[15] >> 23 & 255) << 24;
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 8 + sf_lane * 16), "r"(sfa_word_2_2));
+                        unsigned int sf_row_1_3 = (unsigned int)96 + sf_lane;
+                        unsigned int sfa_word_2_3 = (unsigned int)2139062143;
+                        if (off_m_1 + sf_row_1_3 < shape_m) {
+                            sfa_word_2_3 = (unsigned int)sp_a[12] >> 23 & 255 | ((unsigned int)sp_a[13] >> 23 & 255) << 8 | ((unsigned int)sp_a[14] >> 23 & 255) << 16 | ((unsigned int)sp_a[15] >> 23 & 255) << 24;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 12 + sf_lane * 16), "r"(sfa_word_5));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 12 + sf_lane * 16), "r"(sfa_word_2_3));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         if ((unsigned int)iter_k_2 + 4 < (unsigned int)k_tiles) {
                             {
