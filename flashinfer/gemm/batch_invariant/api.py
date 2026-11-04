@@ -430,17 +430,19 @@ def _run(
     b3 = b_nk.as_strided(
         (N, Kc, C), (b_nk.stride(0), b_nk.stride(1), Kc * b_nk.stride(1))
     )
+    # the output may not overlap what the chain reads while it writes the output: the scales and the bias, read by the
+    # epilogue of a direct store and by the fixup of the workspace split alike
+    for t, what in (
+        *((sc, "a scale") for sc in scales),
+        *(((bias, "the bias"),) if bias is not None else ()),
+    ):
+        if _overlaps(out, t):
+            raise unsupported(
+                cls,
+                f"the output overlapping {what}",
+                "an output disjoint from the scales and the bias (they are read while the output is written)",
+            )
     if direct:
-        for t, what in (
-            *((sc, "a scale") for sc in scales),
-            *(((bias, "the bias"),) if bias is not None else ()),
-        ):
-            if _overlaps(out, t):
-                raise unsupported(
-                    cls,
-                    f"the output overlapping {what}",
-                    "an output disjoint from the scales and the bias (they are read while the output is written)",
-                )
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
@@ -937,7 +939,9 @@ def prepare_mxfp8_operands(
     architecture, e4m3 A and B, 2-D shapes with matching K, K a multiple of 32 (one whole scale block, hence 16-byte TMA
     rows) and N of 8, A's row placement, B the transpose of a row-major (N, K) weight (the block-scaled instruction takes
     K-major operands only), the two scale-factor buffers, the output's dtype / shape / layout (allocated when absent).
-    Returns ``(a, sfa, sfb, out, M, N, K)`` with the scale buffers as flat uint8 views."""
+    Returns ``(a, sfa, sfb, out, M, N, K)`` with the scale buffers as flat uint8 views. K is a multiple of 32; where it is not a multiple of the class's step (64 on SM107) the last step is partial: its
+    padded values are TMA zero fill, its scales are read from the scale buffers' padding, so those bytes must be finite
+    (the quantizer writes zeros; a NaN or Inf there poisons the row)."""
     cls = CLASS_MXFP8
     check_device(a.device, cls, MM_MXFP8_ARCHS)
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:

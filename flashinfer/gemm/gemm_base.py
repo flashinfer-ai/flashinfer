@@ -7791,6 +7791,9 @@ def _heuristic_func_mm_mxfp8(
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
     batch_invariant: bool = False,
 ) -> List[str]:
+    if batch_invariant:
+        # the batch-invariant class runs in place of the backends: their availability does not decide the call
+        return ["batch_invariant"]
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
         order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])

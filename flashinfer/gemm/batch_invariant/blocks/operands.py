@@ -68,6 +68,7 @@ ALIGN = {
 
 NUM_ACC_STAGE = 2  # TMEM accumulator double buffer
 NUM_C_STAGE_MIN = 2  # C smem stages before the leftover budget is added
+MAX_GRID_Z = 65535  # the hardware's grid.z limit: the in-cluster split's one-cluster-per-tile launch
 MBAR_RESERVE_BYTES = 1024  # barriers and the TMEM holding word
 OCCUPANCY = 1
 TMEM_ARCH = "sm_100"
@@ -340,15 +341,19 @@ def can_implement(
             )
         if knobs.cluster_k > 1:
             # the in-cluster split computes exactly the class kchunk[cluster_k]: its chunks are whole k-tiles (one smem
-            # stage), so K splits into cluster_k equal k-tile ranges; the output is stored directly
+            # stage), so K splits into cluster_k equal k-tile ranges; the output is stored directly. Its launch puts one
+            # cluster per output tile on the grid's z axis, which the hardware caps (MAX_GRID_Z): above that tile count
+            # the record is not a placement of the shape and the workspace split (the same class) takes over
             from ..generator import MainloopBlock
 
             k_tile = MainloopBlock(in_fmt).k_block
+            tiles = -(-M // knobs.tile_m) * -(-N // knobs.tile_n)
             return (
                 chunks == knobs.cluster_k
                 and K % (k_tile * chunks) == 0
                 and N % ALIGN["bf16"] == 0
                 and Kc % al_in == 0
+                and tiles <= MAX_GRID_Z
             )
     return (
         Kc % al_in == 0

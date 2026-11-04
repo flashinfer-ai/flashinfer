@@ -896,12 +896,31 @@ def test_unsupported_bias_inputs_raise():
         mm_bf16_batch_invariant(a, b, bias=bias.float())
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bias of type list"):
         mm_bf16_batch_invariant(a, b, bias=[0.0] * N)
-    # the direct store reads the bias while it writes the output: they may not overlap
+    # the chain reads the bias while it writes the output: they may not overlap, on the direct store (the unsplit
+    # class, the in-CTA fold) and on the workspace split, whose fixup reads the bias
     out = torch.empty(16, N, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
     ):
         bi_mm(a, b, bias=out[0], out=out)
+    Ns, Ks = 128, 8192  # the split class: C = 4
+    Cs = chunks_for(Ns, Ks)
+    assert Cs > 1
+    a_s, b_s = rnd_bf16(16, Ks, 156), rnd_bf16(Ks, Ns, 157)
+    out_s = torch.empty(16, Ns, dtype=torch.bfloat16, device="cuda")
+    ws_rec = Knobs((128, 64), (1, 1), False, True, "m", 1)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
+    ):
+        mm_bf16_batch_invariant(
+            a_s, b_s, out=out_s, bias=out_s[0], config=ws_rec, chunks=Cs
+        )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
+    ):
+        bi_mm(
+            a_s, b_s, bias=out_s[0], out=out_s
+        )  # the dispatcher's own pick at the split shape
     with pytest.raises(ValueError):  # the public API's own dtype contract comes first
         bi_mm(a, b, bias=bias.float())
     with pytest.raises(bi.BatchInvariantUnsupportedError, match=r"shape \(4096,\)"):
