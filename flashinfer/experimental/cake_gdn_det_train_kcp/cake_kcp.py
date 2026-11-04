@@ -62,7 +62,8 @@ recompute of the forward reads it back: no collective, no summary walk over the 
 merge -- the light replay's launches (at ``P > 1`` its local segment walks and carry merges).
 
 Saved set (``boundary_mode="saved"``): ``S_in`` (fresh), the owner's c1
-receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``) and, with
+receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``, with
+``save_transfer`` or ``save_mode="full"``) and, with
 ``save_mode="full"``, the forward tapes (``h``, ``v_new``, ``w``, ``u``,
 ``Aqk``, ``Akk``, the gate rows); ``save_mode="light"`` (default) keeps the
 boundary tensors only and the backward re-runs #1 and the #2 tape walk from
@@ -617,8 +618,30 @@ BWD_DEAD_BEFORE_DQKG: tuple[str, ...] = ("carry", "b2_recv")
 RING_POOLS: tuple[str, ...] = ("ring_out", "ring_in")
 # The pools a call replaces with fresh (forward) or saved (backward) tensors under ``save_transfer``: the c1 receive
 # tensor and the ``M_seg^T`` staging plane are saved-set tensors, so the workspace pools of those names are dead for
-# that call and are not sized (``_prepare`` -> ``WorkspaceDetKcp.ensure(skip=...)``).
+# that call and are not sized (``_prepare`` -> ``WorkspaceDetKcp.ensure(skip=...)``).  ``save_mode="full"`` saves the
+# ``M_seg^T`` plane in either ``save_transfer`` form (:func:`_saves_m_seg`).
 SAVE_TRANSFER_FRESH_POOLS: tuple[str, ...] = ("c1_recv", "stage_m")
+# save_mode="full" without save_transfer: the saved M_seg^T plane only (its backward runs no transfer walk).
+_FULL_FRESH_POOLS: tuple[str, ...] = ("stage_m",)
+
+
+def _saves_m_seg(save_mode: str, save_transfer: bool, P: int) -> bool:
+    """Whether the saved set carries ``M_seg`` (the forward's ``M_seg^T`` staging plane): at ``P > 1`` under
+    ``save_transfer`` and under ``save_mode="full"``.  The backward's merges (``tmap_d_*``, ``tmap_m``,
+    ``dcarry_*``) read that plane; the light backward rebuilds it in its replay (transfer walk), the kept hand-off
+    carries the recompute forward's, and the ``"full"`` backward runs no transfer walk, so its saved set holds it."""
+    return int(P) > 1 and (bool(save_transfer) or save_mode == "full")
+
+
+def _fwd_fresh_pools(opts: OptionsDetKcp, save: bool) -> tuple[str, ...]:
+    """The pools a forward replaces with fresh saved-set tensors (not sized for the call)."""
+    if not save:
+        return ()
+    if opts.save_transfer:
+        return SAVE_TRANSFER_FRESH_POOLS
+    return _FULL_FRESH_POOLS if opts.save_mode == "full" else ()
+
+
 # The saved-set tensor bound under each per-call buffer name (``CallDetKcp.drop_bound`` forgets both at the last reader).
 SAVED_TENSOR_OF_BUFFER: dict[str, str] = {
     "S_in": "S_in",
@@ -2502,12 +2525,13 @@ class WorkspaceDetKcp:
     (:data:`FWD_TAPES` / :data:`BWD_TAPES` of the padded geometry ``(R, NC_pad, HV)``, allocated on first use;
     ``dv_new`` is the ``dv_intra`` buffer, :data:`TAPE_ALIASES`).  The
     saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
-    ``save_transfer`` at ``P > 1``, the forward tapes under ``save_mode="full"``) are never workspace slices: the
-    calls allocate them fresh.  The persistent programs' dynamic-ticket words live here too: one 128-byte u32 slot
-    per launch site (:data:`TICKET_SITES`), zeroed once when the workspace is first sized, never released, never
-    read by the host; every launch leaves its word at zero (the kernels' self-resetting ticket), so a captured graph
-    replays on the same slots.  A workspace is reusable across calls and layers of the same ``(ctx, H_qk, HV)``; a
-    call with a larger need grows it.  ``bytes`` counts the pools, the tapes and the ticket slots."""
+    ``save_transfer`` or ``save_mode="full"`` at ``P > 1``, the forward tapes under ``save_mode="full"``) are never
+    workspace slices: the calls allocate them fresh.  The persistent programs' dynamic-ticket words live here too:
+    one 128-byte u32 slot per launch site (:data:`TICKET_SITES`), zeroed once when the workspace is first sized,
+    never released, never read by the host; every launch leaves its word at zero (the kernels' self-resetting
+    ticket), so a captured graph replays on the same slots.  A workspace is reusable across calls and layers of the
+    same ``(ctx, H_qk, HV)``; a call with a larger need grows it.  ``bytes`` counts the pools, the tapes and the
+    ticket slots."""
 
     def __init__(
         self,
@@ -2559,9 +2583,10 @@ class WorkspaceDetKcp:
     ) -> _Tables:
         """Size the pools for ``(ctx, HV)`` and bind the tape geometry; returns the tables (``P``: the segments
         override of the plan).  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
-        pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` and
-        ``stage_m`` under ``save_transfer``); a skipped pool is not allocated, a held one is left as it is, and a
-        later ``ensure()`` without the name sizes it.  A workspace built from ``(ctx, H_qk, HV)`` sizes every pool."""
+        pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` under
+        ``save_transfer`` and ``stage_m`` when the saved set carries ``M_seg``); a skipped pool is not allocated, a
+        held one is left as it is, and a later ``ensure()`` without the name sizes it.  A workspace built from
+        ``(ctx, H_qk, HV)`` sizes every pool."""
         device = (
             torch.device(device) if device is not None else torch.device(ctx.device)
         )
@@ -2703,11 +2728,11 @@ class WorkspaceDetKcp:
 @dataclasses.dataclass(frozen=True)
 class SavedDetKcp:
     """The saved context of one forward (``boundary_mode="saved"``): ``S_in`` (the fresh c2 output), the owner's c1
-    receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the saved tapes of the
-    ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the scalars of the
-    call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32 ``r`` of q and k
-    ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows ``meta()["qk_l2norm"]``, so
-    :meth:`flags` keeps its three entries).  Every
+    receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` or ``save_mode="full"`` at ``P > 1``), the saved
+    tapes of the ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the
+    scalars of the call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32
+    ``r`` of q and k ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows
+    ``meta()["qk_l2norm"]``, so :meth:`flags` keeps its three entries).  Every
     tensor is fresh per call and travels through ``save_for_backward`` only (#7039).  ``kept`` (never saved, never
     compared: not in ``tensors()`` / ``flags()`` / ``meta()``) is the recompute forward's tape hand-off of
     ``reuse_recompute_tapes`` on its way through the autograd Function's backward; ``None`` everywhere else."""
@@ -4154,10 +4179,11 @@ def _forward(
     s_in: torch.Tensor | None = None,
 ) -> None:
     """The forward sequence.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1
-    receive tensor and ``M_seg``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward of a
-    replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
-    graph task (``reuse_recompute_tapes``): no tape is dropped and the tape walk takes the light replay's form
-    (:func:`_replay_tape_walk`).  ``s_in``: the recompute of a forward that stored its incoming states in a recompute
+    receive tensor; ``M_seg`` at ``P > 1`` with ``save_transfer`` or ``save_mode="full"``; with ``save_mode="full"``
+    fresh forward tapes); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept);
+    ``hand_off``: the forward tapes go to the backward of this graph task (``reuse_recompute_tapes``): no tape is
+    dropped and the tape walk takes the light replay's form (:func:`_replay_tape_walk`).
+    ``s_in``: the recompute of a forward that stored its incoming states in a recompute
     handle -- no collective, no summary walk over the crossing-out fragments, no merge of the owners: #1, at
     ``P > 1`` the local segment walks and carry merges from ``S_in``, and the light replay's tape walk
     (:func:`_replay_from_states`), the very launches of the light backward's replay.  ``schedule="wait_first"``: ``c1 -> wait -> fwd merge -> c2 ->
@@ -4174,10 +4200,10 @@ def _forward(
     )
     keep = save and not replay
     keep_transfer = opts.save_transfer and keep
-    if keep_transfer and tb.P > 1:
+    if keep and _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P):
         call.fresh(
             "stage_m"
-        )  # M_seg^T of the segmented fragments: the summaries write it
+        )  # M_seg^T of the segmented fragments: the summaries (or the recompute's transfer walk) write it
     if (
         keep
     ):  # the saved tapes are fresh per call (light: none; full: every forward tape)
@@ -4823,7 +4849,8 @@ def _prepare(
     if callable(prepare):
         prepare(H_qk, HV, P=P)
     # Dead pools are not allocated (R2-L1 1a): the ring pools under the a2a exchange and the pools the call binds
-    # fresh / saved tensors for (``c1_recv`` / ``stage_m`` under ``save_transfer``) never hold a byte of this call.
+    # fresh / saved tensors for (``c1_recv`` under ``save_transfer``, ``stage_m`` when the saved set carries
+    # ``M_seg``) never hold a byte of this call.
     skip = list(fresh_pools)
     if opts.exchange != "ring":
         skip += list(RING_POOLS)
@@ -4971,7 +4998,7 @@ def _fwd_entry(
         opts=opts,
         workspace=workspace,
         backward=False,
-        fresh_pools=SAVE_TRANSFER_FRESH_POOLS if (save and opts.save_transfer) else (),
+        fresh_pools=_fwd_fresh_pools(opts, save),
     )
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         res = _graph_capture(
@@ -4996,9 +5023,7 @@ def _fwd_entry(
             opts=opts,
             workspace=workspace,
             backward=False,
-            fresh_pools=SAVE_TRANSFER_FRESH_POOLS
-            if (save and opts.save_transfer)
-            else (),
+            fresh_pools=_fwd_fresh_pools(opts, save),
         )
     s_in = None
     if boundary is not None:
@@ -5050,8 +5075,8 @@ def _fwd_entry(
 def _saved_count(call: CallDetKcp, save: bool) -> int:
     """What :class:`ChunkGDNDetFunctionKcp` saves for this forward: the five operands and the saved set's tensors
     (:meth:`SavedDetKcp.tensors`: ``S_in``; the c1 receive tensor under ``save_transfer``; ``M_seg`` under
-    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens; ``qk_rstd`` with
-    ``use_qk_l2norm_in_kernel``) -- known before
+    ``save_transfer`` or ``save_mode="full"`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds
+    tokens; ``qk_rstd`` with ``use_qk_l2norm_in_kernel``) -- known before
     the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
     if not save:
         return _SAVED_OPERANDS
@@ -5059,7 +5084,7 @@ def _saved_count(call: CallDetKcp, save: bool) -> int:
     n = (
         1
         + (1 if opts.save_transfer else 0)
-        + (1 if (opts.save_transfer and tb.P > 1) else 0)
+        + (1 if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P) else 0)
     )
     if call.T_r > 0:
         n += len(saved_tapes(opts.save_mode))
@@ -5173,14 +5198,17 @@ def _fwd_body(
 
 def _saved_set(call: CallDetKcp) -> SavedDetKcp:
     """The saved set of this forward (``boundary_mode="saved"``, ``kept=None``): the fresh ``S_in``, with
-    ``save_transfer`` the c1 receive tensor and ``M_seg`` (``P > 1``), the saved tapes of the ``save_mode`` (none in
-    ``"light"``), the scalars of the call.  Built before #5 so the forward knows what the Function saves."""
+    ``save_transfer`` the c1 receive tensor, ``M_seg`` (``P > 1``, also under ``save_mode="full"``), the saved tapes
+    of the ``save_mode`` (none in ``"light"``), the scalars of the call.  Built before #5 so the forward knows what
+    the Function saves."""
     tb, opts = call.tb, call.opts
     return SavedDetKcp(
         version=KCP_SAVED_VERSION,
         S_in=call.bufs["S_in"],
         c1_recv=call.bufs.get("c1_recv") if opts.save_transfer else None,
-        M_seg=call.bufs.get("stage_m") if (opts.save_transfer and tb.P > 1) else None,
+        M_seg=call.bufs.get("stage_m")
+        if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P)
+        else None,
         tapes=tuple(call.tapes[n] for n in saved_tapes(opts.save_mode))
         if call.T_r > 0
         else None,
@@ -5267,16 +5295,18 @@ def _check_saved(saved: SavedDetKcp, call: CallDetKcp) -> None:
             call.state_dtype,
             call.device,
         )
-        if tb.P > 1:
-            if saved.M_seg is None:
-                raise ValueError("saved: save_transfer at P > 1 needs M_seg")
-            _check(
-                saved.M_seg,
-                "saved.M_seg",
-                (tb.sizes["stage_m"],),
-                call.state_dtype,
-                call.device,
+    if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P):
+        if saved.M_seg is None:
+            raise ValueError(
+                'saved: save_transfer or save_mode="full" at P > 1 needs M_seg'
             )
+        _check(
+            saved.M_seg,
+            "saved.M_seg",
+            (tb.sizes["stage_m"],),
+            call.state_dtype,
+            call.device,
+        )
     if call.T_r > 0:
         names = saved_tapes(opts.save_mode)
         if saved.tapes is None or len(saved.tapes) != len(names):

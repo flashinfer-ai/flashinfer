@@ -6587,6 +6587,17 @@ def _zero_dlogp_floor(rows):
         cake_backend.set_zero_dlogp_min_rows(previous)
 
 
+@contextlib.contextmanager
+def _tau_dz_counted(counted):
+    """Run with the zero-gradient row skip's ``dz`` temperature form counted or not
+    (:func:`cake_backend.set_zero_dlogp_temperature_dz_counted`), then restore the previous."""
+    previous = cake_backend.set_zero_dlogp_temperature_dz_counted(counted)
+    try:
+        yield
+    finally:
+        cake_backend.set_zero_dlogp_temperature_dz_counted(previous)
+
+
 def _with_zero_dlogp(inp, zero, *, negative_zero=True):
     """``inp`` with ``dlogp`` 0 on ``zero`` (``-0.0`` on every other zero row with ``negative_zero``)."""
     d = inp.dlogp.clone()
@@ -7817,16 +7828,18 @@ _STAGE_VALUES = {
 
 def test_registry_temperature_forms_are_well_formed():
     """The temperature forms (:func:`cake_jit.registered_stages_with_temperature`; outside ``STAGES``) pass the
-    deterministic suite's per-stage registry checks: every record (``sm_107a`` too) registers the four, each with a ``build.json`` entry of its own, an argument plan of its twin's host values plus
-    ``temperature``, kernel and binding sources that exist and name its symbol, and its twin's cluster in the geometry
-    a call with a temperature binds with (``_TemperatureGeometry``, which declares every other stage's cluster as
-    :class:`Geometry` does)."""
+    deterministic suite's per-stage registry checks: every record (``sm_107a`` too) registers the five (the ``dz``
+    arm's counted form among them), each with a ``build.json`` entry of its own, an argument plan of its twin's host
+    values plus ``temperature``, kernel and binding sources that exist and name its symbol, and its twin's cluster in
+    the geometry a call with a temperature binds with (``_TemperatureGeometry``, which declares every other stage's
+    cluster as :class:`Geometry` does)."""
     manifest = cake_build.manifest()
     libraries = {entry["name"]: entry for entry in manifest["libraries"]}
     package = Path(cake_jit.__file__).resolve().parent
     twin = {
         "gemm_logits_mcnt_tau": "gemm_logits_mcnt",
         "gemm_logits_dz_tau": "gemm_logits_dz",
+        "gemm_logits_dz_dcnt_tau": "gemm_logits_dz_dcnt",
         "gemm_logits_lbl_tau": "gemm_logits_lbl",
         "row_finalize_tau": "row_finalize",
     }
@@ -7883,11 +7896,12 @@ def test_registry_temperature_forms_are_well_formed():
 TAU_STAGES = (
     "gemm_logits_mcnt_tau",
     "gemm_logits_dz_tau",
+    "gemm_logits_dz_dcnt_tau",
     "gemm_logits_lbl_tau",
     "row_finalize_tau",
 )
 # the stages a temperature call never binds on the generated program (their temperature forms replace them; under
-# the zero-gradient row skip the dz arm keeps its uncounted temperature form, never the counted form without one)
+# the zero-gradient row skip the dz arm runs a temperature form, counted or not, never the counted form without one)
 _UNTAU_STAGES = frozenset(
     (
         "gemm_logits",
@@ -8646,15 +8660,17 @@ def test_temperature_plan_keys():
         )  # no registered program
 
 
-def test_temperature_plan_runs_the_counted_dx_dw_forms():
-    """``make_plan_temperature(dcnt=True)`` (the zero-gradient row skip with a temperature) is the mixed plan: every
-    chunk's ``dz`` recompute keeps the uncounted temperature form ``gemm_logits_dz_tau`` (never
-    ``gemm_logits_dz_dcnt``), the K-sliced dX chunks and the weight-gradient GEMMs run the counted forms of the skip's
-    plan without a temperature -- the same chunks, slices and instance knobs; a short last chunk the TMA cast's
-    counted form, the counted per-thread cast with ``counted_tma_cast`` off -- and an explicitly pinned
-    weight-gradient TMA epilogue keeps the plan uncounted.  Its twin (``without_temperature``) keeps the uncounted
-    ``dz`` arm, its launch keys are the counted plan's with the temperature forms, and the dW side stream forks
-    behind the ``dz`` temperature form."""
+@pytest.mark.parametrize("counted_dz", (True, False), ids=("counted_dz", "mixed"))
+def test_temperature_plan_runs_the_counted_dx_dw_forms(counted_dz):
+    """``make_plan_temperature(dcnt=True)`` (the zero-gradient row skip with a temperature): the K-sliced dX chunks
+    and the weight-gradient GEMMs run the counted forms of the skip's plan without a temperature -- the same chunks,
+    slices and instance knobs; a short last chunk the TMA cast's counted form, the counted per-thread cast with
+    ``counted_tma_cast`` off -- and an explicitly pinned weight-gradient TMA epilogue keeps the plan uncounted.  Every
+    chunk's ``dz`` recompute runs the counted temperature form ``gemm_logits_dz_dcnt_tau``
+    (:class:`_CountedTemperaturePlan`, the default) or, with ``counted_dz=False`` (the mixed plan), the uncounted
+    ``gemm_logits_dz_tau`` -- never ``gemm_logits_dz_dcnt``.  The twin (``without_temperature``) is the skip's plan
+    with the counted ``dz`` arm, or the plan with the uncounted one; the launch keys are the counted plan's with the
+    temperature forms, and the dW side stream forks behind the ``dz`` temperature form."""
     g = cake_backend.Geometry.from_record(
         {"geometry": {"hidden": 6144, "vocab": 154880}}
     )
@@ -8670,11 +8686,17 @@ def test_temperature_plan_runs_the_counted_dx_dw_forms():
         logprob_dz=True,
         logprob_lbl=True,
     )
+    dz_tau = "gemm_logits_dz_dcnt_tau" if counted_dz else "gemm_logits_dz_tau"
     rename = {
-        "gemm_logits_dz_dcnt": "gemm_logits_dz_tau",
+        "gemm_logits_dz_dcnt": dz_tau,
         "gemm_logits_lbl": "gemm_logits_lbl_tau",
         "row_finalize": "row_finalize_tau",
     }
+    kind = (
+        cake_backend._CountedTemperaturePlan
+        if counted_dz
+        else cake_backend._TemperaturePlan
+    )
     counted = 0
     # three chunks (the last of 3808 rows), and the T = 65031 timing row: fifteen chunks of 4096 and one of 339
     for T, rows in ((12000, 12000), (65031, 15 * 4096 + 339)):
@@ -8684,8 +8706,11 @@ def test_temperature_plan_runs_the_counted_dx_dw_forms():
             kw = dict(common, arch=arch, valid_rows=rows)
             skip = cake_backend.make_plan(problem, dcnt=True, **kw)
             shipped = cake_backend.make_plan_temperature(tau_problem, **kw)
-            tau = cake_backend.make_plan_temperature(tau_problem, dcnt=True, **kw)
-            assert type(tau) is cake_backend._TemperaturePlan and not shipped.dcnt
+            tau = cake_backend.make_plan_temperature(
+                tau_problem, dcnt=True, counted_dz=counted_dz, **kw
+            )
+            assert type(tau) is kind and not shipped.dcnt
+            assert type(shipped) is cake_backend._TemperaturePlan
             assert tau.dcnt == skip.dcnt, (T, arch)
             if not tau.dcnt:
                 continue
@@ -8694,7 +8719,8 @@ def test_temperature_plan_runs_the_counted_dx_dw_forms():
             assert tau.dx_slices == skip.dx_slices == shipped.dx_slices
             assert tau.variants == skip.variants == shipped.variants
             for i in range(tau.num_chunks):
-                assert tau.recompute_stage(i) == "gemm_logits_dz_tau"
+                assert tau.recompute_stage(i) == dz_tau
+                assert shipped.recompute_stage(i) == "gemm_logits_dz_tau"
                 assert tau.dx_stage_of(i) == skip.dx_stage_of(i)
                 assert tau.dx_stage_of(i).endswith("_dcnt") == (
                     tau.dx_slices_of(i) > 1
@@ -8708,12 +8734,14 @@ def test_temperature_plan_runs_the_counted_dx_dw_forms():
                 s for s in cake_jit.STAGES_WITH_TEMPERATURE if s in tau.stages
             ]
             assert not set(tau.stages) & _UNTAU_STAGES
-            assert {s.removesuffix("_dcnt") for s in tau.stages} == set(shipped.stages)
+            assert {s.replace("_dcnt", "") for s in tau.stages} == set(shipped.stages)
             twin = tau.without_temperature()
-            assert type(twin) is cake_backend.Plan and not twin.dcnt
-            assert twin == dataclasses.replace(skip, problem=tau_problem, dcnt=False)
+            assert type(twin) is cake_backend.Plan and twin.dcnt == counted_dz
+            assert twin == dataclasses.replace(
+                skip, problem=tau_problem, dcnt=counted_dz
+            )
             assert {twin.recompute_stage(i) for i in range(twin.num_chunks)} == {
-                "gemm_logits_dz"
+                "gemm_logits_dz_dcnt" if counted_dz else "gemm_logits_dz"
             }
             bwd = cake_backend._recompute_keys_temperature(tau)
             assert bwd == tuple(
@@ -8723,20 +8751,25 @@ def test_temperature_plan_runs_the_counted_dx_dw_forms():
             _, forks, sides = cake_backend._side_stream_schedule_temperature(
                 tau, bwd, True
             )
-            assert sorted(forks) == [
-                i for i, k in enumerate(bwd) if k[0] == "gemm_logits_dz_tau"
-            ]
+            assert sorted(forks) == [i for i, k in enumerate(bwd) if k[0] == dz_tau]
             assert sides and all(bwd[p][0].endswith("_dcnt") for p in sides)
             if T == 65031:
                 assert shipped.dw_cast_stage == "gemm_dw_cast_bf16_tma"
                 assert tau.dw_cast_stage == cake_backend.DW_CAST_TMA_DCNT_STAGE
                 old = cake_backend.make_plan_temperature(
-                    tau_problem, dcnt=True, counted_tma_cast=False, **kw
+                    tau_problem,
+                    dcnt=True,
+                    counted_tma_cast=False,
+                    counted_dz=counted_dz,
+                    **kw,
                 )
                 assert old.dcnt and old.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+                assert type(old) is kind
             pin = dict(kw, gemm_tuning={"dw": {"epi_store": "tma"}})
-            pinned = cake_backend.make_plan_temperature(tau_problem, dcnt=True, **pin)
-            assert not pinned.dcnt
+            pinned = cake_backend.make_plan_temperature(
+                tau_problem, dcnt=True, counted_dz=counted_dz, **pin
+            )
+            assert not pinned.dcnt and type(pinned) is cake_backend._TemperaturePlan
             assert pinned == cake_backend.make_plan_temperature(tau_problem, **pin)
     assert counted, "no architecture ran the counted forms"
 
@@ -9196,7 +9229,7 @@ def test_temperature_memory_report():
 
 
 def _require_tau_program():
-    """Skip unless the registered program carries the four temperature forms (``TAU_STAGES``)."""
+    """Skip unless the registered program carries the five temperature forms (``TAU_STAGES``)."""
     _require_program(entry="logprob")
     name, _ = cake_backend.record_for(CUDA)
     missing = [
@@ -9228,11 +9261,16 @@ def _spy_bound_stages(monkeypatch) -> list:
 
 
 def _assert_temperature_plan(bound, *, hidden, case):
-    """The launches of a temperature call that bound: the label-column, ``dz`` and row-finalize temperature forms,
-    the device-count form exactly when the hidden valid-row count ran, and none of the stages they replace."""
+    """The launches of a temperature call that bound: the label-column, ``dz`` (counted under the zero-gradient row
+    skip, or not) and row-finalize temperature forms, the device-count form exactly when the hidden valid-row count
+    ran, and none of the stages they replace."""
     stages = set(bound)
-    need = {"gemm_logits_lbl_tau", "gemm_logits_dz_tau", "row_finalize_tau"}
+    need = {"gemm_logits_lbl_tau", "row_finalize_tau"}
     assert need <= stages, (case, sorted(stages))
+    assert stages & {"gemm_logits_dz_tau", "gemm_logits_dz_dcnt_tau"}, (
+        case,
+        sorted(stages),
+    )
     assert ("gemm_logits_mcnt_tau" in stages) == bool(hidden), (case, sorted(stages))
     assert not stages & _UNTAU_STAGES, (case, sorted(stages & _UNTAU_STAGES))
 
@@ -10320,15 +10358,20 @@ TAU_ZERO_DLOGP_CASES = [
 ]
 
 
+@pytest.mark.parametrize("dz_form", ("counted", "mixed"))
 @pytest.mark.parametrize("T, kind, form", TAU_ZERO_DLOGP_CASES, ids=str)
 def test_device_temperature_zero_dlogp_rows_skip(
-    glm_weight, monkeypatch, T, kind, form
+    glm_weight, monkeypatch, T, kind, form, dz_form
 ):
     """The zero-gradient row skip with a temperature (a distinct per-token temperature on every row, or the scalar
     0.7; ignored rows; zero rows ``+0`` and ``-0``) against the same calls without the skip
     (``set_zero_dlogp_min_rows(None)``), the deterministic package's temperature entry and the FP64 oracle.  Every
-    call with the skip runs the partition (binding and remembered binding) and binds the mixed plan: the uncounted
-    ``gemm_logits_dz_tau``, never ``gemm_logits_dz_dcnt``, and the counted weight-gradient GEMMs.  ``logp`` keeps
+    call with the skip runs the partition (binding and remembered binding) and binds the counted weight-gradient
+    GEMMs; its backward plan runs the ``dz`` arm's counted temperature form ``gemm_logits_dz_dcnt_tau``
+    (``dz_form="counted"``, the default, where the record registers it) or the uncounted ``gemm_logits_dz_tau``
+    (``"mixed"``: ``set_zero_dlogp_temperature_dz_counted(False)``, which binds no counted form), never
+    ``gemm_logits_dz_dcnt`` (the forward's runner, prepared before ``dlogp`` is known, binds the uncounted form in
+    both: bound, not launched by the backward under the skip).  ``logp`` keeps
     its bits; the zero rows' and the ignored rows' ``dX`` rows are exact ``+0``; with one dX slice pinned
     (``_TAU_ONE``) a live row's ``dX`` -- the same product of its ``dz`` row -- keeps the bits of the call without the
     skip (the ``dz`` of the live rows is unchanged: the temperature rows follow the skip's row order).  ``dW`` and the
@@ -10344,25 +10387,39 @@ def test_device_temperature_zero_dlogp_rows_skip(
     valid = inp.labels >= 0
     live = valid & ~zero
     rows = int(valid.sum())
-    case = (T, kind, form)
+    case = (T, kind, form, dz_form)
+    module_name, _ = cake_backend.record_for(CUDA)
+    counted_dz = dz_form == "counted" and (
+        cake_backend.LOGPROB_DZ_DCNT_TAU_STAGE
+        in cake_jit.registered_stages_with_temperature(module_name)
+    )
+    dz_stage = "gemm_logits_dz_dcnt_tau" if counted_dz else "gemm_logits_dz_tau"
     calls = _counted_partition(monkeypatch)
     bound = _spy_bound_stages(monkeypatch)
     kw = dict(entry="logprob", backend="cake")
     cake_backend.BINDING_CACHE.clear()
-    with _zero_dlogp_floor(0):
+    with _zero_dlogp_floor(0), _tau_dz_counted(dz_form == "counted"):
         one = _run(inp, 4096, **kw, **_TAU_ONE)
         again = _run(inp, 4096, **kw, **_TAU_ONE)  # the remembered binding
         sliced = _run(inp, 4096, **kw)
     assert calls == [rows] * 3, (case, calls)
     _assert_temperature_plan(bound, hidden=_expect_hidden(inp, 4096, {}), case=case)
     assert any(s.startswith("gemm_dw") and s.endswith("_dcnt") for s in bound), case
+    # the backward binds its plan's dz form; the forward's runner (no skip yet) binds the uncounted one in both forms,
+    # so the bound set shows the counted form's presence / absence and the plans below which form the backward runs
+    bound_set = sorted(set(bound))
+    assert dz_stage in bound, (case, bound_set)
+    assert "gemm_logits_dz_dcnt" not in bound, (case, bound_set)
+    assert counted_dz or "gemm_logits_dz_dcnt_tau" not in bound, (case, bound_set)
     skip_plans = _logprob_bwd_plans()
     assert len(skip_plans) == 2, case
-    for plan, _keys in skip_plans:
+    for plan, keys in skip_plans:
         assert plan.temperature and plan.dcnt, case
-        assert {plan.recompute_stage(i) for i in range(plan.num_chunks)} == {
-            "gemm_logits_dz_tau"
-        }
+        assert plan.counted_dz == counted_dz, case
+        assert {plan.recompute_stage(i) for i in range(plan.num_chunks)} == {dz_stage}
+        # the backward's launch sequence: one dz launch per chunk, every one in the plan's form
+        dz_run = [k[0] for k in keys if k[0].startswith("gemm_logits_dz")]
+        assert dz_run == [dz_stage] * plan.num_chunks, (case, dz_run)
     if T == 5000:
         module_name, record = cake_backend.record_for(CUDA)
         tma = cake_backend.dw_cast_tma_rule(2, rows - 4096, record["arch"])
@@ -10423,7 +10480,7 @@ def test_device_temperature_zero_dlogp_rows_skip(
         ignored = (~valid).nonzero().reshape(-1)
         extreme[ignored[0::2]] = 1e-30
         extreme[ignored[1::2]] = 3e38
-        with _zero_dlogp_floor(0):
+        with _zero_dlogp_floor(0), _tau_dz_counted(dz_form == "counted"):
             other = _run(
                 dataclasses.replace(inp, temperature=extreme), 4096, **kw, **_TAU_ONE
             )
@@ -10432,6 +10489,69 @@ def test_device_temperature_zero_dlogp_rows_skip(
         f"\ntemperature zero-dlogp skip {case} zero {int(zero.sum())}/{rows}: dW rel-L2 vs skip off "
         f"{dw_rel['one']:.2e} (one slice) / {dw_rel['sliced']:.2e}, vs det {dw_rel['det']:.2e}"
     )
+
+
+@pytest.mark.parametrize(
+    "T, kind, form",
+    [
+        (12289, ("random", 0.166), "distinct"),
+        (12289, ("random", 0.5), "distinct"),
+        (12289, "all", "distinct"),
+        (8117, ("random", 0.5), "scalar"),
+        # two chunks, the second of about 650 valid rows (the TMA cast's counted form)
+        (5000, ("random", 0.5), "distinct"),
+    ],
+    ids=str,
+)
+def test_device_temperature_counted_dz_is_the_mixed_plans_bits(
+    glm_weight, monkeypatch, T, kind, form
+):
+    """Under the zero-gradient row skip with a temperature, the counted ``dz`` temperature form
+    (``gemm_logits_dz_dcnt_tau``) leaves out only work whose result no later launch reads: ``logp``, ``dX`` and ``dW``
+    (one dX slice pinned: binding and remembered binding) are the mixed plan's bits
+    (``set_zero_dlogp_temperature_dz_counted(False)``: ``gemm_logits_dz_tau`` over every row) -- the same row order,
+    the same counted dX / dW forms, the same ``dz`` on every row they read; with the default slices ``logp`` and
+    ``dW`` are its bits and ``dX`` -- whose K-sliced reduction adds its slices in the order they finish, so it may
+    differ from run to run by FP32 rounding -- stays within the dX budget floor (:func:`_assert_tau_close`)."""
+    _require_zero_dlogp_skip()
+    _require_tau_program()
+    module_name, _ = cake_backend.record_for(CUDA)
+    if (
+        cake_backend.LOGPROB_DZ_DCNT_TAU_STAGE
+        not in cake_jit.registered_stages_with_temperature(module_name)
+    ):
+        pytest.skip("this device's record registers no counted dz temperature form")
+    base = _tau_inputs(T, W=glm_weight)
+    zero = _zero_dlogp_set(base, kind)
+    tau = _distinct_tau(T) if form == "distinct" else 0.7
+    inp = dataclasses.replace(_with_zero_dlogp(base, zero), temperature=tau)
+    case = (T, kind, form)
+    bound = _spy_bound_stages(monkeypatch)
+    kw = dict(entry="logprob", backend="cake")
+    runs = {}
+    for counted in (True, False):
+        cake_backend.BINDING_CACHE.clear()
+        bound.clear()
+        with _zero_dlogp_floor(0), _tau_dz_counted(counted):
+            runs[counted] = [
+                _run(inp, 4096, **kw, **_TAU_ONE),
+                _run(inp, 4096, **kw, **_TAU_ONE),  # the remembered binding
+                _run(inp, 4096, **kw),
+            ]
+        dz_stage = "gemm_logits_dz_dcnt_tau" if counted else "gemm_logits_dz_tau"
+        assert dz_stage in bound, (case, counted, sorted(set(bound)))
+        plans = _logprob_bwd_plans()
+        assert len(plans) == 2, (case, counted)
+        # the backward's launch sequence: one dz launch per chunk, in this plan's form
+        for plan, keys in plans:
+            dz_run = [k[0] for k in keys if k[0].startswith("gemm_logits_dz")]
+            assert dz_run == [dz_stage] * plan.num_chunks, (case, counted, dz_run)
+    names = ("one", "again", "sliced")
+    for name, a, b in zip(names, runs[True], runs[False], strict=True):
+        if name == "sliced":
+            _assert_tau_close(a, b, (case, name), keys=_LOGPROB_KEYS)
+        else:
+            _assert_same_bits(a, b, _LOGPROB_KEYS)
 
 
 def test_device_temperature_zero_dlogp_skip_follows_the_row_order(
@@ -10668,12 +10788,19 @@ def test_reference_temperature_matches_the_deterministic_reference(form, compact
 
 def test_temperature_stage_names_round_trip():
     """The temperature forms of the log-probability entry (the logits GEMM arms, the device-count logits GEMM with
-    the statistics and ``row_finalize``): suffix ``_tau`` last (after ``_dcnt``, which none of them has), every form
-    parses back to its base and knobs through :func:`cake_backend.stage_form`, a base without a temperature form and a
-    misplaced suffix are refused; every stage name of ``STAGES_WITH_TEMPERATURE`` round-trips."""
+    the statistics and ``row_finalize``): suffix ``_tau`` last (after ``_dcnt``, which only the ``dz`` arm's counted
+    form has), every form parses back to its base and knobs through :func:`cake_backend.stage_form`, a base without a
+    temperature form, a counted form of another base and a misplaced suffix are refused; every stage name of
+    ``STAGES_WITH_TEMPERATURE`` round-trips."""
     form = cake_backend.stage_form
     assert form("gemm_logits_lbl", temperature=True) == "gemm_logits_lbl_tau"
     assert form("gemm_logits_dz", temperature=True) == "gemm_logits_dz_tau"
+    assert (
+        form("gemm_logits_dz", dcnt=True, temperature=True)
+        == cake_backend.LOGPROB_DZ_DCNT_TAU_STAGE
+        == "gemm_logits_dz_dcnt_tau"
+    )
+    assert cake_backend.parse_stage("gemm_logits_dz_dcnt_tau")[1]["dcnt"] is True
     assert form("gemm_logits", count=True, temperature=True) == "gemm_logits_mcnt_tau"
     assert form("row_finalize", temperature=True) == "row_finalize_tau"
     assert cake_backend.parse_stage("gemm_logits_mcnt_tau") == (
@@ -10696,7 +10823,10 @@ def test_temperature_stage_names_round_trip():
     )
     for stage in TAU_STAGES:
         base = cake_backend.base_stage(stage)
-        assert stage == base + ("_mcnt_tau" if stage.endswith("_mcnt_tau") else "_tau")
+        suffix = next(
+            x for x in ("_mcnt_tau", "_dcnt_tau", "_tau") if stage.endswith(x)
+        )
+        assert stage == base + suffix
         assert cake_backend.parse_stage(stage)[1]["temperature"] is True
     for stage in cake_jit.STAGES_WITH_TEMPERATURE:
         base, knobs = cake_backend.parse_stage(stage)
@@ -10707,7 +10837,8 @@ def test_temperature_stage_names_round_trip():
         dict(base="gemm_logits"),
         dict(base="gemm_logits_nostats"),
         dict(base="gemm_logits_nostats", count=True),
-        dict(base="gemm_logits_dz", dcnt=True),
+        dict(base="gemm_logits_lbl", dcnt=True),
+        dict(base="gemm_logits", count=True, dcnt=True),
         dict(base="row_grad"),
         dict(base="loss_reduce"),
         dict(base="gemm_dx"),
@@ -10723,7 +10854,9 @@ def test_temperature_stage_names_round_trip():
         "gemm_logits_tau_mcnt",
         "gemm_logits_dz_tau_tau",
         "gemm_logits_dz_tau_dcnt",
-        "gemm_logits_dz_dcnt_tau",
+        "gemm_logits_dz_dcnt_tau_tau",
+        "gemm_logits_lbl_dcnt_tau",
+        "gemm_logits_mcnt_dcnt_tau",
         "row_grad_tau",
         "gemm_dx_tau",
         "gemm_dx_red_tau",

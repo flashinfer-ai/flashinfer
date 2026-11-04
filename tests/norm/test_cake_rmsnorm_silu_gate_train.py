@@ -1303,20 +1303,26 @@ MID_FORWARD_GRIDS = [
 def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
     rows, sm_count, ctas
 ):
+    # each architecture's mid forward module (sm_100a's and sm_103a's warm
+    # later blocks in L2) has this grid rule with the architecture's rows per SM
+    starts = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
+    records = []
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
-        name = loader.ROUTES[arch]["fwd_mid"]
-        assert name == loader.ROUTES["sm_100a"]["fwd_mid"]
-    record = loader.MODULES[name]
-    assert record["grid_rule"] == {
-        "ctas_per_sm": 6,
-        "kind": "persistent_row_blocks",
-        "max_blocks_per_cta": 2,
-        "min_rows_per_sm": {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800},
-        "rows_per_block": 16,
-    }
-    assert record["launch"]["block"] == (128, 1, 1)
-    assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
+        record = loader.MODULES[loader.ROUTES[arch]["fwd_mid"]]
+        assert arch in record["arches"]
+        assert record["grid_rule"] == {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "min_rows_per_sm": {a: starts[a] for a in record["arches"]},
+            "rows_per_block": 16,
+        }
+        assert record["launch"]["block"] == (128, 1, 1)
+        records.append(record)
+    record = records[0]
     grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
+    for other in records[1:]:
+        assert loader.launch_grid(other, rows=rows, sm_count=sm_count) == grid
     assert grid == (ctas, 1, 1)
     blocks, wave = -(-rows // 16), 6 * sm_count
     assert -(-blocks // ctas) <= 2

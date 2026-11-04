@@ -436,8 +436,8 @@ RECORD_ARCHES = {
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
 # rows of the builds with the L2 hints off) run the S1 pair on every backward path of the g mode (their programs ship
 # as the raw class's, RAW_DQKG), and the in-kernel Q/K L2 norm's records (#7817: its fused class, 7 g records with
-# their 7 raw twins and the sm_103a forward intra form, the 2 GLM intra capture forms and the 3 programs of its
-# fallback route) run only under use_qk_l2norm_in_kernel=True, which this package refuses.
+# their 7 raw twins and the sm_103a forward intra and GLM intra forms, the 2 GLM intra capture forms and the 3
+# programs of its fallback route) run only under use_qk_l2norm_in_kernel=True, which this package refuses.
 DET_RECORDS_NOT_LAUNCHED = frozenset(
     (
         "dqkg_davq_nohint",
@@ -450,6 +450,7 @@ DET_RECORDS_NOT_LAUNCHED = frozenset(
         "bwd_prep_g8_noqg_l2n",
         "bwd_prep_g8_noqg_nokb_l2n",
         "glm_intra_l2n",
+        "glm_intra_v30_l2n",  # the fused class's sm_103a GLM intra form
         "fwd_intra_raw_l2n",
         "fwd_intra_v14_raw_l2n",
         "bwd_prep_g8_raw_l2n",
@@ -521,10 +522,10 @@ def _r1c_glm(arch: str, h: int) -> str | None:
     return None
 
 
-# The registry's size: the deterministic package's 95 records, less those, plus the seven S1 records, the hand-off
+# The registry's size: the deterministic package's 96 records, less those, plus the seven S1 records, the hand-off
 # twins, the tape WY twin, the fused gradient's raw class and the R1c pairs.
 MODULE_COUNT = (
-    95
+    96
     - len(DET_RECORDS_NOT_LAUNCHED)
     + 7
     + len(TWIN_RECORDS)
