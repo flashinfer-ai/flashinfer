@@ -93,12 +93,14 @@ class TestUseCudaNormDispatch:
 
         def set_device_caps(caps_list):
             """caps_list: [(major, minor), ...] for cuda:0, cuda:1, ..."""
+
             def mock_get_device_capability(device):
                 if isinstance(device, torch.device):
                     idx = device.index or 0
                 else:
                     idx = int(device)
                 return caps_list[idx]
+
             monkeypatch.setattr(
                 torch.cuda, "get_device_capability", mock_get_device_capability
             )
