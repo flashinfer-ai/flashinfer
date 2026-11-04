@@ -591,10 +591,11 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
         quantization_type, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
         decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
         decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
-    cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                       layout, tensor_map);
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel_instance,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                                       reinterpret_cast<uint32_t*>(output),
+                                       reinterpret_cast<uint32_t*>(SFOutput), layout, tensor_map));
   };
 
   dispatchFP4KernelConfig<quantization_type, SF_VEC_SIZE>(
@@ -642,6 +643,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
                                                   reinterpret_cast<uint32_t*>(output),
                                                   reinterpret_cast<uint32_t*>(SFOutput), layout);
+      TLLM_CUDA_CHECK(cudaGetLastError());
     };
 
     dispatchFP4KernelConfig<BlockScaleQuantizationType::FP8_TO_FP4, SF_VEC_SIZE>(
@@ -705,9 +707,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
               decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag), 2>;
         }
       }
-      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                         layout);
+      TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                                         reinterpret_cast<uint32_t*>(output),
+                                         reinterpret_cast<uint32_t*>(SFOutput), layout));
     };
 
     dispatchFP4KernelConfig<BlockScaleQuantizationType::FP16_TO_FP4, SF_VEC_SIZE>(
