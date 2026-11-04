@@ -153,6 +153,51 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
 
 
 @pytest.mark.gpu_2
+def test_dispatch_views_outlive_communication():
+    """Retained dispatch views keep their descriptor and allocation alive."""
+    import gc
+    import weakref
+
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import BootstrapConfig, MoEEpCommParams, create_communication
+
+    rank, world_size = _init_dist()
+    config = _backend_config("nvlink_one_sided")
+    params = MoEEpCommParams(
+        num_experts=4 * world_size, top_k=2, max_tokens_per_rank=8, hidden_size=1024
+    )
+    generator = torch.Generator().manual_seed(17 + rank)
+    x = torch.randn(8, 1024, generator=generator).to("cuda", torch.bfloat16)
+    ids, weights = _random_routing(8, params.num_experts, 2, generator)
+    for _ in range(3):
+        comm = create_communication(
+            BootstrapConfig(world_size=world_size, rank=rank), params, config
+        )
+        allocation = weakref.ref(comm._state["mnnvl_mem"])
+        try:
+            received = comm.dispatch(x, ids, weights, runtime_max_tokens_per_rank=8)
+            comm.combine(torch.zeros_like(received.hidden_states))
+            expected_ids = received.topk_ids.clone()
+        finally:
+            torch.cuda.synchronize()
+            dist.barrier()
+            comm.destroy()
+        del comm
+        gc.collect()
+        assert allocation() is not None
+        torch.testing.assert_close(received.topk_ids, expected_ids)
+        torch.cuda.synchronize()
+        cycle = [received]
+        cycle.append(cycle)
+        del received, cycle
+        gc.collect()
+        assert allocation() is None
+        dist.barrier()
+
+
+@pytest.mark.gpu_2
 def test_split_layer_identity_round_trip_over_nvlink_one_sided():
     """MoEEpSplitLayer drives a communication backend end to end.
 
@@ -377,7 +422,7 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
     import torch
     import torch.distributed as dist
 
-    from flashinfer.fused_moe.api import QuantFormat
+    from flashinfer.fused_moe.api import CuteDslConfig, QuantFormat
     from flashinfer.moe_ep import (
         BootstrapConfig,
         EpAlgorithm,
@@ -397,6 +442,12 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
     major, minor = torch.cuda.get_device_capability()
     if not candidate.supported(major * 10 + minor):
         pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
+    if (
+        isinstance(candidate, CuteDslConfig)
+        and quant_pair == ("MXFP4", "MXFP8")
+        and (major, minor) == (10, 7)
+    ):
+        pytest.skip("CuTe-DSL W4A8 does not support SM107")
     rank, world_size = _init_dist()
     _backend_config(backend)
     num_tokens, hidden, intermediate = 16, 1024, 512
