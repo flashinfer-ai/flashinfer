@@ -633,3 +633,157 @@ def test_nvfp4_gin_public_prestaged_inputs():
         if not failed:
             for layer in reversed(layers):
                 layer.destroy()
+
+
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capture"])
+@pytest.mark.parametrize("failure", ["overflow", "mismatch"])
+def test_nvfp4_gin_compile_bucket_collective_rejection(capturing, failure):
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import GinPreflightError
+
+    bootstrap = _bootstrap()
+    layer = _layer(bootstrap)
+    inputs = _inputs(bootstrap.rank, 0, "balanced")
+    layer.warmup(inputs)
+    if failure == "overflow" and bootstrap.rank != 0:
+        inputs = MoEEpTensors(
+            hidden_states=inputs.hidden_states[:7],
+            topk_ids=inputs.topk_ids[:7],
+            topk_weights=inputs.topk_weights[:7],
+        )
+    expected = layer.forward(inputs).clone()
+    torch.cuda.synchronize()
+    bucket = 16 if failure == "overflow" else (None if bootstrap.rank == 0 else 32)
+    graph = torch.cuda.CUDAGraph()
+    context = torch.cuda.graph(graph) if capturing else nullcontext()
+    match = "live token count" if failure == "overflow" else "configuration differs"
+    with pytest.raises(GinPreflightError, match=match), context:
+        layer.stage_inputs(inputs, compile_tokens_per_rank=bucket)
+    layer.stage_inputs(inputs, compile_tokens_per_rank=32)
+    actual = layer.compute_staged(output=torch.empty_like(expected))
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+    del graph
+    layer.destroy()
+
+
+def _gin_factory_args(bootstrap):
+    return dict(
+        num_total_experts=48,
+        num_max_tokens=32,
+        num_topk=4,
+        hidden=7168,
+        intermediate=3072,
+        rank=bootstrap.rank,
+        world_size=4,
+        internode=True,
+        ranks_per_node=2,
+    )
+
+
+@pytest.mark.parametrize("all_capture", [False, True], ids=["one-rank", "all-ranks"])
+@pytest.mark.parametrize("entry", ["workspace", "session"])
+def test_nvfp4_gin_capture_initialization_collective_rejection(
+    all_capture, entry, monkeypatch
+):
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import gin, nvfp4
+
+    bootstrap = _bootstrap()
+    created = []
+    original = gin.GinSession.__init__
+
+    def track(self, **kwargs):
+        created.append(self)
+        original(self, **kwargs)
+
+    graph = torch.cuda.CUDAGraph()
+    context = (
+        torch.cuda.graph(graph) if all_capture or bootstrap.rank == 1 else nullcontext()
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(gin.GinSession, "__init__", track)
+        with pytest.raises(gin.GinPreflightError, match="capture"), context:
+            if entry == "workspace":
+                nvfp4.get_symm_buffer_for_mega_moe(**_gin_factory_args(bootstrap))
+            else:
+                gin.create_gin_session(
+                    rank=bootstrap.rank,
+                    world_size=4,
+                    ranks_per_node=2,
+                    device=torch.cuda.current_device(),
+                    layout=gin.build_gin_arena_layout(
+                        transport_bytes=128,
+                        num_tokens=1,
+                        hidden=64,
+                        num_topk=4,
+                        shared_workspace_bytes=128,
+                    ),
+                    signal_count=1,
+                    signature=("capture-init",),
+                )
+    assert created == []
+    del graph
+    workspace = nvfp4.get_symm_buffer_for_mega_moe(**_gin_factory_args(bootstrap))
+    workspace.destroy()
+
+
+@pytest.mark.parametrize("allocation", ["view", "routes", "output", "epilogue"])
+def test_nvfp4_gin_workspace_allocation_failure_cleanup(allocation, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import gin, nvfp4
+
+    bootstrap = _bootstrap()
+    sessions = []
+    create = gin.create_gin_session
+
+    def track(**kwargs):
+        session = create(**kwargs)
+        sessions.append(session)
+        return session
+
+    def inject(original, predicate):
+        def wrapped(*args, **kwargs):
+            if bootstrap.rank == 1 and predicate(*args, **kwargs):
+                raise torch.OutOfMemoryError("injected local allocation failure")
+            return original(*args, **kwargs)
+
+        return wrapped
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gin, "create_gin_session", track)
+        if allocation == "view":
+            patch.setattr(
+                gin.GinSession,
+                "view",
+                inject(
+                    gin.GinSession.view, lambda self, name, **kw: name == "activation"
+                ),
+            )
+        elif allocation == "routes":
+            patch.setattr(
+                torch,
+                "full",
+                inject(torch.full, lambda shape, *a, **kw: shape == (32, 4)),
+            )
+        elif allocation == "output":
+            patch.setattr(
+                torch, "empty", inject(torch.empty, lambda *a, **kw: a == ((32, 7168),))
+            )
+        else:
+            patch.setattr(
+                nvfp4,
+                "_resolve_per_expert_epilogue",
+                inject(
+                    nvfp4._resolve_per_expert_epilogue,
+                    lambda name, *a, **kw: name == "fc1_norm_const",
+                ),
+            )
+        with pytest.raises(
+            gin.GinPreflightError, match="injected local allocation failure"
+        ):
+            nvfp4.get_symm_buffer_for_mega_moe(**_gin_factory_args(bootstrap))
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session._closed and session.root is None and session.views == {}
+    assert session.comm is None and session.dev_comm is None and session.window is None
+    # Every rank can create another registered session after coordinated cleanup.
+    workspace = nvfp4.get_symm_buffer_for_mega_moe(**_gin_factory_args(bootstrap))
+    workspace.destroy()

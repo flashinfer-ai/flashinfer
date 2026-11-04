@@ -9,6 +9,7 @@ Importing this module needs neither Torch nor NCCL; device dependencies are lazy
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 from weakref import WeakKeyDictionary
@@ -452,6 +453,49 @@ class GinSession(GinResourceOwner):
         self.views[name] = result
         return result
 
+    @contextmanager
+    def workspace_construction(self):
+        """Publish a workspace only after all ranks finish local allocations."""
+        import torch.distributed as dist
+
+        error = None
+        try:
+            yield
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        try:
+            collective_gin_preflight(
+                dist,
+                signature=self.identity,
+                local_error=error,
+                phase="workspace-allocation",
+            )
+        except GinPreflightError:
+            cleanup_error = None
+            try:
+                self.close()
+            except Exception as exc:
+                cleanup_error = f"{type(exc).__name__}: {exc}"
+                _failed_sessions.append(self)
+            try:
+                collective_gin_preflight(
+                    dist,
+                    signature=self.identity,
+                    local_error=cleanup_error,
+                    phase="workspace-cleanup",
+                )
+            except Exception as exc:
+                raise GinFatalError(
+                    "GIN workspace cleanup failed; terminate all ranks."
+                ) from exc
+            raise
+        except Exception as exc:
+            # A broken control plane cannot establish safe collective teardown.
+            _failed_sessions.append(self)
+            raise GinFatalError(
+                "GIN workspace agreement failed; terminate all ranks."
+            ) from exc
+
     def close(self) -> None:
         super().close()
         self.views.clear()
@@ -479,12 +523,12 @@ def create_gin_session(
     import torch
     import torch.distributed as dist
 
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        raise GinPreflightError(
-            "Internode GIN initialization cannot run during CUDA Graph capture."
-        )
     local_error = None
     try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Internode GIN initialization cannot run during CUDA Graph capture."
+            )
         layout.validate()
         _positive_int("signal_count", signal_count)
         _positive_int("ranks_per_node", ranks_per_node)

@@ -569,7 +569,8 @@ class MoEEpMegaLayer(nn.Module):
         _validated_kernel: MegaKernelBackend | None = None,
     ) -> tuple[FleetParams, Any, MegaKernelBackend, bool, Any]:
         if (
-            compile_tokens_per_rank is not None
+            not self._kernel.requires_collective_forward_validation
+            and compile_tokens_per_rank is not None
             and compile_tokens_per_rank < t.num_tokens
         ):
             raise MoEEpConfigError(
@@ -595,8 +596,11 @@ class MoEEpMegaLayer(nn.Module):
             kernel.requires_collective_forward_validation
             and kernel is not _validated_kernel
         ):
-            kernel.validate_forward(
-                t, fleet_params, quantize_input=self._mega_config.quantize_input
+            kernel.validate_collective_forward(
+                t,
+                fleet_params,
+                quantize_input=self._mega_config.quantize_input,
+                compile_tokens_per_rank=compile_tokens_per_rank,
             )
         quantize_input = self._resolve_quantize_input(t)
         signature = self._input_signature(t)

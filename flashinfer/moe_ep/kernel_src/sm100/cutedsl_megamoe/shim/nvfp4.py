@@ -44,6 +44,7 @@ import dataclasses
 import math
 import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional, Tuple, Union
 
@@ -1512,6 +1513,8 @@ def get_symm_buffer_for_mega_moe(
             num_total_experts,
             num_topk,
         )
+        if torch.cuda.is_current_stream_capturing():
+            error = "Internode GIN initialization cannot run during CUDA Graph capture."
         if expected != (4, 2, 32, 7168, 3072, 48, 4):
             error = "GIN v1 qualification case requires N2R2, T32/H7168/J3072/E48/K4."
         if (
@@ -1675,93 +1678,95 @@ def get_symm_buffer_for_mega_moe(
         )
         frontend._gin_session = session
         frontend._gin_wire_layout = wire
-        x = session.view(
-            "activation", dtype=_DataDtype, shape=(num_max_tokens, hidden // 2)
+    with session.workspace_construction() if internode else nullcontext():
+        if internode:
+            x = session.view(
+                "activation", dtype=_DataDtype, shape=(num_max_tokens, hidden // 2)
+            )
+            x_sf = session.view(
+                "activation_sf",
+                dtype=_ScaleDtype,
+                shape=(num_max_tokens, hidden_sf_cols_padded),
+            )
+            topk_weights = session.view(
+                "topk_weights", dtype=torch.float32, shape=(num_max_tokens, num_topk)
+            )
+            topk_idx = torch.full(
+                (num_max_tokens, num_topk), -1, dtype=torch.int64, device="cuda"
+            )
+            output_activation = torch.empty(
+                (num_max_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+            )
+        else:
+            x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
+            sym_roots.append(x_root)
+            x_sf, x_sf_root = _sym_zeros_byte_view(
+                (num_max_tokens, hidden_sf_cols_padded),
+                _ScaleDtype,
+            )
+            sym_roots.append(x_sf_root)
+            topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
+            # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
+            # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
+            # tail, but start from the masked state so a partial first staging is safe.
+            topk_idx.fill_(-1)
+            sym_roots.append(topk_idx)
+            topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
+            sym_roots.append(topk_weights)
+            # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
+            # internally.  Allocated on the symmetric heap unconditionally: under
+            # in_kernel_fc2_reduce it IS the cross-rank REDG atomic-add target (hard
+            # requirement), and in explicit-reduce mode a sym allocation behaves like
+            # plain CUDA memory locally.  Always-sym keeps the session ikr-capable so
+            # the knob can flip per-compile (autotune / apply_knobs) without
+            # reallocating; the cost ((T, hidden) bf16) is negligible next to the
+            # internal combine staging.
+            output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+            sym_roots.append(output_activation)
+        fc1_activation_per_token_scale = None
+        if enable_fc1_activation_per_token_scale:
+            # Peer-pulled by the dispatch warps (like topk_weights) -> symmetric
+            # heap.  1.0 keeps unstaged rows neutral.
+            fc1_activation_per_token_scale = sym_zeros((num_max_tokens,), torch.float32)
+            fc1_activation_per_token_scale.fill_(1.0)
+            sym_roots.append(fc1_activation_per_token_scale)
+        fc1_alpha = _resolve_per_expert_epilogue(
+            "fc1_alpha",
+            fc1_alpha,
+            num_experts_per_rank,
         )
-        x_sf = session.view(
-            "activation_sf",
-            dtype=_ScaleDtype,
-            shape=(num_max_tokens, hidden_sf_cols_padded),
+        fc2_alpha = _resolve_per_expert_epilogue(
+            "fc2_alpha",
+            fc2_alpha,
+            num_experts_per_rank,
         )
-        topk_weights = session.view(
-            "topk_weights", dtype=torch.float32, shape=(num_max_tokens, num_topk)
+        fc1_norm_const = _resolve_per_expert_epilogue(
+            "fc1_norm_const",
+            fc1_norm_const,
+            num_experts_per_rank,
         )
-        topk_idx = torch.full(
-            (num_max_tokens, num_topk), -1, dtype=torch.int64, device="cuda"
-        )
-        output_activation = torch.empty(
-            (num_max_tokens, hidden), dtype=torch.bfloat16, device="cuda"
-        )
-    else:
-        x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
-        sym_roots.append(x_root)
-        x_sf, x_sf_root = _sym_zeros_byte_view(
-            (num_max_tokens, hidden_sf_cols_padded),
-            _ScaleDtype,
-        )
-        sym_roots.append(x_sf_root)
-        topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
-        # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
-        # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
-        # tail, but start from the masked state so a partial first staging is safe.
-        topk_idx.fill_(-1)
-        sym_roots.append(topk_idx)
-        topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-        sym_roots.append(topk_weights)
-        # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
-        # internally.  Allocated on the symmetric heap unconditionally: under
-        # in_kernel_fc2_reduce it IS the cross-rank REDG atomic-add target (hard
-        # requirement), and in explicit-reduce mode a sym allocation behaves like
-        # plain CUDA memory locally.  Always-sym keeps the session ikr-capable so
-        # the knob can flip per-compile (autotune / apply_knobs) without
-        # reallocating; the cost ((T, hidden) bf16) is negligible next to the
-        # internal combine staging.
-        output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
-        sym_roots.append(output_activation)
-    fc1_activation_per_token_scale = None
-    if enable_fc1_activation_per_token_scale:
-        # Peer-pulled by the dispatch warps (like topk_weights) -> symmetric
-        # heap.  1.0 keeps unstaged rows neutral.
-        fc1_activation_per_token_scale = sym_zeros((num_max_tokens,), torch.float32)
-        fc1_activation_per_token_scale.fill_(1.0)
-        sym_roots.append(fc1_activation_per_token_scale)
-    fc1_alpha = _resolve_per_expert_epilogue(
-        "fc1_alpha",
-        fc1_alpha,
-        num_experts_per_rank,
-    )
-    fc2_alpha = _resolve_per_expert_epilogue(
-        "fc2_alpha",
-        fc2_alpha,
-        num_experts_per_rank,
-    )
-    fc1_norm_const = _resolve_per_expert_epilogue(
-        "fc1_norm_const",
-        fc1_norm_const,
-        num_experts_per_rank,
-    )
 
-    return MegaMoESymmBuffer(
-        num_total_experts=num_total_experts,
-        num_max_tokens=num_max_tokens,
-        num_topk=num_topk,
-        hidden=hidden,
-        intermediate=intermediate,
-        rank=rank,
-        world_size=world_size,
-        x=x,
-        x_sf=x_sf,
-        topk_idx=topk_idx,
-        topk_weights=topk_weights,
-        output_activation=output_activation,
-        num_valid_tokens=num_valid_tokens_tensor,
-        fc1_alpha=fc1_alpha,
-        fc2_alpha=fc2_alpha,
-        fc1_norm_const=fc1_norm_const,
-        _frontend=frontend,
-        fc1_activation_per_token_scale=fc1_activation_per_token_scale,
-        _sym_roots=sym_roots,
-    )
+        return MegaMoESymmBuffer(
+            num_total_experts=num_total_experts,
+            num_max_tokens=num_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate=intermediate,
+            rank=rank,
+            world_size=world_size,
+            x=x,
+            x_sf=x_sf,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            output_activation=output_activation,
+            num_valid_tokens=num_valid_tokens_tensor,
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=fc1_norm_const,
+            _frontend=frontend,
+            fc1_activation_per_token_scale=fc1_activation_per_token_scale,
+            _sym_roots=sym_roots,
+        )
 
 
 def nvfp4_mega_moe(

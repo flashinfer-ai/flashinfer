@@ -333,12 +333,31 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             return self._validate_forward_local(
                 t, fleet_params, quantize_input=quantize_input
             )
+        self.validate_collective_forward(
+            t, fleet_params, quantize_input=quantize_input, compile_tokens_per_rank=None
+        )
+
+    def validate_collective_forward(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: FleetParams,
+        *,
+        quantize_input: bool,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
         capturing = torch.cuda.is_current_stream_capturing()
         import torch.distributed as dist
         from ......kernel_src.sm100.cutedsl_megamoe import collective_gin_preflight
 
         error = None
         try:
+            if (
+                compile_tokens_per_rank is not None
+                and compile_tokens_per_rank < t.num_tokens
+            ):
+                raise ValueError(
+                    "compile_tokens_per_rank cannot be smaller than the live token count"
+                )
             if capturing and not self._thunk_states:
                 raise ValueError(
                     "GIN capture requires warmup on all ranks before capture."
@@ -366,7 +385,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             phase="backend-forward",
             # Mixed eager/capture would launch on only the eager ranks.
             # CPU agreement runs during capture, never during graph replay.
-            signature=("nvfp4-gin-v1", capturing),
+            signature=("nvfp4-gin-v1", capturing, compile_tokens_per_rank),
             local_error=error,
         )
 

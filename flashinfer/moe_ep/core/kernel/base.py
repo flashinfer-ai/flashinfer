@@ -340,6 +340,17 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
 
+    def validate_collective_forward(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: "FleetParams",
+        *,
+        quantize_input: bool,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        """Collective backends must agree on input and compile-bucket errors."""
+        raise NotImplementedError("Collective input validation is not implemented")
+
     def validate_capture_ready(  # noqa: B027 - intentional no-op default
         self,
         workspace: Any,

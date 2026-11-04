@@ -14,7 +14,8 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 
 def _load_leaf(name, path):
@@ -165,6 +166,7 @@ class _ControlWorld:
             self.reports[rank] = report
             self.barrier.wait()
             output[:] = self.reports
+            self.barrier.wait()
 
         return SimpleNamespace(
             group=SimpleNamespace(WORLD=self.world),
@@ -274,6 +276,111 @@ class PreflightTests(unittest.TestCase):
             gin.collective_gin_preflight(
                 dist, phase="init", signature=(), local_error=None
             )
+
+
+class ConstructionTests(unittest.TestCase):
+    def run_world(self, *, fail_build=False, fail_cleanup=False, capture_init=False):
+        world = _ControlWorld(4)
+        local = threading.local()
+        dist = ModuleType("torch.distributed")
+        dist.group = SimpleNamespace(WORLD=world.world)
+        dist.is_available = lambda: True
+        dist.is_initialized = lambda: True
+        dist.get_rank = lambda group=None: local.rank
+        dist.get_world_size = lambda group=None: 4
+        dist.all_gather_object = lambda *args, **kwargs: world.rank(
+            local.rank
+        ).all_gather_object(*args, **kwargs)
+        torch = ModuleType("torch")
+        torch.distributed = dist
+        torch.cuda = SimpleNamespace(
+            is_available=lambda: True,
+            is_current_stream_capturing=lambda: local.rank == 1,
+            current_device=lambda: local.rank,
+        )
+
+        def run(rank):
+            local.rank = rank
+            calls = []
+            session = gin.GinSession.__new__(gin.GinSession)
+            gin.GinResourceOwner.__init__(
+                session, synchronize=lambda: calls.append("drain")
+            )
+            session.identity = "shared-session"
+            session.views = {"view": object()}
+            session.root = object()
+
+            def close_comm():
+                calls.append("comm")
+                if fail_cleanup and rank == 2:
+                    raise RuntimeError("injected close failure")
+
+            session.comm = SimpleNamespace(close=close_comm)
+            try:
+                if capture_init:
+                    gin.create_gin_session(
+                        rank=rank,
+                        world_size=4,
+                        ranks_per_node=2,
+                        device=rank,
+                        layout=gin.build_gin_arena_layout(
+                            transport_bytes=128,
+                            num_tokens=1,
+                            hidden=64,
+                            num_topk=4,
+                            shared_workspace_bytes=128,
+                        ),
+                        signal_count=1,
+                        signature=("init",),
+                    )
+                else:
+                    with session.workspace_construction():
+                        if fail_build and rank == 1:
+                            raise MemoryError("injected allocation failure")
+                        calls.append("allocated")
+            except Exception as exc:
+                return type(exc), str(exc), calls, session
+            return None, None, calls, session
+
+        with (
+            patch.dict(sys.modules, {"torch": torch, "torch.distributed": dist}),
+            patch.object(gin, "require_gin_apis", return_value=None),
+            ThreadPoolExecutor(max_workers=4) as executor,
+        ):
+            return list(executor.map(run, range(4)))
+
+    def test_publish_only_after_all_ranks_allocate(self):
+        results = self.run_world()
+        self.assertTrue(all(error is None for error, _, _, _ in results))
+        self.assertTrue(all(not owner._closed for _, _, _, owner in results))
+
+    def test_one_allocation_failure_cleans_every_session(self):
+        results = self.run_world(fail_build=True)
+        self.assertEqual({error for error, _, _, _ in results}, {gin.GinPreflightError})
+        self.assertEqual(len({message for _, message, _, _ in results}), 1)
+        self.assertIn("rank 1: MemoryError", results[0][1])
+        for _, _, calls, owner in results:
+            self.assertEqual(calls[-2:], ["drain", "comm"])
+            self.assertTrue(owner._closed)
+            self.assertIsNone(owner.root)
+            self.assertEqual(owner.views, {})
+
+    def test_cleanup_failure_is_fatal_on_every_rank(self):
+        count = len(gin._failed_sessions)
+        try:
+            results = self.run_world(fail_build=True, fail_cleanup=True)
+            self.assertEqual({error for error, _, _, _ in results}, {gin.GinFatalError})
+            self.assertIsNotNone(results[2][3].root)
+            self.assertIn(results[2][3], gin._failed_sessions)
+        finally:
+            del gin._failed_sessions[count:]
+
+    def test_rank_local_capture_init_is_collectively_rejected(self):
+        results = self.run_world(capture_init=True)
+        self.assertEqual({error for error, _, _, _ in results}, {gin.GinPreflightError})
+        self.assertEqual(len({message for _, message, _, _ in results}), 1)
+        self.assertIn("rank 1: ValueError", results[0][1])
+        self.assertIn("capture", results[0][1])
 
 
 class LifecycleTests(unittest.TestCase):
