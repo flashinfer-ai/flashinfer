@@ -2057,7 +2057,7 @@ def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
         )
 
     expected = flashinfer.sampling.top_k_renorm_probs(
-        probs, top_k, is_deterministic=bool(is_deterministic)
+        probs, top_k, is_deterministic=is_deterministic is not False
     )
     torch.testing.assert_close(actual, expected)
 
@@ -2069,7 +2069,7 @@ def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
 def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
     """is_deterministic=True must be bitwise reproducible across invocations.
 
-    The default multi-CTA path accumulates the renormalization sum with float
+    The float multi-CTA path accumulates the renormalization sum with float
     atomicAdd, so CTA arrival order changes the last-bit rounding and repeated
     calls on identical input differ bitwise. Replicated execution (e.g.
     tensor-parallel ranks running the sampler redundantly on identical inputs)
@@ -2088,9 +2088,9 @@ def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
         again = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=True)
         assert torch.equal(again, base), "deterministic renorm differed across calls"
 
-    # Same kept support as the default kernel; values match within the
+    # Same kept support as the float kernel; values match within the
     # fixed-point quantization noise (far below the test tolerance).
-    ref = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    ref = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=False)
     assert torch.equal(base > 0, ref > 0)
     torch.testing.assert_close(base, ref, rtol=1e-3, atol=1e-3)
 
