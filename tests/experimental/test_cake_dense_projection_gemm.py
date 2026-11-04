@@ -3589,9 +3589,9 @@ def test_router_rule_spec_is_the_planners_verdict():
 
 
 def test_k2_rows_without_a_verdict_skip_the_planner(monkeypatch):
-    """``_k2_row_without_verdict`` is true exactly for the valid ``kk`` / ``nn_t`` bindings the planner (no split count)
-    keeps on the deterministic program for want of a verdict, and false for every binding the planner refuses, plans
-    or keeps for another reason (left to the planner); a verdict added at run time is seen."""
+    """``_k2_row_without_verdict`` is true exactly for the valid ``kk`` / ``kn`` / ``nn_t`` bindings the planner (no
+    split count) keeps on the deterministic program for want of a verdict, and false for every binding the planner
+    refuses, plans or keeps for another reason (left to the planner); a verdict added at run time is seen."""
     arch, sm_count = "sm_103a", 152
     _register(
         monkeypatch,
@@ -3645,9 +3645,11 @@ def test_k2_rows_without_a_verdict_skip_the_planner(monkeypatch):
     assert not without_verdict(X, W.t(), out[:, :128], arch, sm_count)
     assert not without_verdict(X[:0], W.t(), out[:0], arch, sm_count)
     assert not without_verdict(X, W.t()[:4096], out, arch, sm_count)
-    assert not without_verdict(
-        torch.empty(64, 256), torch.empty(256, 5120), torch.empty(64, 5120), arch, 152
-    )  # the kn class (the input gradient)
+    # the kn class (the input gradient): no SIMT window on sm_103a, one on 152-SM sm_100a parts
+    g, w, dx = torch.empty(64, 256), torch.empty(256, 5120), torch.empty(64, 5120)
+    assert without_verdict(g, w, dx, arch, 152)
+    assert cake_backend.plan_atomic_router(g, w, dx, arch=arch, sm_count=152)[0] is None
+    assert not without_verdict(g, w, dx, "sm_100a", 152)
     assert not without_verdict(
         torch.zeros(1).expand(64, 5120), W.t(), out, arch, sm_count
     )  # no unit stride

@@ -1700,9 +1700,8 @@ def _k2_row_without_verdict(
 ) -> bool:
     """Whether :func:`plan_atomic_router` keeps a launch without a caller's split count on the deterministic program
     for want of a verdict: valid 2-D fp32 views of the ``kk`` / ``kn`` / ``nn_t`` class whose row has no spec on a
-    device of
-    ``arch`` with ``sm_count`` SMs (:func:`_router_rule_spec` of the launched GEMM), when no other check of the
-    planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
+    device of ``arch`` with ``sm_count`` SMs (:func:`_router_rule_spec` of the launched GEMM), when no other check of
+    the planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
     planner."""
     return _k2_geometry_without_verdict(_k2_geometry(A, B, out), arch, sm_count)
 
@@ -3800,10 +3799,12 @@ def router_symbol(
 ) -> str:
     """Kernel symbol / registry template of a router instance: ``router_fp32_det_gemm_<a><b>[_t]`` of the
     deterministic package, or with ``deterministic=False`` ``router_fp32_gemm_atomic_<a><b>[_t]`` for the layout
-    classes this package reduces (``kk``, ``nn_t``) and the deterministic symbol for ``kn``."""
+    classes this package reduces (``kk``, ``nn_t``) and the deterministic symbol for ``kn`` (no stream-K program; its
+    SIMT programs are named per tile, :func:`router_simt_template`)."""
     det = _resolve_deterministic(deterministic, "router_symbol")
     det_symbol = _det_entry("router_symbol")(a_mn, b_mn, out_t)
-    if det or _route(_k2_class(a_mn, b_mn)) == "det":
+    layout = _k2_class(a_mn, b_mn)
+    if det or layout == "k2_kn" or _route(layout) == "det":
         return det_symbol
     return (
         cake_jit.TEMPLATE_PREFIXES[1]
