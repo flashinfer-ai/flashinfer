@@ -121,10 +121,10 @@ def test_kv_scale_forwarding_math_property(dtype: torch.dtype):
     torch.testing.assert_close(out3, out3_ref * v_scale, rtol=1e-2, atol=1e-3)
 
 
-def _small_plan_inputs(q_lens, metadata_device="cuda"):
-    """Two disjoint 256-token KV sequences for Hopper backend regressions."""
-    if get_compute_capability(torch.device("cuda"))[0] != 9:
-        pytest.skip("FA2/FA3 auto selection requires SM90")
+def _small_plan_inputs(q_lens, metadata_device="cuda", sm=(9, 0)):
+    """Two disjoint 256-token KV sequences for backend regressions."""
+    if get_compute_capability(torch.device("cuda")) != sm:
+        pytest.skip(f"Backend regression requires SM{sm[0]}{sm[1]}")
     metadata = dict(dtype=torch.int32, device=metadata_device)
     return dict(
         qo_indptr=torch.tensor([0, q_lens[0], sum(q_lens)], **metadata),
@@ -264,6 +264,18 @@ def test_cuda_graph_rejects_incompatible_backend_replan(
     wrapper = _small_wrapper(plan_inputs, use_cuda_graph=True)
     wrapper.plan(**plan_inputs)
     assert wrapper._backend == initial_backend
+    q, kv = _small_data(q_lens)
+    baseline = wrapper.run(q, kv)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        wrapper.run(q, kv)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = wrapper.run(q, kv)
+    plan_inputs = _small_plan_inputs((2, 2))
+    plan_inputs.update(head_dim_qk=64, head_dim_vo=64)
     if incompatible_feature == "fp8_query":
         # FP8 queries require FA3, which cannot replace a captured FA2 plan.
         plan_inputs.update(
@@ -274,7 +286,7 @@ def test_cuda_graph_rejects_incompatible_backend_replan(
     elif incompatible_feature == "custom_mask":
         # Custom masks require FA2, which cannot replace a captured FA3 plan.
         plan_inputs["custom_mask"] = torch.ones(
-            sum(q_lens) * 256, dtype=torch.bool, device="cuda"
+            4 * 256, dtype=torch.bool, device="cuda"
         )
     else:
         # Per-token/head KV scales force FA2 through a separate selection path.
@@ -285,6 +297,59 @@ def test_cuda_graph_rejects_incompatible_backend_replan(
     with pytest.raises(ValueError, match="CUDA.graph|backend"):
         wrapper.plan(**plan_inputs)
     assert wrapper._backend == initial_backend
+    # Check allocation dimensions before running: stale values can underallocate
+    # output storage for the previously accepted native kernel.
+    assert (
+        wrapper._qo_indptr_last,
+        wrapper._head_dim_qk,
+        wrapper._head_dim_vo,
+        wrapper._max_q_len,
+    ) == (
+        sum(q_lens),
+        128,
+        128,
+        max(q_lens),
+    )
+    torch.testing.assert_close(wrapper.run(q, kv), baseline, rtol=1e-3, atol=1e-3)
+    graph.replay()
+    torch.testing.assert_close(captured_output, baseline, rtol=1e-3, atol=1e-3)
+
+
+def test_sm120_fp8_cuda_graph_replan_and_replay():
+    plan_inputs = _small_plan_inputs((2, 2), sm=(12, 0))
+    plan_inputs.update(
+        head_dim_qk=256,
+        head_dim_vo=256,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.float16,
+    )
+    wrapper = _small_wrapper(plan_inputs, use_cuda_graph=True)
+    wrapper.plan(**plan_inputs)
+    assert wrapper._backend == "fa2"
+    # Use a supported SM120 FP8 VO-split configuration.
+    torch.manual_seed(42)
+    q = torch.randn(4, 32, 256, dtype=torch.float16, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    kv = torch.randn(32, 2, 16, 8, 256, dtype=torch.float16, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        wrapper.run(q, kv)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = wrapper.run(q, kv)
+    for _ in range(2):
+        plan_inputs["paged_kv_indices"] = plan_inputs["paged_kv_indices"].roll(1)
+        wrapper.plan(**plan_inputs)
+        graph.replay()
+        torch.testing.assert_close(
+            captured_output, _explicit_output(plan_inputs, q, kv), rtol=1e-3, atol=1e-3
+        )
 
 
 def test_sizing_and_failed_plan_do_not_pin_cuda_graph_backend():
