@@ -26,7 +26,8 @@ cooperative launches take instead of the pair-share or routed program, and
 ``_RENDERED_WORK_BIN_MIX_ROUTES`` the bin-mix builds of the turnover programs,
 which turnover launches whose bin table the bin-mix rule admits take
 cooperatively instead of the turnover program on the ``WORK_BIN_MIX_ARCHES``
-parts.
+parts, and ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` the long-task builds of the
+bin-mix programs, which bin-mix launches of longer tasks take instead.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -252,6 +253,18 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.items():
+        for module, program in modules.items():
+            # Every other bin-mix launch keeps the module's bin-mix program.
+            assert module in registry._RENDERED_WORK_BIN_MIX_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_MIX_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -321,6 +334,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1132,6 +1146,7 @@ def unrouted(monkeypatch):
             "_RENDERED_WORK_BIN_MIX_ROUTES",
             "_RENDERED_WORK_BIN_POOL_ROUTES",
             "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
+            "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1179,6 +1194,7 @@ def test_serving_rows_match_the_fp32_reference(
         | set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1532,15 +1548,36 @@ def _bin_mix_programs():
         )
     programs = set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
     assert programs, f"the loader names no bin-mix build on {arch}"
-    return programs
+    return programs | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
+
+
+def _long_task_bin_mix(lengths):
+    """Whether a bin-mix launch of ``lengths`` takes the long-task builds of
+    the bin-mix programs where the loader names them (its longest task longer
+    than ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks)."""
+    limit = runtime.BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS * runtime.BF16_M128_CHUNK
+    return max(lengths) > limit
+
+
+def _expected_bin_mix_programs(lengths):
+    """The bin-mix programs a bin-mix launch of ``lengths`` takes on this
+    device: the long-task build of a module's bin-mix program where the loader
+    names one and the launch's longest task is long enough, else its bin-mix
+    program."""
+    arch = registry.device_arch()
+    mix = registry._RENDERED_WORK_BIN_MIX_ROUTES[arch]
+    if not _long_task_bin_mix(lengths):
+        return set(mix.values())
+    long_task = registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch]
+    return {long_task.get(module, program) for module, program in mix.items()}
 
 
 def _without_bin_mix(patch):
-    patch.setattr(
-        registry,
+    for table in (
         "_RENDERED_WORK_BIN_MIX_ROUTES",
-        {arch: {} for arch in registry.ARCHES},
-    )
+        "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+    ):
+        patch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
 
 @requires_blackwell
@@ -1568,6 +1605,8 @@ def test_bin_mix_launch_is_bitwise_the_turnover_launch(
     schedule = str(mixed.prepared.schedule)
     assert schedule.endswith("_turnover_bin_mix"), schedule
     assert _modules(mixed.prepared) & mix
+    expected = _expected_bin_mix_programs(lengths)
+    assert _modules(mixed.prepared) & mix <= expected, (lengths, expected)
     with monkeypatch.context() as patch:
         _without_bin_mix(patch)
         turned = _Call(d, None, rows=rows)
@@ -1584,6 +1623,25 @@ def test_bin_mix_launch_is_bitwise_the_turnover_launch(
     _assert_bitwise(got, plain.run(), "bin-mix vs work-binned")
     _assert_bitwise(mixed.run(), want, "bin-mix after the other launches")
     _assert_bitwise(turned.run(), got, "turnover repeat")
+    # A launch that takes a long-task build: bit for bit the bin-mix build it
+    # replaces (the long-task table cleared), with the same schedule.
+    arch = registry.device_arch()
+    long_task = set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
+    if _modules(mixed.prepared) & long_task:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                registry,
+                "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+                {name: {} for name in registry.ARCHES},
+            )
+            stock = _Call(d, None, rows=rows)
+        assert str(stock.prepared.schedule) == schedule
+        assert not _modules(stock.prepared) & long_task
+        assert _modules(stock.prepared) & set(
+            registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values()
+        )
+        _assert_bitwise(stock.run(), got, "bin-mix vs long-task bin-mix")
+        _assert_bitwise(mixed.run(), got, "long-task bin-mix repeat")
 
 
 @requires_blackwell
@@ -1608,8 +1666,9 @@ def test_bin_mix_rows_keep_the_turnover_build_elsewhere(
     assert str(turned.prepared.schedule).endswith("_turnover"), str(
         turned.prepared.schedule
     )
-    assert not _modules(turned.prepared) & set(
-        registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values()
+    assert not _modules(turned.prepared) & (
+        set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
     )
     with monkeypatch.context() as patch:
         _without_turnover(patch)

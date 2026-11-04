@@ -3102,6 +3102,20 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 # The roles whose programs plan their channel tiles with :func:`channel_split`
 # (a reduce program runs on its backward record's plan): each has its own rule.
 SPLIT_ROLES = ("fwd", "bwd")
+# The routes whose single-tile rows run 32-vector tiles (``ct_vec`` 32, four
+# token sub-tiles, the last tile partial) instead of one tile of ``cv = C /
+# vec`` vectors, per role, at 128 threads (:func:`_narrow_tile`): the backward
+# at 64 < cv <= 96 (C = 520 to 768, three tiles) and cv = 28 (C = 224), the
+# forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv vectors leaves
+# 128 - cv lanes of every CTA idle over the whole token axis; the programs are
+# unchanged.  The backward's four-tile rows (96 < cv < 128) keep one tile
+# (their ``dweight`` error against FP64 is lowest there), and so do the
+# ``_fp32g`` and ``_dt`` backward routes.
+NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
+    "fwd": ("fwd", "fwd_bias"),
+    "bwd": ("bwd", "bwd_bias"),
+}
+NARROW_TILE_THREADS = 128
 
 
 def channel_split(
@@ -3110,8 +3124,9 @@ def channel_split(
     geometry: dict[str, int],
     role: str | None = None,
     legacy: bool = False,
+    route: str | None = None,
 ) -> tuple[int, int, int]:
-    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry and role.
+    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry, role and route.
 
     ``ct_vec`` channel vectors per channel tile (one thread each), ``n_sub =
     threads // ct_vec`` token sub-tiles per CTA and ``n_ch_tiles = ceil(C / vec
@@ -3141,16 +3156,35 @@ def channel_split(
     from ``ct_vec`` on the device and are measured under this rule).  Each
     role's rule is kept in sync with its copies (the kernel generator of
     that role and the test plan of that kind).
+
+    ``route`` is the launch's route (one of :data:`KINDS` of the role; the
+    host passes its record's).  On a route of :data:`NARROW_TILE_ROUTES` the
+    single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
+    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 768,
+    the forward's C = 576 to 768, so C = 640 runs (32, 4, 3) instead of (80,
+    1, 1).  ``y`` and ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
+    the narrow plan's fixed order (bitwise reproducible).  Without a route,
+    and on every other route, the single tile stays.
     """
 
     return _channel_split(
-        int(C), int(geometry["vec"]), int(geometry["threads"]), role, bool(legacy)
+        int(C),
+        int(geometry["vec"]),
+        int(geometry["threads"]),
+        role,
+        bool(legacy),
+        route,
     )
 
 
 @functools.lru_cache(maxsize=4096)
 def _channel_split(
-    C: int, vec: int, threads: int, role: str | None, legacy: bool
+    C: int,
+    vec: int,
+    threads: int,
+    role: str | None,
+    legacy: bool,
+    route: str | None = None,
 ) -> tuple[int, int, int]:
     """:func:`channel_split` of plain arguments, memoized: a model's channel
     counts are few, so every call after a channel count's first reuses its
@@ -3160,11 +3194,21 @@ def _channel_split(
         raise ValueError(
             f"role must be one of {SPLIT_ROLES} (or legacy=True), got {role!r}"
         )
+    if route is not None and (
+        route not in KINDS or role is None or route_role(route) != role
+    ):
+        raise ValueError(f"route={route!r} is not a route of role {role!r}")
     if C <= 0 or C % vec:
         raise ValueError(f"C={C} must be a positive multiple of {vec}")
     channel_vectors = C // vec
     if legacy or channel_vectors <= threads:
         ct_vec = min(channel_vectors, threads)
+        if (
+            not legacy
+            and route in NARROW_TILE_ROUTES[role]
+            and _narrow_tile(channel_vectors, threads, role)
+        ):
+            ct_vec = 32
     else:
         candidates = [
             width
@@ -3204,6 +3248,16 @@ def _fallback_split(channel_vectors: int, threads: int, role: str) -> int:
     )
 
 
+def _narrow_tile(channel_vectors: int, threads: int, role: str) -> bool:
+    """Whether a single-tile row of ``role`` runs 32-vector tiles on its narrow routes."""
+
+    if threads != NARROW_TILE_THREADS:
+        return False
+    if role == "bwd":
+        return 64 < channel_vectors <= 96 or channel_vectors == 28
+    return 72 <= channel_vectors <= 96
+
+
 def _lane_use(channel_vectors: int, width: int, threads: int) -> float:
     """The busy share of a CTA's lanes over ``ceil(channel_vectors / width)`` tiles of ``width``."""
 
@@ -3222,18 +3276,20 @@ def plan(
     geometry: dict[str, int],
     role: str | None = None,
     legacy: bool = False,
+    route: str | None = None,
 ) -> dict[str, int]:
-    """The kernel's launch scalars for one problem under a record's build geometry and role.
+    """The kernel's launch scalars for one problem under a record's build geometry, role and route.
 
     ``geometry`` is ``record["grid_rule"]["geometry"]``: ``threads`` per CTA
     and ``vec`` BF16 channels per thread; ``role`` is ``record["role"]``
     (``"fwd"`` or ``"bwd"``).  The scalars are ``S``, ``C``, ``num_docs``,
-    :func:`channel_split`'s ``ct_vec`` / ``n_sub`` / ``n_ch_tiles`` (``role``
-    and ``legacy`` are passed on) and ``search_steps``, the number of halvings
-    of the device-side binary search over ``cu_seqlens`` (``max(1, ceil(log2
-    num_docs))``).  Every value is a pure function of ``(S, C, num_docs)``, the
-    geometry and the role: the host never reads ``cu_seqlens``, and the kernel
-    derives its token ranges from ``S`` and the grid.  The ``flags`` scalar of
+    :func:`channel_split`'s ``ct_vec`` / ``n_sub`` / ``n_ch_tiles`` (``role``,
+    ``legacy`` and ``route`` are passed on) and ``search_steps``, the number
+    of halvings of the device-side binary search over ``cu_seqlens``
+    (``max(1, ceil(log2 num_docs))``).  Every value is a pure function of
+    ``(S, C, num_docs)``, the geometry, the role and the route: the host
+    never reads ``cu_seqlens``, and the kernel derives its token ranges from
+    ``S`` and the grid.  The ``flags`` scalar of
     the ``dtype_flags`` programs is not a plan value: the host derives it from
     the tensors of the call.
     """
@@ -3242,7 +3298,7 @@ def plan(
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
     ct_vec, n_sub, n_ch_tiles = channel_split(
-        C, geometry=geometry, role=role, legacy=legacy
+        C, geometry=geometry, role=role, legacy=legacy, route=route
     )
     return {
         "S": S,
@@ -3410,6 +3466,19 @@ def row_may_trim(
     )
 
 
+def _plan_route(record: dict[str, Any], arch: str) -> str | None:
+    """The route :func:`channel_split` plans ``record`` on.
+
+    Its :func:`record_route`, or ``None`` for a record no route of
+    ``ROUTES[arch]`` lists (a KCP program keeps the route-free rule).
+    """
+
+    try:
+        return record_route(record, arch)
+    except ValueError:
+        return None
+
+
 def record_route(record: dict[str, Any], arch: str) -> str:
     """The route of ``ROUTES[arch]`` that lists ``record`` (``ValueError`` if none)."""
 
@@ -3469,8 +3538,9 @@ def launch_grid(
             co_resident = int(rule["ctas_per_sm"]) * sm_count(device_index)
             factor = grid_mult(record, arch)
             if row_may_trim(record, arch, co_resident, factor, int(C), int(S)):
+                route = record_route(record, arch)
                 ct_vec, _, n_ch_tiles = channel_split(
-                    C, geometry=rule["geometry"], role=record["role"]
+                    C, geometry=rule["geometry"], role=record["role"], route=route
                 )
                 grid_x = main_grid(
                     co_resident,
@@ -3480,7 +3550,7 @@ def launch_grid(
                     n_ch_tiles=n_ch_tiles,
                     S=int(S),
                     ct_vec=ct_vec,
-                    route=record_route(record, arch),
+                    route=route,
                 )
     elif kind == "channels_per_cta":
         if C is None:
@@ -3531,13 +3601,17 @@ def workspace_layout(
     n_ch_tiles)`` for the device's launch grid (``grid_mult x ctas_per_sm x SM
     count``: the bytes grow with the record's ``grid_mult``); it depends on
     ``C`` and the device only, so one buffer serves every token count.  The
+    rows follow the plan of the record's route (:func:`channel_split`).  The
     kernel fully writes the rows its reduce program sums, so nothing is zeroed
     between launches or CUDA Graph replays.
     """
 
     grid_x = launch_grid(record, device_index=device_index)[0]
     _, _, n_ch_tiles = channel_split(
-        C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+        C,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+        route=_plan_route(record, device_arch(device_index)),
     )
     rows = partial_rows(grid_x, n_ch_tiles)
     return {
@@ -3595,7 +3669,10 @@ def forward_workspace_words(arch: str, C: int) -> int:
             if record["workspace_rule"] is None:
                 continue
             _, _, n_ch_tiles = channel_split(
-                C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+                C,
+                geometry=record["grid_rule"]["geometry"],
+                role=record["role"],
+                route=kind,
             )
             words = max(words, counter_words(record, n_ch_tiles))
     return words

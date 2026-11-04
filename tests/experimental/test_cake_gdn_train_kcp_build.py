@@ -68,13 +68,14 @@ PREFIX = "cake_gdn_train"
 KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step and the output walk (the shipped records by program name: eighteen libraries), the three
-# programs of the in-kernel Q / K L2 norm (one library each) and the two test-only records.
+# The nine programs of a step and the two output walks (the shipped records by program name: twenty libraries), the
+# three programs of the in-kernel Q / K L2 norm (one library each) and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
     "kcp_fwdh_out",
+    "kcp_fwdh_out_tape",
     "kcp_transfer_walk",
     "kcp_affine_merge",
     "fwd_o",
@@ -95,7 +96,8 @@ TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # omitted one, so these pairs are frozen together with the kernels' build signatures.  The kernel modules are, so
 # far, the deterministic family's (``gdn_chunk_det_*``): the digests equal the twin's, the prefix differs, so no library
 # of this package is named like a library of ``cake_gdn_det_train_kcp`` (a lever that replaces a program updates
-# its row here).  The output walk's module is det-neutral (``gdn_chunk_fwdh_out_v1_kcp``) and no det twin ships it.
+# its row here).  The output walks' modules are det-neutral (``gdn_chunk_fwdh_out_v1_kcp``,
+# ``gdn_chunk_fwdh_out_tape_v1_kcp``) and no det twin ships them.
 IDENTITIES = {
     "fwd_prep": (
         f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_v1",
@@ -184,6 +186,12 @@ IDENTITIES = {
         {},
     ),
 }
+# The tape-and-output walk: the output walk's kernel family under its own module (records named as the output walk's).
+_FWDH_OUT_TAPE_MODULE = IDENTITIES["kcp_fwdh_out"][0].replace(
+    ".gdn_chunk_fwdh_out_v1_kcp", ".gdn_chunk_fwdh_out_tape_v1_kcp"
+)
+IDENTITIES["kcp_fwdh_out_tape"] = (_FWDH_OUT_TAPE_MODULE, {})
+IDENTITIES["kcp_fwdh_out_tape_vh64"] = (_FWDH_OUT_TAPE_MODULE, {"vh": 64})
 # The grid rules the host evaluates: the walks launch one CTA per listed segment and value head, the affine merge one
 # CTA per chain and column block, the chunk-shaped programs one CTA per chunk and (Q/K or value) head.
 GRID_RULES = (
