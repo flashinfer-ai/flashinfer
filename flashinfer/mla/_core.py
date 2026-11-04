@@ -32,6 +32,7 @@ from flashinfer.autotuner import (
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
+    trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..utils import (
@@ -1219,9 +1220,9 @@ def _resolve_dsv4_sparse_mla_backend(
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
-    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
-    # only the prebuilt cubin backend additionally covers SM107.
-    is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
+    # The SM100 CAKE kernels build for SM100/SM103 and, for the FP8 decode
+    # route, SM107 (run_cake_dsv4 refuses a route SM107 has no program for).
+    is_cake_sm100_family = is_sm100_family
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1241,15 +1242,16 @@ def _resolve_dsv4_sparse_mla_backend(
         raise ValueError(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
-    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+    if requested_backend == "cute-dsl" and not is_sm100_family:
         raise ValueError(
-            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend='cute-dsl' requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):
+    if requested_backend == "cake" and not (is_cake_sm100_family or is_sm120_family):
         raise ValueError(
-            f"backend='cake' requires SM100/SM103 or SM120/SM121, got SM{cc[0]}{cc[1]}"
+            "backend='cake' requires SM100/SM103/SM107 or SM120/SM121, "
+            f"got SM{cc[0]}{cc[1]}"
         )
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
@@ -1816,6 +1818,7 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
+@flashinfer_api(trace=trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch)
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -1886,7 +1889,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     the packed backend's final base-2 LSE and finite-sink semantics are
     documented in :meth:`SparseMLASm120Wrapper.run`.
 
-    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    With ``backend="cute-dsl"`` on SM100/SM103/SM107, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
     stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
@@ -1931,7 +1934,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     :func:`flashinfer.mla.dsv41_fp4_quantize_pack_sparse_mla_cache`.
 
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
-    kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
+    kernels (``flashinfer.mla.cake_dsv4``); on SM107 the FP8 cache's decode
+    route runs them (the FP8 persistent, M64 and low-head prefill programs),
+    and any other route raises. The metadata may describe fewer
     tokens than ``query`` provides: with dense ``[B, Q, H, D]`` input the
     table rows cover the first ``T <= B * Q`` flattened tokens (padded batch),
     with ragged ``[sum_q, H, D]`` input the first ``T <= sum_q`` rows. Query
@@ -2052,10 +2057,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch. Used by the
-        TRTLLM-GEN path and, on SM120/SM121, by ``backend="cake"`` with
+        TRTLLM-GEN path; on SM100/SM103/SM107 by ``backend="cake"`` for its
+        FP8 persistent, M64 and low-head prefill programs and, on SM100/SM103,
+        its FP8 H64 cluster program (the other BF16 / FP8 programs launch
+        without it); and on SM120/SM121 by ``backend="cake"`` with
         ``kv_cache_format="fp8_dsv41_fp4_ca"`` (its split merge is launched as a
-        programmatic dependent of the decode grid; ``None`` follows the device
-        default). The NVFP4 Cake family rejects ``True``.
+        programmatic dependent of the decode grid). ``None`` follows the device
+        default. The NVFP4 Cake family rejects ``True``.
     swa_topk_lens : Optional[torch.Tensor]
         Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
         these are sparse-segment lengths. HCA requires them as its per-row
@@ -2148,15 +2156,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         yet include the 128 SWA slots (``128``) or shrink every row uniformly.
         Combined with ``extra_sparse_topk_lens`` the implied 128 is added on
         top of this value.
-
-    Returns
-    -------
-    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
-        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
-        ``[sum_q, 16, 4096]`` and group-major strides
-        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
-        layout described above.
     multi_ctas_kv_counter_buffer : Optional[torch.Tensor]
         Caller-owned, zero-initialized ``uint8`` buffer for the TRTLLM-GEN
         multi-CTA KV split semaphores, sized by
@@ -2199,6 +2198,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         "cake"`` rejects them). Footer and inline caches cannot be told apart
         from their shapes, so the format must name the layout the cache was
         written in.
+
+    Returns
+    -------
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
+        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
+        ``[sum_q, 16, 4096]`` and group-major strides
+        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
+        layout described above.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
@@ -2381,14 +2389,17 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     # On SM120/SM121, backend="cake" selects the Cake NVFP4 sparse-MLA decode,
     # which shares the SM120 "sparse" call surface (swa_topk_lens, dual cache).
     cake_sm120 = backend == "cake" and _is_sm120_family(query.device)
-    if backend == "cake":
-        # The DeepSeek-V4.1 mixed-cache Cake family launches its split merge as a
-        # programmatic dependent of the decode grid (None = device default); the
-        # NVFP4 Cake family has no PDL launch option.
-        if not (cake_sm120 and kv_cache_format == "fp8_dsv41_fp4_ca"):
-            if enable_pdl:
-                raise ValueError("backend='cake' does not support enable_pdl")
-            enable_pdl = False
+    if backend == "cake" and kv_cache_format == "nvfp4":
+        # The NVFP4 Cake family has no PDL launch option.  The DeepSeek-V4.1
+        # mixed-cache family launches its split merge as a programmatic
+        # dependent of the decode grid, and the SM100/SM103 BF16 / FP8 programs
+        # that support it launch as programmatic dependents (None = device
+        # default for both).
+        if enable_pdl:
+            raise ValueError(
+                "backend='cake' with kv_cache_format='nvfp4' does not support enable_pdl"
+            )
+        enable_pdl = False
     elif enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -2639,6 +2650,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             seq_lens=seq_lens,
             backend="cake",
             out_shape=tuple(expected_out_shape),
+            enable_pdl=bool(enable_pdl),
         )
 
     primary_kv_cache = compressed_kv_cache
@@ -4661,8 +4673,9 @@ def nvfp4_sparse_mla_decode(
         ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
     num_ctas_per_token : Optional[int]
         Thread-block cluster size per query token: 3 to 8 with ``backend="cuda"``, 1 to 6 or 8 with
-        ``backend="cake"`` (7 is rejected). By default, the largest size whose ``num_tokens`` clusters all fit
-        on the device in one wave.
+        ``backend="cake"`` (7 is rejected). By default, among the sizes whose ``num_tokens`` clusters all fit
+        on the device in one wave, ``backend="cuda"`` takes the largest and ``backend="cake"`` the one with
+        the least work per CTA.
     backend : str
         ``"cuda"`` (default), the hand-written kernel, or ``"cake"``, the generated program of the same
         operator (``flashinfer/experimental/nvfp4_sparse_mla_decode/cake_backend.py``).

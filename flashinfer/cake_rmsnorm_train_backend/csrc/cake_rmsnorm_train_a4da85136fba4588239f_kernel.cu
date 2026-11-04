@@ -47,22 +47,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_PARTIALS_STRIDE 32
-#define SMEM_TOTAL 128
-#define THREADS 64
-#define ROWS_PER_CTA 2
-#define GROUP_THREADS 64
-#define LAUNCH_BOUNDS_THREADS 64
-
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(64) void
 kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -71,30 +60,25 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
     // === Task calls (declaration order) ===
     int warp_0 = warp;
-    int group = tid / GROUP_THREADS;
-    int gtid = tid - group * GROUP_THREADS;
+    int group = tid / 64;
+    int gtid = tid - group * 64;
     float h_f = 2048.0f;
     int it = 0;
     #pragma unroll 1
-    for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
+    for (int row0 = bid * 2; row0 < T; row0 += num_bids * 2) {
         float x_cache[64];
         float sums[2];
         float zero = 0.0f;
@@ -112,7 +96,7 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
                 for (int v = 0; v < 2; v++) {
                     float _vec_load_0[16];
                     {
-                        const void* _v8p_0 = (const void*)(x + (xbasea + (long long)(gtid * 16 + v * (GROUP_THREADS * 16))) + (0));
+                        const void* _v8p_0 = (const void*)(x + (xbasea + (long long)(gtid * 16 + v * (64 * 16))) + (0));
                         uint32_t _v8_0_0[8];
                         asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                             : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const void*)((const char*)_v8p_0 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -198,7 +182,7 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
                 for (int v_2 = 0; v_2 < 2; v_2++) {
                     float _vec_load_1[16];
                     {
-                        const void* _v8p_3 = (const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16)) + (0));
+                        const void* _v8p_3 = (const void*)(w + (gtid * 16 + v_2 * (64 * 16)) + (0));
                         uint32_t _v8_3_0[8];
                         asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                             : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]), "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7]) : "l"((const void*)((const char*)_v8p_3 + 0)) : "memory");
@@ -223,52 +207,52 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
                     for (int j_2 = 0; j_2 < 16; j_2++) {
                         x_cache[rr_5 * 32 + v_2 * 16 + j_2] = x_cache[rr_5 * 32 + v_2 * 16 + j_2] * rstd_r * _vec_load_1[j_2];
                     }
-                    unsigned int _packed_0[8];
+                    unsigned int packed_1[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 0], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 0]));
-                        _packed_0[_lp] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 0], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 0]));
+                        packed_1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 2], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 2]));
-                        _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 2], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 2]));
+                        packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 4], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 4]));
-                        _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 4], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 4]));
+                        packed_1[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 6], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 6]));
-                        _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 6], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 6]));
+                        packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 8], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 8]));
-                        _packed_0[_lp + 4] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 8], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 8]));
+                        packed_1[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 10], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 10]));
-                        _packed_0[_lp + 5] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 10], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 10]));
+                        packed_1[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 12], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 12]));
-                        _packed_0[_lp + 6] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 12], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 12]));
+                        packed_1[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + rr_5 * 32 + v_2 * 16)[_lp*2 + 14], (x_cache + rr_5 * 32 + v_2 * 16)[_lp*2+1 + 14]));
-                        _packed_0[_lp + 7] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2 + 14], (x_cache + (rr_5 * 32 + v_2 * 16))[_lp*2+1 + 14]));
+                        packed_1[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     {
-                        const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(_packed_0);
+                        const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(packed_1);
                         asm volatile(
                             "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                            :: "l"((void*)(y + (obasec + (long long)(gtid * 16 + v_2 * (GROUP_THREADS * 16))))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
+                            :: "l"((void*)(y + (obasec + (long long)(gtid * 16 + v_2 * (64 * 16))))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
                     }
                 }
             }

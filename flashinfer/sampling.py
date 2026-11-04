@@ -23,7 +23,7 @@ import torch
 from .api_logging import flashinfer_api
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
-from .topk import _ROW_STATES_NBYTES
+from .topk import _get_row_states_buffer
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
     min_p_sampling_trace,
@@ -87,7 +87,7 @@ def get_blackwell_softmax_op():
         temperature_val: float,
         enable_pdl: bool,
         temperature_is_none: bool,
-        is_sm103: bool,
+        pdl_device: bool,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
@@ -102,7 +102,7 @@ def get_blackwell_softmax_op():
             temperature_val,
             enable_pdl,
             temperature_is_none,
-            is_sm103,
+            pdl_device,
         )
         return probs
 
@@ -114,7 +114,7 @@ def get_blackwell_softmax_op():
         temperature_val: float,
         enable_pdl: bool,
         temperature_is_none: bool,
-        is_sm103: bool,
+        pdl_device: bool,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
@@ -122,8 +122,9 @@ def get_blackwell_softmax_op():
 
 
 _BLACKWELL_SOFTMAX_ROUTE_FALLBACK = 0
-_BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512 = 4
 _BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER = 5
+_BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT = 6
+_BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES = 7
 
 
 def _blackwell_softmax_route_for_testing(
@@ -157,6 +158,41 @@ def _blackwell_softmax_route_for_testing(
     )
 
 
+def _blackwell_softmax_cached_kernel_for_testing(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    enable_pdl: bool = False,
+) -> Tuple[int, ...]:
+    """Return the cached-cluster kernel the C++ dispatcher would launch, without
+    launching it: (cluster CTAs, max tiles, 1 if it is a PDL twin, its resident
+    clusters on this device, the resident clusters of the 4-tile kernel twice its
+    size or 0 past 16 CTAs, the per-CTA chunk in elements), or () for the other
+    routes."""
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    device_index = logits.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if not _supports_blackwell_softmax(device_index):
+        return ()
+    maybe_temperature_arr, temperature_val, temperature_is_none = (
+        _validate_softmax_temperature(logits, temperature)
+    )
+    temperature_fp32 = (
+        maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+    )
+    return tuple(
+        int(x)
+        for x in get_blackwell_softmax_module().softmax_cached_kernel(
+            logits.float(),
+            temperature_fp32,
+            temperature_val,
+            enable_pdl,
+            temperature_is_none,
+        )
+    )
+
+
 @functools.cache
 def _blackwell_softmax_capability(device_index: int) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device_index)
@@ -165,12 +201,12 @@ def _blackwell_softmax_capability(device_index: int) -> Tuple[int, int]:
 @functools.cache
 def _supports_blackwell_softmax(device_index: int) -> bool:
     major, minor = _blackwell_softmax_capability(device_index)
-    return major == 10 and minor in (0, 3)
+    return major == 10 and minor in (0, 3, 7)
 
 
 @functools.cache
-def _is_sm103(device_index: int) -> bool:
-    return _blackwell_softmax_capability(device_index) == (10, 3)
+def _blackwell_softmax_launches_with_pdl(device_index: int) -> bool:
+    return _blackwell_softmax_capability(device_index) in ((10, 3), (10, 7))
 
 
 @functools.cache
@@ -925,9 +961,9 @@ def softmax(
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
         If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
-        The custom Blackwell softmax routes currently apply PDL on SM103; the
+        The custom Blackwell softmax routes apply PDL on SM103 and SM107; the
         SM100 fast path remains non-PDL, while fallback routes preserve their
-        existing PDL behavior. On SM100/SM103, 32-byte aligned rows whose
+        existing PDL behavior. On SM100/SM103/SM107, 32-byte aligned rows whose
         vocabulary is a multiple of 8 and at most 262144 take the row-caching
         cluster route, which reads and writes each row exactly once.
     Returns
@@ -978,7 +1014,7 @@ def softmax(
             temperature_val,
             enable_pdl,
             temperature_is_none,
-            _is_sm103(device_index),
+            _blackwell_softmax_launches_with_pdl(device_index),
         )
 
     return get_sampling_module().softmax(
@@ -1221,9 +1257,10 @@ def top_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_p: Union[torch.Tensor, float]
-        Either a float or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        Either a float or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-p sampling.
         If a float, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1351,9 +1388,10 @@ def top_k_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1482,9 +1520,10 @@ def min_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     min_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for min-p sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for min-p sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1598,21 +1637,35 @@ def _top_k_first_fast_path_applicable(
     x: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor],
+    top_k_max: Optional[int] = None,
 ) -> bool:
+    # A per-row top_k tensor qualifies only through the caller's top_k_max bound:
+    # deriving the bound from top_k.max() would add a host sync on every call.
+    # Other tensor shapes fall back, which raises ValueError.
+    select_k = top_k if isinstance(top_k, int) else top_k_max
+    valid_indices = indices is None or (
+        isinstance(indices, torch.Tensor)
+        and indices.ndim == 1
+        and indices.device == x.device
+        and indices.dtype in (torch.int32, torch.int64)
+    )
     return (
-        indices is None
-        and isinstance(top_k, int)
-        and 0 < top_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
+        valid_indices
+        and (isinstance(top_k, int) or top_k.shape == (x.size(0),))
+        and select_k is not None
+        and 0 < select_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
         and x.size(-1) >= _TOP_K_FIRST_FAST_PATH_MIN_VOCAB
-        and top_k < x.size(-1)
+        and select_k < x.size(-1)
     )
 
 
 def _top_k_first_fast_path(
     x: torch.Tensor,
-    top_k: int,
+    top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor],
     *,
+    top_k_max: Optional[int] = None,
     from_logits: bool,
     deterministic: bool,
     generator: Optional[torch.Generator],
@@ -1626,28 +1679,42 @@ def _top_k_first_fast_path(
     Selects the top-k entries with the parallel radix/cluster top-k kernel, then runs
     top-p sampling over only those k entries. ``sorted=True`` gives an identical,
     deterministic ordering for both logits and probs inputs, so the two entry points
-    reduce to the same ``probs_k`` and stay sample-aligned. This is distribution-equivalent
-    to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
+    reduce to the same ``probs_k`` and stay sample-aligned. Passing ``indices`` through
+    the compact sampling step also keeps the exact-k boundary-tie behavior independent
+    of whether ``indices`` is provided, without expanding the compact rows.
+
+    A ``top_k`` tensor selects ``top_k_max`` sorted entries, so masking each row past
+    its own k leaves exactly its top-k.
     """
     # Local import avoids a module-level cycle between sampling and topk.
     from .topk import top_k as _radix_top_k
 
     # deterministic=True makes top-k reproducible (its radix deterministic-collect path is
     # stable even at ties). We do not enforce a tie break that requires 128KB smem/block.
+    select_k = top_k if isinstance(top_k, int) else top_k_max
     values, gathered_indices = _radix_top_k(
-        x, top_k, sorted=True, deterministic=deterministic
+        x, select_k, sorted=True, deterministic=deterministic
     )
     values = values.float()
+    if not isinstance(top_k, int):
+        # As in the fallback: k < 0 means no top-k, k == 0 is greedy.
+        k = top_k.int()
+        row_k = torch.where(k < 0, select_k, k.clamp(min=1)).unsqueeze(-1)
+        cols = torch.arange(select_k, device=x.device)
+        values = values.masked_fill(
+            cols >= row_k, float("-inf") if from_logits else 0.0
+        )
     if from_logits:
         # softmax over the k retained logits == top-k-masked softmax over the full vocab.
         probs_k = torch.softmax(values, dim=-1)
     else:
         # renormalizing the k retained probabilities == top_k_renorm over the full vocab.
         probs_k = values / values.sum(dim=-1, keepdim=True)
+
     result = top_p_sampling_from_probs(
         probs_k,
         top_p,
-        None,
+        indices,
         deterministic,
         check_nan=check_nan,
         generator=generator,
@@ -1657,11 +1724,14 @@ def _top_k_first_fast_path(
     )
 
     def _map(local):
-        return (
-            gathered_indices.gather(1, local.view(-1, 1).long())
-            .squeeze(1)
-            .to(torch.int32)
-        )
+        if indices is None:
+            # Avoid advanced-indexing setup on the common non-indexed fast path.
+            return (
+                gathered_indices.gather(1, local.view(-1, 1).long())
+                .squeeze(1)
+                .to(torch.int32)
+            )
+        return gathered_indices[indices.long(), local.long()].to(indices.dtype)
 
     if return_valid:
         local, valid = result
@@ -1681,6 +1751,7 @@ def top_k_top_p_sampling_from_logits(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    top_k_max: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits.
 
@@ -1698,19 +1769,21 @@ def top_k_top_p_sampling_from_logits(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of logits has its own threshold, and outputs that indices maps to the same row share it.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of logits has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
-        that maps each output to a row in probs. The output tensor will have the same dtype as indices.
-        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        that maps each output to a row in logits. The output tensor will have the same dtype as indices.
+        For example, if indices[i] = j, then the i-th output will be sampled from logits[j].
         This allows reusing the same probability distribution for multiple outputs.
-        If indices is not provided, the i-th output will be sampled from the i-th row of probs
+        If indices is not provided, the i-th output will be sampled from the i-th row of logits
         and output dtype defaults to ``torch.int32``.
     filter_apply_order: str
         The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
@@ -1749,6 +1822,11 @@ def top_k_top_p_sampling_from_logits(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    top_k_max: Optional[int]
+        Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
+        ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
+        Otherwise ignored. Default is ``None``.
 
     Returns
     -------
@@ -1794,11 +1872,13 @@ def top_k_top_p_sampling_from_logits(
     top_p_sampling_from_probs
     """
     if filter_apply_order == "top_k_first":
-        if _top_k_first_fast_path_applicable(logits, top_k, indices):
+        if _top_k_first_fast_path_applicable(logits, top_k, indices, top_k_max):
             return _top_k_first_fast_path(
                 logits,
                 top_k,
                 top_p,
+                indices,
+                top_k_max=top_k_max,
                 from_logits=True,
                 deterministic=deterministic,
                 generator=generator,
@@ -1850,6 +1930,7 @@ def top_k_top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
+    top_k_max: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities.
 
@@ -1867,13 +1948,15 @@ def top_k_top_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1922,6 +2005,11 @@ def top_k_top_p_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
+    top_k_max: Optional[int]
+        Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
+        ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
+        Otherwise ignored. Default is ``None``.
 
     Returns
     -------
@@ -1966,11 +2054,13 @@ def top_k_top_p_sampling_from_probs(
     top_k_mask_logits
     """
     if filter_apply_order == "top_k_first":
-        if _top_k_first_fast_path_applicable(probs, top_k, indices):
+        if _top_k_first_fast_path_applicable(probs, top_k, indices, top_k_max):
             return _top_k_first_fast_path(
                 probs,
                 top_k,
                 top_p,
+                indices,
+                top_k_max=top_k_max,
                 from_logits=False,
                 deterministic=deterministic,
                 generator=generator,
@@ -2167,9 +2257,8 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=probs.device
+    row_states_buffer = _get_row_states_buffer(
+        "top_k_renorm_probs_row_states", probs.device
     )
 
     return get_sampling_module().top_k_renorm_probs(
@@ -2238,9 +2327,8 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
+    row_states_buffer = _get_row_states_buffer(
+        "top_k_mask_logits_row_states", logits.device
     )
 
     return get_sampling_module().top_k_mask_logits(

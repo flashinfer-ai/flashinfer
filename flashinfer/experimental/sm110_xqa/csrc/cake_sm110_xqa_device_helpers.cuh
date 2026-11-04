@@ -35,15 +35,12 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-#if defined(CAKE_SM110_XQA_NEED_MBARRIER_EXPECT_TX)
 __device__ __forceinline__ void mbarrier_expect_tx(int mbar_addr, uint32_t bytes) {
     asm volatile(
         "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
         :: "r"(mbar_addr), "r"(bytes) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_MBARRIER_TRY_WAIT)
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
     uint32_t token;
     asm volatile(
@@ -57,7 +54,6 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) 
         : "r"(mbar_addr), "r"(phase) : "memory");
     return token;
 }
-#endif /* NEED */
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
 // suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
@@ -76,7 +72,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-#if defined(CAKE_SM110_XQA_NEED_MBARRIER_WAIT_CLUSTER_HINT)
 __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         int mbar_addr, int phase, uint32_t suspend_time_hint) {
     asm volatile(
@@ -91,9 +86,7 @@ __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         "}\n"
         :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_MBARRIER_WAIT_HINT)
 __device__ __forceinline__ void mbarrier_wait_hint(
         int mbar_addr, int phase, uint32_t suspend_time_hint) {
     asm volatile(
@@ -110,17 +103,13 @@ __device__ __forceinline__ void mbarrier_wait_hint(
         "}\n"
         :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_MBARRIER_WAIT_TOKEN)
 __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
     if (token == 0) {
         mbarrier_wait(mbar_addr, phase);
     }
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_TCGEN05_MMA_F16)
 __device__ __forceinline__ void tcgen05_mma_f16(
     int taddr, uint64_t a_desc, uint64_t b_desc,
     uint32_t i_desc, int enable_input_d) {
@@ -134,23 +123,19 @@ __device__ __forceinline__ void tcgen05_mma_f16(
            "r"(i_desc), "r"(enable_input_d)
          : "memory");
 }
-#endif /* NEED */
 
 union MmaSmemDesc {
     uint64_t u64;
     uint32_t u32[2];
 };
 
-#if defined(CAKE_SM110_XQA_NEED_INCR_SMEM_DESC_LO)
 __device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
     MmaSmemDesc tmp;
     tmp.u64 = smem_desc;
     tmp.u32[0] += offset;
     smem_desc = tmp.u64;
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_ELECT_COMMIT)
 __device__ __forceinline__ void elect_commit(int mbar_addr) {
     asm volatile(
         "{\n\t"
@@ -161,17 +146,13 @@ __device__ __forceinline__ void elect_commit(int mbar_addr) {
         "}\n"
         :: "r"(mbar_addr));
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_MBARRIER_ARRIVE)
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
     asm volatile(
         "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
         :: "r"(mbar_addr) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_MMA_TS_STEP_CG2)
 __device__ __forceinline__ void mma_ts_step_cg2(
     int taddr_out, int taddr_a, int b_lo, uint32_t b_dhi,
     uint32_t i_desc, int enable_d) {
@@ -192,9 +173,7 @@ __device__ __forceinline__ void mma_ts_step_cg2(
         :: "r"(taddr_out), "r"(taddr_a), "r"(b_lo), "r"(b_dhi),
            "r"(i_desc), "r"(enable_d));
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_ELECT_COMMIT_CG2_MULTICAST)
 __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
     asm volatile(
         "{\n\t"
@@ -205,7 +184,6 @@ __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16
         "}\n"
         :: "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
-#endif /* NEED */
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
     asm volatile(
@@ -213,7 +191,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
         :: "r"(mbar_addr), "r"(bytes) : "memory");
 }
 
-#if defined(CAKE_SM110_XQA_NEED_TMEM_ST_X16_F32)
 __device__ __forceinline__ void tmem_st_x16_f32(int tmem_addr, const float* src) {
     asm volatile(
         "tcgen05.st.sync.aligned.32x32b.x16.b32"
@@ -225,9 +202,7 @@ __device__ __forceinline__ void tmem_st_x16_f32(int tmem_addr, const float* src)
            "f"(src[8]),  "f"(src[9]),  "f"(src[10]), "f"(src[11]),
            "f"(src[12]), "f"(src[13]), "f"(src[14]), "f"(src[15]));
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_TMEM_ST_X32)
 __device__ __forceinline__ void tmem_st_x32(int tmem_addr, uint32_t* src) {
     asm volatile(
         "tcgen05.st.sync.aligned.32x32b.x32.b32"
@@ -245,7 +220,6 @@ __device__ __forceinline__ void tmem_st_x32(int tmem_addr, uint32_t* src) {
            "r"(src[24]), "r"(src[25]), "r"(src[26]), "r"(src[27]),
            "r"(src[28]), "r"(src[29]), "r"(src[30]), "r"(src[31]));
 }
-#endif /* NEED */
 
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
@@ -253,13 +227,11 @@ __device__ __forceinline__ float approx_exp2(float x) {
     return y;
 }
 
-#if defined(CAKE_SM110_XQA_NEED_APPROX_RCP)
 __device__ __forceinline__ float approx_rcp(float x) {
     float y;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
-#endif /* NEED */
 
 __device__ __forceinline__ float max_noftz(float a, float b) {
     float c;
@@ -271,12 +243,10 @@ __device__ __forceinline__ float row_max_reduce(float2 acc) {
     return max_noftz(acc.x, acc.y);
 }
 
-#if defined(CAKE_SM110_XQA_NEED_MUL_F32X2_INPLACE)
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
     asm("mul.rn.ftz.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
-#endif /* NEED */
 
 __device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
     asm("mul.rn.f32x2 %0, %0, %1;"
@@ -302,7 +272,6 @@ __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
-#if defined(CAKE_SM110_XQA_NEED_TCGEN05_COMMIT_CG1_MULTICAST_LEADER)
 __device__ __forceinline__ void tcgen05_commit_cg1_multicast_leader(
     int mbar_addr, uint16_t cta_mask, uint32_t leader) {
     asm volatile(
@@ -313,9 +282,7 @@ __device__ __forceinline__ void tcgen05_commit_cg1_multicast_leader(
         "}\n"
         :: "r"(mbar_addr), "h"(cta_mask), "r"(leader) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_TMA_3D_GMEM2SMEM)
 __device__ __forceinline__ void tma_3d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
     asm volatile(
@@ -325,18 +292,14 @@ __device__ __forceinline__ void tma_3d_gmem2smem(
         :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
            "r"(mbar_addr) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_TCGEN05_COMMIT)
 __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
     asm volatile(
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
         ".shared::cluster.b64 [%0];"
         :: "r"(mbar_addr) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_TCGEN05_COMMIT_LEADER)
 __device__ __forceinline__ void tcgen05_commit_leader(
     int mbar_addr, uint32_t leader) {
     asm volatile(
@@ -347,9 +310,7 @@ __device__ __forceinline__ void tcgen05_commit_leader(
         "}\n"
         :: "r"(mbar_addr), "r"(leader) : "memory");
 }
-#endif /* NEED */
 
-#if defined(CAKE_SM110_XQA_NEED_TMEM_LD_X16)
 __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
     asm volatile(
         "tcgen05.ld.sync.aligned.32x32b.x16.b32"
@@ -361,6 +322,5 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
           "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
         : "r"(tmem_addr));
 }
-#endif /* NEED */
 
 #endif  // CAKE_SM110_XQA_DEVICE_HELPERS_CUH

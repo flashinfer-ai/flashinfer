@@ -28,6 +28,14 @@ once by :meth:`CakeUlyssesA2A.zero_signals`), binds the records' argument plans
 once, and launches with the caller's input and output: no allocation, no copy
 and no host synchronization per call, so a call is CUDA-graph capturable.
 
+An output every rank allocated together and exchanged over CUDA IPC (the
+caller's registered output) takes the direct route instead:
+:meth:`CakeUlyssesA2A.bind_direct` loads and binds its programs once,
+:func:`peer_table` turns the ranks' output addresses into the output's peer
+table, :func:`device_view` views this rank's allocation as the output tensor,
+and :meth:`CakeUlyssesA2A.launch_direct` writes every block straight into its
+destination rank's output.
+
 The route decision is :func:`route_arch`: the device's capability names an
 exported architecture and ``build.json`` delivers the scatter and the gather
 library of ``(dtype, world_size)`` for it.  A communicator whose device or
@@ -50,8 +58,9 @@ _DTYPE_NAMES: dict[torch.dtype, str] = {
     torch.float16: "f16",
     torch.float32: "f32",
 }
-# The logical arguments a launch supplies per call, in the order ``launch`` takes them.
+# The logical arguments a launch supplies per call, in the order ``launch`` and ``launch_direct`` take them.
 _PER_CALL = ("inp", "out", "B", "S_local", "H_local", "D")
+_PER_CALL_DIRECT = ("inp", "out", "out_peers", "B", "S_local", "H_local", "D")
 
 
 def dtype_name(dtype: torch.dtype) -> str:
@@ -72,12 +81,15 @@ def device_arch(device_index: int) -> Optional[str]:
     )
 
 
-def route_arch(device_index: int, dtype: torch.dtype, world_size: int) -> Optional[str]:
+def route_arch(
+    device_index: int, dtype: torch.dtype, world_size: int, *, direct: bool = False
+) -> Optional[str]:
     """The architecture whose delivered libraries own both collectives of a communicator, else ``None``.
 
     ``None`` when the device is not an exported target, the element type or
     world size is outside the package's portfolio, or ``build.json`` does not
-    deliver both the scatter and the gather library for the architecture.
+    deliver both the scatter and the gather library of the route (staged, or
+    direct with ``direct=True``) for the architecture.
     """
 
     arch = device_arch(device_index)
@@ -87,17 +99,21 @@ def route_arch(device_index: int, dtype: torch.dtype, world_size: int) -> Option
         device_capability=tuple(torch.cuda.get_device_capability(device_index)),
         dtype=_DTYPE_NAMES[dtype],
         world_size=world_size,
+        direct=direct,
     ):
         return arch
     return None
 
 
-def warm(arch: str, dtype: torch.dtype, world_size: int) -> None:
-    """Load (JIT-building when no prebuilt file exists) the scatter and gather libraries of one communicator."""
+def warm(
+    arch: str, dtype: torch.dtype, world_size: int, *, direct: bool = False
+) -> None:
+    """Load (JIT-building when no prebuilt file exists) the scatter and gather libraries of one communicator
+    on the route (staged, or direct with ``direct=True``)."""
 
     name = dtype_name(dtype)
     for mode in cake_jit.MODES:
-        cake_jit.load(cake_jit.record_name(name, world_size, mode), arch)
+        cake_jit.load(cake_jit.record_name(name, world_size, mode, direct=direct), arch)
 
 
 def peer_table(addresses: Sequence[int]) -> torch.Tensor:
@@ -117,11 +133,16 @@ def peer_table(addresses: Sequence[int]) -> torch.Tensor:
 
 # ---- a torch view of a raw device allocation ----------------------------------
 #
-# The signal allocation is a plain ``cudaMalloc`` of the caller's IPC transaction,
-# not a torch tensor; the binding checks ``signals_self`` as a contiguous CUDA
-# ``uint32`` tensor on the kernel's device.  A DLPack capsule over the raw pointer
-# with a no-op deleter gives that view without a copy; the capsule's backing
-# structures stay alive on the returned tensor.
+# The signal allocation and a registered output are plain ``cudaMalloc``s of the
+# caller's IPC transactions, not torch tensors; the bindings check
+# ``signals_self`` and ``out`` as contiguous CUDA tensors on the kernel's device.
+# A DLPack capsule over the raw pointer gives that view without a copy.  The
+# capsule's structures live in one C allocation whose deleter is the C
+# library's ``free``: torch calls it when the view's storage is released, so
+# the structures outlive every tensor sharing that storage (a narrowed view
+# made under ``torch.inference_mode`` records no base, and ``.data`` drops
+# it), and no Python code runs at release.  The device memory itself belongs
+# to the caller's IPC transaction, which frees it.
 
 
 class _DLDataType(ctypes.Structure):
@@ -152,57 +173,103 @@ class _DLManagedTensor(ctypes.Structure):
     pass
 
 
+_DLDeleter = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
 _DLManagedTensor._fields_ = [
     ("dl_tensor", _DLTensor),
     ("manager_ctx", ctypes.c_void_p),
-    ("deleter", ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))),
+    ("deleter", _DLDeleter),
 ]
 
 
-@ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
-def _no_op_deleter(_managed: Any) -> None:
-    # The memory belongs to the caller's IPC transaction, which frees it.
-    pass
+class _ViewBlock(ctypes.Structure):
+    """One C allocation: the managed tensor first (the deleter frees it by that address), then its 1-D shape and
+    strides."""
+
+    _fields_ = [
+        ("managed", _DLManagedTensor),
+        ("shape", ctypes.c_int64),
+        ("strides", ctypes.c_int64),
+    ]
+
+
+_LIBC = ctypes.CDLL(None)
+_LIBC.malloc.restype = ctypes.c_void_p
+_LIBC.malloc.argtypes = [ctypes.c_size_t]
+_LIBC.free.restype = None
+_LIBC.free.argtypes = [ctypes.c_void_p]
+_FREE_ADDRESS = ctypes.cast(_LIBC.free, ctypes.c_void_p).value
 
 
 _K_DL_CUDA = 2
 _K_DL_UINT = 1
+_K_DL_FLOAT = 2
+_K_DL_BFLOAT = 4
+# DLPack (type code, bits) of every element type a view takes.
+_DL_TYPES: dict[torch.dtype, tuple[int, int]] = {
+    torch.uint32: (_K_DL_UINT, 32),
+    torch.bfloat16: (_K_DL_BFLOAT, 16),
+    torch.float16: (_K_DL_FLOAT, 16),
+    torch.float32: (_K_DL_FLOAT, 32),
+}
 
 
-class _ViewKeepAlive:
-    """The ctypes objects a DLPack view points into, kept alive on the view."""
+def device_view(
+    pointer: int, device_index: int, dtype: torch.dtype, numel: int
+) -> torch.Tensor:
+    """A contiguous CUDA ``dtype[numel]`` tensor over the device allocation at ``pointer`` (no copy).
 
-    def __init__(self, shape: Any, strides: Any, managed: Any) -> None:
-        self.shape = shape
-        self.strides = strides
-        self.managed = managed
+    The tensor does not own the memory: the allocation's owner frees it, after
+    which the tensor must not be used.
+    """
+
+    if int(pointer) <= 0:
+        raise ValueError("the view's pointer must be a nonzero device pointer")
+    if dtype not in _DL_TYPES:
+        raise ValueError(f"dtype must be one of {tuple(_DL_TYPES)}, got {dtype!r}")
+    if int(numel) < 1:
+        raise ValueError(f"a view holds at least one element, got {numel!r}")
+    code, bits = _DL_TYPES[dtype]
+    address = _LIBC.malloc(ctypes.sizeof(_ViewBlock))
+    if not address:
+        raise MemoryError("cannot allocate a DLPack view's structures")
+    block = _ViewBlock.from_address(address)
+    block.shape = int(numel)
+    block.strides = 1
+    managed = block.managed
+    managed.dl_tensor.data = ctypes.c_void_p(int(pointer))
+    managed.dl_tensor.device = _DLDevice(_K_DL_CUDA, int(device_index))
+    managed.dl_tensor.ndim = 1
+    managed.dl_tensor.dtype = _DLDataType(code, bits, 1)
+    managed.dl_tensor.shape = ctypes.cast(
+        address + _ViewBlock.shape.offset, ctypes.POINTER(ctypes.c_int64)
+    )
+    managed.dl_tensor.strides = ctypes.cast(
+        address + _ViewBlock.strides.offset, ctypes.POINTER(ctypes.c_int64)
+    )
+    managed.dl_tensor.byte_offset = 0
+    managed.manager_ctx = None
+    managed.deleter = _DLDeleter(_FREE_ADDRESS)
+    new_capsule = ctypes.pythonapi.PyCapsule_New
+    new_capsule.restype = ctypes.py_object
+    new_capsule.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    capsule = new_capsule(address, b"dltensor", None)
+    try:
+        return torch.utils.dlpack.from_dlpack(capsule)
+    except BaseException:
+        # torch renames a capsule it consumed (and then owns the structures);
+        # one still named "dltensor" was not taken, so its block is ours.
+        is_valid = ctypes.pythonapi.PyCapsule_IsValid
+        is_valid.restype = ctypes.c_int
+        is_valid.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        if is_valid(capsule, b"dltensor"):
+            _LIBC.free(address)
+        raise
 
 
 def signal_view(pointer: int, device_index: int) -> torch.Tensor:
     """This rank's signal allocation as a contiguous CUDA ``uint32[SIGNAL_WORDS]`` tensor (no copy)."""
 
-    if int(pointer) <= 0:
-        raise ValueError("the signal pointer must be a nonzero device pointer")
-    words = cake_jit.SIGNAL_WORDS
-    shape = (ctypes.c_int64 * 1)(words)
-    strides = (ctypes.c_int64 * 1)(1)
-    managed = _DLManagedTensor()
-    managed.dl_tensor.data = ctypes.c_void_p(int(pointer))
-    managed.dl_tensor.device = _DLDevice(_K_DL_CUDA, int(device_index))
-    managed.dl_tensor.ndim = 1
-    managed.dl_tensor.dtype = _DLDataType(_K_DL_UINT, 32, 1)
-    managed.dl_tensor.shape = ctypes.cast(shape, ctypes.POINTER(ctypes.c_int64))
-    managed.dl_tensor.strides = ctypes.cast(strides, ctypes.POINTER(ctypes.c_int64))
-    managed.dl_tensor.byte_offset = 0
-    managed.manager_ctx = None
-    managed.deleter = _no_op_deleter
-    new_capsule = ctypes.pythonapi.PyCapsule_New
-    new_capsule.restype = ctypes.py_object
-    new_capsule.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    capsule = new_capsule(ctypes.addressof(managed), b"dltensor", None)
-    view = torch.utils.dlpack.from_dlpack(capsule)
-    view._cake_keep_alive = _ViewKeepAlive(shape, strides, managed)  # type: ignore[attr-defined]
-    return view
+    return device_view(pointer, device_index, torch.uint32, cake_jit.SIGNAL_WORDS)
 
 
 # ---- the per-communicator handle --------------------------------------------------
@@ -260,20 +327,34 @@ class CakeUlyssesA2A:
         self.staging_peers = peer_table(staging_ptrs)
         self.signals_peers = peer_table(signal_ptrs)
         self.signals_self = signal_view(signal_ptrs[rank], self.device_index)
-        name = dtype_name(dtype)
-        fixed = {
-            "staging_peers": self.staging_peers,
+        self._launches = self._bind(direct=False)
+        self._direct_launches: Optional[
+            dict[int, tuple[Any, list[Any], tuple[int, ...]]]
+        ] = None
+        self._closed = False
+
+    def _bind(
+        self, *, direct: bool
+    ) -> dict[int, tuple[Any, list[Any], tuple[int, ...]]]:
+        """Each mode's plan on a route bound once: the fixed arguments in place, one slot index per per-call
+        value (found by identity through a sentinel per value, so no argument is compared by value)."""
+
+        fixed: dict[str, Any] = {
             "signals_peers": self.signals_peers,
             "signals_self": self.signals_self,
-            "rank": rank,
+            "rank": self.rank,
         }
-        # Bind each record's plan once: the fixed arguments in place, one slot index per per-call value (found
-        # by identity through a sentinel per value, so no argument is compared by value).
-        self._launches: dict[int, tuple[Any, list[Any], tuple[int, ...]]] = {}
+        if not direct:
+            fixed["staging_peers"] = self.staging_peers
+        per_call = _PER_CALL_DIRECT if direct else _PER_CALL
+        name = dtype_name(self.dtype)
+        launches: dict[int, tuple[Any, list[Any], tuple[int, ...]]] = {}
         for mode in cake_jit.MODES:
-            record_name = cake_jit.record_name(name, world_size, mode)
+            record_name = cake_jit.record_name(
+                name, self.world_size, mode, direct=direct
+            )
             record = cake_jit.MODULES[record_name]
-            sentinels = {key: object() for key in _PER_CALL}
+            sentinels = {key: object() for key in per_call}
             template = cake_jit.plan_arguments(record, {**fixed, **sentinels})
             slots = tuple(
                 next(
@@ -281,12 +362,44 @@ class CakeUlyssesA2A:
                     for index, value in enumerate(template)
                     if value is sentinels[key]
                 )
-                for key in _PER_CALL
+                for key in per_call
             )
-            module = cake_jit.load(record_name, arch)
+            module = cake_jit.load(record_name, self.arch)
             entry = getattr(module, record["ffi_entry"])
-            self._launches[mode] = (entry, template, slots)
-        self._closed = False
+            launches[mode] = (entry, template, slots)
+        return launches
+
+    @property
+    def direct_route(self) -> bool:
+        """Whether ``build.json`` delivers the direct route's scatter and gather libraries for this handle."""
+
+        return (
+            route_arch(self.device_index, self.dtype, self.world_size, direct=True)
+            == self.arch
+        )
+
+    def bind_direct(self) -> None:
+        """Load (JIT-building when needed) and bind the direct route's programs once; idempotent.
+
+        ``RuntimeError`` when the package does not deliver them for this
+        handle's architecture, element type and world size.
+        """
+
+        self._check_open()
+        if self._direct_launches is not None:
+            return
+        if not self.direct_route:
+            raise RuntimeError(
+                f"the package delivers no direct Cake Ulysses all-to-all route for "
+                f"{self.dtype} with world size {self.world_size} on {self.arch}"
+            )
+        self._direct_launches = self._bind(direct=True)
+
+    def output_view(self, pointer: int, numel: int) -> torch.Tensor:
+        """This rank's registered output allocation at ``pointer`` as a contiguous ``numel``-element tensor of
+        the handle's element type (no copy; the caller owns and frees the allocation)."""
+
+        return device_view(pointer, self.device_index, self.dtype, numel)
 
     def zero_signals(self) -> None:
         """Zero this rank's signal words on the current stream (once, before the first collective)."""
@@ -327,11 +440,49 @@ class CakeUlyssesA2A:
         with tvm_ffi.use_torch_stream():
             entry(*args)
 
+    def launch_direct(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        out_peers: torch.Tensor,
+        B: int,
+        S_local: int,
+        H: int,
+        D: int,
+        mode: int,
+    ) -> None:
+        """One collective on the direct route, on the current torch stream: every block goes straight into its
+        destination rank's output.
+
+        ``out`` is this rank's registered output and ``out_peers`` its peer
+        table (:func:`peer_table` of every rank's address of the same
+        registration); every rank passes its own view of the same registration.
+        Otherwise as :meth:`launch`; :meth:`bind_direct` must have run.
+        """
+
+        self._check_open()
+        if self._direct_launches is None:
+            raise RuntimeError("bind_direct() must run before the first direct launch")
+        if mode not in self._direct_launches:
+            raise ValueError(f"mode must be one of {cake_jit.MODES}, got {mode!r}")
+        if H % self.world_size:
+            raise ValueError(
+                f"the global head count {H} is not divisible by world size {self.world_size}"
+            )
+        entry, template, slots = self._direct_launches[mode]
+        args = list(template)
+        values = (inp, out, out_peers, B, S_local, H // self.world_size, D)
+        for slot, value in zip(slots, values, strict=True):
+            args[slot] = value
+        with tvm_ffi.use_torch_stream():
+            entry(*args)
+
     def dispose(self) -> None:
         """Drop the bound arguments; the caller frees the allocations. Idempotent."""
 
         self._closed = True
         self._launches = {}
+        self._direct_launches = None
         self.signals_self = None  # type: ignore[assignment]
         self.staging_peers = None  # type: ignore[assignment]
         self.signals_peers = None  # type: ignore[assignment]
@@ -344,6 +495,7 @@ class CakeUlyssesA2A:
 __all__ = [
     "CakeUlyssesA2A",
     "device_arch",
+    "device_view",
     "dtype_name",
     "peer_table",
     "route_arch",

@@ -14,8 +14,9 @@
 
 """Tests for FP4 NVF4 (E2M1 data, E4M3 scale factors) FC2 BatchedGemm TS kernel.
 
-Covers shuffled BatchM N128 and BatchN high-throughput variants with
-K256/K512 tiles, static/persistent scheduling, and one/two-CTA clusters.
+Covers variant table rows 31-54 (FC2_LL) and 55-58 (FC2_HT):
+  tile_n ∈ {8, 16, 32}, tile_k ∈ {256, 512}, stages ∈ {5, 9},
+  static/persistent, 1-CTA/2-CTA.
 
 Run with: pytest tests/prims_ts/test_batched_gemm_fp4_fc2.py -v
 Requires: CUDA GPU with SM100A+ (B200 Blackwell)
@@ -28,11 +29,14 @@ import torch
 from flashinfer.utils import is_sm100a_supported
 
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-    uniform_pipeline_stage_overrides,
     BatchMode,
     BiasType,
+    CtaRasterOrder,
     DType,
     SfLayout,
+    make_config,
+    resolve_problem_config,
+    uniform_pipeline_stage_overrides,
 )
 
 pytestmark = [
@@ -44,28 +48,18 @@ pytestmark = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def _skip_sm107_gpu_kernels(request):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
-        return
-    if request.cls is not None and request.cls.__name__ != "TestFp4Fc2Validation":
-        pytest.skip("Prims-TS FP4 FC2 supports SM100 and SM103, not SM107")
-
-
-# FP4 FC2 BatchM base config with block-shuffled weights.
+# FP4 FC2 LowLatency base config (rows 31-54).
 # tmem_sfa/sfb_cols = tile_k / mma_k * 4 = num_kblocks * 4
 FP4_FC2_LL = dict(
     route_act=0,
     act_kind=0,
-    sf_layout_b=int(SfLayout.R128c4),
-    cluster_m=1,
-    tile_m=128,
+    sf_layout_b=1,
+    umma_cta_count=1,
     mma_m=128,
     mma_k=64,
     dtype_a=int(DType.E2M1),
     dtype_b=int(DType.E2M1),
     dtype_c=int(DType.BF16),
-    sf_bits=8,
     epilogue_regs=128,
     mma_regs=48,
     load_regs=48,
@@ -86,7 +80,11 @@ def _run_fp4_fc2(
     tile_k=256,
     pipeline_stages=5,
     tile_scheduler=0,
-    cluster_m=1,
+    umma_cta_count=1,
+    cluster_dim_x=0,
+    cluster_dim_y=1,
+    fallback_cluster_dim_x=0,
+    fallback_cluster_dim_y=1,
     num_experts=2,
     num_tokens=256,
     top_k=1,
@@ -97,6 +95,11 @@ def _run_fp4_fc2(
     sf_layout_b=None,
     scale_c_value=1.0,
     scale_gate_value=1.0,
+    output_guard_elements=0,
+    problem_n=None,
+    problem_k=None,
+    require_mixed_cga_runtime=False,
+    data_distribution="default",
 ):
     """Helper: run FP4 FC2 reference check."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -105,8 +108,12 @@ def _run_fp4_fc2(
 
     num_stages_tmem_acc = 2 if tile_scheduler == 1 else 1
     cfg = {**FP4_FC2_LL}
-    cfg["cluster_m"] = cluster_m
-    if cluster_m >= 2:
+    cfg["umma_cta_count"] = umma_cta_count
+    cfg["cluster_dim_x"] = cluster_dim_x
+    cfg["cluster_dim_y"] = cluster_dim_y
+    cfg["fallback_cluster_dim_x"] = fallback_cluster_dim_x
+    cfg["fallback_cluster_dim_y"] = fallback_cluster_dim_y
+    if umma_cta_count >= 2:
         cfg["mma_m"] = 256
     if sf_layout_a is not None:
         cfg["sf_layout_a"] = sf_layout_a
@@ -129,17 +136,22 @@ def _run_fp4_fc2(
         use_tma_store=use_tma_store,
         scale_c_value=scale_c_value,
         scale_gate_value=scale_gate_value,
+        output_guard_elements=output_guard_elements,
+        problem_n=problem_n,
+        problem_k=problem_k,
+        require_mixed_cga_runtime=require_mixed_cga_runtime,
+        data_distribution=data_distribution,
         **cfg,
     )
     assert result, (
         "FP4 FC2 failed: "
         f"tile_n={tile_n}, tile_k={tile_k}, stages={pipeline_stages}, "
-        f"scheduler={tile_scheduler}, cluster_m={cluster_m}"
+        f"scheduler={tile_scheduler}, umma_cta_count={umma_cta_count}"
     )
 
 
 class TestFp4Fc2Validation:
-    def test_validate_tile128_k256(self):
+    def test_validate_tile8_k256(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -148,22 +160,22 @@ class TestFp4Fc2Validation:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=8,
+            mma_n=8,
+            epi_tile_n=8,
             tile_k=256,
             **uniform_pipeline_stage_overrides(5),
             num_stages_tmem_acc=1,
             **FP4_FC2_LL,
         )
 
-    def test_validate_tile128_k512(self):
+    def test_validate_tile16_k512(self):
         """tile_k=512 uses separate CopySf plus 256-K TMA boxes."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
 
-        tile_n = 128
+        tile_n = 16
         tile_k = 512
         build_batched_gemm_task_manager(
             num_experts=2,
@@ -173,7 +185,7 @@ class TestFp4Fc2Validation:
             mma_n=tile_n,
             epi_tile_n=tile_n,
             tile_k=tile_k,
-            **uniform_pipeline_stage_overrides(3),
+            **uniform_pipeline_stage_overrides(5),
             num_stages_tmem_acc=1,
             **FP4_FC2_LL,
         )
@@ -187,7 +199,7 @@ class TestFp4Fc2Validation:
                 mma_n=tile_n,
                 epi_tile_n=tile_n,
                 tile_k=tile_k,
-                **uniform_pipeline_stage_overrides(3),
+                **uniform_pipeline_stage_overrides(5),
                 num_stages_tmem_acc=1,
                 sf_layout_a=int(SfLayout.R8c4),
                 **FP4_FC2_LL,
@@ -211,28 +223,39 @@ class TestFp4Fc2Validation:
                 tile_k=tile_k,
                 **uniform_pipeline_stage_overrides(5),
                 num_stages_tmem_acc=1,
-                **{**FP4_FC2_LL, "sf_layout_b": int(SfLayout.R8c4)},
+                **FP4_FC2_LL,
             )
 
 
 class TestFp4Fc2LLStatic:
-    """FP4 FC2 BatchM with the static scheduler."""
+    """FP4 FC2 LowLatency static scheduler (rows 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53)."""
 
-    def test_tile128_k256_s5_tma_store(self):
-        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5, use_tma_store=1)
+    def test_tile8_k256_s5(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5)
 
-    def test_tile128_k256_s5_b_sf_128x4(self):
-        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5)
+    def test_tile8_k256_s5_all_zero_inputs(self):
+        _run_fp4_fc2(
+            tile_n=8,
+            tile_k=256,
+            pipeline_stages=5,
+            data_distribution="allZeros",
+        )
 
-    def test_tile128_k256_s5_bias_m(self):
-        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5, bias_type=1)
+    def test_tile8_k256_s5_tma_store(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, use_tma_store=1)
 
-    def test_tile128_k256_s5_global_scale_c(self):
+    def test_tile8_k256_s5_b_sf_8x4(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5)
+
+    def test_tile8_k256_s5_bias_m(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, bias_type=1)
+
+    def test_tile8_k256_s5_global_scale_c(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
 
-        tile_n = 128
+        tile_n = 8
         tile_k = 256
         common = dict(
             num_experts=2,
@@ -258,18 +281,18 @@ class TestFp4Fc2LLStatic:
             atol=0.25,
         )
 
-    def test_tile128_k256_s5_tma_oob_opt_partial_m_tile(self):
+    def test_tile8_k256_s5_tma_oob_opt_partial_m_tile(self):
         _run_fp4_fc2(
-            tile_n=128,
+            tile_n=8,
             tile_k=256,
             pipeline_stages=5,
             num_experts=1,
             num_tokens=160,
         )
 
-    def test_tile128_k256_s5_nonrounded_topk_expanded_layout(self):
+    def test_tile8_k256_s5_nonrounded_topk_expanded_layout(self):
         _run_fp4_fc2(
-            tile_n=128,
+            tile_n=8,
             tile_k=256,
             pipeline_stages=5,
             num_experts=3,
@@ -277,12 +300,12 @@ class TestFp4Fc2LLStatic:
             top_k=2,
         )
 
-    def test_tile128_k256_s5_early_exit_overestimated_token_grid(self):
+    def test_tile8_k256_s5_early_exit_overestimated_token_grid(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
 
-        tile_n = 128
+        tile_n = 8
         tile_k = 256
         result = reference_check(
             num_experts=4,
@@ -300,11 +323,14 @@ class TestFp4Fc2LLStatic:
         )
         assert result
 
-    def test_tile128_k256_s5(self):
-        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5)
+    def test_tile16_k256_s5(self):
+        _run_fp4_fc2(tile_n=16, tile_k=256, pipeline_stages=5)
 
-    def test_tile128_k512_s3(self):
-        _run_fp4_fc2(tile_n=128, tile_k=512, pipeline_stages=3, num_tokens=128)
+    def test_tile32_k256_s5(self):
+        _run_fp4_fc2(tile_n=32, tile_k=256, pipeline_stages=5)
+
+    def test_tile8_k512_s5(self):
+        _run_fp4_fc2(tile_n=8, tile_k=512, pipeline_stages=5, num_tokens=128)
 
     def test_tile8_k512_s5_per_token_sfb(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -339,49 +365,201 @@ class TestFp4Fc2LLStatic:
             **cfg,
         )
 
-    def test_tile128_k512_s3_cluster2(self):
-        _run_fp4_fc2(tile_n=128, tile_k=512, pipeline_stages=3, cluster_m=2)
+    def test_tile16_k512_s5_cluster2(self):
+        _run_fp4_fc2(tile_n=16, tile_k=512, pipeline_stages=5, umma_cta_count=2)
+
+    def test_tile32_k512_s5_cluster2(self):
+        _run_fp4_fc2(tile_n=32, tile_k=512, pipeline_stages=5, umma_cta_count=2)
+
+    def test_tile8_k256_s9(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=9)
 
 
 class TestFp4Fc2LLPersistent:
-    """FP4 FC2 BatchM with persistent scheduling."""
+    """FP4 FC2 LowLatency persistent (rows 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54)."""
 
-    def test_tile128_k512_persistent(self):
+    def test_tile8_k256_persistent(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, tile_scheduler=1)
+
+    def test_tile8_k512_persistent(self):
         _run_fp4_fc2(
-            tile_n=128,
+            tile_n=8,
             tile_k=512,
-            pipeline_stages=2,
+            pipeline_stages=5,
             tile_scheduler=1,
             num_tokens=128,
         )
 
-    def test_tile128_k256_persistent_tma_store(self):
+    def test_tile8_k256_s9_persistent(self):
+        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=9, tile_scheduler=1)
+
+    def test_tile8_k256_persistent_tma_store(self):
         _run_fp4_fc2(
-            tile_n=128,
+            tile_n=8,
             tile_k=256,
             pipeline_stages=5,
             tile_scheduler=1,
             use_tma_store=1,
         )
 
-    def test_tile128_k256_persistent(self):
-        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=4, tile_scheduler=1)
+    def test_tile16_k256_persistent(self):
+        _run_fp4_fc2(tile_n=16, tile_k=256, pipeline_stages=5, tile_scheduler=1)
 
-    def test_tile128_k256_persistent_pdl(self):
+    def test_tile16_k512_persistent_cluster2(self):
         _run_fp4_fc2(
-            tile_n=128,
+            tile_n=16,
+            tile_k=512,
+            pipeline_stages=5,
+            tile_scheduler=1,
+            umma_cta_count=2,
+        )
+
+    def test_tile16_k512_persistent_mixed_cga(self):
+        _run_fp4_fc2(
+            tile_n=16,
+            tile_k=512,
+            pipeline_stages=5,
+            tile_scheduler=1,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            output_guard_elements=128,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("tile_n", "tile_k", "pipeline_stages"),
+        [
+            (16, 256, 5),
+            (32, 512, 5),
+        ],
+    )
+    def test_persistent_mixed_cga_tma_variants(self, tile_n, tile_k, pipeline_stages):
+        """Cover compact-SFB/K256 and wider-N/K512 TMA pipelines."""
+        _run_fp4_fc2(
+            tile_n=tile_n,
+            tile_k=tile_k,
+            pipeline_stages=pipeline_stages,
+            tile_scheduler=1,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            output_guard_elements=128,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "cluster_dim_x",
+            "cluster_dim_y",
+            "fallback_cluster_dim_x",
+            "fallback_cluster_dim_y",
+        ),
+        [
+            (4, 1, 2, 1),
+            (2, 2, 2, 1),
+            (4, 4, 2, 2),
+        ],
+    )
+    def test_persistent_mixed_cga_topologies(
+        self,
+        cluster_dim_x,
+        cluster_dim_y,
+        fallback_cluster_dim_x,
+        fallback_cluster_dim_y,
+    ):
+        """Exercise X-only, Y-only, and 16-CTA FC2 TMA topologies."""
+        _run_fp4_fc2(
+            tile_n=16,
+            tile_k=512,
+            pipeline_stages=5,
+            tile_scheduler=1,
+            umma_cta_count=2,
+            cluster_dim_x=cluster_dim_x,
+            cluster_dim_y=cluster_dim_y,
+            fallback_cluster_dim_x=fallback_cluster_dim_x,
+            fallback_cluster_dim_y=fallback_cluster_dim_y,
+            output_guard_elements=128,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
+
+    def test_persistent_mixed_cga_multistage_wrap(self):
+        """Run eight K tiles through the five-stage mixed-CGA pipelines."""
+        _run_fp4_fc2(
+            tile_n=16,
+            tile_k=512,
+            pipeline_stages=5,
+            tile_scheduler=1,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            problem_n=4096,
+            problem_k=4096,
+            require_mixed_cga_runtime=True,
+        )
+
+    @pytest.mark.parametrize("feature", ["pdl", "tma_store"])
+    def test_persistent_mixed_cga_launch_features(self, feature):
+        """Cover PDL ordering and the TMA output-store pipeline."""
+        _run_fp4_fc2(
+            tile_n=16,
             tile_k=256,
-            pipeline_stages=4,
+            pipeline_stages=5,
+            tile_scheduler=1,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            problem_n=4096,
+            use_pdl=int(feature == "pdl"),
+            use_tma_store=int(feature == "tma_store"),
+            require_mixed_cga_runtime=True,
+        )
+
+    def test_persistent_mixed_cga_ragged_routing(self):
+        """Exercise nonuniform expert token counts under both physical CGAs."""
+        _run_fp4_fc2(
+            tile_n=16,
+            tile_k=256,
+            pipeline_stages=5,
+            tile_scheduler=1,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            num_experts=3,
+            num_tokens=130,
+            top_k=2,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
+
+    def test_tile16_k256_persistent_pdl(self):
+        _run_fp4_fc2(
+            tile_n=16,
+            tile_k=256,
+            pipeline_stages=5,
             tile_scheduler=1,
             use_pdl=1,
         )
 
-    def test_tile128_k256_persistent_early_exit(self):
+    def test_tile16_k256_persistent_early_exit(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
 
-        tile_n = 128
+        tile_n = 16
         tile_k = 256
         result = reference_check(
             num_experts=4,
@@ -391,7 +569,7 @@ class TestFp4Fc2LLPersistent:
             mma_n=tile_n,
             epi_tile_n=tile_n,
             tile_k=tile_k,
-            **uniform_pipeline_stage_overrides(4),
+            **uniform_pipeline_stage_overrides(5),
             tile_scheduler=1,
             num_stages_tmem_acc=2,
             use_early_exit=1,
@@ -399,21 +577,21 @@ class TestFp4Fc2LLPersistent:
         )
         assert result
 
-    def test_tile128_k512_persistent_cluster2(self):
+    def test_tile32_k512_persistent_cluster2(self):
         _run_fp4_fc2(
-            tile_n=128,
+            tile_n=32,
             tile_k=512,
-            pipeline_stages=2,
+            pipeline_stages=5,
             tile_scheduler=1,
-            cluster_m=2,
+            umma_cta_count=2,
         )
 
 
 class TestFp4Fc2MultiExpert:
     """FP4 FC2 with multiple experts."""
 
-    def test_4experts_tile128(self):
-        _run_fp4_fc2(tile_n=128, tile_k=256, num_experts=4, num_tokens=512)
+    def test_4experts_tile16(self):
+        _run_fp4_fc2(tile_n=16, tile_k=256, num_experts=4, num_tokens=512)
 
 
 class TestFp4Fc2HT:
@@ -430,6 +608,13 @@ class TestFp4Fc2HT:
         use_unroll_loop_2x_for_mma=0,
         num_experts=2,
         num_tokens=256,
+        cluster_dim_x=0,
+        problem_n=None,
+        problem_k=None,
+        use_early_exit=0,
+        use_clc_fast_drain=0,
+        use_tma_store=0,
+        num_stages_c_smem=0,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             SfLayout,
@@ -440,27 +625,41 @@ class TestFp4Fc2HT:
 
         cfg = {
             **FP4_FC2_LL,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "mma_m": 256,
             "sf_layout_b": int(SfLayout.R8c4 if tile_n <= 64 else SfLayout.R128c4),
             "sf_layout_c": int(SfLayout.R8c4 if tile_n <= 64 else SfLayout.R128c4),
             "batch_mode": int(BatchMode.BATCH_N),
             "transpose_mma_output": 1,
             "use_unroll_loop_2x_for_mma": use_unroll_loop_2x_for_mma,
+            "cluster_dim_x": cluster_dim_x,
+            "use_early_exit": use_early_exit,
+            "use_clc_fast_drain": use_clc_fast_drain,
+            "use_tma_store": use_tma_store,
+            "num_stages_c_smem": num_stages_c_smem,
         }
+        run_cfg = {
+            **cfg,
+            "tile_n": tile_n,
+            "mma_n": tile_n,
+            "epi_tile_n": tile_n,
+            "tile_k": tile_k,
+            **uniform_pipeline_stage_overrides(pipeline_stages),
+            "tile_scheduler": 1,
+            "num_stages_tmem_acc": 2,
+        }
+        if use_unroll_loop_2x_for_mma:
+            assert problem_k is not None
+            resolved = resolve_problem_config(make_config(**run_cfg), problem_k)
+            assert resolved.use_unroll_loop_2x_for_mma == 1
 
         result = reference_check(
             num_experts=num_experts,
             num_tokens=num_tokens,
             top_k=1,
-            tile_n=tile_n,
-            mma_n=tile_n,
-            epi_tile_n=tile_n,
-            tile_k=tile_k,
-            **uniform_pipeline_stage_overrides(pipeline_stages),
-            tile_scheduler=1,
-            num_stages_tmem_acc=2,
-            **cfg,
+            problem_n=problem_n,
+            problem_k=problem_k,
+            **run_cfg,
         )
         assert result, f"FP4 FC2 HT failed: tile_n={tile_n}"
 
@@ -487,6 +686,31 @@ class TestFp4Fc2HT:
         )
 
     @pytest.mark.timeout(240)
+    def test_ht_tile128_k256_fixed_4x1(self):
+        self._run_ht(
+            tile_n=128,
+            pipeline_stages=6,
+            use_unroll_loop_2x_for_mma=1,
+            num_tokens=2048,
+            cluster_dim_x=4,
+            problem_n=7168,
+            problem_k=1024,
+            use_early_exit=1,
+            use_clc_fast_drain=1,
+            use_tma_store=1,
+            num_stages_c_smem=1,
+        )
+
+    @pytest.mark.timeout(240)
+    def test_ht_tile64_k256_unroll2x_multi_k(self):
+        self._run_ht(
+            tile_n=64,
+            tile_k=256,
+            use_unroll_loop_2x_for_mma=1,
+            problem_k=1024,
+        )
+
+    @pytest.mark.timeout(240)
     def test_ht_tile256_k256(self):
         """2-CTA HT256 fused-UTCCP path with tile_n=256 TMEM overlap."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -504,7 +728,6 @@ class TestFp4Fc2HT:
             transpose_mma_output=1,
             route_act=0,
             act_kind=0,
-            tile_m=128,
             tile_n=256,
             tile_k=256,
             epi_tile_m=128,
@@ -512,15 +735,15 @@ class TestFp4Fc2HT:
             mma_m=256,
             mma_n=256,
             mma_k=64,
-            cluster_m=2,
+            umma_cta_count=2,
             dtype_a=int(DType.E2M1),
             dtype_b=int(DType.E2M1),
             dtype_c=int(DType.BF16),
-            sf_bits=8,
             **uniform_pipeline_stage_overrides(5),
             tile_scheduler=1,
             num_stages_tmem_acc=1,
             sf_layout_b=int(SfLayout.R128c4),
+            fuse_sf_copy_to_mma=1,
             use_max_tmem_overlap=1,
             epilogue_regs=48,
             mma_regs=48,
@@ -530,3 +753,264 @@ class TestFp4Fc2HT:
             padding_regs=48,
         )
         assert result, "FP4 FC2 HT256 fused-UTCCP failed"
+
+    @pytest.mark.parametrize("fuse_sf_copy_to_mma", (0, 1))
+    @pytest.mark.timeout(240)
+    def test_ht_tile256_k256_split_sfb_without_tmem_overlap(self, fuse_sf_copy_to_mma):
+        """Validate the NVFP4 split R128c4 SFB descriptor and UTCCP copies."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=512,
+            top_k=1,
+            problem_n=512,
+            problem_k=1024,
+            batch_mode=int(BatchMode.BATCH_N),
+            transpose_mma_output=1,
+            route_act=0,
+            act_kind=0,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=64,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            umma_cta_count=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            **uniform_pipeline_stage_overrides(3, tmem_acc_stages=1),
+            tile_scheduler=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            fuse_sf_copy_to_mma=fuse_sf_copy_to_mma,
+            use_max_tmem_overlap=0,
+            epilogue_regs=48,
+            mma_regs=48,
+            load_regs=48,
+            load_sf_regs=48,
+            copy_sf_regs=48,
+            workid_regs=48,
+            padding_regs=48,
+        )
+        assert result, (
+            f"FP4 FC2 HT256 split-SFB failed: fuse_sf_copy_to_mma={fuse_sf_copy_to_mma}"
+        )
+
+    @pytest.mark.timeout(240)
+    def test_ht_tile256_k256_mixed_cga(self):
+        """TMEM-overlap handoff under multiwave preferred/fallback CGAs."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            SfLayout,
+        )
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=2048,
+            top_k=1,
+            problem_n=4096,
+            batch_mode=int(BatchMode.BATCH_N),
+            transpose_mma_output=1,
+            route_act=0,
+            act_kind=0,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=64,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=1,
+            num_stages_tmem_acc=1,
+            sf_layout_b=int(SfLayout.R128c4),
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            epilogue_regs=48,
+            mma_regs=48,
+            load_regs=48,
+            load_sf_regs=48,
+            workid_regs=48,
+            padding_regs=48,
+            require_mixed_cga_runtime=True,
+        )
+        assert result, "FP4 FC2 HT256 mixed-CGA TMEM overlap failed"
+
+    @pytest.mark.timeout(240)
+    @pytest.mark.parametrize("tmem_ldst_max_num_regs", (32, 64))
+    def test_ht_tile256_k256_no_swap(self, tmem_ldst_max_num_regs):
+        """Regression for non-swap overlap output-subtile addressing."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            SfLayout,
+        )
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=256,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            route_act=0,
+            act_kind=0,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=64,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            umma_cta_count=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=1,
+            num_stages_tmem_acc=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            tmem_ldst_max_num_regs=tmem_ldst_max_num_regs,
+            epilogue_regs=176,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, "FP4 FC2 non-swap HT256 overlap failed"
+
+    @pytest.mark.timeout(240)
+    @pytest.mark.parametrize(
+        ("epi_tile_n", "tmem_ldst_max_num_regs"),
+        ((64, 32), (128, 64)),
+    )
+    def test_ht_tile256_k256_no_swap_multi_work_tile_overlap(
+        self, epi_tile_n, tmem_ldst_max_num_regs
+    ):
+        """Exercise both TMEM windows on persistent resident clusters.
+
+        The old epilogue released TMEM after preserving only one T2R fragment
+        and addressed every later work tile from physical window zero.  This
+        shape has more CLC work than one hardware wave, so resident clusters
+        must consume multiple work tiles and alternate their overlap window.
+        """
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=2048,
+            top_k=1,
+            problem_n=8192,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            route_act=0,
+            act_kind=0,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=epi_tile_n,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            umma_cta_count=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            **uniform_pipeline_stage_overrides(4),
+            tile_scheduler=1,
+            num_stages_tmem_acc=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            tmem_ldst_max_num_regs=tmem_ldst_max_num_regs,
+            epilogue_regs=176,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, (
+            "FP4 FC2 persistent overlap handoff failed: "
+            f"epi_tile_n={epi_tile_n}, "
+            f"tmem_ldst_max_num_regs={tmem_ldst_max_num_regs}"
+        )
+
+    @pytest.mark.timeout(240)
+    def test_ht_tile256_k256_no_swap_along_n(self):
+        """Numerically validate multi-tile non-swap Along-N rasterization."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            SfLayout,
+        )
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=512,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            route_act=0,
+            act_kind=0,
+            tile_n=256,
+            tile_k=256,
+            epi_tile_m=128,
+            epi_tile_n=64,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            umma_cta_count=2,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=1,
+            cta_raster_order=int(CtaRasterOrder.ALONG_N),
+            num_stages_tmem_acc=1,
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.R128c4),
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            epilogue_regs=176,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, "FP4 FC2 non-swap HT256 Along-N overlap failed"

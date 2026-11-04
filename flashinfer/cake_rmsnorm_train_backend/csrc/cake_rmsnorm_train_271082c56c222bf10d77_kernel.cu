@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_RED_FOLD_OFF 0
-#define SMEM_RED_FOLD_STAGE_BYTES 8192
-#define SMEM_RED_FOLD_STRIDE 8192
-#define SMEM_GRP_FOLD_OFF 8192
-#define SMEM_GRP_FOLD_STAGE_BYTES 1024
-#define SMEM_GRP_FOLD_STRIDE 1024
-#define SMEM_TOTAL 9216
-#define THREADS 512
-
 #include <math_constants.h>
 
 extern "C" {
@@ -71,19 +60,14 @@ kernel_cake_rmsnorm_train_271082c56c222bf10d77(float* __restrict__ partial, floa
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red_fold = reinterpret_cast<float*>(smem_raw + 0);
     const int red_fold_addr = smem + 0;
     float* grp_fold = reinterpret_cast<float*>(smem_raw + 8192);

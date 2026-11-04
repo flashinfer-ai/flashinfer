@@ -122,8 +122,12 @@ RANKS = (32, 64, 96, 128)
 # ranks 64 / 96 / 128 at a deep K; the K12288 form of the 64-row program at
 # M 129, whose K 12288 rows the split-K program takes; the form-A biased
 # 64-row program at M 129 on sm_103a, whose K 3072 rows the L2-promoted
-# builds take there -- a K 6144 row).  Update them when the route table
-# changes; ``test_matrix_reaches_every_program`` says when a program is missed.
+# builds take there -- a K 6144 row; the hinted-store rank-32 whole-tile pair
+# build at (M 4096, N 3072, K 6144), the hinted-store rank-128 tail-split build
+# at (M 4096, N 12288, K 3072) and the hinted-store rank-32 tail-split build at
+# (M 6900, N 3072, K 12288), whose performance rows the K=96 builds take on
+# sm_103a).  Update them when the route table changes;
+# ``test_matrix_reaches_every_program`` says when a program is missed.
 COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (333, 3072, 12288, 32, True),
     (6912, 3072, 12288, 64, True),
@@ -134,6 +138,9 @@ COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (129, 3072, 12544, 32, True),
     (129, 3072, 12544, 32, False),
     (129, 3072, 6144, 32, True),
+    (4096, 3072, 6144, 32, True),
+    (4096, 12288, 3072, 128, True),
+    (6900, 3072, 12288, 32, True),
 )
 CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     (m, CONTRACT_N, CONTRACT_K, rank, bias)
@@ -144,29 +151,38 @@ CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
 # The exact-dispatch rows per architecture: the split-K rows (the M 129 K 12288
 # rows of the architectures where the swap-AB split-K program measured faster),
 # the sm_103a M 129 K 3072 rows (the 64-row builds with the TMA L2 promotion of
-# the weight descriptors, shipped for sm_103a only) and the convergence finals'
-# rows; (M, N, K, rank, bias) -> the program it dispatches to there (the shipped
-# cake_r1 two-CTA r32 build on the held rows), the build keywords of those
-# programs, and the programs only one architecture's rows reach.
+# the weight descriptors, shipped for sm_103a only), the sm_103a rows of the
+# two-CTA builds on the K=96 MMA (shipped for sm_103a only), the sm_100a row of
+# the wide-tail build of the tail-split program (shipped for sm_100a only) and
+# the convergence finals' rows; (M, N, K, rank, bias) -> the program it
+# dispatches to there, the
+# build keywords of those programs, and the programs only one architecture's
+# rows reach.
 _P = "cake_nvfp4_svdquant_gemm_"
 EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
     "sm_100a": {
-        (129, 3072, 3072, 128, False): _P + "8c21118cf9b080867cf1",
+        (129, 3072, 3072, 32, False): _P + "5852ad0db045e502e10a",
+        (129, 3072, 3072, 32, True): _P + "05bda082a73c0c1a68b0",
+        (129, 3072, 3072, 64, True): _P + "05bda082a73c0c1a68b0",
+        (129, 3072, 3072, 96, True): _P + "05bda082a73c0c1a68b0",
+        (129, 3072, 3072, 128, False): _P + "5852ad0db045e502e10a",
         (129, 3072, 3072, 128, True): _P + "2270204930b79b8caef7",
-        (129, 3072, 12288, 32, False): _P + "0a3a28f6f508e7d75146",
-        (129, 3072, 12288, 32, True): _P + "8958df827006875b2512",
-        (129, 3072, 12288, 128, False): _P + "0a3a28f6f508e7d75146",
-        (129, 3072, 12288, 128, True): _P + "8958df827006875b2512",
+        (129, 3072, 12288, 32, False): _P + "243af01860dcca0f4e2c",
+        (129, 3072, 12288, 32, True): _P + "36c42441c9d625e03c54",
+        (129, 3072, 12288, 128, False): _P + "243af01860dcca0f4e2c",
+        (129, 3072, 12288, 128, True): _P + "36c42441c9d625e03c54",
         (4096, 3072, 3072, 32, True): _P + "1d78f2bd5722fb02b75a",
+        (4096, 3072, 12288, 32, True): _P + "d758d9efa72998dbcf96",
         (4096, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
         (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6889, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
         (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
         (6912, 3072, 3072, 96, True): _P + "0f7f27a483c337265bf9",
-        (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
-        (9216, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
-        (16384, 3072, 3072, 32, True): _P + "c80322ffcfa97a956474",
-        (16384, 12288, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+        (6912, 3072, 3072, 128, True): _P + "4f451914c2d6580eb2de",
+        (9216, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (16384, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (16384, 12288, 3072, 32, True): _P + "c832b08a912e4c58112b",
     },
     "sm_103a": {
         (129, 3072, 3072, 32, False): _P + "8319e1548886614ab273",
@@ -175,28 +191,39 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
         (129, 3072, 3072, 96, True): _P + "01405277c4bbc4031fbd",
         (129, 3072, 3072, 128, False): _P + "23bfc212699bbb4e6214",
         (129, 3072, 3072, 128, True): _P + "01405277c4bbc4031fbd",
-        (129, 3072, 12288, 32, False): _P + "0a3a28f6f508e7d75146",
-        (129, 3072, 12288, 32, True): _P + "8958df827006875b2512",
-        (129, 3072, 12288, 128, False): _P + "0a3a28f6f508e7d75146",
-        (129, 3072, 12288, 128, True): _P + "8958df827006875b2512",
-        (4096, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
-        (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
-        (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
-        (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
-        (6912, 3072, 3072, 96, True): _P + "5dc32691ea15528b11be",
-        (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
-        (16384, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (129, 3072, 12288, 32, False): _P + "243af01860dcca0f4e2c",
+        (129, 3072, 12288, 32, True): _P + "36c42441c9d625e03c54",
+        (129, 3072, 12288, 128, False): _P + "243af01860dcca0f4e2c",
+        (129, 3072, 12288, 128, True): _P + "36c42441c9d625e03c54",
+        (4096, 3072, 3072, 32, True): _P + "5a1a17e73ef429cf8805",
+        (4096, 3072, 12288, 32, True): _P + "3d47f26879e192ef655a",
+        (4096, 12288, 3072, 32, True): _P + "151d20658188ea0e9651",
+        (6889, 3072, 3072, 32, True): _P + "9fe64b6a30bb7316d03c",
+        (6889, 3072, 12288, 32, True): _P + "151d20658188ea0e9651",
+        (6889, 12288, 3072, 32, True): _P + "9fe64b6a30bb7316d03c",
+        (6912, 3072, 3072, 32, True): _P + "9fe64b6a30bb7316d03c",
+        (6912, 3072, 3072, 64, True): _P + "37c3da710589257a99f1",
+        (6912, 3072, 3072, 96, True): _P + "ff27b5bafbc8d2d15d5b",
+        (6912, 3072, 3072, 128, True): _P + "9d95357d28c063004b71",
+        (6912, 3072, 12288, 32, True): _P + "151d20658188ea0e9651",
+        (6912, 3072, 12288, 128, True): _P + "34ae602d0db3ffa24b4b",
+        (9216, 3072, 3072, 32, True): _P + "a234cd99c8b3ef6af762",
+        (9216, 3072, 12288, 32, True): _P + "3d47f26879e192ef655a",
+        (9216, 12288, 3072, 32, True): _P + "3d47f26879e192ef655a",
+        (16384, 3072, 3072, 32, True): _P + "9fe64b6a30bb7316d03c",
+        (16384, 3072, 12288, 32, True): _P + "60d29f6b0abb512843b5",
+        (16384, 12288, 3072, 32, True): _P + "3d47f26879e192ef655a",
     },
 }
+# The exact rows of the wide-tail build (``wide_tail`` route rows): each admits
+# its problem only where the device's SM count yields the wide schedule of
+# ``tailsplit_wide_units`` (152 SMs, not 148); elsewhere the problem falls
+# through to the program here, the one the rows below route it to.
+WIDE_TAIL_FALLBACK: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
+    "sm_100a": {(4096, 3072, 12288, 32, True): _P + "3880e0aea2ecbe59106a"},
+    "sm_103a": {},
+}
 EXACT_BUILDS: dict[str, dict[str, object]] = {
-    _P + "0a3a28f6f508e7d75146": {
-        "bias": False,
-        "split_k": 4,
-    },
-    _P + "8958df827006875b2512": {
-        "bias": True,
-        "split_k": 4,
-    },
     _P + "0f7f27a483c337265bf9": {
         "bias_path": "regs",
         "rank": 96,
@@ -230,29 +257,6 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "prologue": "overlap",
         "stages": 16,
     },
-    _P + "5dc32691ea15528b11be": {
-        "out_hint": "on",
-        "out_store": "v8hint",
-        "rank": 96,
-    },
-    _P + "8c21118cf9b080867cf1": {
-        "bias": False,
-        "epi": "fused64",
-        "prologue": "overlap",
-        "stages": 15,
-    },
-    _P + "aa5225a75028cbb32391": {
-        "out_hint": "on",
-        "out_store": "v8hint",
-        "rank": 128,
-    },
-    _P + "b4be925d9e1e6959b702": {
-        "rank": 32,
-    },
-    _P + "c80322ffcfa97a956474": {
-        "bias_path": "regs",
-        "rank": 32,
-    },
     _P + "d16d801db12c7bdde4dc": {
         "out_hint": "on",
         "out_store": "v8hint",
@@ -277,22 +281,138 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "prologue": "overlap",
         "stages": 16,
     },
+    _P + "9fe64b6a30bb7316d03c": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "37c3da710589257a99f1": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 64,
+    },
+    _P + "ff27b5bafbc8d2d15d5b": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 96,
+    },
+    _P + "9d95357d28c063004b71": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 128,
+    },
+    _P + "5a1a17e73ef429cf8805": {
+        "k96": True,
+        "k96_form": "panel",
+        "rank": 32,
+    },
+    _P + "3d47f26879e192ef655a": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "a234cd99c8b3ef6af762": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_store": "v8",
+        "rank": 32,
+    },
+    _P + "151d20658188ea0e9651": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "34ae602d0db3ffa24b4b": {
+        "k96": True,
+        "k96_form": "panel",
+        "out_store": "v8hint",
+        "rank": 128,
+    },
+    _P + "60d29f6b0abb512843b5": {
+        "k96": True,
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "c832b08a912e4c58112b": {
+        "bias_path": "regs",
+        "rank": 32,
+    },
+    _P + "05bda082a73c0c1a68b0": {
+        "bias": True,
+        "epi": "fused64",
+        "l2_promotion": "l2_256b",
+        "prologue": "overlap",
+        "stages": 15,
+    },
+    _P + "5852ad0db045e502e10a": {
+        "bias": False,
+        "epi": "fused64",
+        "l2_promotion": "l2_256b",
+        "prologue": "overlap",
+        "stages": 15,
+    },
+    _P + "243af01860dcca0f4e2c": {
+        "bias": False,
+        "inbox": "alias",
+        "l2_promotion": "l2_256b",
+        "split_k": 4,
+        "stages": 11,
+    },
+    _P + "36c42441c9d625e03c54": {
+        "bias": True,
+        "inbox": "alias",
+        "l2_promotion": "l2_256b",
+        "split_k": 4,
+        "stages": 11,
+    },
+    _P + "4f451914c2d6580eb2de": {
+        "out_store": "v8hint",
+        "rank": 128,
+    },
+    _P + "d758d9efa72998dbcf96": {
+        "out_store": "v8hint",
+        "rank": 32,
+        "wide_tail": 192,
+    },
 }
 ARCH_ONLY: dict[str, set[str]] = {
     "sm_100a": {
         _P + "1d78f2bd5722fb02b75a",
         _P + "2270204930b79b8caef7",
         _P + "2ca0cf40f7bbfca9df92",
-        _P + "8c21118cf9b080867cf1",
         _P + "0f7f27a483c337265bf9",
-        _P + "c80322ffcfa97a956474",
+        _P + "05bda082a73c0c1a68b0",
+        _P + "5852ad0db045e502e10a",
+        _P + "c832b08a912e4c58112b",
+        _P + "d16d801db12c7bdde4dc",
+        _P + "d758d9efa72998dbcf96",
+        _P + "fdcf777b3acd972f8841",
     },
     "sm_103a": {
         _P + "01405277c4bbc4031fbd",
         _P + "23bfc212699bbb4e6214",
-        _P + "5dc32691ea15528b11be",
         _P + "8319e1548886614ab273",
         _P + "99bdf6e03d704178faf9",
+        _P + "151d20658188ea0e9651",
+        _P + "34ae602d0db3ffa24b4b",
+        _P + "37c3da710589257a99f1",
+        _P + "3d47f26879e192ef655a",
+        _P + "5a1a17e73ef429cf8805",
+        _P + "60d29f6b0abb512843b5",
+        _P + "9d95357d28c063004b71",
+        _P + "9fe64b6a30bb7316d03c",
+        _P + "a234cd99c8b3ef6af762",
+        _P + "ff27b5bafbc8d2d15d5b",
     },
 }
 # (M, N, K, rank, bias) -> the substring of the ValueError the shape rule raises.
@@ -315,6 +435,7 @@ GRAPH_ROWS = (
     (129, 3072, 12288, 32, False),
     (333, 3072, 3072, 64, False),
     (4096, 3072, 3072, 64, True),
+    (4096, 3072, 12288, 32, True),
     (4097, 3072, 12288, 128, True),
     (6912, 3072, 12288, 32, True),
 )
@@ -521,9 +642,44 @@ def _other_arch() -> str:
     return next(arch for arch in loader.ARCHES if arch != _arch())
 
 
+def _sms() -> int:
+    return loader.sm_count(_device().index)
+
+
 def _route(row) -> str:
     m, n, k, rank, bias = row
-    return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
+    return loader.select_record(
+        m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch(), sm_count=_sms()
+    )
+
+
+def _wide(row, arch: str, sms: int) -> bool:
+    """Whether ``tailsplit_wide_units`` has the wide schedule for ``row`` on
+    ``arch`` with ``sms`` SMs (what a ``wide_tail`` route row admits)."""
+    m, n, k, rank, _ = row
+    group = loader.raster_group(m=m, n=n, k=k, rank=rank, arch=arch)
+    _, _, _, split = loader.tailsplit_wide_units(
+        m=m, n=n, sm_count=sms, raster_group=group
+    )
+    return split == loader.WIDE_TAIL_SPLIT
+
+
+def _exact_rows(arch: str, sms: int) -> dict[tuple[int, int, int, int, bool], str]:
+    """``EXACT_ROWS[arch]`` on a device with ``sms`` SMs: a wide-tail row
+    without the wide schedule there routes to its ``WIDE_TAIL_FALLBACK``."""
+    rows = dict(EXACT_ROWS[arch])
+    for row, name in WIDE_TAIL_FALLBACK[arch].items():
+        if not _wide(row, arch, sms):
+            rows[row] = name
+    return rows
+
+
+def _attempt(**problem) -> str:
+    """``select_record`` of ``problem``, or the name and message of its error."""
+    try:
+        return loader.select_record(**problem)
+    except (RuntimeError, TypeError, ValueError) as error:
+        return f"{type(error).__name__}: {error}"
 
 
 # --------------------------------------------------------------------------- host plan
@@ -622,6 +778,10 @@ def test_route_table_is_total_and_reaches_every_program() -> None:
     for row in table:
         arches = row.get("arches")
         assert arches is None or (arches and set(arches) < set(loader.ARCHES))
+        if "wide_tail" in row:
+            assert row["wide_tail"] is True and "record" in row
+            plan = loader.MODULES[row["record"]]["plan"]
+            assert plan["grid_rule"] == "pair_tailsplit_wide"
         if "records_by_rank" in row:
             assert "record" not in row
             for rank, name in row["records_by_rank"].items():
@@ -650,7 +810,13 @@ def test_matrix_reaches_every_program() -> None:
     this device's architecture routes to (the other architecture's exact rows
     send their problems elsewhere here)."""
     reached = {_route(row) for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS)}
-    expected = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
+    # A wide-tail build is reached only on SM counts with its wide schedule.
+    unreached = {
+        EXACT_ROWS[_arch()][row]
+        for row in WIDE_TAIL_FALLBACK[_arch()]
+        if not _wide(row, _arch(), _sms())
+    }
+    expected = set(loader.MODULES) - ARCH_ONLY[_other_arch()] - unreached
     assert reached == expected, sorted(expected ^ reached)
 
 
@@ -755,13 +921,16 @@ def test_is_supported_needs_a_cuda_device() -> None:
 def test_launch_grid_follows_the_record_rule(m, n) -> None:
     grid_m = -(-m // loader.BLOCK_M)
     sms = 148
+    group = 2
     seen = set()
     for name, record in loader.MODULES.items():
         plan = record["plan"]
         grid_n = n // plan["block_n"]
         rule = plan["grid_rule"]
         seen.add(rule)
-        grid = loader.launch_grid(record, m=m, n=n, k=3072, sm_count=sms)
+        grid = loader.launch_grid(
+            record, m=m, n=n, k=3072, sm_count=sms, raster_group=group
+        )
         if rule == "linear":
             assert grid == (grid_m * grid_n, 1, 1), name
         elif rule == "cluster_n2":
@@ -777,6 +946,21 @@ def test_launch_grid_follows_the_record_rule(m, n) -> None:
             assert units == full + (tiles - full) * 2 and split in (1, 2), name
             with pytest.raises(ValueError, match="sm_count"):
                 loader.launch_grid(record, m=m, n=n, k=3072)
+        elif rule == "pair_tailsplit_wide":
+            tiles, units, full, split = loader.tailsplit_wide_units(
+                m=m, n=n, sm_count=sms, raster_group=group
+            )
+            assert grid == (2 * units, 1, 1), name
+            if split == loader.WIDE_TAIL_SPLIT:
+                assert units == full + sms // 2, name
+            else:
+                assert (tiles, units, full, split) == loader.tailsplit_units(
+                    m=m, n=n, sm_count=sms
+                ), name
+            with pytest.raises(ValueError, match="raster_group"):
+                loader.launch_grid(record, m=m, n=n, k=3072, sm_count=sms)
+            with pytest.raises(ValueError, match="sm_count"):
+                loader.launch_grid(record, m=m, n=n, k=3072, raster_group=group)
         elif rule == "splitk_cluster":
             assert grid == (plan["split_k"] * grid_n, 1, 1), name
         else:
@@ -798,6 +982,10 @@ def test_tailsplit_units_schedule() -> None:
     assert units(m=4096, n=12288, sm_count=148) == (768, 796, 740, 2)
     # 192 pair tiles on 76 pairs: 2 waves + 40 tail tiles, 80 > 76 -> whole tiles.
     assert units(m=4096, n=3072, sm_count=152) == (192, 192, 192, 1)
+    # 1296 pair tiles (27 x 48) on 74 pairs: 17 waves + 38 tail tiles, 76 > 74 ->
+    # whole tiles; on 76 pairs 17 waves + 4 tail tiles -> 8 half units.
+    assert units(m=6889, n=12288, sm_count=148) == (1296, 1296, 1296, 1)
+    assert units(m=6889, n=12288, sm_count=152) == (1296, 1300, 1292, 2)
     # A whole number of waves: nothing to split.
     assert units(m=4096, n=3072, sm_count=128) == (192, 192, 192, 1)
     # Forced schedules and the admitted values.
@@ -808,23 +996,217 @@ def test_tailsplit_units_schedule() -> None:
 
 
 def test_tailsplit_rows_split_on_this_device() -> None:
-    """Every row routed to the tail-split program splits its tail on the
-    device the suite runs on (148 or 152 SMs)."""
+    """Every row routed to the tail-split program has a partial last wave on
+    the device the suite runs on (148 or 152 SMs), and splits it unless the
+    split would need more pairs than the device has: the tail tiles become half
+    units when twice their number fits the CTA pairs, otherwise they stay whole
+    tiles.  (6889, 12288) is such a row on 148 SMs: 1296 tiles are 17 waves of
+    74 pairs and 38 tail tiles, whose 76 half units exceed the 74 pairs; the
+    program still won that row on sm_100a by measurement."""
     sms = loader.sm_count(_device().index or 0)
+    pairs = sms // 2
     for row in (*PERF_ROWS, *COVERAGE_ROWS):
         m, n, k, rank, bias = row
         if loader.MODULES[_route(row)]["plan"]["grid_rule"] != "pair_tailsplit":
             continue
         tiles, units, full, split = loader.tailsplit_units(m=m, n=n, sm_count=sms)
-        assert split == 2 and full < units, (_row_id(row), sms)
+        tail = tiles % pairs
+        assert tail > 0, (_row_id(row), sms)
+        if 2 * tail <= pairs:
+            assert (units, full, split) == (tiles + tail, tiles - tail, 2), (
+                _row_id(row),
+                sms,
+            )
+        else:
+            assert (units, full, split) == (tiles, tiles, 1), (_row_id(row), sms)
+
+
+def _raster_tile(
+    tile: int, tok_tiles: int, w_tiles: int, group: int
+) -> tuple[int, int]:
+    """``(w_idx, tok_idx)`` of pair tile ``tile`` in raster order: column-major
+    inside raster groups of ``group`` token tiles (the last group short; 0 is
+    one group of every token tile)."""
+    if group == 0:
+        return tile // tok_tiles, tile % tok_tiles
+    first = tile // (group * w_tiles)
+    offset = tile - first * group * w_tiles
+    rows = min(group, tok_tiles - first * group)
+    return offset // rows, first * group + offset % rows
+
+
+def _wide_unit_columns(
+    unit: int, *, m: int, n: int, units: int, full: int, group: int
+) -> tuple[int, int, int]:
+    """``(tok_idx, n0, width)`` of tail unit ``unit`` of a wide-tail schedule:
+    the in-kernel decode of the wide-tail build.  The ``g = tail - pairs / 2``
+    groups of three column-adjacent tail tiles fill blocks of three columns by
+    the ``rows`` token tiles of one raster group, starting ``start`` tile ids
+    after ``full``; tail unit ``q < 4 g`` is 192-wide piece ``q % 4`` of group
+    ``q // 4``, the others are the half units of the remaining tail tiles in
+    tile order."""
+    tok_tiles, w_tiles = -(-m // 256), -(-n // 256)
+    tiles = tok_tiles * w_tiles
+    groups = (tiles - full) - (units - full) // 2
+    group_rows = group or tok_tiles
+    size = group_rows * w_tiles
+    first = full // size
+    rows = min(group_rows, tok_tiles - first * group_rows)
+    column, partial = divmod(full - first * size, rows)
+    start = 0
+    if partial and column + 1 < w_tiles:
+        start = rows - partial
+    elif partial:
+        start = (first + 1) * size - full
+        rows = min(group_rows, tok_tiles - (first + 1) * group_rows)
+    q = unit - full
+    if q < 4 * groups:
+        index, piece = divmod(q, 4)
+        block, row = divmod(index, rows)
+        tile = full + start + 3 * block * rows + row
+        w_idx, tok_idx = _raster_tile(tile, tok_tiles, w_tiles, group)
+        return tok_idx, 256 * w_idx + 192 * piece, 192
+    half, h = divmod(q - 4 * groups, 2)
+    blocks, last = divmod(groups, rows)
+    tile = full + half + 3 * groups
+    if half < start:
+        tile = full + half
+    elif last and half < start + 3 * (rows - last):
+        col, row = divmod(half - start, rows - last)
+        tile = full + start + 3 * rows * blocks + col * rows + last + row
+    w_idx, tok_idx = _raster_tile(tile, tok_tiles, w_tiles, group)
+    return tok_idx, 256 * w_idx + 128 * h, 128
+
+
+def test_tailsplit_wide_units_schedule() -> None:
+    """The wide-tail schedule: a last partial wave of more than half and at most
+    three quarters of the CTA pairs runs as one wave of ``pairs`` units when its
+    groups of three tiles fit in full tiles of one raster group; every other
+    problem keeps the :func:`tailsplit_units` schedule."""
+    units = loader.tailsplit_wide_units
+    wide = loader.WIDE_TAIL_SPLIT
+    # 192 pair tiles on 76 pairs: 2 waves + 40 tail tiles -> 2 groups of three
+    # tiles (token tiles 12 and 13, columns 1024-1791) as 8 192-wide units and
+    # the other 34 tail tiles as 68 half units.
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2) == (192, 228, 152, wide)
+    pieces = [
+        _wide_unit_columns(u, m=4096, n=3072, units=228, full=152, group=2)
+        for u in range(152, 160)
+    ]
+    assert pieces == [(12, 1024 + 192 * p, 192) for p in range(4)] + [
+        (13, 1024 + 192 * p, 192) for p in range(4)
+    ]
+    assert units(m=4096, n=3072, sm_count=152, raster_group=8) == (192, 228, 152, wide)
+    # 74 pairs: 2 waves + 44 tail tiles -> 7 groups in 4 blocks need 12 columns
+    # from column 2: whole tiles.
+    assert units(m=4096, n=3072, sm_count=148, raster_group=2) == (192, 192, 192, 1)
+    # 2 * tail <= pairs keeps the half units; groups that do not fit keep
+    # whole tiles.
+    assert units(m=6912, n=3072, sm_count=152, raster_group=2) == (324, 344, 304, 2)
+    assert units(m=9216, n=3072, sm_count=152, raster_group=2) == (432, 432, 432, 1)
+    # Forced schedules and the admitted values.
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=1) == (
+        192,
+        192,
+        192,
+        1,
+    )
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=2) == (
+        192,
+        232,
+        152,
+        2,
+    )
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=wide) == (
+        192,
+        228,
+        152,
+        wide,
+    )
+    with pytest.raises(ValueError, match="no wide tail"):
+        units(m=4096, n=3072, sm_count=148, raster_group=2, tail_split=wide)
+    with pytest.raises(ValueError, match="tail_split"):
+        units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=4)
+
+
+def test_tailsplit_wide_units_cover_the_tail_exactly_once() -> None:
+    """Over every token-tile count up to 40, N up to 6144 in steps of 128 (and
+    two N that are not multiples of 128), raster groups 0 / 1 / 2 / 8 and 148 /
+    152 / 160 SMs: a wide-tail schedule is one wave of ``pairs`` tail units in
+    the admitted band whose columns cover every tail tile exactly once, the
+    192-wide units first, each inside the full 256-column tiles at a scale
+    offset of 0 or 2 words, every half unit 128-aligned; every other problem
+    keeps the :func:`tailsplit_units` schedule."""
+    wide = 0
+    for sms in (148, 152, 160):
+        pairs = sms // 2
+        for group in (0, 1, 2, 8):
+            for tok_tiles in range(1, 41):
+                for n in (*range(128, 6144 + 1, 128), 1000, 3000):
+                    m = 256 * tok_tiles
+                    tiles, units, full, split = loader.tailsplit_wide_units(
+                        m=m, n=n, sm_count=sms, raster_group=group
+                    )
+                    where = (m, n, group, sms)
+                    if split != loader.WIDE_TAIL_SPLIT:
+                        assert (tiles, units, full, split) == loader.tailsplit_units(
+                            m=m, n=n, sm_count=sms
+                        ), where
+                        continue
+                    wide += 1
+                    tail = tiles - full
+                    groups = tail - pairs // 2
+                    assert pairs % 2 == 0 and pairs < 2 * tail, where
+                    assert 4 * tail <= 3 * pairs and n % 128 == 0 and groups >= 1, where
+                    assert full == tiles // pairs * pairs and units == full + pairs, (
+                        where
+                    )
+                    w_tiles = -(-n // 256)
+                    expected = set()
+                    for tile in range(full, tiles):
+                        w_idx, tok_idx = _raster_tile(tile, tok_tiles, w_tiles, group)
+                        expected.update(
+                            (tok_idx, 256 * w_idx + 64 * g) for g in range(4)
+                        )
+                    covered = []
+                    for unit in range(full, units):
+                        tok_idx, n0, width = _wide_unit_columns(
+                            unit, m=m, n=n, units=units, full=full, group=group
+                        )
+                        assert n0 % 64 == 0, (where, unit)
+                        if unit - full < 4 * groups:
+                            assert width == 192 and n0 // 32 % 4 in (0, 2), (
+                                where,
+                                unit,
+                            )
+                            assert n0 + width <= n // 256 * 256, (where, unit)
+                        else:
+                            assert width == 128 and n0 % 128 == 0, (where, unit)
+                        covered.extend(
+                            (tok_idx, n0 + 64 * g) for g in range(width // 64)
+                        )
+                    assert len(covered) == len(set(covered)), where
+                    assert set(covered) == expected, where
+    assert wide > 100, wide
 
 
 def test_raster_group_follows_its_table() -> None:
     assert loader.raster_group(m=4096, n=3072, k=12288, rank=32) == 2
-    assert loader.raster_group(m=16384, n=12288, k=3072, rank=32) == 2
+    assert loader.raster_group(m=16384, n=12288, k=3072, rank=32, arch="sm_100a") == 1
+    assert loader.raster_group(m=16384, n=12288, k=3072, rank=32, arch="sm_103a") == 2
+    with pytest.raises(TypeError, match="per architecture"):
+        loader.raster_group(m=16384, n=12288, k=3072, rank=32)
     assert loader.raster_group(m=16384, n=12288, k=12288, rank=32) == 2
     assert loader.raster_group(m=4096, n=3072, k=3072, rank=32) == 8
-    assert loader.raster_group(m=6912, n=3072, k=3072, rank=128) == 8
+    assert loader.raster_group(m=6912, n=3072, k=3072, rank=128, arch="sm_100a") == 4
+    assert loader.raster_group(m=6912, n=3072, k=3072, rank=128, arch="sm_103a") == 8
+    with pytest.raises(TypeError, match="per architecture"):
+        loader.raster_group(m=6912, n=3072, k=3072, rank=128)
+    assert loader.raster_group(m=16384, n=3072, k=3072, rank=32) == 4
+    assert loader.raster_group(m=6889, n=12288, k=3072, rank=32, arch="sm_100a") == 1
+    assert loader.raster_group(m=6889, n=12288, k=3072, rank=32, arch="sm_103a") == 2
+    with pytest.raises(TypeError, match="per architecture"):
+        loader.raster_group(m=6889, n=12288, k=3072, rank=32)
 
 
 def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
@@ -832,7 +1214,7 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
     lands on the build whose ``out_store`` matches the kernel's hint rule for that
     launch, and both forms are reached by the rows."""
     forms = set()
-    exact = EXACT_ROWS[_arch()]
+    exact = _exact_rows(_arch(), _sms())
     for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS):
         m, n, k, rank, bias = row
         name = _route(row)
@@ -870,21 +1252,70 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
 
 def test_exact_rows_dispatch_per_architecture() -> None:
     """The exact-dispatch rows of the convergence finals: on this device's
-    architecture each lands on its own build (the build the finals adopted, or
-    the shipped cake_r1 build on a held row); every exact row is a performance row."""
+    architecture each lands on its own build (the build its row adopted; a
+    wide-tail row only on SM counts with the wide schedule, else its
+    ``WIDE_TAIL_FALLBACK``); every exact row is a performance row."""
+    exact = _exact_rows(_arch(), _sms())
     for row, name in EXACT_ROWS[_arch()].items():
         assert row in PERF_ROWS, _row_id(row)
-        assert _route(row) == name, _row_id(row)
+        assert _route(row) == exact[row], _row_id(row)
         assert loader.MODULES[name]["build"] == EXACT_BUILDS[name], (_row_id(row), name)
     reachable = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
     assert reachable >= set(EXACT_ROWS[_arch()].values())
 
 
+def test_wide_tail_rows_route_by_the_sm_count(monkeypatch) -> None:
+    """A ``wide_tail`` route row admits its problem only where the device's SM
+    count yields the wide schedule: on sm_100a the (4096, 3072, 12288, 32,
+    bias) problem takes the wide-tail build on 152 SMs and, without the wide
+    schedule (148 SMs), the program the rows below select.  A call without the
+    SM count that meets such a row is refused; every other route is the same
+    on every SM count and equal to the route without one."""
+    sm_counts = (148, 152, 160)
+    primary = (4096, 3072, 12288, 32, True)
+    assert _wide(primary, "sm_100a", 152) and not _wide(primary, "sm_100a", 148)
+    for arch, rows in WIDE_TAIL_FALLBACK.items():
+        for row, fallback in rows.items():
+            m, n, k, rank, bias = row
+            problem = dict(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+            for sms in sm_counts:
+                wide = _wide(row, arch, sms)
+                expected = EXACT_ROWS[arch][row] if wide else fallback
+                got = loader.select_record(**problem, sm_count=sms)
+                assert got == expected, (arch, sms)
+            with pytest.raises(TypeError, match="SM count"):
+                loader.select_record(**problem)
+            # The fallback is the route of the table without its wide-tail rows.
+            with monkeypatch.context() as patch:
+                narrowed = [r for r in loader.ROUTE_TABLE if not r.get("wide_tail")]
+                patch.setattr(loader, "ROUTE_TABLE", tuple(narrowed))
+                assert loader.select_record(**problem) == fallback, arch
+    # Every other problem: the perf, off-table and coverage rows and a grid
+    # around each wide-tail row, on both architectures.
+    problems = {*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS}
+    for row in loader.ROUTE_TABLE:
+        if not row.get("wide_tail"):
+            continue
+        for m in (row["m_min"] - 1, row["m_min"], row["m_max"] + 1):
+            for n in (row["n_min"] - 128, row["n_min"], row["n_max"] + 128):
+                for k in (row["k_min"] - 256, row["k_min"], row["k_max"] + 256):
+                    for rank in RANKS:
+                        problems.add((m, n, k, rank, False))
+                        problems.add((m, n, k, rank, True))
+    for arch in loader.ARCHES:
+        for m, n, k, rank, bias in sorted(problems):
+            if (m, n, k, rank, bias) in WIDE_TAIL_FALLBACK[arch]:
+                continue
+            problem = dict(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+            routes = {_attempt(**problem, sm_count=sms) for sms in sm_counts}
+            assert routes == {_attempt(**problem)}, (arch, m, n, k, rank, bias)
+
+
 def test_splitk_rows_fill_one_cluster_wave() -> None:
     """Every exact row routed to a split-K record on this architecture meets the
     kernel's K rule (``K_tiles = K / block_k`` a multiple of ``split_k``) and
-    launches ``N / 128`` clusters of ``split_k`` CTAs; the record ships for both
-    architectures and its other-architecture route is the form of that architecture."""
+    launches ``N / 128`` clusters of ``split_k`` CTAs; the record (the aliased-inbox,
+    L2-promoted 11-stage build) ships for both architectures."""
     seen = 0
     for row, name in EXACT_ROWS[_arch()].items():
         record = loader.MODULES[name]
@@ -901,10 +1332,13 @@ def test_splitk_rows_fill_one_cluster_wave() -> None:
             1,
         ), (row, name)
         assert set(record["arches"]) == set(loader.ARCHES), name
-        assert record["build"] == {"bias": bias, "split_k": plan["split_k"]}, (
-            row,
-            name,
-        )
+        assert record["build"] == {
+            "bias": bias,
+            "split_k": plan["split_k"],
+            "stages": 11,
+            "inbox": "alias",
+            "l2_promotion": "l2_256b",
+        }, (row, name)
     if seen == 0:
         pytest.skip(f"no split-K route on {_arch()}")
 
@@ -916,8 +1350,8 @@ def test_m129_rows_route_by_k_class(bias) -> None:
     (including K % 256 != 0 and the K between the two classes); the bias form
     follows the problem.  On an architecture whose exact rows name the split-K
     program for K 12288, that row takes it instead; an exact row naming a
-    64-row build (the sm_103a K 3072 rows, whose builds promote the weight
-    loads to 256-byte L2 lines) takes that build of its K class."""
+    64-row build (the K 3072 rows of both architectures, whose builds promote
+    the weight loads to 256-byte L2 lines) takes that build of its K class."""
     for k, form in (
         (3072, M129_FORM_K3072),
         (3200, M129_FORM_K3072),
@@ -944,7 +1378,11 @@ def test_m129_rows_route_by_k_class(bias) -> None:
                 bias,
                 name,
             )
-            assert record["build"] == {"bias": bias, **form, "l2_promotion": "l2_256b"}
+            assert record["build"]["l2_promotion"] == "l2_256b"
+            assert {key: record["build"][key] for key in ("bias", *form)} == {
+                "bias": bias,
+                **form,
+            }
             assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
         else:
             assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
@@ -1030,16 +1468,36 @@ def test_plan_values_view_the_scale_factors_in_place(has_bias) -> None:
         assert values["rank"] == rank and values["rank_chunks"] == 1
         assert values["grid_n"] == n // plan["block_n"]
         sms = loader.sm_count(p.a.device.index)
-        assert values["grid"] == loader.launch_grid(record, m=m, n=n, k=k, sm_count=sms)
-        if plan["grid_rule"] in ("pair_persistent", "pair_tailsplit"):
+        assert values["grid"] == loader.launch_grid(
+            record, m=m, n=n, k=k, sm_count=sms, raster_group=values.get("raster_group")
+        )
+        if plan["grid_rule"] in (
+            "pair_persistent",
+            "pair_tailsplit",
+            "pair_tailsplit_wide",
+        ):
             assert values["raster_group"] == loader.raster_group(
-                m=m, n=n, k=k, rank=rank
+                m=m, n=n, k=k, rank=rank, arch=_arch()
             )
             assert values["num_tiles"] == values["tok_tiles"] * values["w_tiles"]
         else:
             assert "raster_group" not in values
         if plan["grid_rule"] == "pair_tailsplit":
             tiles, units, full, split = loader.tailsplit_units(m=m, n=n, sm_count=sms)
+            assert (
+                values["num_units"],
+                values["full_units"],
+                values["tail_split"],
+            ) == (
+                units,
+                full,
+                split,
+            )
+            assert values["grid"] == (2 * units, 1, 1)
+        elif plan["grid_rule"] == "pair_tailsplit_wide":
+            tiles, units, full, split = loader.tailsplit_wide_units(
+                m=m, n=n, sm_count=sms, raster_group=values["raster_group"]
+            )
             assert (
                 values["num_units"],
                 values["full_units"],

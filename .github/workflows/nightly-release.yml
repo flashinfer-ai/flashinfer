@@ -14,6 +14,20 @@ on:
         required: false
         type: string
 
+concurrency:
+  # One run at a time per ref. Runs on main recreate date-tagged releases and
+  # rewrite the shared wheel index; if two overlapped, an older run could write
+  # its index rows last, with hashes for assets a newer run has since replaced.
+  # update-wheel-index also runs when tests fail, so a slow failing run reaches
+  # that step too. Other refs are dry runs and only queue behind their own
+  # branch. `queue: max` keeps every pending run (up to GitHub's limit of 100)
+  # instead of the default single slot, where a newly queued run cancels the
+  # pending one: a scheduled run waiting behind a manual dispatch would
+  # otherwise be dropped by the next dispatch, and its date never published.
+  group: nightly-release-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   setup:
     runs-on: ubuntu-latest
@@ -114,7 +128,9 @@ jobs:
 
   build-flashinfer-cubin:
     needs: setup
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 mounts /tmp as a quota-limited tmpfs. The isolated PEP 517
+    # environment for torch and its CUDA dependencies exceeds that quota.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -148,7 +164,13 @@ jobs:
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
           FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS: 86400
+          # Keep PEP 517's large isolated build environment off /tmp, which is
+          # a quota-limited tmpfs on Ubuntu 26.04 GitHub-hosted runners.
+          TMPDIR: ${{ runner.temp }}/flashinfer-cubin-build
         run: |
+          mkdir -p "${TMPDIR}"
+          df -hT "${TMPDIR}" /tmp
+          findmnt /tmp || true
           echo "Building flashinfer-cubin with dev suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
           echo "Git commit: $(git rev-parse HEAD)"
           cd flashinfer-cubin
@@ -547,8 +569,17 @@ jobs:
           fi
 
   update-wheel-index:
+    # test-nightly-build stays in `needs` only so that its result is readable
+    # below. A failing test suite no longer withholds the wheels; it marks them
+    # untested in the index instead. Producing a complete set of artifacts every
+    # day is the nightly's contract, so the test outcome is reported, not gated
+    # on. create-release must still have succeeded: without it the release
+    # assets the index links to do not exist.
     needs: [setup, create-release, test-nightly-build]
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      !cancelled()
+      && github.ref == 'refs/heads/main'
+      && needs.create-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo
@@ -579,21 +610,33 @@ jobs:
       - name: Update wheel index
         env:
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          TESTS_PASSED: ${{ needs.test-nightly-build.result == 'success' }}
         run: |
+          UNTESTED_ARGS=()
+          if [ "${TESTS_PASSED}" != "true" ]; then
+            echo "::warning::Nightly tests did not pass; publishing this build with its index entries marked untested."
+            UNTESTED_ARGS=(--untested)
+          fi
           python3 scripts/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
             --base-url "https://github.com/${NIGHTLY_RELEASE_REPOSITORY}/releases/download" \
             --release-tag "${RELEASE_TAG}" \
-            --nightly
+            --nightly \
+            "${UNTESTED_ARGS[@]}"
 
       - name: Push wheel index
         env:
           RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
+          TESTS_PASSED: ${{ needs.test-nightly-build.result == 'success' }}
         run: |
           cd flashinfer-whl
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          COMMIT_MSG="update whl for nightly ${RELEASE_SUFFIX}"
+          if [ "${TESTS_PASSED}" != "true" ]; then
+            COMMIT_MSG="${COMMIT_MSG} (untested)"
+          fi
           git add -A
-          git commit -m "update whl for nightly ${RELEASE_SUFFIX}"
+          git commit -m "${COMMIT_MSG}"
           git push

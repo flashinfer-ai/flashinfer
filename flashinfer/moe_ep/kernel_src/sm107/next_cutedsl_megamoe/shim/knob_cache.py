@@ -375,7 +375,7 @@ def default_knobs(
         }
     if kernel_variant != "inference":
         raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
-    tile_k = 256 if quant_kind == "nvfp4" else 128
+    tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     tile_n = 128 if max_tokens < 2048 else 256
     knobs = {
         "mma_tiler_mnk": (256, tile_n, tile_k),

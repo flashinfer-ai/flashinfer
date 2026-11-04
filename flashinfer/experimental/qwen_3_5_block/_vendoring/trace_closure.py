@@ -12,7 +12,24 @@ a recorded FACT, not a guess.  Then it declares the requested serving form(s) th
 do, and -- with ``--mode execute`` on a Rubin device -- runs check_support / compile / execute / synchronize, logging the stage
 and the wall time of each (a compile budget is NOT a kernel timeout: the stage line says which one ran out).
 
-    trace_closure.py --form {prefill,extend,decode,all} --mode {declare,execute} --device {cpu,cuda} --out <json> [--frost-flag unset|keep]
+    trace_closure.py --form {prefill,extend,decode,decode_qsa,all} --mode {declare,execute} --device {cpu,cuda} --out <json> [--frost-flag unset|keep]
+
+``decode_qsa`` (the Qwen 3.8 Flash-Next decode route): the in-block indexer's DECODE step over the pools -- ``QsaSpec(index_source=
+"indexer", index_band=True)`` with the two paged side caches (the compressed-key cache on the main block table, the raw-key ring) --
+declared FOUR ways so every lazily imported module of the route is traced: the fused prepare launch with the position-table RoPE arm
+and the ring rows from the stack's own slot mapping (the serving form), the same with the rows derived in-kernel, and the unfused
+twin (per-token cos / sin) with and without the slot mapping; ``--mode execute`` runs all four on the device.
+
+``extend_qsa`` (the Qwen 3.8 Flash-Next EXTEND route, cuDNN Frontend 4c8e24355): the in-block indexer's EXTEND step over the pools -- the
+same ``QsaSpec(index_source="indexer")`` declaration at ``S_q = T`` with ``index_select_form="extend"`` (or ``"auto"`` past the decode scorer's
+query-row envelope), ``index_state_slot_mapping_present=True``, per-token ``cos`` / ``sin`` and ``fuse_prepare=None`` -- a T-row chunk of every
+sequence behind a cached prefix; declared FIVE ways so every lazily imported module of that route is traced (the chunk compress, the dense kbar
+gather, the DSA compact-logits scorer + radix top-k the step scores through, the canonical-order kernel, the cache-write ring arm): the bf16
+cache behind a long prefix (a residue-2 chunk start), the ``P = 0`` prefill + a dead sequence under ``"auto"``, the e4m3 cache (the scorer's
+MXFP8 arm), the ``"hf"`` rounding attribute, and two select windows at a lowered ``QSA_EXTEND_SELECT_BUDGET_BYTES``; since the cuDNN Frontend
+6b21be0e0 pin FOUR more declarations PAST 128 rows (a T 512 prefill chunk, a T 2048 chunk behind a 2048-token prefix, B 4 x T 512 with a
+dead sequence, the e4m3 cache at T 512): the indexer band's slab takes the GEMM engine's own baseline tile there (the projection driver's
+large-M rule) on the JIT-only route, so these cells must record NO ``create_handle`` / ``backend_graph`` seam and a capture-safe slab stage.
 
 The JSON holds: the ordered module list with files + sizes, the import edges (importer -> imported) restricted to the
 ``cudnn`` package, every third-party top-level package touched, the data files opened under the package, the extension
@@ -146,7 +163,11 @@ pathlib.Path.open = _hook_path_open  # type: ignore[method-assign]
 
 # --------------------------------------------------------------------------- args
 ap = argparse.ArgumentParser()
-ap.add_argument("--form", default="all", choices=["prefill", "extend", "decode", "all"])
+ap.add_argument(
+    "--form",
+    default="all",
+    choices=["prefill", "extend", "decode", "decode_qsa", "extend_qsa", "all"],
+)
 ap.add_argument("--mode", default="declare", choices=["declare", "execute"])
 ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
 ap.add_argument("--out", required=True)
@@ -239,6 +260,7 @@ from cudnn.gated_attention_block import (  # noqa: E402
     KV_SOURCE_PAGED,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
+    QsaSpec,
     decode_route,
     qkvg_from_vllm,
 )
@@ -327,6 +349,22 @@ def run_stages(name, blk, exec_args, exec_kwargs, out):
                 rec["out_finite"] = bool(torch.isfinite(out.float()).all().item())
             rec["stages"][st] = {"ok": True, "s": round(time.time() - t, 3)}
             log(f"{st}: ok in {time.time() - t:.2f}s")
+            if st == "compile":
+                # the two projection stages' route after compile (the 6b21be0e0 pin: the band slab past 128 rows resolves the GEMM engine's
+                # own baseline tile on the JIT-only route, capture-safe; "heuristic (graph engine)" would be the graph route)
+                facts = {}
+                for nm in ("_proj", "_out_proj"):
+                    stage = getattr(blk, nm, None)
+                    plan = getattr(stage, "_plan", None)
+                    if stage is not None:
+                        facts[nm] = {
+                            "capture_safe": bool(getattr(stage, "capture_safe", False)),
+                            "tile": str(getattr(plan, "tile_config_name", None)),
+                            "route": str(getattr(plan, "route", None)),
+                            "m": int(getattr(stage, "m", 0)),
+                        }
+                rec["proj_facts"] = facts
+                log(f"proj facts: {facts}")
         except Exception as exc:  # noqa: BLE001
             rec["stages"][st] = {
                 "ok": False,
@@ -373,8 +411,27 @@ def declare(name, fn):
                 "cache_write_fused",
                 "gate_fused",
                 "paged_kv_page_size",
+                "sparse_tile_form",
+                "sparse_tile",
+                "decode_split_kv",
+                # the in-block indexer's step form over the pools (the 4c8e24355 pin): the declaration, the resolved form, the extend flag
+                "index_select_form",
+                "index_select_form_resolved",
+                "indexer_extend",
+                "index_cache_dtype",
             )
         }
+        ix = getattr(blk, "_indexer_extend", None)
+        if ix is not None:  # the EXTEND step's window plan and launch count (host ints)
+            RESULT["forms"][name]["extend_facts"] = {
+                "n_windows": int(ix.n_windows),
+                "window_rows": int(ix.window_rows),
+                "n_blocks_max": int(ix.n_blocks_max),
+                "n_pieces": int(ix.n_pieces),
+                "rounding": str(ix.rounding),
+                "fp8": bool(ix.fp8),
+                "launches_per_execute": int(ix.launches_per_execute()),
+            }
         log(
             f"declared in {time.time() - t:.2f}s; stages {RESULT['forms'][name]['stage_list']}"
         )
@@ -616,9 +673,419 @@ except Exception as exc:  # noqa: BLE001
     log(f"host api FAILED: {type(exc).__name__}: {exc}")
     traceback.print_exc()
 
+
+def form_decode_qsa(
+    *,
+    fused: bool,
+    tables_only: bool,
+    ring_slots: bool,
+    batch: int = 4,
+    s_q: int = 4,
+    sparse_tile_form: str = "auto",
+):
+    """The in-block indexer's DECODE step over the pools (the Qwen 3.8 Flash-Next decode route): a dense [B, S_q] declaration on a
+    ``QsaSpec(index_source="indexer", index_band=True)`` geometry with ``kv_source="paged"`` and the two paged side caches -- the
+    compressed-key cache ``[num_pages, P / 4, 1, 128]`` on the MAIN block table and the raw-key ring ``[num_ring_blocks, cap, 1, 128]``
+    behind its own ``[B, 1]`` table -- at B 4 x S_q 4 (the MTP verify width; the tcgen05 core) by default, the four input-contract arms
+    as the keyword arguments say.  ``batch`` / ``s_q`` (appended) shrink the step to the serving stacks' B 1 cells, where the sparse
+    core's body knob ``sparse_tile_form="auto"`` (the FlashInfer default) resolves the LEAN decode tile on cc 10.7 (the placement bound
+    ``B x H_kv <= 4`` CTAs per chunk since cuDNN Frontend 977757763 -- ``B x H_kv x S_q <= 4`` units before it -- where the lean body admits
+    the step; under the in-block indexer the list is per row, which the lean body serves at one row only): the lean kernel module is
+    loaded by path only on that route, so the closure needs a trace of it."""
+
+    def make():
+        g0 = GatedAttentionBlockGeometry(
+            d_model=D_MODEL,
+            h_q=H_Q,
+            h_kv=H_KV,
+            d_head=D,
+            rope_dim=ROPE,
+            causal_bottom_right=True,
+            qsa=QsaSpec(top_k=512, index_source="indexer", index_band=True),
+        )
+        gen = torch.Generator(device=DEV).manual_seed(4)
+        B, S_Q, CAP, D_I = int(batch), int(s_q), 8, 128
+        kv_lens_l = [40, 0, 17, 64][:B] if B <= 4 else [40, 0, 17, 64] + [64] * (B - 4)
+        L_MAX = 64
+        max_pages = (L_MAX + PAGE - 1) // PAGE
+        n_pages = sum((L + PAGE - 1) // PAGE for L in kv_lens_l) + 3
+        n_pos = max_pages * PAGE
+        w = weights(
+            g0, gen
+        )  # w_qkvg carries the fifth (indexer) band: g0.n_qkvg includes it
+        w_iq = torch.ones(D_I, dtype=DT, device=DEV)
+        w_ik = torch.ones(D_I, dtype=DT, device=DEV)
+        h = torch.randn(
+            B, S_Q, D_MODEL, generator=gen, device=DEV, dtype=torch.float32
+        ).to(DT)
+        pos_tab = torch.arange(n_pos, device=DEV)[None]
+        cos_pos, sin_pos = rope_tables(
+            pos_tab
+        )  # [1, n_pos, ROPE]: the position-indexed tables (the block starts; every rotation under the table arm)
+        pos = torch.tensor(
+            [
+                list(range(L - S_Q, L)) if L >= S_Q else list(range(S_Q))
+                for L in kv_lens_l
+            ],
+            device=DEV,
+        )
+        cos, sin = rope_tables(pos)
+        out = torch.empty(B, S_Q, D_MODEL, dtype=DT, device=DEV)
+        kc, vc = pools(n_pages)
+        table = torch.zeros(B, max_pages, dtype=torch.int32, device=DEV)
+        slots = torch.full((B * S_Q,), -1, dtype=torch.int64, device=DEV)
+        ring_slots_t = torch.full((B * S_Q,), -1, dtype=torch.int64, device=DEV)
+        icache = torch.zeros(n_pages, PAGE // 4, 1, D_I, dtype=DT, device=DEV)
+        ring = torch.zeros(B + 1, CAP, 1, D_I, dtype=DT, device=DEV)
+        ring_table = torch.zeros(B, 1, dtype=torch.int32, device=DEV)
+        nxt = 1
+        for b, L in enumerate(kv_lens_l):
+            if L == 0:
+                continue
+            n = (L + PAGE - 1) // PAGE
+            pages = list(range(nxt, nxt + n))
+            nxt += n
+            table[b, :n] = torch.tensor(pages, dtype=torch.int32, device=DEV)
+            ring_table[b, 0] = b + 1
+            for p in range(L - S_Q):
+                kc[pages[p // PAGE], :, p % PAGE] = torch.randn(
+                    H_KV, D, generator=gen, device=DEV, dtype=torch.float32
+                ).to(DT)
+                vc[pages[p // PAGE], :, p % PAGE] = torch.randn(
+                    H_KV, D, generator=gen, device=DEV, dtype=torch.float32
+                ).to(DT)
+            for i in range(S_Q):
+                p = L - S_Q + i
+                if p >= 0:
+                    slots[b * S_Q + i] = pages[p // PAGE] * PAGE + p % PAGE
+                    ring_slots_t[b * S_Q + i] = (b + 1) * CAP + p % CAP
+        kv_lens = torch.tensor(kv_lens_l, dtype=torch.int32, device=DEV)
+        tables = (None, None) if tables_only else (cos, sin)
+        blk = GatedAttentionBlockFwd(
+            h,
+            w["w_qkvg"],
+            w["w_q_norm"],
+            w["w_k_norm"],
+            *tables,
+            w["w_o"],
+            out,
+            g0,
+            paged_kv_page_size=PAGE,
+            kv_source=KV_SOURCE_PAGED,
+            sample_k_cache=kc,
+            sample_v_cache=vc,
+            sample_block_table=table,
+            fuse_norm_rope=False,
+            fuse_gate=FUSE_GATE,
+            fuse_prepare=fused,
+            sample_index_kv_cache=icache,
+            sample_index_state_cache=ring,
+            sample_index_state_block_table=ring_table,
+            index_state_slot_mapping_present=ring_slots,
+            rope_position_tables_only=tables_only,
+            sparse_tile_form=sparse_tile_form,
+        )
+        ids_out = torch.full((B, S_Q, 512), -7, dtype=torch.int32, device=DEV)
+        lens_out = torch.full((B, S_Q), -7, dtype=torch.int32, device=DEV)
+        return (
+            blk,
+            [h, w["w_qkvg"], w["w_q_norm"], w["w_k_norm"], *tables, w["w_o"], out],
+            dict(
+                k_cache=kc,
+                v_cache=vc,
+                block_table=table,
+                kv_lens=kv_lens,
+                slot_mapping=slots,
+                w_iq_norm=w_iq,
+                w_ik_norm=w_ik,
+                block_ids_out=ids_out,
+                block_lens_out=lens_out,
+                index_kv_cache=icache,
+                index_state_cache=ring,
+                index_state_block_table=ring_table,
+                index_state_slot_mapping=ring_slots_t if ring_slots else None,
+                cos_pos=cos_pos,
+                sin_pos=sin_pos,
+            ),
+            out,
+        )
+
+    return make
+
+
+def form_extend_qsa(
+    *,
+    batch: int,
+    s_q: int,
+    prefixes,
+    cap: int = 4,
+    cache_dtype=None,
+    rounding: str = "single",
+    form: str = "extend",
+    budget_rows=None,
+    page: int = PAGE,
+):
+    """The in-block indexer's EXTEND step over the pools (the Qwen 3.8 Flash-Next EXTEND / PREFILL route; cuDNN Frontend 4c8e24355): a dense
+    ``[B, S_q = T]`` declaration on a ``QsaSpec(index_source="indexer", index_band=True)`` geometry with ``kv_source="paged"``, the two paged side
+    caches (the compressed-key cache in ``cache_dtype`` -- None = bf16, e4m3 = the scorer's MXFP8 arm -- on the MAIN block table; the raw-key
+    ring ``[B + 1, cap, 1, 128]``, ``cap >= 3``), ``index_select_form=form`` (``"extend"`` the pin; ``"auto"`` resolves the extend step past the
+    decode scorer's envelope ``S_q x 4 <= 64``), ``index_state_slot_mapping_present=True`` (REQUIRED on this form: the ring's tail write takes
+    the stack's slots), per-token ``cos`` / ``sin`` (``rope_position_tables_only=False`` REQUIRED) and ``fuse_prepare=None`` (reads False).
+    ``prefixes`` = one entry per sequence: the cached prefix length ``P`` (``kv_lens = P + T`` AFTER the chunk; ``P = 0`` is a prefill through
+    the serving caches) or ``None`` for a dead sequence (``kv_lens 0``, table row 0, slots -1).  The prefix's K / V rows, compressed rows and
+    the ring's last ``cap`` positions below the chunk are primed with random FINITE values (an import trace, not an oracle).  ``budget_rows``
+    lowers ``QSA_EXTEND_SELECT_BUDGET_BYTES`` for THIS declaration to ``budget_rows`` rows per select window (the window loop traced)."""
+
+    def make():
+        import cudnn.gated_attention_block.api as _blk_api
+
+        g0 = GatedAttentionBlockGeometry(
+            d_model=D_MODEL,
+            h_q=H_Q,
+            h_kv=H_KV,
+            d_head=D,
+            rope_dim=ROPE,
+            causal_bottom_right=True,
+            qsa=QsaSpec(
+                top_k=512,
+                index_source="indexer",
+                index_band=True,
+                index_cache_dtype=cache_dtype,
+                index_compress_rounding=rounding,
+            ),
+        )
+        gen = torch.Generator(device=DEV).manual_seed(5)
+        B, T, D_I, CAP = int(batch), int(s_q), 128, int(cap)
+        cd = DT if cache_dtype is None else cache_dtype
+        kv_lens_l = [0 if P is None else int(P) + T for P in prefixes]
+        assert len(kv_lens_l) == B
+        L_MAX = max(max(kv_lens_l), T)
+        max_pages = -(-L_MAX // page)
+        rpp = page // 4
+        n_pages = sum((L + page - 1) // page for L in kv_lens_l) + 2
+        n_pos = max_pages * page
+        w = weights(g0, gen)  # w_qkvg carries the fifth (indexer) band
+        w_iq = torch.ones(D_I, dtype=DT, device=DEV)
+        w_ik = torch.ones(D_I, dtype=DT, device=DEV)
+        h = torch.randn(
+            B, T, D_MODEL, generator=gen, device=DEV, dtype=torch.float32
+        ).to(DT)
+        cos_pos, sin_pos = rope_tables(
+            torch.arange(n_pos, device=DEV)[None]
+        )  # [1, n_pos, ROPE]: the block starts
+        pos = torch.tensor(
+            [list(range(L - T, L)) if L else list(range(T)) for L in kv_lens_l],
+            device=DEV,
+        )
+        cos, sin = rope_tables(
+            pos
+        )  # the per-token tables of the chunk's rows [B, T, ROPE]
+        out = torch.empty(B, T, D_MODEL, dtype=DT, device=DEV)
+        kc, vc = pools(n_pages)
+        table = torch.zeros(B, max_pages, dtype=torch.int32, device=DEV)
+        slots = torch.full((B * T,), -1, dtype=torch.int64, device=DEV)
+        ring_slots_t = torch.full((B * T,), -1, dtype=torch.int64, device=DEV)
+        icache = torch.zeros(n_pages, rpp, 1, D_I, dtype=cd, device=DEV)
+        ring = torch.zeros(B + 1, CAP, 1, D_I, dtype=DT, device=DEV)
+        ring_table = torch.zeros(B, 1, dtype=torch.int32, device=DEV)
+        nxt = 1
+        for b, L in enumerate(kv_lens_l):
+            if L == 0:
+                continue
+            n = (L + page - 1) // page
+            pages = torch.arange(nxt, nxt + n, device=DEV)
+            nxt += n
+            table[b, :n] = pages.to(torch.int32)
+            ring_table[b, 0] = b + 1
+            P = L - T
+            if P > 0:
+                p = torch.arange(P, device=DEV)
+                kc[pages[p // page], :, p % page] = torch.randn(
+                    P, H_KV, D, generator=gen, device=DEV, dtype=torch.float32
+                ).to(DT)
+                vc[pages[p // page], :, p % page] = torch.randn(
+                    P, H_KV, D, generator=gen, device=DEV, dtype=torch.float32
+                ).to(DT)
+                nb = (
+                    P // 4
+                )  # the prefix's complete blocks: the compressed rows a prefill wrote (random finite stand-ins)
+                if nb:
+                    j = torch.arange(nb, device=DEV)
+                    icache[pages[j // rpp], j % rpp, 0] = torch.randn(
+                        nb, D_I, generator=gen, device=DEV, dtype=torch.float32
+                    ).to(cd)
+                for q in range(
+                    max(0, P - CAP), P
+                ):  # the ring INPUT contract: the last cap positions below the chunk
+                    ring[b + 1, q % CAP, 0] = torch.randn(
+                        D_I, generator=gen, device=DEV, dtype=torch.float32
+                    ).to(DT)
+            for i in range(T):
+                q = P + i
+                slots[b * T + i] = int(pages[q // page]) * page + q % page
+                if (
+                    q + CAP >= L
+                ):  # the stack's ring slots for the sequence's LAST cap tokens, -1 elsewhere
+                    ring_slots_t[b * T + i] = (b + 1) * CAP + q % CAP
+        kv_lens = torch.tensor(kv_lens_l, dtype=torch.int32, device=DEV)
+        saved = _blk_api.QSA_EXTEND_SELECT_BUDGET_BYTES
+        if budget_rows is not None:
+            _blk_api.QSA_EXTEND_SELECT_BUDGET_BYTES = (
+                int(budget_rows) * max_pages * rpp * 4
+            )
+        try:
+            blk = GatedAttentionBlockFwd(
+                h,
+                w["w_qkvg"],
+                w["w_q_norm"],
+                w["w_k_norm"],
+                cos,
+                sin,
+                w["w_o"],
+                out,
+                g0,
+                paged_kv_page_size=page,
+                kv_source=KV_SOURCE_PAGED,
+                sample_k_cache=kc,
+                sample_v_cache=vc,
+                sample_block_table=table,
+                fuse_norm_rope=False,
+                fuse_gate=FUSE_GATE,
+                fuse_prepare=None,
+                sample_index_kv_cache=icache,
+                sample_index_state_cache=ring,
+                sample_index_state_block_table=ring_table,
+                index_state_slot_mapping_present=True,
+                rope_position_tables_only=False,
+                sparse_tile_form="auto",
+                index_select_form=form,
+            )
+        finally:
+            _blk_api.QSA_EXTEND_SELECT_BUDGET_BYTES = saved
+        assert (
+            blk.indexer_extend
+            and blk.index_select_form_resolved == "extend"
+            and blk.fuse_prepare is False
+        ), (
+            blk.index_select_form,
+            blk.index_select_form_resolved,
+        )
+        ids_out = torch.full((B, T, 512), -7, dtype=torch.int32, device=DEV)
+        lens_out = torch.full((B, T), -7, dtype=torch.int32, device=DEV)
+        return (
+            blk,
+            [h, w["w_qkvg"], w["w_q_norm"], w["w_k_norm"], cos, sin, w["w_o"], out],
+            dict(
+                k_cache=kc,
+                v_cache=vc,
+                block_table=table,
+                kv_lens=kv_lens,
+                slot_mapping=slots,
+                w_iq_norm=w_iq,
+                w_ik_norm=w_ik,
+                block_ids_out=ids_out,
+                block_lens_out=lens_out,
+                index_kv_cache=icache,
+                index_state_cache=ring,
+                index_state_block_table=ring_table,
+                index_state_slot_mapping=ring_slots_t,
+                cos_pos=cos_pos,
+                sin_pos=sin_pos,
+            ),
+            out,
+        )
+
+    return make
+
+
 forms = {"prefill": form_prefill, "extend": form_extend, "decode": form_decode}
-for nm in forms if args.form == "all" else [args.form]:
-    declare(nm, forms[nm])
+# the Qwen 3.8 EXTEND route (the 4c8e24355 re-vendor): five declarations of the in-block indexer's EXTEND step over the pools (all executed on a
+# device) -- the lazily imported modules of this route (the two kernels of the step, the DSA scorer + top-k package it scores through) enter the
+# closure only through these traces; the 6b21be0e0 re-vendor appends four declarations past 128 rows (the large-M JIT route of the band slab)
+EXTEND_QSA_FORMS = {
+    # T 128 behind a 6146-token prefix (the chunk starts at residue 2 of the block grid: the straddling block reads two ring rows), vLLM's cap 4
+    "extend_qsa_b1_t128_p6146_bf16": form_extend_qsa(
+        batch=1, s_q=128, prefixes=[6146], cap=4
+    ),
+    # the P = 0 PREFILL through the serving caches beside a DEAD sequence, "auto" resolving the extend step (20 x 4 = 80 > 64 rows)
+    "extend_qsa_b2_t20_p0_dead_auto_bf16": form_extend_qsa(
+        batch=2, s_q=20, prefixes=[0, None], cap=4, form="auto"
+    ),
+    # the e4m3 compressed-key cache: the compress arms' e4m3 store, the gather's byte copy, the scorer's MXFP8 arm
+    "extend_qsa_b1_t128_p6146_e4m3": form_extend_qsa(
+        batch=1, s_q=128, prefixes=[6146], cap=4, cache_dtype=torch.float8_e4m3fn
+    ),
+    # the "hf" rounding attribute (QsaSpec.index_compress_rounding): the compress recipes' rounding arm
+    "extend_qsa_b1_t64_p301_hf": form_extend_qsa(
+        batch=1, s_q=64, prefixes=[301], cap=4, rounding="hf"
+    ),
+    # two select windows at a lowered budget (40 rows per window over B 4 x T 20 = 80 rows): the window loop, cap 8
+    "extend_qsa_two_windows_b4_t20": form_extend_qsa(
+        batch=4, s_q=20, prefixes=[40, None, 17, 64], cap=8, budget_rows=40
+    ),
+    # PAST 128 rows (the 6b21be0e0 pin): the band slab's projection takes the GEMM engine's own baseline tile on the JIT-only route (the
+    # driver's large-M rule) -- a T 512 prefill chunk, the T 2048 chunk behind a 2048-token prefix (the real prefill chunk), B 4 x T 512
+    # (2048 rows) with a dead sequence and mixed prefixes, the e4m3 cache at T 512; each must compile capture-safe with no cuDNN handle
+    "extend_qsa_b1_t512_p0_bf16": form_extend_qsa(
+        batch=1, s_q=512, prefixes=[0], cap=4
+    ),
+    "extend_qsa_b1_t2048_p2048_bf16": form_extend_qsa(
+        batch=1, s_q=2048, prefixes=[2048], cap=4
+    ),
+    "extend_qsa_b4_t512_mixed_bf16": form_extend_qsa(
+        batch=4, s_q=512, prefixes=[300, None, 2048, 17], cap=4
+    ),
+    "extend_qsa_b1_t512_p301_e4m3": form_extend_qsa(
+        batch=1, s_q=512, prefixes=[301], cap=4, cache_dtype=torch.float8_e4m3fn
+    ),
+}
+# the Qwen 3.8 decode route, four declarations (one per input-contract arm the serving stacks take; all four executed on a device)
+QSA_FORMS = {
+    "decode_qsa_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True
+    ),
+    "decode_qsa_fused_tables": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=False
+    ),
+    "decode_qsa_unfused_pertoken_slots": form_decode_qsa(
+        fused=False, tables_only=False, ring_slots=True
+    ),
+    "decode_qsa_unfused_pertoken": form_decode_qsa(
+        fused=False, tables_only=False, ring_slots=False
+    ),
+    # the serving stacks' B 1 cells (appended at the lean-tile re-vendor): ``sparse_tile_form="auto"`` resolves the LEAN decode tile on cc 10.7
+    # at B 1 x S_q 1 (2 units: the vLLM-shaped step, the fused prepare on the position tables with the ring slots) and at B 1 x S_q 2
+    # (4 units, the bound; the per-token unfused arm) -- the lean kernel module and its shared helper enter the closure through these two
+    "decode_qsa_lean_b1_sq1_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=1, s_q=1
+    ),
+    "decode_qsa_lean_b1_sq2_unfused_pertoken": form_decode_qsa(
+        fused=False, tables_only=False, ring_slots=False, batch=1, s_q=2
+    ),
+    # the placement bound's cells (appended at the 977757763 re-vendor: the bound counts the CTAs per chunk, ``B x H_kv``, not
+    # ``B x H_kv x S_q``): B 2 x S_q 1 = 4 CTAs per chunk, the bound itself -> the lean body; B 4 x S_q 1 = 8 -> the tcgen05 core; B 1 x S_q 4
+    # = 2 CTAs per chunk, inside the bound, but under the in-block indexer the list is PER ROW and the lean body serves per-row lists at one
+    # row only (the list-form decline, independent of the bound) -> the tcgen05 core.  The three resolutions are recorded as declared facts.
+    "decode_qsa_bound_b2_sq1_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=2, s_q=1
+    ),
+    "decode_qsa_bound_b4_sq1_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=4, s_q=1
+    ),
+    "decode_qsa_bound_b1_sq4_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=1, s_q=4
+    ),
+}
+if args.form == "all":
+    selected = {**forms, **QSA_FORMS, **EXTEND_QSA_FORMS}
+elif args.form == "decode_qsa":
+    selected = QSA_FORMS
+elif args.form == "extend_qsa":
+    selected = EXTEND_QSA_FORMS
+else:
+    selected = {args.form: forms[args.form]}
+for nm, fn in selected.items():
+    declare(nm, fn)
 
 # --------------------------------------------------------------------------- the report
 STAGE["name"] = "report"

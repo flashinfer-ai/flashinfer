@@ -92,24 +92,34 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
     weight-side auxiliary pipeline in lockstep with the AB pipeline.
     """
 
+    # Folded scale storage and conversion specialize the packed-FP4 mainloop.
+    _fp4_format_name = "MXFP4"
+    _folded_scale_rows = 16
+    _folded_scale_block_bytes = MXFP4_FOLD_BLOCK_BYTES
+    _make_scale_smem_layout = staticmethod(make_offset_smem_layout)
+    _make_scale_smem_layout_k256 = staticmethod(make_offset_smem_layout_k256)
+    _make_expanded_scale_view = staticmethod(make_expanded_offset_view)
+    _make_expanded_scale_view_k256 = staticmethod(make_expanded_offset_view_k256)
+    _convert_packed_a_kblock = staticmethod(convert_packed_a_kblock)
+
     def __init__(self, *args, **kwargs) -> None:
         ab_dtype = kwargs.pop("ab_dtype", cutlass.Float8E4M3FN)
         fp8_scale_mode = kwargs.pop("fp8_scale_mode", "per_tensor")
         fp8_accum_mode = kwargs.pop("fp8_accum_mode", "1xacc")
         if ab_dtype is not cutlass.Float8E4M3FN:
             raise ValueError(
-                "Hopper MXFP4xFP8 requires FP8 E4M3 activation/output; "
+                f"Hopper {self._fp4_format_name}xFP8 requires FP8 E4M3 activation/output; "
                 f"got ab_dtype={ab_dtype}."
             )
         if fp8_scale_mode not in ("per_tensor", "mxfp4_hybrid"):
             raise NotImplementedError(
-                "Hopper MXFP4xFP8 supports fp8_scale_mode='per_tensor' or "
+                f"Hopper {self._fp4_format_name}xFP8 supports fp8_scale_mode='per_tensor' or "
                 "'mxfp4_hybrid'; generic FP8 blockwise weight scaling is "
                 "intentionally unsupported."
             )
         if fp8_accum_mode != "1xacc":
             raise NotImplementedError(
-                "Hopper MXFP4xFP8 supports only fp8_accum_mode='1xacc'."
+                f"Hopper {self._fp4_format_name}xFP8 supports only fp8_accum_mode='1xacc'."
             )
 
         mma_tiler_mnk = kwargs.get("mma_tiler_mnk")
@@ -119,12 +129,12 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             raise ValueError("mma_tiler_mnk is required")
         if mma_tiler_mnk[2] not in (MXFP4_K_TILE, 2 * MXFP4_K_TILE):
             raise ValueError(
-                "Hopper MXFP4xFP8 requires mma_tiler K=128 or K=256; "
+                f"Hopper {self._fp4_format_name}xFP8 requires mma_tiler K=128 or K=256; "
                 f"got {mma_tiler_mnk[2]}."
             )
         if mma_tiler_mnk[2] == 2 * MXFP4_K_TILE and fp8_scale_mode != "mxfp4_hybrid":
             raise ValueError(
-                "The MXFP4 K=256 tactic is available only for "
+                f"The {self._fp4_format_name} K=256 tactic is available only for "
                 "fp8_scale_mode='mxfp4_hybrid'."
             )
 
@@ -138,7 +148,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             for name, logical_k in logical_ks:
                 if logical_k % mma_tiler_mnk[2] != 0:
                     raise ValueError(
-                        f"Hopper MXFP4xFP8 requires {name} ({logical_k}) "
+                        f"Hopper {self._fp4_format_name}xFP8 requires {name} ({logical_k}) "
                         f"divisible by tile K={mma_tiler_mnk[2]}."
                     )
 
@@ -166,7 +176,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
     def _mma_a_dtype(self, gmem_dtype: Type[cutlass.Numeric]):
         if gmem_dtype not in (cutlass.Int8, cutlass.Uint8):
             raise ValueError(
-                "Hopper MXFP4xFP8 packed weights must use an 8-bit shell; "
+                f"Hopper {self._fp4_format_name}xFP8 packed weights must use an 8-bit shell; "
                 f"got {gmem_dtype}."
             )
         return cutlass.Float8E4M3FN
@@ -203,17 +213,17 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
     def _weight_aux_smem_layout_staged(self) -> cute.Layout:
         if self.mma_tiler[2] == 2 * MXFP4_K_TILE:
-            return make_offset_smem_layout_k256(
+            return self._make_scale_smem_layout_k256(
                 self.mma_tiler[0], self.num_ab_stage
             )
-        return make_offset_smem_layout(
+        return self._make_scale_smem_layout(
             self.mma_tiler[0], self.num_ab_stage
         )
 
     def _weight_sf_bytes_per_stage(self) -> int:
         bytes_per_k128 = (
             self.mma_tiler[0] // MXFP4_FOLD_M
-        ) * MXFP4_FOLD_BLOCK_BYTES
+        ) * self._folded_scale_block_bytes
         if self.mma_tiler[2] == 2 * MXFP4_K_TILE:
             return 2 * bytes_per_k128
         return bytes_per_k128
@@ -221,7 +231,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
     def _setup_attributes(self) -> None:
         if self.b_dtype is not cutlass.Float8E4M3FN:
             raise ValueError(
-                "Hopper MXFP4xFP8 activation must be Float8E4M3FN; "
+                f"Hopper {self._fp4_format_name}xFP8 activation must be Float8E4M3FN; "
                 f"got {self.b_dtype}."
             )
         super()._setup_attributes()
@@ -313,7 +323,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         ) // bytes_per_stage
         if num_ab_stage < 2:
             raise ValueError(
-                "Hopper MXFP4xFP8 requires at least two AB/offset stages; "
+                f"Hopper {self._fp4_format_name}xFP8 requires at least two AB/offset stages; "
                 f"computed {num_ab_stage}."
             )
         return 1, num_ab_stage, num_sched_stages
@@ -349,7 +359,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         lane_idx = tidx % cutlass.Int32(32)
         vectors_per_stage = (
             self.mma_tiler[0] // MXFP4_FOLD_M
-        ) * 16
+        ) * self._folded_scale_rows
         vectors_per_lane = vectors_per_stage // 32
         m64_blocks_per_tile = self.mma_tiler[0] // MXFP4_FOLD_M
         copy_atom = cute.make_copy_atom(
@@ -360,8 +370,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
         for item in cutlass.range_constexpr(vectors_per_lane):
             vector_idx = lane_idx + cutlass.Int32(item * 32)
-            local_m64 = vector_idx // cutlass.Int32(16)
-            folded_row = vector_idx % cutlass.Int32(16)
+            local_m64 = vector_idx // cutlass.Int32(self._folded_scale_rows)
+            folded_row = vector_idx % cutlass.Int32(self._folded_scale_rows)
             global_m64 = (
                 work_tile_info.tile_m_idx
                 * cutlass.Int32(m64_blocks_per_tile)
@@ -435,7 +445,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         and retain the original 32 producer arrivals.
         """
         blocks = self.mma_tiler[0] // MXFP4_FOLD_M
-        bytes_per_block = 2 * MXFP4_FOLD_BLOCK_BYTES
+        bytes_per_block = 2 * self._folded_scale_block_bytes
         with cute.arch.elect_one():
             cute.arch.mbarrier_expect_tx(
                 scale_handle.barrier, blocks * bytes_per_block
@@ -529,7 +539,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         del output_scale_block_base
         lane_idx = tidx % cutlass.Int32(32)
         k128_blocks_per_tile = 2
-        vectors_per_m64 = 16 * k128_blocks_per_tile
+        vectors_per_m64 = self._folded_scale_rows * k128_blocks_per_tile
         vectors_per_stage = (
             self.mma_tiler[0] // MXFP4_FOLD_M
         ) * vectors_per_m64
@@ -545,8 +555,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             vector_idx = lane_idx + cutlass.Int32(item * 32)
             local_m64 = vector_idx // cutlass.Int32(vectors_per_m64)
             vector_in_m64 = vector_idx % cutlass.Int32(vectors_per_m64)
-            local_k128 = vector_in_m64 // cutlass.Int32(16)
-            folded_row = vector_in_m64 % cutlass.Int32(16)
+            local_k128 = vector_in_m64 // cutlass.Int32(self._folded_scale_rows)
+            folded_row = vector_in_m64 % cutlass.Int32(self._folded_scale_rows)
             global_m64 = (
                 work_tile_info.tile_m_idx
                 * cutlass.Int32(m64_blocks_per_tile)
@@ -604,6 +614,12 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
         scale_handle.commit()
 
+    def _weight_sf_decoupled(self) -> bool:
+        return False
+
+    def _weight_sf_state(self, ab_state):
+        return ab_state
+
     @cute.jit
     def _tma_load_a_with_weight_sf_task_tile(
         self,
@@ -641,6 +657,22 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         tAgA_slice = tAgA[(None, tile_m_idx, None, 0)]
         ab_producer.reset()
         weight_sf_producer.reset()
+        if cutlass.const_expr(self._weight_sf_decoupled()):
+            return self._tma_load_a_with_decoupled_weight_sf_task_tile(
+                tma_atom,
+                tAgA_slice,
+                tAsA,
+                desc_ptr_a,
+                weight_sf_gemm,
+                smem_weight_sf,
+                ab_producer,
+                weight_sf_producer,
+                work_tile_info,
+                output_scale_block_base,
+                k_tile_cnt,
+                tidx,
+                mcast_mask,
+            )
         peek_ab_empty_status = ab_producer.try_acquire()
         peek_scale_empty_status = weight_sf_producer.try_acquire()
         for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
@@ -732,6 +764,28 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         return sA_wg, tCrB, tCgC.shape[:3], consumer_state
 
     @cute.jit
+    def _convert_weight_group(
+        self,
+        packed_registers,
+        fp8_fragment_a,
+        partitioned_offsets,
+        local_begin: cutlass.Constexpr,
+        global_begin: cutlass.Constexpr,
+        count: cutlass.Constexpr,
+        stage_idx,
+        smem_weight_sf,
+    ):
+        for k_offset in cutlass.range_constexpr(count):
+            convert_packed_a_kblock_from_offset(
+                packed_registers,
+                fp8_fragment_a,
+                partitioned_offsets,
+                local_begin + k_offset,
+                global_begin + k_offset,
+                stage_idx,
+            )
+
+    @cute.jit
     def _mma_mxfp4_per_tensor_1xacc(
         self,
         local_warp_idx: int,
@@ -765,7 +819,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 tidx % cutlass.Int32(128),
             )
 
-            expanded_offsets = make_expanded_offset_view(
+            expanded_offsets = self._make_expanded_scale_view(
                 smem_weight_sf,
                 self.mma_tiler[0],
             )
@@ -794,7 +848,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 for k_block in cutlass.range_constexpr(
                     MXFP4_K_TILE // 32
                 ):
-                    convert_packed_a_kblock(
+                    self._convert_packed_a_kblock(
                         packed_registers,
                         fp8_fragment_a,
                         partitioned_offsets,
@@ -868,7 +922,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 tidx % cutlass.Int32(128),
             )
 
-            expanded_offsets = make_expanded_offset_view(
+            expanded_offsets = self._make_expanded_scale_view(
                 smem_weight_sf,
                 self.mma_tiler[0],
             )
@@ -906,16 +960,16 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     smem_partition[(None, None, None, stage_idx)],
                     copy_view,
                 )
-                for k_block in cutlass.range_constexpr(
-                    MXFP4_K_TILE // 32
-                ):
-                    convert_packed_a_kblock(
-                        packed_registers,
-                        fp8_fragment_a,
-                        partitioned_offsets,
-                        k_block,
-                        stage_idx,
-                    )
+                self._convert_weight_group(
+                    packed_registers,
+                    fp8_fragment_a,
+                    partitioned_offsets,
+                    0,
+                    0,
+                    MXFP4_K_TILE // 32,
+                    stage_idx,
+                    smem_weight_sf,
+                )
                 # Order the converted A registers before WGMMA reads them.
                 warpgroup.fence()
                 for k_block in cutlass.range_constexpr(
@@ -1298,7 +1352,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 fp8_fragment_a,
                 tidx % cutlass.Int32(128),
             )
-            expanded_offsets = make_expanded_offset_view_k256(
+            expanded_offsets = self._make_expanded_scale_view_k256(
                 smem_weight_sf,
                 self.mma_tiler[0],
             )
@@ -1313,8 +1367,10 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             accumulators.fill(0.0)
             for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(ab_consumer_state)
-                weight_sf_pipeline.consumer_wait(ab_consumer_state)
+                sf_state = self._weight_sf_state(ab_consumer_state)
+                weight_sf_pipeline.consumer_wait(sf_state)
                 stage_idx = ab_consumer_state.index
+                sf_stage_idx = sf_state.index
 
                 for k128_half in cutlass.range_constexpr(2):
                     for packed_k64 in cutlass.range_constexpr(2):
@@ -1336,15 +1392,20 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                         global_k64_group = k128_half * 2 + local_k64_group
                         global_k_block_begin = global_k64_group * 2
                         scale_plane = cutlass.Int32(global_k64_group)
-                        for k_offset in cutlass.range_constexpr(2):
-                            convert_packed_a_kblock_from_offset(
-                                packed_registers,
-                                fp8_fragment_a,
-                                partitioned_offsets,
-                                local_k_block_begin + k_offset,
-                                global_k_block_begin + k_offset,
-                                stage_idx,
-                            )
+                        self._convert_weight_group(
+                            packed_registers,
+                            fp8_fragment_a,
+                            partitioned_offsets,
+                            local_k_block_begin,
+                            global_k_block_begin,
+                            2,
+                            sf_stage_idx,
+                            smem_weight_sf,
+                        )
+                        if cutlass.const_expr(
+                            self._weight_sf_decoupled() and global_k64_group == 3
+                        ):
+                            weight_sf_pipeline.consumer_release(sf_state)
 
                         tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                         warpgroup.fence()
@@ -1381,7 +1442,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                             tidx=tidx,
                         )
 
-                weight_sf_pipeline.consumer_release(ab_consumer_state)
+                if cutlass.const_expr(not self._weight_sf_decoupled()):
+                    weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
 
@@ -1424,7 +1486,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 tidx % cutlass.Int32(128),
             )
 
-            expanded_offsets = make_expanded_offset_view(
+            expanded_offsets = self._make_expanded_scale_view(
                 smem_weight_sf,
                 self.mma_tiler[0],
             )
@@ -1448,14 +1510,16 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     smem_partition[(None, None, None, stage_idx)],
                     copy_view,
                 )
-                for k_block in cutlass.range_constexpr(half_k_blocks):
-                    convert_packed_a_kblock(
-                        packed_registers,
-                        fp8_fragment_a,
-                        partitioned_offsets,
-                        k_block,
-                        stage_idx,
-                    )
+                self._convert_weight_group(
+                    packed_registers,
+                    fp8_fragment_a,
+                    partitioned_offsets,
+                    0,
+                    0,
+                    half_k_blocks,
+                    stage_idx,
+                    smem_weight_sf,
+                )
 
                 scale_plane_base = (
                     k_tile % cutlass.Int32(2)
@@ -1482,16 +1546,16 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     tidx=tidx,
                 )
 
-                for k_block in cutlass.range_constexpr(
-                    half_k_blocks, num_k_blocks
-                ):
-                    convert_packed_a_kblock(
-                        packed_registers,
-                        fp8_fragment_a,
-                        partitioned_offsets,
-                        k_block,
-                        stage_idx,
-                    )
+                self._convert_weight_group(
+                    packed_registers,
+                    fp8_fragment_a,
+                    partitioned_offsets,
+                    half_k_blocks,
+                    half_k_blocks,
+                    num_k_blocks - half_k_blocks,
+                    stage_idx,
+                    smem_weight_sf,
+                )
                 tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                 warpgroup.fence()
                 for k_block in cutlass.range_constexpr(

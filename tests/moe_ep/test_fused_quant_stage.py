@@ -148,7 +148,8 @@ def test_mxfp8_staging_alternates_legacy_and_genphase_routing(monkeypatch):
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.arch_blackwell)]
 )
-def test_genphase_staging_mixed_input_formats(monkeypatch, device):
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+def test_genphase_staging_mixed_input_formats(monkeypatch, device, kind):
     """A prequantized batch must update the fused stager's shared tail memo."""
     from types import SimpleNamespace
     from unittest import mock
@@ -173,11 +174,13 @@ def test_genphase_staging_mixed_input_formats(monkeypatch, device):
     x = torch.randn(
         capacity, hidden, dtype=torch.bfloat16, device=device, generator=generator
     )
-    qx, sx = pkg.quantize_genphase_mxfp8(x, torch.float8_e4m3fn)
+    qx, sx = pkg.quantize_genphase_mxfp8(
+        x, torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+    )
     ids = torch.arange(topk, device=device).expand(capacity, topk).contiguous()
     scores = torch.full((capacity, topk), 1 / topk, device=device)
     workspace = SimpleNamespace(
-        config=SimpleNamespace(hidden=hidden),
+        config=SimpleNamespace(hidden=hidden, sf_vec_size=32, quant_kind=kind),
         x=torch.zeros_like(qx),
         x_sf=torch.zeros(capacity, 128, dtype=torch.uint8, device=device).view(
             torch.float8_e8m0fnu

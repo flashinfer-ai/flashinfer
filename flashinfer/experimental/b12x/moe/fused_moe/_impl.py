@@ -12562,6 +12562,7 @@ def _launch_dynamic_topk_sum(
     m: int,
     num_topk: int,
     k: int,
+    route_expert_ids: torch.Tensor,
     stream,
 ) -> None:
     if route_output.numel() < m * num_topk * k:
@@ -12589,7 +12590,14 @@ def _launch_dynamic_topk_sum(
         k,
         element_dtype,
         int(stream),
+        _int32_route_ids(route_expert_ids),
     )
+
+
+def _int32_route_ids(route_expert_ids: torch.Tensor) -> torch.Tensor:
+    if route_expert_ids.dtype == torch.int32:
+        return route_expert_ids
+    return route_expert_ids.to(torch.int32)
 
 
 def _launch_compact_micro_flat(
@@ -13849,6 +13857,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             k,
             "bf16",
             int(stream),
+            route_expert_ids=_int32_route_ids(flat_ids),
             launcher=compact.topk_sum,
         )
         return scatter_output
@@ -13951,6 +13960,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 m=m,
                 num_topk=num_topk,
                 k=k,
+                route_expert_ids=flat_ids,
                 stream=stream,
             )
     else:

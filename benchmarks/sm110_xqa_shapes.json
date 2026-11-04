@@ -1,6 +1,6 @@
 {
   "architecture": "sm_110a",
-  "shape_count": 13,
+  "shape_count": 9,
   "shapes": [
     {
       "name": "tree_fp16_contiguous",
@@ -51,32 +51,6 @@
       "mask": "causal"
     },
     {
-      "name": "tree_fp16_contiguous_tmem",
-      "batch": 1,
-      "query_tokens": 20,
-      "query_heads": 32,
-      "kv_heads": 4,
-      "head_dim": 512,
-      "capacity": 256,
-      "kv_dtype": "float16",
-      "page_size": 0,
-      "mask": "causal",
-      "kernel": "tmem"
-    },
-    {
-      "name": "tree_fp16_paged_tmem",
-      "batch": 1,
-      "query_tokens": 20,
-      "query_heads": 32,
-      "kv_heads": 4,
-      "head_dim": 512,
-      "capacity": 256,
-      "kv_dtype": "float16",
-      "page_size": 128,
-      "mask": "causal",
-      "kernel": "tmem"
-    },
-    {
       "name": "tree_fp8_contiguous_tmem",
       "batch": 1,
       "query_tokens": 20,
@@ -101,32 +75,6 @@
       "page_size": 128,
       "mask": "causal",
       "kernel": "tmem"
-    },
-    {
-      "name": "tree_fp8_contiguous_pair",
-      "batch": 1,
-      "query_tokens": 20,
-      "query_heads": 32,
-      "kv_heads": 4,
-      "head_dim": 512,
-      "capacity": 256,
-      "kv_dtype": "float8_e4m3fn",
-      "page_size": 0,
-      "mask": "causal",
-      "kernel": "pair"
-    },
-    {
-      "name": "tree_fp8_paged_pair",
-      "batch": 1,
-      "query_tokens": 20,
-      "query_heads": 32,
-      "kv_heads": 4,
-      "head_dim": 512,
-      "capacity": 256,
-      "kv_dtype": "float8_e4m3fn",
-      "page_size": 128,
-      "mask": "causal",
-      "kernel": "pair"
     },
     {
       "name": "decode_b1_c1024",

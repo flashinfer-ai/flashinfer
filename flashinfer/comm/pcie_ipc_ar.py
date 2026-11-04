@@ -105,6 +105,7 @@ def get_pcie_ipc_comm_module():
         all_reduce=all_reduce,
         memop_supported=module.pcie_ipc_memop_supported,
         set_memop_enabled=module.pcie_ipc_set_memop_enabled,
+        set_ce_slow_hops=module.pcie_ipc_set_ce_slow_hops,
     )
 
 
@@ -157,6 +158,11 @@ class PcieIpcAllReduceWorkspace:
         instead of probing for it. The label does not pick a kernel; it
         partitions the tune cache so two topologies do not read each other's
         measurements. Probing is collective and runs before any allocation.
+    ce_slow_hops : int, optional
+        Force the mask of ring hops that cross the CPU interconnect (bit h is
+        the hop from rank h to rank h+1) instead of deriving it from the probe.
+        It shapes the pipelined copy-engine ring's chunks on SM120 and keys the
+        tune cache; a wrong mask costs speed, not correctness.
     tune_cache : str, optional
         Where tuned configurations are read from at construction and written by
         :meth:`tune`. Defaults to ``FLASHINFER_AUTOTUNE_DIR`` (or the workspace
@@ -192,6 +198,7 @@ class PcieIpcAllReduceWorkspace:
         profile: Optional[str] = None,
         tune_batches: Optional[Sequence[int]] = None,
         tune_cache: Optional[str] = None,
+        ce_slow_hops: Optional[int] = None,
     ) -> None:
         # Construction is a staged transaction. Every rank must execute the same
         # sequence of collectives, so a rank that finds a problem does NOT raise
@@ -211,6 +218,7 @@ class PcieIpcAllReduceWorkspace:
         self.max_blocks = max_blocks
         self.profile = ""
         self.memop_supported = False
+        self.slow_hops = 0
         self.profile_reason = ""
         # Resolved launch configurations, keyed exactly. Consulted before any
         # AutoTuner call because even a pure cache lookup there takes a global
@@ -252,6 +260,13 @@ class PcieIpcAllReduceWorkspace:
                 )
             elif max_blocks <= 0:
                 error = f"max_blocks must be positive, got {max_blocks}"
+            elif ce_slow_hops is not None and not (
+                0 <= ce_slow_hops < (1 << self.world_size)
+            ):
+                error = (
+                    f"ce_slow_hops must be a mask of {self.world_size} hops, "
+                    f"got {ce_slow_hops}"
+                )
 
         # Layout must be identical on every rank, or one of them reads a peer
         # slab at the wrong offsets. Gather the config alongside the outcome so
@@ -262,6 +277,7 @@ class PcieIpcAllReduceWorkspace:
             "elem_size": self.elem_size,
             "max_blocks": max_blocks,
             "profile": profile,
+            "ce_slow_hops": ce_slow_hops,
             # Buckets pick which shape a tuned entry is reused for, so ranks
             # that disagree would resolve different configurations.
             "tune_batches": self._tune_batches,
@@ -295,6 +311,12 @@ class PcieIpcAllReduceWorkspace:
         self.memop_supported = self.world_size in (4, 8) and all(
             entry["memop_supported"] for entry in prepared
         )
+        # Only the pipelined ring reads the mask, and only stream-publication
+        # groups run it. Every rank derived it from the same gathered probe.
+        if self.memop_supported:
+            self.slow_hops = (
+                decision.slow_hops if ce_slow_hops is None else int(ce_slow_hops)
+            )
 
         # --- stage 3: allocate and share, then bind --------------------------
         # NOTE: create_shared_buffer() runs its own all_gather_object and
@@ -309,6 +331,8 @@ class PcieIpcAllReduceWorkspace:
             )
             if self.memop_supported:
                 module.set_memop_enabled(self._handle, True)
+                if self.slow_hops:
+                    module.set_ce_slow_hops(self._handle, self.slow_hops)
             # init() zeroes this rank's slab; no peer may push into it until
             # every rank has done so.
             torch.cuda.synchronize(self.device)
@@ -472,6 +496,7 @@ class PcieIpcAllReduceWorkspace:
             self.max_blocks,
             self.max_numel,
             self.memop_supported,
+            self.slow_hops,
         )
         self._joint_check(
             {
@@ -516,11 +541,19 @@ class PcieIpcAllReduceWorkspace:
             return
         self._warned_untuned = True
         if self._tune_cache_exists:
+            # Stream-publication workspaces also key on the ring's slow hops,
+            # which follow the rank-to-GPU mapping and can be pinned with
+            # ce_slow_hops= so tuning and serving agree.
+            hops = (
+                f", stream publication, slow_hops={self.slow_hops:#x}"
+                if self.memop_supported
+                else ""
+            )
             warnings.warn(
                 f"PCIe IPC all-reduce loaded {self._tune_cache} but it holds no "
                 f"entry for this workspace ({self.world_size} ranks, "
                 f"max_numel={self.max_numel}, max_blocks={self.max_blocks}, "
-                f"profile={self.profile}); it was tuned for a different one, so "
+                f"profile={self.profile}{hops}); it was tuned for a different one, so "
                 "every shape falls back to a seed configuration. Re-tune with "
                 "this workspace's parameters, or build it with the ones the "
                 "cache was written for.",

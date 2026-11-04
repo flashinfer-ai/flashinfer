@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import os
 import logging
 import functools
 import math
+from ctypes import byref
 from enum import Enum
 from functools import lru_cache
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -269,6 +271,49 @@ def _get_cache_buf(
     return buf
 
 
+_stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
+# Per-device private pools keep these long-lived buffers out of CUDA graph pools.
+_stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
+
+
+def _get_stream_cache_buf(
+    name: str, num_bytes: int, device: torch.device, zero_init: bool = False
+) -> torch.Tensor:
+    """Return the ``name`` scratch buffer owned by ``device``'s current CUDA stream.
+
+    Same contract as :func:`_get_cache_buf`, keyed additionally by the raw
+    ``cudaStream_t`` handle of the current stream. Launches on one stream are
+    ordered, so a kernel that leaves the buffer in a known state at exit can
+    reuse it on the next launch without re-initialising it; launches on
+    different streams are not ordered, so each stream gets its own buffer
+    (flashinfer-ai/flashinfer#3618). PyTorch draws stream handles from a fixed
+    per-device pool, which bounds the number of buffers.
+
+    Under CUDA graph capture the key is the capture stream, so graphs captured
+    on one stream share the buffer. That is safe only for stateless scratch and
+    only if those graphs never replay concurrently.
+    """
+    key = (name, device, torch.cuda.current_stream(device).cuda_stream)
+    buf = _stream_cache_buf.get(key)
+    if buf is None or buf.size(0) < num_bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        pool = _stream_cache_mem_pools.get(index)
+        if pool is None:
+            with torch.cuda.device(index):
+                pool = _stream_cache_mem_pools[index] = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool, device=index):
+            if zero_init:
+                buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+            else:
+                buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+        _stream_cache_buf[key] = buf
+    return buf
+
+
 # find the least power of 2 that is greater than or equal to x
 def _ceil_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
@@ -317,6 +362,16 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
         raise ValueError("device must be a cuda device")
     properties = get_device_properties(device)
     return properties.major, properties.minor
+
+
+def _check_block_scale_quantization_support(device: torch.device, op_name: str) -> None:
+    # The CUDA quantization kernels have no implementation below SM100.
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                f"{op_name} requires SM100 or newer; got SM{major}{minor}"
+            )
 
 
 # trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
@@ -661,41 +716,49 @@ def get_cuda_python_version() -> str:
     return cuda.__version__
 
 
+@functools.cache
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
+@functools.cache
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm100f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm110a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
 
 
+@functools.cache
 def is_sm120a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm120f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 12 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm12x_supported(device: torch.device) -> bool:
     """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
 
@@ -1252,6 +1315,45 @@ def experimental_backend(checker: Callable) -> Callable:
     return checker
 
 
+def _make_bind_with_defaults(sig: inspect.Signature) -> Callable:
+    """``dict(sig.bind(*args, **kwargs).apply_defaults().arguments)``, faster.
+
+    Covers the common call shape of a signature without ``*args`` /
+    ``**kwargs``; anything else (including every malformed call) goes through
+    ``sig.bind`` so its result and its ``TypeError`` are unchanged.
+    """
+    params = list(sig.parameters.values())
+    fast = all(p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) for p in params)
+    positional = tuple(p.name for p in params if p.kind == p.POSITIONAL_OR_KEYWORD)
+    ordered = tuple((p.name, p.default) for p in params)
+    empty = inspect.Parameter.empty
+
+    def slow(args, kwargs):
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+
+    def bind(args, kwargs):
+        if not fast or len(args) > len(positional):
+            return slow(args, kwargs)
+        given = dict(zip(positional, args, strict=False))
+        for name, value in kwargs.items():
+            if name in given or name not in sig.parameters:
+                return slow(args, kwargs)
+            given[name] = value
+        out = {}
+        for name, default in ordered:
+            if name in given:
+                out[name] = given[name]
+            elif default is empty:
+                return slow(args, kwargs)
+            else:
+                out[name] = default
+        return out
+
+    return bind
+
+
 def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
@@ -1371,6 +1473,7 @@ def backend_requirement(
     def decorator(func):
         # Get the function signature once for reuse
         sig = inspect.signature(func)
+        bind_with_defaults = _make_bind_with_defaults(sig)
 
         # Backends whose checker carries @experimental_backend. Placement is the
         # backstop: a checker defined under flashinfer.experimental without the
@@ -1529,10 +1632,7 @@ def backend_requirement(
                 # Apply defaults from the function signature for validation
                 # This ensures that all parameters (including backend) have their default values
                 # if not explicitly provided by the caller
-                bound_args = sig.bind(*args, **kwargs)
-                bound_args.apply_defaults()
-                # Convert to kwargs for validation functions
-                kwargs_with_defaults = dict(bound_args.arguments)
+                kwargs_with_defaults = bind_with_defaults(args, kwargs)
                 backend = kwargs_with_defaults.get("backend")
                 capability = _get_capability(*args, **kwargs)
                 if not has_backend_choices() and common_check is None:
@@ -1661,19 +1761,44 @@ def is_confidential_compute() -> bool:
         return forced == "1"
     if not torch.cuda.is_available():
         return False
+
     try:
         import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            state = pynvml.nvmlSystemGetConfComputeState()
-            # ccFeature != 0 means CC is enabled (ON or devtools).
-            return int(getattr(state, "ccFeature", 0)) != 0
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:
-        logger.debug("[Flashinfer]: Confidential-compute detection failed: %r", e)
+    except ImportError:
+        logger.warning(
+            "[Flashinfer]: pynvml not available; assuming Confidential Computing is off"
+        )
         return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"[Flashinfer]: Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"[Flashinfer]: Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        with contextlib.suppress(pynvml.NVMLError):
+            pynvml.nvmlShutdown()
+
+    return cc_enabled
 
 
 @lru_cache(maxsize=1)

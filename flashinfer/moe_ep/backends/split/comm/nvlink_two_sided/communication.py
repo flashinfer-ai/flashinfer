@@ -135,7 +135,7 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
     ) -> MoEEpDispatchResult:
         import torch
@@ -146,16 +146,9 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
             raise RuntimeError("NVLinkTwoSidedAlltoAll has been destroyed")
         if self._state is not None:
             raise RuntimeError("dispatch called twice without an intervening combine")
-        tokens_per_rank = (
-            self.params.max_tokens_per_rank
-            if max_tokens_per_rank is None
-            else max_tokens_per_rank
+        tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
+            runtime_max_tokens_per_rank
         )
-        if not 0 < tokens_per_rank <= self.params.max_tokens_per_rank:
-            raise ValueError(
-                f"max_tokens_per_rank={tokens_per_rank} must be in "
-                f"(0, {self.params.max_tokens_per_rank}]"
-            )
         if topk_ids.dtype != torch.int32:
             topk_ids = topk_ids.to(torch.int32)
         if topk_weights is not None and topk_weights.dtype != torch.float32:

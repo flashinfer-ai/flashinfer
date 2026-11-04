@@ -918,7 +918,14 @@ MXFP4), each with its `_swap_ab` counterpart. Up to eight compute warps issue
 warp-level `mma.sync` from TMA-filled shared memory: block-scaled
 `kind::mxf8f6f4` for MXFP8 and MXFP8 × MXFP4 (E2M1 weights unpacked in
 registers) and `kind::mxf4nvf4` for NVFP4, with the scale factors as register
-operands. A scheduler warp runs the same grouped persistent scheduler as SM100.
+operands. The MXFP8 × MXFP4 sources create their A and B TMA descriptors with
+CUTLASS's default 128-byte L2 promotion: the packed E2M1 weight has 64-byte K
+rows (128 values per fp8 K-tile), and without the hint every row is its own
+DRAM request, which held the W4A8 kernels at ~0.85 TB/s on an RTX PRO 6000
+(FC1 of 12 experts, 7168/3072, 16 tokens: 343 µs) against 1.19 TB/s and 253 µs
+with it, level with the CuTe-DSL and CUTLASS mixed-input kernels. The BF16,
+MXFP8 and NVFP4 SM120 sources still carry the DSL default (no promotion);
+128-byte rows measure the same either way, 64-byte BF16 K tiles do not. A scheduler warp runs the same grouped persistent scheduler as SM100.
 The templates address tokens and token scales by coordinate on one global TMA
 descriptor each and store through STG, so they patch no tensormap: the
 workspace is one 128-byte scheduler-counter slot. There is no CTA pair,
@@ -933,7 +940,11 @@ activation of the topology expands through its exact source fragments. Kernel
 IDs start with `sm120_cudnn_frost_`, and catalog and shortlist records carry
 `arch: sm_120a`.
 
-All SM120 sources are exported from cuDNN Frontend `89f40871`. Each host
+The BF16, MXFP8 and NVFP4 SM120 sources are exported from cuDNN Frontend
+`89f40871`; the MXFP8 × MXFP4 sources from `9769e15b` (branch
+`sm120-moe-tma-l2-promotion`, which adds the TMA L2 promotion above to every
+SM120 template and sizes the packed E2M1 side of a mixed pair at its 64-byte
+row in the SMEM footprint check, as `device.py` does here). Each host
 zeroes its scheduler counter with a one-thread kernel before the PDL main
 launch, as the SM100 MoE hosts do, so the exported TVM-FFI function needs no
 caller-side reset. Like the SM107 sources, the schedulers take `G+1` explicit
@@ -954,6 +965,17 @@ fuse the intermediate quantization (E4M3 data and segmented E8M0 scales, both
 through STG) in the normal orientation, for the tiles whose warp tile drains
 whole 32-column quantization blocks. cuDNN Frost cannot store packed FP4 on
 SM120, so NVFP4 plans always use the separate intermediate quantizer.
+
+The SM120 MXFP8 × MXFP4 shortlists were re-measured after the promotion fix
+(the ranking changed: the shipped tables, measured on the unpromoted kernels,
+kept narrow tiles that had been fastest), cold in L2, through the complete
+MoE pipeline with the other stage fixed to its autotuned winner: every legal
+FC1 kernel (SwiGLU for the gated class, ReLU2 for the non-gated one, the other
+activations taking their class's tiles) ranked by its stage time plus the
+requantization launch it does or does not need, every FC2 kernel by its stage
+time, uniform routing at every bucket and skewed routing at 128, 512 and 2048
+tokens, geometric mean of the per-routing normalized latencies, two per stage
+and profile, with a 1024-token bucket added to the eight shipped ones.
 
 Admission, token-count shortlists, the heuristic pool for unlisted shapes,
 the native routing/finalize adapters and the MoELayer

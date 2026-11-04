@@ -1314,3 +1314,81 @@ def test_use_cache_hit_true_under_capture_requires_a_built_program():
     expected = _oracle(inputs)
     _assert_close(runner.out, expected)
     _assert_row_rel_l2(runner.out, expected)
+
+
+def _shared_launcher_programs():
+    """``PROGRAMS`` records whose host launcher is one shared per-route source."""
+    shared = {}
+    suffix = "_binding.cu"
+    for name, record in cake_jit.PROGRAMS.items():
+        stem = cake_jit.Path(record["sources"][1]).name[: -len(suffix)]
+        if stem != name:
+            shared[name] = record
+    return shared
+
+
+def _msa_nvfp4_decode_csrc():
+    return cake_jit.Path(cake_jit.__file__).resolve().parent / "csrc"
+
+
+def test_shared_launchers_take_each_program_from_its_compile_flags():
+    """Every ``#ifndef CAKE_* / #error`` selector of a shared launcher source is set exactly
+    once by the record's compile flags; the kernel symbol and the host shim match the record and
+    the launcher stem is the record's route."""
+    import re
+
+    csrc = _msa_nvfp4_decode_csrc()
+    shared = _shared_launcher_programs()
+    assert shared, "no shared launchers registered"
+    for name, record in shared.items():
+        stem = cake_jit.Path(record["sources"][1]).name[: -len("_binding.cu")]
+        assert stem == f"cake_msa_nvfp4_decode_{record['route']}", (name, stem)
+        text = (csrc / record["sources"][1]).read_text()
+        guards = re.findall(r"#ifndef (CAKE_\w+)\n#error", text)
+        assert "CAKE_PROGRAM_KERNEL" in guards, (name, guards)
+        assert "CAKE_PROGRAM_SHIM" in guards, (name, guards)
+        assert "CAKE_BIND_SMEM" in guards, (name, guards)
+        assert f"-DCAKE_PROGRAM_KERNEL=kernel_{name}" in record["compile_flags"], name
+        shim = [
+            f for f in record["compile_flags"] if f.startswith("-DCAKE_PROGRAM_SHIM=")
+        ]
+        assert len(shim) == 1 and re.fullmatch(
+            r"-DCAKE_PROGRAM_SHIM=cake_host_shim_[0-9a-f]{16}", shim[0]
+        ), (name, shim)
+        for macro in guards:
+            hits = [f for f in record["compile_flags"] if f.startswith(f"-D{macro}=")]
+            assert len(hits) == 1, (name, macro, hits)
+
+
+def test_shared_launchers_have_the_generated_form():
+    """Each shared launcher source carries the generated -D-selected form and no digest."""
+    import re
+
+    csrc = _msa_nvfp4_decode_csrc()
+    launchers = {r["sources"][1] for r in _shared_launcher_programs().values()}
+    assert launchers, "no shared launchers registered"
+    for launcher in sorted(launchers):
+        text = (csrc / launcher).read_text()
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, launcher
+        assert "namespace CAKE_PROGRAM_SHIM {" in text, launcher
+        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);" in text, (
+            launcher
+        )
+        assert "config.dynamicSmemBytes = CAKE_PASTE(CAKE_BIND_SMEM, u);" in text, (
+            launcher
+        )
+        assert not re.search(r"[0-9a-f]{20}", text), launcher
+
+
+def test_shared_launchers_serve_one_route_each():
+    """Records sharing a launcher source share one route and no two carry the same full
+    compile-flag set."""
+    by_stem = {}
+    for record in _shared_launcher_programs().values():
+        stem = cake_jit.Path(record["sources"][1]).name[: -len("_binding.cu")]
+        by_stem.setdefault(stem, []).append(record)
+    assert by_stem, "no shared launchers registered"
+    for stem, records in by_stem.items():
+        assert len({r["route"] for r in records}) == 1, stem
+        tuples = {tuple(r["compile_flags"]) for r in records}
+        assert len(tuples) == len(records), (stem, len(tuples), len(records))

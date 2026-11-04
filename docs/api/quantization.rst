@@ -203,8 +203,23 @@ linear (non-swizzled) block-scale layout.
     nvfp4_kv_dequantize_paged
     nvfp4_quantize_paged_kv_cache
 
+NVFP4 KV Cache Materialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Materialize the active pages of a paged NVFP4 KV cache as FP8 for attention
+kernels that do not read NVFP4 K/V directly.
+
+.. currentmodule:: flashinfer.quantization.kernels.nvfp4_kv_materialize
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_kv_materialize_fp8
+
 FP8 Quantization
 ----------------
+
+.. currentmodule:: flashinfer.quantization
 
 .. autosummary::
     :toctree: ../generated
@@ -233,35 +248,3 @@ Fused gated-activation MXFP8 quantization
 
     silu_and_mul_mxfp8_quantize
     silu_and_mul_mxfp8_quantize_backward
-
-CuTe-DSL Quantization Kernels (experimental)
---------------------------------------------
-
-The CuTe-DSL backends are conditionally available when the
-``nvidia-cutlass-dsl`` package is installed. At runtime they are also
-re-exported as ``flashinfer.quantization.{nvfp4,mxfp4,mxfp8}_quantize_cute_dsl``
-when available; documenting them here via their canonical submodule
-path keeps the docs build from depending on the CuTe-DSL stack being
-importable.
-
-.. currentmodule:: flashinfer.quantization.kernels.nvfp4_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    nvfp4_quantize_cute_dsl
-    nvfp4_quantize_per_token_cute_dsl
-
-.. currentmodule:: flashinfer.quantization.kernels.mxfp4_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    mxfp4_quantize_cute_dsl
-
-.. currentmodule:: flashinfer.quantization.kernels.mxfp8_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    mxfp8_quantize_cute_dsl

@@ -26,8 +26,8 @@ except ImportError:
     CUDNN_AVAILABLE = False
 
 
-def _create_cudnn_handle(stream: torch.cuda.Stream):
-    return get_cudnn_attention_handle(cudnn, stream)
+def _create_cudnn_handle(stream=None, *, device=None):
+    return get_cudnn_attention_handle(cudnn, stream, device=device)
 
 
 # Tensor ids
@@ -526,10 +526,7 @@ def _execute_decode(
     stats_use_log2=False,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
-    device = q.device
-    handle_ = _create_cudnn_handle(
-        torch.cuda.current_stream(device.index if device.type == "cuda" else device)
-    )
+    handle_ = _create_cudnn_handle(device=q.device)
 
     # Dense attention observes the descriptor's (B, H, S) stats
     # layout. Expose that view while retaining the public token-major storage.
