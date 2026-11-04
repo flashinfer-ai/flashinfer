@@ -346,6 +346,7 @@ def cute_dsl_fmha_ragged_prefill(
     kernel_fn=None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool = False,
+    backend: str = "cute-dsl",
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
@@ -401,6 +402,9 @@ def cute_dsl_fmha_ragged_prefill(
         Threshold scale factor for skip-softmax sparsity (https://arxiv.org/abs/2512.12087).
         The actual threshold = scale_factor / max_kv_len, then converted to log2 domain.
         None or 0 disables skip-softmax.
+    backend : str
+        ``cute-dsl`` uses ordinary dispatch. ``cute-dsl-rubin`` explicitly
+        selects SM107 E4M3 D192/V128 equal-head attention with BF16 output.
     """
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
@@ -412,6 +416,48 @@ def cute_dsl_fmha_ragged_prefill(
         skip_softmax_threshold_scale_factor is not None
         and skip_softmax_threshold_scale_factor > 0
     )
+
+    if backend == "cute-dsl-rubin":
+        from .rubin import _validate_rubin_fmha
+
+        _validate_rubin_fmha(
+            q,
+            k,
+            v,
+            o,
+            is_causal=is_causal,
+            window_left=window_left,
+            window_right=window_right,
+            attention_sinks=attention_sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+        if kernel_fn is not None:
+            raise ValueError("cute-dsl-rubin does not support a custom kernel_fn")
+        from flashinfer.cute_dsl.attention.fmha.compile_rubin import (
+            compile_rubin_fmha_kernel,
+        )
+
+        # This specialization has no PDL; the launch hint is only effective
+        # on kernels that support it.
+        enable_pdl = False
+        kernel_fn = compile_rubin_fmha_kernel(
+            q.dtype,
+            v.dtype,
+            o.dtype,
+            H_q,
+            H_k,
+            D,
+            D_v,
+            is_causal,
+            lse is not None,
+            False,
+            False,
+            False,
+            q.device,
+        )
+        enable_tvm_ffi = True
+    elif backend != "cute-dsl":
+        raise ValueError(f"Unsupported CuTe DSL FMHA backend: {backend}")
 
     if kernel_fn is None:
         gpu_arch = _get_gpu_arch(q.device)

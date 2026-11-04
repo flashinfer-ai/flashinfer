@@ -20,6 +20,7 @@ import math
 import os
 from types import SimpleNamespace
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -29,10 +30,14 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    cast,
     overload,
 )
 
 import torch
+
+if TYPE_CHECKING:
+    from .attention.cute_dsl.rubin import RubinPrefillPlan
 
 from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
@@ -5572,7 +5577,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``/``cute-dsl-prims``/``cutile``.
+            or ``cute-dsl``/``cute-dsl-rubin``/``cute-dsl-prims``/``cutile``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability: ``fa3`` on Hopper where it applies,
@@ -5588,6 +5593,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The ``cudnn`` backend takes ``qo_indptr``/``kv_indptr`` in the same **token**
             units as every other backend, whether selected explicitly or via ``auto``.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            ``cute-dsl-rubin`` is an explicit SM107-only E4M3 prefill backend
+            with ``head_dim_qk=192``, ``head_dim_vo=128`` and BF16 output.
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
@@ -5619,10 +5626,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
                 "under MaskMode.CUSTOM."
             )
-        if (
-            jit_args is not None
-            and backend != "cute-dsl"
-            and backend != "cute-dsl-prims"
+        if jit_args is not None and backend not in (
+            "cute-dsl",
+            "cute-dsl-rubin",
+            "cute-dsl-prims",
         ):
             if jit_kwargs is None:
                 jit_kwargs = {}
@@ -5711,11 +5718,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
-        # `auto` is re-resolved on every plan() (its answer depends on plan
-        # arguments such as window_left); _backend holds the resolved value.
+        # `auto` is re-resolved on every plan() from the
+        # requested backend; _backend holds the selected implementation.
         self._requested_backend = backend
         self._backend = backend
         self._cached_module = None
+        self._plan_info: Optional[Any] = None
         # cudnn: stats ragged offset so the LSE lands packed as
         # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
         self._cudnn_stats_offsets: Optional[torch.Tensor] = None
@@ -5959,6 +5967,20 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
+        With ``backend="cute-dsl-rubin"``, SM107 supports E4M3 Q/K/V with
+        ``head_dim_qk=192``, ``head_dim_vo=128`` and BF16 output. Equal query
+        and KV head counts support ragged lengths. Head ratios 2, 4 and 8
+        require positive, uniform query lengths and positive, uniform KV
+        lengths; causal attention additionally requires query length <= KV
+        length. This configuration supports dense and causal masks only.
+
+        For grouped-head SM107 CUDA graphs, call :meth:`plan` before capture
+        and keep both indptr buffers unchanged for the graph's lifetime.
+        Replanning with the same batch size, lengths, head counts, mask and
+        effective softmax scale reuses the existing plan. Changing this
+        configuration requires a new wrapper, even before capture. Equal-head
+        plans retain support for changing ragged lengths.
+
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         q_data_type = canonicalize_torch_dtype(q_data_type)
@@ -6035,6 +6057,63 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if v_indptr is not None:
             v_indptr = v_indptr.contiguous()
 
+        # Host metadata is shared by backend validation and common planning.
+        qo_indptr_host = _plan_indptr_host(qo_indptr, qo_indptr_cpu, "qo_indptr_cpu")
+        kv_indptr_host = _plan_indptr_host(kv_indptr, kv_indptr_cpu, "kv_indptr_cpu")
+
+        if self._backend == "cute-dsl-rubin":
+            from .attention.cute_dsl.rubin import RubinPrefillPlan
+
+            RubinPrefillPlan.validate(
+                device=self.device,
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                q_dtype=cast(torch.dtype, q_data_type),
+                kv_dtype=cast(torch.dtype, kv_data_type),
+                o_dtype=cast(torch.dtype, o_data_type),
+                kv_layout=self._kv_layout,
+                causal=causal,
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+                fixed_split_size=fixed_split_size,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
+                max_token_per_sequence=max_token_per_sequence,
+                max_sequence_kv=max_sequence_kv,
+                v_indptr=v_indptr,
+                o_indptr=o_indptr,
+            )
+
+        if (
+            self.is_cuda_graph_enabled
+            and self._backend == "cute-dsl-rubin"
+            and self._plan_info is not None
+        ):
+            current_plan = cast("RubinPrefillPlan", self._plan_info)
+            if current_plan.is_grouped:
+                # Validation above must precede reuse; neither a rejected nor
+                # an equivalent replan may modify captured buffers or handles.
+                current_plan.check_replan(
+                    qo_indptr_host=qo_indptr_host,
+                    kv_indptr_host=kv_indptr_host,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    causal=causal,
+                    sm_scale=sm_scale,
+                )
+                return
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
             raise ValueError(
@@ -6068,10 +6147,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "before capture, or use backend='auto' or an explicit "
                 "'cudnn'/'fa2' if you need to re-plan"
             )
-
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = _plan_indptr_host(qo_indptr, qo_indptr_cpu, "qo_indptr_cpu")
-        kv_indptr_host = _plan_indptr_host(kv_indptr, kv_indptr_cpu, "kv_indptr_cpu")
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
@@ -6192,7 +6267,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else int(kv_len_arr.max().item())
         )
 
-        if self._backend == "cute-dsl-prims":
+        if self._backend == "cute-dsl-rubin":
+            self._plan_info = RubinPrefillPlan.plan(
+                device=self.device,
+                qo_indptr=self._qo_indptr_buf,
+                kv_indptr=self._kv_indptr_buf,
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
+        elif self._backend == "cute-dsl-prims":
             from .attention.cute_dsl.sm120_fmha import (
                 _validate_sm120_prims_plan_options,
             )
@@ -6233,11 +6320,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 sm_scale=sm_scale,
             )
         elif self._backend == "cute-dsl":
+            self._plan_info = None
             if custom_mask is not None or packed_custom_mask is not None:
                 raise NotImplementedError(
                     "cute-dsl backend does not support custom_mask"
                 )
-            if head_dim_vo is not None and head_dim_vo != head_dim_qk:
+            if head_dim_vo != head_dim_qk:
                 raise NotImplementedError(
                     "cute-dsl backend requires head_dim_vo == head_dim_qk"
                 )
@@ -6673,6 +6761,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._backend not in (
             "cudnn",
             "cute-dsl",
+            "cute-dsl-rubin",
             "cute-dsl-prims",
             "cutile",
         ):
@@ -6819,7 +6908,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_qk]``
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_qk]``.
+            ``cute-dsl-rubin`` prefill requires contiguous Q/K/V, output
+            and LSE. Tensors may be replaced between ordinary :meth:`run`
+            calls; captured graphs retain the storage used during capture.
         k : torch.Tensor
             The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_qk]``
         v : torch.Tensor
@@ -7055,7 +7147,29 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cute-dsl-prims":
+        if self._backend == "cute-dsl-rubin":
+            assert self._plan_info is not None
+            cast("RubinPrefillPlan", self._plan_info).run_ragged(
+                q,
+                k,
+                v,
+                out,
+                lse=lse if return_lse else None,
+                enable_pdl=enable_pdl,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                o_scale=o_scale,
+                custom_args=args,
+                sinks=getattr(self, "_sinks", None),
+                kv_cache_sf=kv_cache_sf,
+            )
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
+        elif self._backend == "cute-dsl-prims":
             assert self._prims_backend is not None
             if args:
                 raise NotImplementedError(
