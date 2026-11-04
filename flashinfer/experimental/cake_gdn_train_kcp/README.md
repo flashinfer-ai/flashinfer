@@ -277,7 +277,7 @@ a successor:
 | inputs `q, k, v, g, beta` (references) | yes | yes | 0 extra |
 | `S_in` (incoming boundary states) FP32 | yes | yes | `n_in * s` |
 | received summary pairs (owner, `save_transfer=True`) | yes | yes | `2 * s_owner * n_owned_fragments` |
-| `M_seg` (segment transfers, `P > 1`) | yes | yes | `(P - 1) * n_frag * s` |
+| `M_seg` (segment transfers, `P > 1`) | yes | `save_transfer=True` only (else rebuilt by the replay) | `P * n_frag * s` |
 | convolution history rows | yes | yes | `<= 3 * n_in * C * 2` |
 | `gamma`, `gcum`, `Akk` | yes | yes | about 6,339 B per token |
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
