@@ -159,8 +159,33 @@ def test_aot_script_lints_specs_before_building_and_inspects_wheels_after():
     text = (
         REPO_ROOT / "scripts/task_test_jit_cache_package_build_import.sh"
     ).read_text()
+    common = (REPO_ROOT / "scripts/jit_cache_build_common.sh").read_text()
 
-    lint = text.index('"${SCRIPT_DIR}/check_jit_spec_gencodes.py"')
+    lint = text.index("run_provider_spec_lint ")
     build_started = text.index("PROVIDER_BUILD_STARTED_AT=")
     inspect = text.index('"${SCRIPT_DIR}/verify_jit_cache_provider_architectures.py"')
     assert lint < build_started < inspect
+    assert "check_jit_spec_gencodes.py" in common
+
+
+@pytest.mark.cpu_only
+def test_standalone_lint_script_covers_both_cpu_architectures():
+    text = (REPO_ROOT / "scripts/task_check_jit_spec_gencodes.sh").read_text()
+
+    assert "x86_64_provider_architectures" in text
+    assert "aarch64_provider_architectures" in text
+    assert "run_provider_spec_lint" in text
+
+
+@pytest.mark.cpu_only
+def test_pr_test_runs_spec_lint_and_requires_it():
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/pr-test.yml").read_text())
+    jobs = workflow["jobs"]
+
+    lint = jobs["spec-lint"]
+    assert lint["needs"] == ["gate", "setup"]
+    # Authorized runs only: the lane executes the PR's code on a self-hosted runner.
+    assert "needs.gate.outputs.authorized == 'true'" in lint["if"]
+    assert "task_check_jit_spec_gencodes.sh" in str(lint["steps"])
+    assert "spec-lint" in jobs["test-results-summary"]["needs"]

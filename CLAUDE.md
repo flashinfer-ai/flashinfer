@@ -921,7 +921,10 @@ the next nightly. Before compiling, `scripts/check_jit_spec_gencodes.py --provid
 <arch>` generates the spec list for each provider (`flashinfer.aot.generate_jit_specs`;
 needs torch and nvcc, not a GPU) and checks every explicit `-gencode` flag with
 `provider_flag_issues` in `flashinfer/jit/_cuda_architecture.py`; modules without
-explicit gencodes follow the provider-filtered compilation context. After the
+explicit gencodes follow the provider-filtered compilation context. The PR
+`Provider Spec Lint (cuXXX)` job (`scripts/task_check_jit_spec_gencodes.sh`, no GPU)
+runs it per CUDA image ahead of the hours-long AOT builds, and is part of `Test
+Results Summary`; the AOT lanes repeat it first. After the
 provider wheels build, `scripts/verify_jit_cache_provider_architectures.py` runs the
 same `cuobjdump` inspection the release builds use. Register a module whose source
 serves several architectures only for the targets in
