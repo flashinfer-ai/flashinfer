@@ -2478,8 +2478,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
         # Host FP32 scales enter the device kernel in log2 units. Device
         # buffers retain natural units until they are loaded by the kernel.
+        softmax_scale_operand = softmax_scale
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
-            softmax_scale = softmax_scale * LOG2_E
+            softmax_scale_operand = softmax_scale * LOG2_E
 
         self.dense_kernel(
             tma_desc_q_latent,
@@ -2495,7 +2496,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             acc_lse,
             cache_seqs,
             cu_seqlens_q,
-            softmax_scale,
+            softmax_scale_operand,
             output_scale,
             tile_sched_params,
             block_split_kvs,
@@ -2625,7 +2626,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         acc_lse: cute.Tensor,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        softmax_scale: cutlass.Float32 | cute.Tensor,
+        softmax_scale_operand: cutlass.Float32 | cute.Tensor,
         output_scale: cutlass.Float32 | cute.Tensor,
         tile_sched_params: object,
         sparse_inputs: object,
@@ -2644,10 +2645,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             # Match the PDL launch before reading live metadata or sparse scales.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
-        if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
-            scale_softmax_log2 = softmax_scale[0] * LOG2_E
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
         else:
-            scale_softmax_log2 = softmax_scale
+            scale_softmax_log2 = softmax_scale_operand
         if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
             output_scale = output_scale[0]
 

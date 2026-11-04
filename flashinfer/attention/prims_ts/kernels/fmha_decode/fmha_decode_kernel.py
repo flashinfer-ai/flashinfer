@@ -2576,7 +2576,7 @@ def _run_decode_gen_active(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32 | cute.Pointer,
+    softmax_scale_operand: Float32 | cute.Pointer,
     output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
@@ -2733,8 +2733,8 @@ def _run_decode_gen_active(
         total_kv_tiles,
         scale_softmax_log2=(
             Float32(1.0)
-            if isinstance(scale_softmax_log2, cute.Pointer)
-            else scale_softmax_log2
+            if isinstance(softmax_scale_operand, cute.Pointer)
+            else softmax_scale_operand
         ),
         o_ptr=o_iter,
         output_scale=(
@@ -2885,9 +2885,9 @@ def _run_decode_gen_active(
         )
     # Scales are first consumed by the task bodies. Bind their device values
     # after the producer acquire so resource initialization can overlap it.
-    if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Pointer)):
-        resolved_softmax_scale = cute.make_tensor(
-            scale_softmax_log2, cute.make_layout(1)
+    if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Pointer)):
+        scale_softmax_log2 = cute.make_tensor(
+            softmax_scale_operand, cute.make_layout(1)
         )[0] * Float32(math.log2(math.e))
         for resource in task_manager.resources:
             if cutlass.const_expr(
@@ -2902,7 +2902,7 @@ def _run_decode_gen_active(
                     ),
                 )
             ):
-                resource.scale_softmax_log2 = resolved_softmax_scale
+                resource.scale_softmax_log2 = scale_softmax_log2
     if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
         resolved_output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
         for resource in task_manager.resources:
@@ -2968,7 +2968,7 @@ def _run_decode_gen_runtime_prefix(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32 | cute.Pointer,
+    softmax_scale_operand: Float32 | cute.Pointer,
     output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
@@ -3058,7 +3058,7 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3115,7 +3115,7 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3173,7 +3173,7 @@ def decode_gen_kernel(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32 | cute.Pointer,
+    softmax_scale_operand: Float32 | cute.Pointer,
     output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
@@ -3299,7 +3299,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3353,7 +3353,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3407,7 +3407,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3510,9 +3510,9 @@ def fmha_decode_launch(
     its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
     log2_e = math.log2(math.e)
-    scale_log2 = softmax_scale
+    softmax_scale_operand = softmax_scale
     if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
-        scale_log2 = Float32(softmax_scale * log2_e)
+        softmax_scale_operand = Float32(softmax_scale * log2_e)
     if cutlass.const_expr(requested_splits is not None):
         # Prepare the reciprocal once on the host; counts stay runtime operands.
         requested_splits = (
@@ -3919,7 +3919,7 @@ def fmha_decode_launch(
                 o_iter,
                 s_k,
                 h_k,
-                scale_log2,
+                softmax_scale_operand,
                 output_scale,
                 seqlens_kv_iter,
                 cu_seqlens_q_iter,
@@ -4003,9 +4003,9 @@ def fmha_block_sparse_launch(
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes and cfg.use_paged_kv):
         raise ValueError("block-sparse proxy routes require contiguous K/V")
 
-    scale_softmax_log2 = softmax_scale
+    softmax_scale_operand = softmax_scale
     if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
-        scale_softmax_log2 = Float32(softmax_scale * math.log2(math.e))
+        softmax_scale_operand = Float32(softmax_scale * math.log2(math.e))
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     q_seq = Int32(cfg.max_seq_len_q)
@@ -4233,7 +4233,7 @@ def fmha_block_sparse_launch(
         o_iter,
         s_k,
         h_k,
-        scale_softmax_log2,
+        softmax_scale_operand,
         output_scale,
         seqlens_kv_iter,
         null_i32_ptr,

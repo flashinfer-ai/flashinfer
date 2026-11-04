@@ -2964,10 +2964,10 @@ def _variable_window_buffers(geometry, empty_i32):
 
 
 def _validate_context_softmax_scale(scale: GlobalScale) -> None:
-    """Keep normalized host scales representable after the log2 conversion."""
+    """Check normalized host scales against the launcher's base-2 conversion limit."""
     if not isinstance(scale, torch.Tensor) and scale > _MAX_CONTEXT_SOFTMAX_SCALE:
         raise ValueError(
-            "softmax_scale * log2(e) must be representable as a positive float32"
+            "softmax_scale is too large for the launcher's FP32 base-2 conversion"
         )
 
 
@@ -3374,13 +3374,10 @@ class BatchPrefillTSWrapper:
             runtime_window_starts = state.empty_i32
             runtime_window_ends = state.empty_i32
             runtime_window_cta_starts = state.empty_i32
-        if softmax_scale is None:
-            softmax_scale = state.softmax_scale
-        else:
-            softmax_scale = resolve_scale(
-                softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
-            )
-            _validate_context_softmax_scale(softmax_scale)
+        softmax_scale = resolve_scale(
+            softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
+        )
+        _validate_context_softmax_scale(softmax_scale)
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", geometry.device
         )
@@ -3666,13 +3663,10 @@ class BatchPrefillPagedTSWrapper:
                 max_q_len = geometry.max_q_len
             if max_kv_len is None:
                 max_kv_len = geometry.max_kv_len
-        if softmax_scale is None:
-            softmax_scale = state.softmax_scale
-        else:
-            softmax_scale = resolve_scale(
-                softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
-            )
-            _validate_context_softmax_scale(softmax_scale)
+        softmax_scale = resolve_scale(
+            softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
+        )
+        _validate_context_softmax_scale(softmax_scale)
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", geometry.device
         )

@@ -1675,8 +1675,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
 
         # Host FP32 scales enter the device kernel in log2 units. Device
         # buffers retain natural units until they are loaded by the kernel.
+        softmax_scale_operand = softmax_scale
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
-            softmax_scale = softmax_scale * LOG2_E
+            softmax_scale_operand = softmax_scale * LOG2_E
 
         self.split_kv_kernel(
             tma_desc_q_latent,
@@ -1695,7 +1696,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cache_seqs,
             cu_seqlens_q,
             block_split_kvs,
-            softmax_scale,
+            softmax_scale_operand,
             output_scale,
             tile_sched_params,
             clc_tile_sched_params,
@@ -1920,7 +1921,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        softmax_scale: cutlass.Float32 | cute.Tensor,
+        softmax_scale_operand: cutlass.Float32 | cute.Tensor,
         output_scale: cutlass.Float32 | cute.Tensor,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
@@ -1935,10 +1936,10 @@ class MlaDecodeTs(Nvfp4KVConfig):
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
         if cutlass.const_expr(acc_o is not None and not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-        if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
-            scale_softmax_log2 = softmax_scale[0] * LOG2_E
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
         else:
-            scale_softmax_log2 = softmax_scale
+            scale_softmax_log2 = softmax_scale_operand
         if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
             output_scale = output_scale[0]
         if cutlass.const_expr(self.direct_sparse):

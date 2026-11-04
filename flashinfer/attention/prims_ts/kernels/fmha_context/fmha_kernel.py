@@ -1,4 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -3409,12 +3408,9 @@ class FmhaTs:
         if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
             raise ValueError("sage_scales is required by, and only by, a Sage kernel")
         cfg = self.cfg
-        scale_softmax_log2 = scale_softmax
+        softmax_scale_operand = scale_softmax
         if cutlass.const_expr(not isinstance(scale_softmax, cute.Tensor)):
-            # Round only the product to FP32, matching the public host-scale contract.
-            scale_softmax_log2 = Float32(
-                cutlass.Float64(scale_softmax) * cutlass.Float64(1.4426950408889634)
-            )
+            softmax_scale_operand = scale_softmax * Float32(1.4426950408889634)
         if cutlass.const_expr(
             cfg.use_paged_kv
             and (
@@ -3761,7 +3757,7 @@ class FmhaTs:
                 q_scales,
                 k_scales,
                 tile_sched_params,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 num_kv_tiles,
                 num_seq_tiles,
@@ -3821,7 +3817,7 @@ class FmhaTs:
             | utils.ClcDynamicPersistentTileSchedulerParams
             | None
         ),
-        scale_softmax_log2: Float32 | cute.Tensor,
+        softmax_scale_operand: Float32 | cute.Tensor,
         output_scale: Float32 | cute.Tensor,
         num_kv_tiles: Int32,
         num_seq_tiles: Int32,
@@ -3872,8 +3868,10 @@ class FmhaTs:
         cfg.num_seq_tiles = num_seq_tiles
         # Host scalars arrive in log2 units; device scalar buffers retain the
         # public natural-exponential units until this load.
-        if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Tensor)):
-            scale_softmax_log2 = scale_softmax_log2[0] * Float32(1.4426950408889634)
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
+        else:
+            scale_softmax_log2 = softmax_scale_operand
         if cutlass.const_expr(
             isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
         ):
