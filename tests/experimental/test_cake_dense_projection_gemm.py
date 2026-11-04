@@ -8011,6 +8011,20 @@ def _k1_exact_sm_count_edges(arch, sm_count):
     return cases
 
 
+def _k1_with_chain_ranges(arch, sm_count, key, T, want):
+    """``(want, chains)``: an edge case's expected ``(block_n, splits)`` and chain count with
+    :data:`K1_CHAIN_RANGES_BY_SM`, whose ranges come before the tables the case is drawn from
+    (:func:`k1_chain_plan`): a token count of a chain range expects that range's tile width at one split and its chain
+    count, every other the case's ``want`` (one chain)."""
+    _, L, M, N, dt = key
+    chain = cake_backend.k1_chain_plan(
+        arch=arch, L=L, M=M, N=N, K=T, out_f32=dt == "f32", sm_count=sm_count
+    )
+    if chain is None:
+        return want, 1
+    return (chain[0], 1), chain[1]
+
+
 def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` or
@@ -8021,8 +8035,9 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
     token count of a two-split range (an odd number of K blocks), the row runs the deterministic program, with the
     deterministic package's bits.  On a part of exactly the SM count of a table of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` (148-SM ``sm_100a`` / ``sm_103a`` parts) the reverse: the deterministic
-    program with its bits at both ends of a range, the row's program one token outside it.  A part of any other SM
-    count skips."""
+    program with its bits at both ends of a range, the row's program one token outside it.  An edge inside a range of
+    :data:`K1_CHAIN_RANGES_BY_SM` for the part runs that range's program of several chains instead
+    (:func:`_k1_with_chain_ranges`), under the same FP64 rule.  A part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -8034,6 +8049,7 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
     for key, plan, T, want_plan in cases:
         _, L, M, N, dt = key
         f32 = dt == "f32"
+        want_plan, chains = _k1_with_chain_ranges(arch, sm_count, key, T, want_plan)
         G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
         out_dtype = torch.float32 if f32 else torch.bfloat16
         out = torch.full((N, M), float("nan"), device=device, dtype=out_dtype)
@@ -8042,6 +8058,10 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
             assert plan == want_plan, (key, T)
             assert isinstance(prepared, cake_backend.PreparedAtomicGemm), (key, T)
             assert (prepared.plan.block_n, prepared.plan.splits) == plan, (key, T)
+            assert prepared.plan.chains == chains, (key, T)
+            assert prepared.template == cake_backend.atomic_k1_template(
+                plan[0], f32, chains
+            ), (key, T)
             _assert_ran(prepared.launch, prepared.module_name)
             torch.cuda.synchronize()
             _k1_check_or_as_det(out, G, X, f"{M} {N} {dt} {T}")
@@ -8068,7 +8088,9 @@ def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding():
     (its :data:`_K1_ATOMIC_CACHE` entry) and gives the bits of the prepared launch where at most two partials meet (the
     FP64 budget otherwise), the tickets zero after; one token outside a range, and one token past the first token count
     of a two-split range, it binds the deterministic package's plan.  On a part of exactly the SM count of a table
-    of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` the reverse.  A part of any other SM count skips."""
+    of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` the reverse.  An edge inside a range of :data:`K1_CHAIN_RANGES_BY_SM`
+    for the part binds that range's program of several chains instead (one split: the bits of the prepared launch).  A
+    part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -8080,6 +8102,7 @@ def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding():
     for key, plan, T, want_plan in cases:
         _, L, M, N, dt = key
         f32 = dt == "f32"
+        want_plan, chains = _k1_with_chain_ranges(arch, sm_count, key, T, want_plan)
         G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
         out_dtype = torch.float32 if f32 else torch.bfloat16
         want = torch.full((N, M), float("nan"), device=device, dtype=out_dtype)
@@ -8096,6 +8119,7 @@ def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding():
         if want_plan is not None:
             assert plan == want_plan, (key, T)
             assert (entry.plan.block_n, entry.plan.splits) == plan, (key, T)
+            assert entry.plan.chains == chains, (key, T)
             if plan[1] <= 2:  # at most two partials per element: bitwise reproducible
                 assert torch.equal(out, want), (key, T)
             else:
