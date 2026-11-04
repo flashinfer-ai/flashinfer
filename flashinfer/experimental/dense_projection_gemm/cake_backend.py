@@ -1146,10 +1146,10 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: than the deterministic plan next to a resident kernel holding 32 SMs, which leaves 180 SMs for its 192 CTAs).
 #: A part's table may also hold rows :data:`ROUTER_RULES` has no entry for, measured on that SM count only: on 212 SMs
 #: the input gradient takes the SIMT program with the 32 x 64 tile in eight slices up to 64 tokens and the 64 x 64
-#: tile in four slices from 65 to 128 tokens at hidden 4096 and 5120 (256 threads each; measured at 64, 128 and 192
-#: tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
-#: resident kernel; the windows start at 1 token as on 152-SM sm_100a parts, measured there at 1, 17 and 32 tokens),
-#: up to 64 tokens at hidden 6144.
+#: tile in four slices from 65 to 128 tokens at hidden 4096 and 5120 (256 threads each; measured on 212-SM R200 parts
+#: at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096 and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144, and at
+#: 192 tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
+#: resident kernel), up to 64 tokens at hidden 6144.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
