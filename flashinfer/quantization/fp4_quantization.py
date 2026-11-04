@@ -1685,7 +1685,8 @@ def nvfp4_quantize(
     so the leading dimensions are folded into the row dimension and the
     swizzle padding is applied once to the folded row count, not to each
     batch.  For a batched ``[B, M, K]`` input whose consumer expects each
-    batch padded independently, use :func:`nvfp4_batched_quantize`.
+    batch padded independently, use :func:`nvfp4_batched_quantize`, whose
+    ``rank_preserving=True`` returns the per-batch 3D scale directly.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     nvfp4_4over6_is_explicit = nvfp4_4over6 is not _UNSET
@@ -2074,6 +2075,7 @@ def nvfp4_batched_quantize(
     sf_vec_size=16,
     # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    rank_preserving: bool = False,
 ):
     r"""Quantize batched input tensor to NVFP4 format.
 
@@ -2093,6 +2095,16 @@ def nvfp4_batched_quantize(
         - ``None``: 4over6 off. The environment is ignored.
         - :class:`NVFP44Over6Config`: on with exactly that recipe. The
           environment is ignored.
+    rank_preserving : bool
+        Scale-factor shape convention.  Defaults to ``False``.
+
+        - ``False``: each batch's swizzled scale buffer is returned
+          flattened, ``[B, round_up(M, 128) * round_up(K / sf_vec_size, 4)]``.
+        - ``True``: the same bytes viewed as the per-batch 3D tensor
+          ``[B, round_up(M, 128), round_up(K / sf_vec_size, 4)]``, the
+          convention :func:`mxfp8_quantize` returns with
+          ``rank_preserving=True``, so batched FP8 and FP4 consumers share
+          one scale layout.
 
     Returns
     -------
@@ -2100,9 +2112,9 @@ def nvfp4_batched_quantize(
         ``(x_q, sf)`` where ``x_q`` has shape ``[B, M, K/2]`` with dtype
         ``FLOAT4_E2M1X2`` and ``sf`` is the per-batch swizzled
         scale-factor tensor of shape
-        ``[B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4]``
-        (M is padded to a multiple of 128 and ``K / sf_vec_size`` is
-        rounded up to a multiple of 4).
+        ``[B, round_up(M, 128) * round_up(K / sf_vec_size, 4)]`` by default
+        or ``[B, round_up(M, 128), round_up(K / sf_vec_size, 4)]`` with
+        ``rank_preserving=True``.
 
     Notes
     -----
@@ -2111,8 +2123,17 @@ def nvfp4_batched_quantize(
     once, this function pads each batch's ``M`` to 128 independently, so
     row ``B_i`` of ``sf`` is exactly the 128x4-swizzled scale buffer of
     ``a[i]``.  Its 3D view is
-    ``sf.view(B, round_up(M, 128), round_up(K / sf_vec_size, 4))``.  Use
-    this function for batched consumers that read a per-batch descale.
+    ``sf.view(B, round_up(M, 128), round_up(K / sf_vec_size, 4))``, which
+    ``rank_preserving=True`` returns directly.  Use this function for
+    batched consumers that read a per-batch descale.
+
+    The per-batch ``[B, round_up(M, 128), round_up(K / sf_vec_size, 4)]``
+    shape is the block-scale layout convention shared with
+    :func:`mxfp8_quantize`.  The MoE weight-refit layout contract refers
+    to this convention: a refit path that ships quantized expert weights
+    with their block scales describes the scales in this form, one padded
+    swizzled block per expert or batch, instead of defining a padding rule
+    of its own.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     # e4m3 input reaches the recipe-less FP8 branch of invokeFP4Quantization;
@@ -2132,6 +2153,8 @@ def nvfp4_batched_quantize(
         False,
         nvfp4_4over6_code(nvfp4_4over6_config),
     )
+    if rank_preserving:
+        a_sf = a_sf.view(a.shape[0], -1, round_up(a.shape[-1] // sf_vec_size, 4))
     return a_fp4, a_sf
 
 
