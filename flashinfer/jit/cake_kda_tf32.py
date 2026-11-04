@@ -1969,7 +1969,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_46f060dd1ef1364317b3": {
         "sources": [
@@ -5412,7 +5412,9 @@ _RENDERED_WORK_BIN_POOL_ROUTES: dict[str, dict[str, str]] = {
 # ``BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM``); every other launch keeps
 # the turnover build.
 _RENDERED_WORK_BIN_TURN_SHORT_ROUTES: dict[str, dict[str, str]] = {
-    "sm_100a": {},
+    "sm_100a": {
+        "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_3ecb1bd9c45dac7eccff",
+    },
     "sm_103a": {},
 }
 
