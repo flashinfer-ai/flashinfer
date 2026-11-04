@@ -1339,7 +1339,10 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
-    (partition tables, byte queries)."""
+    (partition tables, segment plan, the comm and saved byte queries).  The workspace query is not compared: on a
+    rank with crossing fragments this package's counts pools the twin's query leaves out (the ``M_f^T`` tiles and
+    the fused walks' carry slots at ``P > 1``, the larger b1 split form, the forward exchange pools of a saved
+    backward on a caller-held workspace)."""
     facade = importlib.import_module(FACADE)
     det_pkg = importlib.import_module(DET_PACKAGE)
     pkg = _mod()
@@ -1356,11 +1359,9 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
         )
         assert isinstance(det_ctx, det_pkg.ContextDetKcp)
         assert isinstance(ctx, pkg.ContextKcp)
-        for query in (
-            "gdn_comm_bytes_kcp",
-            "gdn_saved_bytes_kcp",
-            "gdn_workspace_bytes_kcp",
-        ):
+        det_hp, hp = det_ctx.heads(6), ctx.heads(6)
+        assert (det_hp.P, det_hp.NSEG) == (hp.P, hp.NSEG), rank
+        for query in ("gdn_comm_bytes_kcp", "gdn_saved_bytes_kcp"):
             det_value = getattr(facade, query)(det_ctx, H_qk=2, HV=6)
             value = getattr(facade, query)(ctx, H_qk=2, HV=6, deterministic=False)
             assert det_value == value, (rank, query)
