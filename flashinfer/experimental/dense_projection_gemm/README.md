@@ -167,13 +167,13 @@ slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`
 
 | K1 row `d_in -> d_out` | `sm_100a` BF16 | `sm_100a` FP32 | `sm_103a` BF16 | `sm_103a` FP32 |
 |---|---|---|---|---|
-| `4096 -> 32` | -- | -- | 65536 | 65536 |
+| `4096 -> 32` | -- | -- | 65536; 65537‡ | 65536; 65537‡ |
 | `4096 -> 48` | 512 | 512 | no verdict | no verdict |
-| `4096 -> 64` | 512; 65536 | 512; 65536 | no verdict | no verdict |
-| `5120 -> 32` | -- | -- | 32768 and up‡ | -- |
-| `5120 -> 48` | 512 to 2048 | 512 | 512 to 2048; 32768‡ | 512 to 2048 |
-| `5120 -> 64` | 512 to 2048; 8192 | 512 to 1024; 8192 | 512 to 1024; 32768‡ | 512 to 1024 |
-| `5120 -> 128` | no verdict | no verdict | 512 to 4096; 32768 and up‡ | 512 to 4096; 32768 to 65536 |
+| `4096 -> 64` | 512; 65536; 65537‡ | 512; 65536; 65537‡ | no verdict | no verdict |
+| `5120 -> 32` | -- | -- | 32767 and up‡ | -- |
+| `5120 -> 48` | 512 to 2048 | 512 | 512 to 2048; 32767 to 32768‡ | 512 to 2048 |
+| `5120 -> 64` | 512 to 2048; 8192 | 512 to 1024; 8192 | 512 to 1024; 32767 to 32769‡ | 512 to 1024 |
+| `5120 -> 128` | no verdict | no verdict | 512 to 4096; 32767 and up‡ | 512 to 4096; 32768 to 65536 |
 | `6144 -> 32` | -- | -- | -- | -- |
 | `6144 -> 128` | no verdict | no verdict | 512 to 8192 | 512 to 8192 |
 
@@ -185,9 +185,13 @@ the 152-SM table above at the same token counts, on B300 (`sm_103a`) and B200 (`
 every split-routed row and token count on one part (9 paired groups, one long-lived process per GPU), the points that
 failed there again on a second part (15 paired groups in a long-lived process and in a fresh process per point; B300:
 a part of a second node, which also screened every point; B200: another part of the same node), and the FP64 error of
-5 seeds on two parts at 32768 and 65536 tokens.  ‡: the split program's FP64 error exceeded the deterministic program's
-by more than 2 % for some seed on both parts (BF16 error-budget ratio); the BF16 rows marked "and up" failed that
-comparison at 65536 tokens too.  Measured token counts that failed the rule but keep the verdict, because the
+5 seeds on two parts at 32768 and 65536 tokens and at the first and the last token count of every entry and one token
+either side of it (98304 and 131072 tokens too for the entries that reach 65536 tokens).  ‡: the split program's FP64
+error exceeded the deterministic program's by more than 2 % for some seed on both parts (BF16 output: the BF16
+error-budget ratio; FP32 output at 65537 tokens: the relative Frobenius error, 2.1 to 2.3 % above); the rows marked
+"and up" failed that comparison at every measured token count from the entry's first one up to 131072 tokens.  The
+token counts next to the entries that start or end at 32767, 32769 or 65537 tokens were not measured and keep the
+verdict.  Measured token counts that failed the rule but keep the verdict, because the
 deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower there on a part:
 `sm_100a`: BF16 output at 512 tokens on `4096 -> 32`, `5120 -> 32`, `6144 -> 32`, at 1024 on `5120 -> 32`, at 2048 on
 `6144 -> 32`, at 32768 on `5120 -> 48`, at 65536 on `4096 -> 32`, `4096 -> 48`, `5120 -> 48`, `5120 -> 64`, `6144 -> 32`;
@@ -280,7 +284,9 @@ run at 512 tokens, nor `8192 -> 128` at 65536.  `5120 -> 1024` BF16 has no progr
 16384 tokens the deterministic plan is faster); its range runs the 256-wide one-split program of `K1_SPLIT_RULES` (its
 216-SM verdict), measured at 512, 1024, 2048, 4096, 8192, 12288 and 32768 tokens with the same protocol on a node of
 four parts, twice with the parts' launch layouts and orders rotated: faster than the deterministic plan in every run up to 12288 tokens, with the FP64 error of the
-deterministic program on every seed; at 32768 tokens it leaves the checkpointed step 2.5 to 4.3 % slower.  On 212 SMs
+deterministic program on every seed; at 32768 tokens it failed the K1 rule in every run (0.1 to 0.6 % faster than the
+deterministic plan alone), and its checkpointed step measured 2.5 to 4.3 % slower, as did a second deterministic launch
+against the first there (1.9 to 4.4 %).  On 212 SMs
 `4096 -> 1024` FP32 keeps the 192-wide program at 512 tokens: the 256-wide program is 15 % faster alone and leaves the
 backward pass 4 to 6 % faster, but the checkpointed step 0.2 to 1.2 % slower in graph replays (median of the paired
 ratios, ratio of the medians).*

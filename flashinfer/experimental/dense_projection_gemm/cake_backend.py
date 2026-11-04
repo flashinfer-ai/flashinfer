@@ -462,13 +462,16 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: / B300 parts) follow the rule of the 152-SM entries of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`, measured on 148-SM
 #: parts at 512, 1024, 2048, 4096, 8192, 16231, 32768 and 65536 tokens (the protocol is in the 148-SM K1 token table of
 #: the README): every point in a screen on one part, the points that failed there again on a second part (B300: every
-#: point on a part of a second node too), and the FP64 error of 5 seeds on two parts at 32768 and 65536 tokens.  A
-#: measured token count is an entry where the split program failed in some run and the deterministic program leaves the
-#: backward pass and the checkpointed step no more than 1.3 % slower on both parts (the worst of the ratio of the
-#: medians and the median of the paired ratios, eager launches and graph replays), or where the split program's FP64
-#: error exceeded the deterministic program's by more than 2 % for some seed on both parts; a token count between two
-#: consecutive measured entries is an entry too, and so is every token count above 65536 of a row whose split program
-#: failed that FP64 comparison at 65536 tokens.  Unmeasured token counts keep the verdict.
+#: point on a part of a second node too), and the FP64 error of 5 seeds on two parts at 32768 and 65536 tokens and at
+#: the first and the last token count of every entry and one token either side of it (and at 98304 and 131072 tokens
+#: for the entries that reach 65536 tokens).  A measured token count is an entry where the split program failed in some
+#: run and the deterministic program leaves the backward pass and the checkpointed step no more than 1.3 % slower on
+#: both parts (the worst of the ratio of the medians and the median of the paired ratios, eager launches and graph
+#: replays), or where the split program's FP64 error exceeded the deterministic program's by more than 2 % for some
+#: seed on both parts (relative Frobenius error; BF16 output: that or the BF16 error-budget ratio); a token count
+#: between two consecutive measured entries is an entry too, and so is every token count above 131072 of a row whose
+#: split program failed that FP64 comparison at every measured token count from its entry's first one up.  Unmeasured
+#: token counts keep the verdict.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -477,22 +480,22 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     ("sm_100a", 148): {
         ("sm_100a", 1, 4096, 48, "bf16"): ((512, 512),),
         ("sm_100a", 1, 4096, 48, "f32"): ((512, 512),),
-        ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, 65536)),
-        ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, 65536)),
+        ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, 65537)),
+        ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, 65537)),
         ("sm_100a", 1, 5120, 48, "bf16"): ((512, 2048),),
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
         ("sm_100a", 1, 5120, 64, "f32"): ((512, 1024), (8192, 8192)),
     },
     ("sm_103a", 148): {
-        ("sm_103a", 1, 4096, 32, "bf16"): ((65536, 65536),),
-        ("sm_103a", 1, 4096, 32, "f32"): ((65536, 65536),),
-        ("sm_103a", 1, 5120, 32, "bf16"): ((32768, None),),
-        ("sm_103a", 1, 5120, 48, "bf16"): ((512, 2048), (32768, 32768)),
+        ("sm_103a", 1, 4096, 32, "bf16"): ((65536, 65537),),
+        ("sm_103a", 1, 4096, 32, "f32"): ((65536, 65537),),
+        ("sm_103a", 1, 5120, 32, "bf16"): ((32767, None),),
+        ("sm_103a", 1, 5120, 48, "bf16"): ((512, 2048), (32767, 32768)),
         ("sm_103a", 1, 5120, 48, "f32"): ((512, 2048),),
-        ("sm_103a", 1, 5120, 64, "bf16"): ((512, 1024), (32768, 32768)),
+        ("sm_103a", 1, 5120, 64, "bf16"): ((512, 1024), (32767, 32769)),
         ("sm_103a", 1, 5120, 64, "f32"): ((512, 1024),),
-        ("sm_103a", 1, 5120, 128, "bf16"): ((512, 4096), (32768, None)),
+        ("sm_103a", 1, 5120, 128, "bf16"): ((512, 4096), (32767, None)),
         ("sm_103a", 1, 5120, 128, "f32"): ((512, 4096), (32768, 65536)),
         ("sm_103a", 1, 6144, 128, "bf16"): ((512, 8192),),
         ("sm_103a", 1, 6144, 128, "f32"): ((512, 8192),),
@@ -607,7 +610,9 @@ K1_SPLIT_RULES_BY_SM_TOKEN_RANGES: dict[
 #: those tables.  Measured as those ranges (the protocol and the rule are in the 212-SM K1 token-range table of the
 #: README).  On 212 SMs ``5120 -> 1024`` BF16 runs the 256-wide program at one split (its :data:`K1_SPLIT_RULES`
 #: verdict) from 512 to 12288 tokens; it stays on the deterministic program at 16172 to 16384 tokens, where the
-#: deterministic plan is faster, and from 32768 tokens up (the checkpointed step 2.5 to 4.3 % slower there).
+#: deterministic plan is faster, and from 32768 tokens up: at 32768 tokens it failed the K1 rule in every run (0.1 to
+#: 0.6 % faster than the deterministic plan alone), and its checkpointed step measured 2.5 to 4.3 % slower, as did a
+#: second deterministic launch against the first there (1.9 to 4.4 %).
 # fmt: off
 K1_SPLIT_RANGE_OVERRIDES_BY_SM: dict[
     tuple[str, int],
