@@ -689,29 +689,43 @@ K1_SPLIT_RANGE_OVERRIDES_BY_SM: dict[
     },
 }
 # fmt: on
-#: Verdicts of rows of a table of :data:`K1_SPLIT_RULES_BY_SM` at further token ranges that hold only where the token
-#: count spans an even number of 64-element K blocks (``ceil(K / 64)`` even), ``(arch, sm_count) -> {key:
-#: ((min_tokens, max_tokens, (block_n, num_splits)), ...)}`` (keys and values as in :data:`K1_SPLIT_RULES`): on a part
-#: of exactly ``sm_count`` SMs below the row's SM-count floor a token count from ``min_tokens`` to ``max_tokens`` with
-#: an even block count runs that range's program, except the token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for
-#: the part.  A token count with an odd block count, and every other token count, part and row, keeps the routing of
-#: the tables above.  A range lies outside :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and outside the row's ranges in
-#: :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM`.  On 212 SMs the FP32 rows
-#: ``4096 / 5120 -> 512 / 1024`` run two splits of their 212-SM tile width (128, 192 for ``4096 -> 1024``, 256 for
-#: ``5120 -> 1024``), each adding half of an output's K blocks.  From 1024 tokens up, at an even block count, their
-#: output was the deterministic program's bit for bit (5 seeds on two parts at 1024, 2048, 4096, 8192, 16231, 16384,
-#: 32768 and 65536 tokens, on one part at 6000, 12000 and 48000); at an odd count from 17 blocks up it was not, with an
-#: FP64 relative Frobenius error 1.01 to 1.17 times the deterministic program's (5 seeds, 1025 to 65537 tokens).
-#: Measured as the ranges of :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, at 512, 1024, 2048, 4096, 8192, 16231, 16384,
-#: 32768 and 65536 tokens (the protocol and the rule are in the 212-SM K1 token-range table of the README): a range
-#: runs between measured token counts at which the two-split program passed, and holds none that failed.  At 512
-#: tokens two splits are not faster than the deterministic plan, ``4096 -> 1024`` is not faster in every run at 1024
-#: tokens, and ``5120 -> 1024`` failed the rule at every measured token count from 16231 up.
+#: Verdicts of rows on a part of exactly one SM count at further token ranges (on 212 SMs rows of the part's table of
+#: :data:`K1_SPLIT_RULES_BY_SM`) that hold only where the token count spans an even number of 64-element K blocks
+#: (``ceil(K / 64)`` even), ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, num_splits)), ...)}`` (keys
+#: and values as in :data:`K1_SPLIT_RULES`): on a part of exactly ``sm_count`` SMs, below the row's SM-count floor or at
+#: or above it, a token count from ``min_tokens`` to ``max_tokens`` with an even block count runs that range's program,
+#: except the token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part.  A token count with an odd block
+#: count, and every other token count, part and row, keeps the routing of the tables above.  A range lies outside
+#: :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and outside the row's ranges in :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and
+#: :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM`.  On 152-SM sm_100a and sm_103a parts the FP32 row ``4096 -> 128`` (no verdict
+#: in :data:`K1_SPLIT_RULES`) runs two splits of 64-wide tiles, each adding half of an output's K blocks: at an even
+#: block count its output was the deterministic program's bit for bit (5 seeds at 1024 to 8192 tokens), at an odd count
+#: (1088 and 2112 tokens) it was not, with an FP64 relative Frobenius error 1.107 and 1.142 times the deterministic
+#: program's.  It passed the K1 rule (the README) at 1024, 2048 and 4096 tokens on two parts of each GPU (0.70 to 0.79
+#: times the deterministic program's time in CUDA graph replays), and at 6144 tokens on two sm_103a parts; on the
+#: sm_100a part measured at 6144 tokens its time next to a kernel holding SMs on another stream was 1.099 times the
+#: deterministic program's, and at 512 and 8192 tokens it failed on every part.  148-SM parts keep the deterministic
+#: program.  On 212 SMs the FP32 rows ``4096 / 5120 -> 512 / 1024`` run two splits of their 212-SM tile width (128, 192
+#: for ``4096 -> 1024``, 256 for ``5120 -> 1024``), each adding half of an output's K blocks.  From 1024 tokens up, at
+#: an even block count, their output was the deterministic program's bit for bit (5 seeds on two parts at 1024, 2048,
+#: 4096, 8192, 16231, 16384, 32768 and 65536 tokens, on one part at 6000, 12000 and 48000); at an odd count from 17
+#: blocks up it was not, with an FP64 relative Frobenius error 1.01 to 1.17 times the deterministic program's (5 seeds,
+#: 1025 to 65537 tokens).  Measured as the ranges of :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, at 512, 1024, 2048,
+#: 4096, 8192, 16231, 16384, 32768 and 65536 tokens (the protocol and the rule are in the 212-SM K1 token-range table of
+#: the README): a range runs between measured token counts at which the two-split program passed, and holds none that
+#: failed.  At 512 tokens two splits are not faster than the deterministic plan, ``4096 -> 1024`` is not faster in every
+#: run at 1024 tokens, and ``5120 -> 1024`` failed the rule at every measured token count from 16231 up.
 # fmt: off
 K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
 ] = {
+    ("sm_100a", 152): {
+        ("sm_100a", 1, 4096, 128, "f32"): ((1024, 4096, (64, 2)),),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 4096, 128, "f32"): ((1024, 6144, (64, 2)),),
+    },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 512, "f32"): ((1024, 8192, (128, 2)), (32768, 65536, (128, 2))),
         ("sm_107a", 1, 4096, 1024, "f32"): ((2048, 8192, (192, 2)), (32768, 65536, (192, 2))),
@@ -755,18 +769,19 @@ def k1_plan(
     row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES` from the SM-count floor of the
     row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`) up, replaced at a ``K`` of
     :data:`K1_SPLIT_RULES_BY_SM_TOKENS` by the row's entry in the table of :data:`K1_SPLIT_OVERRIDES_BY_SM` for exactly
-    ``sm_count``, if any; below the floor the row's verdict in the table of :data:`K1_SPLIT_RULES_BY_SM` for exactly
-    ``sm_count``, only at a ``K`` of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` or of the row's ranges in
-    :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` for that SM count, and the verdict of the row's range in
-    :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` for that SM count at a ``K`` of that range, else the verdict of the row's
-    range in :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` for that SM count at a ``K`` of that range that spans an even
-    number of 64-element K blocks; either except at a ``K`` of the row's entries in
-    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for this part (from the entry's SM count up where that count is at or above
-    the floor, exactly that SM count below it), in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` for exactly
-    ``sm_count``, or, at a ``K`` that spans an odd number of 64-element K blocks, in
+    ``sm_count``, if any, and at a ``K`` of the row's range in :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` for exactly
+    ``sm_count`` that spans an even number of 64-element K blocks by that range's verdict; below the floor the row's
+    verdict in the table of :data:`K1_SPLIT_RULES_BY_SM` for exactly ``sm_count``, only at a ``K`` of
+    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` or of the row's ranges in :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` for that
+    SM count, and the verdict of the row's range in :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` for that SM count at a
+    ``K`` of that range, else the verdict of the row's range in :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` for that SM
+    count at a ``K`` of that range that spans an even number of 64-element K blocks; either except at a ``K`` of the
+    row's entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for this part (from the entry's SM count up where that count
+    is at or above the floor, exactly that SM count below it), in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` for
+    exactly ``sm_count``, or, at a ``K`` that spans an odd number of 64-element K blocks, in
     :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` for this part (as the first table).  A row without a verdict, a ``K`` of
-    those entries, every other ``K`` below the floor and a ``K`` too short for the split count
-    (:func:`k1_splits_fit`) run the deterministic program."""
+    those entries, every other ``K`` below the floor and a ``K`` too short for the split count (:func:`k1_splits_fit`)
+    run the deterministic program."""
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
     floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
     first, last = K1_SPLIT_RULES_BY_SM_TOKENS
@@ -776,6 +791,11 @@ def k1_plan(
         if in_window:
             overrides = K1_SPLIT_OVERRIDES_BY_SM.get((arch, int(sm_count)), {})
             choice = overrides.get(key, choice)
+        if _ceil_div(K, K1_BLOCK_K) % 2 == 0:
+            even = K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM.get((arch, int(sm_count)), {})
+            own = [v for lo, hi, v in even.get(key, ()) if lo <= int(K) <= hi]
+            if own:
+                choice = own[0]
     else:
         part = (arch, int(sm_count))
         ranges = K1_SPLIT_RULES_BY_SM_TOKEN_RANGES.get(part, {}).get(key, ())
