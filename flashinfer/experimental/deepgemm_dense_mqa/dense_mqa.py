@@ -30,7 +30,8 @@ stage buckets of ``fp8:q128:short`` (``K <= 4096``, sm_100a and sm_103a) and
 ``fp8:full:le32:short`` (``K <= 32768``, sm_100a) launch the warp-scan text with a
 four-stage TMEM accumulator ring (identical logits and schedule words); on
 sm_103a the stage bucket of ``fp8:qle2048:short`` (``Q <= 136``,
-``K <= 8448``) launches the fused tiered text with that ring. A class
+``K <= 8448``) launches the fused tiered text with that ring (on sm_103a the
+route binds the ``source_consumer_release`` build of that text). A class
 is named by its query-BLOCK ceiling and served while the KV length is within
 the catalog policy's bound for that class (``fused_*_max_kv``); above the
 bound the two-launch route of the same query count serves the call. The FP4

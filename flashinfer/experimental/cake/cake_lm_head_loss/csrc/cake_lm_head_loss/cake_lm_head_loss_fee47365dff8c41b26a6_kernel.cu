@@ -201,13 +201,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     unsigned int cluster_size;
     asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(cluster_size));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v1_addr = smem + 1024;
     __nv_bfloat16* smem_v1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_v1_addr_0 = smem + 17408;
     unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int clc_resp_addr = smem + 230400;
+
+    // Kernel setup ops
     if (tid == 0) {
         #pragma unroll
         for (int st = 0; st < 7; st++) {
@@ -219,8 +221,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
         }
     }
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 26 barriers)
-    // Mbarriers at smem_raw[0..208)
+    // Mbarrier init (26 barriers at smem_raw[0..208))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -275,10 +276,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {

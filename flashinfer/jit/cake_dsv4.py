@@ -516,6 +516,36 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "fp8_h128_prefill_source_persistent_no_pdl": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["tma_buffer", "tmap_o"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "fp8_h128_prefill_source_persistent_uniform": [
         ["tma_buffer", "tmap_q"],
         ["tma_buffer", "tmap_swa_kv"],
@@ -750,6 +780,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "360a43167438aa6a30d1bf22a05714251a71a66dba5b5384927ffdaa0e16dbfc",
         },
     },
+    "cake_dsv4_132f453f8df4a8300d5c": {
+        "sources": [
+            "sm_103a/cake_dsv4_132f453f8df4a8300d5c_kernel.cu",
+            "sm_103a/cake_dsv4_132f453f8df4a8300d5c_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_no_pdl",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "37774c143b12b6115f2d994229deeae6ecc1af06d63a49bcd15b53da12aa3d69",
+        },
+    },
     "cake_dsv4_13f0ca13f90a32070cfe": {
         "sources": [
             "sm_103a/cake_dsv4_13f0ca13f90a32070cfe_kernel.cu",
@@ -903,6 +945,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a": "954684e567b70122d1e315f5b6ed7a98f1ee4b272f7586676147da5cfbdfa388",
         },
     },
+    "cake_dsv4_506e02d3d583a84bacdd": {
+        "sources": [
+            "sm_100a/cake_dsv4_506e02d3d583a84bacdd_kernel.cu",
+            "sm_100a/cake_dsv4_506e02d3d583a84bacdd_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_no_pdl",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "e89081fea2e8534c42cfee9b5eceb944bc861b6a9ef4b8dd692016a829ff5a91",
+        },
+    },
     "cake_dsv4_50a2c6ca93259d30db6b": {
         "sources": [
             "common/cake_dsv4_50a2c6ca93259d30db6b_kernel.cu",
@@ -954,18 +1008,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "identity": {
             "sm_100a": "00c1f03b2b547713d533e73462ebe845b856a21adc732d2ca3c02b0e7b9527c0",
             "sm_103a": "56980013bb3fe4bba3c55e9c737cc2c2ef6a172363e374108b2b77d67013c23a",
-        },
-    },
-    "cake_dsv4_7302f6fd2e2826d6826e": {
-        "sources": [
-            "sm_103a/cake_dsv4_7302f6fd2e2826d6826e_kernel.cu",
-            "sm_103a/cake_dsv4_7302f6fd2e2826d6826e_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "arg_plan": "fp8_lowhead_qlayout",
-        "arches": ["sm_103a"],
-        "identity": {
-            "sm_103a": "8a69df496b95400682d4dfe1189feebf24e7af8aad00b0f0817a278405c4e7f8",
         },
     },
     "cake_dsv4_750835d54fe97cfc7ad4": {
@@ -1117,6 +1159,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "eed23e81f47b3907beab754067a37f0f5b40d6902187e8f2a5dd5a0210d61ec5",
         },
     },
+    "cake_dsv4_b78d35b605cb10daf20f": {
+        "sources": [
+            "sm_103a/cake_dsv4_b78d35b605cb10daf20f_kernel.cu",
+            "sm_103a/cake_dsv4_b78d35b605cb10daf20f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "31977e5437b6c3f2792cc92d967c421a8307d8e139f222dd522846103e5c22c1",
+        },
+    },
     "cake_dsv4_b7c345c94f3a216b24e5": {
         "sources": [
             "sm_100a/cake_dsv4_b7c345c94f3a216b24e5_kernel.cu",
@@ -1135,11 +1189,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "common/cake_dsv4_cbf3168c696847fd3f69_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
-        "arg_plan": "fp8_lowhead_qlayout",
+        "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_100a", "sm_103a"],
         "identity": {
-            "sm_100a": "8afe0f0222f2ae71dd2da015a91f683a7ce1f1af150b9664c61599681a5f2434",
-            "sm_103a": "770a7af77c1f2abf4024977e5440d72ef72b8f5884f3ffe4cb6c51b37d2e9fa1",
+            "sm_100a": "1805f23a2001fe8a9e6bfa4efdc9104c9df345bbc6a59d051483372e126a5534",
+            "sm_103a": "1408f1cf42e4f32c795d4f4bcaefcba78e6ddc86d6037717ffdc4df8b49e0a04",
         },
     },
     "cake_dsv4_cf7e7f261a5e1c42f98f": {
@@ -1312,6 +1366,7 @@ VARIANTS: dict[str, dict[str, str]] = {
         "bf16_h8_swa128_v43": "cake_dsv4_4869e52499bb527f3e84",
         "bf16_swa128_single_cta": "cake_dsv4_d0233d0d9fe44a645212",
         "fp8_h128_prefill_source_persistent": "cake_dsv4_9f75cb272ce8994420ff",
+        "fp8_h128_prefill_source_persistent_no_pdl": "cake_dsv4_506e02d3d583a84bacdd",
         "fp8_h128_prefill_source_persistent_uniform": "cake_dsv4_009fa784c7206613d7b7",
         "fp8_h64_prefill_source_persistent_m64": "cake_dsv4_5a02e8137c1b1bc7c58a",
         "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_f647b239789ffbbdbd90",
@@ -1341,13 +1396,14 @@ VARIANTS: dict[str, dict[str, str]] = {
         "bf16_h8_swa128_v43": "cake_dsv4_7850190a53cc07aba85a",
         "bf16_swa128_single_cta": "cake_dsv4_13f0ca13f90a32070cfe",
         "fp8_h128_prefill_source_persistent": "cake_dsv4_7c51b4b6d5b345d4fe03",
+        "fp8_h128_prefill_source_persistent_no_pdl": "cake_dsv4_132f453f8df4a8300d5c",
         "fp8_h128_prefill_source_persistent_uniform": "cake_dsv4_8bcdc9f41a3d74231d15",
         "fp8_h64_prefill_source_persistent_m64": "cake_dsv4_40932cb442b76026206f",
         "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_3fce080f96f6dc5e9f8c",
         "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
         "fp8_h8_h16_source_exact": "cake_dsv4_ff4aa022aa97fded6032",
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
-        "fp8_lowhead_one_partition": "cake_dsv4_7302f6fd2e2826d6826e",
+        "fp8_lowhead_one_partition": "cake_dsv4_b78d35b605cb10daf20f",
         "fp8_lowhead_prefill": "cake_dsv4_e21760e2024d7c1e85c9",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },

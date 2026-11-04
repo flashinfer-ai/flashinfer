@@ -113,11 +113,34 @@ exit status is 0 when every boundary's control ratio is in band and its drift
 is at most 2 %, the bitwise comparisons hold and the hand-off engaged as its
 mode says (so ``--ckpt-handoff on`` fails when it did not engage).
 
+Raw gate mode (``--gate raw``): every arm runs the forget gate's raw form
+(``use_gate_in_kernel=True``: the BF16 raw gate, FP32 ``A_log`` / ``dt_bias``,
+lower bound -5, activated in the kernels; the operands of ``make_raw_inputs``,
+those of the deterministic KCP benchmark's ``R`` arm) on the same shards.
+``det``, ``nd``, ``control`` and ``nd_off`` call the KCP entries of their
+package with the raw keywords; ``A_log`` and ``dt_bias`` are leaves of every
+boundary, and every backward ends with the cross-rank sum of their gradients'
+per-rank partial sums (``reduce_gate_param_grads_det_kcp`` /
+``reduce_gate_param_grads_kcp``, the step of the deterministic benchmark's
+``R`` arm).  ``local`` runs the single-rank package's raw mode on the shard;
+``fla`` and ``fla_cp`` run flash-linear-attention's ``chunk_kda`` with
+``use_gate_in_kernel=True``, ``A_log``, ``dt_bias`` and the lower bound (their
+parameter gradients stay the rank's: no cross-rank sum).  This package's raw
+mode runs the deterministic raw programs in the same order, so the agreement
+step requires every result to have the deterministic arm's bit pattern:
+``out``, ``dq``, ``dk``, ``dv``, ``dbeta``, the raw gate's ``dg`` (and the
+convolution's), the per-rank ``dA_log`` / ``ddt_bias`` partials and their
+cross-rank sums.  The checkpoint hand-off never engages in this mode (with
+``nd_off`` or ``--ckpt-handoff on`` the ``ckpt`` comparison expects no
+engagement), and the workspace bytes are those of the raw mode.
+
 Example::
 
     torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
         --seqlen 65536 --docs 3 --heads 16 --channels 4096 --groups 3 --samples 8 \\
         --boundaries fwd bwd step ckpt --json kcp_nd.json
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
+        --seqlen 65536 --docs 3 --heads 16 --no-conv --gate raw --json kcp_nd_raw.json
 """
 
 from __future__ import annotations
@@ -151,6 +174,7 @@ from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     kda_det_saved_bytes_kcp,
     kda_det_workspace_bytes_kcp,
     partition_det_kcp,
+    reduce_gate_param_grads_det_kcp,
 )
 from flashinfer.cake_kda_train import chunk_kda  # noqa: E402
 from flashinfer.cake_kda_train_kcp import (  # noqa: E402
@@ -162,6 +186,7 @@ from flashinfer.cake_kda_train_kcp import (  # noqa: E402
     kda_saved_bytes_kcp,
     kda_workspace_bytes_kcp,
     partition_kcp,
+    reduce_gate_param_grads_kcp,
 )
 from flashinfer.experimental.cake_kda_det_train_kcp import (  # noqa: E402
     cake_kcp as det_kcp,
@@ -169,7 +194,11 @@ from flashinfer.experimental.cake_kda_det_train_kcp import (  # noqa: E402
 from flashinfer.experimental.cake_kda_train_kcp import (  # noqa: E402
     cake_kcp as nd_kcp,
 )
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
+from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+    LOWER_BOUND,
+    make_inputs,
+    make_raw_inputs,
+)
 
 ARMS = ("det", "nd", "control", "nd_off", "local", "fla", "fla_cp")
 MAIN_ARMS = ("det", "nd", "control")
@@ -185,6 +214,11 @@ HANDOFF_ENV = "CAKE_KDA_KCP_CKPT_HANDOFF"  # the default of --ckpt-handoff (the 
 # arms that run only when --arms names them
 OPT_IN_ARMS = ("nd_off", "fla_cp")
 RECORD_STAGES = ("dqkg", "glm_intra")
+GATES = ("g", "raw")
+# the raw gate mode's parameter leaves (after the INPUTS) and the results it adds: the raw gate's dg (bitwise in this
+# mode), the per-rank parameter partials and their cross-rank sums
+PARAMS = ("A_log", "dt_bias")
+RAW_BITWISE = ("dg", "dA_log", "ddt_bias", "dA_log_sum", "ddt_bias_sum")
 
 Step = tuple[Callable[[], Any], Callable[[Any], Any]]
 
@@ -233,9 +267,8 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
     as ``global`` for FLA's partition), this rank's shard on the device and its fragments, and one partition and
     context per package (the two partitions must give every rank the same fragments)."""
     lengths = split_docs(args.seqlen, args.docs)
-    inputs = make_inputs(
-        lengths, args.heads, device="cpu", seed=args.seed, with_dout=True
-    )
+    make = make_raw_inputs if args.gate == "raw" else make_inputs
+    inputs = make(lengths, args.heads, device="cpu", seed=args.seed, with_dout=True)
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
@@ -266,6 +299,10 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
     }
     local["x"] = _shard(x, cu, fragments).to(device)
     local["dy"] = _shard(dy, cu, fragments).to(device)
+    if args.gate == "raw":
+        # the gate parameters are per head, the same on every rank
+        for name in PARAMS:
+            local[name] = inputs[name].to(device)
     local_cu = [0]
     for f in fragments:
         local_cu.append(local_cu[-1] + f.length)
@@ -281,6 +318,7 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
         "tokens_total": args.seqlen,
         "fla_safe_gate": not args.no_fla_safe_gate,
         "ckpt_handoff": args.ckpt_handoff,
+        "gate": args.gate,
     }
     if "fla_cp" in args.arms:
         problem["global"] = {name: inputs[name] for name in (*INPUTS, "dout")}
@@ -288,12 +326,37 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
 
 
 def _leaves(problem: dict[str, Any]) -> tuple[torch.Tensor, ...]:
-    """Fresh leaves of the rank's shard: ``x, weight, q, k, v, g, beta``."""
+    """Fresh leaves of the rank's shard: ``x, weight, q, k, v, g, beta`` and, in the raw gate mode, ``A_log,
+    dt_bias``."""
     local = problem["local"]
     x = local["x"].detach().requires_grad_(True)
     w = problem["weight"].detach().requires_grad_(True)
     qkvgb = tuple(local[n].detach().requires_grad_(True) for n in INPUTS)
-    return (x, w, *qkvgb)
+    params = tuple(
+        local[n].detach().requires_grad_(True)
+        for n in (PARAMS if problem["gate"] == "raw" else ())
+    )
+    return (x, w, *qkvgb, *params)
+
+
+def _raw_kw(problem: dict[str, Any], params: tuple[torch.Tensor, ...]) -> dict:
+    """The raw gate mode's keywords of a KDA call with the parameter leaves ``params`` (empty in the ``g`` mode)."""
+    if problem["gate"] != "raw":
+        return {}
+    a_log, dt_bias = params
+    return {
+        "use_gate_in_kernel": True,
+        "A_log": a_log,
+        "dt_bias": dt_bias,
+        "lower_bound": LOWER_BOUND,
+    }
+
+
+def _with_reduce(fwd, problem: dict[str, Any], reduce):
+    """``fwd`` with ``reduce`` (``(dA_log, ddt_bias) -> (sums)``, the cross-rank sum of a KCP arm's parameter
+    partials) as its ``reduce`` attribute in the raw gate mode; every backward of the arm ends with it."""
+    fwd.reduce = reduce if problem["gate"] == "raw" else None
+    return fwd
 
 
 def _fla_chunk_kda():
@@ -458,36 +521,63 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
     if arm == "det":
         ctx = problem["ctx"]["det"]
 
-        def fwd(x, w, q, k, v, g, beta):
+        def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
-            return y, chunk_kda_det_kcp(q, k, v, g, beta, ctx)
+            return y, chunk_kda_det_kcp(
+                q, k, v, g, beta, ctx, **_raw_kw(problem, params)
+            )
+
+        return _with_reduce(
+            fwd,
+            problem,
+            lambda da, db: reduce_gate_param_grads_det_kcp(ctx, da, db),
+        )
 
     elif arm in ("nd", "control", "nd_off"):
         ctx = problem["ctx"]["nd"]
         mode = "off" if arm == "nd_off" else problem["ckpt_handoff"]
 
-        def fwd(x, w, q, k, v, g, beta):
+        def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
             return y, chunk_kda_kcp(
-                q, k, v, g, beta, ctx, checkpoint_handoff=mode, deterministic=False
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                checkpoint_handoff=mode,
+                deterministic=False,
+                **_raw_kw(problem, params),
             )
+
+        return _with_reduce(
+            fwd,
+            problem,
+            lambda da, db: reduce_gate_param_grads_kcp(
+                ctx, da, db, deterministic=False
+            ),
+        )
 
     elif arm == "local":
 
-        def fwd(x, w, q, k, v, g, beta):
+        def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d(x, w, cu) if conv else None
-            return y, chunk_kda(q, k, v, g, beta, cu, deterministic=False)
+            return y, chunk_kda(
+                q, k, v, g, beta, cu, deterministic=False, **_raw_kw(problem, params)
+            )
 
     elif arm == "fla":
         safe_gate = problem["fla_safe_gate"]
 
-        def fwd(x, w, q, k, v, g, beta):
+        def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d(x, w, cu) if conv else None
             out, _ = fla_chunk_kda(
                 *(t.unsqueeze(0) for t in (q, k, v, g, beta)),
                 scale=None,
                 safe_gate=safe_gate,
                 cu_seqlens=cu,
+                **_raw_kw(problem, params),
             )
             return y, out.squeeze(0)
 
@@ -495,7 +585,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         ctx, cp_ctx = problem["ctx"]["nd"], problem["ctx"]["fla_cp"]
         safe_gate = problem["fla_safe_gate"]
 
-        def fwd(x, w, q, k, v, g, beta):
+        def fwd(x, w, q, k, v, g, beta, *params):
             # the convolution of the main arms on the shard, FLA's KDA on its own
             # partition (its cu_seqlens are the context's)
             y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
@@ -504,37 +594,60 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
                 scale=None,
                 safe_gate=safe_gate,
                 cp_context=cp_ctx,
+                **_raw_kw(problem, params),
             )
             return y, out.squeeze(0)
 
     else:
         raise ValueError(f"unknown arm {arm!r}")
-    return fwd
+    return _with_reduce(fwd, problem, None)
 
 
 def _step(fwd, problem: dict[str, Any], boundary: str) -> Step:
-    """``(setup, timed)`` of ``boundary``: ``setup`` runs untimed before every iteration, ``timed`` is the span."""
-    local = problem["local"]
-
-    def backward(y, out) -> None:
-        outs, grads = [out], [local["dout"]]
-        if y is not None:
-            outs.append(y)
-            grads.append(local["dy"])
-        torch.autograd.backward(outs, grads)
+    """``(setup, timed)`` of ``boundary``: ``setup`` runs untimed before every iteration, ``timed`` is the span (in
+    the raw gate mode a KCP arm's backward ends with the cross-rank sum of its parameter partials, ``fwd.reduce``)."""
 
     def leaves():
         return _leaves(problem)
 
+    def backward(xs, y, out):
+        return _backward(problem, fwd, xs, y, out)
+
     if boundary == "fwd":
         return leaves, lambda xs: fwd(*xs)
     if boundary == "bwd":
-        return (lambda: fwd(*_leaves(problem))), lambda yo: backward(*yo)
+
+        def setup():
+            xs = _leaves(problem)
+            return xs, fwd(*xs)
+
+        return setup, lambda state: backward(state[0], *state[1])
     if boundary == "step":
-        return leaves, lambda xs: backward(*fwd(*xs))
+        return leaves, lambda xs: backward(xs, *fwd(*xs))
     if boundary == "ckpt":
-        return leaves, lambda xs: backward(*checkpoint(fwd, *xs, use_reentrant=False))
+        return leaves, lambda xs: backward(
+            xs, *checkpoint(fwd, *xs, use_reentrant=False)
+        )
     raise ValueError(f"unknown boundary {boundary!r}")
+
+
+def _backward(problem: dict[str, Any], fwd, xs, y, out):
+    """The backward of one call of ``fwd`` on the leaves ``xs`` (``dout``, and ``dy`` with the convolution), then in
+    the raw gate mode the cross-rank sums of the parameter partials when ``fwd`` has a ``reduce`` (a rank whose
+    backward left no parameter gradient adds zeros); returns the sums or ``None``."""
+    local = problem["local"]
+    outs, grads = [out], [local["dout"]]
+    if y is not None:
+        outs.append(y)
+        grads.append(local["dy"])
+    torch.autograd.backward(outs, grads)
+    reduce = getattr(fwd, "reduce", None)
+    if reduce is None:
+        return None
+    partials = [
+        p.grad if p.grad is not None else torch.zeros_like(p) for p in xs[len(xs) - 2 :]
+    ]
+    return reduce(*partials)
 
 
 def _time_visit(
@@ -586,36 +699,17 @@ def _probe_memory(step: Step, device: torch.device) -> dict[str, int]:
 def _agreement(
     problem: dict[str, Any], conv: bool, device: torch.device
 ) -> dict[str, Any]:
-    """One ``step`` of ``det`` and of ``nd`` on the same shard: the bitwise tensors and the ``dg`` difference."""
-    results: dict[str, dict[str, torch.Tensor]] = {}
-    local = problem["local"]
-    for arm in ("det", "nd"):
-        x, w, q, k, v, g, beta = xs = _leaves(problem)
-        y, out = _forward(arm, problem, conv)(*xs)
-        outs, grads = [out], [local["dout"]]
-        if y is not None:
-            outs.append(y)
-            grads.append(local["dy"])
-        torch.autograd.backward(outs, grads)
-        res = {
-            "out": out.detach(),
-            "dq": q.grad,
-            "dk": k.grad,
-            "dv": v.grad,
-            "dg": g.grad,
-            "dbeta": beta.grad,
-        }
-        if conv:
-            res.update(y=y.detach(), dx=x.grad, dweight=w.grad)
-        results[arm] = res
+    """One ``step`` of ``det`` and of ``nd`` on the same shard: the bitwise tensors and the ``dg`` difference (in
+    the raw gate mode every result, ``dg`` and the parameter partials and sums included, with the same bit
+    pattern)."""
+    results = {arm: _results(arm, problem, conv) for arm in ("det", "nd")}
     torch.cuda.synchronize(device)
     det, nd = results["det"], results["nd"]
-    names = [n for n in BITWISE if n in det]
+    raw = problem["gate"] == "raw"
+    names = [n for n in BITWISE + (RAW_BITWISE if raw else ()) if n in det]
+    same = _same_bits if raw else _equal
     equal = torch.tensor(
-        [
-            int(det[n] is not None and nd[n] is not None and torch.equal(det[n], nd[n]))
-            for n in names
-        ],
+        [int(same(det[n], nd[n])) for n in names],
         dtype=torch.int64,
         device=device,
     )
@@ -641,6 +735,38 @@ def _agreement(
     }
 
 
+def _results(
+    arm: str, problem: dict[str, Any], conv: bool, *, ckpt: bool = False
+) -> dict[str, torch.Tensor | None]:
+    """``out`` and the gradients of one ``step`` (``ckpt``: under ``torch.utils.checkpoint``) of ``arm`` on fresh
+    leaves of the shard; the convolution's with ``conv``; in the raw gate mode the parameter partials and, for a KCP
+    arm, their cross-rank sums."""
+    xs = _leaves(problem)
+    x, w, q, k, v, g, beta = xs[:7]
+    fwd = _forward(arm, problem, conv)
+    y, out = checkpoint(fwd, *xs, use_reentrant=False) if ckpt else fwd(*xs)
+    sums = _backward(problem, fwd, xs, y, out)
+    res = {
+        "out": out.detach(),
+        "dq": q.grad,
+        "dk": k.grad,
+        "dv": v.grad,
+        "dg": g.grad,
+        "dbeta": beta.grad,
+    }
+    if conv:
+        res.update(y=y.detach(), dx=x.grad, dweight=w.grad)
+    if problem["gate"] == "raw":
+        res.update(dA_log=xs[7].grad, ddt_bias=xs[8].grad)
+        if sums is not None:
+            res.update(dA_log_sum=sums[0], ddt_bias_sum=sums[1])
+    return res
+
+
+def _equal(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
+    return a is not None and b is not None and torch.equal(a, b)
+
+
 def _handoff_counts() -> dict[str, int]:
     return kcp_handoff_stats()
 
@@ -661,9 +787,11 @@ def _same_bits(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
 
 
 def _handoff_expected(problem: dict[str, Any], device: torch.device) -> bool:
-    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: ``"on"`` yes, ``"off"`` no,
-    ``"auto"`` where the package's admission rule (``kcp_handoff_auto_refusal`` of this device's key, the head count,
-    the batch's total and the world size) admits it."""
+    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: never in the raw gate mode,
+    else ``"on"`` yes, ``"off"`` no, ``"auto"`` where the package's admission rule (``kcp_handoff_auto_refusal`` of
+    this device's key, the head count, the batch's total and the world size) admits it."""
+    if problem["gate"] == "raw":
+        return False
     mode = problem["ckpt_handoff"]
     if mode != "auto":
         return mode == "on"
@@ -693,33 +821,16 @@ def _handoff_agreement(
     each step (rank 0's).  ``engaged``: some rank's ``nd`` step kept and read a tape set; ``engaged_all``: every rank
     with tokens did; ``expected``: the mode engages on every rank (:func:`_handoff_expected`); ``engagement_ok``:
     ``engaged_all`` where expected, else no rank engaged, and ``nd_off`` engaged nowhere."""
-    results: dict[str, dict[str, torch.Tensor]] = {}
+    results: dict[str, dict[str, torch.Tensor | None]] = {}
     counts: dict[str, dict[str, int]] = {}
-    local = problem["local"]
     for arm in ("nd", "nd_off"):
-        x, w, q, k, v, g, beta = xs = _leaves(problem)
         before = _handoff_counts()
-        y, out = checkpoint(_forward(arm, problem, conv), *xs, use_reentrant=False)
-        outs, grads = [out], [local["dout"]]
-        if y is not None:
-            outs.append(y)
-            grads.append(local["dy"])
-        torch.autograd.backward(outs, grads)
+        results[arm] = _results(arm, problem, conv, ckpt=True)
         torch.cuda.synchronize(device)
         counts[arm] = _handoff_delta(before)
-        res = {
-            "out": out.detach(),
-            "dq": q.grad,
-            "dk": k.grad,
-            "dv": v.grad,
-            "dg": g.grad,
-            "dbeta": beta.grad,
-        }
-        if conv:
-            res.update(y=y.detach(), dx=x.grad, dweight=w.grad)
-        results[arm] = res
     on, off = results["nd"], results["nd_off"]
-    names = [n for n in HANDOFF_BITWISE if n in on]
+    raw = RAW_BITWISE if problem["gate"] == "raw" else ()
+    names = [n for n in HANDOFF_BITWISE + raw if n in on]
     bound = counts["nd"].get("bound", 0) > 0
     # MIN over ranks: every bit pattern equal, every rank with tokens engaged, every rank expected to engage
     all_ranks = torch.tensor(
@@ -806,6 +917,7 @@ def _local_records(
             heads,
             mod.cake_jit.sm_count(index),
             mod.cake_jit.device_arch(index),
+            gate=problem["gate"],
         )
         mine[arm] = {
             stage: p.record(stage, mod.LOCAL_PATH_BWD) for stage in RECORD_STAGES
@@ -932,15 +1044,20 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     hosts: list[Any] = [None] * world
     dist.all_gather_object(hosts, socket.gethostname())
     H, C = args.heads, args.channels
+    raw = args.gate == "raw"
     ctx_det, ctx_nd = problem["ctx"]["det"], problem["ctx"]["nd"]
     nbytes = {
         "det": {
-            "workspace": kda_det_workspace_bytes_kcp(ctx_det, H=H, C=C),
+            "workspace": kda_det_workspace_bytes_kcp(
+                ctx_det, H=H, C=C, use_gate_in_kernel=raw
+            ),
             "saved": kda_det_saved_bytes_kcp(ctx_det, H=H, C=C),
             "comm": kda_det_comm_bytes_kcp(ctx_det, H=H, C=C),
         },
         "nd": {
-            "workspace": kda_workspace_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
+            "workspace": kda_workspace_bytes_kcp(
+                ctx_nd, H=H, C=C, use_gate_in_kernel=raw, deterministic=False
+            ),
             "saved": kda_saved_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
             "saved_handoff": kda_saved_bytes_kcp(
                 ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
@@ -966,6 +1083,8 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "conv": conv,
             "fla_safe_gate": problem["fla_safe_gate"],
             "ckpt_handoff": args.ckpt_handoff,
+            "gate": args.gate,
+            "lower_bound": LOWER_BOUND if raw else None,
             "layout": args.layout,
             "world_size": world,
             "arms": arms,
@@ -1003,7 +1122,7 @@ def _print(report: dict[str, Any]) -> None:
     cfg = report["config"]
     print(
         f"KCP x{cfg['world_size']}: S={cfg['seqlen']} docs={cfg['docs']} H={cfg['heads']} C={cfg['channels']} "
-        f"conv={cfg['conv']} layout={cfg['layout']} groups={cfg['groups']} samples={cfg['samples']} "
+        f"gate={cfg['gate']} conv={cfg['conv']} layout={cfg['layout']} groups={cfg['groups']} samples={cfg['samples']} "
         f"({report['env']['device']}, {report['env']['arch']})"
     )
     agree = report["agreement"]
@@ -1101,6 +1220,12 @@ def main() -> int:
         default=os.environ.get(HANDOFF_ENV, "").strip().lower() or "auto",
         choices=("auto", "on", "off"),
         help=f"checkpoint_handoff of the nd and control arms (default: ${HANDOFF_ENV}, else auto)",
+    )
+    parser.add_argument(
+        "--gate",
+        default="g",
+        choices=GATES,
+        help="the forget gate's form: g (the activated FP32 gate) or raw (use_gate_in_kernel=True, every arm)",
     )
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(

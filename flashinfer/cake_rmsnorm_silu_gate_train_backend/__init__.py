@@ -26,9 +26,10 @@ decorations and the user-facing documentation live in
 
 Numerical contract against the deterministic package: the forward is the
 deterministic package's forward kernel rendered here (it has no reduction, so
-its bits are the same), and on sm_100a / sm_103a up to 10 rows per SM a
-forward with 16 threads to a row (the same bits) and from 976 rows per SM on
-sm_100a / sm_103a (800 on sm_107a) a forward whose CTAs each walk several row
+its bits are the same), and up to 12 rows per SM on sm_100a / sm_103a (59 on
+sm_107a) a forward with 16 threads to a row (the same bits) and from 976 rows
+per SM on sm_100a / sm_103a (800 on sm_107a) a forward whose CTAs each walk
+several row
 blocks with the same arithmetic (the same bits); the backward is one kernel that writes ``dx`` and ``dz``
 exactly as the deterministic backward does, sums the weight gradient of the
 row blocks each CTA takes (its own block when the grid has a CTA for every
@@ -41,7 +42,7 @@ rounds the sum once into ``dw`` and zeroes the workspace.  The claimed blocks,
 and so the FP32 runs, and the order of the FP64 additions depend on
 scheduling: ``dw`` can move from call to call, always within the deterministic
 backward's error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.  On
-sm_100a / sm_103a up to 256 rows the backward is one thread-block cluster of
+every architecture up to 256 rows the backward is one thread-block cluster of
 16 CTAs with the same row arithmetic (the same ``dx`` and ``dz`` bits): each
 CTA sums its rows' terms in FP32 (at most 16 FP32 roundings a term), and CTA
 ``r`` adds every CTA's FP32 partial of its eight columns in rank order in FP64
@@ -104,23 +105,29 @@ Host design (the input layout rules are the deterministic package's):
   ready, the graph zero-fills one of its own).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count): the forward launches one CTA per block of 16 rows;
-  on sm_100a and sm_103a up to 10 rows per SM it launches the short forward,
-  one 256-thread CTA per block of 16 rows (16 threads to a row: fewer CTAs
-  than SMs), and from more rows a forward whose CTA ``b`` walks the blocks
+  up to 12 rows per SM on sm_100a and sm_103a (59 on sm_107a) it launches the
+  short forward, one 256-thread CTA per block of 16 rows (16 threads to a row:
+  fewer CTAs than SMs on sm_100a and sm_103a; on sm_107a with 205 SMs or
+  more, as with 212 or 216, at most ``4 * (SMs - 16)``, one wave of 4 CTAs
+  per SM on all SMs but 16, while with fewer SMs, as on a small MIG instance,
+  the grid at 59 rows per SM is larger), and from more rows a forward whose
+  CTA ``b`` walks the blocks
   ``b``, ``b + grid``, ..., loading each next block while it computes the
   current one, in the fewest whole waves that give no CTA more than a few
   blocks: from 976 rows per SM on sm_100a and sm_103a (800 on sm_107a) the
   mid forward (6 CTAs per SM, at most 2 blocks of 16 rows each), from 2400
   (1740 on sm_107a) the long forward (3 CTAs per SM, at most 6 blocks of 32
-  rows each).  The backward
-  launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
+  rows each).  On sm_100a and sm_103a the mid forward's thread 0 also warms
+  in L2, with one bulk prefetch a tensor where x and z hold their rows packed,
+  the CTA's next block and the first block of the CTA one wave later.  The
+  backward launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
   ctas_per_sm * SMs)``: 256-thread CTAs of 16-row blocks with
   ``ctas_per_sm = 4`` (one wave); on sm_100a and sm_103a from 1280 rows per
   SM the same CTAs, whose thread 0 warms the next block of packed rows in L2
   with one bulk prefetch a tensor, with ``ctas_per_sm = 5``, a quarter more
   than an SM holds at once (an SM starts its fifth CTA as one of its first
   four leaves); and on sm_107a from 1024 rows per SM 128-thread CTAs of 8-row
-  blocks with ``ctas_per_sm = 8`` (one wave); on sm_100a and sm_103a up to
+  blocks with ``ctas_per_sm = 8`` (one wave); on every architecture up to
   256 rows the short backward launches one cluster of 16 256-thread CTAs
   (``cake_jit.backward_ctas`` 16), CTA ``r`` taking row block ``r``, its
   CTAs scheduled together on the SMs of one GPC.  When the other backwards'
@@ -148,7 +155,7 @@ Host design (the input layout rules are the deterministic package's):
   short backward's 256-thread CTAs need 6144 bytes each; measured at 48 and
   240 rows, they started at once beside a kernel holding every SM with one
   128-thread CTA, no shared memory and the default or the maximum-L1 carveout
-  (B200 and GB300).
+  on B200 and GB300, and waited for it as the backward does on R200 (sm_107a).
 """
 
 from __future__ import annotations
@@ -441,8 +448,9 @@ def cake_rmsnorm_silu_gate_train_forward(
     ``y = BF16(((x * rstd) * weight) * silu(z))``.
 
     The deterministic package's forward kernel rendered here (it has no
-    reduction: the same bits), or on sm_100a / sm_103a up to 10 rows per SM
-    the short forward, from 976 rows per SM on sm_100a / sm_103a (800 on
+    reduction: the same bits), or up to 12 rows per SM on sm_100a / sm_103a
+    (59 on sm_107a) the short forward, from 976 rows per SM on sm_100a /
+    sm_103a (800 on
     sm_107a) the mid forward and from 2400 (1740) the long forward (the same
     bits).  The
     arguments are those of
@@ -848,8 +856,8 @@ def cake_rmsnorm_silu_gate_train_backward(
     into the FP64 accumulators of the workspace with atomics; the CTA that
     arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s value
     first when accumulating) and zeroes the workspace.  Every call with rows
-    uses a workspace, also with ``compute_grad_weight=False``, but on sm_100a
-    and sm_103a up to 256 rows: there one cluster of 16 CTAs sums the weight
+    uses a workspace, also with ``compute_grad_weight=False``, but up to 256
+    rows: there one cluster of 16 CTAs sums the weight
     gradient on chip in a fixed order (the same ``dw`` bits on every call) and
     uses none.  The arguments
     are those of

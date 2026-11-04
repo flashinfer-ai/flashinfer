@@ -21,9 +21,11 @@ with FLA's ``chunk_gated_delta_rule`` signature (no context parallelism).
 
 The forward runs the prep (``prep_tma``, the q / k tiles staged by TMA and one
 CTA per (chunk, key head), unless its dispatch rule :func:`use_prep_tma` keeps
-the plain prep; both give the same bits), the tcgen05 WY stage and the fused
-tcgen05 scan and output (``fwd_ho``; a split plan first runs the pre-scan and
-the stitch for the segment start states).  The backward runs ``dv_local`` and
+the plain prep; both give the same bits), the tcgen05 WY stage
+(:func:`wy_stage`: ``wy_tc2``, five CTAs per SM, on the architectures of
+``WY_TC2_ARCHS``, else ``wy_tc``; the same bits) and the fused tcgen05 scan
+and output (``fwd_ho``; a split plan first runs the pre-scan and the stitch
+for the segment start states).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -44,9 +46,9 @@ it as two contiguous sequence groups (:func:`sequence_groups`), one on a
 high-priority side stream forked from the caller's stream and joined back
 before the stage returns: the forward's ``wy_tc`` and ``fwd_ho`` of the partial
 group overlap the full rounds of the other, and the adjoint ``dhu_tc2`` of the
-partial group of a serial plan overlaps ``tail_g2`` of the other; beside
-``tail_g3`` the ``dhu_tc2`` pass 2 of a split plan runs as two such groups of
-segments.
+partial group of a serial plan overlaps ``tail_g2`` of the other (``tail_g3`` on
+the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``); beside ``tail_g3`` the
+``dhu_tc2`` pass 2 of a split plan runs as two such groups of segments.
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -58,7 +60,8 @@ the chunks one pre-scan CTA covers) are the records' ``scan`` constants; the
 records' ``select`` tables.
 
 Where the ``dhu_tc2`` adjoint scan feeds ``tail_g2_bf16`` on one stream and
-takes at most half the SMs, or on ``sm_100a`` and ``sm_103a`` is the pass 2 of
+takes at most half the SMs (on ``sm_107a`` with the scan's release in batches
+of eight chunks), or on ``sm_100a`` and ``sm_103a`` is the pass 2 of
 a split plan with more CTAs than SMs on a call of enough tokens x value heads,
 the backward runs them as the wavefront pair
 ``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront`` (the split pass 2 on
@@ -127,6 +130,7 @@ __all__ = [
     "wavefront_engaged",
     "wavefront_order",
     "wavefront_split_engaged",
+    "wy_stage",
 ]
 
 CHUNK: int = int(cake_jit.CHUNK)
@@ -192,6 +196,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "prep_tma": _PREP_TMA_ARGS,
     "prep_tma_bf16beta": _PREP_TMA_ARGS,
     "wy_tc": _WY_ARGS,
+    "wy_tc2": _WY_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
@@ -294,8 +299,9 @@ class ChainOptions:
     forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
     chunk tables, the selection results and the per-stream workspaces between calls; ``lpt`` dispatches the
     sequences of a host-built table longest first (the same bits; ``False``: the caller's order); ``streams`` is
-    ``2`` to let a host-built table's serial scans (the adjoint one beside ``tail_g2``) and the ``dhu_tc2`` pass 2 of
-    its split plans (beside ``tail_g3``) run as two groups on the caller's stream and a side stream where their rule
+    ``2`` to let a host-built table's serial scans (the adjoint one beside ``tail_g2``, and beside ``tail_g3`` on the
+    architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``) and the ``dhu_tc2`` pass 2 of its split plans (beside
+    ``tail_g3``) run as two groups on the caller's stream and a side stream where their rule
     (:func:`two_stream_split`) fills the last round (the same bits), ``1`` to keep every launch on the caller's
     stream.
     """
@@ -1371,6 +1377,11 @@ def two_stream_split(num_segments: int, num_v_heads: int, sm_count: int) -> int 
     return best
 
 
+# the architectures where a serial tcgen05 adjoint scan beside tail_g3 runs as its two groups (the partial round's
+# group B on the side stream beside the tail of group A); elsewhere it keeps one launch on the caller's stream
+TWO_STREAM_SERIAL_G3_ARCHS = ("sm_100a", "sm_103a")
+
+
 def sequence_groups(
     meta: ChunkMeta, num_v_heads: int, sm_count: int
 ) -> tuple[StreamGroups | None, StreamGroups | None]:
@@ -1379,7 +1390,7 @@ def sequence_groups(
     adjoint scan's group A is its full-round group, the forward scan's group A the rest.  The adjoint table of a split
     plan is grouped over its segments by the same rule: group A its first ``k`` segments, the chunks before segment
     ``k`` (used where its pass 2 runs on ``dhu_tc2`` beside ``tail_g3``; a serial adjoint scan's groups are used
-    beside ``tail_g2``)."""
+    beside ``tail_g2``, and beside ``tail_g3`` on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``)."""
     if meta.seq_lens is None:
         return None, None
     order = meta.order if meta.order is not None else range(meta.num_seqs)
@@ -1461,8 +1472,10 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 # fork, and the entry count reaches ``segments x HV`` only once the last CTA of the second round has started, after
 # the first round has given back the SMs it needs, so again the waiting tail never holds an SM a scan CTA still needs.
 # That pass 2 runs the scan ``dhu_tc2_wavefront_split`` (the elected release: with one release per store thread
-# the slower scan ate most of the overlap on sm_103a); the scan of at most half the SMs runs ``dhu_tc2_wavefront``.
-WAVEFRONT_ARCHS = ("sm_100a", "sm_103a")
+# the slower scan ate most of the overlap on sm_103a); the scan of at most half the SMs runs ``dhu_tc2_wavefront``,
+# whose sm_107a program releases in the elected form once per eight chunks (there the release per store thread
+# slowed the scan by about a fifth); the split side stays off sm_107a (``WAVEFRONT_SPLIT_ARCHS``).
+WAVEFRONT_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 # sm_100a: the host path of a call with fewer value heads outlasts its GPU work, so the pair's host cost is not hidden
 WAVEFRONT_MIN_V_HEADS = {"sm_100a": 32}
 # the split pass 2 of more CTAs than SMs: the pair (scan ``dhu_tc2_wavefront_split``) at any value-head count, on a
@@ -1591,6 +1604,18 @@ def _wait_entry(device_index: int):
 # --------------------------------------------------------------------------- #
 # forward
 # --------------------------------------------------------------------------- #
+# The forward WY stage: on an architecture of ``WY_TC2_ARCHS`` every ``wy_tc`` launch (the forward, both sequence
+# groups of the P form and the backward's recompute) runs ``wy_tc2`` instead, the same per-element chains, grid and
+# outputs (so the same bits) with a 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
+# on an SM where ``wy_tc`` fits four.  On sm_107a the stage runs ``wy_tc``.
+WY_TC2_ARCHS = ("sm_100a", "sm_103a")
+
+
+def wy_stage(arch: str) -> str:
+    """The stage of the forward WY launches on ``arch``: ``wy_tc2`` on ``WY_TC2_ARCHS``, else ``wy_tc``."""
+    return "wy_tc2" if arch in WY_TC2_ARCHS else "wy_tc"
+
+
 def _wy_outputs(kn, v, total_tokens, num_v_heads):
     w = torch.empty(
         (total_tokens, num_v_heads, HEAD_DIM), dtype=kn.dtype, device=kn.device
@@ -1614,8 +1639,8 @@ def _launch_wy(
     recompute,
 ):
     w, u = _wy_outputs(kn, v, total_tokens, num_v_heads)
-    _launch("wy_tc", meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
-            num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
+    _launch(wy_stage(arch), meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start,
+            meta.chunk_len, num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
     return w, u
 
 
@@ -1776,8 +1801,10 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     groups = cast("StreamGroups", meta.fwd_groups)
     n, na, ca = segs.num_segments, groups.split, groups.split_chunk
 
+    wy_name = wy_stage(arch)
+
     def wy_tc(c0, c1):
-        _launch("wy_tc", c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
+        _launch(wy_name, c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
                 meta.chunk_len[c0:c1], num_heads, num_v_heads, 0)  # fmt: skip
 
     def fwd_ho(s0, s1):
@@ -1945,10 +1972,14 @@ def gdn_chunk_det_backward(
             if num_v_heads == 3 * num_heads and not pinned and _available(tail3, arch)
             else None
         )
-    # two groups: the tcgen05 adjoint scan feeding the fused tail, for a serial plan beside tail_g2 and for the pass 2
-    # of a split plan beside tail_g3 (a serial plan beside tail_g3 and a split plan beside tail_g2 run one stream)
+    # two groups: the tcgen05 adjoint scan feeding the fused tail, for a serial plan beside tail_g2 (beside tail_g3 on
+    # the architectures of TWO_STREAM_SERIAL_G3_ARCHS) and for the pass 2 of a split plan beside tail_g3 (a split plan
+    # beside tail_g2 runs one stream)
     tail_kind = None if fused_tail is None else fused_tail.removesuffix("_bf16")
-    two_stream = (use_tc and tail_kind == "tail_g2") or (
+    serial_kinds = (
+        ("tail_g2", "tail_g3") if arch in TWO_STREAM_SERIAL_G3_ARCHS else ("tail_g2",)
+    )
+    two_stream = (use_tc and tail_kind in serial_kinds) or (
         split_tc and tail_kind == "tail_g3"
     )
     groups = meta.bwd_groups if two_stream else None

@@ -110,6 +110,20 @@ __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4(
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
+// Their low-latency forms, launched for grids of at most two waves of resident
+// clusters: the same shared memory, launch bounds and outputs.
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4_lat(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4_lat_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_lat(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_lat_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
 
 // Wide row-caching cluster kernels of 10 and 12 CTAs: each CTA keeps up to 13
 // (10 CTAs) or 11 (12 CTAs) tiles of its chunk in registers at one resident

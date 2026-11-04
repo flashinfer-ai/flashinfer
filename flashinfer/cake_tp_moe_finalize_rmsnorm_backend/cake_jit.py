@@ -4720,7 +4720,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     ],
                     [
                         576,
-                        639,
+                        632,
                     ],
                     [
                         1008,
@@ -6950,7 +6950,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         288,
                     ],
                     [
-                        639,
+                        632,
                         1008,
                     ],
                 ],

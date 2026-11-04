@@ -337,6 +337,8 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
     const int smem_p1_addr = smem + 206848;
     unsigned int* smem_sk_flag = reinterpret_cast<unsigned int*>(smem_raw + 208896);
     const int smem_sk_flag_addr = smem + 208896;
+    int* smem_la = reinterpret_cast<int*>(smem_raw + 208912);
+    const int smem_la_addr = smem + 208912;
 #else
     __nv_bfloat16* smem_p0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 137216);
     const int smem_p0_addr = smem + 137216;
@@ -344,6 +346,8 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
     const int smem_p1_addr = smem + 141312;
     unsigned int* smem_sk_flag = reinterpret_cast<unsigned int*>(smem_raw + 143360);
     const int smem_sk_flag_addr = smem + 143360;
+    int* smem_la = reinterpret_cast<int*>(smem_raw + 143376);
+    const int smem_la_addr = smem + 143376;
 #endif
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Qt))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
@@ -354,6 +358,212 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
             for (int line = 0; line < (BATCH_SIZE * 4 + 127) / 128; line++) {
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(causal_seqlens_kv_global + (line * 32))));
             }
+        }
+    }
+    if (warp == 14) {
+        int la_nblk = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
+        int la_cblk = la_nblk + la_nblk % 2;
+        if (la_cblk < 4) {
+            la_cblk = 4;
+        }
+        int sk_full = la_cblk / 2;
+        unsigned int la_groups = (unsigned int)(gridDim.x / 4);
+        unsigned int la_group_lo = (unsigned int)(blockIdx.x / 4);
+        if (la_group_lo > la_groups) {
+            la_group_lo = la_groups;
+        }
+        unsigned int la_group_hi = la_group_lo + 1;
+        if (la_group_hi > la_groups) {
+            la_group_hi = la_groups;
+        }
+        unsigned int la_ends[4];
+        unsigned int la_lane_sum = 0;
+        unsigned int la_last_pairs = 0;
+        #pragma unroll
+        for (int la_k = 0; la_k < 4; la_k++) {
+            int la_req = lane * 4 + la_k;
+            int up_len = causal_seqlens_kv_global[la_req];
+            if (up_len < 0) {
+                up_len = 0;
+            }
+            if (up_len > max_local_seq_len) {
+                up_len = max_local_seq_len;
+            }
+            int up_pairs = ((up_len + 128 - 1) / 128 + 1) / 2;
+            if (up_pairs < 2) {
+                up_pairs = 2;
+            }
+            if (up_pairs > sk_full) {
+                up_pairs = sk_full;
+            }
+            if (la_req == BATCH_SIZE - 1) {
+                la_last_pairs = (unsigned int)up_pairs;
+            }
+            la_lane_sum = la_lane_sum + (unsigned int)up_pairs;
+            la_ends[la_k] = la_lane_sum;
+        }
+        uint32_t la_lane_end = la_lane_sum;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, la_lane_end, 1, 32); if (lane >= 1) { la_lane_end += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, la_lane_end, 2, 32); if (lane >= 2) { la_lane_end += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, la_lane_end, 4, 32); if (lane >= 4) { la_lane_end += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, la_lane_end, 8, 32); if (lane >= 8) { la_lane_end += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, la_lane_end, 16, 32); if (lane >= 16) { la_lane_end += peer; } }
+        unsigned int la_lane_first = la_lane_end - la_lane_sum;
+        unsigned int sk_total;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(sk_total) : "r"(la_lane_sum));
+        unsigned int p2_prev;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(p2_prev) : "r"(la_last_pairs));
+        unsigned int la_group_prev = 0;
+        if (la_group_lo > 0) {
+            la_group_prev = la_group_lo - 1;
+        }
+        unsigned int raw_p = (unsigned int)((unsigned long long)la_group_prev * (unsigned long long)sk_total / (unsigned long long)la_groups);
+        unsigned int raw_l = (unsigned int)((unsigned long long)la_group_lo * (unsigned long long)sk_total / (unsigned long long)la_groups);
+        unsigned int raw_h = (unsigned int)((unsigned long long)la_group_hi * (unsigned long long)sk_total / (unsigned long long)la_groups);
+        unsigned int la_cnt_p = 0;
+        unsigned int la_beg_p = 0;
+        unsigned int la_end_p = 4294967295u;
+        unsigned int la_cnt_l = 0;
+        unsigned int la_beg_l = 0;
+        unsigned int la_end_l = 4294967295u;
+        unsigned int la_cnt_h = 0;
+        unsigned int la_beg_h = 0;
+        unsigned int la_end_h = 4294967295u;
+        #pragma unroll
+        for (int la_j = 0; la_j < 4; la_j++) {
+            unsigned int la_e = la_lane_first + la_ends[la_j];
+            if (la_e <= raw_p) {
+                la_cnt_p = la_cnt_p + 1;
+                la_beg_p = la_e;
+            } else if (la_e < la_end_p) {
+                la_end_p = la_e;
+            }
+            if (la_e <= raw_l) {
+                la_cnt_l = la_cnt_l + 1;
+                la_beg_l = la_e;
+            } else if (la_e < la_end_l) {
+                la_end_l = la_e;
+            }
+            if (la_e <= raw_h) {
+                la_cnt_h = la_cnt_h + 1;
+                la_beg_h = la_e;
+            } else if (la_e < la_end_h) {
+                la_end_h = la_e;
+            }
+        }
+        unsigned int _warp_redux_0;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_0) : "r"(la_cnt_p));
+        int unit_p = (int)_warp_redux_0;
+        unsigned int first_p;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(first_p) : "r"(la_beg_p));
+        unsigned int _warp_redux_1;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_1) : "r"(la_end_p));
+        unsigned int pairs_p = _warp_redux_1 - first_p;
+        if (raw_p >= sk_total) {
+            unit_p = -1;
+        }
+        unsigned int _warp_redux_2;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_2) : "r"(la_cnt_l));
+        int unit_l = (int)_warp_redux_2;
+        unsigned int first_l;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(first_l) : "r"(la_beg_l));
+        unsigned int _warp_redux_3;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_3) : "r"(la_end_l));
+        unsigned int pairs_l = _warp_redux_3 - first_l;
+        if (raw_l >= sk_total) {
+            unit_l = -1;
+        }
+        unsigned int _warp_redux_4;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_4) : "r"(la_cnt_h));
+        int unit_h = (int)_warp_redux_4;
+        unsigned int first_h;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(first_h) : "r"(la_beg_h));
+        unsigned int _warp_redux_5;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(la_end_h));
+        unsigned int pairs_h = _warp_redux_5 - first_h;
+        if (raw_h >= sk_total) {
+            unit_h = -1;
+        }
+        unsigned int la_beg_hb = 0;
+        #pragma unroll
+        for (int la_i = 0; la_i < 4; la_i++) {
+            unsigned int la_eb = la_lane_first + la_ends[la_i];
+            if (la_eb < first_h) {
+                la_beg_hb = la_eb;
+            }
+        }
+        unsigned int _warp_redux_6;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(la_beg_hb));
+        unsigned int pairs_hb = first_h - _warp_redux_6;
+        unsigned int cut_p = sk_total;
+        if (unit_p >= 0) {
+            int sn_off = (int)(raw_p - first_p);
+            int sn_even = sn_off - sn_off % 2;
+            if (sn_even == (int)pairs_p - 1) {
+                sn_even = (int)pairs_p - 3;
+            }
+            cut_p = first_p + (unsigned int)sn_even;
+        }
+        unsigned int cut_l = sk_total;
+        if (unit_l >= 0) {
+            int sn_off_1 = (int)(raw_l - first_l);
+            int sn_even_1 = sn_off_1 - sn_off_1 % 2;
+            if (sn_even_1 == (int)pairs_l - 1) {
+                sn_even_1 = (int)pairs_l - 3;
+            }
+            cut_l = first_l + (unsigned int)sn_even_1;
+        }
+        unsigned int cut_h = sk_total;
+        if (unit_h >= 0) {
+            int sn_off_2 = (int)(raw_h - first_h);
+            int sn_even_2 = sn_off_2 - sn_off_2 % 2;
+            if (sn_even_2 == (int)pairs_h - 1) {
+                sn_even_2 = (int)pairs_h - 3;
+            }
+            cut_h = first_h + (unsigned int)sn_even_2;
+        }
+        unsigned int pair_lo_f = cut_l;
+        int moved_l = 0;
+        if (la_group_lo > 0 && unit_l >= 0 && unit_p == unit_l && cut_p > first_l) {
+            pair_lo_f = first_l + pairs_l;
+            moved_l = 1;
+        }
+        unsigned int pair_hi_f = cut_h;
+        int moved_h = 0;
+        if (la_group_hi > 0 && unit_h >= 0 && unit_l == unit_h && cut_l > first_h) {
+            pair_hi_f = first_h + pairs_h;
+            moved_h = 1;
+        }
+        unsigned int la_tile_begin = (unsigned int)BATCH_SIZE;
+        int lo_off = 0;
+        if (unit_l >= 0) {
+            la_tile_begin = (unsigned int)unit_l;
+            lo_off = (int)(pair_lo_f - first_l);
+            if (moved_l != 0) {
+                la_tile_begin = (unsigned int)unit_l + 1;
+                lo_off = 0;
+            }
+        }
+        unsigned int la_tile_end = (unsigned int)BATCH_SIZE;
+        int hi_off = (int)p2_prev;
+        if (unit_h >= 0) {
+            la_tile_end = (unsigned int)unit_h + 1;
+            hi_off = (int)(pair_hi_f - first_h);
+            if (moved_h == 0 && pair_hi_f == first_h) {
+                la_tile_end = (unsigned int)unit_h;
+                hi_off = (int)pairs_hb;
+            }
+        }
+        if (pair_hi_f <= pair_lo_f) {
+            la_tile_end = la_tile_begin;
+        }
+        int la_pair_lo = (int)la_tile_begin * 65536 + lo_off;
+        int la_pair_hi = ((int)la_tile_end - 1) * 65536 + hi_off;
+        if (elect_sync()) {
+            smem_la[0] = la_pair_lo;
+            smem_la[1] = la_pair_hi;
+            smem_la[2] = (int)la_tile_begin;
+            smem_la[3] = (int)la_tile_end;
         }
     }
 
@@ -548,154 +758,10 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
             if (cta_n_blocks < 4) {
                 cta_n_blocks = 4;
             }
-            int sk_full = cta_n_blocks / 2;
-            unsigned int la_groups = (unsigned int)(gridDim.x / 4);
-            unsigned int la_group_lo = (unsigned int)(blockIdx.x / 4);
-            if (la_group_lo > la_groups) {
-                la_group_lo = la_groups;
-            }
-            unsigned int la_group_hi = la_group_lo + 1;
-            if (la_group_hi > la_groups) {
-                la_group_hi = la_groups;
-            }
-            unsigned int sk_total = 0;
-            #pragma unroll 8
-            for (int sk_b1 = 0; sk_b1 < BATCH_SIZE; sk_b1++) {
-                int up_len = causal_seqlens_kv_global[sk_b1];
-                if (up_len < 0) {
-                    up_len = 0;
-                }
-                if (up_len > max_local_seq_len) {
-                    up_len = max_local_seq_len;
-                }
-                int up_pairs = ((up_len + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs < 2) {
-                    up_pairs = 2;
-                }
-                if (up_pairs > sk_full) {
-                    up_pairs = sk_full;
-                }
-                sk_total = sk_total + (unsigned int)up_pairs;
-            }
-            unsigned int la_group_prev = 0;
-            if (la_group_lo > 0) {
-                la_group_prev = la_group_lo - 1;
-            }
-            unsigned int raw_p = (unsigned int)((unsigned long long)la_group_prev * (unsigned long long)sk_total / (unsigned long long)la_groups);
-            unsigned int raw_l = (unsigned int)((unsigned long long)la_group_lo * (unsigned long long)sk_total / (unsigned long long)la_groups);
-            unsigned int raw_h = (unsigned int)((unsigned long long)la_group_hi * (unsigned long long)sk_total / (unsigned long long)la_groups);
-            unsigned int p2_first = 0;
-            unsigned int p2_prev = 0;
-            int unit_p = -1;
-            unsigned int first_p = 0;
-            unsigned int pairs_p = 0;
-            int unit_l = -1;
-            unsigned int first_l = 0;
-            unsigned int pairs_l = 0;
-            int unit_h = -1;
-            unsigned int first_h = 0;
-            unsigned int pairs_h = 0;
-            unsigned int pairs_hb = 0;
-            #pragma unroll 8
-            for (int sk_b2 = 0; sk_b2 < BATCH_SIZE; sk_b2++) {
-                int up_len_1 = causal_seqlens_kv_global[sk_b2];
-                if (up_len_1 < 0) {
-                    up_len_1 = 0;
-                }
-                if (up_len_1 > max_local_seq_len) {
-                    up_len_1 = max_local_seq_len;
-                }
-                int up_pairs_1 = ((up_len_1 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_1 < 2) {
-                    up_pairs_1 = 2;
-                }
-                if (up_pairs_1 > sk_full) {
-                    up_pairs_1 = sk_full;
-                }
-                unsigned int p2_end = p2_first + (unsigned int)up_pairs_1;
-                if (raw_p >= p2_first && raw_p < p2_end) {
-                    unit_p = (int)sk_b2;
-                    first_p = p2_first;
-                    pairs_p = (unsigned int)up_pairs_1;
-                }
-                if (raw_l >= p2_first && raw_l < p2_end) {
-                    unit_l = (int)sk_b2;
-                    first_l = p2_first;
-                    pairs_l = (unsigned int)up_pairs_1;
-                }
-                if (raw_h >= p2_first && raw_h < p2_end) {
-                    unit_h = (int)sk_b2;
-                    first_h = p2_first;
-                    pairs_h = (unsigned int)up_pairs_1;
-                    pairs_hb = p2_prev;
-                }
-                p2_prev = (unsigned int)up_pairs_1;
-                p2_first = p2_end;
-            }
-            unsigned int cut_p = sk_total;
-            if (unit_p >= 0) {
-                int sn_off = (int)(raw_p - first_p);
-                int sn_even = sn_off - sn_off % 2;
-                if (sn_even == (int)pairs_p - 1) {
-                    sn_even = (int)pairs_p - 3;
-                }
-                cut_p = first_p + (unsigned int)sn_even;
-            }
-            unsigned int cut_l = sk_total;
-            if (unit_l >= 0) {
-                int sn_off_1 = (int)(raw_l - first_l);
-                int sn_even_1 = sn_off_1 - sn_off_1 % 2;
-                if (sn_even_1 == (int)pairs_l - 1) {
-                    sn_even_1 = (int)pairs_l - 3;
-                }
-                cut_l = first_l + (unsigned int)sn_even_1;
-            }
-            unsigned int cut_h = sk_total;
-            if (unit_h >= 0) {
-                int sn_off_2 = (int)(raw_h - first_h);
-                int sn_even_2 = sn_off_2 - sn_off_2 % 2;
-                if (sn_even_2 == (int)pairs_h - 1) {
-                    sn_even_2 = (int)pairs_h - 3;
-                }
-                cut_h = first_h + (unsigned int)sn_even_2;
-            }
-            unsigned int pair_lo_f = cut_l;
-            int moved_l = 0;
-            if (la_group_lo > 0 && unit_l >= 0 && unit_p == unit_l && cut_p > first_l) {
-                pair_lo_f = first_l + pairs_l;
-                moved_l = 1;
-            }
-            unsigned int pair_hi_f = cut_h;
-            int moved_h = 0;
-            if (la_group_hi > 0 && unit_h >= 0 && unit_l == unit_h && cut_l > first_h) {
-                pair_hi_f = first_h + pairs_h;
-                moved_h = 1;
-            }
-            unsigned int tile_begin = (unsigned int)BATCH_SIZE;
-            int lo_off = 0;
-            if (unit_l >= 0) {
-                tile_begin = (unsigned int)unit_l;
-                lo_off = (int)(pair_lo_f - first_l);
-                if (moved_l != 0) {
-                    tile_begin = (unsigned int)unit_l + 1;
-                    lo_off = 0;
-                }
-            }
-            unsigned int tile_end = (unsigned int)BATCH_SIZE;
-            int hi_off = (int)p2_prev;
-            if (unit_h >= 0) {
-                tile_end = (unsigned int)unit_h + 1;
-                hi_off = (int)(pair_hi_f - first_h);
-                if (moved_h == 0 && pair_hi_f == first_h) {
-                    tile_end = (unsigned int)unit_h;
-                    hi_off = (int)pairs_hb;
-                }
-            }
-            if (pair_hi_f <= pair_lo_f) {
-                tile_end = tile_begin;
-            }
-            int pair_lo = (int)tile_begin * 65536 + lo_off;
-            int pair_hi = ((int)tile_end - 1) * 65536 + hi_off;
+            int pair_lo = smem_la[0];
+            int pair_hi = smem_la[1];
+            unsigned int tile_begin = (unsigned int)smem_la[2];
+            unsigned int tile_end = (unsigned int)smem_la[3];
             unsigned int _phase_stats_empty_0 = 1;
             unsigned int _phase_corr_empty_1_0 = 1;
             unsigned int _phase_corr_empty_0_0 = 1;
@@ -727,32 +793,32 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                 if (cta_n_blocks_1 < 4) {
                     cta_n_blocks_1 = 4;
                 }
-                int up_len_2 = causal_seqlens_kv_global[ordered];
-                if (up_len_2 < 0) {
-                    up_len_2 = 0;
+                int up_len_1 = causal_seqlens_kv_global[ordered];
+                if (up_len_1 < 0) {
+                    up_len_1 = 0;
                 }
-                if (up_len_2 > max_local_seq_len) {
-                    up_len_2 = max_local_seq_len;
+                if (up_len_1 > max_local_seq_len) {
+                    up_len_1 = max_local_seq_len;
                 }
-                int up_pairs_2 = ((up_len_2 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_2 < 2) {
-                    up_pairs_2 = 2;
+                int up_pairs_1 = ((up_len_1 + 128 - 1) / 128 + 1) / 2;
+                if (up_pairs_1 < 2) {
+                    up_pairs_1 = 2;
                 }
-                if (up_pairs_2 > cta_n_blocks_1 / 2) {
-                    up_pairs_2 = cta_n_blocks_1 / 2;
+                if (up_pairs_1 > cta_n_blocks_1 / 2) {
+                    up_pairs_1 = cta_n_blocks_1 / 2;
                 }
                 int la_lo = 0;
                 if ((int)ordered == pair_lo >> 16) {
                     la_lo = pair_lo & 65535;
                 }
-                int la_hi = up_pairs_2;
+                int la_hi = up_pairs_1;
                 if ((int)ordered == pair_hi >> 16) {
                     la_hi = pair_hi & 65535;
                 }
                 int part_lo = la_lo;
                 int part_blocks = 2 * (la_hi - la_lo);
                 int split = 0;
-                if (la_lo > 0 || la_hi < up_pairs_2) {
+                if (la_lo > 0 || la_hi < up_pairs_1) {
                     split = 1;
                 }
                 int split_start_block = 2 * part_lo;
@@ -1049,154 +1115,10 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
             if (cta_n_blocks_2 < 4) {
                 cta_n_blocks_2 = 4;
             }
-            int sk_full_1 = cta_n_blocks_2 / 2;
-            unsigned int la_groups_1 = (unsigned int)(gridDim.x / 4);
-            unsigned int la_group_lo_1 = (unsigned int)(blockIdx.x / 4);
-            if (la_group_lo_1 > la_groups_1) {
-                la_group_lo_1 = la_groups_1;
-            }
-            unsigned int la_group_hi_1 = la_group_lo_1 + 1;
-            if (la_group_hi_1 > la_groups_1) {
-                la_group_hi_1 = la_groups_1;
-            }
-            unsigned int sk_total_1 = 0;
-            #pragma unroll 8
-            for (int sk_b1_1 = 0; sk_b1_1 < BATCH_SIZE; sk_b1_1++) {
-                int up_len_3 = causal_seqlens_kv_global[sk_b1_1];
-                if (up_len_3 < 0) {
-                    up_len_3 = 0;
-                }
-                if (up_len_3 > max_local_seq_len) {
-                    up_len_3 = max_local_seq_len;
-                }
-                int up_pairs_3 = ((up_len_3 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_3 < 2) {
-                    up_pairs_3 = 2;
-                }
-                if (up_pairs_3 > sk_full_1) {
-                    up_pairs_3 = sk_full_1;
-                }
-                sk_total_1 = sk_total_1 + (unsigned int)up_pairs_3;
-            }
-            unsigned int la_group_prev_1 = 0;
-            if (la_group_lo_1 > 0) {
-                la_group_prev_1 = la_group_lo_1 - 1;
-            }
-            unsigned int raw_p_1 = (unsigned int)((unsigned long long)la_group_prev_1 * (unsigned long long)sk_total_1 / (unsigned long long)la_groups_1);
-            unsigned int raw_l_1 = (unsigned int)((unsigned long long)la_group_lo_1 * (unsigned long long)sk_total_1 / (unsigned long long)la_groups_1);
-            unsigned int raw_h_1 = (unsigned int)((unsigned long long)la_group_hi_1 * (unsigned long long)sk_total_1 / (unsigned long long)la_groups_1);
-            unsigned int p2_first_1 = 0;
-            unsigned int p2_prev_1 = 0;
-            int unit_p_1 = -1;
-            unsigned int first_p_1 = 0;
-            unsigned int pairs_p_1 = 0;
-            int unit_l_1 = -1;
-            unsigned int first_l_1 = 0;
-            unsigned int pairs_l_1 = 0;
-            int unit_h_1 = -1;
-            unsigned int first_h_1 = 0;
-            unsigned int pairs_h_1 = 0;
-            unsigned int pairs_hb_1 = 0;
-            #pragma unroll 8
-            for (int sk_b2_1 = 0; sk_b2_1 < BATCH_SIZE; sk_b2_1++) {
-                int up_len_4 = causal_seqlens_kv_global[sk_b2_1];
-                if (up_len_4 < 0) {
-                    up_len_4 = 0;
-                }
-                if (up_len_4 > max_local_seq_len) {
-                    up_len_4 = max_local_seq_len;
-                }
-                int up_pairs_4 = ((up_len_4 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_4 < 2) {
-                    up_pairs_4 = 2;
-                }
-                if (up_pairs_4 > sk_full_1) {
-                    up_pairs_4 = sk_full_1;
-                }
-                unsigned int p2_end_1 = p2_first_1 + (unsigned int)up_pairs_4;
-                if (raw_p_1 >= p2_first_1 && raw_p_1 < p2_end_1) {
-                    unit_p_1 = (int)sk_b2_1;
-                    first_p_1 = p2_first_1;
-                    pairs_p_1 = (unsigned int)up_pairs_4;
-                }
-                if (raw_l_1 >= p2_first_1 && raw_l_1 < p2_end_1) {
-                    unit_l_1 = (int)sk_b2_1;
-                    first_l_1 = p2_first_1;
-                    pairs_l_1 = (unsigned int)up_pairs_4;
-                }
-                if (raw_h_1 >= p2_first_1 && raw_h_1 < p2_end_1) {
-                    unit_h_1 = (int)sk_b2_1;
-                    first_h_1 = p2_first_1;
-                    pairs_h_1 = (unsigned int)up_pairs_4;
-                    pairs_hb_1 = p2_prev_1;
-                }
-                p2_prev_1 = (unsigned int)up_pairs_4;
-                p2_first_1 = p2_end_1;
-            }
-            unsigned int cut_p_1 = sk_total_1;
-            if (unit_p_1 >= 0) {
-                int sn_off_3 = (int)(raw_p_1 - first_p_1);
-                int sn_even_3 = sn_off_3 - sn_off_3 % 2;
-                if (sn_even_3 == (int)pairs_p_1 - 1) {
-                    sn_even_3 = (int)pairs_p_1 - 3;
-                }
-                cut_p_1 = first_p_1 + (unsigned int)sn_even_3;
-            }
-            unsigned int cut_l_1 = sk_total_1;
-            if (unit_l_1 >= 0) {
-                int sn_off_4 = (int)(raw_l_1 - first_l_1);
-                int sn_even_4 = sn_off_4 - sn_off_4 % 2;
-                if (sn_even_4 == (int)pairs_l_1 - 1) {
-                    sn_even_4 = (int)pairs_l_1 - 3;
-                }
-                cut_l_1 = first_l_1 + (unsigned int)sn_even_4;
-            }
-            unsigned int cut_h_1 = sk_total_1;
-            if (unit_h_1 >= 0) {
-                int sn_off_5 = (int)(raw_h_1 - first_h_1);
-                int sn_even_5 = sn_off_5 - sn_off_5 % 2;
-                if (sn_even_5 == (int)pairs_h_1 - 1) {
-                    sn_even_5 = (int)pairs_h_1 - 3;
-                }
-                cut_h_1 = first_h_1 + (unsigned int)sn_even_5;
-            }
-            unsigned int pair_lo_f_1 = cut_l_1;
-            int moved_l_1 = 0;
-            if (la_group_lo_1 > 0 && unit_l_1 >= 0 && unit_p_1 == unit_l_1 && cut_p_1 > first_l_1) {
-                pair_lo_f_1 = first_l_1 + pairs_l_1;
-                moved_l_1 = 1;
-            }
-            unsigned int pair_hi_f_1 = cut_h_1;
-            int moved_h_1 = 0;
-            if (la_group_hi_1 > 0 && unit_h_1 >= 0 && unit_l_1 == unit_h_1 && cut_l_1 > first_h_1) {
-                pair_hi_f_1 = first_h_1 + pairs_h_1;
-                moved_h_1 = 1;
-            }
-            unsigned int tile_begin_1 = (unsigned int)BATCH_SIZE;
-            int lo_off_1 = 0;
-            if (unit_l_1 >= 0) {
-                tile_begin_1 = (unsigned int)unit_l_1;
-                lo_off_1 = (int)(pair_lo_f_1 - first_l_1);
-                if (moved_l_1 != 0) {
-                    tile_begin_1 = (unsigned int)unit_l_1 + 1;
-                    lo_off_1 = 0;
-                }
-            }
-            unsigned int tile_end_1 = (unsigned int)BATCH_SIZE;
-            int hi_off_1 = (int)p2_prev_1;
-            if (unit_h_1 >= 0) {
-                tile_end_1 = (unsigned int)unit_h_1 + 1;
-                hi_off_1 = (int)(pair_hi_f_1 - first_h_1);
-                if (moved_h_1 == 0 && pair_hi_f_1 == first_h_1) {
-                    tile_end_1 = (unsigned int)unit_h_1;
-                    hi_off_1 = (int)pairs_hb_1;
-                }
-            }
-            if (pair_hi_f_1 <= pair_lo_f_1) {
-                tile_end_1 = tile_begin_1;
-            }
-            int pair_lo_1 = (int)tile_begin_1 * 65536 + lo_off_1;
-            int pair_hi_1 = ((int)tile_end_1 - 1) * 65536 + hi_off_1;
+            int pair_lo_1 = smem_la[0];
+            int pair_hi_1 = smem_la[1];
+            unsigned int tile_begin_1 = (unsigned int)smem_la[2];
+            unsigned int tile_end_1 = (unsigned int)smem_la[3];
             unsigned int _phase_corr_scale_0 = 0;
             unsigned int _phase_corr_scale_1 = 0;
             unsigned int _phase_o_ready_0_0 = 0;
@@ -1225,32 +1147,32 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                 if (cta_n_blocks_1_1 < 4) {
                     cta_n_blocks_1_1 = 4;
                 }
-                int up_len_5 = causal_seqlens_kv_global[ordered_1];
-                if (up_len_5 < 0) {
-                    up_len_5 = 0;
+                int up_len_2 = causal_seqlens_kv_global[ordered_1];
+                if (up_len_2 < 0) {
+                    up_len_2 = 0;
                 }
-                if (up_len_5 > max_local_seq_len) {
-                    up_len_5 = max_local_seq_len;
+                if (up_len_2 > max_local_seq_len) {
+                    up_len_2 = max_local_seq_len;
                 }
-                int up_pairs_5 = ((up_len_5 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_5 < 2) {
-                    up_pairs_5 = 2;
+                int up_pairs_2 = ((up_len_2 + 128 - 1) / 128 + 1) / 2;
+                if (up_pairs_2 < 2) {
+                    up_pairs_2 = 2;
                 }
-                if (up_pairs_5 > cta_n_blocks_1_1 / 2) {
-                    up_pairs_5 = cta_n_blocks_1_1 / 2;
+                if (up_pairs_2 > cta_n_blocks_1_1 / 2) {
+                    up_pairs_2 = cta_n_blocks_1_1 / 2;
                 }
                 int la_lo_1 = 0;
                 if ((int)ordered_1 == pair_lo_1 >> 16) {
                     la_lo_1 = pair_lo_1 & 65535;
                 }
-                int la_hi_1 = up_pairs_5;
+                int la_hi_1 = up_pairs_2;
                 if ((int)ordered_1 == pair_hi_1 >> 16) {
                     la_hi_1 = pair_hi_1 & 65535;
                 }
                 int part_lo_1 = la_lo_1;
                 int part_blocks_1 = 2 * (la_hi_1 - la_lo_1);
                 int split_1 = 0;
-                if (la_lo_1 > 0 || la_hi_1 < up_pairs_5) {
+                if (la_lo_1 > 0 || la_hi_1 < up_pairs_2) {
                     split_1 = 1;
                 }
                 if (part_blocks_1 / 2 > 0) {
@@ -1544,154 +1466,10 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
             if (cta_n_blocks_3 < 4) {
                 cta_n_blocks_3 = 4;
             }
-            int sk_full_2 = cta_n_blocks_3 / 2;
-            unsigned int la_groups_2 = (unsigned int)(gridDim.x / 4);
-            unsigned int la_group_lo_2 = (unsigned int)(blockIdx.x / 4);
-            if (la_group_lo_2 > la_groups_2) {
-                la_group_lo_2 = la_groups_2;
-            }
-            unsigned int la_group_hi_2 = la_group_lo_2 + 1;
-            if (la_group_hi_2 > la_groups_2) {
-                la_group_hi_2 = la_groups_2;
-            }
-            unsigned int sk_total_2 = 0;
-            #pragma unroll 8
-            for (int sk_b1_2 = 0; sk_b1_2 < BATCH_SIZE; sk_b1_2++) {
-                int up_len_6 = causal_seqlens_kv_global[sk_b1_2];
-                if (up_len_6 < 0) {
-                    up_len_6 = 0;
-                }
-                if (up_len_6 > max_local_seq_len) {
-                    up_len_6 = max_local_seq_len;
-                }
-                int up_pairs_6 = ((up_len_6 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_6 < 2) {
-                    up_pairs_6 = 2;
-                }
-                if (up_pairs_6 > sk_full_2) {
-                    up_pairs_6 = sk_full_2;
-                }
-                sk_total_2 = sk_total_2 + (unsigned int)up_pairs_6;
-            }
-            unsigned int la_group_prev_2 = 0;
-            if (la_group_lo_2 > 0) {
-                la_group_prev_2 = la_group_lo_2 - 1;
-            }
-            unsigned int raw_p_2 = (unsigned int)((unsigned long long)la_group_prev_2 * (unsigned long long)sk_total_2 / (unsigned long long)la_groups_2);
-            unsigned int raw_l_2 = (unsigned int)((unsigned long long)la_group_lo_2 * (unsigned long long)sk_total_2 / (unsigned long long)la_groups_2);
-            unsigned int raw_h_2 = (unsigned int)((unsigned long long)la_group_hi_2 * (unsigned long long)sk_total_2 / (unsigned long long)la_groups_2);
-            unsigned int p2_first_2 = 0;
-            unsigned int p2_prev_2 = 0;
-            int unit_p_2 = -1;
-            unsigned int first_p_2 = 0;
-            unsigned int pairs_p_2 = 0;
-            int unit_l_2 = -1;
-            unsigned int first_l_2 = 0;
-            unsigned int pairs_l_2 = 0;
-            int unit_h_2 = -1;
-            unsigned int first_h_2 = 0;
-            unsigned int pairs_h_2 = 0;
-            unsigned int pairs_hb_2 = 0;
-            #pragma unroll 8
-            for (int sk_b2_2 = 0; sk_b2_2 < BATCH_SIZE; sk_b2_2++) {
-                int up_len_7 = causal_seqlens_kv_global[sk_b2_2];
-                if (up_len_7 < 0) {
-                    up_len_7 = 0;
-                }
-                if (up_len_7 > max_local_seq_len) {
-                    up_len_7 = max_local_seq_len;
-                }
-                int up_pairs_7 = ((up_len_7 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_7 < 2) {
-                    up_pairs_7 = 2;
-                }
-                if (up_pairs_7 > sk_full_2) {
-                    up_pairs_7 = sk_full_2;
-                }
-                unsigned int p2_end_2 = p2_first_2 + (unsigned int)up_pairs_7;
-                if (raw_p_2 >= p2_first_2 && raw_p_2 < p2_end_2) {
-                    unit_p_2 = (int)sk_b2_2;
-                    first_p_2 = p2_first_2;
-                    pairs_p_2 = (unsigned int)up_pairs_7;
-                }
-                if (raw_l_2 >= p2_first_2 && raw_l_2 < p2_end_2) {
-                    unit_l_2 = (int)sk_b2_2;
-                    first_l_2 = p2_first_2;
-                    pairs_l_2 = (unsigned int)up_pairs_7;
-                }
-                if (raw_h_2 >= p2_first_2 && raw_h_2 < p2_end_2) {
-                    unit_h_2 = (int)sk_b2_2;
-                    first_h_2 = p2_first_2;
-                    pairs_h_2 = (unsigned int)up_pairs_7;
-                    pairs_hb_2 = p2_prev_2;
-                }
-                p2_prev_2 = (unsigned int)up_pairs_7;
-                p2_first_2 = p2_end_2;
-            }
-            unsigned int cut_p_2 = sk_total_2;
-            if (unit_p_2 >= 0) {
-                int sn_off_6 = (int)(raw_p_2 - first_p_2);
-                int sn_even_6 = sn_off_6 - sn_off_6 % 2;
-                if (sn_even_6 == (int)pairs_p_2 - 1) {
-                    sn_even_6 = (int)pairs_p_2 - 3;
-                }
-                cut_p_2 = first_p_2 + (unsigned int)sn_even_6;
-            }
-            unsigned int cut_l_2 = sk_total_2;
-            if (unit_l_2 >= 0) {
-                int sn_off_7 = (int)(raw_l_2 - first_l_2);
-                int sn_even_7 = sn_off_7 - sn_off_7 % 2;
-                if (sn_even_7 == (int)pairs_l_2 - 1) {
-                    sn_even_7 = (int)pairs_l_2 - 3;
-                }
-                cut_l_2 = first_l_2 + (unsigned int)sn_even_7;
-            }
-            unsigned int cut_h_2 = sk_total_2;
-            if (unit_h_2 >= 0) {
-                int sn_off_8 = (int)(raw_h_2 - first_h_2);
-                int sn_even_8 = sn_off_8 - sn_off_8 % 2;
-                if (sn_even_8 == (int)pairs_h_2 - 1) {
-                    sn_even_8 = (int)pairs_h_2 - 3;
-                }
-                cut_h_2 = first_h_2 + (unsigned int)sn_even_8;
-            }
-            unsigned int pair_lo_f_2 = cut_l_2;
-            int moved_l_2 = 0;
-            if (la_group_lo_2 > 0 && unit_l_2 >= 0 && unit_p_2 == unit_l_2 && cut_p_2 > first_l_2) {
-                pair_lo_f_2 = first_l_2 + pairs_l_2;
-                moved_l_2 = 1;
-            }
-            unsigned int pair_hi_f_2 = cut_h_2;
-            int moved_h_2 = 0;
-            if (la_group_hi_2 > 0 && unit_h_2 >= 0 && unit_l_2 == unit_h_2 && cut_l_2 > first_h_2) {
-                pair_hi_f_2 = first_h_2 + pairs_h_2;
-                moved_h_2 = 1;
-            }
-            unsigned int tile_begin_2 = (unsigned int)BATCH_SIZE;
-            int lo_off_2 = 0;
-            if (unit_l_2 >= 0) {
-                tile_begin_2 = (unsigned int)unit_l_2;
-                lo_off_2 = (int)(pair_lo_f_2 - first_l_2);
-                if (moved_l_2 != 0) {
-                    tile_begin_2 = (unsigned int)unit_l_2 + 1;
-                    lo_off_2 = 0;
-                }
-            }
-            unsigned int tile_end_2 = (unsigned int)BATCH_SIZE;
-            int hi_off_2 = (int)p2_prev_2;
-            if (unit_h_2 >= 0) {
-                tile_end_2 = (unsigned int)unit_h_2 + 1;
-                hi_off_2 = (int)(pair_hi_f_2 - first_h_2);
-                if (moved_h_2 == 0 && pair_hi_f_2 == first_h_2) {
-                    tile_end_2 = (unsigned int)unit_h_2;
-                    hi_off_2 = (int)pairs_hb_2;
-                }
-            }
-            if (pair_hi_f_2 <= pair_lo_f_2) {
-                tile_end_2 = tile_begin_2;
-            }
-            int pair_lo_2 = (int)tile_begin_2 * 65536 + lo_off_2;
-            int pair_hi_2 = ((int)tile_end_2 - 1) * 65536 + hi_off_2;
+            int pair_lo_2 = smem_la[0];
+            int pair_hi_2 = smem_la[1];
+            unsigned int tile_begin_2 = (unsigned int)smem_la[2];
+            unsigned int tile_end_2 = (unsigned int)smem_la[3];
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_o_empty_0_0 = 1;
             unsigned int _phase_p_full_0_0 = 0;
@@ -1721,32 +1499,32 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                 if (cta_n_blocks_1_2 < 4) {
                     cta_n_blocks_1_2 = 4;
                 }
-                int up_len_8 = causal_seqlens_kv_global[ordered_2];
-                if (up_len_8 < 0) {
-                    up_len_8 = 0;
+                int up_len_3 = causal_seqlens_kv_global[ordered_2];
+                if (up_len_3 < 0) {
+                    up_len_3 = 0;
                 }
-                if (up_len_8 > max_local_seq_len) {
-                    up_len_8 = max_local_seq_len;
+                if (up_len_3 > max_local_seq_len) {
+                    up_len_3 = max_local_seq_len;
                 }
-                int up_pairs_8 = ((up_len_8 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_8 < 2) {
-                    up_pairs_8 = 2;
+                int up_pairs_3 = ((up_len_3 + 128 - 1) / 128 + 1) / 2;
+                if (up_pairs_3 < 2) {
+                    up_pairs_3 = 2;
                 }
-                if (up_pairs_8 > cta_n_blocks_1_2 / 2) {
-                    up_pairs_8 = cta_n_blocks_1_2 / 2;
+                if (up_pairs_3 > cta_n_blocks_1_2 / 2) {
+                    up_pairs_3 = cta_n_blocks_1_2 / 2;
                 }
                 int la_lo_2 = 0;
                 if ((int)ordered_2 == pair_lo_2 >> 16) {
                     la_lo_2 = pair_lo_2 & 65535;
                 }
-                int la_hi_2 = up_pairs_8;
+                int la_hi_2 = up_pairs_3;
                 if ((int)ordered_2 == pair_hi_2 >> 16) {
                     la_hi_2 = pair_hi_2 & 65535;
                 }
                 int part_lo_2 = la_lo_2;
                 int part_blocks_2 = 2 * (la_hi_2 - la_lo_2);
                 int split_2 = 0;
-                if (la_lo_2 > 0 || la_hi_2 < up_pairs_8) {
+                if (la_lo_2 > 0 || la_hi_2 < up_pairs_3) {
                     split_2 = 1;
                 }
                 int kv_trip = 0;
@@ -2228,154 +2006,10 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
             if (cta_n_blocks_4 < 4) {
                 cta_n_blocks_4 = 4;
             }
-            int sk_full_3 = cta_n_blocks_4 / 2;
-            unsigned int la_groups_3 = (unsigned int)(gridDim.x / 4);
-            unsigned int la_group_lo_3 = (unsigned int)(blockIdx.x / 4);
-            if (la_group_lo_3 > la_groups_3) {
-                la_group_lo_3 = la_groups_3;
-            }
-            unsigned int la_group_hi_3 = la_group_lo_3 + 1;
-            if (la_group_hi_3 > la_groups_3) {
-                la_group_hi_3 = la_groups_3;
-            }
-            unsigned int sk_total_3 = 0;
-            #pragma unroll 8
-            for (int sk_b1_3 = 0; sk_b1_3 < BATCH_SIZE; sk_b1_3++) {
-                int up_len_9 = causal_seqlens_kv_global[sk_b1_3];
-                if (up_len_9 < 0) {
-                    up_len_9 = 0;
-                }
-                if (up_len_9 > max_local_seq_len) {
-                    up_len_9 = max_local_seq_len;
-                }
-                int up_pairs_9 = ((up_len_9 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_9 < 2) {
-                    up_pairs_9 = 2;
-                }
-                if (up_pairs_9 > sk_full_3) {
-                    up_pairs_9 = sk_full_3;
-                }
-                sk_total_3 = sk_total_3 + (unsigned int)up_pairs_9;
-            }
-            unsigned int la_group_prev_3 = 0;
-            if (la_group_lo_3 > 0) {
-                la_group_prev_3 = la_group_lo_3 - 1;
-            }
-            unsigned int raw_p_3 = (unsigned int)((unsigned long long)la_group_prev_3 * (unsigned long long)sk_total_3 / (unsigned long long)la_groups_3);
-            unsigned int raw_l_3 = (unsigned int)((unsigned long long)la_group_lo_3 * (unsigned long long)sk_total_3 / (unsigned long long)la_groups_3);
-            unsigned int raw_h_3 = (unsigned int)((unsigned long long)la_group_hi_3 * (unsigned long long)sk_total_3 / (unsigned long long)la_groups_3);
-            unsigned int p2_first_3 = 0;
-            unsigned int p2_prev_3 = 0;
-            int unit_p_3 = -1;
-            unsigned int first_p_3 = 0;
-            unsigned int pairs_p_3 = 0;
-            int unit_l_3 = -1;
-            unsigned int first_l_3 = 0;
-            unsigned int pairs_l_3 = 0;
-            int unit_h_3 = -1;
-            unsigned int first_h_3 = 0;
-            unsigned int pairs_h_3 = 0;
-            unsigned int pairs_hb_3 = 0;
-            #pragma unroll 8
-            for (int sk_b2_3 = 0; sk_b2_3 < BATCH_SIZE; sk_b2_3++) {
-                int up_len_10 = causal_seqlens_kv_global[sk_b2_3];
-                if (up_len_10 < 0) {
-                    up_len_10 = 0;
-                }
-                if (up_len_10 > max_local_seq_len) {
-                    up_len_10 = max_local_seq_len;
-                }
-                int up_pairs_10 = ((up_len_10 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_10 < 2) {
-                    up_pairs_10 = 2;
-                }
-                if (up_pairs_10 > sk_full_3) {
-                    up_pairs_10 = sk_full_3;
-                }
-                unsigned int p2_end_3 = p2_first_3 + (unsigned int)up_pairs_10;
-                if (raw_p_3 >= p2_first_3 && raw_p_3 < p2_end_3) {
-                    unit_p_3 = (int)sk_b2_3;
-                    first_p_3 = p2_first_3;
-                    pairs_p_3 = (unsigned int)up_pairs_10;
-                }
-                if (raw_l_3 >= p2_first_3 && raw_l_3 < p2_end_3) {
-                    unit_l_3 = (int)sk_b2_3;
-                    first_l_3 = p2_first_3;
-                    pairs_l_3 = (unsigned int)up_pairs_10;
-                }
-                if (raw_h_3 >= p2_first_3 && raw_h_3 < p2_end_3) {
-                    unit_h_3 = (int)sk_b2_3;
-                    first_h_3 = p2_first_3;
-                    pairs_h_3 = (unsigned int)up_pairs_10;
-                    pairs_hb_3 = p2_prev_3;
-                }
-                p2_prev_3 = (unsigned int)up_pairs_10;
-                p2_first_3 = p2_end_3;
-            }
-            unsigned int cut_p_3 = sk_total_3;
-            if (unit_p_3 >= 0) {
-                int sn_off_9 = (int)(raw_p_3 - first_p_3);
-                int sn_even_9 = sn_off_9 - sn_off_9 % 2;
-                if (sn_even_9 == (int)pairs_p_3 - 1) {
-                    sn_even_9 = (int)pairs_p_3 - 3;
-                }
-                cut_p_3 = first_p_3 + (unsigned int)sn_even_9;
-            }
-            unsigned int cut_l_3 = sk_total_3;
-            if (unit_l_3 >= 0) {
-                int sn_off_10 = (int)(raw_l_3 - first_l_3);
-                int sn_even_10 = sn_off_10 - sn_off_10 % 2;
-                if (sn_even_10 == (int)pairs_l_3 - 1) {
-                    sn_even_10 = (int)pairs_l_3 - 3;
-                }
-                cut_l_3 = first_l_3 + (unsigned int)sn_even_10;
-            }
-            unsigned int cut_h_3 = sk_total_3;
-            if (unit_h_3 >= 0) {
-                int sn_off_11 = (int)(raw_h_3 - first_h_3);
-                int sn_even_11 = sn_off_11 - sn_off_11 % 2;
-                if (sn_even_11 == (int)pairs_h_3 - 1) {
-                    sn_even_11 = (int)pairs_h_3 - 3;
-                }
-                cut_h_3 = first_h_3 + (unsigned int)sn_even_11;
-            }
-            unsigned int pair_lo_f_3 = cut_l_3;
-            int moved_l_3 = 0;
-            if (la_group_lo_3 > 0 && unit_l_3 >= 0 && unit_p_3 == unit_l_3 && cut_p_3 > first_l_3) {
-                pair_lo_f_3 = first_l_3 + pairs_l_3;
-                moved_l_3 = 1;
-            }
-            unsigned int pair_hi_f_3 = cut_h_3;
-            int moved_h_3 = 0;
-            if (la_group_hi_3 > 0 && unit_h_3 >= 0 && unit_l_3 == unit_h_3 && cut_l_3 > first_h_3) {
-                pair_hi_f_3 = first_h_3 + pairs_h_3;
-                moved_h_3 = 1;
-            }
-            unsigned int tile_begin_3 = (unsigned int)BATCH_SIZE;
-            int lo_off_3 = 0;
-            if (unit_l_3 >= 0) {
-                tile_begin_3 = (unsigned int)unit_l_3;
-                lo_off_3 = (int)(pair_lo_f_3 - first_l_3);
-                if (moved_l_3 != 0) {
-                    tile_begin_3 = (unsigned int)unit_l_3 + 1;
-                    lo_off_3 = 0;
-                }
-            }
-            unsigned int tile_end_3 = (unsigned int)BATCH_SIZE;
-            int hi_off_3 = (int)p2_prev_3;
-            if (unit_h_3 >= 0) {
-                tile_end_3 = (unsigned int)unit_h_3 + 1;
-                hi_off_3 = (int)(pair_hi_f_3 - first_h_3);
-                if (moved_h_3 == 0 && pair_hi_f_3 == first_h_3) {
-                    tile_end_3 = (unsigned int)unit_h_3;
-                    hi_off_3 = (int)pairs_hb_3;
-                }
-            }
-            if (pair_hi_f_3 <= pair_lo_f_3) {
-                tile_end_3 = tile_begin_3;
-            }
-            int pair_lo_3 = (int)tile_begin_3 * 65536 + lo_off_3;
-            int pair_hi_3 = ((int)tile_end_3 - 1) * 65536 + hi_off_3;
+            int pair_lo_3 = smem_la[0];
+            int pair_hi_3 = smem_la[1];
+            unsigned int tile_begin_3 = (unsigned int)smem_la[2];
+            unsigned int tile_end_3 = (unsigned int)smem_la[3];
             #pragma unroll 1
             for (unsigned int tile_idx_la = tile_begin_3; tile_idx_la < tile_end_3; tile_idx_la++) {
                 unsigned int ordered_3 = tile_idx_la - 1;
@@ -2400,32 +2034,32 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                 if (cta_n_blocks_1_3 < 4) {
                     cta_n_blocks_1_3 = 4;
                 }
-                int up_len_11 = causal_seqlens_kv_global[ordered_3];
-                if (up_len_11 < 0) {
-                    up_len_11 = 0;
+                int up_len_4 = causal_seqlens_kv_global[ordered_3];
+                if (up_len_4 < 0) {
+                    up_len_4 = 0;
                 }
-                if (up_len_11 > max_local_seq_len) {
-                    up_len_11 = max_local_seq_len;
+                if (up_len_4 > max_local_seq_len) {
+                    up_len_4 = max_local_seq_len;
                 }
-                int up_pairs_11 = ((up_len_11 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_11 < 2) {
-                    up_pairs_11 = 2;
+                int up_pairs_4 = ((up_len_4 + 128 - 1) / 128 + 1) / 2;
+                if (up_pairs_4 < 2) {
+                    up_pairs_4 = 2;
                 }
-                if (up_pairs_11 > cta_n_blocks_1_3 / 2) {
-                    up_pairs_11 = cta_n_blocks_1_3 / 2;
+                if (up_pairs_4 > cta_n_blocks_1_3 / 2) {
+                    up_pairs_4 = cta_n_blocks_1_3 / 2;
                 }
                 int la_lo_3 = 0;
                 if ((int)ordered_3 == pair_lo_3 >> 16) {
                     la_lo_3 = pair_lo_3 & 65535;
                 }
-                int la_hi_3 = up_pairs_11;
+                int la_hi_3 = up_pairs_4;
                 if ((int)ordered_3 == pair_hi_3 >> 16) {
                     la_hi_3 = pair_hi_3 & 65535;
                 }
                 int part_lo_3 = la_lo_3;
                 int part_blocks_3 = 2 * (la_hi_3 - la_lo_3);
                 int split_3 = 0;
-                if (la_lo_3 > 0 || la_hi_3 < up_pairs_11) {
+                if (la_lo_3 > 0 || la_hi_3 < up_pairs_4) {
                     split_3 = 1;
                 }
                 int split_start_block_la = 2 * part_lo_3;
@@ -2451,6 +2085,13 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                             pg_k_la[0 + 1] = _ivld_0.y;
                             pg_k_la[0 + 2] = _ivld_0.z;
                             pg_k_la[0 + 3] = _ivld_0.w;
+                        }
+                        int kkeys_left = visible_local_keys_3 - pg_base_la * 16;
+                        #pragma unroll
+                        for (int kj = 0; kj < 4; kj++) {
+                            if (kj * 16 >= kkeys_left) {
+                                pg_k_la[kj] = 1073741824;
+                            }
                         }
                         mbarrier_wait(kv_empty_addr + (kv_stage_la) * 8, _phase_kv_empty);
                         mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_la) * 8, 16384);
@@ -2526,6 +2167,13 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                             pg_nk_la[0 + 1] = _ivld_2.y;
                             pg_nk_la[0 + 2] = _ivld_2.z;
                             pg_nk_la[0 + 3] = _ivld_2.w;
+                        }
+                        int kkeys_left_1 = visible_local_keys_3 - npg_base_la * 16;
+                        #pragma unroll
+                        for (int kj_1 = 0; kj_1 < 4; kj_1++) {
+                            if (kj_1 * 16 >= kkeys_left_1) {
+                                pg_nk_la[kj_1] = 1073741824;
+                            }
                         }
 #if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty = (int)((unsigned int)ni_la_1 % 6);
@@ -2664,154 +2312,10 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
             if (cta_n_blocks_5 < 4) {
                 cta_n_blocks_5 = 4;
             }
-            int sk_full_4 = cta_n_blocks_5 / 2;
-            unsigned int la_groups_4 = (unsigned int)(gridDim.x / 4);
-            unsigned int la_group_lo_4 = (unsigned int)(blockIdx.x / 4);
-            if (la_group_lo_4 > la_groups_4) {
-                la_group_lo_4 = la_groups_4;
-            }
-            unsigned int la_group_hi_4 = la_group_lo_4 + 1;
-            if (la_group_hi_4 > la_groups_4) {
-                la_group_hi_4 = la_groups_4;
-            }
-            unsigned int sk_total_4 = 0;
-            #pragma unroll 8
-            for (int sk_b1_4 = 0; sk_b1_4 < BATCH_SIZE; sk_b1_4++) {
-                int up_len_12 = causal_seqlens_kv_global[sk_b1_4];
-                if (up_len_12 < 0) {
-                    up_len_12 = 0;
-                }
-                if (up_len_12 > max_local_seq_len) {
-                    up_len_12 = max_local_seq_len;
-                }
-                int up_pairs_12 = ((up_len_12 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_12 < 2) {
-                    up_pairs_12 = 2;
-                }
-                if (up_pairs_12 > sk_full_4) {
-                    up_pairs_12 = sk_full_4;
-                }
-                sk_total_4 = sk_total_4 + (unsigned int)up_pairs_12;
-            }
-            unsigned int la_group_prev_4 = 0;
-            if (la_group_lo_4 > 0) {
-                la_group_prev_4 = la_group_lo_4 - 1;
-            }
-            unsigned int raw_p_4 = (unsigned int)((unsigned long long)la_group_prev_4 * (unsigned long long)sk_total_4 / (unsigned long long)la_groups_4);
-            unsigned int raw_l_4 = (unsigned int)((unsigned long long)la_group_lo_4 * (unsigned long long)sk_total_4 / (unsigned long long)la_groups_4);
-            unsigned int raw_h_4 = (unsigned int)((unsigned long long)la_group_hi_4 * (unsigned long long)sk_total_4 / (unsigned long long)la_groups_4);
-            unsigned int p2_first_4 = 0;
-            unsigned int p2_prev_4 = 0;
-            int unit_p_4 = -1;
-            unsigned int first_p_4 = 0;
-            unsigned int pairs_p_4 = 0;
-            int unit_l_4 = -1;
-            unsigned int first_l_4 = 0;
-            unsigned int pairs_l_4 = 0;
-            int unit_h_4 = -1;
-            unsigned int first_h_4 = 0;
-            unsigned int pairs_h_4 = 0;
-            unsigned int pairs_hb_4 = 0;
-            #pragma unroll 8
-            for (int sk_b2_4 = 0; sk_b2_4 < BATCH_SIZE; sk_b2_4++) {
-                int up_len_13 = causal_seqlens_kv_global[sk_b2_4];
-                if (up_len_13 < 0) {
-                    up_len_13 = 0;
-                }
-                if (up_len_13 > max_local_seq_len) {
-                    up_len_13 = max_local_seq_len;
-                }
-                int up_pairs_13 = ((up_len_13 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_13 < 2) {
-                    up_pairs_13 = 2;
-                }
-                if (up_pairs_13 > sk_full_4) {
-                    up_pairs_13 = sk_full_4;
-                }
-                unsigned int p2_end_4 = p2_first_4 + (unsigned int)up_pairs_13;
-                if (raw_p_4 >= p2_first_4 && raw_p_4 < p2_end_4) {
-                    unit_p_4 = (int)sk_b2_4;
-                    first_p_4 = p2_first_4;
-                    pairs_p_4 = (unsigned int)up_pairs_13;
-                }
-                if (raw_l_4 >= p2_first_4 && raw_l_4 < p2_end_4) {
-                    unit_l_4 = (int)sk_b2_4;
-                    first_l_4 = p2_first_4;
-                    pairs_l_4 = (unsigned int)up_pairs_13;
-                }
-                if (raw_h_4 >= p2_first_4 && raw_h_4 < p2_end_4) {
-                    unit_h_4 = (int)sk_b2_4;
-                    first_h_4 = p2_first_4;
-                    pairs_h_4 = (unsigned int)up_pairs_13;
-                    pairs_hb_4 = p2_prev_4;
-                }
-                p2_prev_4 = (unsigned int)up_pairs_13;
-                p2_first_4 = p2_end_4;
-            }
-            unsigned int cut_p_4 = sk_total_4;
-            if (unit_p_4 >= 0) {
-                int sn_off_12 = (int)(raw_p_4 - first_p_4);
-                int sn_even_12 = sn_off_12 - sn_off_12 % 2;
-                if (sn_even_12 == (int)pairs_p_4 - 1) {
-                    sn_even_12 = (int)pairs_p_4 - 3;
-                }
-                cut_p_4 = first_p_4 + (unsigned int)sn_even_12;
-            }
-            unsigned int cut_l_4 = sk_total_4;
-            if (unit_l_4 >= 0) {
-                int sn_off_13 = (int)(raw_l_4 - first_l_4);
-                int sn_even_13 = sn_off_13 - sn_off_13 % 2;
-                if (sn_even_13 == (int)pairs_l_4 - 1) {
-                    sn_even_13 = (int)pairs_l_4 - 3;
-                }
-                cut_l_4 = first_l_4 + (unsigned int)sn_even_13;
-            }
-            unsigned int cut_h_4 = sk_total_4;
-            if (unit_h_4 >= 0) {
-                int sn_off_14 = (int)(raw_h_4 - first_h_4);
-                int sn_even_14 = sn_off_14 - sn_off_14 % 2;
-                if (sn_even_14 == (int)pairs_h_4 - 1) {
-                    sn_even_14 = (int)pairs_h_4 - 3;
-                }
-                cut_h_4 = first_h_4 + (unsigned int)sn_even_14;
-            }
-            unsigned int pair_lo_f_4 = cut_l_4;
-            int moved_l_4 = 0;
-            if (la_group_lo_4 > 0 && unit_l_4 >= 0 && unit_p_4 == unit_l_4 && cut_p_4 > first_l_4) {
-                pair_lo_f_4 = first_l_4 + pairs_l_4;
-                moved_l_4 = 1;
-            }
-            unsigned int pair_hi_f_4 = cut_h_4;
-            int moved_h_4 = 0;
-            if (la_group_hi_4 > 0 && unit_h_4 >= 0 && unit_l_4 == unit_h_4 && cut_l_4 > first_h_4) {
-                pair_hi_f_4 = first_h_4 + pairs_h_4;
-                moved_h_4 = 1;
-            }
-            unsigned int tile_begin_4 = (unsigned int)BATCH_SIZE;
-            int lo_off_4 = 0;
-            if (unit_l_4 >= 0) {
-                tile_begin_4 = (unsigned int)unit_l_4;
-                lo_off_4 = (int)(pair_lo_f_4 - first_l_4);
-                if (moved_l_4 != 0) {
-                    tile_begin_4 = (unsigned int)unit_l_4 + 1;
-                    lo_off_4 = 0;
-                }
-            }
-            unsigned int tile_end_4 = (unsigned int)BATCH_SIZE;
-            int hi_off_4 = (int)p2_prev_4;
-            if (unit_h_4 >= 0) {
-                tile_end_4 = (unsigned int)unit_h_4 + 1;
-                hi_off_4 = (int)(pair_hi_f_4 - first_h_4);
-                if (moved_h_4 == 0 && pair_hi_f_4 == first_h_4) {
-                    tile_end_4 = (unsigned int)unit_h_4;
-                    hi_off_4 = (int)pairs_hb_4;
-                }
-            }
-            if (pair_hi_f_4 <= pair_lo_f_4) {
-                tile_end_4 = tile_begin_4;
-            }
-            int pair_lo_4 = (int)tile_begin_4 * 65536 + lo_off_4;
-            int pair_hi_4 = ((int)tile_end_4 - 1) * 65536 + hi_off_4;
+            int pair_lo_4 = smem_la[0];
+            int pair_hi_4 = smem_la[1];
+            unsigned int tile_begin_4 = (unsigned int)smem_la[2];
+            unsigned int tile_end_4 = (unsigned int)smem_la[3];
             unsigned int _phase_q_empty_0 = 1;
             #pragma unroll 1
             for (unsigned int tile_idx_l = tile_begin_4; tile_idx_l < tile_end_4; tile_idx_l++) {
@@ -2837,32 +2341,32 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                 if (cta_n_blocks_1_4 < 4) {
                     cta_n_blocks_1_4 = 4;
                 }
-                int up_len_14 = causal_seqlens_kv_global[ordered_4];
-                if (up_len_14 < 0) {
-                    up_len_14 = 0;
+                int up_len_5 = causal_seqlens_kv_global[ordered_4];
+                if (up_len_5 < 0) {
+                    up_len_5 = 0;
                 }
-                if (up_len_14 > max_local_seq_len) {
-                    up_len_14 = max_local_seq_len;
+                if (up_len_5 > max_local_seq_len) {
+                    up_len_5 = max_local_seq_len;
                 }
-                int up_pairs_14 = ((up_len_14 + 128 - 1) / 128 + 1) / 2;
-                if (up_pairs_14 < 2) {
-                    up_pairs_14 = 2;
+                int up_pairs_5 = ((up_len_5 + 128 - 1) / 128 + 1) / 2;
+                if (up_pairs_5 < 2) {
+                    up_pairs_5 = 2;
                 }
-                if (up_pairs_14 > cta_n_blocks_1_4 / 2) {
-                    up_pairs_14 = cta_n_blocks_1_4 / 2;
+                if (up_pairs_5 > cta_n_blocks_1_4 / 2) {
+                    up_pairs_5 = cta_n_blocks_1_4 / 2;
                 }
                 int la_lo_4 = 0;
                 if ((int)ordered_4 == pair_lo_4 >> 16) {
                     la_lo_4 = pair_lo_4 & 65535;
                 }
-                int la_hi_4 = up_pairs_14;
+                int la_hi_4 = up_pairs_5;
                 if ((int)ordered_4 == pair_hi_4 >> 16) {
                     la_hi_4 = pair_hi_4 & 65535;
                 }
                 int part_lo_4 = la_lo_4;
                 int part_blocks_4 = 2 * (la_hi_4 - la_lo_4);
                 int split_4 = 0;
-                if (la_lo_4 > 0 || la_hi_4 < up_pairs_14) {
+                if (la_lo_4 > 0 || la_hi_4 < up_pairs_5) {
                     split_4 = 1;
                 }
                 int split_start_block_1 = 2 * part_lo_4;
@@ -2894,6 +2398,13 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                             pg_k[0 + 1] = _ivld_0.y;
                             pg_k[0 + 2] = _ivld_0.z;
                             pg_k[0 + 3] = _ivld_0.w;
+                        }
+                        int kkeys_left_2 = visible_local_keys_4 - (pg_base + 4) * 16;
+                        #pragma unroll
+                        for (int kj_2 = 0; kj_2 < 4; kj_2++) {
+                            if (kj_2 * 16 >= kkeys_left_2) {
+                                pg_k[kj_2] = 1073741824;
+                            }
                         }
                         mbarrier_wait(kv_empty_addr + (kv_stage) * 8, _phase_kv_empty_1);
                         mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage) * 8, 16384);
@@ -2970,6 +2481,13 @@ kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83(const __grid_constant__ CUtens
                             pg_nk[0 + 1] = _ivld_2.y;
                             pg_nk[0 + 2] = _ivld_2.z;
                             pg_nk[0 + 3] = _ivld_2.w;
+                        }
+                        int kkeys_left_3 = visible_local_keys_4 - (npg_base + 4) * 16;
+                        #pragma unroll
+                        for (int kj_3 = 0; kj_3 < 4; kj_3++) {
+                            if (kj_3 * 16 >= kkeys_left_3) {
+                                pg_nk[kj_3] = 1073741824;
+                            }
                         }
 #if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_3 = (int)((unsigned int)ni_1 % 6);
