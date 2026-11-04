@@ -17,12 +17,13 @@ from tests.test_helpers import jit_utils
 
 
 @pytest.fixture(autouse=True)
-def _clear_job_cap_cache():
-    # _memory_aware_job_cap is @functools.cache'd; clear it so each test's
-    # monkeypatched memory/cpu values are recomputed.
-    cpp_ext._memory_aware_job_cap.cache_clear()
+def _job_cap_test_env(monkeypatch):
+    # The cap warning is logged once per distinct cap; clear that record, and
+    # keep the host's cgroup CPU quota out of the CPU-count tests.
+    cpp_ext._warn_job_cap.cache_clear()
+    monkeypatch.setattr(cpp_ext, "_cgroup_cpu_quota", lambda: None)
     yield
-    cpp_ext._memory_aware_job_cap.cache_clear()
+    cpp_ext._warn_job_cap.cache_clear()
 
 
 def _set_cpu_count(monkeypatch, n):
@@ -667,7 +668,6 @@ def test_get_num_workers_low_core_matches_ninja_guess(monkeypatch):
     monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 24)
     assert cpp_ext._get_num_workers() is None
     # 16 GiB / 8 == 2 < 3 -> cap to 2.
-    cpp_ext._memory_aware_job_cap.cache_clear()
     monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 16)
     assert cpp_ext._get_num_workers() == 2
 
@@ -693,3 +693,116 @@ def test_get_num_workers_falls_back_to_cpu_count(monkeypatch):
     monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 2)
     monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 16)
     assert cpp_ext._get_num_workers() == 2
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_follows_memory_between_compiles(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # A server's first JIT build can run before weights and the KV pool take
+    # memory (on unified-memory systems, system RAM). Later builds must see
+    # the memory that is left.
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 999)
+    assert cpp_ext._get_num_workers() is None
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 4
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_never_exceeds_ninja_default_under_cpu_quota(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # A pod limited to 4 CPUs on a 64-CPU host: ninja's default is 4 + 2 = 6.
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_cgroup_cpu_quota", lambda: 4)
+    # 128 GiB / 8 == 16 >= 6: keep ninja's default rather than raise it to 16.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 128)
+    assert cpp_ext._get_num_workers() is None
+    # 32 GiB / 8 == 4 < 6: cap to 4.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 4
+
+
+@pytest.mark.cpu_only
+def test_available_memory_uses_cgroup_limit(monkeypatch):
+    # Inside a container /proc/meminfo reports host memory; the cgroup limit's
+    # headroom is what an OOM kill enforces.
+    monkeypatch.setattr(cpp_ext, "_cgroup_available_memory_bytes", lambda: 16 << 30)
+    assert cpp_ext._read_mem_available_gb() <= 16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        ({"cpu.max": "400000 100000\n"}, 4),
+        ({"cpu.max": "50000 100000\n"}, 0),
+        ({"cpu.max": "max 100000\n"}, None),
+        ({"cpu.max": "0 100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "200000\n", "cpu/cpu.cfs_period_us": "100000\n"}, 2),
+        ({"cpu/cpu.cfs_quota_us": "-1\n", "cpu/cpu.cfs_period_us": "100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "200000\n", "cpu/cpu.cfs_period_us": "0\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "0\n", "cpu/cpu.cfs_period_us": "100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "1\n", "cpu/cpu.cfs_period_us": "1\n"}, 1),
+        ({"cpu.max": "1 100000\n"}, 0),
+        ({}, None),
+    ],
+)
+def test_cgroup_cpu_quota_reads_v2_then_v1(monkeypatch, tmp_path, files, expected):
+    monkeypatch.undo()  # the real reader, not the autouse fixture's stub
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    assert cpp_ext._cgroup_cpu_quota(tmp_path) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        ({"memory.max": "4096\n", "memory.current": "1024\n"}, 3072),
+        ({"memory.max": "1024\n", "memory.current": "4096\n"}, 0),
+        ({"memory.max": "max\n"}, None),
+        (
+            {
+                "memory/memory.limit_in_bytes": "4096\n",
+                "memory/memory.usage_in_bytes": "1024\n",
+            },
+            3072,
+        ),
+        (
+            {
+                "memory/memory.limit_in_bytes": "1024\n",
+                "memory/memory.usage_in_bytes": "4096\n",
+            },
+            0,
+        ),
+        # cgroup v1 reports "unlimited" as a value near 2**63.
+        (
+            {
+                "memory/memory.limit_in_bytes": str(1 << 60) + "\n",
+                "memory/memory.usage_in_bytes": "1024\n",
+            },
+            None,
+        ),
+        ({}, None),
+    ],
+)
+def test_cgroup_available_memory_reads_v2_then_v1(tmp_path, files, expected):
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    assert cpp_ext._cgroup_available_memory_bytes(tmp_path) == expected
+
+
+@pytest.mark.cpu_only
+def test_available_memory_reads_meminfo_in_bytes(monkeypatch):
+    try:
+        with open("/proc/meminfo") as f:
+            kb = next(int(ln.split()[1]) for ln in f if ln.startswith("MemAvailable:"))
+    except (OSError, StopIteration):
+        pytest.skip("needs /proc/meminfo with MemAvailable")
+    monkeypatch.setattr(cpp_ext, "_cgroup_available_memory_bytes", lambda: None)
+    # MemAvailable moves between the two reads; 1 GiB covers that.
+    assert abs(cpp_ext._available_host_memory_bytes() - kb * 1024) < 1 << 30
