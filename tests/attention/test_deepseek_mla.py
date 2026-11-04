@@ -941,6 +941,35 @@ def _run_mla(
     head_dim_kpe: int = HEAD_DIM_KPE,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run the batched MLA kernel for one backend and return its output.
+
+    Args:
+        backend: Kernel backend name ("fa3" or "fa2").
+        q_nope: Query tensor without positional encoding, shape
+            [batch * qo_len, num_heads, HEAD_DIM_CKV].
+        q_pe: Query tensor with positional encoding, shape
+            [batch * qo_len, num_heads, head_dim_kpe].
+        ckv: KV latent tensor, either BF16 or FP8 E4M3.
+        kpe: KV positional-encoding tensor, either BF16 or FP8 E4M3.
+        qo_indptr: Query offsets for the batch.
+        kv_indptr: KV page offsets for the batch.
+        kv_indices: KV page indices.
+        kv_len_arr: KV length per batch entry.
+        num_heads: Number of query heads.
+        page_size: KV page size.
+        causal: Whether to apply the causal mask.
+        sm_scale: Softmax scale.
+        q_dtype: Query dtype.
+        kv_dtype: KV dtype.
+        ckv_scale: Per-tensor cKV scale for FP8 KV.
+        kpe_scale: Per-tensor KPE scale for FP8 KV.
+        ckv_scale_arr: Per-row cKV scale array for FP8 KV.
+        head_dim_kpe: KPE head dimension (0 for NoPE MLA).
+        return_lse: Also return the log-sum-exp tensor.
+
+    Returns:
+        The attention output, or (output, lse) when return_lse is True.
+    """
     device = q_nope.device
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
@@ -1182,7 +1211,7 @@ def test_batch_mla_fp8_kv_folded_scale_matches_bf16_reference(head_dim_kpe, kv_l
             device=device,
             dtype=torch.bfloat16,
         )
-        * 0.1
+        * 10.0
     )
     q_pe = (
         torch.randn(
@@ -1192,7 +1221,7 @@ def test_batch_mla_fp8_kv_folded_scale_matches_bf16_reference(head_dim_kpe, kv_l
             device=device,
             dtype=torch.bfloat16,
         )
-        * 0.1
+        * 10.0
     )
 
     num_pages = batch_size * kv_len // page_size
@@ -1235,6 +1264,26 @@ def test_batch_mla_fp8_kv_folded_scale_matches_bf16_reference(head_dim_kpe, kv_l
         kv_dtype=torch.bfloat16,
         head_dim_kpe=head_dim_kpe,
     )
+    # Guard against a degenerate test: with near-zero logits the softmax is
+    # uniform, and the uniform-average output falls inside the tolerance below.
+    pages_per_batch = kv_len // page_size
+    uniform = torch.stack(
+        [
+            ckv_ref[b * pages_per_batch : (b + 1) * pages_per_batch]
+            .float()
+            .mean(dim=(0, 1))
+            for b in range(batch_size)
+        ]
+    )
+    uniform = (
+        uniform.view(batch_size, 1, 1, HEAD_DIM_CKV)
+        .expand(batch_size, qo_len, num_heads, HEAD_DIM_CKV)
+        .reshape_as(o_bf16)
+    )
+    assert (uniform - o_bf16.float()).abs().max().item() > 1.5e-2, (
+        "degenerate test: the uniform-average output is within tolerance of "
+        "the BF16 reference; increase the query magnitude"
+    )
     o_fp8 = _run_mla(
         "fa3",
         q_nope,
@@ -1276,7 +1325,7 @@ def test_batch_mla_fp8_nope_folded_scale_page_one_matches_bf16_reference(kv_len)
     num_heads, scale = 16, 0.0037
     q_nope = (
         torch.randn(1, num_heads, HEAD_DIM_CKV, device=device, dtype=torch.bfloat16)
-        * 0.02
+        * 4.0
     )
     q_pe = torch.empty(1, num_heads, 0, device=device, dtype=torch.bfloat16)
     ckv_fp8 = (
@@ -1312,6 +1361,14 @@ def test_batch_mla_fp8_nope_folded_scale_page_one_matches_bf16_reference(kv_len)
         kv_dtype=torch.bfloat16,
         head_dim_kpe=0,
         return_lse=True,
+    )
+    # Guard against a degenerate test: with near-zero logits the softmax is
+    # uniform, and the uniform average falls inside the tolerance below.
+    uniform = ckv_ref.float().mean(dim=(0, 1)).view(1, 1, 1, HEAD_DIM_CKV)
+    uniform = uniform.expand(1, 1, num_heads, HEAD_DIM_CKV).reshape_as(o_bf16)
+    assert (uniform - o_bf16.float()).abs().max().item() > 2e-2, (
+        "degenerate test: the uniform-average output is within tolerance of "
+        "the BF16 reference; increase the query magnitude"
     )
     o_fp8, lse_fp8 = _run_mla(
         "fa3",
