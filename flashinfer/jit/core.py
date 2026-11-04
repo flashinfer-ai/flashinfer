@@ -765,9 +765,7 @@ def gen_jit_spec(
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
     verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
-    debug = (
-        debug_env if debug_env is not None else verbose_env
-    ) == "1" and not is_windows
+    debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
     # Only add default C++ standard if not specified in extra flags
     cflags_has_std = extra_cflags is not None and any(
@@ -777,7 +775,7 @@ def gen_jit_spec(
         f.startswith("-std=") for f in extra_cuda_cflags
     )
 
-    cflags = ["-O2"] if is_windows else ["-Wno-switch-bool"]
+    cflags = ["/Od" if debug else "-O2"] if is_windows else ["-Wno-switch-bool"]
     if not cflags_has_std:
         if is_windows:
             cflags.insert(0, "/std:c++20")
@@ -798,15 +796,15 @@ def gen_jit_spec(
     if use_fast_math:
         cuda_cflags.insert(len(get_nvcc_parallelism_flags()), "-use_fast_math")
     if is_windows:
-        cuda_cflags.insert(0, "-O2")
+        cuda_cflags.insert(0, "-Xcompiler /Od" if debug else "-O2")
     if not cuda_cflags_has_std:
         cuda_cflags.insert(0, "-std=c++20" if is_windows else "-std=c++17")
 
     if debug:
-        cflags += ["-O0", "-g"]
+        if not is_windows:
+            cflags += ["-O0", "-g"]
+            cuda_cflags += ["-g", "-O0"]
         cuda_cflags += [
-            "-g",
-            "-O0",
             "--device-debug",
             "-lineinfo",
             "--ptxas-options=-v",

@@ -328,7 +328,10 @@ def build_common_cflags(
         common_cflags.append(f'-I"{spdlog_include_overlay}"')
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
-            common_cflags.append(f"-I{extra_dir.resolve()}")
+            if is_windows:
+                common_cflags.append(f'-I"{extra_dir.resolve()}"')
+            else:
+                common_cflags.append(f"-I{extra_dir.resolve()}")
     # Vendored CCCL headers use -I (not -isystem) so they take precedence
     # over the CTK-bundled copy. CCCL headers use #pragma system_header
     # internally to suppress warnings. See https://github.com/NVIDIA/cccl/issues/527
@@ -518,14 +521,14 @@ def generate_ninja_build_for_op(
         link_rsp = str((output_dir / "link.rsp").resolve()).replace(":\\", "$:\\")
         rule_compile = [
             "rule compile",
-            "  command = cl.exe $cflags -c $in /Fo$out $post_cflags",
+            "  command = cl.exe /showIncludes $cflags -c $in /Fo$out $post_cflags",
             "  deps = msvc",
         ]
         rule_cuda_compile = [
             "rule cuda_compile",
             "  command = $nvcc --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
             "  depfile = $out.d",
-            "  deps = msvc",
+            "  deps = gcc",
         ]
         rule_link = [
             "rule link",
@@ -610,7 +613,9 @@ def generate_ninja_build_for_op(
     def ninja_path(path) -> str:
         # ninja reads "C:" as a variable reference; escape the drive colon on Windows.
         text = str(path)
-        return text.replace(":\\", "$:\\") if is_windows else text
+        if not is_windows:
+            return text
+        return text.replace("$", "$$").replace(" ", "$ ").replace(":\\", "$:\\")
 
     objects = []
     for source in sources:

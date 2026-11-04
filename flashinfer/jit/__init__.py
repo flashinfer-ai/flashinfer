@@ -221,7 +221,7 @@ if platform.system() == "Windows":
     else:
         cuda_path = f"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v{torch.version.cuda}"
 
-    if cuda_path and os.path.exists(cuda_path):
+    if cuda_path and os.path.exists(cuda_path) and torch.version.cuda:
         cudart_version = torch.version.cuda.split(".")[0]
         if cudart_version < "12":
             cudart_version += "0"
@@ -234,17 +234,9 @@ if platform.system() == "Windows":
             if os.path.exists(arch_bin_path)
             else os.path.join(cuda_path, "bin")
         )
-        ctypes.CDLL(
-            os.path.join(dll_bin_path, f"cudart64_{cudart_version}.dll"),
-            mode=ctypes.RTLD_GLOBAL,
-        )
-    else:
-        raise ValueError(
-            "CUDA_LIB_PATH is not set. "
-            "CUDA_LIB_PATH need to be set with the absolute path "
-            "to CUDA root folder on Windows (for example, set "
-            "CUDA_LIB_PATH=C:\\CUDA\\v12.4)"
-        )
+        cudart_dll = os.path.join(dll_bin_path, f"cudart64_{cudart_version}.dll")
+        if os.path.exists(cudart_dll):
+            ctypes.CDLL(cudart_dll, mode=ctypes.RTLD_GLOBAL)
 else:
     cuda_lib_path = os.environ.get(
         "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"

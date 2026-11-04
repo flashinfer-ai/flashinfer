@@ -119,14 +119,16 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             cudaStream_t stream, int* occupancy = nullptr) {
   // Dispatch based on tile config and scheduler type
   switch (gemmConfig.tile_config_sm120) {
-    /*case CutlassTileConfigSM120::CtaShape128x32x64B:
+#if !defined(_WIN32)
+    case CutlassTileConfigSM120::CtaShape128x32x64B:
       DISPATCH_WITH_SCHEDULER(128, 32, 128);
     case CutlassTileConfigSM120::CtaShape128x32x128B:
       DISPATCH_WITH_SCHEDULER(128, 32, 256);
     case CutlassTileConfigSM120::CtaShape128x64x64B:
       DISPATCH_WITH_SCHEDULER(128, 64, 128);
     case CutlassTileConfigSM120::CtaShape128x64x128B:
-      DISPATCH_WITH_SCHEDULER(128, 64, 256);*/
+      DISPATCH_WITH_SCHEDULER(128, 64, 256);
+#endif
     case CutlassTileConfigSM120::CtaShape128x128x64B:
       DISPATCH_WITH_SCHEDULER(128, 128, 128);
     case CutlassTileConfigSM120::CtaShape128x128x128B:
@@ -189,12 +191,12 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
 
   // All supported tile configurations for SM120
   std::vector<CutlassTileConfigSM120> tilesSm120 = {
-      /*CutlassTileConfigSM120::CtaShape128x32x64B,  CutlassTileConfigSM120::CtaShape128x32x128B,
-      CutlassTileConfigSM120::CtaShape128x64x64B,  CutlassTileConfigSM120::CtaShape128x64x128B,*/
-      CutlassTileConfigSM120::CtaShape128x128x64B,
-      CutlassTileConfigSM120::CtaShape128x128x128B,
-      CutlassTileConfigSM120::CtaShape256x128x64B,
-      CutlassTileConfigSM120::CtaShape128x256x64B,
+#if !defined(_WIN32)
+      CutlassTileConfigSM120::CtaShape128x32x64B,  CutlassTileConfigSM120::CtaShape128x32x128B,
+      CutlassTileConfigSM120::CtaShape128x64x64B,  CutlassTileConfigSM120::CtaShape128x64x128B,
+#endif
+      CutlassTileConfigSM120::CtaShape128x128x64B, CutlassTileConfigSM120::CtaShape128x128x128B,
+      CutlassTileConfigSM120::CtaShape256x128x64B, CutlassTileConfigSM120::CtaShape128x256x64B,
   };
 
   // SM120/SM121 only supports 1x1x1 cluster shape
