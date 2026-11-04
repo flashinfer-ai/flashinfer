@@ -173,8 +173,11 @@ whose two records disagree on a path (a cast after `glm_intra_raw`, or
 with one replica, 16 KiB per head with 8), shared by the workspace's plan
 views.  `KdaWorkspace.bytes` is the arena alone, `param_acc_bytes` the
 accumulators, and `workspace_bytes` / `memory_report` count both.  A
-backward workspace of an `R1c` plan allocates `param_acc` zeroed with its
-arena (a per-call workspace at its call).  A backward that stops between the
+backward workspace of an `R1c` plan allocates `param_acc` with its arena (a
+per-call workspace at its call), unfilled: the workspace is marked, so its
+first backward zeroes the buffer on its own stream (a fill on the stream that
+built the workspace would not be ordered before a backward on another
+stream).  A backward that stops between the
 two programs leaves sums in it and marks the workspace, and so does a backward
 captured into a CUDA graph (its launches run at the replays).  The next
 backward outside a capture then zeroes the whole buffer before its GLM intra

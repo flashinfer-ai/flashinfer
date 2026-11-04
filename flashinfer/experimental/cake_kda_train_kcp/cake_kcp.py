@@ -3607,8 +3607,9 @@ class WorkspaceKcp:
             )
             for ctx in local:
                 view = self._bind_local(ctx, H, dev, backward)
-                # an R1c plan's accumulators at this pack's size (the views share one storage)
-                self._param_acc_ready(view)
+                # an R1c plan's accumulators at this pack's size (the views share one storage), allocated only:
+                # the first backward zeroes them on its own stream
+                self._param_acc_ready(view, zero=False)
                 for path in (LOCAL_PATH_FWD, LOCAL_PATH_BWD):
                     if cake_kcp_plan.intra_writes_tables(view.plan, path):
                         _scratch_tables(view)
@@ -3616,10 +3617,12 @@ class WorkspaceKcp:
             self.local_view = None
         return self.bytes
 
-    def _param_acc_ready(self, view: Any) -> None:
+    def _param_acc_ready(self, view: Any, *, zero: bool = True) -> None:
         """The ``R1c`` accumulators of the local arena sized for ``view`` (the arena or a plan view of it, bound to a
-        raw backward pack) and, outside a CUDA-graph capture, zero (``cake_backend.KdaWorkspace._param_acc_clean``: an
-        earlier backward that stopped before its cast, or a captured one, left the whole storage marked).  The views
+        raw backward pack) and, with ``zero`` and outside a CUDA-graph capture, zero
+        (``cake_backend.KdaWorkspace._param_acc_clean``: a new storage is allocated unfilled, and an earlier backward
+        that stopped before its cast, or a captured one, left the whole storage marked).  :meth:`reserve` passes
+        ``zero=False`` (allocations only); the backward's :func:`_prepare` zeroes them on the call's stream.  The views
         share one storage of the largest view's elements; a view of more heads (or replicas) grows it and the
         replaced storage goes back to the allocator, so the cached graphs pinning this arena, whose launches add into
         that storage, are dropped first (:func:`_graph_release`, as when the arena is replaced).  Nothing on a plan
@@ -3630,7 +3633,8 @@ class WorkspaceKcp:
         if box is not None and box.nbytes < view.param_acc_bytes:
             _graph_release(self.local)
         _ = view.param_acc
-        view._param_acc_clean()
+        if zero:
+            view._param_acc_clean()
 
     def _check_device(self, device: torch.device) -> None:
         if self.device is None:
@@ -5836,7 +5840,10 @@ def _prepare(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    alert: bool = True,
 ):
+    """The checked operands and the call record of one call.  ``alert``: a raw backward runs :func:`_alert_r1c`
+    first; ``False`` on the eager re-preparation of a backward whose capture failed (its first preparation alerted)."""
     backend = get_backend()
     opts = options if isinstance(options, OptionsKcp) else _options(options)
     if save_mode not in SAVE_MODES:
@@ -5860,7 +5867,7 @@ def _prepare(
     if dout is not None:
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
-    if backward and gate == "raw":
+    if backward and gate == "raw" and alert:
         # before anything is allocated, exchanged or launched; every rank decides alike (_alert_r1c)
         _alert_r1c(device, H)
     if workspace is None:
@@ -6312,6 +6319,7 @@ def chunk_kda_bwd_kcp(
             backward=True,
             dout=dout,
             **gate_args,
+            alert=False,  # the first preparation above alerted: one alert per call
         )
         if saved is not None:
             _check_saved(saved, call)

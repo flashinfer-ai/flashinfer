@@ -2827,10 +2827,10 @@ class KdaWorkspace:
 
     A raw-mode backward workspace whose plan selects an ``R1c`` pair (``sm_100a`` / ``sm_103a``,
     :func:`_r1c_stripes`) also holds :attr:`param_acc`, the FP64 accumulators of the parameter gradients (``[stripes,
-    H, 2, 128]``) outside the arena, allocated zero with it and shared by every view (:meth:`with_plan`,
-    :meth:`batch_view`) like :attr:`eye`: filled by the ``R1c`` GLM intra launches of one backward and zeroed again
-    by its cast.  :attr:`param_acc_bytes` is their size, so :func:`workspace_bytes` is :attr:`bytes` +
-    :attr:`param_acc_bytes`.  Two backwards in flight on one workspace (two streams) are not supported, for the
+    H, 2, 128]``) outside the arena, allocated with it (unfilled, the workspace marked: its first backward zeroes them
+    on its own stream) and shared by every view (:meth:`with_plan`, :meth:`batch_view`) like :attr:`eye`: filled by
+    the ``R1c`` GLM intra launches of one backward and zeroed again by its cast.  :attr:`param_acc_bytes` is their
+    size, so :func:`workspace_bytes` is :attr:`bytes` + :attr:`param_acc_bytes`.  Two backwards in flight on one workspace (two streams) are not supported, for the
     accumulators as for the arena.  A backward that stops between its GLM intra launches and its cast (an
     exception) leaves partial sums, and a backward captured into a CUDA graph leaves the storage as it was (its
     launches run at the graph's replays): either marks the workspace, and the next backward on it outside a capture
@@ -2927,9 +2927,9 @@ class KdaWorkspace:
         # view of this arena (with_plan, batch_view), since the flags the epochs stamp live in the shared eye
         self._eye_box: list[torch.Tensor | None] = [None]
         self._epoch: list[int] = [0]
-        # the R1c accumulators (param_acc, allocated zero with the arena: below) and whether they may hold sums no
-        # cast has zeroed, a mark the next backward outside a capture clears by zeroing them first: one-entry lists,
-        # shared by every view of this arena like the eye
+        # the R1c accumulators (param_acc, allocated unfilled with the arena: below) and whether they may hold
+        # anything but zeros (a new storage, or sums no cast has zeroed), a mark the next backward outside a capture
+        # clears by zeroing them first: one-entry lists, shared by every view of this arena like the eye
         self._param_acc_box: list[torch.Tensor | None] = [None]
         self._param_acc_dirty: list[bool] = [False]
         # the batched option's views of this arena per group geometry, and per doc_lengths its groups with their
@@ -2938,7 +2938,8 @@ class KdaWorkspace:
         self._batch_views: dict[tuple[int, int, int], KdaWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
         self._doc_graphs: set[tuple[int, ...]] = set()
-        # an R1c plan's accumulators come with the workspace, not with its first backward (which may be captured)
+        # an R1c plan's accumulators come with the workspace, not with its first backward (which may be captured);
+        # their zero fill does not: it runs on the stream of that backward
         _ = self.param_acc
 
     def _arena_size(
@@ -3015,24 +3016,25 @@ class KdaWorkspace:
     def param_acc(self) -> torch.Tensor | None:
         """The ``R1c`` accumulators of the parameter gradients, FP64 ``[stripes, H, 2, 128]`` (:func:`_r1c_stripes`;
         chunk ``c`` adds into replica ``c mod stripes``) outside the arena, ``None`` on a workspace whose plan selects
-        no ``R1c`` record (``"g"`` mode, ``sm_107a``) or that serves no backward.  Allocated zero with the workspace
-        (again by the first backward of a per-call workspace taken from the pool, as :attr:`eye`) and shared by every
-        view of this arena: one storage of the largest view's elements, each view reading its own leading part (every
-        element is zero between backwards, so the views' shapes need not agree; a view of more elements grows it).
-        A storage allocated under a CUDA-graph capture is filled only at the graph's replays, so it is allocated
-        unfilled and the workspace marked: its first backward zeroes it (:meth:`_param_acc_begin`)."""
+        no ``R1c`` record (``"g"`` mode, ``sm_107a``) or that serves no backward.  Allocated with the workspace (again
+        by the first backward of a per-call workspace taken from the pool, as :attr:`eye`) and shared by every view of
+        this arena: one storage of the largest view's elements, each view reading its own leading part (every element
+        is zero between backwards, so the views' shapes need not agree; a view of more elements grows it).  A new
+        storage is allocated unfilled and the workspace marked, so the first backward on it zeroes it on that
+        backward's stream, or inside its CUDA-graph capture (:meth:`_param_acc_begin`): a fill on the stream that
+        built the workspace would not be ordered before the backward of another stream."""
         stripes = _r1c_stripes(self.plan) if self.backward else None
         if stripes is None:
             return None
         n = stripes * self.plan.H * 2 * D
         acc = self._param_acc_box[0]
         if acc is None or acc.numel() < n:
-            # a new storage (a smaller one in use by queued work goes back to the allocator in stream order)
-            capturing = _capturing(self.device)
-            acc = self._param_acc_box[0] = (torch.empty if capturing else torch.zeros)(
+            # a new storage, unfilled and marked: the next backward zeroes it on its own stream (a smaller one in
+            # use by queued work goes back to the allocator in stream order)
+            acc = self._param_acc_box[0] = torch.empty(
                 n, dtype=torch.float64, device=self.device
             )
-            self._param_acc_dirty[0] = capturing
+            self._param_acc_dirty[0] = True
         return acc[:n].view(stripes, self.plan.H, 2, D)
 
     def _param_acc_begin(self, entry: str) -> torch.Tensor:
@@ -3462,7 +3464,7 @@ def _entry_release(ws: KdaWorkspace, key: tuple[Any, ...] | None) -> None:
     # the next call builds a fresh eye (flags 0 / the identity's 1.0f), so its epochs restart below any flag value
     ws._eye_box[0] = None
     ws._epoch[0] = 0
-    # and fresh zero R1c accumulators
+    # and fresh R1c accumulators (unfilled and marked: the next backward zeroes them on its stream)
     ws._param_acc_box[0] = None
     ws._param_acc_dirty[0] = False
     ws._doc_cache = {k: packing.on_host() for k, packing in ws._doc_cache.items()}

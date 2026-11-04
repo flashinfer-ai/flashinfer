@@ -2007,12 +2007,13 @@ def _cpu_acc_workspace(p) -> KdaWorkspace:
 
 def test_param_acc_is_one_storage_zeroed_whole_and_capture_aware(monkeypatch) -> None:
     """The R1c accumulators of a workspace and its views of other head counts (the context-parallel route's plan
-    views) are one storage of the largest view's elements: a view of more elements grows it (a fresh zero storage).
-    A backward that stopped before its cast leaves the workspace marked, and the next backward of any view zeroes
-    the whole storage, not only its own part.  Under a CUDA-graph capture (``_capturing`` forced) a new storage is
-    marked (its fill would run only at the replays), the mark survives the cast, and ``_param_acc_clean`` waits
-    for the end of the capture; outside one it zeroes a marked storage and clears the mark.  A plan without the R1c
-    pair has no accumulators: its backward is refused."""
+    views) are one storage of the largest view's elements: a view of more elements grows it.  A new storage is
+    allocated unfilled and the workspace marked (in or outside a capture), so the first backward zeroes it on its
+    own stream, never the stream that built the workspace.  A backward that stopped before its cast leaves the
+    workspace marked, and the next backward of any view zeroes the whole storage, not only its own part.  Under a
+    CUDA-graph capture (``_capturing`` forced) the mark survives the cast, and ``_param_acc_clean`` waits for the
+    end of the capture; outside one it zeroes a marked storage and clears the mark.  A plan without the R1c pair
+    has no accumulators: its backward is refused."""
     arch, sm = "sm_100a", 148
     small = cake_backend.plan(640, 2, 4, sm, arch, gate="raw")
     big = cake_backend.plan(640, 2, 64, sm, arch, gate="raw")
@@ -2022,12 +2023,18 @@ def test_param_acc_is_one_storage_zeroed_whole_and_capture_aware(monkeypatch) ->
     ws = _cpu_acc_workspace(small)
     acc = ws.param_acc
     assert acc.shape == (1, 4, 2, D) and acc.dtype == torch.float64
-    assert ws._param_acc_box[0].numel() == n_small and not ws._param_acc_dirty[0]
+    # a new storage: unfilled and marked, zeroed by the first backward
+    assert ws._param_acc_box[0].numel() == n_small and ws._param_acc_dirty[0] is True
+    ws._param_acc_box[0].fill_(4.0)
+    assert int((ws._param_acc_begin("test") == 0).sum()) == n_small
+    ws._param_acc_end()
+    assert ws._param_acc_dirty[0] is False
     view = ws._view(big)
     acc_big = view.param_acc
     box = ws._param_acc_box[0]
     assert box is view._param_acc_box[0] and box.numel() == n_big
-    assert int((box == 0).sum()) == n_big and not ws._param_acc_dirty[0]
+    # the grown storage is new: marked for every view
+    assert ws._param_acc_dirty[0] is True and view._param_acc_dirty[0] is True
     assert acc_big.shape == (8, 64, 2, D)
     # the big view's backward adds everywhere and stops before its cast
     view._param_acc_begin("test").fill_(1.0)
@@ -10608,7 +10615,8 @@ def test_raw_gate_r1c_repeat_spread(device, manifest, monkeypatch, heads) -> Non
         assert (
             acc.shape == (R1C_STRIPES[glm], heads, 2, D) and acc.dtype == torch.float64
         )
-        assert acc.numel() * 8 == acc_bytes and not bool(acc.view(torch.int64).any())
+        # allocated unfilled and marked: the first backward zeroes it (checked after every backward below)
+        assert acc.numel() * 8 == acc_bytes and ws._param_acc_dirty[0] is True
     out, saved = _rg_fwd(inputs, workspace=ws)
     assert _bits_equal_counted(out, ref_out)
     released: list = []
@@ -10713,10 +10721,13 @@ def test_raw_gate_r1c_recovers_from_an_aborted_backward(device, manifest) -> Non
         assert ws._param_acc_dirty[0] is False
 
 
-def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(device, manifest) -> None:
+def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
+    device, manifest, monkeypatch
+) -> None:
     """Under ``torch.use_deterministic_algorithms(True)`` a raw backward of an R1c row (:func:`_r1c_glm`) raises
     PyTorch's alert naming ``chunk_kda_bwd`` and the deterministic package before it allocates or launches anything
-    (a recording launcher sees no launch; saved or replay, with or without a caller workspace), and with
+    (saved or replay, with or without a caller workspace: the caller workspace's recording launcher sees no launch,
+    and no call enters ``cake_backend._workspace``, which takes a per-call workspace and runs every launch), and with
     ``warn_only=True`` warns once and runs (results of the R1c bound).  On ``sm_107a`` (the deterministic pair) the
     backward gives no such warning and every result is bitwise the deterministic package's.  The g mode is outside
     the R1c rows: no such warning.  (The forwards run with torch's deterministic algorithms off; only this
@@ -10757,6 +10768,14 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(device, manifest) ->
             _, g_saved = chunk_kda_fwd(*gq)
             torch.cuda.synchronize(device)
             launched.clear()
+            entered: list = []
+            take = cake_backend._workspace
+
+            def taking(workspace, *args, _take=take, _entered=entered, **kwargs):
+                _entered.append(workspace is None)
+                return _take(workspace, *args, **kwargs)
+
+            monkeypatch.setattr(cake_backend, "_workspace", taking)
             if alerts:
                 torch.use_deterministic_algorithms(True)
                 for kw in ({"workspace": ws}, {}):
@@ -10764,7 +10783,7 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(device, manifest) ->
                         with pytest.raises(RuntimeError, match=alert) as info:
                             _rg_bwd(inputs, s_in, **kw)
                         assert "flashinfer.cake_kda_det_train" in str(info.value)
-                assert launched == []
+                assert launched == [] and entered == []
             torch.use_deterministic_algorithms(True, warn_only=True)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
@@ -10777,7 +10796,10 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(device, manifest) ->
             assert all(
                 os.path.realpath(w.filename) == os.path.realpath(__file__) for w in ours
             ), [(w.filename, w.lineno) for w in ours]
-            assert launched
+            # the backward that ran went through the patched _workspace with the caller's workspace (the check
+            # above is not vacuous)
+            assert launched and entered and not any(entered)
+            monkeypatch.setattr(cake_backend, "_workspace", take)
             seen += len(ours)
             _rg_check(got, ref, tag=(arch, heads, "torch deterministic"))
             # the g mode: no alert of this package

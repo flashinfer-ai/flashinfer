@@ -1579,12 +1579,13 @@ def test_raw_gate_rows_match_single_rank_and_fp64(row) -> None:
     assert report["pass"], report
 
 
-def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode() -> None:
+def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch) -> None:
     """Under ``torch.use_deterministic_algorithms(True)`` a raw KCP backward of an R1c row (``sm_100a`` / ``sm_103a``)
     raises PyTorch's alert naming ``chunk_kda_bwd_kcp`` before it allocates or launches anything (no backward
-    recorded), eagerly and on a captured graph's replay; with ``warn_only=True`` it warns and runs.  On ``sm_107a``
-    (the deterministic pair) the backward raises no such alert and gives no such warning.  The warning names the
-    caller outside flashinfer (this file)."""
+    recorded), eagerly and on a captured graph's replay; with ``warn_only=True`` it warns and runs, once per call,
+    also when its graph capture fails and the call prepares again to run eagerly.  On ``sm_107a`` (the
+    deterministic pair) the backward raises no such alert and gives no such warning.  The warning names the caller
+    outside flashinfer (this file)."""
     _skip_unless_runnable(1)
     device = torch.device("cuda", torch.cuda.current_device())
     arch = cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
@@ -1649,6 +1650,25 @@ def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode() -> None:
         ), [(w.filename, w.lineno) for w in ours]
         assert len(grads) == len(TOKEN_GRADS + PARAM_GRADS)
         assert cake_kcp.LAST_CALL.get("bwd") is not before
+        # a new key: its first call runs eagerly, its second fails to capture (as _graph_capture records a failure)
+        # and runs eagerly after a second preparation: one warning per call
+        failed: list = []
+
+        def capture_fails(kind, entry, call, body):
+            failed.append(kind)
+            entry.disabled = "test: the capture failed"
+            return None
+
+        monkeypatch.setattr(cake_kcp, "_graph_capture", capture_fails)
+        for i in range(2):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                grads = bwd(saved, graph="replay")
+            torch.cuda.synchronize(device)
+            ours = [w for w in caught if alert in str(w.message)]
+            assert len(ours) == (1 if r1c else 0), (i, [str(w.message) for w in caught])
+            assert len(grads) == len(TOKEN_GRADS + PARAM_GRADS)
+        assert failed == ["bwd"], failed
     finally:
         torch.use_deterministic_algorithms(mode[0], warn_only=mode[1])
         cake_kcp.graph_cache_clear()
