@@ -33,6 +33,9 @@ BYTES_PER_KIB = 1024
 # metadata and scratch) must fit it; TOTAL_SMEM_BUDGET_KIB sizes the Q and
 # K/V pipelines below it.
 SMEM_CAPACITY_KIB = 227
+# Shared memory the system reserves for each resident CTA. N co-resident CTAs
+# share 228 KiB, so each can use (SMEM_CAPACITY_KIB + 1 - N) / N KiB.
+SMEM_RESERVED_PER_CTA_KIB = 1
 
 # The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
 # 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail

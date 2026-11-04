@@ -17,7 +17,24 @@ to the caller's split permission. Sliding-window plans remain nonsplit, but
 may use direct or CLC-persistent execution. There is no public scheduler or
 tuning knob and no fallback to another attention backend.
 
-Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates, plus Swaps Q48/Q64/Q128 for transformed FP8-compute K/V, across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+
+Q tiles of 48 rows or more, for fixed grouped paged queries:
+
+| Tile | Head dim | Q / K/V storage | Output | CTAs per SM |
+| --- | --- | --- | --- | --- |
+| Swaps Q48 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 2 |
+| Swaps Q64 | 128 | FP8 / NVFP4 | FP16, BF16 | 2 |
+| Swaps Q64 | 256, 512 | FP8 / NVFP4 | FP16, BF16 | 1 |
+| Swaps Q128 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
+| Keeps Q128 | 128 | FP8 / FP8 | FP16, BF16 | 1 |
+
+The Swaps rows support dense or causal masks and direct or GMEM split-KV
+reduction (fused or separate kernel). Packed queries, persistent scheduling,
+sparse routes, sliding windows, attention sinks, cluster-SMEM reduction, and
+FP8 output keep their narrower tiles. D512/Q128 is rejected: its PV
+accumulators alone need all 512 TMEM columns. D512 converts K and V in
+separate warp groups.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 
@@ -263,7 +280,8 @@ captured addresses and shapes.
 | [`../../decode.py`](../../decode.py) | Public validation, planning, workspace binding, JIT caching, and launch adaptation |
 | [`fmha_decode_config.py`](fmha_decode_config.py) | Kernel configuration and automatic launch selection |
 | [`fmha_decode_kernel.py`](fmha_decode_kernel.py) | TS kernel construction and launch |
-| [`fmha_decode_tasks.py`](fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
+| [`fmha_decode_tasks/fmha_decode_tasks.py`](fmha_decode_tasks/fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
+| [`fmha_decode_tasks/fmha_decode_dual_transform_task.py`](fmha_decode_tasks/fmha_decode_dual_transform_task.py) | Separate K and V conversion tasks and their MMA task |
 | [`fmha_decode_resources/`](fmha_decode_resources/) | GMEM/SMEM/TMEM resources and pipeline state |
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
 | [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |
