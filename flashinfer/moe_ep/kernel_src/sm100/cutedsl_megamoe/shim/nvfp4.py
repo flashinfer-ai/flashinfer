@@ -679,7 +679,7 @@ class MegaMoENvfp4Frontend:
             c.enable_iket,
             c.enable_fc1_activation_per_token_scale,
             c.internode,
-            c.ranks_per_node,
+            c.ranks_per_node if c.internode else None,
         )
 
     def _construct_kernel(self):
@@ -742,7 +742,9 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
             internode=c.internode,
-            ranks_per_node=c.ranks_per_node or c.world_size,
+            ranks_per_node=(c.ranks_per_node or c.world_size)
+            if c.internode
+            else c.world_size,
             enable_internode_relay=c.internode,
             enable_nccl_gin=c.internode,
             publish_relay_counts_to_gemm=c.internode,

@@ -107,7 +107,10 @@ def test_legacy_nvfp4_fp4_decoder_environment(manual, monkeypatch, tmp_path):
     assert ("cvt.rn.f16x2.e2m1x2" in ptx) is not manual
 
 
-def test_legacy_nvfp4_off_has_no_gin_dependencies(monkeypatch):
+@pytest.mark.parametrize(
+    "ranks_per_node", [None, 2], ids=["default", "ignored-gin-topology"]
+)
+def test_legacy_nvfp4_off_has_no_gin_dependencies(ranks_per_node, monkeypatch):
     """Default/off eager and graph calls must never touch a GIN entry point."""
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -132,7 +135,9 @@ def test_legacy_nvfp4_off_has_no_gin_dependencies(monkeypatch):
     monkeypatch.setattr(gin, "create_gin_session", forbidden)
     monkeypatch.setattr(gin.GinSession, "__init__", forbidden)
     generator = torch.Generator(device="cuda").manual_seed(1901 + rank)
-    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=1024, top_k=4)
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=1024, top_k=4, ranks_per_node=ranks_per_node
+    )
     assert cfg.internode is False
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=world, rank=rank),
