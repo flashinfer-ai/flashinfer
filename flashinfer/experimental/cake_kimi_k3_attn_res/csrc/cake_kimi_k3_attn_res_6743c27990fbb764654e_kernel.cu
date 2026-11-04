@@ -47,27 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM__TMEM_VALUES_OFFSET 0
-#define NUM_CHUNK_PIPE_STAGES 2
-#define SMEM_V_BUFS_OFF 0
-#define SMEM_V_BUFS_STAGE_BYTES 57344
-#define SMEM_V_BUFS_STRIDE 57344
-#define SMEM_DELTA_BUFS_OFF 114688
-#define SMEM_DELTA_BUFS_STAGE_BYTES 14336
-#define SMEM_DELTA_BUFS_STRIDE 14336
-#define SMEM_OUTPUT_NORM_BUF_OFF 143360
-#define SMEM_OUTPUT_NORM_BUF_STAGE_BYTES 14336
-#define SMEM_OUTPUT_NORM_BUF_STRIDE 14336
-#define SMEM_STATS_OFF 157696
-#define SMEM_STATS_STAGE_BYTES 512
-#define SMEM_STATS_STRIDE 512
-#define SMEM_OUTPUT_STATS_OFF 158208
-#define SMEM_OUTPUT_STATS_STAGE_BYTES 64
-#define SMEM_OUTPUT_STATS_STRIDE 64
-#define SMEM_TOTAL 158336
-#define THREADS 288
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -125,34 +104,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ void tmem_ld_x4(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x4.b32"
-        " {%0, %1, %2, %3}, [%4];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])
-        : "r"(tmem_addr));
-}
-
-
-__device__ __forceinline__ void tmem_st_x4_f32(int tmem_addr, const float* src) {
-    asm volatile(
-        "tcgen05.st.sync.aligned.32x32b.x4.b32"
-        " [%0], {%1, %2, %3, %4};"
-        :: "r"(tmem_addr),
-           "f"(src[0]), "f"(src[1]), "f"(src[2]), "f"(src[3]));
-}
-
-
-__device__ __forceinline__ void tmem_st_x8_f32(int tmem_addr, const float* src) {
-    asm volatile(
-        "tcgen05.st.sync.aligned.32x32b.x8.b32"
-        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-        :: "r"(tmem_addr),
-           "f"(src[0]), "f"(src[1]), "f"(src[2]), "f"(src[3]),
-           "f"(src[4]), "f"(src[5]), "f"(src[6]), "f"(src[7]));
-}
-
-
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -191,16 +142,6 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 
 
 
-__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
-          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
-        : "r"(tmem_addr));
-}
-
-
 __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     __nv_bfloat162_raw raw;
     raw.x = static_cast<unsigned short>(v);
@@ -208,13 +149,10 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
-#ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_attn_res_d9b73861f6776f99547b
-#endif
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+kernel_cake_kimi_k3_attn_res_6743c27990fbb764654e(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -224,17 +162,19 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
-    const int mbar_base = smem + 158272;
+    const int mbar_base = smem + 158304;
     #define ready_addr (mbar_base + 0)
     #define consumed_addr (mbar_base + 16)
     #define output_norm_ready_addr (mbar_base + 32)
+    #define clc_full_addr (mbar_base + 40)
+    #define clc_empty_addr (mbar_base + 56)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* v_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int v_bufs_addr = smem + 0;
     __nv_bfloat16* delta_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 114688);
@@ -245,43 +185,39 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
     const int stats_addr = smem + 157696;
     float* output_stats = reinterpret_cast<float*>(smem_raw + 158208);
     const int output_stats_addr = smem + 158208;
+    unsigned int* clc_slots = reinterpret_cast<unsigned int*>(smem_raw + 158272);
+    const int clc_slots_addr = smem + 158272;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[158272..158312)
+    // Mbarrier init (9 barriers at smem_raw[158304..158376))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'chunk_pipe' ---
             // ready: 2 barriers, init_count=1
-            mbarrier_init(smem + 158272, 1);
-            mbarrier_init(smem + 158280, 1);
-            // consumed: 2 barriers, init_count=256
-            mbarrier_init(smem + 158288, 256);
-            mbarrier_init(smem + 158296, 256);
-            // output_norm_ready: 1 barriers, init_count=1
             mbarrier_init(smem + 158304, 1);
+            mbarrier_init(smem + 158312, 1);
+            // consumed: 2 barriers, init_count=256
+            mbarrier_init(smem + 158320, 256);
+            mbarrier_init(smem + 158328, 256);
+            // output_norm_ready: 1 barriers, init_count=1
+            mbarrier_init(smem + 158336, 1);
+            // --- pipeline 'clc_pipe' ---
+            // clc_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 158344, 1);
+            mbarrier_init(smem + 158352, 1);
+            // clc_empty: 2 barriers, init_count=288
+            mbarrier_init(smem + 158360, 288);
+            mbarrier_init(smem + 158368, 288);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
-    __syncwarp();
-
-    // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 158312);
-    if (warp == 1) {
-        int _tmem_hold = smem + 158312;
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
-        __syncwarp();
-    }
-
     __syncthreads();
-    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-
-    const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
-    const int tmem__tmem_values = taddr;
+    __syncwarp();
+    __syncthreads();
 
     // ---- Role: producer ----
     if (warp == 0) {
@@ -292,43 +228,44 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                     "[%0], [%1], %2, [%3];"
-                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + ((unsigned long long)0 * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
+                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + (unsigned long long)0 * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
                     : "memory");
             }
             unsigned int producer_stage = 0;
+            int producer_token = bid;
             unsigned int _phase_consumed = 1;
             #pragma unroll 1
-            for (int token = bid; token < M; token += num_bids) {
+            for (int token = 0; token < M; token++) {
                 #pragma unroll
-                for (int chunk = 0; chunk < 2; chunk++) {
+                for (int chunk = 0; chunk < 1; chunk++) {
                     const int source_base = chunk * 4;
-                    const int remaining_sources = 7 - source_base;
+                    const int remaining_sources = 3 - source_base;
                     const int active_rows = ((remaining_sources > 4) ? 4 : remaining_sources);
                     mbarrier_wait(consumed_addr + (producer_stage) * 8, _phase_consumed);
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        const int extra_delta_row = ((chunk == 1) ? 1 : 0);
+                        const int extra_delta_row = ((chunk == 0) ? 1 : 0);
                         mbarrier_arrive_expect_tx(ready_addr + (producer_stage) * 8, (active_rows + extra_delta_row) * 7168 * 2);
                         #pragma unroll
                         for (int source_in_chunk = 0; source_in_chunk < 4; source_in_chunk++) {
                             const int source = source_base + source_in_chunk;
-                            if (source < 7) {
-                                if (source == 6) {
+                            if (source < 3) {
+                                if (source == 2) {
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + (unsigned long long)(producer_token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(delta_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(delta_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + (unsigned long long)(producer_token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                 } else {
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + (unsigned long long)source * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)producer_token * blocks_m_stride + (unsigned long long)source * blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                 }
                             }
@@ -337,6 +274,52 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                     producer_stage += 1;
                     if (producer_stage == 2) { producer_stage = 0; _phase_consumed ^= 1; }
                 }
+                int _stage_clc_empty = (int)((unsigned int)token % 2);
+                int _parity_clc_empty = (int)((unsigned int)token / 2 % 2) ^ 1;
+                mbarrier_wait(clc_empty_addr + (_stage_clc_empty) * 8, _parity_clc_empty);
+                if (elect_sync()) {
+                    mbarrier_arrive_expect_tx(clc_full_addr + ((int)((unsigned int)token % 2)) * 8, 16);
+                    asm volatile(
+                        "fence.proxy.async.shared::cta;\n\t"
+                        "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                            ".mbarrier::complete_tx::bytes.b128"
+                            " [%0], [%1];"
+                        :: "r"(clc_slots_addr + (int)((unsigned int)token % 2) * 16 + 0 * 16), "r"(clc_full_addr + (int)((unsigned int)token % 2) * 8)
+                        : "memory");
+                }
+                int _stage_clc_full = (int)((unsigned int)token % 2);
+                int _parity_clc_full = (int)((unsigned int)token / 2 % 2);
+                mbarrier_wait(clc_full_addr + (_stage_clc_full) * 8, _parity_clc_full);
+                uint32_t valid = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(valid)
+                    : "r"(clc_slots_addr + (int)((unsigned int)token % 2) * 16 + 0 * 16)
+                    : "memory");
+                uint32_t ctaid = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "+r"(ctaid)
+                    : "r"(clc_slots_addr + (int)((unsigned int)token % 2) * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_arrive(clc_empty_addr + ((int)((unsigned int)token % 2)) * 8);
+                if (valid == 0) {
+                    break;
+                }
+                producer_token = (int)ctaid;
             }
             if (elect_sync()) {
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -351,7 +334,6 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
             int consumer_thread = consumer_warp * 32 + lane;
             int group = consumer_warp / 4;
             int thread_in_group = consumer_thread % 128;
-            int group_tmem_base = taddr + (unsigned int)(group * 128) + (unsigned int)(warp % 4 * 32 << 16);
             float q_cache[28];
             #pragma unroll
             for (int slice_idx = 0; slice_idx < 4; slice_idx++) {
@@ -456,13 +438,14 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                     }
                 }
             }
-            float block_carry[28];
+            float source_carry[84];
             unsigned int consumer_stage = 0;
             mbarrier_wait(output_norm_ready_addr, 0);
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            int consumer_token = bid;
             unsigned int _phase_ready = 0;
             #pragma unroll 1
-            for (int token_1 = bid; token_1 < M; token_1 += num_bids) {
+            for (int token_1 = 0; token_1 < M; token_1++) {
                 float acc32[28];
                 #pragma unroll
                 for (int value_idx_2 = 0; value_idx_2 < 28; value_idx_2++) {
@@ -471,9 +454,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                 float m_running = -3.4028235e+38f;
                 float s_running = 0.0f;
                 #pragma unroll
-                for (int chunk_1 = 0; chunk_1 < 2; chunk_1++) {
+                for (int chunk_1 = 0; chunk_1 < 1; chunk_1++) {
                     const int source_base_1 = chunk_1 * 4;
-                    const int remaining_sources_1 = 7 - source_base_1;
+                    const int remaining_sources_1 = 3 - source_base_1;
                     const int active_rows_1 = ((remaining_sources_1 > 4) ? 4 : remaining_sources_1);
                     mbarrier_wait(ready_addr + (consumer_stage) * 8, _phase_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -493,9 +476,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             #pragma unroll
                             for (int source_in_chunk_2 = 0; source_in_chunk_2 < 4; source_in_chunk_2++) {
                                 const int source_1 = source_base_1 + source_in_chunk_2;
-                                if (source_1 < 7) {
+                                if (source_1 < 3) {
                                     unsigned int prefix_words[2];
-                                    if (source_1 == 6) {
+                                    if (source_1 == 2) {
                                         int prefix_offset = consumer_stage * 4 * 7168 + (unsigned int)(source_in_chunk_2 * 7168) + (unsigned int)hidden_base_2;
                                         reinterpret_cast<unsigned long long*>(prefix_words)[0] = *reinterpret_cast<const unsigned long long*>(v_bufs + prefix_offset);
                                     } else {
@@ -519,7 +502,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                                             values[value_idx_3] = unpack_bf16[value_idx_3];
                                         }
                                     }
-                                    if (source_1 == 6) {
+                                    if (source_1 == 2) {
                                         unsigned int delta_words[2];
                                         reinterpret_cast<unsigned long long*>(delta_words)[0] = *reinterpret_cast<const unsigned long long*>(delta_bufs + (consumer_stage * 7168 + (unsigned int)hidden_base_2));
                                         #pragma unroll
@@ -542,7 +525,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values[_lp*2 + 2], values[_lp*2+1 + 2]));
                                             _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int2*>(prefix + (token_1 * 7168 + hidden_base_2))[0] = reinterpret_cast<int2*>(_packed_0)[0];
+                                        reinterpret_cast<int2*>(prefix + (consumer_token * 7168 + hidden_base_2))[0] = reinterpret_cast<int2*>(_packed_0)[0];
                                     }
                                     #pragma unroll
                                     for (int pair_idx_3 = 0; pair_idx_3 < 2; pair_idx_3++) {
@@ -552,7 +535,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                                         local_sum_sq[source_in_chunk_2] = fma_f32x2_rn_ftz(value_pair, value_pair, local_sum_sq[source_in_chunk_2]);
                                         local_dot[source_in_chunk_2] = fma_f32x2_rn_ftz(value_pair, q_pair_2, local_dot[source_in_chunk_2]);
                                     }
-                                    tmem_st_x4_f32(group_tmem_base + (slice_idx_1 * 4 + source_in_chunk_2) * 8, values);
+                                    #pragma unroll
+                                    for (int value_idx_6 = 0; value_idx_6 < 4; value_idx_6++) {
+                                        source_carry[source_in_chunk_2 * 28 + slice_idx_1 * 8 + value_idx_6] = values[value_idx_6];
+                                    }
                                 }
                             }
                         } else {
@@ -562,9 +548,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             #pragma unroll
                             for (int source_in_chunk_3 = 0; source_in_chunk_3 < 4; source_in_chunk_3++) {
                                 const int source_2 = source_base_1 + source_in_chunk_3;
-                                if (source_2 < 7) {
+                                if (source_2 < 3) {
                                     unsigned int prefix_words_1[4];
-                                    if (source_2 == 6) {
+                                    if (source_2 == 2) {
                                         int prefix_offset_1 = consumer_stage * 4 * 7168 + (unsigned int)(source_in_chunk_3 * 7168) + (unsigned int)hidden_base_3;
                                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                             : "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[(0) + 3]))
@@ -586,21 +572,21 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                                                 : "r"(smem_bf16x2_1[_pair]));
                                         }
                                         #pragma unroll
-                                        for (int value_idx_6 = 0; value_idx_6 < 8; value_idx_6++) {
-                                            values_1[value_idx_6] = unpack_bf16_1[value_idx_6];
+                                        for (int value_idx_7 = 0; value_idx_7 < 8; value_idx_7++) {
+                                            values_1[value_idx_7] = unpack_bf16_1[value_idx_7];
                                         }
                                     }
-                                    if (source_2 == 6) {
+                                    if (source_2 == 2) {
                                         unsigned int delta_words_1[4];
                                         reinterpret_cast<int4*>(delta_words_1)[0] = reinterpret_cast<int4*>(delta_bufs + (consumer_stage * 7168 + (unsigned int)hidden_base_3))[0];
                                         #pragma unroll
                                         for (int pair_idx_4 = 0; pair_idx_4 < 4; pair_idx_4++) {
-                                            const int value_idx_7 = pair_idx_4 * 2;
+                                            const int value_idx_8 = pair_idx_4 * 2;
                                             __nv_bfloat162 prefix_pair_1 = __as_bf16x2(prefix_words_1[pair_idx_4]);
                                             __nv_bfloat162 delta_pair_1 = __as_bf16x2(delta_words_1[pair_idx_4]);
                                             __nv_bfloat162 updated_bf16_pair_1 = prefix_pair_1 + delta_pair_1;
-                                            values_1[value_idx_7] = (float)updated_bf16_pair_1.x;
-                                            values_1[value_idx_7 + 1] = (float)updated_bf16_pair_1.y;
+                                            values_1[value_idx_8] = (float)updated_bf16_pair_1.x;
+                                            values_1[value_idx_8 + 1] = (float)updated_bf16_pair_1.y;
                                         }
                                         unsigned int _packed_1[4];
                                         #pragma unroll
@@ -623,27 +609,24 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1[_lp*2 + 6], values_1[_lp*2+1 + 6]));
                                             _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_3))[0] = reinterpret_cast<int4*>(_packed_1)[0];
+                                        reinterpret_cast<int4*>(prefix + (consumer_token * 7168 + hidden_base_3))[0] = reinterpret_cast<int4*>(_packed_1)[0];
                                     }
                                     #pragma unroll
                                     for (int pair_idx_5 = 0; pair_idx_5 < 4; pair_idx_5++) {
-                                        const int value_idx_8 = pair_idx_5 * 2;
-                                        float2 value_pair_1 = make_float2(values_1[value_idx_8], values_1[value_idx_8 + 1]);
-                                        float2 q_pair_3 = make_float2(q_cache[slice_idx_1 * 8 + value_idx_8], q_cache[slice_idx_1 * 8 + value_idx_8 + 1]);
+                                        const int value_idx_9 = pair_idx_5 * 2;
+                                        float2 value_pair_1 = make_float2(values_1[value_idx_9], values_1[value_idx_9 + 1]);
+                                        float2 q_pair_3 = make_float2(q_cache[slice_idx_1 * 8 + value_idx_9], q_cache[slice_idx_1 * 8 + value_idx_9 + 1]);
                                         local_sum_sq[source_in_chunk_3] = fma_f32x2_rn_ftz(value_pair_1, value_pair_1, local_sum_sq[source_in_chunk_3]);
                                         local_dot[source_in_chunk_3] = fma_f32x2_rn_ftz(value_pair_1, q_pair_3, local_dot[source_in_chunk_3]);
                                     }
-                                    tmem_st_x8_f32(group_tmem_base + (slice_idx_1 * 4 + source_in_chunk_3) * 8, values_1);
+                                    #pragma unroll
+                                    for (int value_idx_10 = 0; value_idx_10 < 8; value_idx_10++) {
+                                        source_carry[source_in_chunk_3 * 28 + slice_idx_1 * 8 + value_idx_10] = values_1[value_idx_10];
+                                    }
                                 }
                             }
                         }
                     }
-#if __CUDA_ARCH__ != 1000
-                    asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-#endif
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     unsigned int stats_stage_base = consumer_stage * 64;
                     #pragma unroll
                     for (int source_in_chunk_4 = 0; source_in_chunk_4 < 4; source_in_chunk_4++) {
@@ -683,9 +666,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             }
                         }
                     }
-#if __CUDA_ARCH__ == 1000
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-#endif
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -722,6 +703,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             float _shfl_sync_20 = __shfl_sync(0xFFFFFFFF, local_logit, source_in_chunk_5 * 8);
                             logits[source_in_chunk_5] = _shfl_sync_20;
                         }
+                    }
+                    if (chunk_1 != 0) {
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     }
                     float weights[4];
                     float new_max = 0.0f;
@@ -765,13 +750,11 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             #pragma unroll
                             for (int source_in_chunk_9 = 0; source_in_chunk_9 < 4; source_in_chunk_9++) {
                                 if (active_rows_1 > source_in_chunk_9) {
-                                    float _tmem_load_0[4];
-                                    tmem_ld_x4(&_tmem_load_0[0], group_tmem_base + (slice_idx_2 * 4 + source_in_chunk_9) * 8);
                                     float2 weight_pair = make_float2(weights[source_in_chunk_9], weights[source_in_chunk_9]);
                                     #pragma unroll
                                     for (int pair_idx_7 = 0; pair_idx_7 < 2; pair_idx_7++) {
                                         const int acc_idx_1 = slice_idx_2 * 8 + pair_idx_7 * 2;
-                                        float2 cached_pair = make_float2(_tmem_load_0[pair_idx_7 * 2], _tmem_load_0[pair_idx_7 * 2 + 1]);
+                                        float2 cached_pair = make_float2(source_carry[source_in_chunk_9 * 28 + acc_idx_1], source_carry[source_in_chunk_9 * 28 + acc_idx_1 + 1]);
                                         float2 acc_pair_1 = make_float2(acc32[acc_idx_1], acc32[acc_idx_1 + 1]);
                                         float2 updated_pair = fma_f32x2_rn_ftz(weight_pair, cached_pair, acc_pair_1);
                                         acc32[acc_idx_1] = updated_pair.x;
@@ -793,13 +776,11 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             #pragma unroll
                             for (int source_in_chunk_10 = 0; source_in_chunk_10 < 4; source_in_chunk_10++) {
                                 if (active_rows_1 > source_in_chunk_10) {
-                                    float _tmem_load_1[8];
-                                    tmem_ld_x8(&_tmem_load_1[0], group_tmem_base + (slice_idx_2 * 4 + source_in_chunk_10) * 8);
                                     float2 weight_pair_1 = make_float2(weights[source_in_chunk_10], weights[source_in_chunk_10]);
                                     #pragma unroll
                                     for (int pair_idx_9 = 0; pair_idx_9 < 4; pair_idx_9++) {
                                         const int acc_idx_3 = slice_idx_2 * 8 + pair_idx_9 * 2;
-                                        float2 cached_pair_1 = make_float2(_tmem_load_1[pair_idx_9 * 2], _tmem_load_1[pair_idx_9 * 2 + 1]);
+                                        float2 cached_pair_1 = make_float2(source_carry[source_in_chunk_10 * 28 + acc_idx_3], source_carry[source_in_chunk_10 * 28 + acc_idx_3 + 1]);
                                         float2 acc_pair_3 = make_float2(acc32[acc_idx_3], acc32[acc_idx_3 + 1]);
                                         float2 updated_pair_1 = fma_f32x2_rn_ftz(weight_pair_1, cached_pair_1, acc_pair_3);
                                         acc32[acc_idx_3] = updated_pair_1.x;
@@ -811,8 +792,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                     }
                     s_running = __fmaf_rn(s_running, correction, weight_sum);
                     m_running = new_max;
-                    consumer_stage += 1;
-                    if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
+                    if (chunk_1 != 0) {
+                        consumer_stage += 1;
+                        if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
+                    }
                 }
                 float output_norm_first_values[8];
                 float2 local_output_sum_pair = make_float2(0.0f, 0.0f);
@@ -834,6 +817,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
                 float total_output_sum_sq = ((lane < 8) ? output_stats[output_stats_stage_base + (unsigned int)lane] : 0.0f);
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
+                consumer_stage += 1;
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 float _shfl_down_sync_24 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 4, 8);
                 total_output_sum_sq += _shfl_down_sync_24;
                 float _shfl_down_sync_25 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 2, 8);
@@ -869,12 +856,12 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                         float2 output_rsigma_pair = make_float2(output_rsigma, output_rsigma);
                         #pragma unroll
                         for (int pair_idx_11 = 0; pair_idx_11 < 2; pair_idx_11++) {
-                            const int value_idx_9 = pair_idx_11 * 2;
-                            const int acc_idx_4 = slice_idx_3 * 8 + value_idx_9;
+                            const int value_idx_11 = pair_idx_11 * 2;
+                            const int acc_idx_4 = slice_idx_3 * 8 + value_idx_11;
                             float2 _f32x2_mul_a_29 = make_float2(acc32[acc_idx_4], acc32[acc_idx_4 + 1]);
                             float2 scaled_pair_2;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_29), "l"(*(const unsigned long long*)&output_rsigma_pair));
-                            float2 _f32x2_mul_b_30 = make_float2(unpack_bf16_2[value_idx_9], unpack_bf16_2[value_idx_9 + 1]);
+                            float2 _f32x2_mul_b_30 = make_float2(unpack_bf16_2[value_idx_11], unpack_bf16_2[value_idx_11 + 1]);
                             float2 normalized_pair;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair) : "l"(*(const unsigned long long*)&scaled_pair_2), "l"(*(const unsigned long long*)&_f32x2_mul_b_30));
                             acc32[acc_idx_4] = normalized_pair.x;
@@ -891,7 +878,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 2], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 2]));
                             _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<int2*>(out + (token_1 * 7168 + hidden_base_4))[0] = reinterpret_cast<int2*>(_packed_2)[0];
+                        reinterpret_cast<int2*>(out + (consumer_token * 7168 + hidden_base_4))[0] = reinterpret_cast<int2*>(_packed_2)[0];
                     } else {
                         int hidden_tile_2 = slice_idx_3 * 2 + group;
                         int hidden_base_5 = hidden_tile_2 * 1024 + thread_in_group * 8;
@@ -913,12 +900,12 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                         float2 output_rsigma_pair_1 = make_float2(output_rsigma, output_rsigma);
                         #pragma unroll
                         for (int pair_idx_12 = 0; pair_idx_12 < 4; pair_idx_12++) {
-                            const int value_idx_10 = pair_idx_12 * 2;
-                            const int acc_idx_5 = slice_idx_3 * 8 + value_idx_10;
+                            const int value_idx_12 = pair_idx_12 * 2;
+                            const int acc_idx_5 = slice_idx_3 * 8 + value_idx_12;
                             float2 _f32x2_mul_a_31 = make_float2(acc32[acc_idx_5], acc32[acc_idx_5 + 1]);
                             float2 scaled_pair_3;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_31), "l"(*(const unsigned long long*)&output_rsigma_pair_1));
-                            float2 _f32x2_mul_b_32 = make_float2(unpack_bf16_3[value_idx_10], unpack_bf16_3[value_idx_10 + 1]);
+                            float2 _f32x2_mul_b_32 = make_float2(unpack_bf16_3[value_idx_12], unpack_bf16_3[value_idx_12 + 1]);
                             float2 normalized_pair_1;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1) : "l"(*(const unsigned long long*)&scaled_pair_3), "l"(*(const unsigned long long*)&_f32x2_mul_b_32));
                             acc32[acc_idx_5] = normalized_pair_1.x;
@@ -945,15 +932,44 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 6], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 6]));
                             _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_5))[0] = reinterpret_cast<int4*>(_packed_3)[0];
+                        reinterpret_cast<int4*>(out + (consumer_token * 7168 + hidden_base_5))[0] = reinterpret_cast<int4*>(_packed_3)[0];
                     }
                 }
+                int _stage_clc_full_1 = (int)((unsigned int)token_1 % 2);
+                int _parity_clc_full_1 = (int)((unsigned int)token_1 / 2 % 2);
+                mbarrier_wait(clc_full_addr + (_stage_clc_full_1) * 8, _parity_clc_full_1);
+                uint32_t valid_1 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(valid_1)
+                    : "r"(clc_slots_addr + (int)((unsigned int)token_1 % 2) * 16 + 0 * 16)
+                    : "memory");
+                uint32_t ctaid_1 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "+r"(ctaid_1)
+                    : "r"(clc_slots_addr + (int)((unsigned int)token_1 % 2) * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_arrive(clc_empty_addr + ((int)((unsigned int)token_1 % 2)) * 8);
+                if (valid_1 == 0) {
+                    break;
+                }
+                consumer_token = (int)ctaid_1;
             }
-            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("barrier.sync 2, 288;" ::: "memory");
-            if (consumer_warp == 0) {
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
-            }
         }
     }
 

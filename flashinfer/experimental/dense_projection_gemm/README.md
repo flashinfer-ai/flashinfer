@@ -316,7 +316,8 @@ it through a cached binding of this package: the deterministic package's plan an
 arena, keyed by the entry point's own tensors.  A batched forward that the deterministic package runs on its swapped
 small-token program makes that package's call (with `enable_pdl` and `weights_static`).
 A cached K2 launch of the convenience path orders its arguments once per cache key
-and converts the arena's BF16x3 stack once per arena growth, so a call converts only the caller's views.  A K2 call
+and converts the arena's BF16x3 stack once per arena growth, so a call passes only the caller's views (each
+converted in its FFI call) and enters the arena's stream context, made once.  A K2 call
 that runs the deterministic program -- the input gradient, the forward without a split count, a call without a split
 count whose row has no verdict in the router table of the device's SM count (`ROUTER_RULES`, or the part's own table
 in `ROUTER_RULES_BY_SM`; not planned here) -- launches it through a cached binding of this package: the
@@ -325,7 +326,11 @@ partials in this package's arena, bound once per arena growth, and the entry poi
 views.  It issues the same launches as the deterministic package's convenience path in fewer host operations.  Whether a row has a verdict is kept per device and view geometry, and whether any
 router table gives the forward one is kept too, until a router table changes: the router tables count their changes,
 so a verdict set or removed at run time is seen at the next call (a table rebound to a plain `dict` is read on every
-call).
+call).  The router entry points (`router_forward`, `router_dgrad`, `router_wgrad`) cache each call once more by their
+own tensors, the operation, the split count and the PDL flag: a call goes from that key to the cached launch its
+route takes, without building the transposed operand, routing the row or building the launch's own key; the key is
+routed again when a router table or `ROUTES` changes (with a table rebound to a plain `dict`, every call takes the
+full path).
 
 ## Benchmark
 

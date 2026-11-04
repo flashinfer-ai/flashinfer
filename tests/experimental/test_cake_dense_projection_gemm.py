@@ -33,7 +33,7 @@ import sys
 import threading
 import warnings
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -3776,6 +3776,277 @@ def test_k2_bound_arguments_are_the_ordered_arguments(monkeypatch, case):
         assert bound.fill is None
 
 
+def _cpu_k2_launches(monkeypatch, arch="sm_103a"):
+    """CPU binding tests of the router entry points' K2 launches (:func:`_cpu_k1_launches`, nothing is loaded or
+    launched): the entry points' tensors taken as on device 0, the zero fill of ``out`` (part tiles) recorded, fresh
+    K2 caches and router-table memo; returns the stand-in module's entry and the fill recorder."""
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    monkeypatch.setattr(cake_backend, "_k2_index", lambda A, B, out: 0)
+    monkeypatch.setattr(cake_backend, "_CU_DRIVER", False)
+    fill = Recorder()
+    monkeypatch.setattr(cake_backend, "_fill_rows", fill)
+    for cache in ("_K2_ATOMIC_CACHE", "_K2_SPLITK_CACHE", "_K2_ENTRY_CACHE"):
+        monkeypatch.setattr(cake_backend, cache, type(getattr(cake_backend, cache))())
+    memo = cake_backend._RouterMemo(-1, None, None, False, True)
+    monkeypatch.setattr(cake_backend, "_ROUTER_MEMO", memo)
+    return entry_fn, fill
+
+
+# A router entry point's call on a 152-SM sm_103a part: (op, T, hidden, splits, padded out, padded G, whether it runs
+# this package's program -- else the deterministic program through this package's binding)
+# fmt: off
+ROUTER_ENTRY_CASES = {
+    "fwd": ("fwd", 64, 5120, None, False, False, False),
+    "fwd_two_splits": ("fwd", 64, 5120, 2, False, False, True),
+    "fwd_padded_out": ("fwd", 64, 5120, None, True, False, False),
+    "dgrad": ("dgrad", 64, 5120, None, False, False, False),
+    "dgrad_padded_out": ("dgrad", 64, 5120, None, True, False, False),
+    "wgrad_waves": ("wgrad", 64, 5120, None, False, False, True),
+    "wgrad_head_tail": ("wgrad", 16172, 5120, None, False, False, True),
+    "wgrad_no_verdict": ("wgrad", 1000, 6144, None, False, False, False),
+    "wgrad_padded_out": ("wgrad", 64, 5120, 2, True, False, True),
+    "wgrad_torch_chain": ("wgrad", 64, 5120, None, False, True, True),
+}
+# fmt: on
+
+
+def _router_entry_call(case):
+    """``(call, out)``: a router entry point's ``deterministic=False`` call of ``case`` (:data:`ROUTER_ENTRY_CASES`)
+    on fresh CPU tensors, and its output."""
+    op, T, H, splits, pad_out, pad_g, _ = ROUTER_ENTRY_CASES[case]
+    X, W = torch.empty(T, H), torch.empty(256, H)
+    G = torch.empty(T, 256 + 16)[:, :256] if pad_g else torch.empty(T, 256)
+    rows, cols = {"fwd": (T, 256), "dgrad": (T, H), "wgrad": (256, H)}[op]
+    out = torch.empty(rows, cols + 64)[:, :cols] if pad_out else torch.empty(rows, cols)
+    kw = (
+        dict(deterministic=False)
+        if op == "dgrad"
+        else dict(deterministic=False, splits=splits)
+    )
+    call = {
+        "fwd": lambda: cake_backend.router_forward(X, W, out, **kw),
+        "dgrad": lambda: cake_backend.router_dgrad(G, W, out, **kw),
+        "wgrad": lambda: cake_backend.router_wgrad(G, X, out, **kw),
+    }[op]
+    return call, out
+
+
+@pytest.mark.parametrize("case", sorted(ROUTER_ENTRY_CASES))
+def test_router_entry_points_launch_their_paths_launches(monkeypatch, case):
+    """With ``deterministic=False`` a router entry point's call goes through ``_K2_ENTRY_CACHE``: planned once per key
+    of its own tensors into the cached launch its own path takes (the same ``_K2_SPLITK_CACHE`` / ``_K2_ATOMIC_CACHE``
+    entry, under the same key), it issues that path's launches -- the same programs with the same arguments, the
+    same split and zero fill -- and the next calls go from the key to the bound launch (no geometry, layout, key of
+    the launch or planning)."""
+    entry_fn, fill = _cpu_k2_launches(monkeypatch)
+    split = Recorder()  # the torch chain's split
+    monkeypatch.setattr(det_backend, "split_fp32_to_bf16x3_det_", split)
+    op, *_, atomic = ROUTER_ENTRY_CASES[case]
+    call, out = _router_entry_call(case)
+    with monkeypatch.context() as m:
+        m.setattr(cake_backend, "_k2_entry", lambda *args: None)
+        assert call() is out
+    recorders = (entry_fn, fill, split)
+    want = [list(r.calls) for r in recorders]
+    assert len(want[0]) == (1 if case.endswith("torch_chain") else 2)
+    assert len(want[2]) == (1 if case.endswith("torch_chain") else 0)
+    inner = cake_backend._K2_ATOMIC_CACHE if atomic else cake_backend._K2_SPLITK_CACHE
+    ((inner_key, launch),) = [(k, e) for k, e in inner.items() if e.plan is not None]
+    for again in range(3):
+        for r in recorders:
+            r.calls.clear()
+        assert call() is out
+        for r, expected in zip(recorders, want, strict=True):
+            assert len(r.calls) == len(expected)
+            for (args, kwargs), (w_args, w_kwargs) in zip(
+                r.calls, expected, strict=True
+            ):
+                _same_arguments(list(args), list(w_args))
+                assert kwargs == w_kwargs
+        ((key, entry),) = cake_backend._K2_ENTRY_CACHE.items()
+        assert key[2][0] == op and key[2][2] == 1  # the PDL flag: the device's default
+        assert entry.launch is launch and entry.atomic == atomic
+        assert entry.arena is launch.arena
+        assert inner[inner_key] is launch
+        if again == 0:
+            for name in ("_k2_geometry", "_k2_layout", "_k2_key", "_plan_k2_entry"):
+                monkeypatch.setattr(
+                    cake_backend,
+                    name,
+                    lambda *args, _n=name: pytest.fail(f"{_n} on a cached call"),
+                )
+    assert len(fill.calls) == int(atomic and launch.k2.fill is not None)
+
+
+def test_router_entry_cache_keys_and_routes_again(monkeypatch):
+    """``_K2_ENTRY_CACHE`` keys a call by the device, the raw stream, the operation, the split count, the PDL flag and
+    the entry point's tensors, and routes a key again after a router table changes (a forward verdict set at run time
+    runs this package's program, its removal the deterministic one) or a ``ROUTES`` value does; a call whose tensors
+    are not on one CUDA device, or made while a router table is a plain ``dict``, takes the entry point's own path.
+    ``clear_convenience_caches`` drops the entries."""
+    arch, sm_count = "sm_103a", 152
+    X, W, out = torch.empty(64, 5120), torch.empty(256, 5120), torch.empty(64, 256)
+    assert cake_backend._k2_entry("fwd", X, W, out, None, None) is None  # CPU tensors
+    entry_fn, _ = _cpu_k2_launches(monkeypatch, arch)
+    cache = cake_backend._K2_ENTRY_CACHE
+
+    def fwd(**kw):
+        n = len(entry_fn.calls)
+        assert cake_backend.router_forward(X, W, out, deterministic=False, **kw) is out
+        assert len(entry_fn.calls) > n
+        return cache[next(reversed(cache))]
+
+    forward_verdicts = cake_backend._router_memo().forward_verdicts
+    fwd()
+    fwd(enable_pdl=False)
+    fwd(splits=2)
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 7)
+    fwd()
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 0)
+    keys = list(cache)
+    assert [k[:3] for k in keys] == [
+        (0, 0, ("fwd", None, 1)),
+        (0, 0, ("fwd", None, 0)),
+        (0, 0, ("fwd", 2, 1)),
+        (0, 7, ("fwd", None, 1)),
+    ]
+    assert [k[3:] for k in keys] == [keys[0][3:]] * 4
+    assert cache[keys[2]].atomic and (cache[keys[2]].layout, cache[keys[2]].route) == (
+        "k2_kk",
+        "atomic",
+    )
+    assert [cache[k].arena.key for k in keys] == [(0, 0), (0, 0), (0, 0), (0, 7)]
+    if not forward_verdicts:  # the forward without a split count reads no route
+        assert all(cache[k].layout is None and not cache[k].atomic for k in keys[:2])
+    # a forward verdict set at run time, and removed: this package's program, then the deterministic one
+    table, _ = cake_backend.router_rules(arch, sm_count)
+    if table is cake_backend.ROUTER_RULES:
+        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+    X, W, out = torch.empty(1000, 6144), torch.empty(256, 6144), torch.empty(1000, 256)
+    key = (arch, "kk", 6144, 256)
+    assert table.get(key) is None  # no verdict on any architecture
+    before = fwd()
+    assert not before.atomic and before.launch is not None
+    monkeypatch.setitem(table, key, "forward")
+    after = fwd()
+    assert after.atomic and after.memo is not before.memo and after.route == "atomic"
+    assert after.launch.plan is not None and after.launch.k2 is not None
+    table[key] = None
+    assert not fwd().atomic
+    # a ROUTES value changed at run time
+    X, G, out = torch.empty(64, 5120), torch.empty(64, 256), torch.empty(256, 5120)
+
+    def wgrad():
+        n = len(entry_fn.calls)
+        assert cake_backend.router_wgrad(G, X, out, deterministic=False) is out
+        assert len(entry_fn.calls) > n
+        return cache[next(reversed(cache))]
+
+    assert wgrad().atomic
+    monkeypatch.setitem(cake_backend.ROUTES, "k2_nn_t", "det")
+    routed = wgrad()
+    assert not routed.atomic and routed.launch is not None
+    assert (routed.layout, routed.route) == ("k2_nn_t", "det")
+    monkeypatch.setitem(cake_backend.ROUTES, "k2_nn_t", "atomic")
+    assert wgrad().atomic
+    # a router table rebound to a plain dict: every call takes the entry point's own path
+    size = len(cache)
+    with monkeypatch.context() as m:
+        m.setattr(cake_backend, "ROUTER_RULES", dict(cake_backend.ROUTER_RULES))
+        assert cake_backend._k2_entry("wgrad", G, X, out, None, None) is None
+        n = len(entry_fn.calls)
+        assert cake_backend.router_wgrad(G, X, out, deterministic=False) is out
+        assert len(entry_fn.calls) > n and len(cache) == size
+    cake_backend.clear_convenience_caches()
+    assert not cache and not cake_backend._ATOMIC_ARENAS
+
+
+def test_router_entry_without_a_bound_launch_takes_the_entry_points_path(monkeypatch):
+    """A key whose launch is not bound, or whose plan does not take the entry point's tensors as its launch views,
+    is kept without a launch: its calls take the entry point's own path (without planning the key again), and a plan
+    with the entry point's flags is bound."""
+    _cpu_k2_launches(monkeypatch)
+    G, W, out = torch.empty(64, 256), torch.empty(256, 5120), torch.empty(64, 5120)
+    arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))
+    memo = cake_backend._router_memo()
+
+    def plan(flags, bound):
+        swapped, a_mn, b_mn = flags
+        return cake_backend._CachedSplitK2(
+            plan=SimpleNamespace(swapped=swapped, a_mn=a_mn, b_mn=b_mn),
+            entry=Recorder(),
+            arena=arena,
+            k2=bound,
+        )
+
+    dgrad_flags = cake_backend._DGRAD_VIEWS
+    for launch, kept in (
+        (plan(dgrad_flags, None), False),
+        (plan(cake_backend._FORWARD_VIEWS, object()), False),
+        (plan(dgrad_flags, object()), True),
+    ):
+        cake_backend._K2_SPLITK_CACHE.clear()
+        monkeypatch.setattr(
+            cake_backend, "_plan_splitk_k2", lambda *args, launch=launch: launch
+        )
+        entry = cake_backend._plan_k2_entry("dgrad", G, W, out, 1, 0, 0, 1, memo)
+        assert (entry.launch is launch) == kept and (entry.arena is arena) == kept
+        assert entry.memo is memo and entry.layout is None and not entry.atomic
+    monkeypatch.setattr(
+        cake_backend, "_plan_splitk_k2", lambda *args: plan(dgrad_flags, None)
+    )
+    cake_backend._K2_SPLITK_CACHE.clear()
+    path = Recorder()
+    monkeypatch.setattr(cake_backend, "_splitk_k2", path)
+    assert cake_backend.router_dgrad(G, W, out, deterministic=False) is path.result
+    ((key, entry),) = cake_backend._K2_ENTRY_CACHE.items()
+    assert entry.launch is None and key[2] == ("dgrad", 1, 1)
+    monkeypatch.setattr(
+        cake_backend, "_plan_k2_entry", lambda *args: pytest.fail("planned again")
+    )
+    assert cake_backend.router_dgrad(G, W, out, deterministic=False) is path.result
+    assert len(path.calls) == 2
+
+
+def test_router_entry_cache_holds_its_arenas(monkeypatch):
+    """An entry of ``_K2_ENTRY_CACHE`` holds a reference to its launch's arena, as the launch's own entry does: an
+    arena's reference count is the number of cached entries of every cache that use it, eviction (the cache bound)
+    drops them, and an arena no entry uses any more is released."""
+    _cpu_k2_launches(monkeypatch)
+    monkeypatch.setattr(det_backend, "CONVENIENCE_CACHE_SIZE", 3)
+    W = torch.empty(256, 6144)
+    caches = (
+        cake_backend._K2_ENTRY_CACHE,
+        cake_backend._K2_SPLITK_CACHE,
+        cake_backend._K2_ATOMIC_CACHE,
+    )
+
+    def dgrad(T):
+        G, out = torch.empty(T, 256), torch.empty(T, 6144)
+        assert cake_backend.router_dgrad(G, W, out, deterministic=False) is out
+        arenas = list(cake_backend._ATOMIC_ARENAS.values())
+        for arena in arenas:
+            users = sum(e.arena is arena for c in caches for e in c.values())
+            assert arena.refs == users > 0
+        assert all(
+            any(e.arena is a for a in arenas) for c in caches for e in c.values()
+        )
+        return {a.key: a.refs for a in arenas}
+
+    for T in (64, 128, 192, 256, 320):
+        refs = dgrad(T)
+    assert len(caches[0]) == len(caches[1]) == 3 and refs == {(0, 0): 6}
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 7)
+    assert dgrad(64) == {(0, 0): 4, (0, 7): 2}  # an arena of the stream's own
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 0)
+    for T in (64, 128, 192):
+        refs = dgrad(T)
+    assert refs == {(0, 0): 6}  # evicted from both caches: released
+    cake_backend.clear_convenience_caches()
+    assert not cake_backend._ATOMIC_ARENAS and not any(caches)
+
+
 def test_deterministic_backend_follows_the_binding_and_sys_modules(monkeypatch):
     """``deterministic_backend`` returns the module an import of the bound package's ``cake_backend`` returns: a
     rebinding and a replaced ``sys.modules`` entry are seen on the next call."""
@@ -5713,6 +5984,156 @@ def test_gpu_router_misaligned_out_takes_the_deterministic_path():
         )
     with pytest.raises(ValueError, match=message):
         cake_backend.router_fp32_gemm(X, W.t(), out, splits=1, deterministic=False)
+
+
+def _router_entry_of(op, P, Q, out, splits, stream):
+    """The ``_K2_ENTRY_CACHE`` entry of a router entry point's call (``op`` and its tensors ``P``, ``Q``, ``out``)
+    on ``stream`` with the device's default PDL flag, or ``None``."""
+    index = out.get_device()
+    pdl = int(det_backend.pdl_enabled(None, index))
+    key = cake_backend._k1_key(index, stream.cuda_stream, (op, splits, pdl), P, Q, out)
+    return cake_backend._K2_ENTRY_CACHE.get(key)
+
+
+def _router_entry_bits(entry) -> bool:
+    """Whether a cached router entry's launch repeats bit for bit: the deterministic program, or a reproducible plan
+    of this package's."""
+    return not entry.atomic or entry.launch.plan.reproducible
+
+
+@pytest.mark.parametrize("hidden, T", [(5120, 64), (4096, 256), (6144, 1000)])
+def test_gpu_router_entry_points_give_their_paths_results(monkeypatch, hidden, T):
+    """``deterministic=False`` through ``_K2_ENTRY_CACHE``: every router entry point's call -- the forward with and
+    without a split count, the input gradient, the weight gradient with and without one; dense and padded outputs;
+    another stream -- binds the launch its own path takes and gives that path's results on repeated calls: the
+    deterministic program and a reproducible plan bit for bit (the deterministic program the deterministic package's
+    bits), every launch within the gate; the padding keeps its values."""
+    device, arch = _atomic_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    X, W, G = _router_inputs(T, device, SEED + 100 + T, K=hidden)
+    tensors = {"fwd": (X, W), "dgrad": (G, W), "wgrad": (G, X)}
+    calls = {
+        "fwd": cake_backend.router_forward,
+        "dgrad": cake_backend.router_dgrad,
+        "wgrad": cake_backend.router_wgrad,
+    }
+    shapes = {"fwd": (T, 256), "dgrad": (T, hidden), "wgrad": (256, hidden)}
+    side = torch.cuda.Stream(device)
+    ran = {"bits": 0, "gate": 0}
+    # fmt: off
+    cases = (
+        ("fwd", None, False, False), ("fwd", 2, False, False), ("fwd", None, True, True),
+        ("dgrad", None, False, False), ("dgrad", None, True, True),
+        ("wgrad", None, False, False), ("wgrad", 2, True, False), ("wgrad", None, False, True),
+    )
+    # fmt: on
+    for op, splits, pad, on_side in cases:
+        P, Q = tensors[op]
+        kw = dict(deterministic=False)
+        if op != "dgrad":
+            kw["splits"] = splits
+        rows, cols = shapes[op]
+        storage = torch.full((rows, cols + (64 if pad else 0)), 7.0, device=device)
+        out = storage[:, :cols]
+        ref = (P.double().t() if op == "wgrad" else P.double()) @ (
+            Q.double().t() if op == "fwd" else Q.double()
+        )
+        stream = side if on_side else torch.cuda.current_stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            with monkeypatch.context() as m:
+                m.setattr(cake_backend, "_k2_entry", lambda *args: None)
+                want = calls[op](P, Q, out, **kw).clone()
+            for _ in range(3):
+                out.fill_(float("nan"))
+                assert calls[op](P, Q, out, **kw) is out
+                stream.synchronize()
+                entry = _router_entry_of(
+                    op, P, Q, out, splits if op != "dgrad" else 1, stream
+                )
+                assert entry is not None and entry.launch is not None, (op, splits, pad)
+                assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX, (op, splits, pad)
+                assert bool((storage[:, cols:] == 7.0).all()), (op, splits, pad)
+                if _router_entry_bits(entry):
+                    assert torch.equal(out, want), (op, splits, pad)
+            if not entry.atomic:
+                det_kw = {} if op == "dgrad" or splits is None else {"splits": splits}
+                det_out = calls[op](P, Q, torch.empty_like(out), **det_kw)
+                stream.synchronize()
+                assert torch.equal(out, det_out), (op, splits, pad)
+        ran["bits" if _router_entry_bits(entry) else "gate"] += 1
+    print(f"ROUTER_ENTRY {arch} H{hidden} T{T}: {ran}")
+
+
+def test_gpu_router_entry_points_capture_in_a_cuda_graph(monkeypatch):
+    """The router entry points' ``deterministic=False`` calls through ``_K2_ENTRY_CACHE`` (the forward with and
+    without a split count, the input gradient, the weight gradient of a row with a verdict and of one without), their
+    keys cached on the capturing stream, capture in a CUDA graph without planning: every replay gives the eager calls'
+    results -- bit for bit for the deterministic program and a reproducible plan -- within the gate."""
+    device, arch = _atomic_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    stream = torch.cuda.Stream(device)
+    cases = []
+    for hidden, T in ((5120, 64), (6144, 1000)):
+        X, W, G = _router_inputs(T, device, SEED + 110 + T, K=hidden)
+        # name -> (op, P, Q, splits, out)
+        # fmt: off
+        cases += [
+            ("fwd", X, W, None, torch.empty(T, 256, device=device)),
+            ("fwd", X, W, 2, torch.empty(T, 256, device=device)),
+            ("dgrad", G, W, 1, torch.empty(T, hidden, device=device)),
+            ("wgrad", G, X, None, torch.empty(256, hidden, device=device)),
+        ]
+        # fmt: on
+
+    def run_all():
+        for op, P, Q, splits, out in cases:
+            if op == "fwd":
+                cake_backend.router_forward(
+                    P, Q, out, splits=splits, deterministic=False
+                )
+            elif op == "dgrad":
+                cake_backend.router_dgrad(P, Q, out, deterministic=False)
+            else:
+                cake_backend.router_wgrad(P, Q, out, splits=splits, deterministic=False)
+
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            run_all()
+    stream.synchronize()
+    eager = [out.clone() for *_, out in cases]
+    entries = [_router_entry_of(op, P, Q, out, s, stream) for op, P, Q, s, out in cases]
+    assert all(e is not None and e.launch is not None for e in entries)
+    keys = set(cake_backend._K2_ENTRY_CACHE)
+    graph = torch.cuda.CUDAGraph()
+    with monkeypatch.context() as m:
+        m.setattr(
+            cake_backend,
+            "_plan_k2_entry",
+            lambda *args: pytest.fail("planned in capture"),
+        )
+        with torch.cuda.graph(graph, stream=stream):
+            run_all()
+    assert set(cake_backend._K2_ENTRY_CACHE) == keys
+    for _ in range(3):
+        for *_, out in cases:
+            out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for (op, P, Q, splits, out), want, entry in zip(
+            cases, eager, entries, strict=True
+        ):
+            ref = (P.double().t() if op == "wgrad" else P.double()) @ (
+                Q.double().t() if op == "fwd" else Q.double()
+            )
+            assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX, (op, splits)
+            if _router_entry_bits(entry):
+                assert torch.equal(out, want), (op, splits)
+    print(
+        f"ROUTER_ENTRY_GRAPH {arch}: {len(cases)} launches, "
+        f"{sum(map(_router_entry_bits, entries))} bit for bit"
+    )
 
 
 # ---------------------------------------------------------------------------
