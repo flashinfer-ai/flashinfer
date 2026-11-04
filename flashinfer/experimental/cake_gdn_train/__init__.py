@@ -14,64 +14,59 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: context-parallel (KCP) packed GDN (Gated DeltaNet)
-# chunked training with precise cross-rank state passing, native grouped Q/K
-# heads (``HV = r * H_qk``), the FP32 scalar gate and FP32 beta, per-document
-# zigzag / ragged partitions (head dimension 128, chunk 64) on SM100 / SM103 /
-# SM107.  The public entry points are ``flashinfer.gdn_train.kcp_partition``,
-# ``build_kcp_context``, ``chunk_gdn_kcp``, ``chunk_gdn_kcp_fwd``,
-# ``chunk_gdn_kcp_bwd`` and the byte queries; the partition / context plan, the
-# host orchestration, the options, the registry and the generated sources live
-# here.  This package imports itself, torch and torch.distributed only (never
-# ``cake_kda_train``) and reads no environment variable.
+# Legacy import path of the deterministic context-parallel GDN training package: the
+# canonical package is ``flashinfer.experimental.cake_gdn_det_train_kcp``.  This package
+# holds no code, sources or manifests of its own: it re-exports the canonical package's
+# public names and the pre-rename compatibility aliases (the same objects), and each
+# submodule (``cake_kcp_plan``, ...) is the canonical submodule object itself.
 
-from .cake_kcp import (
-    KCP_SAVED_VERSION,
-    LAST_CALL,
-    PROGRAMS,
-    SCALE,
-    Backend,
+from ..cake_gdn_det_train_kcp import *  # noqa: F403
+from ..cake_gdn_det_train_kcp import __all__ as _canonical_all
+from ..cake_gdn_det_train_kcp import (  # noqa: F401 - compatibility aliases
     ChunkGDNKcpFunction,
-    FakeBackend,
     KcpCall,
+    KcpContext,
+    KcpFragment,
+    KcpOptions,
+    KcpPartition,
+    KcpRecomputeHandle,
     KcpSaved,
     KcpWorkspace,
-    KernelBackend,
+    build_kcp_context,
     chunk_gdn_kcp,
     chunk_gdn_kcp_bwd,
     chunk_gdn_kcp_fwd,
     gdn_kcp_comm_bytes,
     gdn_kcp_saved_bytes,
     gdn_kcp_workspace_bytes,
-    get_backend,
-    graph_cache_clear,
-    set_backend,
-)
-from .cake_kcp_plan import (
-    KcpContext,
-    KcpFragment,
-    KcpPartition,
-    build_kcp_context,
     kcp_partition,
 )
-from .cake_options import KcpOptions, make_options, validate_heads, validate_ring
 
+# The submodules as attributes of this package, as before the rename (each import runs its alias shim).
+from . import (  # noqa: F401, E402
+    cake_backend,
+    cake_build,
+    cake_bytes,
+    cake_fake_backend,
+    cake_jit,
+    cake_kcp,
+    cake_kcp_plan,
+    cake_options,
+    cake_tables,
+)
+
+# The canonical names and the pre-rename names, so ``from ... import *`` binds both.
 __all__ = [
-    "KCP_SAVED_VERSION",
-    "LAST_CALL",
-    "PROGRAMS",
-    "SCALE",
-    "Backend",
+    *_canonical_all,
     "ChunkGDNKcpFunction",
-    "FakeBackend",
     "KcpCall",
     "KcpContext",
     "KcpFragment",
     "KcpOptions",
     "KcpPartition",
+    "KcpRecomputeHandle",
     "KcpSaved",
     "KcpWorkspace",
-    "KernelBackend",
     "build_kcp_context",
     "chunk_gdn_kcp",
     "chunk_gdn_kcp_bwd",
@@ -79,11 +74,5 @@ __all__ = [
     "gdn_kcp_comm_bytes",
     "gdn_kcp_saved_bytes",
     "gdn_kcp_workspace_bytes",
-    "get_backend",
-    "graph_cache_clear",
     "kcp_partition",
-    "make_options",
-    "set_backend",
-    "validate_heads",
-    "validate_ring",
 ]

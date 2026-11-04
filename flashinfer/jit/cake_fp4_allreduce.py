@@ -30,9 +30,13 @@ each served instead of its call's whole program for one band of row counts --
 and ``LIMITS``: the host rules).  Every
 program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
-B300, ``sm_107a`` for SM107 devices) with that target's flag set, without fast math and with
-``--fmad=false``, into a module named after the program, the target and a
-digest of its sources.  Build targets follow ``FLASHINFER_CUDA_ARCH_LIST``
+B300, ``sm_107a`` for SM107 devices) with that target's flag set and the
+program's ``-D`` defines (:func:`program_defines`: the kernel symbol, the CTA
+size and the dynamic shared memory of its form's shared binding, and the
+residual prefetch of a prefetch program, which shares its base program's
+kernel source), without fast math and with ``--fmad=false``, into a module
+named after the program, the target and a digest of its sources and
+defines.  Build targets follow ``FLASHINFER_CUDA_ARCH_LIST``
 when set, else the visible devices (:class:`CompilationContext`); a device
 whose capability is not a build target is rejected by :func:`target_arch`.
 """
@@ -44,18 +48,18 @@ import hashlib
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
 from ..compilation_context import CompilationContext
-from . import cake_fp4_allreduce_programs as _programs
 from . import env as jit_env
 from .cake_fp4_allreduce_programs import (
     LIMITS,
     PROGRAMS,
     SELECT_BV,
     SELECT_PREFETCH,
+    SELECT_ROWS,
     WINDOWS,
 )
 from .core import (
@@ -66,15 +70,10 @@ from .core import (
     sm107a_nvcc_flags,
 )
 
-CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a", "sm_107a"]
-
 # SELECT_ROWS: per rows-dispatched program (a fused-norm or a world-size-2
 # all-reduce program), the band of row counts it serves instead of the whole
-# program of its call -- ``{"kind": "prefix" | "suffix", "threshold": rows,
-# "whole": {target: whole program}}``, the threshold inclusive for both kinds
-# (:func:`select_rows`).  A registry written before the generator published the
-# literal has no dispatched program.
-SELECT_ROWS: dict[str, dict[str, Any]] = dict(getattr(_programs, "SELECT_ROWS", {}))
+# program of its call -- ``{"kind": "prefix" | "suffix", "threshold": rows}``,
+# the threshold inclusive for both kinds (:func:`select_rows`).
 
 SOURCE_PACKAGE = "cake_fp4_allreduce"
 MODULE_PREFIX = "cake_fp4_allreduce"
@@ -213,13 +212,12 @@ def programs(
     input_format: Optional[str] = None,
     output_format: Optional[str] = None,
     bv: Optional[int] = None,
-    poll: Optional[str] = None,
     prefetch: Optional[bool] = None,
     target: Optional[str] = None,
 ) -> tuple[str, ...]:
     """Program ids whose registry rows match every given key, in registry order.
 
-    ``output_format=None``, ``bv=None``, ``poll=None`` and ``prefetch=None`` do
+    ``output_format=None``, ``bv=None`` and ``prefetch=None`` do
     not filter; pass ``output_format=""`` to select the rows without an output
     format (the ``allreduce`` family).  ``target`` keeps the rows compiled for
     that target.
@@ -238,8 +236,6 @@ def programs(
             if record["output_format"] != wanted:
                 continue
         if bv is not None and record["bv"] != int(bv):
-            continue
-        if poll is not None and record["poll"] != poll:
             continue
         if prefetch is not None and record["prefetch"] != bool(prefetch):
             continue
@@ -265,26 +261,6 @@ def world_sizes(family: str) -> tuple[int, ...]:
             }
         )
     )
-
-
-def output_formats(family: str, world_size: int, input_format: str) -> tuple[str, ...]:
-    """Output formats of one (family, world size, input format): ``("",)`` when the family has none."""
-
-    formats = tuple(
-        dict.fromkeys(
-            "" if record["output_format"] is None else record["output_format"]
-            for record in PROGRAMS.values()
-            if record["family"] == family
-            and int(record["world_size"]) == int(world_size)
-            and record["input_format"] == input_format
-        )
-    )
-    if not formats:
-        raise ValueError(
-            "no Cake NVFP4-transport all-reduce program for family "
-            f"{family!r}, world size {world_size}, input format {input_format!r}"
-        )
-    return formats
 
 
 def select_bv(rows: int, grid: int) -> int:
@@ -529,6 +505,32 @@ def program_sources(program: str) -> list[Path]:
     return [_source_path(relative) for relative in program_record(program)["sources"]]
 
 
+def program_defines(program: str) -> list[str]:
+    """The ``-D`` flags that select ``program`` in its shared sources.
+
+    The binding of a (family, world size, input format, output format) form
+    serves every program of the form: ``CAKE_FP4_ALLREDUCE_KERNEL`` names the
+    kernel symbol, ``CAKE_FP4_ALLREDUCE_THREADS`` the CTA size (the registry
+    ``block``) and ``CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM`` the dynamic shared memory
+    (``dynamic_smem_bytes``).  A fused-norm kernel source serves its own
+    program and that program's prefetch twin: the symbol macro's default is
+    its base program's symbol, and ``CAKE_FP4_ALLREDUCE_PREFETCH`` enables the
+    residual prefetch of the twin.  Every record passes its symbol, block and
+    dynamic shared memory; a kernel without a twin reads none of the macros,
+    so the flags change nothing there.
+    """
+
+    record = program_record(program)
+    defines = [
+        f"-DCAKE_FP4_ALLREDUCE_KERNEL={record['kernel_symbol']}",
+        f"-DCAKE_FP4_ALLREDUCE_THREADS={int(record['block'])}",
+        f"-DCAKE_FP4_ALLREDUCE_DYNAMIC_SMEM={int(record['dynamic_smem_bytes'])}",
+    ]
+    if record["prefetch"]:
+        defines.append("-DCAKE_FP4_ALLREDUCE_PREFETCH=1")
+    return defines
+
+
 def _check_target(target: str) -> None:
     if target not in TARGET_FLAGS:
         raise ValueError(
@@ -539,12 +541,15 @@ def _check_target(target: str) -> None:
 
 @functools.cache
 def module_name(program: str, target: str) -> str:
-    """``cake_fp4_allreduce_<program>_<target>_<digest>``: the exact target and a SHA-256 over the sources (20 hex digits).
+    """``cake_fp4_allreduce_<program>_<target>_<digest>``: the exact target and a SHA-256 over the sources and the program's defines (20 hex digits).
 
     FlashInfer resolves installed AOT artifacts by module name before ninja
     sees the build inputs, so the content-derived name keeps a changed program
     from reusing a stale library, and the target keeps the exact-architecture
-    libraries of one program apart under one target set.
+    libraries of one program apart under one target set.  The digest takes
+    the bytes of every source in registry order, then every ``-D`` flag of
+    :func:`program_defines` in order as UTF-8 text, so a define-only change
+    of a record renames its modules.
     """
 
     _check_target(target)
@@ -557,18 +562,24 @@ def module_name(program: str, target: str) -> str:
     digest = hashlib.sha256()
     for source in program_sources(program):
         digest.update(source.read_bytes())
+    for define in program_defines(program):
+        digest.update(define.encode())
     return f"{MODULE_PREFIX}_{program}_{target}_{digest.hexdigest()[:20]}"
 
 
 @functools.cache
 def gen_cake_fp4_allreduce_module(program: str, target: str) -> JitSpec:
-    """JIT spec of one (program, exact target): the device and binding translation units, the target's flags, no fast math."""
+    """JIT spec of one (program, exact target): the device and binding translation units, the target's flags, the program's defines, no fast math."""
 
     source_dir = _source_dir()
     return gen_jit_spec(
         name=module_name(program, target),
         sources=program_sources(program),
-        extra_cuda_cflags=[*TARGET_FLAGS[target], *COMPILE_FLAGS],
+        extra_cuda_cflags=[
+            *TARGET_FLAGS[target],
+            *COMPILE_FLAGS,
+            *program_defines(program),
+        ],
         extra_include_paths=[source_dir, source_dir.parent, _include_dir()],
         # The source build carries ``--fmad=false``; FlashInfer's default
         # ``-use_fast_math`` would change the codec's rounding.
@@ -612,7 +623,6 @@ __all__ = [
     "TARGET_CAPABILITIES",
     "TARGET_FLAGS",
     "WINDOWS",
-    "CakeFp4AllReduceTarget",
     "DeviceFacts",
     "device_facts",
     "evaluate_linear_form",
@@ -621,7 +631,7 @@ __all__ = [
     "get_cake_fp4_allreduce_module",
     "grid_max",
     "module_name",
-    "output_formats",
+    "program_defines",
     "program_for",
     "program_record",
     "program_sources",

@@ -19,22 +19,76 @@ from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.experimental import primitives as prims
+from cutlass.pipeline.sm100 import PipelineClcFetchAsync, PipelineTmaUmma
 
-from cutlass.experimental.task_scheduling.enums import TileSchedulerType
+from cutlass.experimental.task_scheduling.enums import PipelineType, TileSchedulerType
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     StageInfo,
     TaskLocalVariable,
     WorkQueue,
-    WorkTileInfo,
     consumer_work,
+)
+from cutlass.utils.dynamic_persistent_tile_scheduler import (
+    ClcDynamicPersistentTileScheduler,
 )
 
 from .batched_gemm_config import BatchedGemmConfig
+from .batched_gemm_cga import (
+    active_cga_coords,
+    active_clc_consumer_threads,
+    has_multiple_umma_atoms,
+    host_clc_consumer_threads,
+    is_flexible_cga,
+)
 
 Constexpr = cutlass.Constexpr
+
+
+class MixedCgaClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileScheduler):
+    """Decode the shared launch grid for preferred and fallback CGAs.
+
+    Both physical cluster shapes use the preferred cluster's launch grid.
+    N rasterization packs preferred-cluster tiles into grid Z; fallback
+    cluster leaders additionally carry X/Y offsets within those tiles.
+    """
+
+    @cute.jit
+    def _swizzle_and_rasterize(
+        self,
+        x_idx,
+        y_idx,
+        z_idx,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if cutlass.const_expr(self.params.swizzle_size != 1):
+            raise ValueError("mixed-CGA BatchedGemm requires swizzle_size=1")
+
+        if cutlass.const_expr(self.params._raster_along_m):
+            return x_idx, y_idx, z_idx
+
+        # get_grid_shape() packs Z using the preferred shape for the entire
+        # launch. Decode that same grid for both physical cluster shapes.
+        cluster_minor_batch, cluster_major = divmod(
+            z_idx, self.params.cluster_shape_major_fdd
+        )
+        batch_l, cluster_minor = divmod(
+            cluster_minor_batch, self.params.cluster_shape_minor_fdd
+        )
+        cluster_shape_m, cluster_shape_n = self.params.cluster_shape_mn
+        # Preferred leaders have x_idx=y_idx=0. Fallback leaders may start
+        # inside that preferred tile; preserve their offsets. The caller adds
+        # each CTA's coordinates within its physical cluster afterward.
+        return (
+            cluster_minor * cluster_shape_m + x_idx,
+            cluster_major * cluster_shape_n + y_idx,
+            batch_l,
+        )
 
 
 @dataclass(kw_only=True)
@@ -48,6 +102,10 @@ class WorkThrottleBarrierResource(MemoryResource):
 
     is_barrier: Constexpr[bool] = True
     producer_state_owned_by_signaling_ctas_only: Constexpr[bool] = True
+    # WorkSchedule is physical-CGA CTA0-only. The stock CtaLeader predicate is
+    # based on the static 2-CTA UMMA atom and would also select ranks 2, 4, ...
+    # in a wider CGA, creating local throttle barriers that no task releases.
+    global_cga_producer_cta0: Constexpr[bool] = True
 
 
 @dataclass(kw_only=True)
@@ -80,11 +138,11 @@ class BatchedGemmWorkQueue(WorkQueue):
         self.cfg = cfg
         self.num_non_exiting_ctas_tensor = num_non_exiting_ctas_tensor
         self.num_non_exiting_ctas_value = num_non_exiting_ctas_value
-        self.fast_drain_response_ptr = None
-        self.fast_drain_mbar_ptr = None
+        self.fast_drain_response_ptr = fast_drain_response_ptr
+        self.fast_drain_mbar_ptr = fast_drain_mbar_ptr
         object.__setattr__(self, "_alloc_fast_drain_response", None)
         object.__setattr__(self, "_alloc_fast_drain_mbar", None)
-        if self._uses_fast_drain():
+        if self._uses_fast_drain() and fast_drain_mbar_ptr is None:
             object.__setattr__(
                 self,
                 "_alloc_fast_drain_response",
@@ -106,42 +164,10 @@ class BatchedGemmWorkQueue(WorkQueue):
             )
 
     def _uses_fast_drain(self) -> bool:
-        # Batched cancellation bypasses the logical raster transform.
         return (
             getattr(self.cfg, "is_persistent", False)
             and getattr(self.cfg, "use_early_exit", False)
             and getattr(self.cfg, "use_clc_fast_drain", False)
-            and not self.cfg.rasterizes_features_first
-        )
-
-    @cute.jit
-    def _rasterize_batch_m_work_tile(self, work_tile):
-        if cutlass.const_expr(self.cfg.rasterizes_features_first):
-            m_idx, n_idx, l_idx = work_tile.tile_idx
-            grid_m, grid_n, _ = cute.arch.grid_dim()
-            cluster_m = cutlass.Int32(self.cfg.cluster_m)
-            # Decode the physical cluster ordinal as feature-first logical
-            # work, preserving both CTA rank and the scheduler validity bit.
-            ordinal = n_idx * (grid_m // cluster_m) + m_idx // cluster_m
-            # Use task scheduling's WorkTileInfo to satisfy its task-local type check.
-            work_tile = WorkTileInfo(
-                (
-                    (ordinal // grid_n) * cluster_m + m_idx % cluster_m,
-                    ordinal % grid_n,
-                    l_idx,
-                ),
-                work_tile.is_valid_tile,
-            )
-        return work_tile
-
-    @cute.jit
-    def _make_initial_work_tile(self):
-        return self._rasterize_batch_m_work_tile(super()._make_initial_work_tile())
-
-    @cute.jit
-    def _get_and_advance_work_tile_impl(self, stage_info):
-        return self._rasterize_batch_m_work_tile(
-            super()._get_and_advance_work_tile_impl(stage_info)
         )
 
     def get_smem_requirements(self):
@@ -156,7 +182,9 @@ class BatchedGemmWorkQueue(WorkQueue):
     def _init_fast_drain_smem_state(self, stage_info: StageInfo) -> None:
         if cutlass.const_expr(not self._uses_fast_drain()):
             return
-        assert self._alloc_fast_drain_response is not None
+        if cutlass.const_expr(self._alloc_fast_drain_response is None):
+            # Caller-supplied storage; the pointers are already set.
+            return
         assert self._alloc_fast_drain_mbar is not None
         context = stage_info.context
         self.fast_drain_response_ptr = cute.make_ptr(
@@ -168,6 +196,95 @@ class BatchedGemmWorkQueue(WorkQueue):
             cutlass.Int64,
             context.smem_base.data_ptr() + self._alloc_fast_drain_mbar.offset,
             mem_space=cutlass.AddressSpace.smem,
+        )
+
+    def create_pipeline(self, pipeline_config):
+        if (
+            not has_multiple_umma_atoms(self.cfg)
+            or pipeline_config.pipeline_type != PipelineType.ClcFetchAsync
+        ):
+            return super().create_pipeline(pipeline_config)
+
+        barrier_ptr = pipeline_config.barrier_ptr
+        if barrier_ptr is None:
+            barrier_storage = cutlass.Array(
+                cutlass.Int64,
+                pipeline_config.num_stages * 2,
+                space=cutlass.AddressSpace.smem,
+                alignment=8,
+            )
+            barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                barrier_storage.data_ptr(),
+                mem_space=cutlass.AddressSpace.smem,
+            )
+
+        sync_object_full = PipelineTmaUmma._make_sync_object(
+            barrier_ptr.align(min_align=8),
+            pipeline_config.num_stages,
+            (pipeline.PipelineOp.ClcLoad, pipeline_config.producer_group),
+            pipeline_config.num_bytes,
+        )
+        if is_flexible_cga(self.cfg):
+            # Flexible launch: the barrier count must follow the device-selected
+            # preferred/fallback shape.
+            consumer_threads = active_clc_consumer_threads(self.cfg)
+        else:
+            # Fixed wider launch: materialize the exact preferred-shape count;
+            # no runtime dimension query is needed.
+            dim_x, dim_y, _ = self.cfg.preferred_cluster_shape
+            consumer_threads = cutlass.Int32(
+                host_clc_consumer_threads(self.cfg, dim_x, dim_y)
+            )
+        sync_object_empty = PipelineTmaUmma._make_sync_object(
+            barrier_ptr.align(min_align=8) + pipeline_config.num_stages,
+            pipeline_config.num_stages,
+            (
+                pipeline.PipelineOp.AsyncThread,
+                pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    consumer_threads,
+                ),
+            ),
+        )
+
+        tidx, _, _ = cute.arch.thread_idx()
+        dim_x, dim_y, _, _, _, _ = active_cga_coords(self.cfg)
+        dst_rank = tidx % cutlass.Int32(32)
+        is_signaling_thread = dst_rank < dim_x * dim_y
+        return PipelineClcFetchAsync(
+            sync_object_full,
+            sync_object_empty,
+            pipeline_config.num_stages,
+            dst_rank,
+            cutlass.Int32(0),
+            is_signaling_thread,
+        )
+
+    def create_tile_scheduler(self):
+        if (
+            not has_multiple_umma_atoms(self.cfg)
+            or self.tile_scheduler_config.tile_scheduler_type
+            != TileSchedulerType.ClcDynamicPersistent
+        ):
+            return super().create_tile_scheduler()
+
+        params = self.tile_scheduler_config.tile_scheduler_params
+        bidx, bidy, bidz = cute.arch.block_idx()
+        # Fixed wider launches use compile-time preferred dimensions here;
+        # flexible launches query only the active preferred/fallback shape.
+        dim_x, dim_y, _, _, _, _ = active_cga_coords(self.cfg)
+        cta_id_in_cluster = (
+            cutlass.Int32(bidx % dim_x),
+            cutlass.Int32(bidy % dim_y),
+            cutlass.Int32(0),
+        )
+        return MixedCgaClcDynamicPersistentTileScheduler(
+            params,
+            cta_id_in_cluster,
+            cutlass.Int32(0),
+            self.tile_scheduler_config.response_ptr,
+            (bidx, bidy, bidz),
         )
 
     @cute.jit
@@ -189,6 +306,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             token_cta_idx = tile_coord_n
         else:
             token_cta_idx = tile_coord_m
+        token_cga_idx = token_cta_idx // cutlass.Int32(self.cfg.token_cluster_dim)
 
         if cutlass.const_expr(self.num_non_exiting_ctas_value is not None):
             num_non_exiting_ctas = self.num_non_exiting_ctas_value
@@ -199,10 +317,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             num_non_exiting_ctas = num_non_exiting_ctas_view.load(
                 idx=cutlass.Int32(0), vector_size=1
             )[0]
-        return (
-            token_cta_idx // cutlass.Int32(self.cfg.token_metadata_stride)
-            >= num_non_exiting_ctas
-        )
+        return token_cga_idx >= num_non_exiting_ctas
 
     @cute.jit
     def _clc_fast_drain_batch(self, parity: cutlass.Int32) -> cutlass.Int32:
@@ -248,7 +363,14 @@ class BatchedGemmWorkQueue(WorkQueue):
 
     @cute.jit
     def _maybe_fast_drain_skipped_tile(self) -> None:
-        if cutlass.const_expr(self._uses_fast_drain()):
+        # Fast-drain cancels every cluster that has not launched yet. Early-exit
+        # padding sits on the token axis only, so that is a suffix of the CLC
+        # order solely when the token axis is the slow raster axis. Along-N on
+        # swap-AB hits the first M cluster's token padding while later M
+        # clusters are still queued; draining there drops those tiles.
+        if cutlass.const_expr(
+            self._uses_fast_drain() and self.cfg.clc_fast_drain_skip_is_suffix
+        ):
             skip_work_tile = self._get_consumer_var_from_ts("skip_work_tile")
             if skip_work_tile:
                 self._clc_fast_drain_all()
@@ -282,13 +404,21 @@ class ProxyClusterBarrierResource(MemoryResource):
     data to be ready, releases via tcgen05.commit CTA_2).
 
     Pipeline: TS ``AsyncUmma`` (CUTLASS ``PipelineAsyncUmma``)
-      Full barrier: AsyncThread producer with 32*cluster_m arrivals into the
+      Full barrier: AsyncThread producer with 32*umma_cta_count arrivals into the
       leader CTA's full barrier.
       Empty barrier: TCGen05Mma consumer release with CTA_2 peer signaling.
     """
 
     cfg: Constexpr[BatchedGemmConfig]
     consumer_stage_idx: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            from .mixed_cga_ts import override_umma_atom_pipeline
+
+            return override_umma_atom_pipeline(result)
+        return result
 
     def __post_init__(self) -> None:
         self.consumer_stage_idx = TaskLocalVariable(

@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_RING_OFF 1024
 #define SMEM_RING_STAGE_BYTES 196608
 #define SMEM_RING_STRIDE 196608
@@ -138,12 +137,7 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
@@ -220,8 +214,9 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
             for (int first = bid * 4; first < T; first += num_bids * 4) {
                 int row = first + rg;
                 int slot = k % 4;
-                int parity = k / 4 & 1;
-                mbarrier_wait(full_addr + (slot) * 8, parity);
+                int _stage_full = (int)((unsigned int)k % 4);
+                int _parity_full = (int)((unsigned int)k / 4 % 2);
+                mbarrier_wait(full_addr + (_stage_full) * 8, _parity_full);
                 int xaddr = ring_c + slot * 49152 + rg * 12288 + g0 * 16;
                 #pragma unroll
                 for (int c_1 = 0; c_1 < 4; c_1++) {
@@ -236,7 +231,7 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
                     }
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(empty_addr + (slot) * 8);
+                mbarrier_arrive(empty_addr + ((int)((unsigned int)k % 4)) * 8);
                 if (row < T) {
                     float sum0 = 0.0f;
                     #pragma unroll
@@ -257,9 +252,9 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-                    float sum1 = 0.0f;
+                    float sum1_1_0 = 0.0f;
                     #pragma unroll
-                    for (int i_1 = 0; i_1 < 12; i_1++) {
+                    for (int i_1_0 = 0; i_1_0 < 12; i_1_0++) {
                         float _dot_3;
                         asm volatile(
                             "{\n\t"
@@ -269,16 +264,16 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
                             "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
                             "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
                             "}\n"
-                            : "=f"(_dot_3) : "r"(xw[12 + i_1]), "r"(xw[12 + i_1]), "f"(sum1));
-                        sum1 = _dot_3;
+                            : "=f"(_dot_3) : "r"(xw[12 + i_1_0]), "r"(xw[12 + i_1_0]), "f"(sum1_1_0));
+                        sum1_1_0 = _dot_3;
                     }
-                    float _warp_reduce_1 = sum1;
+                    float _warp_reduce_1 = sum1_1_0;
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
-                    float sum2 = 0.0f;
+                    float sum1_1_1 = 0.0f;
                     #pragma unroll
-                    for (int i_2 = 0; i_2 < 12; i_2++) {
+                    for (int i_1_1 = 0; i_1_1 < 12; i_1_1++) {
                         float _dot_4;
                         asm volatile(
                             "{\n\t"
@@ -288,16 +283,16 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
                             "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
                             "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
                             "}\n"
-                            : "=f"(_dot_4) : "r"(xw[24 + i_2]), "r"(xw[24 + i_2]), "f"(sum2));
-                        sum2 = _dot_4;
+                            : "=f"(_dot_4) : "r"(xw[24 + i_1_1]), "r"(xw[24 + i_1_1]), "f"(sum1_1_1));
+                        sum1_1_1 = _dot_4;
                     }
-                    float _warp_reduce_2 = sum2;
+                    float _warp_reduce_2 = sum1_1_1;
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-                    float sum3 = 0.0f;
+                    float sum1_1_2 = 0.0f;
                     #pragma unroll
-                    for (int i_3 = 0; i_3 < 12; i_3++) {
+                    for (int i_1_2 = 0; i_1_2 < 12; i_1_2++) {
                         float _dot_5;
                         asm volatile(
                             "{\n\t"
@@ -307,10 +302,10 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
                             "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
                             "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
                             "}\n"
-                            : "=f"(_dot_5) : "r"(xw[36 + i_3]), "r"(xw[36 + i_3]), "f"(sum3));
-                        sum3 = _dot_5;
+                            : "=f"(_dot_5) : "r"(xw[36 + i_1_2]), "r"(xw[36 + i_1_2]), "f"(sum1_1_2));
+                        sum1_1_2 = _dot_5;
                     }
-                    float _warp_reduce_3 = sum3;
+                    float _warp_reduce_3 = sum1_1_2;
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
@@ -389,22 +384,23 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
             #pragma unroll 1
             for (int first_p = bid * 4; first_p < T; first_p += num_bids * 4) {
                 int slot_p = k_p % 4;
-                int parity_p = k_p / 4 & 1;
                 int rows_k = ((T - first_p) < (4) ? (T - first_p) : (4));
                 int sbase = ring_p + slot_p * 49152;
-                mbarrier_wait(empty_addr + (slot_p) * 8, parity_p);
+                int _stage_empty = (int)((unsigned int)k_p % 4);
+                int _parity_empty = (int)((unsigned int)k_p / 4 % 2);
+                mbarrier_wait(empty_addr + (_stage_empty) * 8, _parity_empty);
                 if (lane_p == 0) {
-                    mbarrier_arrive_expect_tx(full_addr + (slot_p) * 8, rows_k * 12288);
+                    mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)k_p % 4)) * 8, rows_k * 12288);
                 }
                 if (lane_p == 0) {
                     #pragma unroll
-                    for (int i_4 = 0; i_4 < 4; i_4++) {
-                        if (rows_k > i_4) {
-                            long long src_i = (long long)(first_p + i_4) * x_stride_p;
+                    for (int i_1 = 0; i_1 < 4; i_1++) {
+                        if (rows_k > i_1) {
+                            long long src_i = (long long)(first_p + i_1) * x_stride_p;
                             asm volatile(
                                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1], %2, [%3], %4;"
-                                :: "r"(sbase + i_4 * 12288), "l"(reinterpret_cast<const uint8_t*>(x + src_i)), "r"((unsigned)(12288)), "r"(full_addr + (slot_p) * 8),
+                                :: "r"(sbase + i_1 * 12288), "l"(reinterpret_cast<const uint8_t*>(x + src_i)), "r"((unsigned)(12288)), "r"(full_addr + ((int)((unsigned int)k_p % 4)) * 8),
                                    "l"(0x14F0000000000000ULL) : "memory");
                         }
                     }

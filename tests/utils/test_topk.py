@@ -21,6 +21,7 @@ import pytest
 import torch
 
 import flashinfer
+import flashinfer.utils as flashinfer_utils
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
 from tests.test_helpers.parametrize import parametrize_product
@@ -91,6 +92,16 @@ def _build_strictly_descending_logits(
 ) -> torch.Tensor:
     base = torch.arange(vocab_size, 0, -1, device=device, dtype=torch.float32)
     return base.unsqueeze(0).repeat(num_rows, 1).contiguous()
+
+
+def _cached_row_states_buffer(device: torch.device):
+    """The ``row_states`` buffer the radix top-k APIs reuse on ``device``'s current stream."""
+    key = (
+        "radix_topk_row_states",
+        device,
+        torch.cuda.current_stream(device).cuda_stream,
+    )
+    return flashinfer_utils._stream_cache_buf.get(key)
 
 
 def _top_k_case_id(case):
@@ -416,6 +427,151 @@ def test_multi_cta_row_states_not_shared_across_graphs(set_topk_algo):
                 assert all(
                     torch.equal(a, b) for a, b in zip(result, reference, strict=True)
                 )
+
+
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+def test_multi_cta_row_states_isolated_across_streams_with_different_row_counts(
+    api_kind, set_topk_algo
+):
+    """Streams whose launches dirty different numbers of row-state groups stay apart.
+
+    Each stream reuses one cached ``row_states`` buffer across its launches, and
+    two streams must never share one. The deterministic kernel places its
+    per-group collect scratch right after the row-state array, so a 2-row launch
+    and a 32-row launch put it at different offsets: a shared buffer would let
+    each stream overwrite the other's histograms, counters and scratch.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    vocab_size, k = 131072, 512
+    logits_a = _build_strictly_descending_logits(2, vocab_size, device)
+    logits_b = torch.flip(
+        _build_strictly_descending_logits(32, vocab_size, device), dims=(-1,)
+    ).contiguous()
+
+    def run(logits):
+        if api_kind == "top_k":
+            return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+        return _run_transform(logits, k, api_kind, deterministic=True)
+
+    def equal(x, y):
+        if isinstance(x, tuple):
+            return all(torch.equal(a, b) for a, b in zip(x, y, strict=True))
+        return torch.equal(x, y)
+
+    ref_a = run(logits_a)
+    ref_b = run(logits_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    outs_a, outs_b = [], []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(run(logits_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(run(logits_b))
+    torch.cuda.synchronize()
+
+    for out in outs_a:
+        assert equal(out, ref_a)
+    for out in outs_b:
+        assert equal(out, ref_b)
+
+    with torch.cuda.stream(stream_a):
+        buf_a = _cached_row_states_buffer(logits_a.device)
+    with torch.cuda.stream(stream_b):
+        buf_b = _cached_row_states_buffer(logits_b.device)
+    assert buf_a is not None and buf_b is not None
+    assert buf_a is not buf_b
+
+
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+def test_multi_cta_reuses_row_states_buffer_on_one_stream_across_regimes(
+    api_kind, set_topk_algo
+):
+    """One stream reuses its cached ``row_states`` buffer, dirty, across regimes.
+
+    The buffer is zeroed only when it is allocated, so every multi-CTA launch
+    must leave it ready for the next one: when the next launch switches between
+    the deterministic and non-deterministic kernels, which place their collect
+    scratch differently, and when it follows a single-CTA launch that never
+    touches the buffer.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, k = 4, 512
+    multi_cta_logits = _build_strictly_descending_logits(batch_size, 131072, device)
+    # A 4096-wide fp32 row keeps ctas_per_group == 1 even under the multi_cta
+    # override, so this runs the radix single-CTA branch.
+    single_cta_logits = _build_strictly_descending_logits(batch_size, 4096, device)
+
+    def run_and_check(logits, deterministic):
+        expected_indices = (
+            torch.arange(k, device=device, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(logits.shape[0], -1)
+        )
+        if api_kind == "top_k":
+            values, indices = flashinfer.top_k(
+                logits, k, sorted=True, deterministic=deterministic
+            )
+            torch.testing.assert_close(values, logits[:, :k])
+            assert torch.equal(indices, expected_indices)
+        else:
+            output = _run_transform(logits, k, api_kind, deterministic=deterministic)
+            _assert_unordered_indices_match(output, expected_indices.to(torch.int32))
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run_and_check(multi_cta_logits, deterministic=False)
+        buf = _cached_row_states_buffer(multi_cta_logits.device)
+        assert buf is not None
+        run_and_check(multi_cta_logits, deterministic=True)
+        run_and_check(single_cta_logits, deterministic=True)
+        run_and_check(multi_cta_logits, deterministic=False)
+        run_and_check(multi_cta_logits, deterministic=True)
+        assert _cached_row_states_buffer(multi_cta_logits.device) is buf
+    torch.cuda.synchronize()
+
+
+def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_algo):
+    """Captured launches own their ``row_states``; eager launches on another stream own theirs."""
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, vocab_size, k = 16, 262144, 512
+    logits_graph = _build_strictly_descending_logits(batch_size, vocab_size, device)
+    logits_eager = logits_graph.flip(-1).contiguous()
+    ref_graph = torch.topk(logits_graph, k, dim=-1)
+    ref_eager = torch.topk(logits_eager, k, dim=-1)
+
+    def run(logits):
+        return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+
+    run(logits_graph)
+    run(logits_eager)
+    torch.cuda.synchronize()
+
+    graph_stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    graph_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=graph_stream):
+        graph_outs = [run(logits_graph) for _ in range(8)]
+    torch.cuda.synchronize()
+
+    eager_stream = torch.cuda.Stream()
+    eager_outs = []
+    for _ in range(16):
+        with torch.cuda.stream(graph_stream):
+            graph.replay()
+        with torch.cuda.stream(eager_stream):
+            eager_outs.extend(run(logits_eager) for _ in range(8))
+    torch.cuda.synchronize()
+
+    for out in graph_outs:
+        assert all(torch.equal(a, b) for a, b in zip(out, ref_graph, strict=True))
+    for out in eager_outs:
+        assert all(torch.equal(a, b) for a, b in zip(out, ref_eager, strict=True))
 
 
 @pytest.mark.parametrize("k", [256, 1024, 2048])

@@ -18,6 +18,7 @@
 #pragma once
 #include "../../cake_warp_decode_contract.cuh"
 #include "declarations.cuh"
+#include "../cake_warp_decode_tile_n8_fc2.cuh"
 #include <array>
 #include <cstring>
 #include <mutex>
@@ -35,41 +36,47 @@ inline ManifestStatus Runtime(cudaError_t error, const char* operation) {
 inline bool Supported(const Shape& shape) {
   return IsGeometry(shape, 4096, 2048, 256, 6) && shape.num_tokens >= 1 && shape.num_tokens <= 32;
 }
+// The rows whose FC2 the tile-N8 FC2 program kK512Stage5 runs (SelectTileN8Fc2). Their workspace ends with
+// kTileN8Fc2ClampedCounterBytes more bytes for its work counter pair, which PrepareWorkspace zeroes.
+inline bool TileN8Fc2Row(const Shape& shape) {
+  return SelectTileN8Fc2(Target::kSm100a, shape) == TileN8Fc2::kK512Stage5;
+}
 inline int64_t WorkspaceSize(const Shape& shape, const Schedule&) {
   if (!Supported(shape)) return -1;
+  const int64_t counter_bytes = TileN8Fc2Row(shape) ? kTileN8Fc2ClampedCounterBytes : 0;
   switch (shape.num_tokens) {
-    case 1: return 449792;
-    case 2: return 898560;
-    case 3: return 1347328;
-    case 4: return 1795840;
-    case 5: return 2244608;
-    case 6: return 2693376;
-    case 7: return 3142400;
-    case 8: return 3590912;
-    case 9: return 4039680;
-    case 10: return 4488704;
-    case 11: return 4938240;
-    case 12: return 5386752;
-    case 13: return 5835520;
-    case 14: return 6284288;
-    case 15: return 6733056;
-    case 16: return 7181568;
-    case 17: return 7630336;
-    case 18: return 8079104;
-    case 19: return 8527872;
-    case 20: return 8976384;
-    case 21: return 9425152;
-    case 22: return 9874688;
-    case 23: return 10323456;
-    case 24: return 10771968;
-    case 25: return 11220736;
-    case 26: return 11669504;
-    case 27: return 12118272;
-    case 28: return 12566784;
-    case 29: return 13015552;
-    case 30: return 13464320;
-    case 31: return 13913088;
-    case 32: return 14361600;
+    case 1: return 449792 + counter_bytes;
+    case 2: return 898560 + counter_bytes;
+    case 3: return 1347328 + counter_bytes;
+    case 4: return 1795840 + counter_bytes;
+    case 5: return 2244608 + counter_bytes;
+    case 6: return 2693376 + counter_bytes;
+    case 7: return 3142144 + counter_bytes;
+    case 8: return 3590912 + counter_bytes;
+    case 9: return 4039936 + counter_bytes;
+    case 10: return 4488704 + counter_bytes;
+    case 11: return 4938240 + counter_bytes;
+    case 12: return 5386752 + counter_bytes;
+    case 13: return 5835520 + counter_bytes;
+    case 14: return 6284288 + counter_bytes;
+    case 15: return 6733056 + counter_bytes;
+    case 16: return 7181568 + counter_bytes;
+    case 17: return 7630336 + counter_bytes;
+    case 18: return 8079104 + counter_bytes;
+    case 19: return 8527872 + counter_bytes;
+    case 20: return 8976384 + counter_bytes;
+    case 21: return 9425152 + counter_bytes;
+    case 22: return 9874688 + counter_bytes;
+    case 23: return 10323456 + counter_bytes;
+    case 24: return 10771968 + counter_bytes;
+    case 25: return 11220736 + counter_bytes;
+    case 26: return 11669504 + counter_bytes;
+    case 27: return 12118272 + counter_bytes;
+    case 28: return 12566784 + counter_bytes;
+    case 29: return 13015552 + counter_bytes;
+    case 30: return 13464320 + counter_bytes;
+    case 31: return 13913088 + counter_bytes;
+    case 32: return 14361600 + counter_bytes;
     default: return -1;
   }
 }
@@ -123,11 +130,11 @@ inline ManifestStatus PrepareWorkspace(const Invocation& inv, const Schedule& sc
       initializers.push_back({2693120u, {1152}});
       break;
     case 7:
-      initializers.push_back({387328u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6}});
-      initializers.push_back({388864u, {1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 209, 217, 225, 233, 241, 249, 257, 265, 273, 281, 289, 297, 305, 313, 321, 329}});
-      initializers.push_back({389120u, {42}});
-      initializers.push_back({389376u, {1344}});
-      initializers.push_back({3142144u, {1344}});
+      initializers.push_back({387072u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6}});
+      initializers.push_back({388608u, {1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 209, 217, 225, 233, 241, 249, 257, 265, 273, 281, 289, 297, 305, 313, 321, 329}});
+      initializers.push_back({388864u, {42}});
+      initializers.push_back({389120u, {1344}});
+      initializers.push_back({3141888u, {1344}});
       break;
     case 8:
       initializers.push_back({442624u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7}});
@@ -135,13 +142,6 @@ inline ManifestStatus PrepareWorkspace(const Invocation& inv, const Schedule& sc
       initializers.push_back({444416u, {48}});
       initializers.push_back({444672u, {1536}});
       initializers.push_back({3590656u, {1536}});
-      break;
-    case 9:
-      initializers.push_back({497920u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8}});
-      initializers.push_back({499712u, {1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 209, 217, 225, 233, 241, 249, 257, 265, 273, 281, 289, 297, 305, 313, 321, 329, 337, 345, 353, 361, 369, 377, 385, 393, 401, 409, 417, 425}});
-      initializers.push_back({499968u, {54}});
-      initializers.push_back({500224u, {1728}});
-      initializers.push_back({4039424u, {1728}});
       break;
     default: break;
   }
@@ -158,7 +158,7 @@ inline ManifestStatus PrepareWorkspace(const Invocation& inv, const Schedule& sc
   return ManifestStatus::Success();
 }
 
-struct DeviceState { bool ready = false; };
+struct DeviceState { bool ready = false; int32_t sm_count = 0; };
 inline std::array<DeviceState, 64>& DeviceStates() { static std::array<DeviceState, 64> states{}; return states; }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
 inline ManifestStatus EnsureDeviceReady(int32_t device, bool allow_initialization) {
@@ -190,8 +190,20 @@ inline ManifestStatus EnsureDeviceReady(int32_t device, bool allow_initializatio
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready_expert_order), cudaFuncAttributeMaxDynamicSharedMemorySize, 199040);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
+  error = cudaDeviceGetAttribute(&state.sm_count, cudaDevAttrMultiProcessorCount, device);
+  if (error != cudaSuccess) return Runtime(error, "clamped E256 SM count");
+  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_warp_decode_4352a5beff13b20b2912), cudaFuncAttributeMaxDynamicSharedMemorySize, 199808);
+  if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   state.ready = true;
   return ManifestStatus::Success();
+}
+// The SM count EnsureDeviceReady recorded for the current device; 0 when that device is not ready.
+inline int32_t ReadySmCount() {
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return 0;
+  std::lock_guard<std::mutex> lock(DeviceMutex());
+  const auto& state = DeviceStates()[device];
+  return state.ready ? state.sm_count : 0;
 }
 
 struct Args_device_10 {
@@ -550,6 +562,38 @@ inline cudaError_t Submit_device_14(const cudaLaunchConfig_t* config, const void
       args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.route_order);
 }
 
+// The tile-N8 FC2 program kK512Stage5 on a clamped row: the route inventory's FC1 output (B), its scales (SFB)
+// and partials (C) of `extent` route tiles at these workspace offsets, its route tile tables, and the work
+// counter pair in the region WorkspaceSize appends.
+struct TileN8Fc2Regions {
+  size_t activations, activation_scales, partials, tile_mn_limit, num_tiles;
+  int64_t extent;
+};
+inline cudaError_t SubmitTileN8Fc2(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const TileN8Fc2Args*>(opaque);
+  return SubmitExtendedKernel(config, kernel_cake_warp_decode_4352a5beff13b20b2912,
+      args.A, args.B, args.SFA, args.SFB, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_tiles,
+      args.work_counter, args.grid_m, args.max_tiles, args.K_tiles);
+}
+inline void VisitTileN8Fc2(const Invocation& inv, int64_t workspace_bytes, const TileN8Fc2Regions& regions,
+                           int* tile_expert, int carveout, LaunchVisitor visitor, void* context) {
+  uint8_t* workspace = static_cast<uint8_t*>(inv.workspace);
+  TileN8Fc2Args args{};
+  if (!EncodeTileN8Fc2(&args, false, inv.gemm2_weights, inv.gemm2_weights_scale, workspace + regions.activations,
+                       workspace + regions.activation_scales, workspace + regions.partials, 256, 4096, 2048,
+                       regions.extent))
+    throw std::runtime_error("clamped E256 tensor map encoding failed");
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  args.tile_expert = tile_expert;
+  args.tile_mn_limit = reinterpret_cast<int*>(workspace + regions.tile_mn_limit);
+  args.num_tiles = reinterpret_cast<int*>(workspace + regions.num_tiles);
+  args.work_counter = reinterpret_cast<int*>(workspace + workspace_bytes - kTileN8Fc2ClampedCounterBytes);
+  KernelLaunch launch{
+      "kernel_cake_warp_decode_4352a5beff13b20b2912", dim3(TileN8Fc2Ctas(32, regions.extent, ReadySmCount()), 1, 1),
+      dim3(512, 1, 1), dim3(1, 1, 1), 199808u, true, false, false, &SubmitTileN8Fc2, &args, carveout};
+  visitor(launch, context);
+}
+
 inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, LaunchVisitor visitor, void* context) {
   const int64_t required = WorkspaceSize(inv.shape, schedule);
   if (required < 0 || inv.workspace == nullptr || inv.workspace_bytes < static_cast<size_t>(required) || !visitor)
@@ -614,83 +658,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(6);
     args_0.K_tiles = static_cast<int>(8);
-    Args_device_07 args_1{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_3_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_3_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_3_box[] = {256u, 128u, 1u};
-      const uint32_t map_3_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_3_dims, map_3_strides, map_3_box, map_3_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.A) == sizeof(encoded));
-      std::memcpy(&args_1.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_4_dims[] = {2048ull, 8ull, 6ull};
-      const uint64_t map_4_strides[] = {1024ull, 8192ull};
-      const uint32_t map_4_box[] = {256u, 8u, 1u};
-      const uint32_t map_4_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 0u) + 0, map_4_dims, map_4_strides, map_4_box, map_4_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.B) == sizeof(encoded));
-      std::memcpy(&args_1.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_5_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_5_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_5_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_5_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_5_dims, map_5_strides, map_5_box, map_5_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.SFA) == sizeof(encoded));
-      std::memcpy(&args_1.SFA, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_6_dims[] = {32ull, 32ull, 6ull};
-      const uint64_t map_6_strides[] = {32ull, 1024ull};
-      const uint32_t map_6_box[] = {32u, 8u, 1u};
-      const uint32_t map_6_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 49152u) + 0, map_6_dims, map_6_strides, map_6_box, map_6_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.SFB) == sizeof(encoded));
-      std::memcpy(&args_1.SFB, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_7_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_7_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_7_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_7_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 56320u) + 0, map_7_dims, map_7_strides, map_7_box, map_7_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.C_tma) == sizeof(encoded));
-      std::memcpy(&args_1.C_tma, &encoded, sizeof(encoded));
-    }
-    args_1.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 56320u));
-    args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_1.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 55552u));
-    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 55808u));
-    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 449536u));
-    args_1.M = static_cast<int>(4096);
-    args_1.K = static_cast<int>(2048);
-    args_1.grid_m = static_cast<int>(32);
-    args_1.grid_n = static_cast<int>(6);
-    args_1.K_tiles = static_cast<int>(4);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 56320u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -703,11 +670,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       199040u, true, false, false,
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
-    KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 6, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      81536u, true, false, false,
-      &Submit_device_07, &args_1, 100};
-    visitor(launch_1, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{0u, 49152u, 56320u, 55552u, 55808u, 6},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0)), 100, visitor, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 1, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -774,83 +738,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(12);
     args_0.K_tiles = static_cast<int>(8);
-    Args_device_07 args_1{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_11_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_11_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_11_box[] = {256u, 128u, 1u};
-      const uint32_t map_11_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_11_dims, map_11_strides, map_11_box, map_11_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.A) == sizeof(encoded));
-      std::memcpy(&args_1.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_12_dims[] = {2048ull, 8ull, 12ull};
-      const uint64_t map_12_strides[] = {1024ull, 8192ull};
-      const uint32_t map_12_box[] = {256u, 8u, 1u};
-      const uint32_t map_12_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 0u) + 0, map_12_dims, map_12_strides, map_12_box, map_12_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.B) == sizeof(encoded));
-      std::memcpy(&args_1.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_13_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_13_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_13_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_13_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_13_dims, map_13_strides, map_13_box, map_13_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.SFA) == sizeof(encoded));
-      std::memcpy(&args_1.SFA, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_14_dims[] = {32ull, 32ull, 12ull};
-      const uint64_t map_14_strides[] = {32ull, 1024ull};
-      const uint32_t map_14_box[] = {32u, 8u, 1u};
-      const uint32_t map_14_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 98304u) + 0, map_14_dims, map_14_strides, map_14_box, map_14_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.SFB) == sizeof(encoded));
-      std::memcpy(&args_1.SFB, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_15_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_15_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_15_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_15_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 111872u) + 0, map_15_dims, map_15_strides, map_15_box, map_15_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.C_tma) == sizeof(encoded));
-      std::memcpy(&args_1.C_tma, &encoded, sizeof(encoded));
-    }
-    args_1.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 111872u));
-    args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_1.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 111104u));
-    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 111360u));
-    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 898304u));
-    args_1.M = static_cast<int>(4096);
-    args_1.K = static_cast<int>(2048);
-    args_1.grid_m = static_cast<int>(32);
-    args_1.grid_n = static_cast<int>(12);
-    args_1.K_tiles = static_cast<int>(4);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 111872u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -863,11 +750,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       199040u, true, false, false,
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
-    KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 12, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      81536u, true, false, false,
-      &Submit_device_07, &args_1, 100};
-    visitor(launch_1, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{0u, 98304u, 111872u, 111104u, 111360u, 12},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0)), 100, visitor, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 2, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -1516,173 +1400,163 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 7: {
-    Args_device_08 args_0{};
-    args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_0.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
-    args_0.route_count = static_cast<int>(42);
-    Args_device_02 args_1{};
+    Args_device_13 args_0{};
     {
       CUtensorMap encoded{};
-      const uint64_t map_48_dims[] = {128ull, 4096ull, 16ull, 256ull};
-      const uint64_t map_48_strides[] = {2048ull, 128ull, 8388608ull};
-      const uint32_t map_48_box[] = {128u, 128u, 1u, 1u};
-      const uint32_t map_48_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3d7x0_dims[] = {128ull, 4096ull, 16ull, 256ull};
+      const uint64_t map_c3d7x0_strides[] = {2048ull, 128ull, 8388608ull};
+      const uint32_t map_c3d7x0_box[] = {128u, 128u, 1u, 1u};
+      const uint32_t map_c3d7x0_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights)) + 0) + 0, map_48_dims, map_48_strides, map_48_box, map_48_elem,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights)) + 0) + 0, map_c3d7x0_dims, map_c3d7x0_strides, map_c3d7x0_box, map_c3d7x0_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_0.A) == sizeof(encoded));
+      std::memcpy(&args_0.A, &encoded, sizeof(encoded));
+    }
+    args_0.B = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q)) + 0));
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x1_dims[] = {256ull, 2ull, 64ull, 8192ull};
+      const uint64_t map_c3d7x1_strides[] = {256ull, 512ull, 32768ull};
+      const uint32_t map_c3d7x1_box[] = {256u, 2u, 8u, 1u};
+      const uint32_t map_c3d7x1_elem[] = {1u, 1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0) + 0, map_c3d7x1_dims, map_c3d7x1_strides, map_c3d7x1_box, map_c3d7x1_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_0.SFA) == sizeof(encoded));
+      std::memcpy(&args_0.SFA, &encoded, sizeof(encoded));
+    }
+    args_0.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale)) + 0));
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x2_dims[] = {2048ull, 8ull, 2147483648ull, 2147483648ull};
+      const uint64_t map_c3d7x2_strides[] = {1024ull, 17179868160ull, 1024ull};
+      const uint32_t map_c3d7x2_box[] = {64u, 8u, 1u, 1u};
+      const uint32_t map_c3d7x2_elem[] = {1u, 1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4,
+          (static_cast<uint8_t*>(inv.workspace) + 0u) + 0, map_c3d7x2_dims, map_c3d7x2_strides, map_c3d7x2_box, map_c3d7x2_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_0.C) == sizeof(encoded));
+      std::memcpy(&args_0.C, &encoded, sizeof(encoded));
+    }
+    args_0.SFC = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 344064u));
+    args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 387072u));
+    args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_0.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388608u));
+    args_0.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
+    args_0.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389120u));
+    args_0.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_scalar)) + 0));
+    args_0.scale_gate = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_gate_scalar)) + 0));
+    args_0.clamp_limit = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_clamp_limit)) + 0));
+    args_0.act_alpha = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_alpha)) + 0));
+    args_0.act_beta = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_beta)) + 0));
+    args_0.M_out = static_cast<int>(2048);
+    args_0.K = static_cast<int>(4096);
+    args_0.grid_m = static_cast<int>(32);
+    args_0.grid_n = static_cast<int>(42);
+    args_0.K_tiles = static_cast<int>(8);
+    Args_device_07 args_1{};
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x3_dims[] = {2048ull, 4096ull, 256ull};
+      const uint64_t map_c3d7x3_strides[] = {1024ull, 4194304ull};
+      const uint32_t map_c3d7x3_box[] = {256u, 128u, 1u};
+      const uint32_t map_c3d7x3_elem[] = {1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_c3d7x3_dims, map_c3d7x3_strides, map_c3d7x3_box, map_c3d7x3_elem,
           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.A) == sizeof(encoded));
       std::memcpy(&args_1.A, &encoded, sizeof(encoded));
     }
-    args_1.B = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q)) + 0));
     {
       CUtensorMap encoded{};
-      const uint64_t map_49_dims[] = {256ull, 2ull, 64ull, 8192ull};
-      const uint64_t map_49_strides[] = {256ull, 512ull, 32768ull};
-      const uint32_t map_49_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_49_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3d7x4_dims[] = {2048ull, 8ull, 42ull};
+      const uint64_t map_c3d7x4_strides[] = {1024ull, 8192ull};
+      const uint32_t map_c3d7x4_box[] = {256u, 8u, 1u};
+      const uint32_t map_c3d7x4_elem[] = {1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
+          (static_cast<uint8_t*>(inv.workspace) + 0u) + 0, map_c3d7x4_dims, map_c3d7x4_strides, map_c3d7x4_box, map_c3d7x4_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_1.B) == sizeof(encoded));
+      std::memcpy(&args_1.B, &encoded, sizeof(encoded));
+    }
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x5_dims[] = {256ull, 2ull, 32ull, 8192ull};
+      const uint64_t map_c3d7x5_strides[] = {256ull, 512ull, 16384ull};
+      const uint32_t map_c3d7x5_box[] = {256u, 2u, 8u, 1u};
+      const uint32_t map_c3d7x5_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0) + 0, map_49_dims, map_49_strides, map_49_box, map_49_elem,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_c3d7x5_dims, map_c3d7x5_strides, map_c3d7x5_box, map_c3d7x5_elem,
           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.SFA) == sizeof(encoded));
       std::memcpy(&args_1.SFA, &encoded, sizeof(encoded));
     }
-    args_1.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale)) + 0));
     {
       CUtensorMap encoded{};
-      const uint64_t map_50_dims[] = {2048ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_50_strides[] = {1024ull, 17179868160ull, 1024ull};
-      const uint32_t map_50_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_50_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 256u) + 0, map_50_dims, map_50_strides, map_50_box, map_50_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      const uint64_t map_c3d7x6_dims[] = {32ull, 32ull, 42ull};
+      const uint64_t map_c3d7x6_strides[] = {32ull, 1024ull};
+      const uint32_t map_c3d7x6_box[] = {32u, 8u, 1u};
+      const uint32_t map_c3d7x6_elem[] = {1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
+          (static_cast<uint8_t*>(inv.workspace) + 344064u) + 0, map_c3d7x6_dims, map_c3d7x6_strides, map_c3d7x6_box, map_c3d7x6_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.C) == sizeof(encoded));
-      std::memcpy(&args_1.C, &encoded, sizeof(encoded));
+      static_assert(sizeof(args_1.SFB) == sizeof(encoded));
+      std::memcpy(&args_1.SFB, &encoded, sizeof(encoded));
     }
-    args_1.SFC = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 344320u));
-    args_1.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 387328u));
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x7_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
+      const uint64_t map_c3d7x7_strides[] = {8192ull, 68719468544ull, 8192ull};
+      const uint32_t map_c3d7x7_box[] = {64u, 8u, 1u, 1u};
+      const uint32_t map_c3d7x7_elem[] = {1u, 1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
+          (static_cast<uint8_t*>(inv.workspace) + 389376u) + 0, map_c3d7x7_dims, map_c3d7x7_strides, map_c3d7x7_box, map_c3d7x7_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_1.C_tma) == sizeof(encoded));
+      std::memcpy(&args_1.C_tma, &encoded, sizeof(encoded));
+    }
+    args_1.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
+    args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
     args_1.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
-    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389120u));
-    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
-    args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_scalar)) + 0));
-    args_1.scale_gate = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_gate_scalar)) + 0));
-    args_1.clamp_limit = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_clamp_limit)) + 0));
-    args_1.act_alpha = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_alpha)) + 0));
-    args_1.act_beta = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_beta)) + 0));
-    args_1.M_out = static_cast<int>(2048);
-    args_1.K = static_cast<int>(4096);
+    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388608u));
+    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
+    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3141888u));
+    args_1.M = static_cast<int>(4096);
+    args_1.K = static_cast<int>(2048);
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(42);
-    args_1.K_tiles = static_cast<int>(8);
-    args_1.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
-    Args_device_07 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_51_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_51_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_51_box[] = {256u, 128u, 1u};
-      const uint32_t map_51_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_51_dims, map_51_strides, map_51_box, map_51_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_52_dims[] = {2048ull, 8ull, 42ull};
-      const uint64_t map_52_strides[] = {1024ull, 8192ull};
-      const uint32_t map_52_box[] = {256u, 8u, 1u};
-      const uint32_t map_52_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 256u) + 0, map_52_dims, map_52_strides, map_52_box, map_52_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_53_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_53_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_53_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_53_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_53_dims, map_53_strides, map_53_box, map_53_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_54_dims[] = {32ull, 32ull, 42ull};
-      const uint64_t map_54_strides[] = {32ull, 1024ull};
-      const uint32_t map_54_box[] = {32u, 8u, 1u};
-      const uint32_t map_54_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 344320u) + 0, map_54_dims, map_54_strides, map_54_box, map_54_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFB) == sizeof(encoded));
-      std::memcpy(&args_2.SFB, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_55_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_55_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_55_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_55_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 389632u) + 0, map_55_dims, map_55_strides, map_55_box, map_55_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389632u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
-    args_2.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389120u));
-    args_2.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3142144u));
+    args_1.K_tiles = static_cast<int>(4);
+    Args_device_04 args_2{};
+    args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
+    args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
+    args_2.output = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.output)) + 0));
+    args_2.num_tokens = static_cast<int>(7);
+    args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(42);
-    args_2.K_tiles = static_cast<int>(4);
-    Args_device_04 args_3{};
-    args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389632u));
-    args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
-    args_3.output = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.output)) + 0));
-    args_3.num_tokens = static_cast<int>(7);
-    args_3.route_stride = static_cast<int>(32768);
-    args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_t7_direct_route_order", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
-      128u, true, false, false,
-      &Submit_device_08, &args_0, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      199040u, true, false, false,
+      &Submit_device_13, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      199040u, true, false, false,
-      &Submit_device_02, &args_1, -1};
-    visitor(launch_1, context);
-    KernelLaunch launch_2{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       81536u, true, false, false,
-      &Submit_device_07, &args_2, 100};
-    visitor(launch_2, context);
-    KernelLaunch launch_3{
+      &Submit_device_07, &args_1, 100};
+    visitor(launch_1, context);
+    KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 7, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
-      &Submit_device_04, &args_3, -1};
-    visitor(launch_3, context);
+      &Submit_device_04, &args_2, -1};
+    visitor(launch_2, context);
     return;
   }
   case 8: {
@@ -1856,19 +1730,30 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 9: {
-    Args_device_08 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_0.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
+    args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
+    args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 1792u));
+    args_0.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2048u));
+    args_0.route_slots = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u));
+    args_0.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2560u));
+    args_0.fc1_work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
+    args_0.fc2_work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u));
     args_0.route_count = static_cast<int>(54);
-    Args_device_02 args_1{};
+    args_0.top_k = static_cast<int>(6);
+    args_0.local_expert_offset = static_cast<int>(0);
+    args_0.num_experts = static_cast<int>(256);
+    args_0.fc1_initial_work = static_cast<int>(0);
+    args_0.fc2_initial_work = static_cast<int>(0);
+    Args_device_01 args_1{};
     {
       CUtensorMap encoded{};
-      const uint64_t map_64_dims[] = {128ull, 4096ull, 16ull, 256ull};
-      const uint64_t map_64_strides[] = {2048ull, 128ull, 8388608ull};
-      const uint32_t map_64_box[] = {128u, 128u, 1u, 1u};
-      const uint32_t map_64_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3p9x0_dims[] = {128ull, 4096ull, 16ull, 256ull};
+      const uint64_t map_c3p9x0_strides[] = {2048ull, 128ull, 8388608ull};
+      const uint32_t map_c3p9x0_box[] = {128u, 64u, 2u, 1u};
+      const uint32_t map_c3p9x0_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights)) + 0) + 0, map_64_dims, map_64_strides, map_64_box, map_64_elem,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights)) + 0) + 0, map_c3p9x0_dims, map_c3p9x0_strides, map_c3p9x0_box, map_c3p9x0_elem,
           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.A) == sizeof(encoded));
@@ -1877,12 +1762,12 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.B = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q)) + 0));
     {
       CUtensorMap encoded{};
-      const uint64_t map_65_dims[] = {256ull, 2ull, 64ull, 8192ull};
-      const uint64_t map_65_strides[] = {256ull, 512ull, 32768ull};
-      const uint32_t map_65_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_65_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3p9x1_dims[] = {256ull, 2ull, 64ull, 8192ull};
+      const uint64_t map_c3p9x1_strides[] = {256ull, 512ull, 32768ull};
+      const uint32_t map_c3p9x1_box[] = {256u, 2u, 8u, 1u};
+      const uint32_t map_c3p9x1_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0) + 0, map_65_dims, map_65_strides, map_65_box, map_65_elem,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0) + 0, map_c3p9x1_dims, map_c3p9x1_strides, map_c3p9x1_box, map_c3p9x1_elem,
           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.SFA) == sizeof(encoded));
@@ -1891,23 +1776,23 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale)) + 0));
     {
       CUtensorMap encoded{};
-      const uint64_t map_66_dims[] = {2048ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_66_strides[] = {1024ull, 17179868160ull, 1024ull};
-      const uint32_t map_66_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_66_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3p9x2_dims[] = {2048ull, 8ull, 2147483648ull, 2147483648ull};
+      const uint64_t map_c3p9x2_strides[] = {1024ull, 17179868160ull, 1024ull};
+      const uint32_t map_c3p9x2_box[] = {32u, 8u, 1u, 1u};
+      const uint32_t map_c3p9x2_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 256u) + 0, map_66_dims, map_66_strides, map_66_box, map_66_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+          (static_cast<uint8_t*>(inv.workspace) + 3328u) + 0, map_c3p9x2_dims, map_c3p9x2_strides, map_c3p9x2_box, map_c3p9x2_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.C) == sizeof(encoded));
       std::memcpy(&args_1.C, &encoded, sizeof(encoded));
     }
-    args_1.SFC = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 442624u));
-    args_1.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 497920u));
-    args_1.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 499712u));
-    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 499968u));
-    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 500224u));
+    args_1.SFC = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 445696u));
+    args_1.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
+    args_1.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 1792u));
+    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2048u));
+    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2560u));
+    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
     args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_scalar)) + 0));
     args_1.scale_gate = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_gate_scalar)) + 0));
     args_1.clamp_limit = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_clamp_limit)) + 0));
@@ -1915,118 +1800,40 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.act_beta = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_beta)) + 0));
     args_1.M_out = static_cast<int>(2048);
     args_1.K = static_cast<int>(4096);
-    args_1.grid_m = static_cast<int>(32);
+    args_1.grid_m = static_cast<int>(64);
     args_1.grid_n = static_cast<int>(54);
     args_1.K_tiles = static_cast<int>(8);
-    args_1.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
-    Args_device_12 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_67_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_67_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_67_box[] = {256u, 128u, 1u};
-      const uint32_t map_67_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_67_dims, map_67_strides, map_67_box, map_67_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_68_dims[] = {2048ull, 8ull, 54ull};
-      const uint64_t map_68_strides[] = {1024ull, 8192ull};
-      const uint32_t map_68_box[] = {256u, 8u, 1u};
-      const uint32_t map_68_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 256u) + 0, map_68_dims, map_68_strides, map_68_box, map_68_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_69_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_69_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_69_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_69_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_69_dims, map_69_strides, map_69_box, map_69_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_70_dims[] = {32ull, 32ull, 54ull};
-      const uint64_t map_70_strides[] = {32ull, 1024ull};
-      const uint32_t map_70_box[] = {32u, 8u, 1u};
-      const uint32_t map_70_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 442624u) + 0, map_70_dims, map_70_strides, map_70_box, map_70_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFB) == sizeof(encoded));
-      std::memcpy(&args_2.SFB, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_71_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_71_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_71_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_71_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 500480u) + 0, map_71_dims, map_71_strides, map_71_box, map_71_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 500480u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 499712u));
-    args_2.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 499968u));
-    args_2.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4039424u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(54);
-    args_2.K_tiles = static_cast<int>(4);
-    Args_device_04 args_3{};
-    args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 500480u));
+    args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
+    args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 3328u));
+    Args_device_03 args_3{};
+    args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 500992u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
+    args_3.route_slots = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u));
     args_3.output = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.output)) + 0));
     args_3.num_tokens = static_cast<int>(9);
-    args_3.route_stride = static_cast<int>(32768);
+    args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_t7_direct_route_order", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
-      128u, true, false, false,
-      &Submit_device_08, &args_0, -1};
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      6272u, true, false, false,
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order", dim3(32, 54, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      199040u, true, false, false,
-      &Submit_device_02, &args_1, -1};
+      "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 54, 1), dim3(352, 1, 1), dim3(2, 1, 1),
+      64128u, true, false, true,
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23", dim3(32, 54, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      81536u, true, false, false,
-      &Submit_device_12, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{3328u, 445696u, 500992u, 2048u, 2560u, 54},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 1792u)), 100, visitor, context);
     KernelLaunch launch_3{
-      "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 9, 1), dim3(128, 1, 1), dim3(1, 1, 1),
+      "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 9, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
-      &Submit_device_04, &args_3, -1};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
   case 10: {
-    Args_device_10 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2048u));
@@ -2101,70 +1908,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 3584u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_75_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_75_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_75_box[] = {256u, 128u, 1u};
-      const uint32_t map_75_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_75_dims, map_75_strides, map_75_box, map_75_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_76_dims[] = {2048ull, 8ull, 60ull};
-      const uint64_t map_76_strides[] = {1024ull, 8192ull};
-      const uint32_t map_76_box[] = {256u, 8u, 1u};
-      const uint32_t map_76_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 3584u) + 0, map_76_dims, map_76_strides, map_76_box, map_76_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_77_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_77_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_77_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_77_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_77_dims, map_77_strides, map_77_box, map_77_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 495104u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_78_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_78_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_78_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_78_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 556544u) + 0, map_78_dims, map_78_strides, map_78_box, map_78_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 556544u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2048u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(60);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 556544u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2174,20 +1917,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_sorted_short_route_pack", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
-      128u, true, false, false,
-      &Submit_device_10, &args_0, -1};
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      6272u, true, false, false,
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 60, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 60, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{3584u, 495104u, 556544u, 2304u, 2816u, 60},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2048u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 10, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -2271,70 +2011,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_82_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_82_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_82_box[] = {256u, 128u, 1u};
-      const uint32_t map_82_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_82_dims, map_82_strides, map_82_box, map_82_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_83_dims[] = {2048ull, 8ull, 66ull};
-      const uint64_t map_83_strides[] = {1024ull, 8192ull};
-      const uint32_t map_83_box[] = {256u, 8u, 1u};
-      const uint32_t map_83_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_83_dims, map_83_strides, map_83_box, map_83_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_84_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_84_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_84_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_84_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_84_dims, map_84_strides, map_84_box, map_84_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 545280u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_85_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_85_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_85_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_85_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 612864u) + 0, map_85_dims, map_85_strides, map_85_box, map_85_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 612864u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(66);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 612864u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2353,11 +2029,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 66, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{4608u, 545280u, 612864u, 2816u, 3840u, 66},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 11, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -2366,7 +2039,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 12: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u));
@@ -2441,161 +2114,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_89_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_89_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_89_box[] = {256u, 128u, 1u};
-      const uint32_t map_89_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_89_dims, map_89_strides, map_89_box, map_89_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_90_dims[] = {2048ull, 1ull, 72ull};
-      const uint64_t map_90_strides[] = {1024ull, 8192ull};
-      const uint32_t map_90_box[] = {256u, 8u, 1u};
-      const uint32_t map_90_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_90_dims, map_90_strides, map_90_box, map_90_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_91_dims[] = {2048ull, 2ull, 72ull};
-      const uint64_t map_91_strides[] = {1024ull, 8192ull};
-      const uint32_t map_91_box[] = {256u, 8u, 1u};
-      const uint32_t map_91_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_91_dims, map_91_strides, map_91_box, map_91_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_92_dims[] = {2048ull, 3ull, 72ull};
-      const uint64_t map_92_strides[] = {1024ull, 8192ull};
-      const uint32_t map_92_box[] = {256u, 8u, 1u};
-      const uint32_t map_92_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_92_dims, map_92_strides, map_92_box, map_92_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_93_dims[] = {2048ull, 4ull, 72ull};
-      const uint64_t map_93_strides[] = {1024ull, 8192ull};
-      const uint32_t map_93_box[] = {256u, 8u, 1u};
-      const uint32_t map_93_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_93_dims, map_93_strides, map_93_box, map_93_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_94_dims[] = {2048ull, 5ull, 72ull};
-      const uint64_t map_94_strides[] = {1024ull, 8192ull};
-      const uint32_t map_94_box[] = {256u, 8u, 1u};
-      const uint32_t map_94_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_94_dims, map_94_strides, map_94_box, map_94_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_95_dims[] = {2048ull, 6ull, 72ull};
-      const uint64_t map_95_strides[] = {1024ull, 8192ull};
-      const uint32_t map_95_box[] = {256u, 8u, 1u};
-      const uint32_t map_95_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_95_dims, map_95_strides, map_95_box, map_95_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_96_dims[] = {2048ull, 7ull, 72ull};
-      const uint64_t map_96_strides[] = {1024ull, 8192ull};
-      const uint32_t map_96_box[] = {256u, 8u, 1u};
-      const uint32_t map_96_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_96_dims, map_96_strides, map_96_box, map_96_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_97_dims[] = {2048ull, 8ull, 72ull};
-      const uint64_t map_97_strides[] = {1024ull, 8192ull};
-      const uint32_t map_97_box[] = {256u, 8u, 1u};
-      const uint32_t map_97_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4608u) + 0, map_97_dims, map_97_strides, map_97_box, map_97_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_98_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_98_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_98_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_98_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_98_dims, map_98_strides, map_98_box, map_98_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 594432u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_99_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_99_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_99_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_99_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 668160u) + 0, map_99_dims, map_99_strides, map_99_box, map_99_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 668160u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(72);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 668160u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2605,20 +2123,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 72, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 72, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{4608u, 594432u, 668160u, 2816u, 3840u, 72},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2304u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 12, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -2702,70 +2217,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 4864u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_103_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_103_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_103_box[] = {256u, 128u, 1u};
-      const uint32_t map_103_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_103_dims, map_103_strides, map_103_box, map_103_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_104_dims[] = {2048ull, 8ull, 78ull};
-      const uint64_t map_104_strides[] = {1024ull, 8192ull};
-      const uint32_t map_104_box[] = {256u, 8u, 1u};
-      const uint32_t map_104_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 4864u) + 0, map_104_dims, map_104_strides, map_104_box, map_104_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_105_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_105_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_105_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_105_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_105_dims, map_105_strides, map_105_box, map_105_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 643840u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_106_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_106_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_106_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_106_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 723712u) + 0, map_106_dims, map_106_strides, map_106_box, map_106_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 723712u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2560u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(78);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4096u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 723712u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2784,11 +2235,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 78, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{4864u, 643840u, 723712u, 3072u, 4096u, 78},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2560u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 13, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -2797,7 +2245,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 14: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
@@ -2872,161 +2320,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5120u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_110_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_110_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_110_box[] = {256u, 128u, 1u};
-      const uint32_t map_110_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_110_dims, map_110_strides, map_110_box, map_110_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_111_dims[] = {2048ull, 1ull, 84ull};
-      const uint64_t map_111_strides[] = {1024ull, 8192ull};
-      const uint32_t map_111_box[] = {256u, 8u, 1u};
-      const uint32_t map_111_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_111_dims, map_111_strides, map_111_box, map_111_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_112_dims[] = {2048ull, 2ull, 84ull};
-      const uint64_t map_112_strides[] = {1024ull, 8192ull};
-      const uint32_t map_112_box[] = {256u, 8u, 1u};
-      const uint32_t map_112_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_112_dims, map_112_strides, map_112_box, map_112_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_113_dims[] = {2048ull, 3ull, 84ull};
-      const uint64_t map_113_strides[] = {1024ull, 8192ull};
-      const uint32_t map_113_box[] = {256u, 8u, 1u};
-      const uint32_t map_113_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_113_dims, map_113_strides, map_113_box, map_113_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_114_dims[] = {2048ull, 4ull, 84ull};
-      const uint64_t map_114_strides[] = {1024ull, 8192ull};
-      const uint32_t map_114_box[] = {256u, 8u, 1u};
-      const uint32_t map_114_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_114_dims, map_114_strides, map_114_box, map_114_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_115_dims[] = {2048ull, 5ull, 84ull};
-      const uint64_t map_115_strides[] = {1024ull, 8192ull};
-      const uint32_t map_115_box[] = {256u, 8u, 1u};
-      const uint32_t map_115_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_115_dims, map_115_strides, map_115_box, map_115_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_116_dims[] = {2048ull, 6ull, 84ull};
-      const uint64_t map_116_strides[] = {1024ull, 8192ull};
-      const uint32_t map_116_box[] = {256u, 8u, 1u};
-      const uint32_t map_116_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_116_dims, map_116_strides, map_116_box, map_116_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_117_dims[] = {2048ull, 7ull, 84ull};
-      const uint64_t map_117_strides[] = {1024ull, 8192ull};
-      const uint32_t map_117_box[] = {256u, 8u, 1u};
-      const uint32_t map_117_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_117_dims, map_117_strides, map_117_box, map_117_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_118_dims[] = {2048ull, 8ull, 84ull};
-      const uint64_t map_118_strides[] = {1024ull, 8192ull};
-      const uint32_t map_118_box[] = {256u, 8u, 1u};
-      const uint32_t map_118_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5120u) + 0, map_118_dims, map_118_strides, map_118_box, map_118_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_119_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_119_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_119_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_119_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_119_dims, map_119_strides, map_119_box, map_119_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 693248u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_120_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_120_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_120_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_120_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 779264u) + 0, map_120_dims, map_120_strides, map_120_box, map_120_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 779264u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3328u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(84);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4352u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 779264u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3036,20 +2329,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 84, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 84, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{5120u, 693248u, 779264u, 3328u, 4352u, 84},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 2816u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 14, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -3058,7 +2348,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 15: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u));
@@ -3133,161 +2423,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_124_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_124_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_124_box[] = {256u, 128u, 1u};
-      const uint32_t map_124_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_124_dims, map_124_strides, map_124_box, map_124_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_125_dims[] = {2048ull, 1ull, 90ull};
-      const uint64_t map_125_strides[] = {1024ull, 8192ull};
-      const uint32_t map_125_box[] = {256u, 8u, 1u};
-      const uint32_t map_125_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_125_dims, map_125_strides, map_125_box, map_125_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_126_dims[] = {2048ull, 2ull, 90ull};
-      const uint64_t map_126_strides[] = {1024ull, 8192ull};
-      const uint32_t map_126_box[] = {256u, 8u, 1u};
-      const uint32_t map_126_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_126_dims, map_126_strides, map_126_box, map_126_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_127_dims[] = {2048ull, 3ull, 90ull};
-      const uint64_t map_127_strides[] = {1024ull, 8192ull};
-      const uint32_t map_127_box[] = {256u, 8u, 1u};
-      const uint32_t map_127_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_127_dims, map_127_strides, map_127_box, map_127_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_128_dims[] = {2048ull, 4ull, 90ull};
-      const uint64_t map_128_strides[] = {1024ull, 8192ull};
-      const uint32_t map_128_box[] = {256u, 8u, 1u};
-      const uint32_t map_128_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_128_dims, map_128_strides, map_128_box, map_128_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_129_dims[] = {2048ull, 5ull, 90ull};
-      const uint64_t map_129_strides[] = {1024ull, 8192ull};
-      const uint32_t map_129_box[] = {256u, 8u, 1u};
-      const uint32_t map_129_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_129_dims, map_129_strides, map_129_box, map_129_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_130_dims[] = {2048ull, 6ull, 90ull};
-      const uint64_t map_130_strides[] = {1024ull, 8192ull};
-      const uint32_t map_130_box[] = {256u, 8u, 1u};
-      const uint32_t map_130_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_130_dims, map_130_strides, map_130_box, map_130_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_131_dims[] = {2048ull, 7ull, 90ull};
-      const uint64_t map_131_strides[] = {1024ull, 8192ull};
-      const uint32_t map_131_box[] = {256u, 8u, 1u};
-      const uint32_t map_131_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_131_dims, map_131_strides, map_131_box, map_131_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_132_dims[] = {2048ull, 8ull, 90ull};
-      const uint64_t map_132_strides[] = {1024ull, 8192ull};
-      const uint32_t map_132_box[] = {256u, 8u, 1u};
-      const uint32_t map_132_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_132_dims, map_132_strides, map_132_box, map_132_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_133_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_133_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_133_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_133_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_133_dims, map_133_strides, map_133_box, map_133_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 742656u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_134_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_134_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_134_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_134_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 834816u) + 0, map_134_dims, map_134_strides, map_134_box, map_134_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 834816u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3584u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(90);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 834816u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3297,20 +2432,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 90, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 90, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{5376u, 742656u, 834816u, 3584u, 4608u, 90},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 15, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -3319,7 +2451,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 16: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u));
@@ -3394,70 +2526,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_138_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_138_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_138_box[] = {256u, 128u, 1u};
-      const uint32_t map_138_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_138_dims, map_138_strides, map_138_box, map_138_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_139_dims[] = {2048ull, 8ull, 96ull};
-      const uint64_t map_139_strides[] = {1024ull, 8192ull};
-      const uint32_t map_139_box[] = {256u, 8u, 1u};
-      const uint32_t map_139_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5376u) + 0, map_139_dims, map_139_strides, map_139_box, map_139_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_140_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_140_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_140_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_140_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_140_dims, map_140_strides, map_140_box, map_140_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 791808u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_141_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_141_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_141_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_141_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 890112u) + 0, map_141_dims, map_141_strides, map_141_box, map_141_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 890112u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3584u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(96);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 890112u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3467,20 +2535,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 96, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 96, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{5376u, 791808u, 890112u, 3584u, 4608u, 96},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3072u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 16, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -3489,7 +2554,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 17: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3328u));
@@ -3564,161 +2629,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5632u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_145_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_145_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_145_box[] = {256u, 128u, 1u};
-      const uint32_t map_145_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_145_dims, map_145_strides, map_145_box, map_145_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_146_dims[] = {2048ull, 1ull, 102ull};
-      const uint64_t map_146_strides[] = {1024ull, 8192ull};
-      const uint32_t map_146_box[] = {256u, 8u, 1u};
-      const uint32_t map_146_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_146_dims, map_146_strides, map_146_box, map_146_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_147_dims[] = {2048ull, 2ull, 102ull};
-      const uint64_t map_147_strides[] = {1024ull, 8192ull};
-      const uint32_t map_147_box[] = {256u, 8u, 1u};
-      const uint32_t map_147_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_147_dims, map_147_strides, map_147_box, map_147_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_148_dims[] = {2048ull, 3ull, 102ull};
-      const uint64_t map_148_strides[] = {1024ull, 8192ull};
-      const uint32_t map_148_box[] = {256u, 8u, 1u};
-      const uint32_t map_148_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_148_dims, map_148_strides, map_148_box, map_148_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_149_dims[] = {2048ull, 4ull, 102ull};
-      const uint64_t map_149_strides[] = {1024ull, 8192ull};
-      const uint32_t map_149_box[] = {256u, 8u, 1u};
-      const uint32_t map_149_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_149_dims, map_149_strides, map_149_box, map_149_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_150_dims[] = {2048ull, 5ull, 102ull};
-      const uint64_t map_150_strides[] = {1024ull, 8192ull};
-      const uint32_t map_150_box[] = {256u, 8u, 1u};
-      const uint32_t map_150_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_150_dims, map_150_strides, map_150_box, map_150_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_151_dims[] = {2048ull, 6ull, 102ull};
-      const uint64_t map_151_strides[] = {1024ull, 8192ull};
-      const uint32_t map_151_box[] = {256u, 8u, 1u};
-      const uint32_t map_151_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_151_dims, map_151_strides, map_151_box, map_151_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_152_dims[] = {2048ull, 7ull, 102ull};
-      const uint64_t map_152_strides[] = {1024ull, 8192ull};
-      const uint32_t map_152_box[] = {256u, 8u, 1u};
-      const uint32_t map_152_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_152_dims, map_152_strides, map_152_box, map_152_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_153_dims[] = {2048ull, 8ull, 102ull};
-      const uint64_t map_153_strides[] = {1024ull, 8192ull};
-      const uint32_t map_153_box[] = {256u, 8u, 1u};
-      const uint32_t map_153_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5632u) + 0, map_153_dims, map_153_strides, map_153_box, map_153_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_154_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_154_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_154_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_154_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_154_dims, map_154_strides, map_154_box, map_154_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 841216u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_155_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_155_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_155_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_155_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 945664u) + 0, map_155_dims, map_155_strides, map_155_box, map_155_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 945664u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3328u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(102);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4864u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 945664u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3728,20 +2638,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 102, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 102, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{5632u, 841216u, 945664u, 3840u, 4864u, 102},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3328u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 17, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -3750,7 +2657,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 18: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3584u));
@@ -3825,161 +2732,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5888u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_159_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_159_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_159_box[] = {256u, 128u, 1u};
-      const uint32_t map_159_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_159_dims, map_159_strides, map_159_box, map_159_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_160_dims[] = {2048ull, 1ull, 108ull};
-      const uint64_t map_160_strides[] = {1024ull, 8192ull};
-      const uint32_t map_160_box[] = {256u, 8u, 1u};
-      const uint32_t map_160_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_160_dims, map_160_strides, map_160_box, map_160_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_161_dims[] = {2048ull, 2ull, 108ull};
-      const uint64_t map_161_strides[] = {1024ull, 8192ull};
-      const uint32_t map_161_box[] = {256u, 8u, 1u};
-      const uint32_t map_161_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_161_dims, map_161_strides, map_161_box, map_161_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_162_dims[] = {2048ull, 3ull, 108ull};
-      const uint64_t map_162_strides[] = {1024ull, 8192ull};
-      const uint32_t map_162_box[] = {256u, 8u, 1u};
-      const uint32_t map_162_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_162_dims, map_162_strides, map_162_box, map_162_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_163_dims[] = {2048ull, 4ull, 108ull};
-      const uint64_t map_163_strides[] = {1024ull, 8192ull};
-      const uint32_t map_163_box[] = {256u, 8u, 1u};
-      const uint32_t map_163_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_163_dims, map_163_strides, map_163_box, map_163_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_164_dims[] = {2048ull, 5ull, 108ull};
-      const uint64_t map_164_strides[] = {1024ull, 8192ull};
-      const uint32_t map_164_box[] = {256u, 8u, 1u};
-      const uint32_t map_164_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_164_dims, map_164_strides, map_164_box, map_164_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_165_dims[] = {2048ull, 6ull, 108ull};
-      const uint64_t map_165_strides[] = {1024ull, 8192ull};
-      const uint32_t map_165_box[] = {256u, 8u, 1u};
-      const uint32_t map_165_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_165_dims, map_165_strides, map_165_box, map_165_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_166_dims[] = {2048ull, 7ull, 108ull};
-      const uint64_t map_166_strides[] = {1024ull, 8192ull};
-      const uint32_t map_166_box[] = {256u, 8u, 1u};
-      const uint32_t map_166_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_166_dims, map_166_strides, map_166_box, map_166_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_167_dims[] = {2048ull, 8ull, 108ull};
-      const uint64_t map_167_strides[] = {1024ull, 8192ull};
-      const uint32_t map_167_box[] = {256u, 8u, 1u};
-      const uint32_t map_167_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 5888u) + 0, map_167_dims, map_167_strides, map_167_box, map_167_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_168_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_168_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_168_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_168_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_168_dims, map_168_strides, map_168_box, map_168_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 890624u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_169_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_169_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_169_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_169_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1001216u) + 0, map_169_dims, map_169_strides, map_169_box, map_169_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1001216u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3584u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4096u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(108);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5120u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1001216u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3989,20 +2741,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 108, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 108, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{5888u, 890624u, 1001216u, 4096u, 5120u, 108},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3584u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 18, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -4011,7 +2760,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 19: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
@@ -4086,161 +2835,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_173_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_173_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_173_box[] = {256u, 128u, 1u};
-      const uint32_t map_173_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_173_dims, map_173_strides, map_173_box, map_173_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_174_dims[] = {2048ull, 1ull, 114ull};
-      const uint64_t map_174_strides[] = {1024ull, 8192ull};
-      const uint32_t map_174_box[] = {256u, 8u, 1u};
-      const uint32_t map_174_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_174_dims, map_174_strides, map_174_box, map_174_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_175_dims[] = {2048ull, 2ull, 114ull};
-      const uint64_t map_175_strides[] = {1024ull, 8192ull};
-      const uint32_t map_175_box[] = {256u, 8u, 1u};
-      const uint32_t map_175_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_175_dims, map_175_strides, map_175_box, map_175_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_176_dims[] = {2048ull, 3ull, 114ull};
-      const uint64_t map_176_strides[] = {1024ull, 8192ull};
-      const uint32_t map_176_box[] = {256u, 8u, 1u};
-      const uint32_t map_176_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_176_dims, map_176_strides, map_176_box, map_176_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_177_dims[] = {2048ull, 4ull, 114ull};
-      const uint64_t map_177_strides[] = {1024ull, 8192ull};
-      const uint32_t map_177_box[] = {256u, 8u, 1u};
-      const uint32_t map_177_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_177_dims, map_177_strides, map_177_box, map_177_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_178_dims[] = {2048ull, 5ull, 114ull};
-      const uint64_t map_178_strides[] = {1024ull, 8192ull};
-      const uint32_t map_178_box[] = {256u, 8u, 1u};
-      const uint32_t map_178_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_178_dims, map_178_strides, map_178_box, map_178_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_179_dims[] = {2048ull, 6ull, 114ull};
-      const uint64_t map_179_strides[] = {1024ull, 8192ull};
-      const uint32_t map_179_box[] = {256u, 8u, 1u};
-      const uint32_t map_179_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_179_dims, map_179_strides, map_179_box, map_179_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_180_dims[] = {2048ull, 7ull, 114ull};
-      const uint64_t map_180_strides[] = {1024ull, 8192ull};
-      const uint32_t map_180_box[] = {256u, 8u, 1u};
-      const uint32_t map_180_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_180_dims, map_180_strides, map_180_box, map_180_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_181_dims[] = {2048ull, 8ull, 114ull};
-      const uint64_t map_181_strides[] = {1024ull, 8192ull};
-      const uint32_t map_181_box[] = {256u, 8u, 1u};
-      const uint32_t map_181_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_181_dims, map_181_strides, map_181_box, map_181_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_182_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_182_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_182_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_182_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_182_dims, map_182_strides, map_182_box, map_182_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 940032u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_183_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_183_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_183_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_183_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1056768u) + 0, map_183_dims, map_183_strides, map_183_box, map_183_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1056768u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4352u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(114);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1056768u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -4250,20 +2844,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 114, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 114, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{6144u, 940032u, 1056768u, 4352u, 5376u, 114},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 19, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -4272,7 +2863,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 20: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
@@ -4347,70 +2938,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_187_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_187_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_187_box[] = {256u, 128u, 1u};
-      const uint32_t map_187_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_187_dims, map_187_strides, map_187_box, map_187_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_188_dims[] = {2048ull, 8ull, 120ull};
-      const uint64_t map_188_strides[] = {1024ull, 8192ull};
-      const uint32_t map_188_box[] = {256u, 8u, 1u};
-      const uint32_t map_188_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6144u) + 0, map_188_dims, map_188_strides, map_188_box, map_188_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_189_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_189_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_189_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_189_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_189_dims, map_189_strides, map_189_box, map_189_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 989184u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_190_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_190_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_190_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_190_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1112064u) + 0, map_190_dims, map_190_strides, map_190_box, map_190_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1112064u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4352u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(120);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1112064u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -4420,20 +2947,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 120, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 120, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{6144u, 989184u, 1112064u, 4352u, 5376u, 120},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3840u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 20, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -4442,7 +2966,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 21: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4096u));
@@ -4517,70 +3041,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 6400u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_194_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_194_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_194_box[] = {256u, 128u, 1u};
-      const uint32_t map_194_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_194_dims, map_194_strides, map_194_box, map_194_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_195_dims[] = {2048ull, 8ull, 126ull};
-      const uint64_t map_195_strides[] = {1024ull, 8192ull};
-      const uint32_t map_195_box[] = {256u, 8u, 1u};
-      const uint32_t map_195_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 6400u) + 0, map_195_dims, map_195_strides, map_195_box, map_195_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_196_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_196_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_196_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_196_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_196_dims, map_196_strides, map_196_box, map_196_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1038592u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_197_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_197_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_197_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_197_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1167616u) + 0, map_197_dims, map_197_strides, map_197_box, map_197_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1167616u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4096u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(126);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5632u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1167616u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -4590,20 +3050,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 126, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 126, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{6400u, 1038592u, 1167616u, 4608u, 5632u, 126},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4096u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 21, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -4612,7 +3069,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 22: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4352u));
@@ -4687,161 +3144,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7424u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_201_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_201_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_201_box[] = {256u, 128u, 1u};
-      const uint32_t map_201_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_201_dims, map_201_strides, map_201_box, map_201_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_202_dims[] = {2048ull, 1ull, 132ull};
-      const uint64_t map_202_strides[] = {1024ull, 8192ull};
-      const uint32_t map_202_box[] = {256u, 8u, 1u};
-      const uint32_t map_202_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_202_dims, map_202_strides, map_202_box, map_202_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_203_dims[] = {2048ull, 2ull, 132ull};
-      const uint64_t map_203_strides[] = {1024ull, 8192ull};
-      const uint32_t map_203_box[] = {256u, 8u, 1u};
-      const uint32_t map_203_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_203_dims, map_203_strides, map_203_box, map_203_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_204_dims[] = {2048ull, 3ull, 132ull};
-      const uint64_t map_204_strides[] = {1024ull, 8192ull};
-      const uint32_t map_204_box[] = {256u, 8u, 1u};
-      const uint32_t map_204_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_204_dims, map_204_strides, map_204_box, map_204_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_205_dims[] = {2048ull, 4ull, 132ull};
-      const uint64_t map_205_strides[] = {1024ull, 8192ull};
-      const uint32_t map_205_box[] = {256u, 8u, 1u};
-      const uint32_t map_205_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_205_dims, map_205_strides, map_205_box, map_205_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_206_dims[] = {2048ull, 5ull, 132ull};
-      const uint64_t map_206_strides[] = {1024ull, 8192ull};
-      const uint32_t map_206_box[] = {256u, 8u, 1u};
-      const uint32_t map_206_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_206_dims, map_206_strides, map_206_box, map_206_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_207_dims[] = {2048ull, 6ull, 132ull};
-      const uint64_t map_207_strides[] = {1024ull, 8192ull};
-      const uint32_t map_207_box[] = {256u, 8u, 1u};
-      const uint32_t map_207_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_207_dims, map_207_strides, map_207_box, map_207_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_208_dims[] = {2048ull, 7ull, 132ull};
-      const uint64_t map_208_strides[] = {1024ull, 8192ull};
-      const uint32_t map_208_box[] = {256u, 8u, 1u};
-      const uint32_t map_208_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_208_dims, map_208_strides, map_208_box, map_208_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_209_dims[] = {2048ull, 8ull, 132ull};
-      const uint64_t map_209_strides[] = {1024ull, 8192ull};
-      const uint32_t map_209_box[] = {256u, 8u, 1u};
-      const uint32_t map_209_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7424u) + 0, map_209_dims, map_209_strides, map_209_box, map_209_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_210_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_210_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_210_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_210_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_210_dims, map_210_strides, map_210_box, map_210_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1088768u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_211_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_211_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_211_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_211_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1223936u) + 0, map_211_dims, map_211_strides, map_211_box, map_211_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1223936u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4352u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5120u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(132);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6656u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1223936u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -4851,20 +3153,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 132, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 132, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{7424u, 1088768u, 1223936u, 5120u, 6656u, 132},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4352u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 22, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -4948,70 +3247,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7680u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_215_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_215_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_215_box[] = {256u, 128u, 1u};
-      const uint32_t map_215_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_215_dims, map_215_strides, map_215_box, map_215_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_216_dims[] = {2048ull, 8ull, 138ull};
-      const uint64_t map_216_strides[] = {1024ull, 8192ull};
-      const uint32_t map_216_box[] = {256u, 8u, 1u};
-      const uint32_t map_216_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_216_dims, map_216_strides, map_216_box, map_216_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_217_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_217_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_217_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_217_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_217_dims, map_217_strides, map_217_box, map_217_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1138176u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_218_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_218_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_218_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_218_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1279488u) + 0, map_218_dims, map_218_strides, map_218_box, map_218_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1279488u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(138);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6912u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1279488u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -5030,11 +3265,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 138, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{7680u, 1138176u, 1279488u, 5376u, 6912u, 138},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 23, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -5043,7 +3275,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 24: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
@@ -5118,161 +3350,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7680u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_222_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_222_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_222_box[] = {256u, 128u, 1u};
-      const uint32_t map_222_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_222_dims, map_222_strides, map_222_box, map_222_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_223_dims[] = {2048ull, 1ull, 144ull};
-      const uint64_t map_223_strides[] = {1024ull, 8192ull};
-      const uint32_t map_223_box[] = {256u, 8u, 1u};
-      const uint32_t map_223_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_223_dims, map_223_strides, map_223_box, map_223_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_224_dims[] = {2048ull, 2ull, 144ull};
-      const uint64_t map_224_strides[] = {1024ull, 8192ull};
-      const uint32_t map_224_box[] = {256u, 8u, 1u};
-      const uint32_t map_224_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_224_dims, map_224_strides, map_224_box, map_224_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_225_dims[] = {2048ull, 3ull, 144ull};
-      const uint64_t map_225_strides[] = {1024ull, 8192ull};
-      const uint32_t map_225_box[] = {256u, 8u, 1u};
-      const uint32_t map_225_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_225_dims, map_225_strides, map_225_box, map_225_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_226_dims[] = {2048ull, 4ull, 144ull};
-      const uint64_t map_226_strides[] = {1024ull, 8192ull};
-      const uint32_t map_226_box[] = {256u, 8u, 1u};
-      const uint32_t map_226_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_226_dims, map_226_strides, map_226_box, map_226_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_227_dims[] = {2048ull, 5ull, 144ull};
-      const uint64_t map_227_strides[] = {1024ull, 8192ull};
-      const uint32_t map_227_box[] = {256u, 8u, 1u};
-      const uint32_t map_227_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_227_dims, map_227_strides, map_227_box, map_227_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_228_dims[] = {2048ull, 6ull, 144ull};
-      const uint64_t map_228_strides[] = {1024ull, 8192ull};
-      const uint32_t map_228_box[] = {256u, 8u, 1u};
-      const uint32_t map_228_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_228_dims, map_228_strides, map_228_box, map_228_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_229_dims[] = {2048ull, 7ull, 144ull};
-      const uint64_t map_229_strides[] = {1024ull, 8192ull};
-      const uint32_t map_229_box[] = {256u, 8u, 1u};
-      const uint32_t map_229_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_229_dims, map_229_strides, map_229_box, map_229_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_230_dims[] = {2048ull, 8ull, 144ull};
-      const uint64_t map_230_strides[] = {1024ull, 8192ull};
-      const uint32_t map_230_box[] = {256u, 8u, 1u};
-      const uint32_t map_230_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7680u) + 0, map_230_dims, map_230_strides, map_230_box, map_230_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_231_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_231_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_231_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_231_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_231_dims, map_231_strides, map_231_box, map_231_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1187328u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_232_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_232_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_232_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_232_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1334784u) + 0, map_232_dims, map_232_strides, map_232_box, map_232_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1334784u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(144);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6912u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1334784u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -5282,20 +3359,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 144, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 144, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{7680u, 1187328u, 1334784u, 5376u, 6912u, 144},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4608u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 24, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -5304,7 +3378,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 25: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4864u));
@@ -5379,70 +3453,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7936u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_236_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_236_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_236_box[] = {256u, 128u, 1u};
-      const uint32_t map_236_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_236_dims, map_236_strides, map_236_box, map_236_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_237_dims[] = {2048ull, 8ull, 150ull};
-      const uint64_t map_237_strides[] = {1024ull, 8192ull};
-      const uint32_t map_237_box[] = {256u, 8u, 1u};
-      const uint32_t map_237_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 7936u) + 0, map_237_dims, map_237_strides, map_237_box, map_237_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_238_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_238_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_238_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_238_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_238_dims, map_238_strides, map_238_box, map_238_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1236736u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_239_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_239_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_239_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_239_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1390336u) + 0, map_239_dims, map_239_strides, map_239_box, map_239_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1390336u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4864u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5632u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(150);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 7168u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1390336u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -5452,20 +3462,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 150, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 150, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{7936u, 1236736u, 1390336u, 5632u, 7168u, 150},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 4864u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 25, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -5474,7 +3481,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 26: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5120u));
@@ -5549,161 +3556,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8192u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_243_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_243_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_243_box[] = {256u, 128u, 1u};
-      const uint32_t map_243_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_243_dims, map_243_strides, map_243_box, map_243_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_244_dims[] = {2048ull, 1ull, 156ull};
-      const uint64_t map_244_strides[] = {1024ull, 8192ull};
-      const uint32_t map_244_box[] = {256u, 8u, 1u};
-      const uint32_t map_244_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_244_dims, map_244_strides, map_244_box, map_244_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_245_dims[] = {2048ull, 2ull, 156ull};
-      const uint64_t map_245_strides[] = {1024ull, 8192ull};
-      const uint32_t map_245_box[] = {256u, 8u, 1u};
-      const uint32_t map_245_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_245_dims, map_245_strides, map_245_box, map_245_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_246_dims[] = {2048ull, 3ull, 156ull};
-      const uint64_t map_246_strides[] = {1024ull, 8192ull};
-      const uint32_t map_246_box[] = {256u, 8u, 1u};
-      const uint32_t map_246_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_246_dims, map_246_strides, map_246_box, map_246_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_247_dims[] = {2048ull, 4ull, 156ull};
-      const uint64_t map_247_strides[] = {1024ull, 8192ull};
-      const uint32_t map_247_box[] = {256u, 8u, 1u};
-      const uint32_t map_247_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_247_dims, map_247_strides, map_247_box, map_247_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_248_dims[] = {2048ull, 5ull, 156ull};
-      const uint64_t map_248_strides[] = {1024ull, 8192ull};
-      const uint32_t map_248_box[] = {256u, 8u, 1u};
-      const uint32_t map_248_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_248_dims, map_248_strides, map_248_box, map_248_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_249_dims[] = {2048ull, 6ull, 156ull};
-      const uint64_t map_249_strides[] = {1024ull, 8192ull};
-      const uint32_t map_249_box[] = {256u, 8u, 1u};
-      const uint32_t map_249_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_249_dims, map_249_strides, map_249_box, map_249_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_250_dims[] = {2048ull, 7ull, 156ull};
-      const uint64_t map_250_strides[] = {1024ull, 8192ull};
-      const uint32_t map_250_box[] = {256u, 8u, 1u};
-      const uint32_t map_250_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_250_dims, map_250_strides, map_250_box, map_250_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_251_dims[] = {2048ull, 8ull, 156ull};
-      const uint64_t map_251_strides[] = {1024ull, 8192ull};
-      const uint32_t map_251_box[] = {256u, 8u, 1u};
-      const uint32_t map_251_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8192u) + 0, map_251_dims, map_251_strides, map_251_box, map_251_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_252_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_252_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_252_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_252_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_252_dims, map_252_strides, map_252_box, map_252_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1286144u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_253_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_253_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_253_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_253_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1445888u) + 0, map_253_dims, map_253_strides, map_253_box, map_253_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1445888u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5120u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5888u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(156);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 7424u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1445888u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -5713,20 +3565,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 156, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 156, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{8192u, 1286144u, 1445888u, 5888u, 7424u, 156},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5120u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 26, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -5735,7 +3584,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 27: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
@@ -5810,161 +3659,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8448u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_257_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_257_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_257_box[] = {256u, 128u, 1u};
-      const uint32_t map_257_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_257_dims, map_257_strides, map_257_box, map_257_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_258_dims[] = {2048ull, 1ull, 162ull};
-      const uint64_t map_258_strides[] = {1024ull, 8192ull};
-      const uint32_t map_258_box[] = {256u, 8u, 1u};
-      const uint32_t map_258_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_258_dims, map_258_strides, map_258_box, map_258_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_259_dims[] = {2048ull, 2ull, 162ull};
-      const uint64_t map_259_strides[] = {1024ull, 8192ull};
-      const uint32_t map_259_box[] = {256u, 8u, 1u};
-      const uint32_t map_259_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_259_dims, map_259_strides, map_259_box, map_259_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_260_dims[] = {2048ull, 3ull, 162ull};
-      const uint64_t map_260_strides[] = {1024ull, 8192ull};
-      const uint32_t map_260_box[] = {256u, 8u, 1u};
-      const uint32_t map_260_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_260_dims, map_260_strides, map_260_box, map_260_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_261_dims[] = {2048ull, 4ull, 162ull};
-      const uint64_t map_261_strides[] = {1024ull, 8192ull};
-      const uint32_t map_261_box[] = {256u, 8u, 1u};
-      const uint32_t map_261_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_261_dims, map_261_strides, map_261_box, map_261_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_262_dims[] = {2048ull, 5ull, 162ull};
-      const uint64_t map_262_strides[] = {1024ull, 8192ull};
-      const uint32_t map_262_box[] = {256u, 8u, 1u};
-      const uint32_t map_262_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_262_dims, map_262_strides, map_262_box, map_262_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_263_dims[] = {2048ull, 6ull, 162ull};
-      const uint64_t map_263_strides[] = {1024ull, 8192ull};
-      const uint32_t map_263_box[] = {256u, 8u, 1u};
-      const uint32_t map_263_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_263_dims, map_263_strides, map_263_box, map_263_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_264_dims[] = {2048ull, 7ull, 162ull};
-      const uint64_t map_264_strides[] = {1024ull, 8192ull};
-      const uint32_t map_264_box[] = {256u, 8u, 1u};
-      const uint32_t map_264_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_264_dims, map_264_strides, map_264_box, map_264_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_265_dims[] = {2048ull, 8ull, 162ull};
-      const uint64_t map_265_strides[] = {1024ull, 8192ull};
-      const uint32_t map_265_box[] = {256u, 8u, 1u};
-      const uint32_t map_265_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_265_dims, map_265_strides, map_265_box, map_265_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_266_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_266_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_266_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_266_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_266_dims, map_266_strides, map_266_box, map_266_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1335552u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_267_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_267_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_267_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_267_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1501440u) + 0, map_267_dims, map_267_strides, map_267_box, map_267_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1501440u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(162);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 7680u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1501440u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -5974,20 +3668,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 162, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 162, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{8448u, 1335552u, 1501440u, 6144u, 7680u, 162},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 27, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -5996,7 +3687,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 28: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
@@ -6071,161 +3762,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8448u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_271_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_271_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_271_box[] = {256u, 128u, 1u};
-      const uint32_t map_271_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_271_dims, map_271_strides, map_271_box, map_271_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_272_dims[] = {2048ull, 1ull, 168ull};
-      const uint64_t map_272_strides[] = {1024ull, 8192ull};
-      const uint32_t map_272_box[] = {256u, 8u, 1u};
-      const uint32_t map_272_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_272_dims, map_272_strides, map_272_box, map_272_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_273_dims[] = {2048ull, 2ull, 168ull};
-      const uint64_t map_273_strides[] = {1024ull, 8192ull};
-      const uint32_t map_273_box[] = {256u, 8u, 1u};
-      const uint32_t map_273_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_273_dims, map_273_strides, map_273_box, map_273_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_274_dims[] = {2048ull, 3ull, 168ull};
-      const uint64_t map_274_strides[] = {1024ull, 8192ull};
-      const uint32_t map_274_box[] = {256u, 8u, 1u};
-      const uint32_t map_274_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_274_dims, map_274_strides, map_274_box, map_274_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_275_dims[] = {2048ull, 4ull, 168ull};
-      const uint64_t map_275_strides[] = {1024ull, 8192ull};
-      const uint32_t map_275_box[] = {256u, 8u, 1u};
-      const uint32_t map_275_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_275_dims, map_275_strides, map_275_box, map_275_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_276_dims[] = {2048ull, 5ull, 168ull};
-      const uint64_t map_276_strides[] = {1024ull, 8192ull};
-      const uint32_t map_276_box[] = {256u, 8u, 1u};
-      const uint32_t map_276_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_276_dims, map_276_strides, map_276_box, map_276_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_277_dims[] = {2048ull, 6ull, 168ull};
-      const uint64_t map_277_strides[] = {1024ull, 8192ull};
-      const uint32_t map_277_box[] = {256u, 8u, 1u};
-      const uint32_t map_277_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_277_dims, map_277_strides, map_277_box, map_277_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_278_dims[] = {2048ull, 7ull, 168ull};
-      const uint64_t map_278_strides[] = {1024ull, 8192ull};
-      const uint32_t map_278_box[] = {256u, 8u, 1u};
-      const uint32_t map_278_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_278_dims, map_278_strides, map_278_box, map_278_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_279_dims[] = {2048ull, 8ull, 168ull};
-      const uint64_t map_279_strides[] = {1024ull, 8192ull};
-      const uint32_t map_279_box[] = {256u, 8u, 1u};
-      const uint32_t map_279_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8448u) + 0, map_279_dims, map_279_strides, map_279_box, map_279_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_280_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_280_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_280_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_280_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_280_dims, map_280_strides, map_280_box, map_280_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1384704u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_281_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_281_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_281_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_281_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1556736u) + 0, map_281_dims, map_281_strides, map_281_box, map_281_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1556736u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(168);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 7680u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1556736u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -6235,20 +3771,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 168, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 168, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{8448u, 1384704u, 1556736u, 6144u, 7680u, 168},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5376u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 28, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -6257,7 +3790,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 29: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5632u));
@@ -6332,70 +3865,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8704u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_285_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_285_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_285_box[] = {256u, 128u, 1u};
-      const uint32_t map_285_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_285_dims, map_285_strides, map_285_box, map_285_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_286_dims[] = {2048ull, 8ull, 174ull};
-      const uint64_t map_286_strides[] = {1024ull, 8192ull};
-      const uint32_t map_286_box[] = {256u, 8u, 1u};
-      const uint32_t map_286_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8704u) + 0, map_286_dims, map_286_strides, map_286_box, map_286_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_287_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_287_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_287_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_287_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_287_dims, map_287_strides, map_287_box, map_287_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1434112u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_288_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_288_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_288_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_288_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1612288u) + 0, map_288_dims, map_288_strides, map_288_box, map_288_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1612288u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5632u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6400u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(174);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 7936u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1612288u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -6405,20 +3874,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 174, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 174, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{8704u, 1434112u, 1612288u, 6400u, 7936u, 174},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5632u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 29, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -6427,7 +3893,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 30: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5888u));
@@ -6502,70 +3968,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8960u));
-    Args_device_09 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_292_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_292_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_292_box[] = {256u, 128u, 1u};
-      const uint32_t map_292_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_292_dims, map_292_strides, map_292_box, map_292_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_293_dims[] = {2048ull, 8ull, 180ull};
-      const uint64_t map_293_strides[] = {1024ull, 8192ull};
-      const uint32_t map_293_box[] = {256u, 8u, 1u};
-      const uint32_t map_293_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 8960u) + 0, map_293_dims, map_293_strides, map_293_box, map_293_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_294_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_294_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_294_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_294_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_294_dims, map_294_strides, map_294_box, map_294_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1483520u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_295_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_295_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_295_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_295_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1667840u) + 0, map_295_dims, map_295_strides, map_295_box, map_295_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1667840u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5888u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6656u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(180);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 8192u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1667840u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -6575,20 +3977,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 180, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_v21_sm100", dim3(32, 180, 1), dim3(416, 1, 1), dim3(2, 1, 1),
-      85120u, true, false, true,
-      &Submit_device_09, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{8960u, 1483520u, 1667840u, 6656u, 8192u, 180},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 5888u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 30, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -6597,7 +3996,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 31: {
-    Args_device_00 args_0{};
+    Args_device_05 args_0{};
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
@@ -6672,161 +4071,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 9216u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_299_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_299_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_299_box[] = {256u, 128u, 1u};
-      const uint32_t map_299_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_299_dims, map_299_strides, map_299_box, map_299_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_300_dims[] = {2048ull, 1ull, 186ull};
-      const uint64_t map_300_strides[] = {1024ull, 8192ull};
-      const uint32_t map_300_box[] = {256u, 8u, 1u};
-      const uint32_t map_300_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_300_dims, map_300_strides, map_300_box, map_300_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_301_dims[] = {2048ull, 2ull, 186ull};
-      const uint64_t map_301_strides[] = {1024ull, 8192ull};
-      const uint32_t map_301_box[] = {256u, 8u, 1u};
-      const uint32_t map_301_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_301_dims, map_301_strides, map_301_box, map_301_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_302_dims[] = {2048ull, 3ull, 186ull};
-      const uint64_t map_302_strides[] = {1024ull, 8192ull};
-      const uint32_t map_302_box[] = {256u, 8u, 1u};
-      const uint32_t map_302_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_302_dims, map_302_strides, map_302_box, map_302_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_303_dims[] = {2048ull, 4ull, 186ull};
-      const uint64_t map_303_strides[] = {1024ull, 8192ull};
-      const uint32_t map_303_box[] = {256u, 8u, 1u};
-      const uint32_t map_303_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_303_dims, map_303_strides, map_303_box, map_303_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_304_dims[] = {2048ull, 5ull, 186ull};
-      const uint64_t map_304_strides[] = {1024ull, 8192ull};
-      const uint32_t map_304_box[] = {256u, 8u, 1u};
-      const uint32_t map_304_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_304_dims, map_304_strides, map_304_box, map_304_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_305_dims[] = {2048ull, 6ull, 186ull};
-      const uint64_t map_305_strides[] = {1024ull, 8192ull};
-      const uint32_t map_305_box[] = {256u, 8u, 1u};
-      const uint32_t map_305_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_305_dims, map_305_strides, map_305_box, map_305_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_306_dims[] = {2048ull, 7ull, 186ull};
-      const uint64_t map_306_strides[] = {1024ull, 8192ull};
-      const uint32_t map_306_box[] = {256u, 8u, 1u};
-      const uint32_t map_306_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_306_dims, map_306_strides, map_306_box, map_306_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_307_dims[] = {2048ull, 8ull, 186ull};
-      const uint64_t map_307_strides[] = {1024ull, 8192ull};
-      const uint32_t map_307_box[] = {256u, 8u, 1u};
-      const uint32_t map_307_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_307_dims, map_307_strides, map_307_box, map_307_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_308_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_308_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_308_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_308_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_308_dims, map_308_strides, map_308_box, map_308_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1532928u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_309_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_309_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_309_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_309_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1723392u) + 0, map_309_dims, map_309_strides, map_309_box, map_309_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1723392u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6912u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(186);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 8448u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1723392u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -6836,20 +4080,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
+      "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
-      &Submit_device_00, &args_0, -1};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100", dim3(64, 186, 1), dim3(352, 1, 1), dim3(2, 1, 1),
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 186, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{9216u, 1532928u, 1723392u, 6912u, 8448u, 186},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 31, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
@@ -6933,161 +4174,6 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 9216u));
-    Args_device_11 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_313_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_313_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_313_box[] = {256u, 128u, 1u};
-      const uint32_t map_313_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_313_dims, map_313_strides, map_313_box, map_313_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_314_dims[] = {2048ull, 1ull, 192ull};
-      const uint64_t map_314_strides[] = {1024ull, 8192ull};
-      const uint32_t map_314_box[] = {256u, 8u, 1u};
-      const uint32_t map_314_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_314_dims, map_314_strides, map_314_box, map_314_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_1) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_1, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_315_dims[] = {2048ull, 2ull, 192ull};
-      const uint64_t map_315_strides[] = {1024ull, 8192ull};
-      const uint32_t map_315_box[] = {256u, 8u, 1u};
-      const uint32_t map_315_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_315_dims, map_315_strides, map_315_box, map_315_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_2) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_2, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_316_dims[] = {2048ull, 3ull, 192ull};
-      const uint64_t map_316_strides[] = {1024ull, 8192ull};
-      const uint32_t map_316_box[] = {256u, 8u, 1u};
-      const uint32_t map_316_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_316_dims, map_316_strides, map_316_box, map_316_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_3) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_3, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_317_dims[] = {2048ull, 4ull, 192ull};
-      const uint64_t map_317_strides[] = {1024ull, 8192ull};
-      const uint32_t map_317_box[] = {256u, 8u, 1u};
-      const uint32_t map_317_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_317_dims, map_317_strides, map_317_box, map_317_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_4) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_4, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_318_dims[] = {2048ull, 5ull, 192ull};
-      const uint64_t map_318_strides[] = {1024ull, 8192ull};
-      const uint32_t map_318_box[] = {256u, 8u, 1u};
-      const uint32_t map_318_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_318_dims, map_318_strides, map_318_box, map_318_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_5) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_5, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_319_dims[] = {2048ull, 6ull, 192ull};
-      const uint64_t map_319_strides[] = {1024ull, 8192ull};
-      const uint32_t map_319_box[] = {256u, 8u, 1u};
-      const uint32_t map_319_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_319_dims, map_319_strides, map_319_box, map_319_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_6) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_6, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_320_dims[] = {2048ull, 7ull, 192ull};
-      const uint64_t map_320_strides[] = {1024ull, 8192ull};
-      const uint32_t map_320_box[] = {256u, 8u, 1u};
-      const uint32_t map_320_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_320_dims, map_320_strides, map_320_box, map_320_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_7) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_7, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_321_dims[] = {2048ull, 8ull, 192ull};
-      const uint64_t map_321_strides[] = {1024ull, 8192ull};
-      const uint32_t map_321_box[] = {256u, 8u, 1u};
-      const uint32_t map_321_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 9216u) + 0, map_321_dims, map_321_strides, map_321_box, map_321_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.tmap_b_rows_8) == sizeof(encoded));
-      std::memcpy(&args_2.tmap_b_rows_8, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_322_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_322_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_322_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_322_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_322_dims, map_322_strides, map_322_box, map_322_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    args_2.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 1582080u));
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_323_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_323_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_323_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_323_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 1778688u) + 0, map_323_dims, map_323_strides, map_323_box, map_323_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1778688u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6912u));
-    args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(192);
-    args_2.K_tiles = static_cast<int>(4);
-    args_2.total_tiles = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 8448u));
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1778688u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -7106,11 +4192,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       64128u, true, false, true,
       &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
-    KernelLaunch launch_2{
-      "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100", dim3(32, 192, 1), dim3(384, 1, 1), dim3(1, 1, 1),
-      85120u, true, false, false,
-      &Submit_device_11, &args_2, 100};
-    visitor(launch_2, context);
+    VisitTileN8Fc2(inv, required, TileN8Fc2Regions{9216u, 1582080u, 1778688u, 6912u, 8448u, 192},
+                   reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 6144u)), 100, visitor, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 32, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,

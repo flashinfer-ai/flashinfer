@@ -36,7 +36,21 @@ CUTEDSL_REQUIRED = "4.8.0"
 FORMS: Tuple[str, ...] = ("prefill", "extend", "decode")
 PAGE_SIZES: Tuple[int, ...] = (16, 32, 64, 128)
 PAGE_SIZE_ALIGN = 16
-KV_LAYOUTS: Tuple[str, ...] = ("NHD", "HND")
+#: the cache spellings: FlashInfer's NHD / HND (a 5-D ``[num_pages, 2, ...]`` buffer or a ``(k_cache, v_cache)`` pair) and the serving
+#: stacks' packed K|V pool, ``"UNIFIED"`` -- ONE ``[num_pages, H_kv, page_size, 2 x D]`` tensor per layer with K in columns ``[0, D)``
+#: and V in ``[D, 2D)`` of every row (the 24 / 4 model family's bf16 cache ``[pages, 4, 16 or 32, 512]``), bound as its two half views:
+#: the vendored tree's ``unified`` pool layout (its ``SERVING_POOL_LAYOUTS`` = ``hnd`` / ``nhd`` / ``unified``, one FlashInfer spelling each;
+#: :func:`check_vendored_rules` compares the two vocabularies).  The Qwen 3.8 sibling package spells ITS stack's packed row -- the
+#: NHD-ordered ``[num_pages, page_size, H_kv, 2 x D]`` -- with the same word: the binding (K at ``+0``, V at ``+D`` of one row) is the
+#: same, the axis order is each stack's own.
+KV_LAYOUTS: Tuple[str, ...] = ("NHD", "HND", "UNIFIED")
+KV_LAYOUT_UNIFIED = "UNIFIED"
+#: the cache tensor each spelling hands the block (the shape ``api.kv_views`` reads; a ``(k, v)`` pair of 4-D tensors binds under NHD / HND too)
+KV_LAYOUT_SHAPES: Dict[str, str] = {
+    "NHD": "[num_pages, 2, page_size, H_kv, D]",
+    "HND": "[num_pages, 2, H_kv, page_size, D]",
+    "UNIFIED": "[num_pages, H_kv, page_size, 2 x D]",
+}
 DECODE_MAX_Q_LEN = 4  # the claimed envelope: the packed Rubin d256 decode tile
 DECODE_MAX_ROWS = (
     32  # routed (the unpacked tile) and declared up to here; a typed decline past it
@@ -122,7 +136,8 @@ _VENDORED = Path(__file__).resolve().parent / "_cudnn_frost"
 @dataclass(frozen=True)
 class Qwen35BlockGeometry:
     """The sub-layer's shape at THIS tensor-parallel rank (Qwen3.5-397B at TP 1: ``d_model=4096, num_qo_heads=32,
-    num_kv_heads=2``; ``24 / 2`` at ``d_model=2560`` for the 27B-class shards).  ``is_causal`` with the bottom-right
+    num_kv_heads=2``; ``24 / 2`` at ``d_model=2560`` for the 27B-class shards; the Qwen3.8-27B dense attention layer:
+    ``d_model=5120, num_qo_heads=24, num_kv_heads=4``).  ``is_causal`` with the bottom-right
     diagonal, no window and no soft-cap are fixed, not parameters.  The constructor checks the FORM of the fields (positive
     ints, whole GQA groups, an even ``rope_dim`` within the head); :meth:`unsupported_reason` is the kernels' envelope
     (``head_dim`` 256, ``d_model`` a multiple of the projection tile, ``rope_dim`` in :data:`ROPE_DIMS`)."""
@@ -335,6 +350,10 @@ class Qwen35BlockSupport:
     kv_cache_dtypes: Tuple[torch.dtype, ...] = KV_CACHE_DTYPES
     #: the rope_dim values served at head_dim 256 (appended; the geometry gate's envelope)
     rope_dims: Tuple[int, ...] = ROPE_DIMS
+    #: the cache tensor each ``kv_layouts`` spelling hands the block (appended; :data:`KV_LAYOUT_SHAPES`)
+    kv_layout_shapes: Dict[str, str] = field(
+        default_factory=lambda: dict(KV_LAYOUT_SHAPES)
+    )
 
     def form(self, name: str) -> Qwen35BlockFormSupport:
         if name not in FORMS:
@@ -429,7 +448,8 @@ def check_vendored_rules() -> Dict[str, Any]:
     tree reads the other way.  Compared: the fused fork's tile constants (``_FusedQkvProjection._TILE_N`` = head_dim, ``2 *
     _SUBTILE_N`` = the rope_dim pair), the lowered chain's rope rule as BEHAVIOUR (the TMA and the LDG norm + RoPE kernels'
     ``validate_shape`` over every even ``rope_dim`` up to the head dim, at a geometry the TMA tiling fits), the decode row cap,
-    the validated page sizes and the target cc.  Once per process (the probe's vendored read, ``api.prepare``); returns the
+    the validated page sizes, the pool layout vocabulary (the tree's ``SERVING_POOL_LAYOUTS`` against :data:`KV_LAYOUTS`) and the
+    target cc.  Once per process (the probe's vendored read, ``api.prepare``); returns the
     tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
     from ._cudnn_frost.gated_attention_block import api as vendored
     from ._cudnn_frost.gated_attention_block.kernels import (
@@ -445,6 +465,9 @@ def check_vendored_rules() -> Dict[str, Any]:
         "rope_row_lanes": int(qk_norm_rope.lanes_per_row(HEAD_DIM)),
         "decode_max_rows": int(vendored.DECODE_MAX_ROWS),
         "page_sizes": tuple(int(p) for p in vendored.SERVING_PAGE_SIZES),
+        "pool_layouts": tuple(
+            sorted(str(x).lower() for x in vendored.SERVING_POOL_LAYOUTS)
+        ),
         "supported_cc": tuple(int(x) for x in vendored._SM107_CC),
     }
     mirrored: Dict[str, Any] = {
@@ -454,6 +477,7 @@ def check_vendored_rules() -> Dict[str, Any]:
         "rope_row_lanes": _ROPE_ROW_LANES,
         "decode_max_rows": DECODE_MAX_ROWS,
         "page_sizes": PAGE_SIZES,
+        "pool_layouts": tuple(sorted(x.lower() for x in KV_LAYOUTS)),
         "supported_cc": SUPPORTED_CC,
     }
     drift = [

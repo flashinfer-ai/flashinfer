@@ -3071,7 +3071,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "0a969a4150fe9b82e1f41a2f7d03f89c4cb8d289a8d8d7d9c811d2844eb24936",
+      "closure_sha256": "8568d34f2eb457712eb8fc448a8f2ccfa817aadc2dc1a409a09bb2186ace552d",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -3081,7 +3081,7 @@
       "path": "aot/cake_stepfun_moe_c16c727913eac39c7f25_sm_100a.so",
       "sha256": {
         "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_binding.cu": "077ca788f0c850dafd6319a6d083ada985039575004b18c608442485c8c2a2f1",
-        "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_kernel.cu": "62d20c82662f1429290e74848982287f2eb99273dc34d5085a88cd62c2a5607b"
+        "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_kernel.cu": "5c802d139c049856ec1da7a99a53cde2bae8d9b910d4cc8a6545902f68d8419e"
       },
       "sources": [
         "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_kernel.cu",
@@ -3090,7 +3090,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "9700ed9cbdee45ec4827dbc6e1030ca663545c80d283fda4e542c57983a86058",
+      "closure_sha256": "9edfdf04b602386cfbe0612f3516572b7bc66d13b0c9eb16266d24719a637e45",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -3100,7 +3100,7 @@
       "path": "aot/cake_stepfun_moe_c16c727913eac39c7f25_sm_103a.so",
       "sha256": {
         "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_binding.cu": "077ca788f0c850dafd6319a6d083ada985039575004b18c608442485c8c2a2f1",
-        "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_kernel.cu": "62d20c82662f1429290e74848982287f2eb99273dc34d5085a88cd62c2a5607b"
+        "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_kernel.cu": "5c802d139c049856ec1da7a99a53cde2bae8d9b910d4cc8a6545902f68d8419e"
       },
       "sources": [
         "csrc/cake_stepfun_moe/cake_stepfun_moe_c16c727913eac39c7f25_kernel.cu",

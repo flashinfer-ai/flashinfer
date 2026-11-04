@@ -45,6 +45,7 @@ from ..jit import (
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..utils import (
+    _check_block_scale_quantization_support,
     backend_requirement,
     device_support_pdl,
     get_compute_capability,
@@ -348,13 +349,9 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf_size = _compute_swizzled_layout_sf_size(
                 m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
             )
-            out_sf_size_padded = out_sf_size
         else:
             out_sf_size = m * k // sf_vec_size
-            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
-        out_sf = torch.empty(
-            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
-        )
+        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
         module.fp4_quantize(
             input,
             global_scale,
@@ -368,7 +365,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             enable_pdl,
             nvfp4_4over6_code,
         )
-        return out_val, out_sf[:out_sf_size]
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
@@ -694,11 +691,11 @@ def get_fp4_quantization_module(backend: str = "100"):
         when requested, and an optional global scale can be applied.
 
         Args:
-            input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
-                torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
-            mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.
-            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
-                dtype float32.
+            input (torch.Tensor): Input tensor of shape [B, M, 2 * K] (gate half, then up
+                half) with dtype torch.float16 or torch.bfloat16.
+            mask (torch.Tensor): valid row count per group, shape [B], dtype torch.int32.
+            global_scale (torch.Tensor, optional): Global scale factor, one per group,
+                of shape [B] and dtype float32.
             nvfp4_4over6_code (int, optional): Packed NVFP4 4over6 recipe (see
                 flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
                 kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
@@ -1049,6 +1046,45 @@ def silu_and_mul_nvfp4_quantize(
     )
 
 
+def _resolve_fp4_quantize_recipe(
+    input: torch.Tensor,
+    sf_vec_size: int,
+    sf_use_ue8m0: bool,
+    nvfp4_4over6: Optional[NVFP44Over6Config],
+) -> Optional[NVFP44Over6Config]:
+    # MXFP4 never reads the environment; only an explicit recipe is an error.
+    is_mxfp4 = sf_vec_size != 16 or sf_use_ue8m0
+    explicit = nvfp4_4over6 is not _UNSET
+    if is_mxfp4:
+        if explicit and nvfp4_4over6 is not None:
+            raise ValueError(
+                "nvfp4_4over6 applies to NVFP4 only (sf_vec_size=16, "
+                f"sf_use_ue8m0=False); got sf_vec_size={sf_vec_size}, "
+                f"sf_use_ue8m0={sf_use_ue8m0}."
+            )
+        return None
+
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    if (
+        explicit
+        and nvfp4_4over6_config is not None
+        and input.dtype in _FP8_TO_FP4_INPUT_DTYPES
+    ):
+        raise nvfp4_4over6_fp8_input_error(input.dtype)
+    return nvfp4_4over6_config
+
+
+def _fp4_quantize_cute_dsl_parameter_error(
+    sf_vec_size: int, sf_use_ue8m0: bool
+) -> ValueError:
+    return ValueError(
+        f"CuTe-DSL backend does not support sf_vec_size={sf_vec_size} with "
+        f"sf_use_ue8m0={sf_use_ue8m0}. Supported: "
+        f"(sf_vec_size=16, sf_use_ue8m0=False) for NVFP4, "
+        f"(sf_vec_size=32, sf_use_ue8m0=True) for MXFP4."
+    )
+
+
 @flashinfer_api(trace=fp4_quantize_trace)
 def fp4_quantize(
     input: torch.Tensor,
@@ -1096,7 +1132,7 @@ def fp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"cuda"``: stable CUDA kernel on SM100+ (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
           Supported combinations:
 
@@ -1147,30 +1183,23 @@ def fp4_quantize(
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
-    # Resolve exactly once here; the backends below receive the resolved
-    # recipe (``None`` = off). MXFP4 has no candidate search: it never reads
-    # the environment and an explicit recipe is an error. The FP8->FP4 kernels
-    # hardcode the off-recipe: an explicit recipe is an error, an
-    # environment-derived one keeps its historical silent ignore on the CUDA
-    # backend (the CuTe-DSL kernel rejects it, as it always has).
-    is_mxfp4 = sf_vec_size != 16 or sf_use_ue8m0
-    explicit = nvfp4_4over6 is not _UNSET
-    if is_mxfp4:
-        if explicit and nvfp4_4over6 is not None:
-            raise ValueError(
-                "nvfp4_4over6 applies to NVFP4 only (sf_vec_size=16, "
-                f"sf_use_ue8m0=False); got sf_vec_size={sf_vec_size}, "
-                f"sf_use_ue8m0={sf_use_ue8m0}."
-            )
-        nvfp4_4over6_config = None
-    else:
-        nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
-        if (
-            explicit
-            and nvfp4_4over6_config is not None
-            and input.dtype in _FP8_TO_FP4_INPUT_DTYPES
-        ):
+    # Resolve exactly once; backends receive the resolved recipe (None = off).
+    # CUDA historically ignores environment-only recipes for FP8 input, while
+    # CuTe-DSL rejects them as well as explicit ones.
+    nvfp4_4over6_config = _resolve_fp4_quantize_recipe(
+        input, sf_vec_size, sf_use_ue8m0, nvfp4_4over6
+    )
+    if backend == "cute-dsl":
+        if nvfp4_4over6_config is not None and input.dtype in _FP8_TO_FP4_INPUT_DTYPES:
             raise nvfp4_4over6_fp8_input_error(input.dtype)
+        if not (
+            (sf_vec_size == 16 and not sf_use_ue8m0)
+            or (sf_vec_size == 32 and sf_use_ue8m0)
+        ):
+            raise _fp4_quantize_cute_dsl_parameter_error(sf_vec_size, sf_use_ue8m0)
+
+    if backend in ("cuda", "cute-dsl"):
+        _check_block_scale_quantization_support(input.device, "fp4_quantize")
 
     # The quantize kernel reads global_scale as float32 on input's device. Normalize
     # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
@@ -1359,12 +1388,7 @@ def _fp4_quantize_cute_dsl(
         )
 
     else:
-        raise ValueError(
-            f"CuTe-DSL backend does not support sf_vec_size={sf_vec_size} with "
-            f"sf_use_ue8m0={sf_use_ue8m0}. Supported: "
-            f"(sf_vec_size=16, sf_use_ue8m0=False) for NVFP4, "
-            f"(sf_vec_size=32, sf_use_ue8m0=True) for MXFP4."
-        )
+        raise _fp4_quantize_cute_dsl_parameter_error(sf_vec_size, sf_use_ue8m0)
 
 
 @flashinfer_api
@@ -1612,7 +1636,7 @@ def nvfp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"cuda"``: stable CUDA kernel on SM100+ (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
           supports all ``sfLayout`` values
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
@@ -1677,7 +1701,44 @@ def nvfp4_quantize(
             raise ValueError(
                 "out_scale is only supported with backend='cute-dsl' or 'cake'"
             )
+    elif out_scale is not None:
+        raise ValueError("out_scale is only supported with per_token_activation=True")
 
+    if per_token_activation:
+        if backend == "cute-dsl" and expanded_idx_to_permuted_idx is not None:
+            raise ValueError(
+                "CuTe-DSL per-token NVFP4 quantization does not support "
+                "expanded_idx_to_permuted_idx"
+            )
+        if (
+            backend in ("cuda", "cute-dsl")
+            and nvfp4_4over6_is_explicit
+            and not isinstance(a_global_sf, torch.Tensor)
+        ):
+            _check_per_token_global_scale(float(a_global_sf), nvfp4_4over6_config)
+    elif backend == "cuda":
+        if expanded_idx_to_permuted_idx is not None:
+            raise ValueError(
+                "expanded_idx_to_permuted_idx is only supported with per_token_activation=True"
+            )
+        # fp4_quantize performs the same pure recipe validation after the copy.
+        # Other sf_vec_size values retain its preceding NotImplementedError.
+        if nvfp4_4over6_is_explicit and sf_vec_size in (16, 32):
+            _resolve_fp4_quantize_recipe(a, sf_vec_size, False, nvfp4_4over6)
+    elif backend == "cute-dsl":
+        if sf_vec_size != 16:
+            raise ValueError(
+                f"CuTe-DSL backend only supports sf_vec_size=16, got {sf_vec_size}"
+            )
+        if nvfp4_4over6_config is not None and a.dtype in _FP8_TO_FP4_INPUT_DTYPES:
+            raise nvfp4_4over6_fp8_input_error(a.dtype)
+
+    if backend in ("cuda", "cute-dsl"):
+        _check_block_scale_quantization_support(
+            torch.device("cuda", torch.cuda.current_device()), "nvfp4_quantize"
+        )
+
+    if per_token_activation:
         sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
         if do_shuffle:
             assert sfLayout == SfLayout.layout_128x4
@@ -1689,7 +1750,7 @@ def nvfp4_quantize(
                 else float(a_global_sf)
             )
             # Free: this path already materialized the scale on the host above.
-            if nvfp4_4over6_is_explicit:
+            if nvfp4_4over6_is_explicit and isinstance(a_global_sf, torch.Tensor):
                 _check_per_token_global_scale(scale_inv, nvfp4_4over6_config)
             a_cuda = a.cuda()
             expanded_idx_to_permuted_idx_cuda = (
@@ -1711,11 +1772,6 @@ def nvfp4_quantize(
         elif backend == "cute-dsl":
             from ..cute_dsl import is_cute_dsl_available
 
-            if expanded_idx_to_permuted_idx is not None:
-                raise ValueError(
-                    "CuTe-DSL per-token NVFP4 quantization does not support "
-                    "expanded_idx_to_permuted_idx"
-                )
             if not is_cute_dsl_available():
                 raise RuntimeError(
                     "CuTe-DSL backend requested but CuTe-DSL is not available. "
@@ -1733,11 +1789,8 @@ def nvfp4_quantize(
                 SfLayout.layout_8x4: SF_LAYOUT_8x4,
                 SfLayout.layout_linear: SF_LAYOUT_LINEAR,
             }
-            # A device tensor is deliberately left unchecked: reading it costs a
-            # stream synchronization this path has never had (and which would be
-            # illegal under CUDA graph capture).
-            if nvfp4_4over6_is_explicit and not isinstance(a_global_sf, torch.Tensor):
-                _check_per_token_global_scale(float(a_global_sf), nvfp4_4over6_config)
+            # Device-tensor scales remain unchecked: reading them would add a
+            # stream synchronization and be illegal under CUDA graph capture.
             a_fp4, a_sf, per_token_scale = nvfp4_quantize_per_token_cute_dsl(
                 a.cuda(),
                 (
@@ -1785,13 +1838,7 @@ def nvfp4_quantize(
             raise ValueError(
                 f"Unknown backend: {backend}. Must be 'cuda', 'cute-dsl' or 'cake'."
             )
-    elif out_scale is not None:
-        raise ValueError("out_scale is only supported with per_token_activation=True")
     elif backend == "cuda":
-        if expanded_idx_to_permuted_idx is not None:
-            raise ValueError(
-                "expanded_idx_to_permuted_idx is only supported with per_token_activation=True"
-            )
         if do_shuffle:
             assert sfLayout == SfLayout.layout_128x4
             is_sf_swizzled_layout = False
@@ -1820,10 +1867,6 @@ def nvfp4_quantize(
             raise RuntimeError(
                 "CuTe-DSL backend requested but CuTe-DSL is not available. "
                 "Please install the required dependencies."
-            )
-        if sf_vec_size != 16:
-            raise ValueError(
-                f"CuTe-DSL backend only supports sf_vec_size=16, got {sf_vec_size}"
             )
         from .kernels.nvfp4_quantize import (
             SF_LAYOUT_128x4,
@@ -1895,7 +1938,7 @@ def mxfp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"cuda"``: stable CUDA kernel on SM100+ (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Only used when
@@ -1921,6 +1964,13 @@ def mxfp4_quantize(
     notice.  Use at your own risk for production workloads.
     """
     sfLayout = SfLayout(sfLayout)
+    if backend in ("cuda", "cute-dsl"):
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "cuda"
+            else a.device
+        )
+        _check_block_scale_quantization_support(device, "mxfp4_quantize")
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
 
@@ -2262,9 +2312,11 @@ def scaled_fp4_grouped_quantize(
     a : torch.Tensor
         Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
     mask : torch.Tensor
-        Mask tensor applied before quantization.
+        Valid row count per group, shape ``[B]``, dtype ``int32``. Only the
+        first ``mask[b]`` rows of group ``b`` are quantized; the entries of
+        ``x_q`` and ``sf`` for the remaining rows are unspecified.
     a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+        Global scale factor, one per group: shape ``[B]``, dtype ``float32``.
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
 

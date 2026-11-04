@@ -547,6 +547,7 @@ kernel_flashkda_bf16_bt16_prepare(__nv_bfloat16* __restrict__ q, CakeTensorMap c
                     smem_gate_raw[tail_gate_row * 128 + col] = 0.0f;
                 }
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
         }
         float prefix_log2 = 0.0f;

@@ -21,7 +21,7 @@ DISABLE_SANITY_TEST=true
 source "${SCRIPT_DIR}/test_utils.sh"
 
 # Define the specific test files for multi-node comm tests
-TEST_FILES="tests/comm/test_mnnvl_memory.py tests/comm/test_trtllm_mnnvl_allreduce.py tests/comm/test_cake_moe_alltoall_multi_gpu.py tests/comm/test_trtllm_allreduce_checkpoint.py tests/moe_ep/test_moe_ep_communication_multirank.py"
+TEST_FILES="tests/comm/test_mnnvl_memory.py tests/comm/test_trtllm_mnnvl_allreduce.py tests/comm/test_cake_moe_alltoall_multi_gpu.py tests/comm/test_trtllm_allreduce_checkpoint.py tests/moe_ep/test_moe_ep_communication_multirank.py tests/moe_ep/test_nvlink_one_sided_lamport.py"
 
 # Every run of this script is launched across ranks, so multi-rank tests must
 # not be skipped for a missing WORLD_SIZE (see tests/conftest.py).

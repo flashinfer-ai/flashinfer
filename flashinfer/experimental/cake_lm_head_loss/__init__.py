@@ -14,10 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: chunked large-vocabulary LM-head projection +
-# log-sum-exp / cross-entropy / policy-gradient loss with a memory-bounded
-# backward (every vocabulary-sized intermediate spans at most one token chunk)
-# for training on SM100 / SM103 (flashinfer-ai/flashinfer#5680, tracker #4642).
-# The public entry points are ``flashinfer.chunked_lm_head.chunked_lm_head_loss``
-# and ``chunked_lm_head_logprob``; the autograd wrappers, host planning, JIT
-# registration and the generated sources live in this package.
+# The package's import path before the deterministic (``det``) naming.  The
+# implementation, its generated sources and its build manifest live in
+# ``flashinfer.experimental.cake_lm_head_det_loss``; each module of this
+# package is an alias of the module of the same name there (the same module
+# object, so state such as the binding cache is shared).

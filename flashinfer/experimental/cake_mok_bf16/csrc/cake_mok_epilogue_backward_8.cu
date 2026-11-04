@@ -133,6 +133,10 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    return __bfloat1622float2(v);
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
@@ -184,7 +188,7 @@ kernel_cake_mok_epilogue_backward_8(__nv_bfloat16* __restrict__ shared, __nv_bfl
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int col_blocks = (hidden + 1024 - 1) / 1024;
     int units = tokens * col_blocks;
     int count = 0;
@@ -220,7 +224,7 @@ kernel_cake_mok_epilogue_backward_8(__nv_bfloat16* __restrict__ shared, __nv_bfl
             float accumulator[4];
             #pragma unroll
             for (int pair = 0; pair < 2; pair++) {
-                float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(words[base + pair]));
+                float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(words[base + pair]));
                 accumulator[pair * 2] = _cvt_f32_0.x;
                 accumulator[pair * 2 + 1] = _cvt_f32_0.y;
             }
@@ -229,7 +233,7 @@ kernel_cake_mok_epilogue_backward_8(__nv_bfloat16* __restrict__ shared, __nv_bfl
                 float weight = 1.0f;
                 #pragma unroll
                 for (int pair_1 = 0; pair_1 < 2; pair_1++) {
-                    float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(words[base + (1 + k) * 512 + pair_1]));
+                    float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(words[base + (1 + k) * 512 + pair_1]));
                     accumulator[pair_1 * 2] = accumulator[pair_1 * 2] + _cvt_f32_1.x;
                     accumulator[pair_1 * 2 + 1] = accumulator[pair_1 * 2 + 1] + _cvt_f32_1.y;
                 }

@@ -47,8 +47,9 @@ the facade's ``"auto"`` keeps the CuTe DSL kernel there.
 
 from __future__ import annotations
 
+import bisect
 import operator
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Iterable, Optional, Sequence, cast
 
 import torch
 import tvm_ffi
@@ -67,10 +68,14 @@ from .cake_jit import (
 GATED_RESIDUAL_NEXT_RMSNORM = "gated_residual_next_rmsnorm"
 GATED_RESIDUAL_RMSNORM = "gated_residual_rmsnorm"
 RMSNORM_SIGMOID_GATE = "rmsnorm_sigmoid_gate"
-#: The two-norm kernels load every operand in 256-bit accesses: rows and vectors are 32-byte aligned.
+#: Every program of the package reaches rows and vectors in accesses of up to 256 bits (the two-norm kernels on every
+#: operand, the gated residual RMSNorm on its FP32 planes, the sigmoid gate's 16-head programs on their rows): the
+#: package serves 32-byte aligned storage alone, so that no 256-bit access meets a view aligned to 16 bytes only.
 ALIGNMENT_BYTES = 32
-#: The gated residual RMSNorm and the sigmoid gate load in 128-bit accesses: 16-byte aligned storage.
-ROW_ALIGNMENT_BYTES = 16
+#: The alignment of the gated residual RMSNorm's and the sigmoid gate's rows and vectors: the package's one alignment.
+ROW_ALIGNMENT_BYTES = ALIGNMENT_BYTES
+#: The sigmoid gate's token stride is a multiple of this many BF16 elements: every token's row starts aligned.
+GATE_STRIDE_ELEMENTS = ROW_ALIGNMENT_BYTES // 2
 #: The head dimension of the sigmoid gate's rows.
 HEAD_DIM = 64
 
@@ -102,6 +107,108 @@ def _arch(device: torch.device) -> Optional[str]:
     if device.type != "cuda":
         return None
     return arch_for_capability(_capability(device))
+
+
+# ----------------------------------------------------------------------------- admit index
+#
+# ``backend="auto"`` asks ``is_cake_*_supported(..., rows=)`` (``heads=`` / ``tokens=`` for the sigmoid gate) on every
+# call.  The loader's ``admits`` answers one record at a time -- a Python loop over the route's records per call, growing
+# with the records before the one that admits the row count.  The index below folds each route's windows, per
+# architecture and (for the sigmoid gate) per head count, into one sorted list of disjoint spans ``above < rows <=
+# at_most`` -- at import for every route of the registry, on first use for any other (arch, route) a call asks (the
+# variant functions spell finitely many) -- so a call answers with one bisection.  It admits exactly the row counts the
+# loader's scan admits: tests/norm/test_cake_muse_spark_norm_launch_plans.py compares the two over every row count up to
+# 20000 of every route.  A test that replaces registry records or route lists resets the index with
+# ``monkeypatch.setattr(pkg, "_ADMIT_INDEX", {})`` after the replacement.
+
+_UNBOUNDED = float("inf")
+_Spans = tuple[list[int], list[float]]
+_RouteIndex = tuple[bool, bool, list[int], list[float], dict[int, _Spans]]
+
+
+def _spans(windows: Iterable[Sequence[Any]]) -> _Spans:
+    """``(aboves, at_mosts)`` of the disjoint spans ``above < rows <= at_most`` that the ``(above, at_most)`` windows
+    cover (``at_most`` ``None`` = unbounded), sorted by ``above``: a window holding no row count is dropped, touching
+    or overlapping windows are merged, so the span holding ``rows`` is the last one whose ``above`` lies below it."""
+    merged: list[list[float]] = []
+    for above, at_most in sorted(
+        (int(above), _UNBOUNDED if at_most is None else int(at_most))
+        for above, at_most in windows
+    ):
+        if at_most <= above:
+            continue
+        if merged and above <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], at_most)
+        else:
+            merged.append([above, at_most])
+    return [int(above) for above, _ in merged], [at_most for _, at_most in merged]
+
+
+def _route_index(arch: str, route: str) -> _RouteIndex:
+    """``(exported, always, aboves, at_mosts, by_heads)`` of ``route`` on ``arch``: ``exported`` when the architecture
+    ships a record of the route (the loader's ``route_available``); ``always`` when a record of the route has no
+    selection rule; the spans of the route's ``rows_between`` windows; the spans of its ``tokens_heads_between``
+    windows per head count.  A rule's ``routes`` spell the windows another route gives the record (a PDL route
+    launching the plain build): the index of that route reads them in place of ``windows``."""
+    always = False
+    row_windows: list[Sequence[Any]] = []
+    head_windows: dict[int, list[Sequence[Any]]] = {}
+    for name in _loader.route_modules(arch, route):
+        rule = _loader.MODULES[name].get("select_rule")
+        if rule is None:
+            always = True
+            continue
+        kind = rule.get("kind")
+        if kind not in _loader.SELECT_KINDS:
+            raise ValueError(f"unknown Cake norm select rule {kind!r}")
+        windows = rule.get("routes", {}).get(route, rule["windows"]).get(arch, ())
+        if kind == _loader.SELECT_KIND:
+            row_windows.extend(windows)
+        else:
+            for count, above, at_most in windows:
+                head_windows.setdefault(int(count), []).append((above, at_most))
+    aboves, at_mosts = _spans(row_windows)
+    return (
+        _loader.route_available(arch, route),
+        always,
+        aboves,
+        at_mosts,
+        {count: _spans(w) for count, w in head_windows.items()},
+    )
+
+
+_ADMIT_INDEX: dict[tuple[str, str], _RouteIndex] = {
+    (arch, route): _route_index(arch, route)
+    for arch, routes in _loader.ROUTES.items()
+    for route in routes
+}
+
+
+def _admits(
+    arch: str, route: str, rows: Optional[int], heads: Optional[int] = None
+) -> bool:
+    """Whether ``arch`` ships a program of ``route`` and, with ``rows``, one of the route's windows admits that row
+    count; for a route selecting on the head count as well (the sigmoid gate), with ``heads``, whether one of its
+    windows names that head count and, with ``rows`` too, holds the token count.  The loader's record-by-record
+    ``admits`` folded into one bisection of the admit index."""
+    entry = _ADMIT_INDEX.get((arch, route))
+    if entry is None:
+        entry = _ADMIT_INDEX[(arch, route)] = _route_index(arch, route)
+    exported, always, aboves, at_mosts, by_heads = entry
+    if not exported:
+        return False
+    if always:
+        return True
+    if heads is not None:
+        spans = by_heads.get(int(heads))
+        if spans is None:
+            return False
+        aboves, at_mosts = spans
+    if rows is None:
+        return True
+    rows = int(rows)
+    i = bisect.bisect_left(aboves, rows)
+    return i > 0 and rows <= at_mosts[i - 1]
 
 
 def gated_residual_next_rmsnorm_variant(
@@ -136,14 +243,8 @@ def is_cake_gated_residual_next_rmsnorm_supported(
     arch = _arch(device)
     if arch is None:
         return False
-    route = gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
-    if not _loader.route_available(arch, route):
-        return False
-    if rows is None:
-        return True
-    return any(
-        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
-        for name in _loader.route_modules(arch, route)
+    return _admits(
+        arch, gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight), rows
     )
 
 
@@ -347,19 +448,14 @@ def is_cake_gated_residual_rmsnorm_supported(
 ) -> bool:
     """Whether this package ships a program for ``device`` and the call's variant (``weight`` applied before the norm
     or absent, programmatic dependent launch or not) -- and, with ``rows``, one whose window admits that row count
-    (a route's windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead).  The tensor
-    contract is :mod:`flashinfer.norm`'s."""
+    (a route's windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead; a window of a PDL
+    route may name the plain build of its program, launched without the attribute).  The tensor contract is
+    :mod:`flashinfer.norm`'s."""
     arch = _arch(device)
     if arch is None:
         return False
-    route = gated_residual_rmsnorm_route(weight_before_norm, enable_pdl)
-    if not _loader.route_available(arch, route):
-        return False
-    if rows is None:
-        return True
-    return any(
-        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
-        for name in _loader.route_modules(arch, route)
+    return _admits(
+        arch, gated_residual_rmsnorm_route(weight_before_norm, enable_pdl), rows
     )
 
 
@@ -596,7 +692,7 @@ def cake_gated_residual_rmsnorm(
             )
         )
     # The plan's key fixes the device, the row count, the variant and the launch mode; the rest of the contract
-    # is one flat check per call (dtypes, shapes, same device, contiguous, 16-byte aligned storage).
+    # is one flat check per call (dtypes, shapes, same device, contiguous, 32-byte aligned storage).
     f32, bf16, align = torch.float32, torch.bfloat16, ROW_ALIGNMENT_BYTES
     if plan is None or not (
         shape[1] == HIDDEN_SIZE
@@ -662,9 +758,18 @@ def cake_gated_residual_rmsnorm(
     )
 
 
-def rmsnorm_sigmoid_gate_route() -> str:
-    """The one route of the sigmoid gate (BF16 rows of 64)."""
-    return route_key(RMSNORM_SIGMOID_GATE, "bf16")
+def rmsnorm_sigmoid_gate_variant(enable_pdl: bool = False) -> str:
+    """The variant a sigmoid gate call maps onto: ``bf16`` (BF16 rows of 64), with ``_pdl`` for a programmatic
+    dependent launch."""
+    return f"bf16{'_pdl' if enable_pdl else ''}"
+
+
+def rmsnorm_sigmoid_gate_route(enable_pdl: bool = False) -> str:
+    """The route a sigmoid gate call launches from (its variant's).  A window of the ``_pdl`` route names the PDL
+    build of a program, its late-signal PDL build or its plain build (launched without the attribute where the PDL
+    build measured slower); the route covers every token count the plain route covers but for its declared gaps,
+    where the facade keeps the CuTe DSL kernel under PDL."""
+    return route_key(RMSNORM_SIGMOID_GATE, rmsnorm_sigmoid_gate_variant(enable_pdl))
 
 
 def is_cake_rmsnorm_sigmoid_gate_supported(
@@ -672,34 +777,24 @@ def is_cake_rmsnorm_sigmoid_gate_supported(
     *,
     heads: Optional[int] = None,
     tokens: Optional[int] = None,
+    enable_pdl: bool = False,
 ) -> bool:
-    """Whether this package ships a program for ``device`` -- and, with ``heads``, one whose windows name that head
-    count (a 2-D ``(rows, 64)`` call is one head), with ``tokens`` too, one whose window admits that token count.
-    The tensor contract is :mod:`flashinfer.norm`'s."""
+    """Whether this package ships a program for ``device`` and the call's launch form (plain, or the ``_pdl`` route
+    under ``enable_pdl``) -- and, with ``heads``, one whose windows name that head count (a 2-D ``(rows, 64)`` call
+    is one head), with ``tokens`` too, one whose window admits that token count.  The tensor contract is
+    :mod:`flashinfer.norm`'s."""
     arch = _arch(device)
     if arch is None:
         return False
-    route = rmsnorm_sigmoid_gate_route()
-    if not _loader.route_available(arch, route):
-        return False
-    if heads is None:
-        return True
-    for name in _loader.route_modules(arch, route):
-        windows = _loader.MODULES[name]["select_rule"]["windows"].get(arch, ())
-        for count, above, at_most in windows:
-            if int(count) != int(heads):
-                continue
-            if tokens is None or (
-                tokens > int(above) and (at_most is None or tokens <= int(at_most))
-            ):
-                return True
-    return False
+    route = rmsnorm_sigmoid_gate_route(enable_pdl)
+    return _admits(arch, route, None if heads is None else tokens, heads)
 
 
 def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:
     """The token stride of ``tensor`` after the layout checks of the contract: BF16 on the call's device, 2-D
     ``(tokens, 64)`` or 3-D ``(tokens, heads, 64)``, unit stride along the row, packed heads, a token stride that is a
-    multiple of eight elements and 16-byte aligned storage."""
+    multiple of :data:`GATE_STRIDE_ELEMENTS` (16: a 32-byte multiple) and 32-byte aligned storage (the 16-head programs
+    of sm_107a read and write 256-bit vectors; the package admits one alignment for every program)."""
     if tensor.dtype != torch.bfloat16 or tensor.device != device:
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: {name} must be a bfloat16 tensor on {device}"
@@ -712,18 +807,19 @@ def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:
     if (
         tensor.stride(-1) != 1
         or (tensor.ndim == 3 and tensor.stride(1) != HEAD_DIM)
-        or tensor.stride(0) % 8 != 0
+        or tensor.stride(0) % GATE_STRIDE_ELEMENTS != 0
         or tensor.data_ptr() % ROW_ALIGNMENT_BYTES != 0
     ):
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: {name} must hold contiguous rows of {HEAD_DIM} with packed heads, a token "
-            f"stride that is a multiple of 8 elements and {ROW_ALIGNMENT_BYTES}-byte aligned storage"
+            f"stride that is a multiple of {GATE_STRIDE_ELEMENTS} elements and {ROW_ALIGNMENT_BYTES}-byte aligned "
+            "storage"
         )
     return int(tensor.stride(0))
 
 
 def _prepare_rmsnorm_sigmoid_gate(
-    input: torch.Tensor, gate: torch.Tensor
+    input: torch.Tensor, gate: torch.Tensor, *, enable_pdl: bool
 ) -> Optional[_LaunchPlan]:
     """The full contract check of one call and its launch plan (``None`` for an empty batch, which launches nothing)."""
     device = input.device
@@ -742,14 +838,16 @@ def _prepare_rmsnorm_sigmoid_gate(
     gate_stride = _gate_layout(gate, "gate", device)
     tokens = int(input.shape[0])
     heads = int(input.shape[1]) if input.ndim == 3 else 1
-    route = rmsnorm_sigmoid_gate_route()
+    route = rmsnorm_sigmoid_gate_route(enable_pdl)
     if not _loader.route_available(arch, route):
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: no exported program of route {route!r} on {arch}"
         )
     if tokens == 0:
         return None
-    if not is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads, tokens=tokens):
+    if not is_cake_rmsnorm_sigmoid_gate_supported(
+        device, heads=heads, tokens=tokens, enable_pdl=enable_pdl
+    ):
         # a head count or a token count outside the route's windows: the facade's "auto" runs the CuTe DSL kernel
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: no exported program of route {route!r} on {arch} admits "
@@ -773,6 +871,7 @@ def _prepare_rmsnorm_sigmoid_gate(
         heads,
         input_stride,
         gate_stride,
+        bool(enable_pdl),
     )
     plan = _LAUNCH_PLANS[key] = _LaunchPlan(
         name, arch, _device_index(device), values, tokens
@@ -781,12 +880,15 @@ def _prepare_rmsnorm_sigmoid_gate(
 
 
 def cake_rmsnorm_sigmoid_gate(
-    input: torch.Tensor, gate: torch.Tensor, *, eps: float
+    input: torch.Tensor, gate: torch.Tensor, *, eps: float, enable_pdl: bool = False
 ) -> None:
     """``input = bf16(RMSNorm(input) * sigmoid(gate))`` per row of 64, in place, one launch of the exported program
     whose window admits the head count and the token count.  ``input`` and ``gate`` are ``(tokens, 64)`` or
     ``(tokens, heads, 64)`` with the same shape; their token strides may differ (``gate`` is typically a view of a
-    wider projection).  An empty batch launches nothing.
+    wider projection).  ``enable_pdl`` selects the programmatic dependent launch route: its window names the PDL
+    build of a program or its plain build (which launches without the attribute); a window naming no program, like a
+    head count the routes do not name, is the facade's CuTe DSL branch (``ValueError`` here).  An empty batch
+    launches nothing.
     """
     device = input.device
     shape = input.shape
@@ -804,6 +906,7 @@ def cake_rmsnorm_sigmoid_gate(
                 heads,
                 input_stride,
                 gate_stride,
+                bool(enable_pdl),
             )
         )
     bf16, align = torch.bfloat16, ROW_ALIGNMENT_BYTES
@@ -819,7 +922,7 @@ def cake_rmsnorm_sigmoid_gate(
         and input.data_ptr() % align == 0
         and gate.data_ptr() % align == 0
     ):
-        plan = _prepare_rmsnorm_sigmoid_gate(input, gate)
+        plan = _prepare_rmsnorm_sigmoid_gate(input, gate, enable_pdl=enable_pdl)
         if plan is None:
             return
         heads = shape[1] if ndim == 3 else 1
@@ -835,6 +938,7 @@ def cake_rmsnorm_sigmoid_gate(
 
 __all__ = [
     "ALIGNMENT_BYTES",
+    "GATE_STRIDE_ELEMENTS",
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "GATED_RESIDUAL_NEXT_RMSNORM",
@@ -857,6 +961,7 @@ __all__ = [
     "is_cake_gated_residual_rmsnorm_supported",
     "is_cake_rmsnorm_sigmoid_gate_supported",
     "rmsnorm_sigmoid_gate_route",
+    "rmsnorm_sigmoid_gate_variant",
     "warm_up",
     "zero_post_weight",
 ]

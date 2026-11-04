@@ -27,6 +27,8 @@ did not provide, never synchronises the host and is CUDA-graph capturable:
 every launch argument is a by-value scalar or a tensor pointer, and the stage
 (the generated build) is selected from the architecture, the SM count and the
 problem's host scalars only, so a captured graph replays the same build.
+``enable_pdl`` selects the stage's pdl build (launched with programmatic
+dependent launch) where ``PDL_POLICY`` admits the problem.
 """
 
 from __future__ import annotations
@@ -44,10 +46,12 @@ from .cake_jit import (
     HEAD_DIM,
     KNOB_KEYS,
     MODULES,
+    PDL_POLICY,
     STAGE,
     STAGE_POLICY,
     SUPPORTED_HEADS,
     arch_for_capability,
+    pdl_enabled,
     stage_for,
     stages_for,
 )
@@ -128,6 +132,8 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
     out_v: Optional[torch.Tensor] = None,
     q_scale: Optional[torch.Tensor] = None,
     split_k_flag: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Body of :func:`flashinfer.cake_fused_qk_rope_fp8_append.cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache`."""
     _check(len(paged_kv_cache) == 2, "paged_kv_cache must be (key_cache, value_cache)")
@@ -293,6 +299,7 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
         max_pages_per_request=max_pages_per_request,
         has_out_kv=has_out_kv,
         quant_policy=int(quant_policy),
+        enable_pdl=bool(enable_pdl),
     )
     values: dict[str, Any] = {
         **tensors,
@@ -322,6 +329,7 @@ __all__ = [
     "HEAD_DIM",
     "KNOB_KEYS",
     "MODULES",
+    "PDL_POLICY",
     "STAGE",
     "STAGE_POLICY",
     "SUPPORTED_COMPUTE_CAPABILITIES",
@@ -329,6 +337,7 @@ __all__ = [
     "arch_for_capability",
     "cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache",
     "launch_plan",
+    "pdl_enabled",
     "stage_for",
     "stages_for",
 ]

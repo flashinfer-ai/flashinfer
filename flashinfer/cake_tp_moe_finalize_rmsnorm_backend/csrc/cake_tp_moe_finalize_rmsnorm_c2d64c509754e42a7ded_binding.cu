@@ -91,9 +91,9 @@ void Run(TensorView a_gemm2, int64_t a_row_stride, int64_t a_rows, TensorView a_
   check_same_device(a_peer_table, a_gemm2, "peer_table", "gemm2");
   check_contiguous(a_ctl, "ctl");
   check_same_device(a_ctl, a_gemm2, "ctl", "gemm2");
-  TVM_FFI_CHECK((a_n_tok >= 1), ValueError)
+  TVM_FFI_CHECK((a_n_tok >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (n_tok >= 1)";
-  TVM_FFI_CHECK((a_max_ctas >= 1), ValueError)
+  TVM_FFI_CHECK((a_max_ctas >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (max_ctas >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

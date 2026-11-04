@@ -128,12 +128,27 @@ not picked them up):
 - Humming MXFP4: adds packed MXFP4 weights on top of the FP8 implementation
   from #4688 and #5338, reusing its dispatch, scheduling and reduction code.
   See [TUNING.md](TUNING.md) for configurations and reproduction commands.
+- NVFP4 inherits the MXFP4 frontend, backend, configuration, and packed-FP4
+  kernel. Keep its K16 E4M3 scale layout, LUT conversion, stage budget, and
+  FC1 overlap overrides in `shim/`. The shared swap-AB entry uses the
+  `_allocate_weight_aux_smem` hook for NV scale storage and LUT initialization;
+  it is not copied into the NV kernel. MX folded-scale storage/view hooks and
+  `_convert_weight_group` retain their original defaults; the folded-layout
+  builder shares its byte/row parameters between formats. Reapply these hooks
+  when updating the drop, and
+  compare complete MX and NV cubins before accepting a refactor.
+  The NV scale ring overrides `_weight_sf_stage_count`; reapply the base
+  hook for scale barrier storage and pipeline sizing independently of AB.
+  Shared MX producer/FC2 loops use `_weight_sf_decoupled` (default false)
+  and `_weight_sf_state` (default identity); the NV shim supplies only the
+  delayed scale-producer loop and early-release policy. Preserve these hooks
+  when reapplying the scale-ring extension.
 
 ## Layout
 
 ```
 kernel_src/sm90/pull_style_cutedsl_megakernel/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
+├── src/                    ← vendored drop with the documented local extensions above
 │   ├── common/             ← shared constants/host utils (SM90-drop revision)
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
 │   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,

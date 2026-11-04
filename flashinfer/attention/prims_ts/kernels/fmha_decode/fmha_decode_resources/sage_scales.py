@@ -18,12 +18,12 @@ Every scale reaches the kernel from the buffer the Sage prepare writes
 before attention (``_SageScaleLayout``), in the order the kernel reads it:
 ``sfQ`` as one word per row of each Q tile, ``sfK`` as one atom of words per
 64 K tokens, ``sfV`` and ``v_mean`` as one row per sequence. The prepare
-resolves the flat layout (``sage.config.flat_scale_slot`` and
-``sage.index.load_flat_scale``) and gives Q
+resolves the flat layout (``sage.config.sage_flat_scale_slot`` and
+``sage.index.load_sage_flat_scale``) and gives Q
 rows past the valid row count and K tokens past the sequence end the last
 valid scale, so masked scores keep a finite scale and exponentiate to zero.
-Each softmax lane loads its row's ``sfQ`` word once per work tile
-(``load_q_scale``).
+Each softmax lane loads its row's ``sfQ`` word once per work tile with
+``sage.index.load_sage_q_scale``, which the context kernel shares.
 
 :class:`SageKScalesResource` is one softmax instance's ring of ``sfK``
 tiles, which the load warp produces after each K tile with ``cp.async``
@@ -67,8 +67,7 @@ from ...._block_sparse.prepared import (
     _BlockSparseRouteLayout,
 )
 from ....sage.index import (
-    _load_scale,
-    sage_q_word,
+    _load_sage_scale,
     sage_section_word,
     sage_sequence_words,
 )
@@ -91,31 +90,6 @@ from .helpers_kv_tile_idx import (
 )
 
 Constexpr = cutlass.Constexpr
-
-
-@cute.jit
-def load_q_scale(
-    cfg: Constexpr[FmhaDecodeConfig],
-    scales_ptr: cute.Pointer,
-    *,
-    sequence_words: Int32,
-    q_group_idx: Int32,
-    row_idx: Int32,
-) -> Float32:
-    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_group_idx`` from the prepared scales.
-
-    ``sequence_words`` is the first word of the row's sequence
-    (``sage_sequence_words``). The word already holds the scale of the row's
-    token and Q head, the last token's for a row past the sequence's end
-    (``_SageQSection``).
-    """
-    word = sage_q_word(
-        cfg.sage_scale_layout(cfg.static_seq_len_kv),
-        sequence_words=sequence_words,
-        q_tile_idx=q_group_idx,
-        row_idx=row_idx,
-    )
-    return _load_scale(scales_ptr.toint(), word)
 
 
 def sage_k_section(cfg: FmhaDecodeConfig, proxy: bool = False) -> _SageKSection:
@@ -338,9 +312,9 @@ def stage_v_channel_scales(
     rows_base = sage_section_word(sequence_words, v_rows)
     for base in cutlass.range_constexpr(0, cfg.headdim, num_threads):
         channel = Int32(base) + thread_idx
-        staged[channel] = _load_scale(scales_addr, rows_base + channel)
+        staged[channel] = _load_sage_scale(scales_addr, rows_base + channel)
         if cutlass.const_expr(cfg.sage_v_mean):
-            staged[channel + Int32(cfg.headdim)] = _load_scale(
+            staged[channel + Int32(cfg.headdim)] = _load_sage_scale(
                 scales_addr, rows_base + Int32(v_rows.mean_word_offset) + channel
             )
 

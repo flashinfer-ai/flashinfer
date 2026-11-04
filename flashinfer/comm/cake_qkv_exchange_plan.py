@@ -108,7 +108,7 @@ GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD: dict[str, dict[int, int]] = {
     "sm_90a": {2: 1, 4: 1, 8: 1},
     "sm_100a": {2: 2, 4: 2, 8: 1},
     "sm_103a": {2: 2, 4: 2, 8: 2},
-    # SM107 keeps the baseline plan on every group size (the scale was not measured there); the 8-rank entry
+    # SM107 keeps the baseline plan on every group size (the 2-rank doubling was not adopted); the 8-rank entry
     # exists because every row covers SUPPORTED_WORLD_SIZES -- SM107 sessions admit 2 or 4 ranks only.
     "sm_107a": {2: 1, 4: 1, 8: 1},
 }
@@ -138,9 +138,10 @@ RESERVED_SMS = 2
 # the rows it selects and needs that program delivered.  Measured per
 # architecture (``SHAPE_GATE_DEFAULT_BY_ARCH``): SM100 / SM103 ship the small-row
 # word gate and the per-destination launch gate, SM90 ships the small-row word
-# gate and the large-row reserved-SM gate, SM107 ships none; one (architecture,
-# world size) cell differs from those tables (``SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``,
-# merged by ``default_shape_gates``): a group of 8 ranks on SM90 ships the
+# gate and the large-row reserved-SM gate, SM107 ships no per-architecture gate;
+# three (architecture, world size) cells differ from those tables
+# (``SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``, merged by ``default_shape_gates``): a
+# group of 8 ranks on SM90 and groups of 2 and 4 ranks on SM107 ship the
 # small-row word gate for every row.  Elsewhere the pair-tile gate ships nowhere
 # (an opt-in on the pair architectures; SM90 builds no pair tile and refuses
 # it); ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the
@@ -178,7 +179,8 @@ SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
         "per_dest_large_m": 16384,
         "pair_off_large_m": SHAPE_GATE_OFF,
     },
-    # SM107: no gate ships (none was measured there); every call takes the ungated host plan.
+    # SM107: no gate in the per-architecture row; its 2- and 4-rank cells in SHAPE_GATE_DEFAULT_BY_ARCH_WORLD ship
+    # the small-row word gate for every row.
     "sm_107a": {
         "words_capacity_small_m": SHAPE_GATE_OFF,
         "reserved_sms_large_m": SHAPE_GATE_OFF,
@@ -191,6 +193,9 @@ SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
 SHAPE_GATE_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], dict[str, int]] = {
     # SM90, 8 ranks: one readiness word per destination for every row count.
     ("sm_90a", 8): {"words_capacity_small_m": SHAPE_GATE_ALL_ROWS},
+    # SM107, 2 and 4 ranks (the sizes it admits): the same.
+    ("sm_107a", 2): {"words_capacity_small_m": SHAPE_GATE_ALL_ROWS},
+    ("sm_107a", 4): {"words_capacity_small_m": SHAPE_GATE_ALL_ROWS},
 }
 
 

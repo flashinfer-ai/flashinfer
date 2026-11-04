@@ -14,6 +14,26 @@ from tests.moe.test_b12x_fused_moe import (
 
 
 @cute_dsl_available
+def test_fp16_packed_scales_preserve_all_finite_nonnegative_e4m3_values():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+        _process_nvfp4_packed_scales,
+    )
+
+    # Include zero, all seven subnormals, the normal range, and maximum 448.
+    codes = torch.cat(
+        (torch.arange(127, dtype=torch.uint8), torch.zeros(1, dtype=torch.uint8))
+    )
+    scales = codes.view(torch.float8_e4m3fn).half().reshape(8, 16)
+    packed = _process_nvfp4_packed_scales(
+        scales, scale_factor=1.0, a_dtype=torch.float16
+    )
+    # The device FP16 decoder places each packed byte into half bits [14:7].
+    restored = (packed.view(torch.uint8).to(torch.int16) << 7).view(torch.float16)
+    restored = restored.reshape(-1, 4)[:, [0, 2, 1, 3]].reshape_as(scales)
+    torch.testing.assert_close(restored.float() / 128, scales.float(), rtol=0, atol=0)
+
+
+@cute_dsl_available
 @pytest.mark.parametrize(
     "dtype,layout,scale,expected",
     [
@@ -59,8 +79,9 @@ def test_fp16_direct_route_cap_preserves_large_expert_reuse(
 @pytest.mark.parametrize("tokens", [7, 8])
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
 @pytest.mark.parametrize("hidden,intermediate,top_k", [(256, 256, 3), (2048, 512, 10)])
+@pytest.mark.parametrize("scale_mode", ["normal", "subnormal"])
 def test_fp16_direct_matches_packed_routes_and_live_graph(
-    tokens, activation, hidden, intermediate, top_k, monkeypatch
+    tokens, activation, hidden, intermediate, top_k, scale_mode, monkeypatch
 ):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
         prepare_w4a16_packed_weights,
@@ -91,11 +112,23 @@ def test_fp16_direct_matches_packed_routes_and_live_graph(
         sf = torch.full((e, rows, cols // 16), 0.0625, device="cuda").to(
             torch.float8_e4m3fn
         )
+        if scale_mode == "subnormal":
+            # Mix zero, all subnormals and the smallest normals across blocks.
+            sf = (
+                (torch.arange(sf.numel(), device="cuda") % 16)
+                .to(torch.uint8)
+                .reshape_as(sf)
+                .view(torch.float8_e4m3fn)
+            )
         swizzled = torch.stack(
             [block_scale_interleave(v.view(torch.uint8)) for v in sf]
         ).reshape_as(sf)
         codes = torch.stack((q & 15, q >> 4), dim=-1).flatten(-2).long()
-        decoded = lut[codes & 7] * (1 - 2 * ((codes & 8) != 0).float()) * 0.0625
+        decoded = (
+            lut[codes & 7]
+            * (1 - 2 * ((codes & 8) != 0).float())
+            * sf.float().repeat_interleave(16, -1)
+        )
         return q, swizzled, decoded.double()
 
     w1, s1, dense1 = weights(branches * i, h)

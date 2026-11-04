@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.test_helpers.pdl import late_store
 
 import flashinfer
 from flashinfer.jit import env as jit_env
@@ -628,6 +629,109 @@ def test_norm_pdl_matches_plain_launch(case, dtype):
         )
 
 
+@pytest.mark.parametrize(
+    "hidden_size",
+    # The last two are not multiples of 16 and exercise the divisor fallback.
+    [
+        8192,
+        16384,
+        32768,
+        40960,
+        49152,
+        57344,
+        58112,
+        65536,
+        98304,
+        131072,
+        262144,
+        100001,
+        2097160,
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
+    """A cluster size that fits the cp.async budget must be the one chosen.
+
+    ``_compute_cluster_n`` sizes the shared-memory tile that ``use_async_copy``
+    gates; picking a smaller size turns cp.async off while the per-thread
+    fragment is still large, which spills to local memory.
+    """
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
+
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    kernel = RMSNormKernel(cute_dtype, hidden_size)
+    if kernel.sm_version < 90:
+        pytest.skip("cluster reduction requires SM90+")
+
+    # A cluster that does not divide H leaves the row tail uncovered.
+    assert hidden_size % kernel.cluster_n == 0
+
+    elem_size = cute_dtype.width // 8
+    device = torch.cuda.current_device()
+    optin = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    affordable = [
+        cluster_n
+        for cluster_n in (1, 2, 4, 8, 16)
+        if hidden_size % cluster_n == 0
+        and RMSNormKernel._estimate_smem_bytes(hidden_size, cluster_n, elem_size)
+        <= optin // 2
+    ]
+    if not affordable:
+        pytest.skip(
+            f"no cluster_n fits the occupancy target at hidden_size={hidden_size}; "
+            f"got cluster_n={kernel.cluster_n}"
+        )
+
+    assert kernel.cluster_n in affordable, (
+        f"cluster_n={kernel.cluster_n} for hidden_size={hidden_size} {dtype}: "
+        f"{affordable} satisfy the occupancy target, but cp.async is "
+        f"{'on' if kernel.use_async_copy else 'off'}"
+    )
+    assert kernel.use_async_copy
+
+
+@pytest.mark.parametrize(
+    "hidden_size,dtype",
+    [
+        (65536, torch.float16),  # cluster_n=2
+        (58112, torch.bfloat16),  # cluster_n=2 at the cp.async threshold
+        (131072, torch.float16),  # cluster_n=4
+        (163840, torch.float32),  # cluster_n=8
+        (524288, torch.float16),  # cluster_n=16
+        (1048576, torch.float16),  # cluster_n=16 with cp.async off
+    ],
+)
+def test_norm_large_hidden_size(hidden_size, dtype):
+    """Run the per-row layouts chosen for large hidden sizes on real data.
+
+    One case per cluster size the kernel selects above the cp.async threshold,
+    including the no-candidate-fit fallback.  The layout is per row, so a small
+    batch still exercises the same cluster and cp.async configuration.
+    """
+    from flashinfer.norm import _use_cuda_norm
+
+    # The public entry point falls back to the CUDA JIT norm kernels when the
+    # CuTe DSL cannot target this device, or when the env var forces it; those
+    # layouts are not the ones under test here.
+    if _use_cuda_norm(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("CuTe-DSL RMSNorm is not the active path on this device")
+
+    x = torch.randn(2, hidden_size, device="cuda", dtype=dtype)
+    w = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+    y_ref = llama_rms_norm(x, w)
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    # Scale with the storage dtype; bf16 rounding is ~1.6e-2 at this size.
+    tol = max(1e-3, 4 * torch.finfo(dtype).eps)
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
+
+
 @parametrize_product(
     {
         "batch_size": [1, 19, 99, 989],
@@ -1002,6 +1106,61 @@ def test_layernorm(batch_size, hidden_size, dtype):
     out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(dtype)
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "hidden_size,row_padding,input_offset,weight_offset,broadcast",
+    [
+        pytest.param(128, 0, 0, 0, False, id="dense"),
+        pytest.param(128, 128, 0, 0, False, id="padded"),
+        pytest.param(128, 136, 8, 0, False, id="padded_offset"),
+        pytest.param(128, 1, 0, 0, False, id="odd_stride"),
+        pytest.param(128, 1, 1, 0, False, id="unaligned_input"),
+        pytest.param(128, 16, 0, 1, False, id="unaligned_weights"),
+        pytest.param(129, 129, 0, 0, False, id="odd_hidden"),
+        pytest.param(128, 0, 0, 0, True, id="broadcast"),
+        pytest.param(24576, 16, 0, 0, False, id="large_shared"),
+        pytest.param(None, 2, 0, 0, False, id="no_shared_memory"),
+    ],
+)
+def test_layernorm_cuda_row_stride(
+    hidden_size, row_padding, input_offset, weight_offset, broadcast, monkeypatch
+):
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    if hidden_size is None:
+        # Exceed even the opt-in limit so the kernel must reread global input.
+        max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+        hidden_size = 2 * (max_smem // 4 + 1)
+
+    torch.manual_seed(0)
+    batch_size, eps = 3, 1e-6
+    storage = torch.full(
+        (batch_size, hidden_size + row_padding + input_offset),
+        7.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    rows = storage[:, input_offset : input_offset + hidden_size]
+    rows.copy_(torch.randn_like(rows))
+    # Retain storage for all rows even in the broadcast case: a broken dense
+    # read then stays inside the allocation and fails the numerical comparison.
+    x = rows[:1].expand(batch_size, -1) if broadcast else rows
+    storage_before = storage.clone()
+    gamma = torch.randn(hidden_size + weight_offset, device="cuda")[weight_offset:]
+    beta = torch.randn(hidden_size + weight_offset, device="cuda")[weight_offset:]
+
+    x64 = x.double()
+    centered = x64 - x64.mean(dim=-1, keepdim=True)
+    out_ref = (
+        centered
+        * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + eps)
+        * gamma.double()
+        + beta.double()
+    ).to(x.dtype)
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(storage, storage_before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -1474,6 +1633,49 @@ def test_norm_compilation_without_fp8():
 
     # Verify the module loaded successfully
     assert module is not None
+
+
+# The public API takes CuTe DSL kernels where they are supported, so call the CUDA kernels.
+def _rmsnorm_quant_cuda(out, x, residual, w, scale, enable_pdl):
+    flashinfer.norm.get_norm_module().rmsnorm_quant(out, x, w, scale, 1e-6, enable_pdl)
+
+
+def _fused_add_rmsnorm_quant_cuda(out, x, residual, w, scale, enable_pdl):
+    flashinfer.norm.get_norm_module().fused_add_rmsnorm_quant(
+        out, x, residual, w, scale, 1e-6, enable_pdl
+    )
+
+
+@pytest.mark.parametrize(
+    "norm_quant",
+    [
+        _rmsnorm_quant_cuda,
+        _fused_add_rmsnorm_quant_cuda,
+    ],
+)
+def test_norm_quant_pdl_waits_for_scale(norm_quant):
+    x = torch.randn(128, 4096, dtype=torch.bfloat16, device="cuda")
+    if not device_support_pdl(x.device):
+        pytest.skip("PDL not supported on this device")
+    residual = torch.randn_like(x)
+    w = torch.randn(4096, dtype=torch.bfloat16, device="cuda")
+    scale_value = 0.5
+
+    expected = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([scale_value], device="cuda")
+    norm_quant(expected, x.clone(), residual.clone(), w, scale, enable_pdl=False)
+
+    # The scale the previous kernel is still producing, as in a dynamic-scale pipeline.
+    # No other kernel may run between that producer and the norm kernel.
+    out = torch.empty_like(expected)
+    x, residual = x.clone(), residual.clone()
+    scale = torch.tensor([scale_value * 4], device="cuda")
+    late_store(scale, scale_value)
+    norm_quant(out, x, residual, w, scale, enable_pdl=True)
+
+    torch.testing.assert_close(
+        out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
 
 
 if __name__ == "__main__":

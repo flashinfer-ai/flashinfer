@@ -7,7 +7,9 @@ from . import (
     bf16_mxfp8_bf16_cutedsl,
     bf16_nvfp4_bf16_cutedsl,
     mxfp8_mxfp8_bf16_cutedsl,
+    mxfp8_mxfp4_bf16_cutedsl,
     nvfp4_nvfp4_bf16_cutedsl,
+    standard_cutedsl,
 )
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     "bf16_mxfp8_bf16_cutedsl",
     "bf16_nvfp4_bf16_cutedsl",
     "mxfp8_mxfp8_bf16_cutedsl",
+    "mxfp8_mxfp4_bf16_cutedsl",
     "nvfp4_nvfp4_bf16_cutedsl",
+    "standard_cutedsl",
 ]

@@ -1508,7 +1508,7 @@ def _run_nvfp4_routing_rounds(
             w2_scale=s2.reshape(local_experts, hidden, intermediate // 16),
         )
     elif mode == "w4a16":
-        from .w4a16_reference import make_w4a16_weights
+        from tests.test_helpers.w4a16_reference import make_w4a16_weights
 
         weights = make_w4a16_weights(hidden, intermediate, local_experts, rank)
         # Preserve expert-shard views, including their scalar-only alignment.

@@ -256,9 +256,13 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE workspace allocation cannot run during CUDA graph capture"
             )
-        if live_tokens is not None and not self._kernel.supports_live_token_tuning:
-            raise MoEEpConfigError("This backend does not support live-token tuning")
         automatic = automatic and knobs is None
+        if (
+            live_tokens is not None
+            and not automatic
+            and not self._kernel.supports_live_token_tuning
+        ):
+            raise MoEEpConfigError("This backend does not support live-token tuning")
         if automatic and live_tokens is not None:
             warnings.warn(
                 "live_tokens is ignored for automatic tuning; selection uses "
@@ -512,6 +516,21 @@ class MoEEpMegaLayer(nn.Module):
             # Introspection must not trigger lazy workspace allocation.
             backend_workspace, kernel = self._workspace, self._kernel
         return kernel.get_tuned_knobs(backend_workspace)
+
+    def get_tuned_config(self, *, workspace: MoEEpMegaWorkspace | None = None) -> Any:
+        """Return a fixed kernel config, including the selected variant and knobs.
+
+        Pass it as ``MegaConfig(megakernel=...)`` when reconstructing a layer
+        with the same geometry and weights. This call does not allocate or tune.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
+        handle = workspace if workspace is not None else self._default_workspace_handle
+        if handle is not None:
+            _, backend_workspace, kernel = self._resolve_workspace(handle)
+        else:
+            backend_workspace, kernel = self._workspace, self._kernel
+        return kernel.get_tuned_config(backend_workspace)
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:

@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_PARTIALS_OFF 0
 #define SMEM_PARTIALS_STAGE_BYTES 64
 #define SMEM_PARTIALS_STRIDE 64
@@ -84,12 +83,7 @@ kernel_cake_rmsnorm_train_cf1d05546951bdbd9f5d(__nv_bfloat16* __restrict__ x, __
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;

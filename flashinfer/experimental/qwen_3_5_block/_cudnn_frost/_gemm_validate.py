@@ -42,6 +42,7 @@ COVERED_NODE_TYPES = frozenset(
         NodeType.BLOCK_SCALE_QUANTIZE,
         NodeType.POINTWISE,
         NodeType.REDUCTION,
+        NodeType.TRANSPOSE,
     }
 )
 
@@ -73,6 +74,8 @@ def validate_node(node) -> None:
     """Dispatch one GEMM-family node to its rules."""
     if node.node_type == NodeType.MATMUL:
         _validate_matmul(node)
+    elif node.node_type == NodeType.TRANSPOSE:
+        _validate_transpose(node)
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
         _validate_moe_offsets(node)
@@ -114,6 +117,27 @@ def validate_node(node) -> None:
             dim = _dims(tensor)
             if dim and out and (len(dim) > len(out) or any(x != 1 and x != y for x, y in zip(reversed(dim), reversed(out)))):
                 raise _not_supported("Pointwise inputs do not broadcast to the output shape")
+
+
+def _validate_transpose(node) -> None:
+    """Version-independent transpose semantics; FROST's narrower scope is a support gate."""
+    _validate_required(node, "Transpose", ("input",), ("OUT_0",))
+    dim = _dims(node.inputs["input"]) or []
+    permutation = node.params.get("permutation")
+    if not permutation:
+        raise ValueError("Permutation must be set for transpose operation.")
+    if len(permutation) != len(dim):
+        raise ValueError("Permutation size must match input tensor dimensionality.")
+    if any(not isinstance(i, int) or i < 0 or i >= len(dim) for i in permutation):
+        raise ValueError("Permutation indices must be in range [0, n-1].")
+    if len(set(permutation)) != len(permutation):
+        raise ValueError("Permutation indices must be unique.")
+    source, output = node.inputs["input"], node.outputs["OUT_0"]
+    if source.get_data_type() != output.get_data_type():
+        raise ValueError("Output and input tensor data types must match for transpose operation.")
+    expected = [dim[i] for i in permutation]
+    if _dims(output) != expected:
+        raise _not_supported(f"Transpose output dims must match the permuted input dims {expected}")
 
 
 def _validate_moe_combine(node) -> None:

@@ -761,6 +761,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
   CheckCudaTensor(arg_published_hidden_bf16, "published_hidden_bf16");
   CheckDtype(arg_published_hidden_bf16, "published_hidden_bf16", 4, 16, 1);
   CheckContiguous(arg_published_hidden_bf16, "published_hidden_bf16");
+  TVM_FFI_CHECK(arg_published_hidden_bf16.numel() >= 16 * arg_tokens_per_rank * 3072, ValueError)
+      << "row mailbox 'published_hidden_bf16' requires 16 x tokens_per_rank x 3072 entries";
   CheckCudaTensor(arg_published_hidden_bf16_peers, "published_hidden_bf16_peers");
   CheckDtype(arg_published_hidden_bf16_peers, "published_hidden_bf16_peers", 0, 64, 1);
   CheckContiguous(arg_published_hidden_bf16_peers, "published_hidden_bf16_peers");
@@ -769,6 +771,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
   CheckCudaTensor(arg_published_topk_ids_i32, "published_topk_ids_i32");
   CheckDtype(arg_published_topk_ids_i32, "published_topk_ids_i32", 0, 32, 1);
   CheckContiguous(arg_published_topk_ids_i32, "published_topk_ids_i32");
+  TVM_FFI_CHECK(arg_published_topk_ids_i32.numel() >= 16 * arg_tokens_per_rank * 8, ValueError)
+      << "route mailbox 'published_topk_ids_i32' requires 16 x tokens_per_rank x 8 entries";
   CheckCudaTensor(arg_published_topk_ids_i32_peers, "published_topk_ids_i32_peers");
   CheckDtype(arg_published_topk_ids_i32_peers, "published_topk_ids_i32_peers", 0, 64, 1);
   CheckContiguous(arg_published_topk_ids_i32_peers, "published_topk_ids_i32_peers");
@@ -777,6 +781,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
   CheckCudaTensor(arg_published_topk_weights_f32, "published_topk_weights_f32");
   CheckDtype(arg_published_topk_weights_f32, "published_topk_weights_f32", 2, 32, 1);
   CheckContiguous(arg_published_topk_weights_f32, "published_topk_weights_f32");
+  TVM_FFI_CHECK(arg_published_topk_weights_f32.numel() >= 16 * arg_tokens_per_rank * 8, ValueError)
+      << "route mailbox 'published_topk_weights_f32' requires 16 x tokens_per_rank x 8 entries";
   CheckCudaTensor(arg_published_topk_weights_f32_peers, "published_topk_weights_f32_peers");
   CheckDtype(arg_published_topk_weights_f32_peers, "published_topk_weights_f32_peers", 0, 64, 1);
   CheckContiguous(arg_published_topk_weights_f32_peers, "published_topk_weights_f32_peers");
@@ -1157,12 +1163,20 @@ void SetupTmaPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
       arg_tma_descriptor_workspace.data_ptr(), workspace_maps, stream);
 }
 
+// The fused kernel's cooperative grid: CAKE_MEGAMOE_GRID_CLUSTERS two-CTA clusters, as the generated body schedules
+// (72 by default; the sm_107a build defines 104). Its grid counters count (epoch + 1) x CTAs in 32-bit signed arithmetic.
+#ifndef CAKE_MEGAMOE_GRID_CLUSTERS
+#define CAKE_MEGAMOE_GRID_CLUSTERS 72
+#endif
+constexpr int64_t kCakeMegamoeFusedGridCtas = CAKE_MEGAMOE_GRID_CLUSTERS * 2;
+constexpr int64_t kCakeMegamoeMaxLaunchEpoch = 2147483647 / kCakeMegamoeFusedGridCtas - 1;
+
 void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   TVM_FFI_CHECK(num_args == 35, TypeError)
       << "Cake MXFP8 MegaMoE expects 35 arguments, got " << num_args;
   int64_t launch_epoch = args[20].cast<int64_t>();
-  TVM_FFI_CHECK(launch_epoch >= 0 && launch_epoch <= 14913079, ValueError)
-      << "Cake MXFP8 MegaMoE launch_epoch must be in [0, 14913079], got "
+  TVM_FFI_CHECK(launch_epoch >= 0 && launch_epoch <= kCakeMegamoeMaxLaunchEpoch, ValueError)
+      << "Cake MXFP8 MegaMoE launch_epoch must be in [0, " << kCakeMegamoeMaxLaunchEpoch << "], got "
       << launch_epoch;
   DLDevice dev = args[0].cast<TensorView>().device();
   ScopedCudaDevice device_guard(dev.device_id);
@@ -1174,7 +1188,7 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_fused::PreparedLaunch prepared_fused;
   stage_topk_reduce::PreparedLaunch prepared_topk_reduce;
   stage_fused::Prepare(
-      prepared_fused, args[0].cast<TensorView>(), args[1].cast<TensorView>(), args[2].cast<TensorView>(), args[3].cast<TensorView>(), args[4].cast<TensorView>(), args[5].cast<TensorView>(), args[5].cast<TensorView>(), args[5].cast<TensorView>(), args[6].cast<TensorView>(), args[7].cast<TensorView>(), args[8].cast<TensorView>(), args[8].cast<TensorView>(), args[8].cast<TensorView>(), args[9].cast<TensorView>(), args[10].cast<TensorView>(), args[11].cast<TensorView>(), args[12].cast<TensorView>(), args[13].cast<TensorView>(), args[14].cast<TensorView>(), args[15].cast<TensorView>(), args[16].cast<TensorView>(), args[17].cast<TensorView>(), args[18].cast<TensorView>(), args[19].cast<TensorView>(), args[20].cast<int64_t>(), args[21].cast<int64_t>(), args[22].cast<int64_t>(), args[23].cast<int64_t>(), args[24].cast<TensorView>(), args[25].cast<TensorView>(), args[26].cast<TensorView>(), args[27].cast<TensorView>(), args[28].cast<TensorView>(), args[29].cast<TensorView>(), args[30].cast<TensorView>(), args[31].cast<TensorView>(), args[32].cast<TensorView>(), args[34].cast<TensorView>(), 144, 1, 1, stream);
+      prepared_fused, args[0].cast<TensorView>(), args[1].cast<TensorView>(), args[2].cast<TensorView>(), args[3].cast<TensorView>(), args[4].cast<TensorView>(), args[5].cast<TensorView>(), args[5].cast<TensorView>(), args[5].cast<TensorView>(), args[6].cast<TensorView>(), args[7].cast<TensorView>(), args[8].cast<TensorView>(), args[8].cast<TensorView>(), args[8].cast<TensorView>(), args[9].cast<TensorView>(), args[10].cast<TensorView>(), args[11].cast<TensorView>(), args[12].cast<TensorView>(), args[13].cast<TensorView>(), args[14].cast<TensorView>(), args[15].cast<TensorView>(), args[16].cast<TensorView>(), args[17].cast<TensorView>(), args[18].cast<TensorView>(), args[19].cast<TensorView>(), args[20].cast<int64_t>(), args[21].cast<int64_t>(), args[22].cast<int64_t>(), args[23].cast<int64_t>(), args[24].cast<TensorView>(), args[25].cast<TensorView>(), args[26].cast<TensorView>(), args[27].cast<TensorView>(), args[28].cast<TensorView>(), args[29].cast<TensorView>(), args[30].cast<TensorView>(), args[31].cast<TensorView>(), args[32].cast<TensorView>(), args[34].cast<TensorView>(), kCakeMegamoeFusedGridCtas, 1, 1, stream);
   stage_topk_reduce::Prepare(
       prepared_topk_reduce, args[31].cast<TensorView>(), args[33].cast<TensorView>(), args[21].cast<int64_t>(), args[21].cast<int64_t>() * 3, 1, 1, stream);
   stage_fused::Submit(prepared_fused, stream);

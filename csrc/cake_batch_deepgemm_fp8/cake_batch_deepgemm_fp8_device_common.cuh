@@ -58,13 +58,12 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include "cake_device_helpers/cake_mbarrier_arrive_expect_tx_54ce59d489f69526.cuh"
 #include "cake_device_helpers/cake_make_sf_cp_desc_lo_sbo128_d7bc33f4814285f6.cuh"
 #include "cake_device_helpers/cake_tcgen05_cp_32x128b_warpx4_889f02d6972847cb.cuh"
+#include "cake_device_helpers/cake_tma_4d_gmem2smem_5a3b7d28a4d0b342.cuh"
+#include "cake_device_helpers/cake_tma_store_3d_a0d668161ec63906.cuh"
 #include "cake_device_helpers/cake_tcgen05_cp_32x128b_warpx4_cta2_d56d930686a205c4.cuh"
 #include "cake_device_helpers/cake_tma_2d_gmem2smem_f2637c69284c470a.cuh"
 #include "cake_device_helpers/cake_tma_store_2d_d8ce2704cc6b8732.cuh"
 #include "cake_device_helpers/cake_tma_4d_gmem2smem_cta2_85c32162ed442f8a.cuh"
-#include "cake_device_helpers/cake_tma_4d_gmem2smem_5a3b7d28a4d0b342.cuh"
-#include "cake_device_helpers/cake_tma_store_3d_a0d668161ec63906.cuh"
-#include "cake_device_helpers/cake_tcgen05_commit_3d61b9d0baed52f9.cuh"
 #include "cake_device_helpers/cake_tmem_ld_x8_38cb8e5e57da80f2.cuh"
 
 // Definitions without a content-addressed copy, verbatim from the kernels that inlined them.
@@ -78,12 +77,4 @@ __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo256(int lo) {
     return (uint64_t)(uint32_t)lo
          | (desc_encode(SBO) << 32ULL)
          | (1ULL << 46ULL);
-}
-
-__device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
 }

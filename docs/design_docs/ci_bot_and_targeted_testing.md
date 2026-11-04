@@ -24,6 +24,11 @@ have to care which.
 Historically only GitLab accepted a test path. The GitHub command took no arguments, so a
 GitHub run was always the full matrix.
 
+Both now take a scope, and the policy is that **a scoped run is the default**:
+`@flashinfer-bot run tests/<dir-or-file> [tests/...]` / `/bot run tests/<dir-or-file> [tests/...]`.
+The full matrix is the exception — a final pre-merge check of a cross-cutting change — because
+an unscoped run is the most expensive thing a PR comment can do.
+
 ## The command vocabulary
 
 The bot answers a comment in one of three ways, and this vocabulary is load-bearing —

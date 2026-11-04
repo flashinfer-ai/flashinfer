@@ -14,10 +14,25 @@ from ..trace.templates.quantize import (
 )
 from ..jit.cake_grouped_mxfp8_quantize import (
     BF16 as _CAKE_GROUPED_MXFP8_BF16,
+    BULK_BF16 as _CAKE_GROUPED_MXFP8_BULK_BF16,
+    BULK_F16 as _CAKE_GROUPED_MXFP8_BULK_F16,
     F16 as _CAKE_GROUPED_MXFP8_F16,
+    HEAD2048_BF16 as _CAKE_GROUPED_MXFP8_HEAD2048_BF16,
+    HEAD2048_F16 as _CAKE_GROUPED_MXFP8_HEAD2048_F16,
+    HEAD4096_BF16 as _CAKE_GROUPED_MXFP8_HEAD4096_BF16,
+    HEAD4096_F16 as _CAKE_GROUPED_MXFP8_HEAD4096_F16,
+    TILED_BF16 as _CAKE_GROUPED_MXFP8_TILED_BF16,
+    TILED_F16 as _CAKE_GROUPED_MXFP8_TILED_F16,
+    TILED_K2048_BF16 as _CAKE_GROUPED_MXFP8_TILED_K2048_BF16,
+    TILED_K2048_F16 as _CAKE_GROUPED_MXFP8_TILED_K2048_F16,
+    TILED_K4096_BF16 as _CAKE_GROUPED_MXFP8_TILED_K4096_BF16,
+    TILED_K4096_F16 as _CAKE_GROUPED_MXFP8_TILED_K4096_F16,
+    TILED_WIDE_BF16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_BF16,
+    TILED_WIDE_F16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
 )
 from ..jit.cake_program import CakeProgram
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from ..jit.quantization import gen_quantization_module
 from ..utils import (
     device_support_pdl,
     get_compute_capability,
@@ -57,6 +72,88 @@ def _to_masked_gemm_layout(
     b, padded_m, scale_k = sf.shape
     sf = sf.view(b, padded_m // 128, scale_k // 4, 32, 4, 4).permute(3, 4, 1, 5, 2, 0)
     return x_q.permute(1, 2, 0), sf
+
+
+@functools.cache
+def get_per_token_group_quant_8bit_cuda_module():
+    """Build and cache the native CUDA per-token-group quantization module."""
+    return gen_quantization_module().build_and_load()
+
+
+def _per_token_group_quant_8bit_cuda(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    dst_dtype: torch.dtype,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the register-resident native CUDA backend."""
+    if group_size != 128:
+        raise ValueError(
+            "backend='cuda' currently requires group_size=128; "
+            "use backend='cutile' for other group sizes"
+        )
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(
+            f"backend='cuda' requires float16 or bfloat16 input; got {x.dtype}"
+        )
+    if not x.is_cuda:
+        raise ValueError("backend='cuda' requires a CUDA input tensor")
+    if not x.is_contiguous():
+        raise ValueError("backend='cuda' requires a contiguous input tensor")
+    if x.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"the last dimension of x ({x.shape[-1]}) must be divisible by "
+            f"group_size ({group_size})"
+        )
+    if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
+        raise TypeError(
+            f"dst_dtype must be float8_e4m3fn, float8_e5m2, or int8; got {dst_dtype}"
+        )
+    if scale_tma_aligned or scale_ue8m0:
+        if not column_major_scales:
+            raise ValueError(
+                "scale_tma_aligned or scale_ue8m0 requires column_major_scales=True"
+            )
+
+    x_q = torch.empty_like(x, dtype=dst_dtype)
+    groups_per_row = x.shape[-1] // group_size
+
+    if column_major_scales:
+        if x.dim() != 2:
+            raise ValueError(
+                "column_major_scales is only supported for 2D inputs; "
+                f"got a {x.dim()}D input"
+            )
+        num_tokens = x.shape[0]
+        scale_stride = _round_up(num_tokens, 4) if scale_tma_aligned else num_tokens
+        x_s_storage = torch.empty(
+            (groups_per_row, scale_stride), device=x.device, dtype=torch.float32
+        )
+        x_s = x_s_storage[:, :num_tokens].t()
+    else:
+        scale_shape = x.shape[:-1] + (groups_per_row,)
+        x_s_storage = torch.empty(scale_shape, device=x.device, dtype=torch.float32)
+        x_s = x_s_storage
+        scale_stride = groups_per_row
+
+    if x.numel() == 0:
+        return x_q, x_s
+
+    get_per_token_group_quant_8bit_cuda_module().per_token_group_quant_8bit(
+        x,
+        x_q,
+        x_s_storage,
+        float(eps),
+        group_size,
+        groups_per_row,
+        scale_stride,
+        column_major_scales,
+        scale_ue8m0,
+    )
+    return x_q, x_s
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -470,14 +567,90 @@ def get_mxfp8_grouped_quantization_module():
     )
 
 
-# Generated Cake programs of the grouped MXFP8 quantizer, one per input dtype.
-# Both read two-byte elements through one bfloat16 pointer (the float16
-# program widens with its own conversion), so the host selects the program by
-# dtype and passes float16 storage as a bfloat16 view.  Each program ships for
-# exact compute capability 10.0 (sm_100a) and 10.3 (sm_103a) only.
+# Generated Cake programs of the grouped MXFP8 quantizer: eight programs per
+# input dtype, all writing the same bytes.  Every program reads two-byte
+# elements through one bfloat16 pointer (the float16 programs widen with their
+# own conversion), so the host selects the program by dtype and shape and
+# passes float16 storage as a bfloat16 view.  Each program ships for exact
+# compute capability 10.0 (sm_100a) and 10.3 (sm_103a) only.
+#
+# The row-2D kernel launches one CTA per row and K tile; each CTA reads its
+# group's mask word, then its row's blocks.
 _CAKE_GROUPED_MXFP8_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
     torch.bfloat16: _CAKE_GROUPED_MXFP8_BF16,
     torch.float16: _CAKE_GROUPED_MXFP8_F16,
+}
+# The head-window programs are the row-2D kernel with two L2 prefetches: the
+# first CTA warms L2 with the mask, and each CTA whose slice of the input
+# starts in the first 2 MiB (or 4 MiB) of the input warms L2 with that slice
+# as soon as it has issued its mask-word load.  The mask prefetch is a bulk
+# prefetch of the mask's address, which must be a multiple of 16 bytes.
+_CAKE_GROUPED_MXFP8_HEAD2048_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_HEAD2048_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_HEAD2048_F16,
+}
+_CAKE_GROUPED_MXFP8_HEAD4096_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_HEAD4096_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_HEAD4096_F16,
+}
+# The bulk kernel has the row-2D grid and copies the CTA's blocks to shared
+# memory before it reads the mask word, so the two round trips overlap.  It
+# moves masked-out rows too, so it serves only problems small enough to be
+# bound by the round trips rather than by bandwidth.
+_CAKE_GROUPED_MXFP8_BULK_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_BULK_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_BULK_F16,
+}
+# The tiled kernel gives each thread a block of ``ROWS`` rows of its group and
+# reads the mask word once for them, so a sparse mask launches a fraction of
+# the CTAs that would only read the mask word.  A row of fewer blocks than the
+# CTA has threads shares the CTA with ``SUBROWS`` rows side by side.
+_CAKE_GROUPED_MXFP8_TILED_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_F16,
+}
+# The tiled programs below are builds of the same kernel for one K each.  They
+# write the same bytes; they differ in the CTA width and in how a thread holds
+# a block, computes its scale byte and forms its addresses.
+#
+# K = 7168: 224-thread CTAs, so a row of 224 blocks is one CTA instead of two
+# and the grid has half the CTAs; the scale byte from integer operations.
+_CAKE_GROUPED_MXFP8_TILED_WIDE_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_WIDE_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
+}
+# K = 4096: 256-thread CTAs, each holding two rows of 128 blocks side by side;
+# packed two-byte pairs, the integer scale byte, one row address stepped per
+# row and a launch bound of five CTAs per SM.
+_CAKE_GROUPED_MXFP8_TILED_K4096_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_K4096_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_K4096_F16,
+}
+# K = 2048: 128-thread CTAs with the packed pairs, the integer scale byte and
+# the stepped row address.
+_CAKE_GROUPED_MXFP8_TILED_K2048_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_K2048_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_K2048_F16,
+}
+# Problems of at most this many input bytes take the bulk kernel.
+_CAKE_BULK_MAX_INPUT_BYTES = 4 << 20
+# Problems of at least this many rows (B * M) take a tiled kernel, at
+# _CAKE_TILED_ROWS rows per thread: the one _CAKE_TILED_PROGRAMS_BY_K names
+# for K, else the 128-thread one.
+_CAKE_TILED_MIN_ROWS = 16384
+_CAKE_TILED_ROWS = 2
+_CAKE_TILED_PROGRAMS_BY_K: Dict[int, Dict[torch.dtype, CakeProgram]] = {
+    7168: _CAKE_GROUPED_MXFP8_TILED_WIDE_PROGRAMS,
+    4096: _CAKE_GROUPED_MXFP8_TILED_K4096_PROGRAMS,
+    2048: _CAKE_GROUPED_MXFP8_TILED_K2048_PROGRAMS,
+}
+# Problems of exactly these (B, M, K) that would take the row-2D program take
+# a head-window program instead when the mask is 16-byte aligned.
+_CAKE_HEAD_PROGRAMS_BY_SHAPE: Dict[
+    Tuple[int, int, int], Dict[torch.dtype, CakeProgram]
+] = {
+    (8, 512, 2048): _CAKE_GROUPED_MXFP8_HEAD2048_PROGRAMS,
+    (64, 128, 4096): _CAKE_GROUPED_MXFP8_HEAD4096_PROGRAMS,
 }
 _CAKE_QUANT_BLOCK = 32
 # One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
@@ -526,6 +699,52 @@ def is_cake_grouped_mxfp8_quantize_available(
     return True
 
 
+def cake_grouped_mxfp8_quantize_program(
+    dtype: torch.dtype,
+    b: int,
+    m: int,
+    k: int,
+    padded_k: Optional[int] = None,
+    mask_aligned: bool = True,
+) -> CakeProgram:
+    """The program that quantizes ``b`` groups of ``m`` rows of ``k`` elements of
+    ``dtype`` into rows of ``padded_k`` codes (default ``round_up(k, 128)``),
+    chosen from the shape alone (the host never reads the mask).
+
+    The bulk, tiled and head-window programs take rows padded to
+    ``round_up(k, 128)``; a wider padded row keeps the row-2D program, whose CTAs
+    past ``k`` read nothing.  ``mask_aligned`` says whether the mask's address is
+    a multiple of 16 bytes; the head-window programs need it.
+    """
+    programs = (
+        _CAKE_GROUPED_MXFP8_PROGRAMS,
+        _CAKE_GROUPED_MXFP8_BULK_PROGRAMS,
+        _CAKE_TILED_PROGRAMS_BY_K.get(k, _CAKE_GROUPED_MXFP8_TILED_PROGRAMS),
+    )
+    if dtype not in _CAKE_GROUPED_MXFP8_PROGRAMS:
+        raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {dtype}")
+    row2d, bulk, tiled = (table[dtype] for table in programs)
+    if k < _CAKE_QUANT_BLOCK:
+        return row2d
+    if padded_k is not None and padded_k != _round_up(k, _CAKE_SCALE_TILE):
+        return row2d
+    if b * m * k * dtype.itemsize <= _CAKE_BULK_MAX_INPUT_BYTES:
+        return bulk
+    if b * m >= _CAKE_TILED_MIN_ROWS:
+        return tiled
+    head_window = _CAKE_HEAD_PROGRAMS_BY_SHAPE.get((b, m, k))
+    if head_window is not None and mask_aligned:
+        return head_window[dtype]
+    return row2d
+
+
+def _cake_grouped_mxfp8_subrows(program: CakeProgram, blocks_per_row: int) -> int:
+    """Rows a CTA of the tiled ``program`` holds side by side: as many as its
+    threads cover when a row has fewer blocks than the CTA has threads."""
+    threads = program.block[0]
+    return threads // blocks_per_row if blocks_per_row < threads else 1
+
+
 def cake_grouped_mxfp8_quantize_grid(
     program: CakeProgram, b: int, m: int, blocks_per_row: int
 ) -> Tuple[int, int, int]:
@@ -534,10 +753,15 @@ def cake_grouped_mxfp8_quantize_grid(
 
     One thread per block along x in CTAs of ``program.block[0]`` threads (the
     last CTA of a row is partial when ``blocks_per_row`` is not a multiple of
-    the CTA width), one CTA row per M and one grid slice per group.
+    the CTA width) and one grid slice per group; one CTA row per M, or, for a
+    tiled program (one that takes ``ROWS``), one per ``ROWS * SUBROWS`` rows.
     """
     threads = program.block[0]
-    return ((blocks_per_row + threads - 1) // threads, m, b)
+    grid_x = (blocks_per_row + threads - 1) // threads
+    if "ROWS" not in program.args:
+        return (grid_x, m, b)
+    rows = _CAKE_TILED_ROWS * _cake_grouped_mxfp8_subrows(program, blocks_per_row)
+    return (grid_x, (m + rows - 1) // rows, b)
 
 
 def cake_grouped_mxfp8_quantize_launch(
@@ -564,10 +788,6 @@ def cake_grouped_mxfp8_quantize_launch(
         raise ValueError(
             f"B and M must not exceed the CUDA grid limit {_CAKE_MAX_GRID_YZ}, got B={b}, M={m}"
         )
-    program = _CAKE_GROUPED_MXFP8_PROGRAMS.get(a.dtype)
-    if program is None:
-        raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {a.dtype}")
-    target = _cake_grouped_mxfp8_target(program, a.device)
     # The binding validates dtype, device, contiguity and scalar ranges; the
     # shapes the kernel's scalars are derived from are validated here.
     quantized_shape = tuple(quantized.shape)
@@ -595,6 +815,10 @@ def cake_grouped_mxfp8_quantize_launch(
             "scales must have shape [B, padded_M, padded_K / 32] with padded_M a "
             f"multiple of {_CAKE_SCALE_TILE} and >= M={m}, got {list(scales_shape)}"
         )
+    program = cake_grouped_mxfp8_quantize_program(
+        a.dtype, b, m, k, padded_k, mask.data_ptr() % 16 == 0
+    )
+    target = _cake_grouped_mxfp8_target(program, a.device)
     pm_tiles = padded_m // _CAKE_SCALE_TILE
     pk_tiles = padded_k // _CAKE_SCALE_TILE
     grid_x, grid_y, grid_z = cake_grouped_mxfp8_quantize_grid(
@@ -612,6 +836,8 @@ def cake_grouped_mxfp8_quantize_launch(
         PK_TILES=pk_tiles,
         BLOCKS_PER_ROW=blocks_per_row,
         TOTAL_TASKS=b * m * blocks_per_row,
+        ROWS=_CAKE_TILED_ROWS,
+        SUBROWS=_cake_grouped_mxfp8_subrows(program, blocks_per_row),
         grid_x=grid_x,
         grid_y=grid_y,
         grid_z=grid_z,
@@ -725,8 +951,8 @@ def mxfp8_grouped_quantize(
         ``a`` and ``mask``; ``"cuda"`` also requires ``a`` to be 32-byte
         aligned. A failed launch is not retried on another backend.
 
-        Outputs match across backends for finite inputs, except possibly in
-        bfloat16 blocks whose largest magnitude is at most ``448 * 2**-117``.
+        Outputs match across backends for finite inputs, including bfloat16
+        subnormals. A zero UE8M0 scale byte produces signed-zero payloads.
         ``"cuda"`` quantizes NaN and infinities to 448, as
         :func:`mxfp8_quantize` does; blocks that hold them can differ.
 
@@ -933,7 +1159,7 @@ def per_token_group_quant_8bit(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
-    backend: Literal["cutile"] = "cutile",
+    backend: Literal["cutile", "cuda"] = "cutile",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-token group 8-bit quantization (FP8 or INT8).
 
@@ -962,8 +1188,11 @@ def per_token_group_quant_8bit(
     scale_ue8m0 : bool
         If ``True``, encode scales in the UE8M0 format (Blackwell / sm100+).
     backend : str
-        Implementation backend. Currently only ``"cutile"`` (the cuda.tile
-        Python backend) is supported.
+        Implementation backend. ``"cutile"`` uses the cuda.tile Python
+        backend. ``"cuda"`` uses a register-resident native CUDA kernel and
+        currently supports ``group_size=128`` with FP16/BF16 input. Both
+        backends compute the scale with IEEE float32 division and, for
+        ``dst_dtype=torch.int8``, round half up (``floor(x + 0.5)``).
 
     Returns
     -------
@@ -971,6 +1200,9 @@ def per_token_group_quant_8bit(
         ``(x_q, x_s)``: the quantized tensor (same shape as ``x``) and the
         per-group scale tensor of shape ``(*x.shape[:-1], x.shape[-1] // group_size)``.
     """
+    if dst_dtype is None:
+        dst_dtype = torch.float8_e4m3fn
+
     if backend == "cutile":
         from .kernels.cutile.per_token_group_quant_8bit_cutile import (
             per_token_group_quant_8bit_cutile,
@@ -986,4 +1218,58 @@ def per_token_group_quant_8bit(
             scale_ue8m0=scale_ue8m0,
         )
 
+    if backend == "cuda":
+        return _per_token_group_quant_8bit_cuda(
+            x,
+            group_size,
+            eps,
+            dst_dtype,
+            column_major_scales,
+            scale_tma_aligned,
+            scale_ue8m0,
+        )
+
     raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")
+
+
+def mxfp8_quantize_bshd(
+    x: torch.Tensor, backend: Literal["cuda", "cute-dsl"] = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a ``[B, S, H, D]`` attention operand to MXFP8 for the PrimTS
+    context kernel.
+
+    The data stays in ``[B, S, H, D]`` order, so the rows are quantized in
+    place of any transpose. The scales come back as the kernel's
+    ``[B, H, tiles, 128, 4]`` byte atoms, one per 128-token tile and head with
+    one E8M0 scale per 32 channels, in the 128x4 order of the block-scaled
+    tensor-core instruction. ``S`` is padded to whole tiles with zero scales.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Half-precision ``[B, S, H, D]`` tensor with ``D`` a multiple of 32.
+    backend : {"cuda", "cute-dsl"}
+        Quantizer backend, as for :func:`mxfp8_quantize`.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(data, scales)``, the ``float8_e4m3fn`` data in the input layout and
+        the ``[B, H, tiles, 128, 4]`` uint8 scale atoms.
+    """
+    batch_size, seq_len, num_heads, head_dim = x.shape
+    data, scales = mxfp8_quantize(
+        x.reshape(batch_size * seq_len * num_heads, head_dim),
+        is_sf_swizzled_layout=False,
+        backend=backend,
+    )
+    tiles = (seq_len + 127) // 128
+    scales = scales.view(batch_size, seq_len, num_heads, head_dim // 32)
+    scales = torch.nn.functional.pad(
+        scales.permute(0, 2, 1, 3), (0, 0, 0, tiles * 128 - seq_len)
+    )
+    # Row r of a tile sits at byte 16 * (r % 32) + 4 * (r // 32) + block.
+    scales = scales.reshape(batch_size, num_heads, tiles, 4, 32, head_dim // 32)
+    return data.view(x.shape), scales.permute(0, 1, 2, 4, 3, 5).reshape(
+        batch_size, num_heads, tiles, 128, 4
+    )

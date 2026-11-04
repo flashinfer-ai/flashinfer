@@ -13,44 +13,128 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake fused BF16 RMSNorm training forward / backward (SM100 / SM103 / SM107).
+Cake fused BF16 RMSNorm training forward / backward (SM100 / SM103 / SM107)
+with a deterministic default and an opt-in non-deterministic weight gradient.
 
 Forward: ``r_t = (mean_j x_tj^2 + eps)^(-1/2)`` in FP32, ``y = BF16((x * r) * w)``.
 The only tensor saved for the backward besides the inputs is the FP32 per-row
 reciprocal RMS ``rstd`` (``[T]``).  Backward: one fused pass produces
 ``dx = BF16(r * g * w - x * r^3 * mean(g * w * x))`` and the FP32 weight
-gradient ``dw = sum_t g * x * r`` through a fixed row-chunk partition and a
-fixed-order reduction, so ``dw`` is bitwise reproducible for a given token
-count on a given architecture.  The optional residual-add fusion computes
+gradient ``dw = sum_t g * x * r``.  The optional residual-add fusion computes
 ``h_new = BF16(h + u)`` first, normalizes ``h_new``, and in the backward adds
 the gradient flowing directly through ``h_new`` so that one ``dx`` tensor is
 the gradient of both ``h`` and ``u``.
 
-All kernels use FP32 statistics and accumulation with IEEE division and
-square root (no fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``
+Every entry point takes ``deterministic`` (default ``True``):
+
+* ``deterministic=True`` runs :mod:`flashinfer.cake_rmsnorm_det_train` with the
+  same arguments: ``dw`` through a fixed row-chunk partition and a fixed-order
+  reduction (a main kernel and a reduce kernel), bitwise reproducible for a
+  given token count on devices with the same SM count.  The default call
+  returns exactly that package's results.
+* ``deterministic=False`` runs this package's kernels: the same forward programs
+  (the forward has no cross-row reduction) and, per token-count window, the
+  backward form this build's registry lists for the window
+  (``cake_jit.program_windows``; the backward docstring's notes are generated
+  from it).  The single-kernel form, in the windows that ship it: persistent
+  CTAs claim row chunks, write ``dx`` and add their per-column ``dw`` sums into
+  FP64 sums in the workspace in the order they finish; the CTA that finishes
+  last rounds the sums into ``dw``.  ``dx`` is bitwise reproducible and within
+  one BF16 ulp of max(|dx|, rms(dx)) of the deterministic backward's ``dx``
+  (not always bitwise equal to it); ``dw`` is not guaranteed bitwise
+  reproducible (the order of the FP64 additions depends on scheduling).  In
+  the windows the backward docstring's notes name, a twosum single kernel keeps
+  each thread's ``dw`` column sums exact (error-free FP32 products, TwoSum
+  compensation) before the FP64 additions, so its ``dw`` error does not grow
+  with ``T``.  Every other window runs
+  the deterministic package's backward pair (main kernel and fixed-order
+  reduce), rendered into this package.  This path also accepts ``[..., H]`` inputs whose leading dimensions collapse into
+  rows (for example a ``[T, heads, 256]`` per-head view sharing one ``w[256]``)
+  and an FP32 weight on the routes that ship the FP32-weight programs.
+* ``deterministic=False`` while ``torch.use_deterministic_algorithms(True)`` is
+  in effect raises ``RuntimeError``.  With ``warn_only=True`` it warns, the
+  forward runs this package's forward programs (deterministic) and the backward
+  runs the deterministic package with a workspace of its own; a call that
+  package cannot serve (``[..., H]`` inputs, an FP32 weight, a width or residual
+  route it does not export) raises one ``RuntimeError`` naming the feature
+  instead.  A call that asks for determinism never runs the non-deterministic
+  kernels.  ``deterministic`` must be a ``bool`` (``TypeError`` otherwise).
+
+All kernels use FP32 statistics and accumulation (the non-deterministic
+single kernel's ``dw`` sums across CTAs in FP64) with IEEE division and square root (no
+fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``
 are FP32.  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
 are accepted when ``stride(1) == 1``, ``stride(0)`` is a multiple of eight
 elements and the storage is aligned (32 bytes for the forward inputs, 16 for
-the backward); outputs are contiguous.  The
-token count ``T`` is a runtime scalar: it may change between calls, ``T == 1``
-is supported and ``T == 0`` returns empty outputs without launching.
+the backward); outputs are contiguous.  The token count ``T`` is a runtime
+scalar: it may change between calls, ``T == 1`` is supported and ``T == 0``
+returns empty outputs (a zero ``dw``) without launching.
+
+The non-deterministic backward's workspace
+(``cake_rmsnorm_train_backward_workspace_bytes(T, H, ..., deterministic=False)``
+bytes) has one layout, with offsets fixed by the package, for every call: the
+deterministic pair's counters, the single kernel's counters and FP64 column
+sums (``cake_jit.SUMS_BYTES``, the largest of the package's single kernels)
+and, when a window up to ``T`` runs the deterministic pair, its FP32 partial
+rows.  Zero the buffer once: after every launch the kernels leave the counters
+at rest and the sums at zero, so with no host write one buffer serves any
+sequence of ``deterministic=False`` backward calls it is large enough for --
+hidden sizes, residual flags, weight dtypes, token counts, windows and CUDA
+Graph replays.  A buffer serves calls of one mode: a ``deterministic=True``
+call takes the deterministic package's workspace.  Zeroing it again is
+harmless.  Give each stream that may run a backward at the same time its own
+buffer.  A call with a workspace issues no memset, copy or synchronization; a
+call without one allocates and zero-fills one per call (a caching-allocator
+call, one fill kernel of about 3 us and about 35 us of host time on B200).
+The backward writes all of ``dw``.
+
+Beside kernels resident on other streams (``deterministic=False``): the backward
+kernel needs part of its SM's shared memory, registers for its CTA and one CTA
+slot, and an SM serves it only once it can switch to that shared-memory
+carveout.  A kernel on another stream whose CTAs hold every SM with a small
+carveout therefore delays the backward's start until that kernel exits; kernels
+that hold only some SMs cost it no more than the SMs they hold.  Setting
+``cudaFuncAttributePreferredSharedMemoryCarveout`` to
+``cudaSharedmemCarveoutMaxShared`` on such a resident kernel lets the backward
+start beside it.  The windows that run the deterministic pair start and wait
+exactly as the deterministic backward does, including its whole-SM programs
+(see :mod:`flashinfer.cake_rmsnorm_det_train`).  A resident kernel that holds a
+large dynamic shared-memory allocation on every SM delays the windows whose
+programs need more shared memory than it leaves, deterministic-pair windows
+included: ``cake_windows.SMEM_WAITS`` and the backward's notes list, per
+architecture, route and window, the measured allocation from which the window
+waits (``cake_windows.SMEM_SIDE_KB``: the sizes measured).  Programs that need a
+whole SM wait beside any kernel resident on every SM, whatever its carveout: the
+deterministic package's whole-SM programs where this package runs them -- the
+residual-fused hidden 6144 backward in its deterministic-pair windows, and on
+R200 (``sm_107a``) the backward of hidden 1536 and 4096 above 1024 tokens and of
+hidden 2048 above 256 tokens in deterministic-pair windows (FP32-weight twins
+included) and the forward of hidden 6144 above 4096 tokens.
+``cake_windows.WHOLE_SM`` and the notes of the forward and backward list them per
+architecture, route and token range; no single-kernel window of this package
+needs a whole SM at the token counts measured (256 to 16384).  Beside those,
+leave some SMs free of the resident kernel.  The forward programs are the
+deterministic package's; see :mod:`flashinfer.cake_rmsnorm_det_train`.
 
 Usage::
 
     y, rstd = cake_rmsnorm_train_forward(x, w, eps)
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)          # dw is FP32 [H]
+    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)                  # deterministic
+    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd, deterministic=False)
 
-    # autograd (dw is returned in w.dtype; the kernel accumulates in FP32)
-    y = cake_rmsnorm(x, w, eps)
-    y, h_new = cake_rmsnorm(h, w, eps, residual=u)                 # fused add
+    # autograd (dw is returned in w.dtype; the kernels accumulate in FP32)
+    y = cake_rmsnorm(x, w, eps)                                          # deterministic
+    y = cake_rmsnorm(x, w, eps, deterministic=False)
+    y, h_new = cake_rmsnorm(h, w, eps, residual=u, deterministic=False)  # fused add
 
-    # caller-owned backward workspace (partials + self-resetting counters)
-    ws = cake_rmsnorm_train_backward_workspace(T, H, x.device)
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd, workspace=ws)
+    # caller-owned non-deterministic workspace (counters, FP64 column sums, partial rows)
+    ws = cake_rmsnorm_train_backward_workspace(T, H, x.device, deterministic=False)
+    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd, deterministic=False, workspace=ws)
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import Optional
 
 import torch
@@ -82,40 +166,19 @@ def cake_rmsnorm_train_forward(
     out: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
+    deterministic: bool = True,
 ) -> tuple[torch.Tensor, ...]:
-    r"""Fused BF16 RMSNorm forward with FP32 statistics.
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        BF16 ``[T, H]`` input of any layout.  Row-strided views with a contiguous
-        feature dimension, 32-byte aligned storage and a row stride that is a
-        multiple of 32 bytes are read in place; other layouts (odd column offset,
-        odd row stride, transposed storage) are materialized once.  With
-        ``residual`` this is the residual stream ``h`` and the normalized value is
-        ``h_new = BF16(h + residual)``.
-    w : torch.Tensor
-        BF16 ``[H]`` weight, read in place when contiguous and 32-byte aligned
-        (the forward kernels load it with 32-byte vectors), else copied once.
-    eps : float
-        Variance epsilon (FP32 inside the kernel).
-    residual : torch.Tensor, optional
-        BF16 ``[T, H]`` update added to ``x`` before normalization (same layout
-        rules as ``x``).  Enables the fused residual-add route.
-    out, rstd, residual_out : torch.Tensor, optional
-        Preallocated outputs: BF16 ``[T, H]`` ``y``, FP32 ``[T]`` reciprocal RMS
-        and (residual only) BF16 ``[T, H]`` ``h_new``.  Contiguous aligned buffers
-        are written directly; any other layout receives a copy after the launch.
-
-    Returns
-    -------
-    ``(y, rstd)`` or ``(y, rstd, h_new)`` when ``residual`` is given.
-    ``rstd`` is the FP32 per-row ``1 / sqrt(mean(h_new^2) + eps)`` the backward
-    needs; no other ``[T, H]`` temporary is produced.
-    """
+    """See :func:`flashinfer.cake_rmsnorm_train_backend.cake_rmsnorm_train_forward`."""
 
     return _backend.cake_rmsnorm_train_forward(
-        x, w, eps, residual=residual, out=out, rstd=rstd, residual_out=residual_out
+        x,
+        w,
+        eps,
+        residual=residual,
+        out=out,
+        rstd=rstd,
+        residual_out=residual_out,
+        deterministic=deterministic,
     )
 
 
@@ -132,43 +195,7 @@ def cake_rmsnorm_train_backward(
     dx: Optional[torch.Tensor] = None,
     dw: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""Fused BF16 RMSNorm backward: ``dx`` and the FP32 weight gradient ``dw``.
-
-    Parameters
-    ----------
-    g : torch.Tensor
-        BF16 ``[T, H]`` gradient of ``y`` of any layout.  Views with a contiguous
-        feature dimension, 16-byte aligned storage and a row stride that is a
-        multiple of 16 bytes (expanded or sliced autograd gradients included) are
-        read in place; other layouts are materialized once.
-    x : torch.Tensor
-        The BF16 ``[T, H]`` tensor that was normalized (``x`` of the plain
-        forward, ``h_new`` of the residual forward); same layout rules as ``g``.
-    w : torch.Tensor
-        BF16 ``[H]`` weight, read in place when contiguous and 16-byte aligned,
-        else copied once.
-    rstd : torch.Tensor
-        FP32 ``[T]`` reciprocal RMS returned by the forward.
-    deterministic : bool
-        Only the deterministic fixed-order ``dw`` reduction is exported;
-        ``False`` is rejected.
-    g_residual : torch.Tensor, optional
-        BF16 ``[T, H]`` gradient flowing directly through ``h_new`` (residual
-        forward), any layout.  It is added once so that the returned ``dx`` is
-        the gradient of both residual-add inputs.
-    workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from
-        :func:`cake_rmsnorm_train_backward_workspace`; allocated when omitted.
-    dx, dw : torch.Tensor, optional
-        Preallocated outputs: BF16 ``[T, H]`` and FP32 ``[H]``.  Contiguous
-        aligned buffers are written directly; any other layout receives a copy
-        after the launch.
-
-    Returns
-    -------
-    ``(dx, dw)`` with ``dw`` in FP32; the caller decides whether to cast it.
-    For a fixed token count and architecture ``dw`` is bitwise reproducible.
-    """
+    """See :func:`flashinfer.cake_rmsnorm_train_backend.cake_rmsnorm_train_backward`."""
 
     return _backend.cake_rmsnorm_train_backward(
         g,
@@ -191,34 +218,42 @@ def cake_rmsnorm(
     residual: Optional[torch.Tensor] = None,
     deterministic: bool = True,
 ):
-    """Autograd-enabled fused BF16 RMSNorm (optionally with a fused residual add).
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        BF16 ``[T, H]`` input on a supported CUDA device.
-    w : torch.Tensor
-        BF16 ``[H]`` RMSNorm weight.
-    eps : float
-        Variance epsilon evaluated in FP32 by the kernel.
-    residual : torch.Tensor, optional
-        BF16 ``[T, H]`` update added to ``x`` before normalization.  When
-        provided, the normalized input ``h_new`` is returned with the output.
-    deterministic : bool
-        Whether to use the deterministic fixed-order weight-gradient reduction.
-        Only ``True`` is supported; ``False`` is rejected during backward.
-
-    Returns
-    -------
-    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        BF16 ``y`` with shape ``[T, H]``, or ``(y, h_new)`` when ``residual``
-        is given.  Backward launches the fused ``dx`` and deterministic ``dw``
-        kernels of :func:`cake_rmsnorm_train_backward`.
-    """
+    """See :func:`flashinfer.cake_rmsnorm_train_backend.cake_rmsnorm`."""
 
     return _backend.cake_rmsnorm(
         x, w, eps, residual=residual, deterministic=deterministic
     )
+
+
+# Sphinx renders the backend docstrings; the one-line delegations satisfy the checker.
+cake_rmsnorm_train_forward.__doc__ = _backend.cake_rmsnorm_train_forward.__doc__
+cake_rmsnorm_train_backward.__doc__ = _backend.cake_rmsnorm_train_backward.__doc__
+cake_rmsnorm.__doc__ = _backend.cake_rmsnorm.__doc__
+
+
+# The deterministic names of the previous ``flashinfer.cake_rmsnorm_train`` (before
+# this package it was the deterministic facade itself): each resolves on first
+# access to the deterministic facade's object of that name (not in ``__all__``).
+_PREVIOUS_DET_NAMES = frozenset(
+    (
+        "CakeRMSNormDetFunction",
+        "cake_rmsnorm_det",
+        "cake_rmsnorm_det_train_backward",
+        "cake_rmsnorm_det_train_backward_workspace",
+        "cake_rmsnorm_det_train_backward_workspace_bytes",
+        "cake_rmsnorm_det_train_forward",
+        "is_cake_rmsnorm_det_train_supported",
+    )
+)
+
+
+def __getattr__(name: str):
+    """A deterministic name of the previous module (:data:`_PREVIOUS_DET_NAMES`): the
+    deterministic facade's object of that name."""
+    if name in _PREVIOUS_DET_NAMES:
+        det = importlib.import_module(f"{__package__}.cake_rmsnorm_det_train")
+        return getattr(det, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

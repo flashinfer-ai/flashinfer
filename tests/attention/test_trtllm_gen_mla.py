@@ -2027,6 +2027,42 @@ def test_trtllm_mla_blackwell_domain_selection(
     assert f"{domain}__sm_100a" in ROUTES and f"{domain}__sm_103a" in ROUTES
 
 
+@pytest.mark.parametrize(
+    ("domain", "arch", "num_sms", "work_items", "expected_route"),
+    [
+        ("mla_bf16_clc", "sm_100a", 148, 74, "mla_bf16_clc_one_wave__sm_100a__148"),
+        ("mla_bf16_clc", "sm_100a", 148, 75, "mla_bf16_clc__sm_100a"),
+        ("mla_bf16_clc", "sm_100a", 152, 76, "mla_bf16_clc__sm_100a"),
+        ("mla_bf16_clc", "sm_103a", 152, 76, "mla_bf16_clc_one_wave__sm_103a__152"),
+        ("mla_bf16_clc", "sm_103a", 152, 77, "mla_bf16_clc__sm_103a__152"),
+        ("mla_bf16_clc", "sm_103a", 148, 74, "mla_bf16_clc__sm_103a"),
+        (
+            "mla_bf16_clc_exact007790",
+            "sm_100a",
+            148,
+            1,
+            "mla_bf16_clc_exact007790__sm_100a",
+        ),
+        (
+            "mla_bf16_clc_exact007826",
+            "sm_103a",
+            152,
+            1,
+            "mla_bf16_clc_exact007826__sm_103a__152",
+        ),
+    ],
+)
+def test_trtllm_mla_blackwell_one_wave_clc_family(
+    domain: str, arch: str, num_sms: int, work_items: int, expected_route: str
+) -> None:
+    from flashinfer.mla.cake_trtllm_mla_blackwell import ROUTES, launch_family
+
+    # A generic CLC launch whose work items fit one wave of clusters takes the
+    # one-wave program where the device has one; every other launch keeps its
+    # domain's program.
+    assert launch_family(domain, arch, num_sms, work_items) == ROUTES[expected_route]
+
+
 def test_trtllm_mla_blackwell_rejects_non_scalar_or_nonfinite_scales() -> None:
     from flashinfer.mla.cake_trtllm_mla_blackwell import _normalize_scale
 
