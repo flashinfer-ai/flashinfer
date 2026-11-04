@@ -64,7 +64,12 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
 
 
 class SelectionCache:
-    """Locked reload/merge/atomic publication prevents concurrent lost updates."""
+    """Locked reload/merge/atomic publication prevents concurrent lost updates.
+
+    The lock is ``fcntl.flock``; where ``fcntl`` is unavailable (Windows) the
+    reload, merge and publication run without it, so concurrent writers on one
+    host can lose a record. A lost record costs a re-tune, nothing else.
+    """
 
     def __init__(self, root: str | Path, identity: Mapping[str, object]):
         self.identity = json.loads(_json(identity))

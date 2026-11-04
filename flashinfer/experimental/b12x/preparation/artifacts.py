@@ -44,7 +44,13 @@ class CuTeArtifactCache:
             yield Path(temporary)
 
     def publish(self, key: str, staged: Path) -> bool:
-        """Publish a verified pair without waiting for an active local compiler."""
+        """Publish a verified pair without waiting for an active local compiler.
+
+        The per-key lock is ``fcntl.flock``; where ``fcntl`` is unavailable
+        (Windows) the pair is published without it, so two publishers of the
+        same key on one host can leave a mixed pair. One publisher per key is
+        assumed there.
+        """
         object_path, manifest_path = (
             staged / (key + suffix) for suffix in (".o", ".json")
         )
