@@ -74,7 +74,7 @@ kernel_cake_gdn_train_89f5ff59f03eb170e3bf_kcp(float* __restrict__ m, float* __r
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* x_block = reinterpret_cast<float*>(smem_raw + 0);
     const int x_block_addr = smem + 0;
     float* slabs = reinterpret_cast<float*>(smem_raw + 8192);

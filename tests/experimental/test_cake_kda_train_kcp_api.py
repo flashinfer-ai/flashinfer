@@ -588,10 +588,15 @@ def test_package_entries_accept_the_modes_off(entry) -> None:
 def test_package_byte_queries_take_the_raw_gate() -> None:
     """The package's workspace and saved-set byte queries take ``use_gate_in_kernel`` as the deterministic queries
     do: ``False`` gives the bytes of the omitted keyword; ``True`` gives the raw plan's workspace bytes (the
-    deterministic query's answer for the same partition, never more than the explicit mode's, the facade's answer on
-    both routes) and the saved-set bytes of the explicit gate (the saved set does not depend on the gate mode, on
-    either route); a non-bool is a ``ValueError`` and ``True`` with the lean local arena a ``NotImplementedError``."""
+    deterministic query's answer for the same partition plus, on a backward workspace of an R1c plan, the local
+    arena's FP64 parameter-gradient accumulators; its arena never more than the explicit mode's; the facade's
+    answer on each route is its package's) and the saved-set bytes of the explicit gate (the saved set does not
+    depend on the gate mode, on either route); a non-bool is a ``ValueError`` and ``True`` with the lean local arena
+    a ``NotImplementedError``."""
     plan, det_plan = _mod("cake_kcp_plan"), _det("cake_kcp_plan")
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_kda_train.cake_backend"
+    )
     ctx = kcp_api.build_context_kcp(
         kcp_api.partition_kcp(MODE_CU, 2, deterministic=False),
         None,
@@ -610,11 +615,20 @@ def test_package_byte_queries_take_the_raw_gate() -> None:
         raw = plan.kda_workspace_bytes_kcp(
             ctx, H=4, backward=backward, use_gate_in_kernel=True
         )
-        assert raw == det_plan.kda_det_workspace_bytes_kcp(
+        det_raw = det_plan.kda_det_workspace_bytes_kcp(
             det_ctx, H=4, backward=backward, use_gate_in_kernel=True
-        ), backward
-        assert raw <= plan.kda_workspace_bytes_kcp(ctx, H=4, backward=backward)
-        for det, c in ((False, ctx), (True, det_ctx)):
+        )
+        # the R1c accumulators (one replica at 4 heads; none on sm_107a, none for a forward-only workspace)
+        local_plan = backend.plan(ctx.T_r, ctx.n_frag, 4, ctx.sm_count, gate="raw")
+        acc = (
+            8 * 4 * 2 * 128
+            if backward and local_plan.arch in ("sm_100a", "sm_103a")
+            else 0
+        )
+        assert acc == (backend._param_acc_bytes(local_plan) if backward else 0)
+        assert raw == det_raw + acc, backward
+        assert raw - acc <= plan.kda_workspace_bytes_kcp(ctx, H=4, backward=backward)
+        for det, c, want in ((False, ctx, raw), (True, det_ctx, det_raw)):
             assert (
                 kcp_api.kda_workspace_bytes_kcp(
                     c,
@@ -623,7 +637,7 @@ def test_package_byte_queries_take_the_raw_gate() -> None:
                     use_gate_in_kernel=True,
                     deterministic=det,
                 )
-                == raw
+                == want
             ), (backward, det)
     saved = plan.kda_saved_bytes_kcp(ctx, H=4)
     assert plan.kda_saved_bytes_kcp(ctx, H=4, use_gate_in_kernel=True) == saved

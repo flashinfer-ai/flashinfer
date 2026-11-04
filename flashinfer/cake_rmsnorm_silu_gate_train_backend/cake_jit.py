@@ -42,10 +42,9 @@ architecture of the record; :func:`module_for_rows`; the long role first, from
 more rows): on every architecture a forward that walks several row blocks per
 CTA, loading each next block while it computes the current one, ``y`` the same
 bits (the long forward 32-row blocks on 256-thread CTAs, the mid forward
-16-row blocks on 128-thread CTAs; on sm_100a and sm_103a the mid forward's
-thread 0 also warms later row blocks of packed rows in L2 with one bulk
-prefetch a tensor); on sm_100a and sm_103a from
-1280 rows per SM a backward whose thread 0 warms the next row block of
+16-row blocks on 128-thread CTAs whose thread 0 also warms later row blocks
+of packed rows in L2 with one bulk prefetch a tensor); on sm_100a and sm_103a
+from 1280 rows per SM a backward whose thread 0 warms the next row block of
 packed rows in L2 with one bulk prefetch a tensor, launched with 5 CTAs per
 SM, and on sm_107a from 1024 the backward with 128-thread CTAs, ``dx`` and
 ``dz`` the same bits.  An architecture may also route the forward's short
@@ -274,76 +273,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd_long",
     },
     # The mid forward: the long forward's kernel on 128 threads, 8 lanes per
-    # row (16-row blocks), at most 6 CTAs per SM (build {"lanes": 8, "math":
-    # "x2", "min_blocks": 6, "prefetch_ahead": 0, "prefetch_wave": 0,
-    # "threads": 128}); whole waves of at most 2 blocks per CTA, from 800 rows
-    # per SM on sm_107a, up to the long forward's.
-    "cake_rmsnorm_silu_gate_train_b0eb3df9844d5b734850": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "z"],
-            ["buffer", "w"],
-            ["buffer", "y"],
-            ["parameter", "rows"],
-            ["parameter", "heads"],
-            ["parameter", "x_tok"],
-            ["parameter", "x_head"],
-            ["parameter", "z_tok"],
-            ["parameter", "z_head"],
-            ["parameter", "eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "ctas_per_sm": 6,
-            "kind": "persistent_row_blocks",
-            "max_blocks_per_cta": 2,
-            "min_rows_per_sm": {
-                "sm_107a": 800,
-            },
-            "rows_per_block": 16,
-        },
-        "kernel": "cake_rmsnorm_silu_gate_train_b0eb3df9844d5b734850",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_b0eb3df9844d5b734850",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_silu_gate_train_b0eb3df9844d5b734850",
-        "logical": {
-            "eps": "eps",
-            "heads": "heads",
-            "rows": "rows",
-            "w": "w",
-            "x": "x",
-            "x_head": "x_head",
-            "x_tok": "x_tok",
-            "y": "y",
-            "z": "z",
-            "z_head": "z_head",
-            "z_tok": "z_tok",
-        },
-        "role": "fwd_mid",
-    },
-    # The mid forward with the L2 prefetch (sm_100a, sm_103a): the mid
-    # forward's program, whose thread 0 also warms in L2, with one bulk prefetch
-    # a tensor where x and z hold their rows packed, the CTA's next row block
-    # and the first row block of the CTA one wave of 6 CTAs per SM later
-    # (build {"lanes": 8, "math": "x2", "min_blocks": 6, "prefetch_ahead": 1,
-    # "prefetch_wave": 1, "threads": 128}); whole waves of at most 2 blocks per
-    # CTA, from 976 rows per SM up to the long forward's.
+    # row (16-row blocks), at most 6 CTAs per SM, whose thread 0 also warms in
+    # L2, with one bulk prefetch a tensor where x and z hold their rows packed,
+    # the CTA's next row block and the first row block of the CTA one wave of 6
+    # CTAs per SM later (build {"lanes": 8, "math": "x2", "min_blocks": 6,
+    # "prefetch_ahead": 1, "prefetch_wave": 1, "threads": 128}); whole waves of
+    # at most 2 blocks per CTA, from 976 rows per SM on sm_100a and sm_103a and
+    # from 800 on sm_107a, up to the long forward's.
     "cake_rmsnorm_silu_gate_train_87f0173e9583ad4fdd2a": {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "x"],
@@ -369,6 +310,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "min_rows_per_sm": {
                 "sm_100a": 976,
                 "sm_103a": 976,
+                "sm_107a": 800,
             },
             "rows_per_block": 16,
         },
@@ -1100,7 +1042,7 @@ ROUTES: dict[str, dict[str, str]] = {
     "sm_107a": {
         "fwd": "cake_rmsnorm_silu_gate_train_05ffc12001cf81513436",
         "fwd_long": "cake_rmsnorm_silu_gate_train_7b7fac905aff1ddaa258",
-        "fwd_mid": "cake_rmsnorm_silu_gate_train_b0eb3df9844d5b734850",
+        "fwd_mid": "cake_rmsnorm_silu_gate_train_87f0173e9583ad4fdd2a",
         "fwd_short": "cake_rmsnorm_silu_gate_train_de5df3c9a4a5a804fcf2",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_58f1ac96c476c73ec5c8",
         "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_8b61372f6a32eeca4d10",
