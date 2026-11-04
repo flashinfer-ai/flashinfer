@@ -546,8 +546,8 @@ def pad_trtllm_moe_weights(
     Weights are padded with zeros and block scales with the neutral scale of
     their format (E8M0 ``127`` = 1.0 for the 32-element MX blocks, E4M3 ``1.0``
     for the 16-element NVFP4 blocks), so a padded element dequantizes to zero.
-    GEMM1 still contracts over the padded hidden size, so this is what keeps the
-    padded activation columns out of the result.
+    The kernels read each padded dimension only up to ``roundUp(valid, 128)``,
+    so that stretch of the pad must dequantize to zero and the rest is never read.
     For gated activations the gate and up halves of ``gemm1_weights`` are
     padded independently, so the padded tensor is still
     ``[gate (intermediate_size rows); up (intermediate_size rows)]`` with the

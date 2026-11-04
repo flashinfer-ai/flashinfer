@@ -165,8 +165,7 @@ _SHUFFLE_ROW_INDEX_HELPERS = [
 @pytest.mark.parametrize(
     ("helper", "num_rows"),
     [
-        # Nemotron Nano intermediate sizes (TP1 / TP2) and the #3206 TP4 shape,
-        # none of which the trtllm weight shuffle accepts without pad-and-declare.
+        # Nemotron Nano intermediate sizes (TP1 / TP2) and the #3206 TP4 shard.
         pytest.param(get_shuffle_matrix_sf_a_row_indices, 1856, id="sf_a-1856"),
         pytest.param(get_shuffle_matrix_sf_a_row_indices, 928, id="sf_a-928"),
         pytest.param(get_shuffle_matrix_sf_a_row_indices, 176, id="sf_a-176"),

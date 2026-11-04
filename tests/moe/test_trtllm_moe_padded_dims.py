@@ -327,7 +327,7 @@ def _run_padded_moe(
         num_experts, gemm2_rows, pi // sf_vec_size
     )
 
-    # GEMM1 contracts over the padded hidden: poison the pad so only zero weights can hide it.
+    # Poison the activation pad: the kernel must not read past roundUp(valid_hidden_size, 128).
     hidden_padded = torch.full(
         (num_tokens, ph), _CONTAM, device=device, dtype=torch.bfloat16
     )
