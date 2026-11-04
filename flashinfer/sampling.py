@@ -1780,7 +1780,8 @@ def top_k_top_p_sampling_from_logits(
         whose strictly-greater mass is below ``top_p``), as :func:`top_k_renorm_probs` and
         :func:`top_p_renorm_probs` do, with one exception: the ``"top_k_first"`` fast path
         (no ``indices``, ``top_k_max <= 256``, ``num_classes >= 65536``) selects exactly ``k``
-        tokens with a radix top-k whose choice among tied boundary tokens follows thread order.
+        tokens with a radix top-k; its choice among tied boundary tokens is fixed by CTA and
+        thread position when ``deterministic=True`` and follows atomic arrival order otherwise.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1963,7 +1964,8 @@ def top_k_top_p_sampling_from_probs(
         whose strictly-greater mass is below ``top_p``), as :func:`top_k_renorm_probs` and
         :func:`top_p_renorm_probs` do, with one exception: the ``"top_k_first"`` fast path
         (no ``indices``, ``top_k_max <= 256``, ``num_classes >= 65536``) selects exactly ``k``
-        tokens with a radix top-k whose choice among tied boundary tokens follows thread order.
+        tokens with a radix top-k; its choice among tied boundary tokens is fixed by CTA and
+        thread position when ``deterministic=True`` and follows atomic arrival order otherwise.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.

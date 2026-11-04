@@ -2098,6 +2098,22 @@ def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
     torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_top_k_renorm_probs_default_is_deterministic(dtype):
+    """The default path (public function and the 4-argument custom op) is bitwise reproducible."""
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(99, 152064, device="cuda:0"), dim=-1).to(dtype)
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=probs.device)
+    op = flashinfer.sampling.get_sampling_module().top_k_renorm_probs
+
+    base = flashinfer.sampling.top_k_renorm_probs(probs, 500)
+    base_op = op(probs, None, 500, row_states_buffer)
+    for _ in range(10):
+        assert torch.equal(flashinfer.sampling.top_k_renorm_probs(probs, 500), base)
+        assert torch.equal(op(probs, None, 500, row_states_buffer), base_op)
+    assert torch.equal(base_op, base)
+
+
 def _boundary_tie_rows(rows, vocab_size, pad):
     out = torch.full((len(rows), vocab_size), pad, dtype=torch.float32, device="cuda:0")
     for i, row in enumerate(rows):
