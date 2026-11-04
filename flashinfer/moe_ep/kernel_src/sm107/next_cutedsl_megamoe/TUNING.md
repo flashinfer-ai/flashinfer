@@ -334,6 +334,21 @@ EP rank zero. The default store is `FLASHINFER_CACHE_DIR/autotune`;
 The managed record and MegaMoE file include implementation, dependency,
 fixed-resource and measurement compatibility information.
 
+Pass `--kernel-variant auto` to search inference and GenPhase in one run.
+Both use the same generated inputs and complete-forward timing. Variants that
+cannot support the capacity or numerical settings are excluded. The CLI writes
+each variant's winner and the overall selection through the same v2 protocol
+as layer warmup, bypassing cached winners at both levels. It does not install
+or prepare the final winner after the search.
+
+`--max-candidates` limits each variant's grid separately. `--sweep schedule`
+resolves each variant's base on EP rank zero and shares the grid across ranks.
+An explicit `--base-knobs` dictionary is applied to both variants. The sweep
+fails before tuning if an eligible variant has no valid schedule candidates;
+use a compatible base or select an explicit variant. Workload, warmup and
+measurement options apply to both searches. The default remains
+`--kernel-variant inference`.
+
 Use a separate cache file for each qualification job to avoid concurrent
 writers. Start with the regular candidate grid; use a schedule sweep with
 production-like skew after correctness passes:

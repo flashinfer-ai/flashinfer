@@ -982,8 +982,8 @@ def _nd_support() -> ModuleType:
 
 
 def _no_temperature(temperature: object) -> bool:
-    """Whether ``temperature`` is no temperature for the deterministic entry: ``None`` or a Python number (not a
-    ``bool``) whose FP32 value is 1.0."""
+    """Whether ``temperature`` is no temperature for the non-deterministic entry (which then runs the call without
+    one): ``None`` or a Python number (not a ``bool``) whose FP32 value is 1.0."""
     if temperature is None:
         return True
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
@@ -1109,7 +1109,7 @@ def _nd_loss(
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
     r"""Differentiable chunked LM-head projection + loss with a selectable
-    numerical mode, SM100 / SM103 only.
+    numerical mode, SM100 / SM103 / SM107 only.
 
     The computation, the arguments and the outputs are those of
     :func:`chunked_lm_head_det_loss` (each switch keyword left at ``None``
@@ -1195,13 +1195,6 @@ def _nd_logprob(
         return _det_logprob(
             X, W, labels, **_det_fallback_kwargs("chunked_lm_head_logprob", kwargs)
         )
-    if not _no_temperature(temperature):
-        # the non-deterministic package has no temperature forms
-        raise ValueError(
-            "chunked_lm_head_logprob(deterministic=False) takes no temperature (the "
-            "non-deterministic package has no temperature path): pass temperature=None "
-            "or 1.0, or deterministic=True"
-        )
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
@@ -1216,6 +1209,39 @@ def _nd_logprob(
         hidden_count=hidden_count,
         gemm_tuning=gemm_tuning,
     )
+    if not _no_temperature(temperature):
+        # the backends' temperature entries (as the deterministic entry routes a temperature); ``None`` and a number
+        # whose FP32 value is 1.0 are the call without one
+        if isinstance(temperature, bool):
+            raise ValueError(
+                "temperature must be None, a positive number or a float32 [T] tensor, not a bool"
+            )
+        if memory_mode is not None or num_valid_rows is not None:
+            return _nd_backend_opt_in().chunked_lm_head_logprob_temperature(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                deterministic=False,
+                backend="cake",
+                **knobs,
+                memory_mode=memory_mode,
+                num_valid_rows=num_valid_rows,
+                check_num_valid_rows=check_num_valid_rows,
+                temperature=temperature,
+                check_temperature=check_temperature,
+            )
+        return _nd_backend().chunked_lm_head_logprob_temperature(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=False,
+            backend="cake",
+            **knobs,
+            temperature=temperature,
+            check_temperature=check_temperature,
+        )
     if memory_mode is not None or num_valid_rows is not None:
         return _nd_backend_opt_in().chunked_lm_head_logprob(
             X,
@@ -1245,7 +1271,7 @@ def chunked_lm_head_logprob(
     *args: Any, deterministic: bool = True, **kwargs: Any
 ) -> torch.Tensor:
     r"""Differentiable chunked selected-token log-probability with a selectable
-    numerical mode, SM100 / SM103 only.
+    numerical mode, SM100 / SM103 / SM107 only.
 
     The computation and the arguments are those of
     :func:`chunked_lm_head_det_logprob`.  ``deterministic=True`` (default):
@@ -1257,10 +1283,12 @@ def chunked_lm_head_logprob(
     order); under ``torch.use_deterministic_algorithms(True)`` it runs the
     deterministic entry and warns once (a dX ``k_slices`` pin above its four
     slices is dropped, with one warning).  A value that is not a ``bool`` is a
-    ``TypeError``.  ``temperature`` is served by the deterministic entry only:
-    with ``deterministic=False`` the non-deterministic package (no temperature
-    path) takes ``None`` or a scalar whose FP32 value is 1.0 (the call without a
-    temperature), and any other value is a ``ValueError``.
+    ``TypeError``.  ``temperature`` / ``check_temperature`` reach either
+    package: the non-deterministic one runs the same temperature forms
+    (``logp`` the deterministic entry's bits, ``dW`` too when no valid row has
+    a zero ``dlogp``; ``dX`` the same products, a sliced chunk's in the
+    unordered reduction) and its zero-gradient row skip runs the dX / dW
+    GEMMs of the rows with a nonzero ``dlogp`` only, with a temperature too.
     """
     if deterministic is True:
         try:
@@ -1284,7 +1312,7 @@ def chunked_lm_head_preload(
     temperature: bool = False,
 ):
     r"""Do part of the one-time work of a process's first chunked LM-head call
-    ahead of it, then wait for the device once (SM100 / SM103 only).
+    ahead of it, then wait for the device once (SM100 / SM103 / SM107 only).
 
     ``deterministic=True`` (default): :func:`chunked_lm_head_det_preload`
     (the deterministic package's libraries and per-device state);
@@ -1295,22 +1323,18 @@ def chunked_lm_head_preload(
     per-thread state (side streams, events, count cells) is the calling
     thread's: another thread forms its own at its first call.  A value that is
     not a ``bool`` is a ``TypeError``.  ``temperature=True`` also loads the
-    deterministic package's temperature libraries
-    (:func:`chunked_lm_head_det_preload`); the non-deterministic package has no
-    temperature path, so ``deterministic=False`` with ``temperature=True`` is a
-    ``ValueError``.
+    package's temperature libraries and launches its temperature path's
+    PyTorch operators once (:func:`chunked_lm_head_det_preload`; the same for
+    the non-deterministic package).
     """
     if deterministic is True or _runs_det(deterministic, "chunked_lm_head_preload"):
         if temperature is False:
             return _det_preload(device)
         return _det_preload(device, temperature=temperature)
-    if temperature is not False:
-        raise ValueError(
-            "chunked_lm_head_preload(deterministic=False) takes no temperature (the "
-            "non-deterministic package has no temperature path): pass temperature=False, "
-            "or deterministic=True"
-        )
-    _nd_backend_opt_in().preload(device)
+    if temperature is False:
+        _nd_backend_opt_in().preload(device)
+        return
+    _nd_backend_opt_in().preload(device, temperature=temperature)
 
 
 def _nd_support_logprob(
@@ -1365,7 +1389,7 @@ def chunked_lm_head_support_logprob(
     *args: Any, deterministic: bool = True, **kwargs: Any
 ) -> torch.Tensor:
     r"""Differentiable log-probabilities over a ragged candidate support per
-    token with a selectable numerical mode, SM100 / SM103 only.
+    token with a selectable numerical mode, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
     :func:`chunked_lm_head_det_support_logprob`.  ``deterministic=True``
@@ -1446,7 +1470,7 @@ def _nd_support_kl(
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_support_kl(*args: Any, deterministic: bool = True, **kwargs: Any):
     r"""Unreduced forward KL from a detached teacher over a ragged candidate
-    support with a selectable numerical mode, SM100 / SM103 only.
+    support with a selectable numerical mode, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
     :func:`chunked_lm_head_det_support_kl`; ``deterministic`` as in

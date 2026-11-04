@@ -1106,6 +1106,7 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
     #define page_empty_addr (mbar_base + 144)
     #define work_id_full_addr (mbar_base + 192)
     #define work_id_empty_addr (mbar_base + 200)
+    #define stats_full_addr (mbar_base + 216)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -1138,7 +1139,7 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
     const int work_id_slot_addr = smem + 200896;
 
     // Mbarrier init (14 pipeline groups, 0 ordered-sequence groups, 26 barriers)
-    // Mbarriers at smem_raw[0..208)
+    // Mbarriers at smem_raw[0..208); stats_full at smem_raw[216..224), after the TMEM address slot
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -1185,6 +1186,8 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
             mbarrier_init(smem + 192, 1);
             // work_id_empty: 1 barriers, init_count=352
             mbarrier_init(smem + 200, 352);
+            // stats_full: 1 barrier, init_count=128
+            mbarrier_init(smem + 216, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -2082,7 +2085,10 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                 }
                 sScale[warp % 4 * 32 + lane + (unsigned int)(2 * BLOCK_M)] = row_sum_val;
                 sScale[warp % 4 * 32 + lane + (unsigned int)(4 * BLOCK_M)] = row_max_val;
-                mbarrier_arrive(corr_sig_addr);
+                // The tile's final row sum / max go on their own barrier: an arrive on corr_sig here would let the
+                // next tile's first corr_sig arrive complete a second phase before the correction's parity wait for
+                // this one (no corr_done wait in between), and the correction would then wait forever.
+                mbarrier_arrive(stats_full_addr);
             }
         }
     }
@@ -2150,8 +2156,9 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                 }
                 mbarrier_wait(o_full_addr, _phase_o_full_0);
                 _phase_o_full_0 ^= 1;
-                mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
-                _phase_corr_sig_0 ^= 1;
+                // The tile's final row sum / max (stats_full, see the softmax): one phase per tile of this CTA, so
+                // the parity is that of the tile count (no phase register).
+                mbarrier_wait(stats_full_addr, tile_iter_1 & 1);
                 float final_sum = sScale[warp % 4 * 32 + lane + (unsigned int)(2 * BLOCK_M)];
                 float final_max = sScale[warp % 4 * 32 + lane + (unsigned int)(4 * BLOCK_M)];
                 float final_scale;

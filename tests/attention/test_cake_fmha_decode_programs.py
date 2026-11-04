@@ -13,7 +13,9 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import importlib
+import json
 import operator
+import subprocess
 import sys
 import types
 from types import SimpleNamespace
@@ -32,12 +34,17 @@ def _loader(family):
 
 
 def _served() -> dict[tuple[str, str], set[str]]:
-    """``(family, identifier)`` -> the targets whose routes name it."""
+    """``(family, identifier)`` -> the targets whose routes name it (a
+    length-aware twin serves its stream-K program's targets on an opt-in
+    call)."""
 
     served: dict[tuple[str, str], set[str]] = {}
     for target, routes in cake_api._DECODE_PROGRAM_ROUTES.items():
         for key, identifier in routes.items():
             served.setdefault((key[0], identifier), set()).add(_TARGET_ARCH[target])
+    for key, twin in cake_api._DECODE_PROGRAM_LENGTH_AWARE.items():
+        if key in served:
+            served.setdefault(twin, set()).update(served[key])
     return served
 
 
@@ -1002,7 +1009,15 @@ def _bits(tensor):
     return tensor.view(dtype)
 
 
-def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
+def _run_decode(
+    case,
+    *,
+    seq_lens=None,
+    out=None,
+    max_seq_len=None,
+    lse=None,
+    length_aware_schedule=False,
+):
     return decode_api.trtllm_batch_decode_with_kv_cache(
         case.query,
         case.kv_cache,
@@ -1022,6 +1037,7 @@ def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
         lse=lse,
+        length_aware_schedule=length_aware_schedule,
     )
 
 
@@ -1252,6 +1268,148 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_device(
     assert _select(_row_kwargs("smallm_kv60008_q8_p64")).program is None
     decode_target("sm100a", sm_count=152)
     assert _select(_row_kwargs("smallm_kv60008_q8_p64")).program is None
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
+    monkeypatch, decode_target, target
+) -> None:
+    """A launch on a stream of an SM partition (a green context) plans its
+    split on the partition's SMs: 32 SMs split one tile 32 ways (the JIT
+    member: no program has that split) and never take the nine-CTA cluster
+    program; the whole device keeps the pinned programs."""
+
+    decode_target(target)
+    rows = ("smallm_kv8200_q8_p64", "smallm_kv60008_q8_p64", "smallm_kv1032_q8_p64")
+    for row in rows:
+        route = _select(_row_kwargs(row))
+        assert route.program == ("decode_smallm", SHAPE_ROWS[row][-1][target]), row
+    monkeypatch.setattr(
+        cake_api, "_smallm_launch_sm_count", lambda device, count=None: 32
+    )
+    monkeypatch.setattr(cake_api, "_SMALLM_SM_PARTITIONS", True)
+    for row in rows:
+        route = _select(_row_kwargs(row))
+        assert route.component == "decode_native_bf16_hd256_smallm", row
+        assert route.program is None and route.num_split == 32, (row, route)
+    # Two tiles share the partition: 16 splits each.
+    route = _select(_row_kwargs("smallm_kv60008_q8_p64", **_TWO_KV_HEADS))
+    assert route.program is None and route.num_split == 16, route
+
+
+def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
+    """Driver queries over ``state``: the current stream's handle, its ID, its
+    context's handle, ID and SM count (``contexts`` overrides the ID and SM
+    count per context handle, ``current`` is the thread's current context,
+    ``stream_err`` fails the stream's context query); ``calls`` logs each
+    context read."""
+
+    def context_of(context):
+        return state.get("contexts", {}).get(
+            context, (state["context_id"], state["sms"])
+        )
+
+    def stream_id(stream):
+        return 0, state["stream_id"]
+
+    def stream_context(stream):
+        assert stream == state["stream"]
+        return state.get("stream_err", 0), state["handle"]
+
+    def context_id(context):
+        return 0, context_of(context)[0]
+
+    def context_resource(context, sm_type):
+        key, sms = context_of(context)
+        calls.append(key)
+        return 0, SimpleNamespace(sm=SimpleNamespace(smCount=sms))
+
+    monkeypatch.setattr(
+        torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
+    )
+    monkeypatch.setattr(cake_api, "_STREAM_SM_COUNTS", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_SM_COUNTS", {})
+    monkeypatch.setattr(cake_api, "_CU_STREAMS", {})
+    monkeypatch.setattr(
+        cake_api,
+        "_CONTEXT_QUERIES",
+        (
+            stream_id if stream_ids else None,
+            stream_context,
+            lambda: (0, state.get("current", state["handle"])),
+            context_id,
+            context_resource,
+            "sm",
+            lambda stream: stream,
+        ),
+    )
+
+
+def test_cake_fmha_smallm_partition_sm_count_follows_a_reused_stream_handle(
+    monkeypatch,
+) -> None:
+    """Without stream IDs, a stream handle (and a context handle) reused by a
+    new green context of another size reads the new context's SM count: the
+    count is cached per context ID, which the driver never reuses."""
+
+    state = {"stream": 7, "stream_id": None, "handle": 0x10, "context_id": 1}
+    state["sms"] = 64
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=False)
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1]
+    # The 64-SM context and its stream are destroyed; a 32-SM context reuses
+    # both handles.
+    state.update(context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2]
+
+
+def test_cake_fmha_smallm_partition_sm_count_is_cached_per_stream_id(
+    monkeypatch,
+) -> None:
+    """The SM count is cached per stream ID: a launch on a known stream reads
+    no context, and a reused stream handle with a new ID (a new green context)
+    reads its own context.  The per-thread default stream, whose context is the
+    thread's, is resolved to its context on every launch."""
+
+    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state["sms"] = 64
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    assert cake_api._stream_context_sm_count(0) == 64
+    state["context_id"] = 99  # a hit reads no context
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1]
+    state.update(stream_id=12, context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2]
+    state.update(stream=2, stream_id=None, context_id=3, sms=48)
+    assert cake_api._stream_context_sm_count(0) == 48
+    assert cake_api._stream_context_sm_count(0) == 48
+    assert calls == [1, 2, 3]
+
+
+def test_cake_fmha_smallm_partition_sm_count_of_a_failed_stream_query_is_not_cached(
+    monkeypatch,
+) -> None:
+    """When the stream's context query fails (say, after a recoverable launch
+    error) the launch is planned on the current context's SM count, which is
+    not cached under the stream's ID; once the query answers, the stream's own
+    context is read and cached."""
+
+    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state.update(sms=32, current=0x20, contexts={0x20: (5, 148)}, stream_err=1)
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    assert cake_api._stream_context_sm_count(0) == 148
+    assert cake_api._STREAM_SM_COUNTS == {}
+    state["stream_err"] = 0
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert cake_api._STREAM_SM_COUNTS == {11: 32}
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [5, 1]
 
 
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
@@ -1559,6 +1717,203 @@ def test_cake_decode_smallm_program_without_a_counter_buffer(served_programs) ->
     assert not with_buffer.counter.any()
 
 
+# A launch inside an SM partition: one process per run (a split planned on
+# more SMs than the partition holds never completes), under a watchdog.
+_PARTITION_SMS = 32
+_PARTITION_ROWS = (
+    "smallm_kv8200_q8_p64",
+    "smallm_kv60008_q8_p64",
+    "smallm_kv1032_q8_p64",
+)
+_PARTITION_CHILD = """
+import importlib.util, sys
+green = None
+if sys.argv[4] == "torch_before_import":
+    import torch
+    torch.zeros(1, device="cuda")
+    try:
+        from torch.cuda.green_contexts import GreenContext
+        green = GreenContext.create(num_sms=int(sys.argv[2]), device_id=0)
+    except Exception as error:
+        green = error
+spec = importlib.util.spec_from_file_location("cake_decode_programs", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._smallm_partition_child(
+    int(sys.argv[2]), sys.argv[3].split(","), sys.argv[4], green
+)
+"""
+
+
+_RECREATE_ATTEMPTS = 8
+
+
+def _recreated_green_context(sms):
+    """A ``sms``-SM torch green context and its stream, whose handle is the
+    handle of a stream of a destroyed ``2 * sms``-SM green context that the
+    module planned on, and a record of the attempt: create, plan and destroy
+    the larger context, then create the smaller one, up to
+    ``_RECREATE_ATTEMPTS`` times until the driver hands an old handle back
+    (``None`` and a ``skip`` record if it never does)."""
+
+    import gc
+
+    from torch.cuda.green_contexts import GreenContext
+
+    planned, seen, first_sms = set(), [], []
+    for attempt in range(1, _RECREATE_ATTEMPTS + 1):
+        first = GreenContext.create(num_sms=2 * sms, device_id=0)
+        with torch.cuda.stream(first.Stream()):
+            first_sms.append(cake_api._smallm_launch_sm_count(torch.device("cuda")))
+            planned.add(torch.cuda.current_stream().cuda_stream)
+        del first
+        gc.collect()
+        green = GreenContext.create(num_sms=sms, device_id=0)
+        stream = green.Stream()
+        seen.append(stream.cuda_stream)
+        if stream.cuda_stream in planned:
+            return (green, stream), {
+                "first_sms": first_sms,
+                "handle_reused": True,
+                "attempts": attempt,
+                "handles": seen,
+            }
+        del stream, green
+        gc.collect()
+    return None, {
+        "skip": f"no stream handle reused in {_RECREATE_ATTEMPTS} attempts: "
+        f"planned {sorted(planned)}, new {seen}"
+    }
+
+
+def _smallm_partition_child(sms, rows, api, green=None):
+    """Run each small-M row on a stream of an ``sms``-SM green context made by
+    ``api`` (FlashInfer's green-context helpers, torch's green contexts, or a
+    torch green context ``green`` created before FlashInfer was imported; the
+    inputs live in the primary context), with no partition setting of the
+    module, and print one JSON record per row: the served route, the
+    partition's SM count, the error against the FP32 reference.  The JIT
+    member is built before the launch's watchdog starts."""
+
+    import faulthandler
+
+    faulthandler.dump_traceback_later(1500, exit=True)
+    try:
+        if api == "flashinfer":
+            from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+            streams, resources = split_device_green_ctx_by_sm_count(
+                torch.device("cuda:0"), [sms]
+            )
+            stream, partition = streams[0], int(resources[0].sm.smCount)
+        else:
+            if isinstance(green, Exception):
+                raise green
+            if api == "torch_recreated":
+                made, record = _recreated_green_context(sms)
+                print(json.dumps(record), flush=True)
+                if made is None:
+                    return
+                green, stream = made
+            else:
+                if green is None:
+                    from torch.cuda.green_contexts import GreenContext
+
+                    green = GreenContext.create(num_sms=sms, device_id=0)
+                stream = green.Stream()
+            partition = sms
+    except Exception as error:  # noqa: BLE001 - any failure means no partition
+        print(json.dumps({"skip": f"no green context: {error!r}"}), flush=True)
+        return
+    served = []
+    resolve = cake_api._resolve_cake_fmha_decode_module
+
+    def spy(device, route):
+        served.append(route)
+        resolved = resolve(device, route)  # builds the JIT member, untimed
+        faulthandler.dump_traceback_later(120, exit=True)  # the launch's watchdog
+        return resolved
+
+    cake_api._resolve_cake_fmha_decode_module = spy
+    for row in rows:
+        case = _bf16_case(row, seed=20261102)
+        torch.cuda.synchronize()
+        served.clear()
+        with torch.cuda.stream(stream):
+            launch_sms = cake_api._smallm_launch_sm_count(torch.device("cuda"))
+            got = _run_decode(case)
+            stream.synchronize()
+        faulthandler.dump_traceback_later(1500, exit=True)
+        reference = _bf16_reference(case, [0])[0]
+        print(
+            json.dumps(
+                {
+                    "row": row,
+                    "partition": partition,
+                    "launch_sms": launch_sms,
+                    "served": [(r.program, r.num_split) for r in served],
+                    "tiles": SHAPE_ROWS[row][2] * SHAPE_ROWS[row][6],
+                    "max_abs": (got.float() - reference).abs().max().item(),
+                    "close": torch.allclose(
+                        got.float(), reference, atol=1e-2, rtol=1e-2
+                    ),
+                }
+            ),
+            flush=True,
+        )
+
+
+@_GPU
+@pytest.mark.parametrize(
+    "api", ("flashinfer", "torch", "torch_before_import", "torch_recreated")
+)
+def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
+    """On a stream of a 32-SM green context (FlashInfer's or torch's, also one
+    created before FlashInfer was imported or after a 64-SM one was planned
+    and destroyed, with no partition setting) the small-M rows plan at most 32
+    splits per tile and
+    complete (the full device's 65- and 152-way programs
+    would wait forever for CTAs the partition cannot hold, and its nine-CTA
+    cluster would not launch), matching the FP32 reference."""
+
+    _require_full_device()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _PARTITION_CHILD,
+            __file__,
+            str(_PARTITION_SMS),
+            ",".join(_PARTITION_ROWS),
+            api,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    records = [
+        json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")
+    ]
+    if records and "skip" in records[0]:
+        pytest.skip(records[0]["skip"])
+    assert result.returncode == 0, result.stderr[-4000:]
+    if api == "torch_recreated":
+        first = records.pop(0)
+        print(json.dumps(first))
+        assert first["handle_reused"] is True, first
+        assert set(first["first_sms"]) == {2 * _PARTITION_SMS}, first
+    assert [r["row"] for r in records] == list(_PARTITION_ROWS), result.stderr[-4000:]
+    device_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    for record in records:
+        partition = record["partition"]
+        assert _PARTITION_SMS <= partition < device_sms, record
+        assert record["launch_sms"] == partition, record
+        ((program, num_split),) = record["served"]
+        assert program != ["decode_smallm", "N64_P64_Q8_C9"], record
+        assert num_split >= 1 and record["tiles"] * num_split <= partition, record
+        assert record["close"], record
+
+
 # --- BF16 boundaries (host-only) ---------------------------------------------
 
 
@@ -1573,8 +1928,33 @@ def test_cake_decode_smallm_program_without_a_counter_buffer(served_programs) ->
         ("bf16_b4_s1024", {"kv_len": 1, "width": 32}, "DEC_B4C4"),
         ("bf16_b4_s1024", {"kv_len": 1}, None),
         ("bf16_b128_s4096", {"kv_len": 4000, "width": 256}, "DEC_B128"),
+        # A table narrower than the kernels read keeps a JIT member that
+        # serves the launch; the stream-K program's 16-byte page-id loads also
+        # need a width of a multiple of four pages.
         ("bf16_b128_s4096", {"kv_len": 4000}, None),
         ("bf16_b128_s4096", {"width": 255}, None),
+        ("bf16_b128_s4096", {"width": 258}, None),
+        ("bf16_b128_s4096", {"width": 260}, "DEC_B128"),
+        ("bf16_b128_s4096", {"kv_len": 1300, "width": 97}, None),
+        # Short KV (at most nine 128-token blocks) on a table that fits.
+        ("bf16_b128_s4096", {"kv_len": 1152, "width": 80}, "DEC_B128"),
+        ("bf16_b128_s4096", {"kv_len": 1152}, None),
+        ("bf16_b256_s4096_sink", {"kv_len": 1152, "width": 80}, "DEC_SINK"),
+        ("bf16_b256_s4096_sink", {"kv_len": 1152}, None),
+        # No JIT member serves a sink launch the exact member cannot finish:
+        # the program takes it with its table padded at the end of the
+        # workspace, when the workspace holds that copy past its scratch.
+        ("bf16_b256_s4096_sink", {"kv_len": 1300, "width": 82}, "DEC_SINK"),
+        (
+            "bf16_b256_s4096_sink",
+            {"kv_len": 1300, "width": 82, "workspace_bytes": 132352},
+            "DEC_SINK",
+        ),
+        (
+            "bf16_b256_s4096_sink",
+            {"kv_len": 1300, "width": 82, "workspace_bytes": 132095},
+            None,
+        ),
         ("bf16_b128_s4096", {"batch": 127}, None),
         ("bf16_b128_s4096", {"batch": 129}, None),
         ("bf16_b256_s4096_sink", {"batch": 255}, None),
@@ -1671,6 +2051,95 @@ def test_cake_fmha_decode_bf16_streamk_program_admission(
     )
     route = _select(short)
     assert route is None or route.program is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_bf16_length_aware_schedule_is_opt_in(
+    decode_target, target, device_scales
+) -> None:
+    """A stream-K B128 launch runs its length-aware twin only when the caller
+    asks for the length-aware schedule (the twin's route runs its program);
+    the default keeps the stream-K program, and a launch the stream-K program
+    does not admit ignores it."""
+
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    twin = identifier.replace("DEC_B128", "DEC_B128_LA")
+    kwargs = _row_kwargs("bf16_b128_s4096", device_scales=device_scales)
+    decode_target(target)
+    assert _select(kwargs).program == ("decode_bf16", identifier)
+    assert _select({**kwargs, "length_aware_schedule": False}).program == (
+        "decode_bf16",
+        identifier,
+    )
+    route = _select({**kwargs, "length_aware_schedule": True})
+    assert route.program == ("decode_bf16", twin)
+    assert cake_api._DECODE_PROGRAMS[("decode_bf16", twin)][1] == "streamk"
+    # the twin's route runs its program (not the compat module)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert (
+        cake_api._decode_program_record(route)
+        == (cake_api._DECODE_PROGRAMS[("decode_bf16", twin)])
+    )
+    decode_target(target, sm_count=260)  # 65 groups: 128 requests not admitted
+    route = _select({**kwargs, "length_aware_schedule": True})
+    assert route is None or route.program is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("kv_len", (300, 512, 640, 1024, 1152))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_b128_short_kv_runs_no_exact_retained_member(
+    decode_target, target, kv_len, device_scales
+) -> None:
+    """No exact B128 q1 32/4 retained-KV member serves a short-KV launch (at
+    most nine 128-token blocks) of that shape; that member gave wrong,
+    run-to-run different outputs on sm_103a.  The registry resolves the
+    generic retained-KV member for the shape, a table the stream-K program
+    reads in place takes DEC_B128 / DEC_B128_DS, and a narrower table takes
+    that program on a padded copy (device scales) or the generic member."""
+
+    from flashinfer.jit import cake_fmha as jit_cake_fmha
+
+    def selector(use_scale_ptr):
+        return jit_cake_fmha._resolve_decode_native_bf16_selector(
+            target,
+            128,
+            1,
+            32,
+            4,
+            has_sink=False,
+            has_window=False,
+            use_scale_ptr=use_scale_ptr,
+            retain_kv_l2=True,
+        )
+
+    decode_target(target)
+    for use_scale_ptr in (False, True):
+        assert "BATCH_SIZE" not in (selector(use_scale_ptr) or {})
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    blocks = -(-kv_len // 128)
+    wide = 8 * max(4, blocks + blocks % 2)
+    for width in (-(-kv_len // 16), wide):
+        kwargs = _row_kwargs(
+            "bf16_b128_s4096",
+            kv_len=kv_len,
+            width=width,
+            device_scales=device_scales,
+        )
+        route = _select(kwargs)
+        assert route is not None and route.retain_kv_l2, route
+        if cake_api._decode_route_runs_program(route):
+            assert route.program == ("decode_bf16", identifier), route
+            continue
+        assert width < wide and not device_scales, route
+        assert route.component == "decode_native_bf16", route
+        assert selector(route.use_scale_ptr) == {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0,
+        }
 
 
 @pytest.mark.parametrize("device_scales", (False, True))
@@ -1816,6 +2285,45 @@ def test_cake_decode_bf16_program_values(monkeypatch, row, grid, device_scales) 
         assert "split_ws" not in values and "split_counter" not in values
 
 
+@pytest.mark.parametrize(
+    ("row", "kv_len", "width", "device_scales"),
+    [
+        ("bf16_b256_s4096_sink", 1300, 82, False),
+        ("bf16_b256_s4096_sink", 1300, 82, True),
+        ("bf16_b128_s4096", 4000, 250, True),
+        ("bf16_b128_s4096", 1152, 72, True),
+    ],
+)
+def test_cake_decode_bf16_program_reads_a_padded_table(
+    monkeypatch, row, kv_len, width, device_scales
+) -> None:
+    """A launch no JIT member serves, with a table narrower than the kernels
+    read (eight pages per evened 128-token block): the program reads a copy
+    in the last 256-byte-aligned bytes of the workspace, the caller's pages
+    then page 0, its width the row stride.  The LSE scratch stays at the JIT
+    route's offset."""
+
+    kwargs, launches = _program_values(
+        monkeypatch, row, device_scales=device_scales, kv_len=kv_len, width=width
+    )
+    ((_, values),) = launches
+    batch = kwargs["batch_size"]
+    blocks = -(-kv_len // 128)
+    pages = 8 * max(4, blocks + blocks % 2)
+    table = values["page_table"]
+    workspace = kwargs["workspace_buffer"]
+    offset = (workspace.numel() - batch * pages * 4) // 256 * 256
+    assert table.shape == (batch, pages) and table.dtype == torch.int32
+    assert table.data_ptr() == workspace.data_ptr() + offset
+    assert values["max_pages_per_seq"] == pages
+    # the workspace was poisoned: the copy and the padding were written
+    assert torch.equal(table[:, :width], kwargs["block_tables"])
+    assert not table[:, width:].any()
+    assert values["LSE_ptr"].data_ptr() == (
+        workspace.data_ptr() + (batch * 4 + 15) // 16 * 16
+    )
+
+
 @pytest.mark.parametrize("counters", ("caller", "small_caller", "workspace"))
 @pytest.mark.parametrize("sm_count", (148, 152))
 def test_cake_decode_bf16_streamk_counters_follow_the_buffers(
@@ -1915,6 +2423,7 @@ def _run_bf16(case, **kwargs):
         sinks=case.sinks,
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
+        length_aware_schedule=kwargs.get("length_aware_schedule", False),
     )
 
 
@@ -1955,6 +2464,80 @@ def test_cake_decode_bf16_programs_match_reference_and_the_jit_route(
         assert torch.equal(_bits(got), _bits(jit))
     else:
         torch.testing.assert_close(got.float(), jit.float(), atol=1e-2, rtol=1e-2)
+
+
+@_GPU
+@pytest.mark.parametrize("lengths", ("uniform", "ragged"))
+@pytest.mark.parametrize(
+    ("row", "kv_len", "device_scales"),
+    [
+        ("bf16_b256_s4096_sink", 1300, False),
+        ("bf16_b256_s4096_sink", 1300, True),
+        ("bf16_b128_s4096", 1300, True),
+    ],
+)
+def test_cake_decode_bf16_program_padded_table_matches_the_wide_table(
+    served_programs, row, kv_len, device_scales, lengths
+) -> None:
+    """A table holding only each request's pages (82 for 1300 keys, under
+    the 96 the kernels read) of a launch no JIT member serves runs the
+    program on a padded copy: the bits of the table widened with page 0, and
+    the FP32 reference."""
+
+    target = _require_full_device()
+    batch = SHAPE_ROWS[row][2]
+    seq = [kv_len] * batch
+    if lengths == "ragged":
+        seq = ([kv_len, 1, 2, 129, kv_len - 1, 255, kv_len // 2, 17] * batch)[:batch]
+    case = _bf16_gpu_case(row, seed=20261101, lengths=seq, device_scales=device_scales)
+    pages = -(-kv_len // 16)
+    case.block_tables = case.block_tables[:, :pages].contiguous()
+    case.max_seq_len = kv_len
+    narrow = _run_bf16(case)
+    identifier = SHAPE_ROWS[row][-1][target]
+    if device_scales:
+        identifier = _device_scale_program("decode_bf16", identifier)
+    assert served_programs == [("decode_bf16", identifier)]
+    wide = torch.zeros((batch, 96), dtype=torch.int32, device="cuda")
+    wide[:, :pages] = case.block_tables
+    case.block_tables = wide
+    widened = _run_bf16(case)
+    assert served_programs[-1] == ("decode_bf16", identifier)
+    assert torch.equal(_bits(narrow), _bits(widened))
+    batches = list(range(batch)) if "B128" in identifier else [0, 1, 2, batch - 1]
+    reference = _bf16_reference(case, batches)
+    for b in batches:
+        torch.testing.assert_close(
+            narrow[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
+
+
+@_GPU
+@pytest.mark.parametrize("width", (97, 98, 99))
+def test_cake_decode_bf16_odd_width_table_matches_the_reference(
+    served_programs, width
+) -> None:
+    """A table whose width is not a multiple of four pages (1300 keys): the
+    stream-K program and the JIT member read page ids with 16-byte loads, so
+    the launch keeps the member, which reads a padded copy, and matches the
+    FP32 reference."""
+
+    _require_full_device()
+    batch, kv_len = 128, 1300
+    case = _bf16_gpu_case("bf16_b128_s4096", seed=20261102, lengths=[kv_len] * batch)
+    pages = -(-kv_len // 16)
+    table = torch.zeros((batch, width), dtype=torch.int32, device="cuda")
+    table[:, :pages] = case.block_tables[:, :pages]
+    case.block_tables = table
+    case.max_seq_len = kv_len
+    got = _run_bf16(case)
+    torch.cuda.synchronize()
+    assert served_programs == []
+    reference = _bf16_reference(case, list(range(batch)))
+    for b in range(batch):
+        torch.testing.assert_close(
+            got[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
 
 
 @_GPU
@@ -2019,6 +2602,74 @@ def test_cake_decode_bf16_streamk_counters_are_graph_safe(
         if counter:
             assert not case.counter.any()
     assert set(served_programs) == {("decode_bf16", "DEC_B128")}
+
+
+@_GPU
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("lengths", ("uniform", "ragged", "skewed"))
+def test_cake_decode_bf16_length_aware_program(
+    served_programs, lengths, device_scales
+) -> None:
+    """The length-aware twin of the stream-K B128 program (the caller's
+    opt-in) is within the BF16 tolerance of an FP32 reference on every
+    request, the same bits run to run and after a graph replay of new
+    in-place lengths, and, for a batch of equal lengths, the default
+    program's bits (the same cuts)."""
+
+    _require_full_device()
+    batch, kv_len = 128, SHAPE_ROWS["bf16_b128_s4096"][4]
+    ragged = None
+    if lengths == "ragged":
+        ragged = ([kv_len, 1, 2, 129, kv_len - 1, 255, kv_len // 2, 17] * batch)[:batch]
+    elif lengths == "skewed":
+        # a few long requests among short ones: one long request holds the
+        # cuts of several CTA groups
+        ragged = [kv_len] * 4 + [130] * (batch - 4)
+    case = _bf16_gpu_case(
+        "bf16_b128_s4096", seed=20261102, lengths=ragged, device_scales=device_scales
+    )
+    default = _run_bf16(case)
+    got = _run_bf16(case, length_aware_schedule=True)
+    again = _run_bf16(case, length_aware_schedule=True)
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    twin = identifier.replace("DEC_B128", "DEC_B128_LA")
+    assert served_programs == [
+        ("decode_bf16", identifier),
+        ("decode_bf16", twin),
+        ("decode_bf16", twin),
+    ]
+    assert torch.equal(_bits(got), _bits(again))
+    reference = _bf16_reference(case, list(range(batch)))
+    for b in range(batch):
+        torch.testing.assert_close(
+            got[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
+    if lengths == "uniform":
+        assert torch.equal(_bits(got), _bits(default))
+    # A graph captured once replays new in-place lengths bitwise to direct
+    # launches; the split counters read zero after every launch.
+    seq_lens = case.seq_lens.clone()
+    out = torch.empty_like(case.out)
+    _run_bf16(case, seq_lens=seq_lens, out=out, length_aware_schedule=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_bf16(case, seq_lens=seq_lens, out=out, length_aware_schedule=True)
+    generator = torch.Generator(device="cuda").manual_seed(20261104)
+    for _ in range(3):
+        lengths_now = torch.randint(
+            1,
+            case.max_seq_len + 1,
+            (batch,),
+            generator=generator,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_lens.copy_(lengths_now)
+        graph.replay()
+        direct = _run_bf16(case, seq_lens=lengths_now, length_aware_schedule=True)
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(out), _bits(direct))
+        assert not case.counter.any()
 
 
 # --- FP8 boundaries (host-only) ----------------------------------------------
@@ -2237,3 +2888,55 @@ def test_cake_decode_program_launches_on_the_current_torch_stream(
     assert torch.equal(_bits(out), _bits(direct))
     family = "decode_fp8" if row.startswith("fp8") else "decode_bf16"
     assert set(served_programs) == {(family, SHAPE_ROWS[row][-1][target])}
+
+
+# --- GPU: pages past each request's length -----------------------------------
+
+
+def _poison_pages_past_the_lengths(case, poison):
+    """Every table slot past a request's last page: its page holds NaN keys and
+    values (``nan_pages``), or the slot names no page of the pool
+    (``garbage_ids``).  The slots up to each length stay."""
+
+    page, width = case.kv_cache.shape[3], case.block_tables.shape[1]
+    used = (case.seq_lens.long() + page - 1) // page
+    past = torch.arange(width, device=used.device)[None, :] >= used[:, None]
+    if poison == "nan_pages":
+        case.kv_cache[case.block_tables[past].long()] = float("nan")
+        return
+    junk = torch.tensor(
+        (-1, 2**31 - 1, case.kv_cache.shape[0] + 5, -(2**30)),
+        dtype=torch.int32,
+        device=used.device,
+    )
+    count = int(past.sum())
+    case.block_tables[past] = junk[torch.arange(count, device=used.device) % 4]
+
+
+@_GPU
+@pytest.mark.parametrize("poison", ("nan_pages", "garbage_ids"))
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("row", _BF16_GPU_ROWS)
+def test_cake_decode_bf16_programs_read_no_page_past_the_length(
+    served_programs, row, device_scales, poison
+) -> None:
+    """A program walks each request's table only up to the request's length:
+    pages past it (NaN, or ids outside the pool) leave every output bit as the
+    clean cache gives it, and a request without keys writes zeros."""
+
+    target = _require_full_device()
+    batch, kv_len, page = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4], SHAPE_ROWS[row][7]
+    lengths = [kv_len, 0, 1, page, page + 1, kv_len - page, 255, kv_len // 2]
+    lengths = (lengths * batch)[:batch]
+    case = _bf16_gpu_case(
+        row, seed=20261102, lengths=lengths, device_scales=device_scales
+    )
+    clean = _run_bf16(case)
+    _poison_pages_past_the_lengths(case, poison)
+    got = _run_bf16(case)
+    identifier = SHAPE_ROWS[row][-1][target] + ("_DS" if device_scales else "")
+    assert set(served_programs) == {("decode_bf16", identifier)}
+    assert torch.isfinite(got.float()).all()
+    assert torch.equal(_bits(got), _bits(clean))
+    empty = [b for b, length in enumerate(lengths) if length == 0]
+    assert not got[empty].float().any()

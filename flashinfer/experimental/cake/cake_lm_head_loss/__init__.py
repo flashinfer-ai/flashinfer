@@ -17,7 +17,7 @@ limitations under the License.
 # Experimental Cake backend, non-deterministic form:
 # chunked large-vocabulary LM-head projection + log-sum-exp / cross-entropy /
 # policy-gradient loss with a memory-bounded backward for training on
-# SM100 / SM103, whose dX GEMM combines its K-slice partials in an unordered
+# SM100 / SM103 / SM107, whose dX GEMM combines its K-slice partials in an unordered
 # FP32 reduction.  The public entry points are
 # ``flashinfer.chunked_lm_head.chunked_lm_head_loss``, ``chunked_lm_head_logprob``,
 # ``chunked_lm_head_preload`` and the candidate-support entries

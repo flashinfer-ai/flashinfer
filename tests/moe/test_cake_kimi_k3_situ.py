@@ -63,8 +63,9 @@ LARGE_TOKENS = (8192, 16384)
 REFERENCE_SM_COUNT = 148
 
 # Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
-# hints on their weight-stream TMA loads (four kernels) -- sm_100a today; sm_103a keeps the
-# "n8_feature" / "n8_w2a_m16" routes.
+# hints on their weight-stream TMA loads (four kernels) and whose single-token route runs the
+# FC1 program with that hint (a fifth kernel) -- sm_100a today; sm_103a keeps the
+# "n8_feature" / "n8_w2a_m16" / "m1_s2a" routes.
 SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures and token counts whose large route runs the routing histogram
 # and scatter kernels with per-CTA shared-memory privatization and block
@@ -120,6 +121,7 @@ GENERIC_STAGES = [
 QR_GENERIC_STAGES = ["quant_reset"] + GENERIC_STAGES[2:]
 STAGES_BY_SELECTOR = {
     "m1_s2a": ["fc1", "fc2", "finalize"],
+    "m1_s2a_m1ef": ["fc1", "fc2", "finalize"],
     "n8_feature": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_w2a_m16": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_feature_ef_f2e": ["quant_route", "fc1", "fc2", "finalize"],
@@ -146,6 +148,8 @@ def _tile_bucket(num_tokens):
 
 
 def _expected_selector(arch, num_tokens):
+    if num_tokens == 1 and arch in SMALL_L2POLICY_ARCHES:
+        return "m1_s2a_m1ef"
     if num_tokens == 8 and arch in SMALL_L2POLICY_ARCHES:
         return "n8_feature_ef_f2e"
     if num_tokens == 16 and arch in SMALL_L2POLICY_ARCHES:
@@ -475,10 +479,17 @@ def _skewed_routing(num_tokens, device):
     return ids.contiguous()
 
 
+def _hot_routing(num_tokens, device):
+    # Every token routes to the same 16 experts; the other 880 receive none.
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    return slots[None, :].expand(num_tokens, TOP_K).contiguous()
+
+
 ROUTINGS = {
     "uniform": _uniform_routing,
     "grouped": _grouped_routing,
     "skewed": _skewed_routing,
+    "hot": _hot_routing,
 }
 
 
@@ -798,8 +809,23 @@ def test_cake_situ_every_route_eager_and_external_graph(
         # activation scale and the expert ids).
         options = _options(x, ids, route_weights, output, weights, workspace)
         bindings = _cake_situ_stage_bindings(options, prepared)
-        assert prepared["selector"] == "m1_s2a"
+        assert prepared["selector"] == _expected_selector(arch, num_tokens)
         assert list(bindings) == STAGES_BY_SELECTOR[prepared["selector"]]
+        if prepared["selector"] == "m1_s2a_m1ef":
+            # The FC1 program puts an evict_first cache hint on its weight-stream
+            # TMA loads and keeps the argument plan of the "m1_s2a" FC1; FC2 and
+            # the finalize are those of "m1_s2a".
+            assert prepared["modules"]["fc1"] == cake_situ_program(
+                arch, "fc1:n8_s2a_m1ef"
+            )
+            assert (
+                MODULES[prepared["modules"]["fc1"]]["arg_plan"]
+                == MODULES[cake_situ_program("sm_103a", "fc1:n8_s2a")]["arg_plan"]
+            )
+            for stage in ("fc2", "finalize"):
+                assert prepared["modules"][stage] == cake_situ_program(
+                    arch, _SELECTORS["m1_s2a"][1][stage]
+                )
         assert "x" in bindings["fc1"]
         assert bindings["fc1"]["x"].data_ptr() == x.data_ptr()
         assert bindings["fc1"]["topk_ids"].data_ptr() == ids.data_ptr()
@@ -1237,8 +1263,8 @@ def _tile_n16_routing_in_pair_order(views, ids):
 
 @pytest.mark.parametrize(
     "num_tokens, routing",
-    [(64, "uniform"), (64, "skewed")],
-    ids=["m64_uniform", "m64_skewed"],
+    [(64, "uniform"), (64, "skewed"), (64, "hot")],
+    ids=["m64_uniform", "m64_skewed", "m64_hot"],
 )
 def test_cake_situ_fused_quant_route_matches_the_two_launch_route(
     num_tokens,
@@ -1280,6 +1306,9 @@ def test_cake_situ_fused_quant_route_matches_the_two_launch_route(
     fused = _tile_n16_routing_in_pair_order(views, ids)
     fused_output = output.clone()
     assert 0 < fused["total_tiles"] <= prepared["max_tiles"]
+    if routing == "hot":
+        # Experts 0..15 receive every token: num_tokens / 16 full tiles each.
+        assert fused["total_tiles"] == TOP_K * num_tokens // 16
     for name in ("intermediate_packed", "intermediate_scales", "x_packed", "x_scales"):
         views[name].zero_()
     views["token_to_permuted"].fill_(-1)

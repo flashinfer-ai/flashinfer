@@ -19,7 +19,11 @@ called with ``deterministic=False``) under both launch schedules: the
 bits as the shipped ``"wait_first"`` schedule -- forward output and every gradient, on every rank, with the norm off
 and with ``use_qk_l2norm_in_kernel``.  Two partitions of a four-rank group: one whose documents cross rank boundaries
 (one and two hops) and one with no crossing fragment anywhere (``N_out == 0``: no exchange at all).  The ranks are
-CPU processes on a gloo group running the fake backend (the torch emulation of the programs' ABI).
+CPU processes on a gloo group running the fake backend (the torch emulation of the programs' ABI).  Also on that group:
+``save_mode="full"`` with ``save_transfer=False`` at ``P = 2``, ring and a2a, with every package allocation filled
+with NaN bytes -- the saved set carries ``M_seg`` and the full form gives the light form's bits, with the shipped
+tape-and-output walk ``kcp_fwdh_out_tape`` under both schedules and with its split form (test knob
+``fused_o_tape=0``: the tape walk, then #5).
 """
 
 from __future__ import annotations
@@ -176,3 +180,102 @@ def test_ring_overlap_schedule_equals_wait_first(cu: list[int], crossing: bool) 
     with tempfile.TemporaryDirectory() as tmp:
         init_file = os.path.join(tmp, "rendezvous")
         mp.spawn(_rank, args=(init_file, cu, crossing), nprocs=W, join=True)
+
+
+# save_mode="full" without save_transfer (the ring's only form) at P = 2: [130, 600) spans ranks 0..2 (two hops),
+# [600, 1024) ranks 2..3 (one hop); every fragment holds at least two chunks
+FULL_P2 = [0, 130, 600, 1024]
+
+
+def _rank_full(rank: int, init_file: str) -> None:
+    """Every tensor the package allocates is filled with NaN bytes; per exchange (ring, a2a) and norm (off, on) the
+    full form's saved set carries ``M_seg`` and its forward + backward give the light form's bits (the fake backend
+    is deterministic), all finite: the shipped full forward (the tape-and-output walk at every tape-walk launch list,
+    no #5) under the ``wait_first`` and the ``overlap`` schedule (the document-start walk under c1 / the first ring
+    hop), and its split form (``fused_o_tape=0``: the tape walk, then #5)."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=W
+    )
+    try:
+        torch.set_flush_denormal(False)
+        kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
+        part = plan.partition_kcp(
+            torch.tensor(FULL_P2, dtype=torch.int64), W, "contiguous"
+        )
+        ctx = plan.build_context_kcp(part, dist.group.WORLD, rank, torch.device("cpu"))
+        assert int(ctx.N_out) > 0 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
+        raw = _local(part, FULL_P2, rank, _global_inputs(FULL_P2))
+        hat = dict(raw)
+        hat["q"], hat["k"] = (l2n_ref.qk_l2norm_ref(raw[n])[0] for n in ("q", "k"))
+        real_alloc = kcp._alloc
+
+        def nan_alloc(shape, dtype, device):
+            t = real_alloc(shape, dtype, device)
+            if t.numel():
+                t.view(-1).view(torch.uint8).fill_(0xFF)
+            return t
+
+        kcp._alloc = nan_alloc
+        try:
+            for exchange in ("ring", "a2a"):
+                for l2n in (False, True):
+                    ops = raw if l2n else hat
+                    base = {
+                        "exchange": exchange,
+                        "save_transfer": False,
+                        "segments": 2,
+                        "use_qk_l2norm_in_kernel": l2n,
+                    }
+                    _, saved = kcp.chunk_gdn_fwd_kcp(
+                        *(ops[n] for n in ("q", "k", "v", "g", "beta")),
+                        ctx,
+                        backend="fake",
+                        save_mode="full",
+                        deterministic=False,
+                        **base,
+                    )
+                    assert saved.P == 2 and saved.M_seg is not None, (rank, exchange)
+                    del saved
+                    light, _ = _pass(kcp, ctx, ops, **base)
+                    fused = kcp.fused_o_tape_shipped()
+                    arms = {
+                        "full": ({}, fused),
+                        "full_overlap": ({"schedule": "overlap"}, fused),
+                        "full_split": ({"fused_o_tape": 0}, False),
+                    }
+                    for arm, (knobs, tape_walk) in arms.items():
+                        full, seq = _pass(
+                            kcp, ctx, ops, save_mode="full", test_knobs=knobs, **base
+                        )
+                        assert ("kcp_fwdh_out_tape" in seq) == tape_walk, (
+                            rank,
+                            arm,
+                            seq,
+                        )
+                        assert ("fwd_o" in seq) == (not tape_walk), (rank, arm, seq)
+                        assert ("kcp_fwdh_tape" in seq) == (not tape_walk), (rank, arm)
+                        for name in TENSORS:
+                            a, b = light[name], full[name]
+                            assert torch.isfinite(a.float()).all(), (
+                                rank,
+                                exchange,
+                                l2n,
+                                name,
+                            )
+                            assert torch.equal(a, b), (
+                                f"rank {rank} {exchange} l2n={l2n} {arm}: {name} of save_mode='full' differs from "
+                                f"the light form (max |diff| {(a.float() - b.float()).abs().max().item()})"
+                            )
+        finally:
+            kcp._alloc = real_alloc
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_full_saved_set_without_save_transfer_on_the_ring_and_a2a() -> None:
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("torch.distributed with gloo is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        init_file = os.path.join(tmp, "rendezvous")
+        mp.spawn(_rank_full, args=(init_file,), nprocs=W, join=True)

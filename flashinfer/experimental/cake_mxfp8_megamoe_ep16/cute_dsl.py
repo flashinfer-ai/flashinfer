@@ -193,8 +193,11 @@ class _Runner:
             raise ValueError("CuTe-DSL requires an EP16 rank")
         if device.type != "cuda" or device.index is None:
             raise ValueError("CuTe-DSL requires an explicit CUDA device index")
-        if tuple(workspace.flags.tensor.shape) != (66,):
-            raise ValueError("CuTe-DSL requires the 66-word rank-barrier workspace")
+        if tuple(workspace.flags.tensor.shape) != (2,):
+            raise ValueError("CuTe-DSL requires the two-word rank-barrier workspace")
+        mailbox = (16, tokens_per_rank, 3072)
+        if tuple(workspace.published_hidden.tensor.shape) != mailbox:
+            raise ValueError("CuTe-DSL requires one row mailbox per source rank")
         self._device = device
         self._tokens = tokens_per_rank
         arch = _jit.device_arch(

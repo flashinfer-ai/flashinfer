@@ -148,7 +148,7 @@ except ImportError:
 
 from ..jit.cubin_loader import setup_cubin_loader
 from ..utils import (
-    _get_cache_buf,
+    _get_stream_cache_buf,
     determine_gemm_backend,
     get_indptr,
     is_float8,
@@ -409,6 +409,7 @@ def _cutlass_mm_bf16_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if bias is not None:
         raise ValueError(
@@ -435,6 +436,7 @@ def _cublaslt_mm_bf16_requirement(
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if bias is not None:
         if out_dtype != torch.bfloat16:
@@ -468,6 +470,7 @@ def _cudnn_mm_bf16_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     _validate_bf16_output_dtype(out_dtype)
     return _cudnn_available_or_raise_for_backend(backend)
@@ -484,6 +487,7 @@ def _tgv_gemm_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
@@ -517,6 +521,7 @@ def _cute_dsl_mm_bf16_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cute-dsl", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
@@ -580,6 +585,7 @@ def _cutile_mm_bf16_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
@@ -606,6 +612,7 @@ def _tinygemm_mm_bf16_requirement(
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
@@ -641,6 +648,7 @@ def _check_mm_bf16_problem_size(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -684,6 +692,7 @@ def _heuristic_func_mm_bf16(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
+    batch_invariant: bool = False,
 ):
     heuristic_backends = []
     if bias is not None or pdl:
@@ -744,6 +753,8 @@ def mm_bf16(
         "cute-dsl",
         "auto",
     ] = "cudnn",
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -806,6 +817,19 @@ def mm_bf16(
         tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
+    batch_invariant: bool
+        ``True`` runs the batch-invariant bf16 GEMM class in place of the
+        backends (requires ``backend="auto"``, bf16 output and no bias): a
+        row of the output is bit-identical whatever the number of rows, the
+        row's position in the batch or the configuration chosen, and the
+        result is deterministic. Under autotuning the class's top
+        configurations for the shape are profiled; all of them compute the
+        same bits. ``b`` may be the row-major ``(k, n)`` tensor or the
+        transpose of a row-major ``(n, k)`` weight. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        Defaults to ``False``.
+
     Returns
     -------
     torch.Tensor
@@ -845,6 +869,11 @@ def mm_bf16(
     torch.bfloat16
     """
 
+    if batch_invariant:
+        from .batch_invariant.tuning import mm_bf16_batch_invariant_auto
+
+        return mm_bf16_batch_invariant_auto(a, b, bias, pdl, out, out_dtype, backend)
+
     if out is None:
         out = torch.empty(
             (a.shape[0], b.shape[1]),
@@ -862,7 +891,7 @@ def mm_bf16(
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return mm_bf16_cutile(a, b, out)
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     if backend == "auto":
@@ -1155,7 +1184,7 @@ def bmm_bf16(
             get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
         return out
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
@@ -3513,7 +3542,7 @@ def tgv_gemm_sm100(
             b_descale,
             a_descale,
             out.T,
-            _get_cache_buf(
+            _get_stream_cache_buf(
                 "tgv_gemm_sm100_blockscaled_workspace",
                 DEFAULT_WORKSPACE_SIZE,
                 a.device,
@@ -6436,7 +6465,7 @@ def mm_fp8(
     elif backend == "cutedsl_low_latency":
         k = a.shape[1]
         scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
-        workspace = _get_cache_buf(
+        workspace = _get_stream_cache_buf(
             "mm_fp8_low_latency_workspace",
             DEFAULT_WORKSPACE_SIZE + sum(scale_sizes),
             a.device,
@@ -6456,7 +6485,8 @@ def mm_fp8(
             b_descale,
             a_descale,
             out.T,
-            workspace[sum(scale_sizes) :],
+            # Fixed length keeps the tuner cache key stable.
+            workspace[sum(scale_sizes) : sum(scale_sizes) + DEFAULT_WORKSPACE_SIZE],
             (n, m, k, 1),
             alpha,
             None,
@@ -6468,7 +6498,7 @@ def mm_fp8(
     elif runner_names:
         # bmm_fp8 runners with batch 1; (n, k) row-major is bmm_fp8's column-major B.
         unit_scale = _fp8_unit_scale(a.device)
-        workspace_buffer = _get_cache_buf(
+        workspace_buffer = _get_stream_cache_buf(
             "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
         )
         fp8_gemm_sm100(
@@ -7900,7 +7930,7 @@ def mm_mxfp8(
             dtype=out_dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -10117,7 +10147,7 @@ def mm_fp4(
             dtype=out_dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -10459,7 +10489,7 @@ def bmm_fp8(
             dtype=dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
@@ -10760,7 +10790,7 @@ def gemm_fp8_nt_groupwise(
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -11291,10 +11321,10 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    int_workspace_buffer = _get_cache_buf(
+    int_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    float_workspace_buffer = _get_cache_buf(
+    float_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_fp8_nt_groupwise_float_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -11539,10 +11569,10 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    int_workspace_buffer = _get_cache_buf(
+    int_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_mxfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    float_workspace_buffer = _get_cache_buf(
+    float_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_mxfp4_nt_groupwise_float_workspace",
         DEFAULT_WORKSPACE_SIZE,
         a.device,
@@ -11791,10 +11821,10 @@ def group_gemm_nvfp4_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    int_workspace_buffer = _get_cache_buf(
+    int_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_nvfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    float_workspace_buffer = _get_cache_buf(
+    float_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_nvfp4_nt_groupwise_float_workspace",
         DEFAULT_WORKSPACE_SIZE,
         a.device,
@@ -13214,7 +13244,7 @@ def bmm_mxfp8(
             dtype=dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 

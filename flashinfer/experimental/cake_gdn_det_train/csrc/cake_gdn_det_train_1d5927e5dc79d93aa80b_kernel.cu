@@ -47,68 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_COLS_OFFSET 0
-#define SMEM_S_KN_OFF 0
-#define SMEM_S_KN_STAGE_BYTES 16384
-#define SMEM_S_KN_STRIDE 16384
-#define SMEM_S_V_OFF 16384
-#define SMEM_S_V_STAGE_BYTES 16384
-#define SMEM_S_V_STRIDE 16384
-#define SMEM_S_DW_OFF 32768
-#define SMEM_S_DW_STAGE_BYTES 16384
-#define SMEM_S_DW_STRIDE 16384
-#define SMEM_S_DU_OFF 49152
-#define SMEM_S_DU_STAGE_BYTES 16384
-#define SMEM_S_DU_STRIDE 16384
-#define SMEM_S_A_OFF 65536
-#define SMEM_S_A_STAGE_BYTES 8192
-#define SMEM_S_A_STRIDE 8192
-#define SMEM_S_DA_OFF 49152
-#define SMEM_S_DA_STAGE_BYTES 8192
-#define SMEM_S_DA_STRIDE 8192
-#define SMEM_S_DA2T_OFF 57344
-#define SMEM_S_DA2T_STAGE_BYTES 8192
-#define SMEM_S_DA2T_STRIDE 8192
-#define SMEM_S_DA3B_OFF 16384
-#define SMEM_S_DA3B_STAGE_BYTES 8192
-#define SMEM_S_DA3B_STRIDE 8192
-#define SMEM_S_AT_OFF 65536
-#define SMEM_S_AT_STAGE_BYTES 8192
-#define SMEM_S_AT_STRIDE 8192
-#define SMEM_S_DUT_OFF 49152
-#define SMEM_S_DUT_STAGE_BYTES 16384
-#define SMEM_S_DUT_STRIDE 16384
-#define SMEM_S_DWT_OFF 32768
-#define SMEM_S_DWT_STAGE_BYTES 16384
-#define SMEM_S_DWT_STRIDE 16384
-#define SMEM_S_KNT_OFF 0
-#define SMEM_S_KNT_STAGE_BYTES 16384
-#define SMEM_S_KNT_STRIDE 16384
-#define SMEM_S_DA3BT_OFF 16384
-#define SMEM_S_DA3BT_STAGE_BYTES 8192
-#define SMEM_S_DA3BT_STRIDE 8192
-#define SMEM_S_G_OFF 73728
-#define SMEM_S_G_STAGE_BYTES 256
-#define SMEM_S_G_STRIDE 256
-#define SMEM_S_B_OFF 73984
-#define SMEM_S_B_STAGE_BYTES 256
-#define SMEM_S_B_STRIDE 256
-#define SMEM_S_GEXP_OFF 74240
-#define SMEM_S_GEXP_STAGE_BYTES 256
-#define SMEM_S_GEXP_STRIDE 256
-#define SMEM_S_COL_OFF 74496
-#define SMEM_S_COL_STAGE_BYTES 1024
-#define SMEM_S_COL_STRIDE 1024
-#define SMEM_S_DBP_OFF 49152
-#define SMEM_S_DBP_STAGE_BYTES 512
-#define SMEM_S_DBP_STRIDE 512
-#define SMEM_S_DGP_OFF 49664
-#define SMEM_S_DGP_STAGE_BYTES 512
-#define SMEM_S_DGP_STRIDE 512
-#define SMEM_TOTAL 75648
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -220,7 +158,7 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_kn_addr = smem + 0;
     __nv_bfloat16* s_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -260,8 +198,7 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
     float* s_dgp = reinterpret_cast<float*>(smem_raw + 49664);
     const int s_dgp_addr = smem + 49664;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 10 barriers)
-    // Mbarriers at smem_raw[75520..75600)
+    // Mbarrier init (10 barriers at smem_raw[75520..75600))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -304,10 +241,8 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_cols = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_cols = taddr;
 
     // === Task calls (declaration order) ===
     int chunk = blockIdx.x;
@@ -775,7 +710,7 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
             unsigned int _packed_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb6 * 4 + 2)[_lp*2 + 0], (acc + nb6 * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb6 * 4 + 2))[_lp*2 + 0], (acc + (nb6 * 4 + 2))[_lp*2+1 + 0]));
                 _packed_1[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dv_out + (out_b + (long long)(nb6 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
@@ -1013,13 +948,13 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
                 : "=r"(*reinterpret_cast<uint32_t*>(&gq[0])), "=r"(*reinterpret_cast<uint32_t*>(&gq[(0) + 1]))
                 : "r"(s_g_addr + (unsigned int)(col0_1 * 4)));
             float _exp2_23 = approx_exp2(g_a - gq[0]);
-            float va0 = (-acc_s[(2 * p_2 + q_1) * 4]) * _exp2_23;
+            float va0 = -acc_s[(2 * p_2 + q_1) * 4] * _exp2_23;
             float _exp2_24 = approx_exp2(g_a - gq[1]);
-            float va1 = (-acc_s[(2 * p_2 + q_1) * 4 + 1]) * _exp2_24;
+            float va1 = -acc_s[(2 * p_2 + q_1) * 4 + 1] * _exp2_24;
             float _exp2_25 = approx_exp2(g_b - gq[0]);
-            float vb0 = (-acc_s[(2 * p_2 + q_1) * 4 + 2]) * _exp2_25;
+            float vb0 = -acc_s[(2 * p_2 + q_1) * 4 + 2] * _exp2_25;
             float _exp2_26 = approx_exp2(g_b - gq[1]);
-            float vb1 = (-acc_s[(2 * p_2 + q_1) * 4 + 3]) * _exp2_26;
+            float vb1 = -acc_s[(2 * p_2 + q_1) * 4 + 3] * _exp2_26;
             float val_a0_1 = 0.0f;
             float val_a1_1 = 0.0f;
             float val_b0_1 = 0.0f;
@@ -1243,7 +1178,7 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
             unsigned int _packed_3[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb18 * 4 + 2)[_lp*2 + 0], (acc + nb18 * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb18 * 4 + 2))[_lp*2 + 0], (acc + (nb18 * 4 + 2))[_lp*2+1 + 0]));
                 _packed_3[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dk2_out + (out_b + (long long)(nb18 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
@@ -1298,7 +1233,7 @@ kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b(__nv_bfloat16* __restrict__ kn, _
             unsigned int _packed_5[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb18_1 - 4) * 4 + 2)[_lp*2 + 0], (acc + (nb18_1 - 4) * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + ((nb18_1 - 4) * 4 + 2))[_lp*2 + 0], (acc + ((nb18_1 - 4) * 4 + 2))[_lp*2+1 + 0]));
                 _packed_5[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dk2_out + (out_b + (long long)(nb18_1 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];

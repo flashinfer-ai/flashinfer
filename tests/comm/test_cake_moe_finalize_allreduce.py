@@ -33,14 +33,16 @@ PROCESS_CLEANUP_TIMEOUT_S = 30.0
 # at world size 2 except for top_k 4 without a shared expert (while the device holds
 # that many small-token clusters). Above that, the two-shot program runs at world
 # size 8, the large-token program at world size 2 for top_k 4 above
-# LARGE_TOKEN_MIN_TOKENS tokens (LARGE_TOKEN_MIN_TOKENS_SHARED with a shared expert)
-# and the persistent program otherwise.
+# LARGE_TOKEN_MIN_TOKENS tokens (LARGE_TOKEN_MIN_TOKENS_SHARED with a shared expert),
+# the quad program at world size 2 up to W2_QUAD_MAX_TOKENS tokens and the persistent
+# program otherwise.
 SMALL_TOKEN_EXTENDED_MAX = 71
 TWO_SHOT_MIN_TOKENS = {4: 72, 8: 56}
 TWO_SHOT_DEFER_MIN_TOKENS = {4: 1536, 8: 768}
 TWO_SHOT_EARLY_MAX_TOKENS = {4: 128, 8: 128}
 LARGE_TOKEN_MIN_TOKENS = 512
 LARGE_TOKEN_MIN_TOKENS_SHARED = 1280
+W2_QUAD_MAX_TOKENS = 142
 # SM count at which the small-token program holds SMALL_TOKEN_EXTENDED_MAX clusters (B200, B300).
 SMALL_TOKEN_EXTENDED_MIN_SMS = 148
 _PROGRAM_SUFFIX = {
@@ -49,6 +51,7 @@ _PROGRAM_SUFFIX = {
     "two_shot_defer": "_tsd",
     "two_shot_early": "_tse",
     "large_token": "_lt",
+    "quad": "_quad",
     "persistent": "",
 }
 
@@ -192,6 +195,8 @@ def _token_counts(world_size: int) -> tuple[int, ...]:
             LARGE_TOKEN_MIN_TOKENS + 1,
             LARGE_TOKEN_MIN_TOKENS_SHARED,
             LARGE_TOKEN_MIN_TOKENS_SHARED + 1,
+            W2_QUAD_MAX_TOKENS,
+            W2_QUAD_MAX_TOKENS + 1,
         }
     return tuple(sorted(tokens))
 
@@ -242,6 +247,8 @@ def _expected_program(
     )
     if world_size == 2 and top_k == 4 and tokens > large_token_min:
         return "large_token"
+    if world_size == 2 and tokens <= W2_QUAD_MAX_TOKENS:
+        return "quad"
     return "persistent"
 
 

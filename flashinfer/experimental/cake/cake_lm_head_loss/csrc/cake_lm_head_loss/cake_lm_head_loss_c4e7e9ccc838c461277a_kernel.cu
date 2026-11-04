@@ -47,22 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_SC_LIVE_OFF 0
-#define SMEM_SC_LIVE_STAGE_BYTES 128
-#define SMEM_SC_LIVE_STRIDE 128
-#define SMEM_SC_HEAD_OFF 128
-#define SMEM_SC_HEAD_STAGE_BYTES 128
-#define SMEM_SC_HEAD_STRIDE 128
-#define SMEM_SC_VALID_OFF 256
-#define SMEM_SC_VALID_STAGE_BYTES 128
-#define SMEM_SC_VALID_STRIDE 128
-#define SMEM_SC_TILE_OFF 384
-#define SMEM_SC_TILE_STAGE_BYTES 128
-#define SMEM_SC_TILE_STRIDE 128
-#define SMEM_TOTAL 512
-#define THREADS 1024
-
 #include <math_constants.h>
 
 extern "C" {
@@ -88,7 +72,7 @@ kernel_cake_lm_head_loss_c4e7e9ccc838c461277a(long long* __restrict__ labels, fl
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* sc_live = reinterpret_cast<int*>(smem_raw + 0);
     const int _sc_live_addr = smem + 0;
     int* sc_head = reinterpret_cast<int*>(smem_raw + 128);

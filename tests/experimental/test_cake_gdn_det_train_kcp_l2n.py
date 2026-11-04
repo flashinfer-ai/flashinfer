@@ -21,7 +21,10 @@ CPU tests of the in-kernel Q / K L2 norm of the KCP GDN route (``use_qk_l2norm_i
   against the norm-off programs on the normalized rows;
 * the host plumbing on the fake backend: the composed chain (helper -> norm-off route on ``(q_hat, k_hat)`` ->
   helper pullback) bitwise, every saved / replay / checkpoint / handle form bitwise the direct one, ``qn`` / ``kn``
-  never retained, the saved set v2, the option and the facade keyword, the byte queries.
+  never retained, the saved set v2, the option and the facade keyword, the byte queries;
+* issue #8367 (norm off and on): plain ``split`` / ``view`` head views of a packed QKV row keep torch's autograd
+  path -- their hooks and ``retain_grad`` fire, the gradients are bitwise those of contiguous operands and of
+  ``packed_qkv_views_det_kcp`` views, and only the packed views hand the packed dQKV row on without a concatenation.
 
 The fake backend is not bitwise the device programs in #1 / #8's bodies (different accumulation orders): these tests
 prove the plumbing and the oracle, not GPU numerics (``test_cake_gdn_det_train_kcp_dist.py`` holds the GPU rows).
@@ -679,6 +682,114 @@ def test_modes_are_bitwise_with_the_norm(segments) -> None:
     assert not torch.equal(off["out"], ref["out"]) and not torch.equal(
         off["dq"], ref["dq"]
     )
+
+
+def _split_view_pass(ctx, ops, form: str, *, ckpt: bool, **o) -> dict:
+    """One autograd pass on q / k / v as head views of a packed ``[T, (2 H_qk + HV) * 128]`` leaf.  ``form``:
+    ``"plain"`` = ``split`` + ``view`` (torch's own split backward), ``"packed"`` = :func:`packed_qkv_views_det_kcp`,
+    ``"replace"`` = packed views with a hook on ``q`` that returns a new gradient.  A tensor hook (recording the
+    gradient) and ``retain_grad`` are set on every view (and on the split outputs) of the original forward."""
+    T, H, HV = ops["q"].shape[0], ops["q"].shape[1], ops["v"].shape[1]
+    row = torch.cat([ops[n].reshape(T, -1) for n in ("q", "k", "v")], -1)
+    row = row.contiguous().requires_grad_(True)
+    g, beta = (ops[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
+    fired: dict[str, list[torch.Tensor]] = {}
+    views: dict[str, torch.Tensor] = {}
+
+    def fn(row, g, beta):
+        if form == "plain":
+            parts = row.split((H * 128, H * 128, HV * 128), dim=-1)
+            q, k, v = (
+                p.view(T, n, 128) for p, n in zip(parts, (H, H, HV), strict=True)
+            )
+        else:
+            parts = ()
+            q, k, v = kcp.packed_qkv_views_det_kcp(row, H_qk=H, HV=HV)
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+            if form == "replace":
+                q.register_hook(lambda gr: gr.clone())
+        return kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, backend="fake", **o)
+
+    before = dict(kcp.PACKED_SPLIT_STATS)
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g, beta, use_reentrant=False)
+    else:
+        out = fn(row, g, beta)
+    out.backward(ops["dout"])
+    return {
+        "out": out.detach(),
+        "row": row.grad,
+        "dg": g.grad,
+        "dbeta": beta.grad,
+        "fired": fired,
+        "views": views,
+        "grad_layout": kcp.LAST_CALL["bwd"]["grad_layout"],
+        "split": {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before},
+    }
+
+
+@pytest.mark.parametrize("ckpt", [False, True], ids=["direct", "checkpoint"])
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+def test_plain_split_views_keep_hooks_and_bitwise_gradients(norm, ckpt) -> None:
+    """Issue #8367: plain ``split`` / ``view`` head views of one packed QKV row take torch's own autograd path (the
+    split backward concatenates the GDN backward's packed ``dq`` / ``dk`` / ``dv`` views): tensor hooks and
+    ``retain_grad`` on ``q`` / ``k`` / ``v`` and on the split outputs fire once with the contiguous call's gradients,
+    and the row gradient, ``dg``, ``dbeta`` and ``out`` are bitwise those of contiguous operands and of
+    :func:`packed_qkv_views_det_kcp` views.  Only the packed views' split hands the packed row on; hooks on the packed
+    views fire too, and a hook that replaces a gradient makes that split concatenate (same values)."""
+    ctx, ops = _setup()
+    if not norm:
+        # unit-norm Q / K rows: valid operands with the norm off (the raw rows are the norm-on operands)
+        for n in ("q", "k"):
+            x = ops[n].float()
+            ops[n] = (x / x.norm(dim=-1, keepdim=True)).to(BF16)
+    o = {"use_qk_l2norm_in_kernel": norm}
+    ref = _autograd(ctx, ops, ckpt=ckpt, **o)
+    T = ops["q"].shape[0]
+    want = {n: ref["d" + n] for n in ("q", "k", "v")}
+    row = torch.cat([want[n].reshape(T, -1) for n in ("q", "k", "v")], -1)
+    expect_split = {
+        "plain": {"aliased": 0, "concatenated": 0},
+        "packed": {"aliased": 1, "concatenated": 0},
+        "replace": {"aliased": 0, "concatenated": 1},
+    }
+    for form, split in expect_split.items():
+        got = _split_view_pass(ctx, ops, form, ckpt=ckpt, **o)
+        assert torch.equal(got["out"], ref["out"]), form
+        assert torch.equal(got["row"], row), form
+        assert torch.equal(got["dg"], ref["dg"]) and torch.equal(
+            got["dbeta"], ref["dbeta"]
+        ), form
+        # the GDN backward writes one packed dQKV row for packed operands in every form
+        assert got["grad_layout"] == "packed", form
+        assert got["split"] == split, form
+        assert sorted(got["fired"]) == sorted(got["views"]), form
+        for i, n in enumerate(("q", "k", "v")):
+            assert len(got["fired"][n]) == 1, (form, n)
+            assert torch.equal(got["fired"][n][0], want[n]), (form, n)
+            assert torch.equal(got["views"][n].grad, want[n]), (form, n)
+            if form == "plain":
+                part = got["fired"][f"part{i}"]
+                assert len(part) == 1 and torch.equal(part[0], want[n].reshape(T, -1))
+
+
+def test_packed_views_refuse_in_place_changes() -> None:
+    """The packed views are outputs of one custom autograd node that are views of ``qkv``: autograd refuses an
+    in-place change to them while ``qkv`` requires grad (the README's packed Q/K/V note)."""
+    H, HV, T = 2, 6, 5
+    qkv = torch.zeros(T, (2 * H + HV) * 128, dtype=BF16, requires_grad=True)
+    q, k, v = kcp.packed_qkv_views_det_kcp(qkv, H_qk=H, HV=HV)
+    for t in (q, k, v):
+        with pytest.raises(RuntimeError, match="inplace"):
+            t.mul_(2)
 
 
 def test_norm_off_is_the_v1_route() -> None:

@@ -47,34 +47,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 6
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define NUM_EPI_STORE_PIPE_STAGES 2
-#define NUM_CLC_PIPE_STAGES 2
-#define NUM_THR_PIPE_STAGES 2
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 32768
-#define SMEM_SMEM_V1_OFF 17408
-#define SMEM_SMEM_V1_STAGE_BYTES 16384
-#define SMEM_SMEM_V1_STRIDE 32768
-#define SMEM_SMEM_EPI_OFF 197632
-#define SMEM_SMEM_EPI_STAGE_BYTES 16384
-#define SMEM_SMEM_EPI_STRIDE 16384
-#define SMEM_CLC_RESP_OFF 230400
-#define SMEM_CLC_RESP_STAGE_BYTES 16
-#define SMEM_CLC_RESP_STRIDE 16
-#define SMEM_TOTAL 230528
-#define THREADS 224
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDA_ARCH__ == 1000) && ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 9) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ == 0))
 #define CAKE_ARRIVE_FIRST 1
 #else
 #define CAKE_ARRIVE_FIRST 0
 #endif
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -220,7 +197,7 @@ kernel_cake_lm_head_loss_3da632b3f70182303342(const __grid_constant__ CUtensorMa
     unsigned int cluster_size;
     asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(cluster_size));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -229,6 +206,8 @@ kernel_cake_lm_head_loss_3da632b3f70182303342(const __grid_constant__ CUtensorMa
     const int smem_epi_addr = smem + 197632;
     unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int clc_resp_addr = smem + 230400;
+
+    // Kernel setup ops
     if (tid == 0) {
         #pragma unroll
         for (int st = 0; st < 6; st++) {
@@ -240,8 +219,7 @@ kernel_cake_lm_head_loss_3da632b3f70182303342(const __grid_constant__ CUtensorMa
         }
     }
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (24 barriers at smem_raw[0..192))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -295,10 +273,8 @@ kernel_cake_lm_head_loss_3da632b3f70182303342(const __grid_constant__ CUtensorMa
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -454,8 +430,13 @@ kernel_cake_lm_head_loss_3da632b3f70182303342(const __grid_constant__ CUtensorMa
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((mm_k == 0) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                            int _mma_a_lo_0 = (((smem_v0_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 2048;
+                            int _mma_b_lo_0 = ((((smem_v1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+#else
                             int _mma_a_lo_0 = (((smem_v0_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2048;
                             int _mma_b_lo_0 = ((((smem_v1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

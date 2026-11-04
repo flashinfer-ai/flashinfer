@@ -25,7 +25,8 @@ evidence), the six head pairs (16, 48), (8, 24), (4, 12),
 (2, 6), (1, 3), (4, 4), the degenerate one-token / zero-token packs, the packed
 QKV strided view against the contiguous input, and the explicit forward /
 backward entries against autograd (output order ``dq, dk, dv, dbeta, dg``,
-saved-context against replay).  The multi-rank rows, the bitwise contracts and
+saved-context against replay), and ``save_mode="full"`` without ``save_transfer`` at
+``P = 2`` under NaN-filled allocations against the light form (bitwise).  The multi-rank rows, the bitwise contracts and
 the runtime contracts live in ``test_cake_gdn_det_train_kcp_dist.py``; the CPU plan,
 table and byte-query tests in ``test_cake_gdn_det_train_kcp.py``.
 """
@@ -251,6 +252,130 @@ def test_packed_qkv_strided_view_equals_the_contiguous_input(
         assert torch.equal(strided[n], contiguous[n]), (
             f"{n}: strided view differs from the contiguous input"
         )
+
+
+def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict:
+    """One autograd pass with q / k / v taken from the packed ``[1, T, (2 H_qk + HV) * 128]`` row ``row0``:
+    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``packed_qkv_views_det_kcp``, ``"contiguous"`` =
+    separate contiguous leaves holding the same values.  A tensor hook (recording the gradient) and ``retain_grad``
+    are set on every view (and on the split outputs) of the original forward."""
+    H, HV = heads
+    T = row0.shape[1]
+    sizes = (H * D, H * D, HV * D)
+    row = row0.detach().clone().requires_grad_(True)
+    g, beta = (x.detach().clone().requires_grad_(True) for x in (g0, b0))
+    leaves = []
+    if form == "contiguous":
+        leaves = [
+            p.detach()
+            .clone(memory_format=torch.contiguous_format)
+            .view(1, T, n, D)
+            .requires_grad_(True)
+            for p, n in zip(row0.split(sizes, dim=-1), (H, H, HV), strict=True)
+        ]
+    fired: dict = {}
+    views: dict = {}
+
+    def fn(row, g, beta, *leaves):
+        parts = ()
+        if form == "contiguous":
+            q, k, v = leaves
+        elif form == "plain":
+            parts = row.split(sizes, dim=-1)
+            q, k, v = (
+                p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True)
+            )
+        else:
+            q, k, v = gdn_api.packed_qkv_views_det_kcp(row, H_qk=H, HV=HV)
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+        return gdn_api.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g, beta, *leaves, use_reentrant=False)
+    else:
+        out = fn(row, g, beta, *leaves)
+    out.backward(dout)
+    drow = (
+        torch.cat([x.grad.reshape(1, T, -1) for x in leaves], -1)
+        if leaves
+        else row.grad
+    )
+    return {
+        "out": out.detach(),
+        "row": drow,
+        "dg": g.grad,
+        "dbeta": beta.grad,
+        "fired": fired,
+        "views": views,
+    }
+
+
+@pytest.mark.parametrize("ckpt", [False, True], ids=["direct", "checkpoint"])
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_plain_split_views_keep_hooks_and_bitwise_gradients(
+    device, lengths, heads, norm, ckpt
+) -> None:
+    """Issue #8367 on the device programs: plain ``split`` / ``view`` head views of one packed QKV row, the
+    ``packed_qkv_views_det_kcp`` views of it and contiguous operands give bitwise the same ``out``, row gradient
+    (``dq | dk | dv``), ``dg`` and ``dbeta``, with the in-kernel norm off and on, direct and checkpointed.  Plain views
+    keep torch's autograd path: their tensor hooks and ``retain_grad`` (and those on the split outputs) fire once
+    with the gradient, and only the packed views' split hands the packed dQKV row on without a concatenation."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    H, HV = heads
+    cu = _cu(lengths)
+    T = cu[-1]
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    row0 = torch.cat(
+        [inputs[n].to(device).reshape(1, T, -1) for n in ("q", "k", "v")], -1
+    ).contiguous()
+    g0, b0, dout = (inputs[n].to(device) for n in ("g", "beta", "dout"))
+    o = {"use_qk_l2norm_in_kernel": norm}
+    cols = {"q": (0, H * D), "k": (H * D, 2 * H * D), "v": (2 * H * D, None)}
+    expect_split = {
+        "contiguous": {"aliased": 0, "concatenated": 0},
+        "plain": {"aliased": 0, "concatenated": 0},
+        "packed": {"aliased": 1, "concatenated": 0},
+    }
+    ref = None
+    for form, split in expect_split.items():
+        before = dict(kcp.PACKED_SPLIT_STATS)
+        got = _split_view_pass(form, row0, g0, b0, dout, ctx, heads, ckpt=ckpt, **o)
+        delta = {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before}
+        assert delta == split, (form, delta)
+        assert kcp.LAST_CALL["bwd"]["grad_layout"] == (
+            "separate" if form == "contiguous" else "packed"
+        ), form
+        if ref is None:
+            ref = got
+        for n in ("out", "row", "dg", "dbeta"):
+            assert torch.equal(got[n], ref[n]), f"{form}: {n} differs from contiguous"
+        assert sorted(got["fired"]) == sorted(got["views"]), form
+        for i, n in enumerate(("q", "k", "v")):
+            a, b = cols[n]
+            want = ref["row"][..., a:b]
+            assert len(got["fired"][n]) == 1, (form, n)
+            assert torch.equal(got["fired"][n][0].reshape(want.shape), want), (form, n)
+            assert torch.equal(got["views"][n].grad.reshape(want.shape), want), (
+                form,
+                n,
+            )
+            if form == "plain":
+                part = got["fired"][f"part{i}"]
+                assert len(part) == 1 and torch.equal(part[0], want), (form, n)
 
 
 def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> None:
@@ -522,3 +647,76 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
             kcp.LAST_CALL["bwd"]["tapes_source"],
         )
         assert kcp.kept_registry_size() == 0, (later_saver, form)
+
+
+# --------------------------------------------------------------------------- save_mode="full" without save_transfer at P > 1
+
+
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
+    device, monkeypatch, norm
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` (the only form of ``exchange="ring"``) at ``P = 2``: every
+    tensor the package allocates is filled with NaN bytes, so a read of a plane no program of the call wrote (the
+    ``M_seg^T`` staging plane the backward's merges read) shows up as a non-finite gradient.  The saved set carries
+    ``M_seg``; the full form gives the light form's bits (out and the five gradients) on a per-call, a fresh and a
+    shared workspace (twice on the shared one) and under a non-reentrant checkpoint."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = real_alloc(shape, dtype, dev)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+    cu = [0, 11000, 23000, 32768]
+    H, HV = 16, 48
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    dout = inputs["dout"].to(device)
+    o = {"segments": 2, "save_transfer": False, "use_qk_l2norm_in_kernel": norm}
+
+    def run(workspace, *, ckpt: bool = False, **kw) -> dict:
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+
+        def fn(*a):
+            return gdn_api.chunk_gdn_det_kcp(*a, ctx, workspace=workspace, **o, **kw)
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, use_reentrant=False)
+        else:
+            out = fn(*leaves)
+        out.backward(dout)
+        torch.cuda.synchronize(device)
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(OPERANDS, leaves, strict=True)},
+        }
+
+    ops = [inputs[n].to(device) for n in OPERANDS]
+    _, saved = gdn_api.chunk_gdn_det_fwd_kcp(
+        *ops, ctx, save_for_backward=True, save_mode="full", **o
+    )
+    assert saved.P == 2 and saved.c1_recv is None and saved.M_seg is not None
+    del saved, ops
+    light = run(None)
+    assert kcp.LAST_CALL["fwd"]["P"] == 2
+    for n, t in light.items():
+        assert bool(torch.isfinite(t.float()).all()), ("light", n)
+    shared = kcp.WorkspaceDetKcp()
+    arms = (
+        (None, False),
+        (kcp.WorkspaceDetKcp(), False),
+        (shared, False),
+        (shared, False),
+        (None, True),
+    )
+    for i, (ws, ckpt) in enumerate(arms):
+        full = run(ws, ckpt=ckpt, save_mode="full")
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
+        for n in light:
+            assert torch.equal(full[n], light[n]), (i, n)

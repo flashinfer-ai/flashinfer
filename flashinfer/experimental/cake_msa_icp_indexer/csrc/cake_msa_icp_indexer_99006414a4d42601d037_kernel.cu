@@ -40,23 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_OFFSET 0
-#define NUM_K_PIPE_STAGES 6
-#define NUM_ACC_PIPE_STAGES 4
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_K_OFF 17408
-#define SMEM_SMEM_K_STAGE_BYTES 8192
-#define SMEM_SMEM_K_STRIDE 8192
-#define SMEM_LISTS_OFF 1024
-#define SMEM_LISTS_STAGE_BYTES 16384
-#define SMEM_LISTS_STRIDE 16384
-#define SMEM_TOTAL 78848
-#define THREADS 192
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -212,7 +195,7 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -248,7 +231,7 @@ kernel_cake_msa_icp_indexer_99006414a4d42601d037(const __grid_constant__ CUtenso
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     uint8_t* smem_k = reinterpret_cast<uint8_t*>(smem_raw + 17408);
@@ -256,8 +239,7 @@ kernel_cake_msa_icp_indexer_99006414a4d42601d037(const __grid_constant__ CUtenso
     unsigned long long* lists = reinterpret_cast<unsigned long long*>(smem_raw + 1024);
     const int lists_addr = smem + 1024;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (22 barriers at smem_raw[0..176))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -310,10 +292,8 @@ kernel_cake_msa_icp_indexer_99006414a4d42601d037(const __grid_constant__ CUtenso
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // ---- Role: epi ----
     if (warp <= 3) {
@@ -480,7 +460,7 @@ kernel_cake_msa_icp_indexer_99006414a4d42601d037(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_2 & (1u << 30))) acc[62] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 31))) acc[63] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_5 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_5 = {-CUDART_INF_F, -CUDART_INF_F};
                         row_max_x32_accum(&acc[0], _reg_reduce_max2_5);
                         row_max_x32_accum(&acc[32], _reg_reduce_max2_5);
                         float _reg_array_reduce_4 = row_max_reduce(_reg_reduce_max2_5);
