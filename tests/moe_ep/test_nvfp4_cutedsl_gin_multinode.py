@@ -638,7 +638,9 @@ def test_nvfp4_gin_public_prestaged_inputs():
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capture"])
 @pytest.mark.parametrize("failure", ["overflow", "mismatch"])
 def test_nvfp4_gin_compile_bucket_collective_rejection(capturing, failure):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import GinPreflightError
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
+        GinPreflightError,
+    )
 
     bootstrap = _bootstrap()
     layer = _layer(bootstrap)
