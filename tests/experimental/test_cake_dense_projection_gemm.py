@@ -4981,8 +4981,10 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(hidden, T):
     ``RERUNS`` launches into a NaN-poisoned ``out``: finite, within the reordering bound of the K-order sum of the
     deterministic program's one-split partials of its segments, relative Frobenius error against FP64 at most
     ``ROUTER_REL_FRO_MAX``.  On whole tiles (one unit per tile) it stores the bits of the three-chunk-buffer head/tail
-    program at the same partition, which are the deterministic program's one-split result.  Skips on any other device
-    and outside the part's windows."""
+    program at the same partition, which are the deterministic program's one-split result.  On a part of that
+    architecture with another SM count, where the windows do not hold (``router_rules``: :data:`ROUTER_RULES` off
+    :data:`ROUTER_SM_COUNT`, e.g. 148-SM sm_103a), the default plan is the deterministic program.  Skips on any other
+    device and outside the part's windows."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     ts = cake_backend.router_head_tail_template(arch, sm_count)
@@ -4996,10 +4998,19 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(hidden, T):
         pytest.skip(
             f"no head/tail window of {arch} on {sm_count} SMs at {hidden}, T={T}"
         )
-    _require_template(arch, ts)
-    _require_template(arch, c3)
     X, W, G = _router_inputs(T, device, SEED + 30, K=hidden)
     A, B, out = _router_case("wgrad", X, W, G)
+    if not cake_backend.router_rules(arch, sm_count)[1]:
+        plan, reason = cake_backend.plan_atomic_router(
+            A, B, out, arch=arch, sm_count=sm_count
+        )
+        assert plan is None, plan
+        assert reason == "the planner keeps the row on the deterministic program"
+        prepared = cake_backend.prepare_router_fp32_gemm(A, B, out, deterministic=False)
+        assert not isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+        return
+    _require_template(arch, ts)
+    _require_template(arch, c3)
     plan, reason = cake_backend.plan_atomic_router(
         A, B, out, arch=arch, sm_count=sm_count
     )
