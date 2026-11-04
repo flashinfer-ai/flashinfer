@@ -72,7 +72,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_mhi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_mhi_addr = smem + 0;
     __nv_bfloat16* s_mlo = reinterpret_cast<__nv_bfloat16*>(smem_raw + 32768);
@@ -754,19 +754,19 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
                         : "+f"((acc + nb * 8)[0]), "+f"((acc + nb * 8)[1]), "+f"((acc + nb * 8)[2]), "+f"((acc + nb * 8)[3])
                         : "r"(a_hi[0]), "r"(a_hi[1]), "r"(a_hi[2]), "r"(a_hi[3]), "r"(b_hi[0]), "r"(b_hi[1]));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                        : "+f"((acc + nb * 8 + 4)[0]), "+f"((acc + nb * 8 + 4)[1]), "+f"((acc + nb * 8 + 4)[2]), "+f"((acc + nb * 8 + 4)[3])
+                        : "+f"((acc + (nb * 8 + 4))[0]), "+f"((acc + (nb * 8 + 4))[1]), "+f"((acc + (nb * 8 + 4))[2]), "+f"((acc + (nb * 8 + 4))[3])
                         : "r"(a_hi[0]), "r"(a_hi[1]), "r"(a_hi[2]), "r"(a_hi[3]), "r"(b_hi[2]), "r"(b_hi[(2) + 1]));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                         : "+f"((acc + nb * 8)[0]), "+f"((acc + nb * 8)[1]), "+f"((acc + nb * 8)[2]), "+f"((acc + nb * 8)[3])
                         : "r"(a_hi[0]), "r"(a_hi[1]), "r"(a_hi[2]), "r"(a_hi[3]), "r"(b_lo[0]), "r"(b_lo[1]));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                        : "+f"((acc + nb * 8 + 4)[0]), "+f"((acc + nb * 8 + 4)[1]), "+f"((acc + nb * 8 + 4)[2]), "+f"((acc + nb * 8 + 4)[3])
+                        : "+f"((acc + (nb * 8 + 4))[0]), "+f"((acc + (nb * 8 + 4))[1]), "+f"((acc + (nb * 8 + 4))[2]), "+f"((acc + (nb * 8 + 4))[3])
                         : "r"(a_hi[0]), "r"(a_hi[1]), "r"(a_hi[2]), "r"(a_hi[3]), "r"(b_lo[2]), "r"(b_lo[(2) + 1]));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                         : "+f"((acc + nb * 8)[0]), "+f"((acc + nb * 8)[1]), "+f"((acc + nb * 8)[2]), "+f"((acc + nb * 8)[3])
                         : "r"(a_lo[0]), "r"(a_lo[1]), "r"(a_lo[2]), "r"(a_lo[3]), "r"(b_hi[0]), "r"(b_hi[1]));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                        : "+f"((acc + nb * 8 + 4)[0]), "+f"((acc + nb * 8 + 4)[1]), "+f"((acc + nb * 8 + 4)[2]), "+f"((acc + nb * 8 + 4)[3])
+                        : "+f"((acc + (nb * 8 + 4))[0]), "+f"((acc + (nb * 8 + 4))[1]), "+f"((acc + (nb * 8 + 4))[2]), "+f"((acc + (nb * 8 + 4))[3])
                         : "r"(a_lo[0]), "r"(a_lo[1]), "r"(a_lo[2]), "r"(a_lo[3]), "r"(b_hi[2]), "r"(b_hi[(2) + 1]));
                 }
             }
