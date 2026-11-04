@@ -1051,9 +1051,13 @@ def test_per_call_dtype_is_pcie_only_and_whitelisted(gloo_pg, monkeypatch):
         pcie.close()
 
 
-def test_joint_config_validation_uses_gathered_backends():
+def test_joint_config_validation_uses_gathered_backends(monkeypatch):
     """The verdict must be a pure function of the gathered configs, so every
     rank raises (or passes) together whatever backend it requested locally."""
+    # _encode_config range-checks the ordinal against the visible device
+    # count. The verdict under test does not depend on the machine, so pin
+    # a count that makes "cuda:0" valid even where no GPU is visible.
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     encode = UlyssesCommunicator._encode_config
     pcie_int8 = encode(1 << 10, torch.int8, "cuda:0", "pcie")
     UlyssesCommunicator._validate_configs_jointly(
@@ -1073,6 +1077,17 @@ def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
     )
     assert comm.backend == "nccl"
     assert comm.fallback_reason is None  # explicitly requested, not a fallback
+    comm.close()
+
+
+@requires_cuda
+def test_ctor_legacy_element_capacity(gloo_pg, monkeypatch):
+    forbid_ipc_and_jit(monkeypatch)
+    comm = UlyssesCommunicator(
+        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl"
+    )
+    assert comm.max_bytes == 1024 * torch.float16.itemsize
+    assert comm.max_elems == 1024
     comm.close()
 
 
@@ -1110,6 +1125,13 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_bytes="big", dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=True, dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=2**33, dtype=torch.float16), "int32"),
+        (dict(max_elems=0, dtype=torch.float16), "max_elems"),
+        (dict(max_elems=2**31, dtype=torch.float16), "max_elems"),
+        (
+            dict(max_bytes=2048, max_elems=1024, dtype=torch.float16),
+            "only one of max_bytes or max_elems",
+        ),
+        (dict(dtype=torch.float16), "either max_bytes or max_elems"),
         (dict(max_bytes=2048, dtype=torch.int32), "dtype"),
         (dict(max_bytes=2048, dtype="float16"), "dtype"),
         (dict(max_bytes=2048, dtype=torch.float16, device="cpu"), "CUDA device"),
@@ -1443,7 +1465,8 @@ def _worker_main(rank, world_size, rendezvous, body_name, arg, allow_skip, q):
     hardware limitation. Runtime init/JIT/IPC failures always FAIL, except
     that PCIe bodies pre-probe the verbs/mlx5 toolchain and re-raise a missing
     one as UlyssesBackendError so a machine without RDMA headers skips."""
-    body = globals()[body_name]
+    # Lowp tests reuse this runner with a top-level, spawn-safe callable.
+    body = body_name if callable(body_name) else globals()[body_name]
     outcome = None
     try:
         group = _init_pg(
@@ -1541,14 +1564,7 @@ def _destination_passing_body(rank, world_size, group, backend):
     for iteration in range(3):
         torch.manual_seed(1000 + iteration + rank)
         x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device="cuda")
-        scatter_out = torch.empty(
-            B,
-            S_local * world_size,
-            H // world_size,
-            D,
-            dtype=x.dtype,
-            device=x.device,
-        )
+        scatter_out = comm.allocate_output(x, "scatter_heads")
         returned = comm.scatter_heads(x, out=scatter_out, workspace=workspace)
         ref = _ref_scatter_heads(x, world_size, rank, group)
         torch.cuda.synchronize()
@@ -1557,7 +1573,7 @@ def _destination_passing_body(rank, world_size, group, backend):
 
         torch.manual_seed(2000 + iteration + rank)
         y = torch.randn_like(scatter_out)
-        gather_out = torch.empty_like(x)
+        gather_out = comm.allocate_output(y, "gather_heads")
         returned = comm.gather_heads(y, out=gather_out, workspace=workspace)
         ref = _ref_gather_heads(y, world_size, rank, group)
         torch.cuda.synchronize()
@@ -2376,7 +2392,8 @@ def _init_fault_body(rank, world_size, group, arg):
         def bad_init(*a, **k):
             raise RuntimeError("injected init failure")
 
-        ulysses_mod.init_ulysses_a2a = bad_init
+        # Inject at the configured initializer used by the communicator.
+        ulysses_mod._init_ulysses_a2a_configured = bad_init
     elif fault == "jit" and rank == 0:
         # rank-local stage-J failure: nothing may be allocated anywhere
         vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")

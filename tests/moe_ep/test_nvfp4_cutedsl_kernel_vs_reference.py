@@ -42,7 +42,13 @@ NVFP4_MODES = ("w4a4", "w4a16")
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "kind,intermediate",
-    [("nvfp4", 192), ("nvfp4", 96), ("mxfp8_e4m3", 192), ("mxfp8_e5m2", 192)],
+    [
+        ("nvfp4", 192),
+        ("nvfp4", 96),
+        ("mxfp8_e4m3", 192),
+        ("mxfp8_e5m2", 192),
+        ("mxfp4_mxfp8", 256),
+    ],
 )
 @pytest.mark.parametrize("early", [True, False])
 @pytest.mark.parametrize("capacity", [1, 129])

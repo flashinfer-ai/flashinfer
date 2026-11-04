@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_TOKEN_BITS_OFF 1024
 #define SMEM_TOKEN_BITS_STAGE_BYTES 2064
 #define SMEM_TOKEN_BITS_STRIDE 2064
@@ -288,126 +287,126 @@ kernel_alpha_moe_fused_router_cluster_c4_w8_threshold(float* __restrict__ logits
         stage[stage_base + 96 + lane] = lane_key;
         __syncwarp();
         int lanes_above = 0;
-        unsigned int lane_keys[16];
+        unsigned int lane_keys_1_0[16];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(0) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(0) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(4) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(4) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 4) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[8])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(8) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(8) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 8) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[12])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys[(12) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_0[(12) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 12) * 4)));
-        if (lane_keys[0] > lane_key) {
+        if (lane_keys_1_0[0] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[1] > lane_key) {
+        if (lane_keys_1_0[1] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[2] > lane_key) {
+        if (lane_keys_1_0[2] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[3] > lane_key) {
+        if (lane_keys_1_0[3] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[4] > lane_key) {
+        if (lane_keys_1_0[4] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[5] > lane_key) {
+        if (lane_keys_1_0[5] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[6] > lane_key) {
+        if (lane_keys_1_0[6] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[7] > lane_key) {
+        if (lane_keys_1_0[7] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[8] > lane_key) {
+        if (lane_keys_1_0[8] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[9] > lane_key) {
+        if (lane_keys_1_0[9] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[10] > lane_key) {
+        if (lane_keys_1_0[10] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[11] > lane_key) {
+        if (lane_keys_1_0[11] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[12] > lane_key) {
+        if (lane_keys_1_0[12] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[13] > lane_key) {
+        if (lane_keys_1_0[13] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[14] > lane_key) {
+        if (lane_keys_1_0[14] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys[15] > lane_key) {
+        if (lane_keys_1_0[15] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        unsigned int lane_keys_0[16];
+        unsigned int lane_keys_1_1[16];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(0) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(0) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 16) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(4) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(4) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 20) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(8) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(8) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 24) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_0[(12) + 3]))
+            : "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lane_keys_1_1[(12) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 28) * 4)));
-        if (lane_keys_0[0] > lane_key) {
+        if (lane_keys_1_1[0] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[1] > lane_key) {
+        if (lane_keys_1_1[1] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[2] > lane_key) {
+        if (lane_keys_1_1[2] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[3] > lane_key) {
+        if (lane_keys_1_1[3] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[4] > lane_key) {
+        if (lane_keys_1_1[4] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[5] > lane_key) {
+        if (lane_keys_1_1[5] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[6] > lane_key) {
+        if (lane_keys_1_1[6] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[7] > lane_key) {
+        if (lane_keys_1_1[7] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[8] > lane_key) {
+        if (lane_keys_1_1[8] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[9] > lane_key) {
+        if (lane_keys_1_1[9] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[10] > lane_key) {
+        if (lane_keys_1_1[10] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[11] > lane_key) {
+        if (lane_keys_1_1[11] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[12] > lane_key) {
+        if (lane_keys_1_1[12] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[13] > lane_key) {
+        if (lane_keys_1_1[13] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[14] > lane_key) {
+        if (lane_keys_1_1[14] > lane_key) {
             lanes_above = lanes_above + 1;
         }
-        if (lane_keys_0[15] > lane_key) {
+        if (lane_keys_1_1[15] > lane_key) {
             lanes_above = lanes_above + 1;
         }
         unsigned int bound_vote = 4294967295;
@@ -755,30 +754,30 @@ kernel_alpha_moe_fused_router_cluster_c4_w8_threshold(float* __restrict__ logits
                 rank_bit_lanes = rank_bit_lanes ^ 4294967295u;
             }
             tied_lanes = tied_lanes & rank_bit_lanes;
-            int rank_bit_set_0 = candidate_rank >> 1 & 1;
-            unsigned int rank_bit_lanes_1 = __ballot_sync(0xFFFFFFFF, rank_bit_set_0 != 0);
-            if (rank_bit_set_0 == 0) {
-                rank_bit_lanes_1 = rank_bit_lanes_1 ^ 4294967295u;
+            int rank_bit_set_r_r_0 = candidate_rank >> 1 & 1;
+            unsigned int rank_bit_lanes_r_r_0 = __ballot_sync(0xFFFFFFFF, rank_bit_set_r_r_0 != 0);
+            if (rank_bit_set_r_r_0 == 0) {
+                rank_bit_lanes_r_r_0 = rank_bit_lanes_r_r_0 ^ 4294967295u;
             }
-            tied_lanes = tied_lanes & rank_bit_lanes_1;
-            int rank_bit_set_2 = candidate_rank >> 2 & 1;
-            unsigned int rank_bit_lanes_3 = __ballot_sync(0xFFFFFFFF, rank_bit_set_2 != 0);
-            if (rank_bit_set_2 == 0) {
-                rank_bit_lanes_3 = rank_bit_lanes_3 ^ 4294967295u;
+            tied_lanes = tied_lanes & rank_bit_lanes_r_r_0;
+            int rank_bit_set_r_r_1 = candidate_rank >> 2 & 1;
+            unsigned int rank_bit_lanes_r_r_1 = __ballot_sync(0xFFFFFFFF, rank_bit_set_r_r_1 != 0);
+            if (rank_bit_set_r_r_1 == 0) {
+                rank_bit_lanes_r_r_1 = rank_bit_lanes_r_r_1 ^ 4294967295u;
             }
-            tied_lanes = tied_lanes & rank_bit_lanes_3;
-            int rank_bit_set_4 = candidate_rank >> 3 & 1;
-            unsigned int rank_bit_lanes_5 = __ballot_sync(0xFFFFFFFF, rank_bit_set_4 != 0);
-            if (rank_bit_set_4 == 0) {
-                rank_bit_lanes_5 = rank_bit_lanes_5 ^ 4294967295u;
+            tied_lanes = tied_lanes & rank_bit_lanes_r_r_1;
+            int rank_bit_set_r_r_2 = candidate_rank >> 3 & 1;
+            unsigned int rank_bit_lanes_r_r_2 = __ballot_sync(0xFFFFFFFF, rank_bit_set_r_r_2 != 0);
+            if (rank_bit_set_r_r_2 == 0) {
+                rank_bit_lanes_r_r_2 = rank_bit_lanes_r_r_2 ^ 4294967295u;
             }
-            tied_lanes = tied_lanes & rank_bit_lanes_5;
-            int rank_bit_set_6 = candidate_rank >> 4 & 1;
-            unsigned int rank_bit_lanes_7 = __ballot_sync(0xFFFFFFFF, rank_bit_set_6 != 0);
-            if (rank_bit_set_6 == 0) {
-                rank_bit_lanes_7 = rank_bit_lanes_7 ^ 4294967295u;
+            tied_lanes = tied_lanes & rank_bit_lanes_r_r_2;
+            int rank_bit_set_r_r_3 = candidate_rank >> 4 & 1;
+            unsigned int rank_bit_lanes_r_r_3 = __ballot_sync(0xFFFFFFFF, rank_bit_set_r_r_3 != 0);
+            if (rank_bit_set_r_r_3 == 0) {
+                rank_bit_lanes_r_r_3 = rank_bit_lanes_r_r_3 ^ 4294967295u;
             }
-            tied_lanes = tied_lanes & rank_bit_lanes_7;
+            tied_lanes = tied_lanes & rank_bit_lanes_r_r_3;
             candidate_rank = candidate_rank + (int)(unsigned int)__popc(tied_lanes & lanes_below);
             if (candidates > lane && candidate_rank < top_k) {
                 stage[stage_base + 64 + candidate_rank] = candidate_bits;

@@ -55,54 +55,54 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_B_OFF 148480
 #define SMEM_SMEM_B_STAGE_BYTES 1024
 #define SMEM_SMEM_B_STRIDE 1024
-#define SMEM_SMEM_A_MMA0_OFF 1024
-#define SMEM_SMEM_A_MMA0_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA0_STRIDE 16384
-#define SMEM_SMEM_A_MMA1_OFF 1056
-#define SMEM_SMEM_A_MMA1_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA1_STRIDE 16384
-#define SMEM_SMEM_A_MMA2_OFF 1088
-#define SMEM_SMEM_A_MMA2_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA2_STRIDE 16384
-#define SMEM_SMEM_A_MMA3_OFF 1120
-#define SMEM_SMEM_A_MMA3_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA3_STRIDE 16384
-#define SMEM_SMEM_A_MMA4_OFF 1024
-#define SMEM_SMEM_A_MMA4_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA4_STRIDE 16384
-#define SMEM_SMEM_A_MMA5_OFF 1024
-#define SMEM_SMEM_A_MMA5_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA5_STRIDE 16384
-#define SMEM_SMEM_A_MMA6_OFF 1024
-#define SMEM_SMEM_A_MMA6_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA6_STRIDE 16384
-#define SMEM_SMEM_A_MMA7_OFF 1024
-#define SMEM_SMEM_A_MMA7_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA7_STRIDE 16384
-#define SMEM_SMEM_B_MMA0_OFF 148480
-#define SMEM_SMEM_B_MMA0_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA0_STRIDE 1024
-#define SMEM_SMEM_B_MMA1_OFF 148512
-#define SMEM_SMEM_B_MMA1_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA1_STRIDE 1024
-#define SMEM_SMEM_B_MMA2_OFF 148544
-#define SMEM_SMEM_B_MMA2_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA2_STRIDE 1024
-#define SMEM_SMEM_B_MMA3_OFF 148576
-#define SMEM_SMEM_B_MMA3_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA3_STRIDE 1024
-#define SMEM_SMEM_B_MMA4_OFF 148480
-#define SMEM_SMEM_B_MMA4_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA4_STRIDE 1024
-#define SMEM_SMEM_B_MMA5_OFF 148480
-#define SMEM_SMEM_B_MMA5_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA5_STRIDE 1024
-#define SMEM_SMEM_B_MMA6_OFF 148480
-#define SMEM_SMEM_B_MMA6_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA6_STRIDE 1024
-#define SMEM_SMEM_B_MMA7_OFF 148480
-#define SMEM_SMEM_B_MMA7_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA7_STRIDE 1024
+#define SMEM_SMEM_A_MMA_R_0_OFF 1024
+#define SMEM_SMEM_A_MMA_R_0_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_R_0_STRIDE 16384
+#define SMEM_SMEM_A_MMA_R_1_OFF 1056
+#define SMEM_SMEM_A_MMA_R_1_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_R_1_STRIDE 16384
+#define SMEM_SMEM_A_MMA_R_2_OFF 1088
+#define SMEM_SMEM_A_MMA_R_2_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_R_2_STRIDE 16384
+#define SMEM_SMEM_A_MMA_R_3_OFF 1120
+#define SMEM_SMEM_A_MMA_R_3_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_R_3_STRIDE 16384
+#define SMEM_SMEM_A_MMA_0_OFF 1024
+#define SMEM_SMEM_A_MMA_0_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_0_STRIDE 16384
+#define SMEM_SMEM_A_MMA_1_OFF 1024
+#define SMEM_SMEM_A_MMA_1_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_1_STRIDE 16384
+#define SMEM_SMEM_A_MMA_2_OFF 1024
+#define SMEM_SMEM_A_MMA_2_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_2_STRIDE 16384
+#define SMEM_SMEM_A_MMA_3_OFF 1024
+#define SMEM_SMEM_A_MMA_3_STAGE_BYTES 4096
+#define SMEM_SMEM_A_MMA_3_STRIDE 16384
+#define SMEM_SMEM_B_MMA_R_0_OFF 148480
+#define SMEM_SMEM_B_MMA_R_0_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_R_0_STRIDE 1024
+#define SMEM_SMEM_B_MMA_R_1_OFF 148512
+#define SMEM_SMEM_B_MMA_R_1_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_R_1_STRIDE 1024
+#define SMEM_SMEM_B_MMA_R_2_OFF 148544
+#define SMEM_SMEM_B_MMA_R_2_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_R_2_STRIDE 1024
+#define SMEM_SMEM_B_MMA_R_3_OFF 148576
+#define SMEM_SMEM_B_MMA_R_3_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_R_3_STRIDE 1024
+#define SMEM_SMEM_B_MMA_0_OFF 148480
+#define SMEM_SMEM_B_MMA_0_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_0_STRIDE 1024
+#define SMEM_SMEM_B_MMA_1_OFF 148480
+#define SMEM_SMEM_B_MMA_1_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_1_STRIDE 1024
+#define SMEM_SMEM_B_MMA_2_OFF 148480
+#define SMEM_SMEM_B_MMA_2_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_2_STRIDE 1024
+#define SMEM_SMEM_B_MMA_3_OFF 148480
+#define SMEM_SMEM_B_MMA_3_STAGE_BYTES 256
+#define SMEM_SMEM_B_MMA_3_STRIDE 1024
 #define SMEM_SMEM_A_MMA0_NEXT_OFF 1024
 #define SMEM_SMEM_A_MMA0_NEXT_STAGE_BYTES 4096
 #define SMEM_SMEM_A_MMA0_NEXT_STRIDE 16384
@@ -373,38 +373,38 @@ kernel_cake_warp_decode_07e18a56e1735d296d56(const __grid_constant__ CUtensorMap
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 148480);
     const int smem_b_addr = smem + 148480;
-    uint8_t* smem_a_mma0 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_a_mma0_addr = smem + 1024;
-    uint8_t* smem_a_mma1 = reinterpret_cast<uint8_t*>(smem_raw + 1056);
-    const int smem_a_mma1_addr = smem + 1056;
-    uint8_t* smem_a_mma2 = reinterpret_cast<uint8_t*>(smem_raw + 1088);
-    const int smem_a_mma2_addr = smem + 1088;
-    uint8_t* smem_a_mma3 = reinterpret_cast<uint8_t*>(smem_raw + 1120);
-    const int smem_a_mma3_addr = smem + 1120;
-    uint8_t* smem_a_mma4 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_a_mma4_addr = smem + 1024;
-    uint8_t* smem_a_mma5 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_a_mma5_addr = smem + 1024;
-    uint8_t* smem_a_mma6 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_a_mma6_addr = smem + 1024;
-    uint8_t* smem_a_mma7 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_a_mma7_addr = smem + 1024;
-    uint8_t* smem_b_mma0 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
-    const int smem_b_mma0_addr = smem + 148480;
-    uint8_t* smem_b_mma1 = reinterpret_cast<uint8_t*>(smem_raw + 148512);
-    const int smem_b_mma1_addr = smem + 148512;
-    uint8_t* smem_b_mma2 = reinterpret_cast<uint8_t*>(smem_raw + 148544);
-    const int smem_b_mma2_addr = smem + 148544;
-    uint8_t* smem_b_mma3 = reinterpret_cast<uint8_t*>(smem_raw + 148576);
-    const int smem_b_mma3_addr = smem + 148576;
-    uint8_t* smem_b_mma4 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
-    const int smem_b_mma4_addr = smem + 148480;
-    uint8_t* smem_b_mma5 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
-    const int smem_b_mma5_addr = smem + 148480;
-    uint8_t* smem_b_mma6 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
-    const int smem_b_mma6_addr = smem + 148480;
-    uint8_t* smem_b_mma7 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
-    const int smem_b_mma7_addr = smem + 148480;
+    uint8_t* smem_a_mma_r_0 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+    const int smem_a_mma_addr_r_0 = smem + 1024;
+    uint8_t* smem_a_mma_r_1 = reinterpret_cast<uint8_t*>(smem_raw + 1056);
+    const int smem_a_mma_addr_r_1 = smem + 1056;
+    uint8_t* smem_a_mma_r_2 = reinterpret_cast<uint8_t*>(smem_raw + 1088);
+    const int smem_a_mma_addr_r_2 = smem + 1088;
+    uint8_t* smem_a_mma_r_3 = reinterpret_cast<uint8_t*>(smem_raw + 1120);
+    const int smem_a_mma_addr_r_3 = smem + 1120;
+    uint8_t* smem_a_mma_0 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+    const int smem_a_mma_addr_0 = smem + 1024;
+    uint8_t* smem_a_mma_1 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+    const int smem_a_mma_addr_1 = smem + 1024;
+    uint8_t* smem_a_mma_2 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+    const int smem_a_mma_addr_2 = smem + 1024;
+    uint8_t* smem_a_mma_3 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+    const int smem_a_mma_addr_3 = smem + 1024;
+    uint8_t* smem_b_mma_r_0 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
+    const int smem_b_mma_addr_r_0 = smem + 148480;
+    uint8_t* smem_b_mma_r_1 = reinterpret_cast<uint8_t*>(smem_raw + 148512);
+    const int smem_b_mma_addr_r_1 = smem + 148512;
+    uint8_t* smem_b_mma_r_2 = reinterpret_cast<uint8_t*>(smem_raw + 148544);
+    const int smem_b_mma_addr_r_2 = smem + 148544;
+    uint8_t* smem_b_mma_r_3 = reinterpret_cast<uint8_t*>(smem_raw + 148576);
+    const int smem_b_mma_addr_r_3 = smem + 148576;
+    uint8_t* smem_b_mma_0 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
+    const int smem_b_mma_addr_0 = smem + 148480;
+    uint8_t* smem_b_mma_1 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
+    const int smem_b_mma_addr_1 = smem + 148480;
+    uint8_t* smem_b_mma_2 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
+    const int smem_b_mma_addr_2 = smem + 148480;
+    uint8_t* smem_b_mma_3 = reinterpret_cast<uint8_t*>(smem_raw + 148480);
+    const int smem_b_mma_addr_3 = smem + 148480;
     uint8_t* smem_a_mma0_next = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_mma0_next_addr = smem + 1024;
     uint8_t* smem_b_mma0_next = reinterpret_cast<uint8_t*>(smem_raw + 148480);
@@ -738,7 +738,7 @@ kernel_cake_warp_decode_07e18a56e1735d296d56(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 144 + stage * 8 + 0), "r"(word[0]));
+                        :: "r"(taddr + 16 + 144 + stage * 8), "r"(word[0]));
                     const int q_3_1 = 1;
                     for (int reg_1_1 = 0; reg_1_1 < 1; reg_1_1++) {
                         word[reg_1_1] = 0;

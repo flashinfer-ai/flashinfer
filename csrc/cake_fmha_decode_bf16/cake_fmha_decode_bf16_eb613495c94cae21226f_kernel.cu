@@ -40,81 +40,11 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 128
-#define TMEM_TMEM_S0_OFFSET 0
-#define TMEM_TMEM_S1_OFFSET 8
-#define TMEM_TMEM_STATS0_OFFSET 16
-#define TMEM_TMEM_STATS1_OFFSET 48
-#define TMEM_TMEM_O0_OFFSET 80
-#define TMEM_TMEM_O1_OFFSET 88
-#define NUM_WORK_PIPE_STAGES 2
-#define NUM_THROTTLE_PIPE_STAGES 2
-#define SMEM_SMEM_CORR0_OFF 1024
-#define SMEM_SMEM_CORR0_STAGE_BYTES 64
-#define SMEM_SMEM_CORR0_STRIDE 64
-#define SMEM_SMEM_CORR1_OFF 1088
-#define SMEM_SMEM_CORR1_STAGE_BYTES 64
-#define SMEM_SMEM_CORR1_STRIDE 64
-#define SMEM_SMEM_EXCH0_OFF 1152
-#define SMEM_SMEM_EXCH0_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH0_STRIDE 256
-#define SMEM_SMEM_EXCH1_OFF 1408
-#define SMEM_SMEM_EXCH1_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH1_STRIDE 256
-#define SMEM_SMEM_EXCH0_U32_OFF 1152
-#define SMEM_SMEM_EXCH0_U32_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH0_U32_STRIDE 256
-#define SMEM_SMEM_EXCH1_U32_OFF 1408
-#define SMEM_SMEM_EXCH1_U32_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH1_U32_STRIDE 256
-#define SMEM_SMEM_QT_OFF 1664
-#define SMEM_SMEM_QT_STAGE_BYTES 2048
-#define SMEM_SMEM_QT_STRIDE 2048
-#define SMEM_SMEM_KV_OFF 6144
-#define SMEM_SMEM_KV_STAGE_BYTES 32768
-#define SMEM_SMEM_KV_STRIDE 32768
-#define SMEM_SMEM_V_OFF 6144
-#define SMEM_SMEM_V_STAGE_BYTES 32768
-#define SMEM_SMEM_V_STRIDE 32768
-#if __CUDA_ARCH__ == 1030
-#define SMEM_SMEM_P0_OFF 202752
-#else
-#define SMEM_SMEM_P0_OFF 169984
-#endif
-#define SMEM_SMEM_P0_STAGE_BYTES 2048
-#define SMEM_SMEM_P0_STRIDE 2048
-#if __CUDA_ARCH__ == 1030
-#define SMEM_SMEM_P1_OFF 206848
-#else
-#define SMEM_SMEM_P1_OFF 174080
-#endif
-#define SMEM_SMEM_P1_STAGE_BYTES 2048
-#define SMEM_SMEM_P1_STRIDE 2048
-#if __CUDA_ARCH__ == 1030
-#define SMEM_SMEM_PAGE_OFFSETS_OFF 208896
-#else
-#define SMEM_SMEM_PAGE_OFFSETS_OFF 176128
-#endif
-#define SMEM_SMEM_PAGE_OFFSETS_STAGE_BYTES 128
-#define SMEM_SMEM_PAGE_OFFSETS_STRIDE 128
-#if __CUDA_ARCH__ == 1030
-#define SMEM_WORK_RESPONSE_OFF 209920
-#else
-#define SMEM_WORK_RESPONSE_OFF 177152
-#endif
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#if __CUDA_ARCH__ == 1030
-#define SMEM_TOTAL 210944
-#else
-#define SMEM_TOTAL 178176
-#endif
-#define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
 #define PAGE_SIZE 16
+#define TMEM_NCOLS 128
 #define BATCH_SIZE 256
 #define NUM_Q_HEADS 32
 #define NUM_KV_HEADS 4
@@ -123,14 +53,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define HAS_WINDOW 0
 #define USE_SCALE_PTR 0
 #define RETAIN_KV_L2 0
-#if __CUDA_ARCH__ == 1030
-#define NUM_KV_STAGES 6
-#else
-#define NUM_KV_STAGES 5
-#endif
-#define K_LOOKAHEAD (NUM_KV_STAGES - 2)
-#define KV_SUFFIX (5120 + (NUM_KV_STAGES * 32768))
-#define SMEM_BYTES (KV_SUFFIX + 8192)
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -762,7 +684,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix = kv_len_b - Q_LEN;
                 }
                 int global_q_pos = causal_prefix + q_row_idx;
-                int visible_local_keys = global_q_pos + 1;
+                int visible_local_keys = ((global_q_pos + 1) < (kv_len_b) ? (global_q_pos + 1) : (kv_len_b));
                 int win_start = 0;
                 int num_n_blocks_total = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks = ((num_n_blocks_total + num_n_blocks_total % 2) > (4) ? (num_n_blocks_total + num_n_blocks_total % 2) : (4));
@@ -1120,7 +1042,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_1 = kv_len_b_1 - Q_LEN;
                 }
                 int global_q_pos_1 = causal_prefix_1 + q_row_idx_1;
-                int visible_local_keys_1 = global_q_pos_1 + 1;
+                int visible_local_keys_1 = ((global_q_pos_1 + 1) < (kv_len_b_1) ? (global_q_pos_1 + 1) : (kv_len_b_1));
                 int win_start_1 = 0;
                 int num_n_blocks_total_1 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1 = ((num_n_blocks_total_1 + num_n_blocks_total_1 % 2) > (4) ? (num_n_blocks_total_1 + num_n_blocks_total_1 % 2) : (4));
@@ -1463,7 +1385,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_2 = kv_len_b_2 - Q_LEN;
                 }
                 int global_q_pos_2 = causal_prefix_2 + q_row_idx_2;
-                int visible_local_keys_2 = global_q_pos_2 + 1;
+                int visible_local_keys_2 = ((global_q_pos_2 + 1) < (kv_len_b_2) ? (global_q_pos_2 + 1) : (kv_len_b_2));
                 int win_start_2 = 0;
                 int num_n_blocks_total_2 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_2 = ((num_n_blocks_total_2 + num_n_blocks_total_2 % 2) > (4) ? (num_n_blocks_total_2 + num_n_blocks_total_2 % 2) : (4));
@@ -1573,10 +1495,17 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                 int kv_pos = 0;
                 #pragma unroll 1
                 for (int pair_2 = 0; pair_2 < cta_n_blocks_2 / 2 - 1; pair_2++) {
-                    int s0_1 = 2 * pair_2 % NUM_KV_STAGES;
-                    int s1_1 = (2 * pair_2 + 1) % NUM_KV_STAGES;
-                    int s0_next = (2 * pair_2 + 2) % NUM_KV_STAGES;
-                    int s1_next = (2 * pair_2 + 3) % NUM_KV_STAGES;
+#if __CUDA_ARCH__ == 1030
+                    int s0_1 = 2 * pair_2 % 6;
+                    int s1_1 = (2 * pair_2 + 1) % 6;
+                    int s0_next = (2 * pair_2 + 2) % 6;
+                    int s1_next = (2 * pair_2 + 3) % 6;
+#else
+                    int s0_1 = 2 * pair_2 % 5;
+                    int s1_1 = (2 * pair_2 + 1) % 5;
+                    int s0_next = (2 * pair_2 + 2) % 5;
+                    int s1_next = (2 * pair_2 + 3) % 5;
+#endif
                     mbarrier_wait(s_empty_0_addr, _phase_s_empty_0_0);
                     _phase_s_empty_0_0 ^= 1;
 #if __CUDA_ARCH__ == 1030
@@ -1820,8 +1749,13 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                 }
                 elect_commit(q_empty_addr);
                 int last = cta_n_blocks_2 / 2 - 1;
-                int s0_last = kv_pos % NUM_KV_STAGES;
-                int s1_last = (kv_pos + 1) % NUM_KV_STAGES;
+#if __CUDA_ARCH__ == 1030
+                int s0_last = kv_pos % 6;
+                int s1_last = (kv_pos + 1) % 6;
+#else
+                int s0_last = kv_pos % 5;
+                int s1_last = (kv_pos + 1) % 5;
+#endif
                 mbarrier_wait(o_empty_0_addr, _phase_o_empty_0_0);
                 _phase_o_empty_0_0 ^= 1;
 #if __CUDA_ARCH__ == 1030
@@ -2029,7 +1963,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_3 = kv_len_b_3 - Q_LEN;
                 }
                 int global_q_pos_3 = causal_prefix_3 + q_row_idx_3;
-                int visible_local_keys_3 = global_q_pos_3 + 1;
+                int visible_local_keys_3 = ((global_q_pos_3 + 1) < (kv_len_b_3) ? (global_q_pos_3 + 1) : (kv_len_b_3));
                 int win_start_3 = 0;
                 int pt_base_p = batch_idx_3 * max_pages_per_seq;
                 int num_n_blocks_total_3 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
@@ -2269,7 +2203,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_4 = kv_len_b_4 - Q_LEN;
                 }
                 int global_q_pos_4 = causal_prefix_4 + q_row_idx_4;
-                int visible_local_keys_4 = global_q_pos_4 + 1;
+                int visible_local_keys_4 = ((global_q_pos_4 + 1) < (kv_len_b_4) ? (global_q_pos_4 + 1) : (kv_len_b_4));
                 int win_start_4 = 0;
                 int num_n_blocks_total_4 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_4 = ((num_n_blocks_total_4 + num_n_blocks_total_4 % 2) > (4) ? (num_n_blocks_total_4 + num_n_blocks_total_4 % 2) : (4));
@@ -2283,10 +2217,18 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     tma_3d_gmem2smem(smem_qt_addr, (&Qt), 0, off_qt, 0, q_full_addr);
                 }
                 int page_tile_base_l = page_slot_l;
-                int prefill = K_LOOKAHEAD;
+#if __CUDA_ARCH__ == 1030
+                int prefill = (6 - 2);
+#else
+                int prefill = (5 - 2);
+#endif
                 #pragma unroll 1
                 for (int ni = 0; ni < prefill; ni++) {
-                    int kv_stage = ni % NUM_KV_STAGES;
+#if __CUDA_ARCH__ == 1030
+                    int kv_stage = ni % 6;
+#else
+                    int kv_stage = ni % 5;
+#endif
                     int n_block = split_start_block_1 + cta_n_blocks_4 - 1 - ni;
                     if (ni % 4 == 0) {
                         mbarrier_wait(page_full_addr + (page_slot_l) * 8, _phase_page_full);
@@ -2314,14 +2256,14 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni % 5)) * 8, 32768);
 #endif
                         int ldst = smem_kv_addr + (unsigned int)(kv_stage * 32768);
-                        int page_ids[4];
+                        int pg_k_lo[4];
                         int page_addr_1 = smem_page_offsets_addr + (unsigned int)(page_stage_k * 128) + (unsigned int)(ni % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[(0) + 3]))
                             : "r"(page_addr_1));
                         #pragma unroll
                         for (int page_i = 0; page_i < 4; page_i++) {
-                            int page_id = page_ids[page_i];
+                            int page_id = pg_k_lo[page_i];
                             #pragma unroll
                             for (int head_dim_half = 0; head_dim_half < 2; head_dim_half++) {
                                 int byte_offset = head_dim_half * 16384 + page_i * 2048;
@@ -2352,10 +2294,18 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         }
                     }
                 }
-                int main_ni = cta_n_blocks_4 - K_LOOKAHEAD;
+#if __CUDA_ARCH__ == 1030
+                int main_ni = cta_n_blocks_4 - (6 - 2);
+#else
+                int main_ni = cta_n_blocks_4 - (5 - 2);
+#endif
                 #pragma unroll 1
                 for (int ni_1 = 0; ni_1 < main_ni; ni_1++) {
-                    int stage = ni_1 % NUM_KV_STAGES;
+#if __CUDA_ARCH__ == 1030
+                    int stage = ni_1 % 6;
+#else
+                    int stage = ni_1 % 5;
+#endif
                     int n_block_1 = split_start_block_1 + cta_n_blocks_4 - 1 - ni_1;
                     int pg_v[4];
                     int page_stage_v = (page_tile_base_l + ni_1 / 4) % 8;
@@ -2364,6 +2314,13 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&pg_v[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 3]))
                             : "r"(page_addr_2));
+                        int keys_left = visible_local_keys_4 - ((split_start_block_1 + ni_1) * 8 + 4) * 16;
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            if (j * 16 >= keys_left) {
+                                pg_v[j] = 1073741824;
+                            }
+                        }
                     }
                     int page_group_done = ((ni_1 % 4 == 3) ? 1 : 0);
                     page_group_done = page_group_done | ((ni_1 + 1 == cta_n_blocks_4) ? 1 : 0);
@@ -2380,14 +2337,21 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni_1 % 5)) * 8, 32768);
 #endif
                         int vdst = smem_kv_addr + (unsigned int)(stage * 32768);
-                        int page_ids_1[4];
+                        int pg_v_lo[4];
                         int page_addr_3 = smem_page_offsets_addr + (unsigned int)(page_stage_v * 128) + (unsigned int)(ni_1 % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[(0) + 3]))
                             : "r"(page_addr_3));
+                        int keys_left_1 = visible_local_keys_4 - (split_start_block_1 + ni_1) * 8 * 16;
+                        #pragma unroll
+                        for (int j_1 = 0; j_1 < 4; j_1++) {
+                            if (j_1 * 16 >= keys_left_1) {
+                                pg_v_lo[j_1] = 1073741824;
+                            }
+                        }
                         #pragma unroll
                         for (int page_i_1 = 0; page_i_1 < 4; page_i_1++) {
-                            int page_id_1 = page_ids_1[page_i_1];
+                            int page_id_1 = pg_v_lo[page_i_1];
                             #pragma unroll
                             for (int head_dim_half_1 = 0; head_dim_half_1 < 2; head_dim_half_1++) {
                                 int byte_offset_1 = head_dim_half_1 * 16384 + page_i_1 * 2048;
@@ -2420,8 +2384,13 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                             }
                         }
                     }
-                    int next_ni = ni_1 + K_LOOKAHEAD;
-                    int k_stage = next_ni % NUM_KV_STAGES;
+#if __CUDA_ARCH__ == 1030
+                    int next_ni = ni_1 + (6 - 2);
+                    int k_stage = next_ni % 6;
+#else
+                    int next_ni = ni_1 + (5 - 2);
+                    int k_stage = next_ni % 5;
+#endif
                     int next_n = split_start_block_1 + cta_n_blocks_4 - 1 - next_ni;
                     if (next_ni % 4 == 0) {
                         mbarrier_wait(page_full_addr + (page_slot_l) * 8, _phase_page_full);
@@ -2437,34 +2406,34 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                             : "r"(page_addr_4));
                     }
 #if __CUDA_ARCH__ == 1030
-                    int _stage_kv_empty_2 = (int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 6);
+                    int _stage_kv_empty_2 = (int)((unsigned int)(ni_1 + (6 - 2)) % 6);
 #else
-                    int _stage_kv_empty_2 = (int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 5);
+                    int _stage_kv_empty_2 = (int)((unsigned int)(ni_1 + (5 - 2)) % 5);
 #endif
                     mbarrier_wait(kv_empty_addr + (_stage_kv_empty_2) * 8, 1);
                     if (elect_sync()) {
 #if __CUDA_ARCH__ == 1030
-                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 6)) * 8, 32768);
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + (6 - 2)) % 6)) * 8, 32768);
 #else
-                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 5)) * 8, 32768);
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + (5 - 2)) % 5)) * 8, 32768);
 #endif
                         int kdst = smem_kv_addr + (unsigned int)(k_stage * 32768);
-                        int page_ids_2[4];
+                        int pg_nk_lo[4];
                         int page_addr_5 = smem_page_offsets_addr + (unsigned int)(page_stage_nk * 128) + (unsigned int)(next_ni % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[(0) + 3]))
                             : "r"(page_addr_5));
                         #pragma unroll
                         for (int page_i_2 = 0; page_i_2 < 4; page_i_2++) {
-                            int page_id_2 = page_ids_2[page_i_2];
+                            int page_id_2 = pg_nk_lo[page_i_2];
                             #pragma unroll
                             for (int head_dim_half_2 = 0; head_dim_half_2 < 2; head_dim_half_2++) {
                                 int byte_offset_2 = head_dim_half_2 * 16384 + page_i_2 * 2048;
                                 {
 #if __CUDA_ARCH__ == 1030
-                                    tma_5d_gmem2smem(kdst + byte_offset_2, (&K), 0, 0, head_dim_half_2, kv_head_idx_4, page_id_2, kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 6)) * 8);
+                                    tma_5d_gmem2smem(kdst + byte_offset_2, (&K), 0, 0, head_dim_half_2, kv_head_idx_4, page_id_2, kv_full_addr + ((int)((unsigned int)(ni_1 + (6 - 2)) % 6)) * 8);
 #else
-                                    tma_5d_gmem2smem(kdst + byte_offset_2, (&K), 0, 0, head_dim_half_2, kv_head_idx_4, page_id_2, kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 5)) * 8);
+                                    tma_5d_gmem2smem(kdst + byte_offset_2, (&K), 0, 0, head_dim_half_2, kv_head_idx_4, page_id_2, kv_full_addr + ((int)((unsigned int)(ni_1 + (5 - 2)) % 5)) * 8);
 #endif
                                 }
                             }
@@ -2478,9 +2447,9 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                                 int ntoff = hg_2 * 16384 + pg_i_2 * 2048;
                                 {
 #if __CUDA_ARCH__ == 1030
-                                    tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_2, kv_head_idx_4, npg0, kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 6)) * 8);
+                                    tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_2, kv_head_idx_4, npg0, kv_full_addr + ((int)((unsigned int)(ni_1 + (6 - 2)) % 6)) * 8);
 #else
-                                    tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_2, kv_head_idx_4, npg0, kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 5)) * 8);
+                                    tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_2, kv_head_idx_4, npg0, kv_full_addr + ((int)((unsigned int)(ni_1 + (5 - 2)) % 5)) * 8);
 #endif
                                 }
                             }
@@ -2489,7 +2458,11 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                 }
                 #pragma unroll 1
                 for (int tail_ni = main_ni; tail_ni < cta_n_blocks_4; tail_ni++) {
-                    int tstage = tail_ni % NUM_KV_STAGES;
+#if __CUDA_ARCH__ == 1030
+                    int tstage = tail_ni % 6;
+#else
+                    int tstage = tail_ni % 5;
+#endif
                     int tn_block = split_start_block_1 + cta_n_blocks_4 - 1 - tail_ni;
                     int tpg_v[4];
                     int page_stage_tv = (page_tile_base_l + tail_ni / 4) % 8;
@@ -2498,6 +2471,13 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[0])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(0) + 3]))
                             : "r"(page_addr_6));
+                        int keys_left_2 = visible_local_keys_4 - ((split_start_block_1 + tail_ni) * 8 + 4) * 16;
+                        #pragma unroll
+                        for (int j_2 = 0; j_2 < 4; j_2++) {
+                            if (j_2 * 16 >= keys_left_2) {
+                                tpg_v[j_2] = 1073741824;
+                            }
+                        }
                     }
                     int page_group_done_tail = ((tail_ni % 4 == 3) ? 1 : 0);
                     page_group_done_tail = page_group_done_tail | ((tail_ni + 1 == cta_n_blocks_4) ? 1 : 0);
@@ -2514,14 +2494,21 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)tail_ni % 5)) * 8, 32768);
 #endif
                         int tvdst = smem_kv_addr + (unsigned int)(tstage * 32768);
-                        int page_ids_3[4];
+                        int tpg_v_lo[4];
                         int page_addr_7 = smem_page_offsets_addr + (unsigned int)(page_stage_tv * 128) + (unsigned int)(tail_ni % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[(0) + 3]))
                             : "r"(page_addr_7));
+                        int keys_left_3 = visible_local_keys_4 - (split_start_block_1 + tail_ni) * 8 * 16;
+                        #pragma unroll
+                        for (int j_3 = 0; j_3 < 4; j_3++) {
+                            if (j_3 * 16 >= keys_left_3) {
+                                tpg_v_lo[j_3] = 1073741824;
+                            }
+                        }
                         #pragma unroll
                         for (int page_i_3 = 0; page_i_3 < 4; page_i_3++) {
-                            int page_id_3 = page_ids_3[page_i_3];
+                            int page_id_3 = tpg_v_lo[page_i_3];
                             #pragma unroll
                             for (int head_dim_half_3 = 0; head_dim_half_3 < 2; head_dim_half_3++) {
                                 int byte_offset_3 = head_dim_half_3 * 16384 + page_i_3 * 2048;

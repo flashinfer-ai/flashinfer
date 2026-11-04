@@ -49,34 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 4
-#define NUM_IT_PIPE_STAGES 8
-#define NUM_CG_PIPE_STAGES 1
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 4096
-#define SMEM_SMEM_Q_STRIDE 4096
-#define SMEM_SMEM_W_OFF 9216
-#define SMEM_SMEM_W_STAGE_BYTES 128
-#define SMEM_SMEM_W_STRIDE 1024
-#define SMEM_SMEM_KV_G0_OFF 11264
-#define SMEM_SMEM_KV_G0_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G0_STRIDE 8192
-#define SMEM_SMEM_KV_G1_OFF 44032
-#define SMEM_SMEM_KV_G1_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G1_STRIDE 8192
-#define SMEM_SMEM_SC_G0_OFF 76800
-#define SMEM_SMEM_SC_G0_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G0_STRIDE 1024
-#define SMEM_SMEM_SC_G1_OFF 80896
-#define SMEM_SMEM_SC_G1_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G1_STRIDE 1024
-#define SMEM_SMEM_IT_OFF 84992
-#define SMEM_SMEM_IT_STAGE_BYTES 256
-#define SMEM_SMEM_IT_STRIDE 256
-#define SMEM_TOTAL 85248
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -188,7 +160,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_b28f2463c396c580283b(const __grid_co
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 9216);
@@ -203,11 +175,12 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_b28f2463c396c580283b(const __grid_co
     const int smem_sc_g1_addr = smem + 80896;
     int* smem_it = reinterpret_cast<int*>(smem_raw + 84992);
     const int smem_it_addr = smem + 84992;
-    if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + (bid * 2)))); }
+
+    // Kernel setup ops
+    if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + bid * 2))); }
     if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + (bid * 2 + 3)))); }
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 38 barriers)
-    // Mbarriers at smem_raw[0..304)
+    // Mbarrier init (38 barriers at smem_raw[0..304))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -1543,7 +1516,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_b28f2463c396c580283b(const __grid_co
                     int s_lo = ((b_cq == b_sq) ? b_skv : 0);
                     int s_hi = b_ekv;
                     if (b_cq != b_eq) {
-                        s_hi = (context_lens[b_cq * 1 + 1 - 1] + 64 - 1) / 64;
+                        s_hi = (context_lens[b_cq + 1 - 1] + 64 - 1) / 64;
                     }
                     int s_steps = (s_hi - s_lo + 2 - 1) / 2;
                     b_ckv = s_lo;
@@ -1607,7 +1580,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_b28f2463c396c580283b(const __grid_co
                             int n_lo = ((b_cq == b_sq) ? b_skv : 0);
                             int n_hi = b_ekv;
                             if (b_cq != b_eq) {
-                                n_hi = (context_lens[b_cq * 1 + 1 - 1] + 64 - 1) / 64;
+                                n_hi = (context_lens[b_cq + 1 - 1] + 64 - 1) / 64;
                             }
                             int n_steps = (n_hi - n_lo + 2 - 1) / 2;
                             b_ckv = n_lo;

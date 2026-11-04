@@ -515,7 +515,14 @@ class TmemSResource(MlaResource):
             batch_idx,
         )
         local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
-        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+        tile_idx = global_kv_tile_idx(
+            cfg,
+            local_tile_idx,
+            seq_len_kv,
+            cta_idx_kv,
+            requested_splits=self.runtime_split_kv,
+            task_cache=task_cache,
+        )
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         raw_mask_routes = (
@@ -540,7 +547,9 @@ class TmemSResource(MlaResource):
             # D576 query rows of one CTA are heads of one token: one mask.
             if cutlass.const_expr(
                 (
-                    (cfg.num_tokens_per_page == 1 and not cfg.sparse_d576_reload)
+                    cfg.num_tokens_per_page == 1
+                    and not cfg.sparse_d576_reload
+                    and cfg.fixed_seqlen
                     and cfg.logical_seq_len_q == 1
                 )
                 or cfg.sparse_d576_reload
@@ -612,7 +621,8 @@ class TmemSResource(MlaResource):
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value and cfg.logical_seq_len_q > 1
+            cfg.mask_type == MaskType.CAUSAL.value
+            and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
         )
         if cutlass.const_expr(needs_row_causal_mask):
             min_seq_len_kv = runtime_seq_len_kv_for_query_row(
@@ -627,7 +637,10 @@ class TmemSResource(MlaResource):
                 next_tile_offset_k > min_seq_len_kv
             )
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            if cutlass.const_expr(cfg.logical_seq_len_q == 1 or cfg.sparse_d576_reload):
+            if cutlass.const_expr(
+                (cfg.fixed_seqlen and cfg.logical_seq_len_q == 1)
+                or cfg.sparse_d576_reload
+            ):
                 # Cached route bits include the live prefix boundary.
                 should_apply_dense_mask = (mask_routes.low | mask_routes.high) != Int32(
                     0

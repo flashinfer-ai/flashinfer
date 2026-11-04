@@ -1,258 +1,637 @@
-# Cake dense projection GEMM backend (SM100 / SM107)
+# Cake dense projection GEMM backend with an explicit numerical mode (SM100 / SM103 / SM107)
 
-Experimental backend for the GLM-5.2 training GEMMs: the BF16 dense projection
-GEMM (K1 -- BF16 operands, FP32 accumulation, BF16 or FP32 output, strided
-views, ragged token counts, batched head projections) and the FP32 router-gate
-GEMM through split-BF16x3 tensor-core emulation with chunked FP32 promotion
-(K2).  Tracking issue: flashinfer-ai/flashinfer#5677.
+Experimental backend for the GLM-5.2 training GEMMs -- the BF16 dense projection GEMM (K1: BF16 operands, FP32
+accumulation, BF16 or FP32 output, strided views, ragged token counts, batched head projections) and the FP32
+router-gate GEMM through split-BF16x3 tensor-core emulation (K2) -- with a selectable numerical mode.  Family issue:
+flashinfer-ai/flashinfer#5677.
+
+The deterministic implementation is the package `flashinfer.experimental.dense_projection_det_gemm`
+(flashinfer-ai/flashinfer#5677, #7043; see its README for the view contract, the host paths and the per-architecture
+programs).  This package keeps its operations, dtypes, accuracy budgets and host paths, and adds programs whose
+split-K reductions add the partials in the order they finish.  Only run-to-run bitwise reproducibility is relaxed,
+and only where a row adds more than two partials.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) is built
-from the same sources and, for five input-gradient rows, ships the knob-free
-eight-warp CTA form of the GEMM (one program, measured on GB200); SM103 (B300 /
-GB300) ships its own builds of the same programs and, for three input-gradient
-rows, the eight-warp CTA form in two programs (`cake_jit.KERNELS` lists the registered architectures).  A device whose architecture the registry does not
-list raises `NotImplementedError` naming the missing instance.  The feature has
-no core entry point yet (importing this package is
-the explicit opt-in) and does not participate in automatic backend selection,
-autotuning or trace-apply.  Its libraries are loaded prebuilt from `aot/` when
-the package ships them and JIT-built by FlashInfer from `build.json` otherwise
-(see "Layout of this package").
 
-## Entry points (`cake_backend.py`)
+## Numerical mode
 
-```python
-from flashinfer.experimental.dense_projection_gemm import cake_backend as gemm
+Every entry point of `cake_backend` takes the keyword-only `deterministic: bool = True`.
 
-# K1: strided-view GEMM  out[l, m, n] = sum_k A[l, m, k] B[l, k, n]
-gemm.dense_projection_gemm(A, B, out, transposed_out=False)   # convenience path (cached plan)
-gemm.projection_forward(X, W, out=None)               # out[T, N] = X[T, K] @ W[N, K].T
-gemm.projection_dgrad(G, W, out=None, out_dtype=None)  # out[T, K] = G[T, N] @ W[N, K]
-gemm.projection_wgrad(G, X, out=None, out_dtype=None)  # out[N, K] = G[T, N].T @ X[T, K]
-prepared = gemm.prepare_dense_projection_gemm(A, B, out, transposed_out=False)
-prepared = gemm.prepare_projection_wgrad(G, X, out)
-prepared.launch()   # allocation-free; prepared.template / .grid / .module_name / .plan
-
-# K2: FP32 router GEMM through split-BF16x3 emulation
-gemm.router_fp32_gemm(A, B, out, splits=None)                  # convenience path (cached plan)
-gemm.router_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
-gemm.router_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
-gemm.router_wgrad(G, X, out=None, splits=6)            # out[N, K] = G[T, N].T @ X[T, K]
-prepared = gemm.prepare_router_fp32_gemm(A, B, out, splits=None)
-prepared.launch()   # re-splits B, launches, reduces the split-K partials; .splits
-```
-
-### Host paths
-
-Both paths run the same planner once per binding and bind the same generated
-module; they differ in who owns the plan and the workspace.
-
-| | prepared path (`prepare_*` + `launch()`) | convenience path (`dense_projection_gemm`, `projection_*`, `router_*`) |
-|---|---|---|
-| planning | once, in `prepare_*` | once per cache key, on the first call |
-| workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, the torch-chain split's fp32 scratch, split-K partials) | owned by the prepared object | carved out of the workspace arena of the (device, stream): one growable buffer per kind shared by every cached entry of that device and stream, grown to the largest requirement seen, never per entry |
-| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; `out` is allocated only when the caller passes none |
-| device queries | none after `prepare_*` | none after the first call |
-| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `clear_convenience_caches()` |
-| memory held | the prepared object's workspace | bounded by the largest geometry seen per workspace kind, however many token counts the cache has planned (a ragged T adds entries, not workspace) |
-| CUDA Graphs | capture `launch()` | do not capture (a later growth replaces, an eviction frees, the workspace a graph replays) |
-
-The orientation of `projection_wgrad` / `prepare_projection_wgrad` follows the
-row's measured rule when the rule table keys the row in exactly one orientation
-(the swapped `X.T @ G` form with the transposed store, or the direct `G.T @
-X`), else the launcher's padded-tile-work rule (N < 256 and N = 576 swap);
-`wgrad_views(G, X, arch=..., out_f32=...)` exposes the decision.
-
-The cache key is `(device index, raw stream, flags / knobs, geometry of A, B,
-out)` where a view's geometry is its shape, strides, dtype, storage offset and
-the 16-byte alignment residue of its first element -- never its address, so new
-tensors of the same geometry hit (a training step with fresh activations) and
-an entry never holds a caller's tensor.  Launches on different streams never
-share a workspace (the stream is in the key and each (device, stream) has its
-own arena); launches of one device and stream -- the only users of its arena --
-are ordered by that stream, which is what makes one buffer per kind safe to
-share: the K2 split rewrites the BF16x3 stack and its scratch in full before
-every launch, the split-K partials are reduced into `out` right after the
-launch, and growing a buffer replaces it while an earlier launch may still be
-in flight on the old one -- safe because PyTorch's caching allocator is
-stream-ordered (a freed block is handed out again only to a later allocation on
-the stream it was freed on, or after a device-synchronising `cudaFree`).  The
-stream-K slice counters are zero-initialised once and reused without a memset:
-the kernel resets every counter it uses (the last arriver of a tail tile's slice
-writes zero after the fixup), so the shared counter buffer is zero again when
-each launch completes -- the same contract the Cake launcher's per-device
-counters rely on.  Threads: planning and the arena bookkeeping (creation,
-growth, reference counts, insertion, eviction, `clear_convenience_caches()`)
-are serialised by a module lock (a miss re-checks the cache under it, so a key
-is planned once; a growth keeps the larger buffer); the K2 hit path holds its
-arena's lock from the carve of the workspace views through the split-K
-reduction, because one router call is three stream operations (split, kernel,
-reduction) on the shared BF16x3 stack and partials that two threads issuing on
-one stream must not interleave; the K1 hit path (one self-contained kernel per
-call) and the cache lookup take no lock.  The stream-ordering argument assumes
-one issuer per stream at a time, as CUDA stream semantics do.  The device facts
-a plan depends on (architecture tag, SM count, L2 size) are read once per
-device index (`device_facts`).
-
-### K1 contract
-
-* `A` BF16 `[L, M, K]` (or `[M, K]`) with unit stride on `m` or `k`; `B`
-  BF16 `[L, K, N]` (or `[K, N]`) with unit stride on `k` or `n`.  The other
-  matrix stride and the batch stride are multiples of 8 elements (16 bytes);
-  every view starts at a 16-byte aligned address.
-* `out` BF16 or FP32 `[L, M, N]` / `[M, N]` with unit stride on `n` and
-  16-byte aligned rows and batches, or -- with `transposed_out` -- `[L, N, M]`
-  / `[N, M]` with unit stride on `m` (element `(m, n)` lands at `out[l, n,
-  m]`).  The caller's view is written in place; nothing is copied or
-  re-laid-out.  The row and batch strides the kernel receives (`ldo`, `out_l`,
-  in elements; `rows` / `cols` = `M` / `N`, or `N` / `M` under `transposed_out`)
-  satisfy `ldo >= cols`, `out_l >= cols` and one of two layouts: batch-major,
-  `out_l >= rows * ldo` (each batch holds its matrix), or interleaved within a
-  row, `ldo >= L * out_l` (a `[T, H, D]` projection written as `[H, T, D]`:
-  `out_l = D`, `ldo = H * D`).  A batch of one passes its view's batch stride
-  when that spans the matrix and the matrix span `rows * ldo` otherwise
-  (`_out_strides`); any other layout is refused at launch.
-* `M, K >= 1` and `N` a positive multiple of 8 are runtime values (no
-  padding: TMA zero-fills out-of-bounds boxes, the epilogue masks rows `>= M`
-  and columns `>= N`); `L` is arbitrary and the batch strides follow the
-  layout rule above, so the token-major head views of the MLA projections
-  (`[T, H, D]` permuted to `[H, T, D]`, `D` a slice of a wider slot) run
-  without copies.
-* The three training layouts map onto the operator: forward `X @ W.T`
-  (`A` K-major, `B = W.T` K-major), input gradient `G @ W` (`B` MN-major),
-  weight gradient `G.T @ X` (both MN-major, `K = T` ragged).  A weight
-  gradient with fewer than 256 output rows runs the swapped `X.T @ G` with
-  the transposed store (`projection_wgrad` / `prepare_projection_wgrad`).
-* Numerics: BF16 x BF16 products exact in FP32, tensor-core FP32
-  accumulation, one rounding at the store.  BF16 outputs match an FP64
-  reference to `atol = rtol = 1e-2` elementwise; FP32 outputs carry the
-  accumulation error (`rel_fro <= 5e-5`, `max_abs <= 1e-3 * max|ref|`).
-
-### Host planning (mirror of the Cake launcher)
-
-The host selects one traced kernel instance per (A layout, B layout, tile
-width, tile height, output kind, epilogue path, raster group, TMA L2 eviction
-hints); every
-rule is a verbatim copy of the Cake kernel host's (each function names its
-source line range).  Two device facts enter the plan: the SM count (CTA pairs:
-stream-K split, raster group, wave working set) and the L2 size (hint gate);
-`prepare_*` and the convenience path read both once per device index
-(`device_facts`: `device_sm_count`, `device_l2_bytes` =
-`torch.cuda.get_device_properties(...).L2_cache_size`, falling back to
-`cuDeviceGetAttribute`), `plan_dense_projection_gemm` takes them as inputs:
-
-| choice | rule |
+| call | runs |
 |---|---|
-| operand layout | `operand_view`: the contraction axis contiguous -> K-major, else the M/N axis contiguous -> MN-major |
-| `BLOCK_N` | `default_block_n`: 128 when `N <= 128`, 192 when `N` is a multiple of 192 but not of 256 (`N = 576`: three exact tiles), else 256.  The menu is `BLOCK_N_CHOICES = (128, 160, 192, 224, 256)`: 160 / 224 (Cake round 9) are wave-quantization fits a rule or caller selects; their 80 / 112-column warp slices take the register epilogue |
-| `CTA_ROWS` | `default_cta_rows`: 128.  The 256-row tall-tile family (`cta_rows=256`, symbol `_m256`) and the 64-row Layout-B family (`cta_rows=64`, Cake round 9: 128 x `BLOCK_N` pair tiles through the M=128 `cta_group::2` MMA, four TMEM buffers; symbol `_m64`) are rule or caller selections (`CTA_ROWS_CHOICES = (64, 128, 256)`).  A caller-forced `cta_rows` outside the row's rule (or default) family drops the rule's `stages` / `slots` / `epi`; its other knobs still apply |
-| epilogue | `epi_mode`: a warp slice is `epi_cols = BLOCK_N / 2` columns (`BLOCK_N / 4` on 64-row tiles; always a multiple of 16).  Transposed output -> register stores (`reg`); row-major fp32 -> TMA stores (`tma`) when the slice is whole 32-column chunks (`epi="reg"` is an opt-in float4 register path; 160 / 224-wide and 64-row 192-wide slices have no TMA path); row-major bf16 -> `tma` when `K <= 1024` and the slice is whole 64-column chunks (`BLOCK_N = 256` at any height, 128 at 128 / 256 rows), else `reg`; `quad_store` (rule-selected, `_q`) is the bf16 `reg` variant for whole-64-column slices that transposes 32-byte row segments across lane quads so each lane issues one 256-bit store per 4-row group |
-| staging slots | `epi_slots`: 1 with the TMA-store epilogue (2 only when `K <= K_TWO_SLOTS = 0` and the slice's chunk count is even), 0 otherwise |
-| stages | `default_stages(slots, cta_rows, block_n, b_mn)`: 7 / 6 / 5 for 0 / 1 / 2 slots at `BLOCK_N = 160 / 192 / 224 / 256`, 9 / 8 / 6 at `BLOCK_N = 128`, 4 / 4 / 3 for tall (256-row) tiles; 64-row tiles take the deepest pipeline that fits the 227 KiB opt-in beside the staging (32 KiB per slot), at most 12 (9 / 8 / 6 at `BLOCK_N = 256`, 12 / 12 / 10 at 128; `b_mn` sizes the MN-major B panels); the single-CTA form (`cta1`, round 19: its B stage streams the whole `BLOCK_N` columns per CTA, `b_stage_bytes(..., cta_group=1)`, so 48 KiB stages at `BLOCK_N = 256` and 32 KiB at 128) takes the deepest fit the same way (4 / 4 / 3 and 7 / 6 / 5).  A rule or caller `stages` is bounded by `smem_limit_for(arch)`: the 232448 B opt-in, or 334336 B on `sm_107a` (CUDA 13.4 oversized shared-memory mode, `SMEM_OVERSIZED`); the limit is not part of the instance key, so an instance has one symbol on every architecture |
-| raster group | `default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)`: 16 CTA row tiles per cluster-launch-control raster group (a launch parameter since round 11, not an instance-key field) (even, so the two CTAs of a pair are the row halves of one 256-row tile) on every row; a 4-row group for one-to-two-wave weight-gradient rows measured no gain in the production configuration and is not applied.  A non-default group would carry the symbol suffix `_g<n>` |
-| L2 hints | `default_hints(a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, l2_bytes)`: no hint while one wave's operand panels fit the L2 (`wave_working_set(m_tiles, n_tiles, K, group_m, pairs) <= l2_bytes`); otherwise `A` streams `evict_first` when there is one column tile (`n_tiles == 1`); every other row gets no hint (reuse-ratio hints on the weight-gradient class measured 0..-4 percent in the production stream-K configuration).  Symbol suffix `_h<a><b>` (first letters): `_hen` = A evict_first, B none |
-| L2 promotion, prefetch | `default_promo` = `none`, `default_pf` = 0 (measured, off); the symbol carries `_<promo>` / `_pf<n>` when set |
-| CTA form | `form`: `""` (the ten-warp pipeline of every other program) or one of `W8_FORMS = ("w8r", "w8rs", "w8")`, the eight-warp CTA form of the same GEMM measured for three `sm_103a` input-gradient rows (`w8r` / `w8rs`) and five `sm_100a` input-gradient rows (`w8`, the knob-free program): four epilogue warps, a loader, a scheduler (`w8r`; `w8` = the same without the early accumulator release) or the loader's elected lane issuing the cluster-launch-control queries in its place (`w8rs`) and the MMA warp on CTA-pair 256 x 256 tiles over six 32 KiB stages, whole tiles only, the BF16 output through the TMA store, the raster quotients resolved by four fast divisors the host passes (`fd_tiles_l` / `fd_tiles_g` / `fd_group` / `fd_last`: launch arguments of these programs alone).  Symbols `_tma1_w8r` / `_tma1_w8rs` / `_tma1_w8` (the form token is the last knob suffix; `instance_key` field 37).  A rule's form yields where the plan is not whole-tile or a caller forces a pipeline, tile, output, epilogue, tail or raster knob (the row's ten-warp program runs the plan asked for; the rule's `pd` / `pro` / `lw` / `mg` / `sw` are its program there); where the form stands, those knobs are cleared from the key.  A caller-forced form is refused there (`instance_key`; the planner for stream-K units) |
-| template | `instance_symbol(instance_key(...))`, e.g. `dense_proj_gemm_kk_n256`, `dense_proj_gemm_kk_n128_hen`, `dense_proj_gemm_kn_n256_f32_tma1`, `dense_proj_gemm_nn_n256_f32_tma1`, `dense_proj_gemm_nn_n128_hen_t`, `dense_proj_gemm_kk_n256_m64`, `dense_proj_gemm_kk_n256_m256_ov_ht`, `dense_proj_gemm_nn_n160_m256_bz64`, `dense_proj_gemm_nn_n128_hen_t_skx`, `dense_proj_gemm_kn_n256_tma1_bg8`, `dense_proj_gemm_kn_n256_f32_v8_ef_s9`, `dense_proj_gemm_nn_n256_m256_sks_sb2`, `dense_proj_gemm_kk_n128_hen_c1`, `dense_proj_gemm_kn_n256_tma1_w8r`, `dense_proj_gemm_kn_n256_tma1_w8rs`, `dense_proj_gemm_kn_n256_tma1_w8` (round 13: `_pk` parked / `_ov` overlapped single-TMEM-buffer / `_ht` half-height-tail-wave tall epilogues; `htail` replaces the stream-K tail plan by 2 x tail whole-K half items when they fit the CTA pairs, so `ws_f32_elems = 0` and `sk_iters = sk_units * k_blocks`; `_bz64` = 32-column MN-major B panels (`b_swz` 64, smaller stages, deeper default pipeline), `_skx` = exact p-way K split of the tail tiles (`sk_exact`, pre-empts `sk_parts` / `htail`, p travels in `sk_iters`); `_sks` = synchronised stream-K tail (round 18: `sk_sync`, the tail tiles' main units over K steps [0, s) plus collector units over the leftovers, one fp32 slab per tail tile and a deterministic two-addend fixup; `sk_iters` = the main-unit count, `iters_per_unit` = s = ceil((q K + `sk_sync_m`) / (q + 1)); yields to `sk_exact`, pre-empts `sk_parts` / `htail`); `_bg8` = eight adjacent batch entries (heads) interleaved across the CTA pairs (`batch_group`, batched MLA rows only, 0 for a batch of one); `_ef` = fp32 v8 register stores with `L1::no_allocate.L2::evict_first` (`store_ef`), `_s9` = nine pipeline stages (oversized dynamic shared memory on sm_107a); round 19: `_sb<n>` = the slab path of the synchronised fixup (`sk_slab`: 1 early arrival, 2 + the bulk slab read through the dead mainloop stages, 3 + the fp32 output as the slab - the same `_sks` plan, forced to 0 without `sk_sync`; a rule's 3 yields to 2 when a caller forces the row-major fp32 register epilogue, a rule's 2 to 0 when the eight warp slabs do not fit a caller-forced pipeline), `_c1` = the single-CTA form (`cta1`: one `CTA_ROWS` x `BLOCK_N` tile per CTA with cluster dims (1, 1, 1), so `m_tiles` is not rounded to pairs, `pair_tiles` counts CTA tiles, `sm_pairs` is the SM count (`sm_units`), the grid is `num_full` CTAs and the form carries no tail policy; 128-row family only); `_skf` directly after `_skx` = the tail-first order of the exact split (`sk_first`: pair work items `[0, sk_units)` are the K parts of the tail tiles, then the whole tiles; the same plan, counters and slabs as `_skx`), `_lw` between `_or` and `_pro` = the load warp leaving the pair prelude before the post-allocation CTA rendezvous (`lw`; pair programs whose MMA warp allocates TMEM, `pro` bit 4), `_mg` directly after `_lw` = the whole-tile tile resolve (`mg`: the load warp and the MMA warp walk whole tiles, one segment per item, with the raster quotients resolved through corrected fp32 reciprocals; whole tiles only - no batch raster, column-grouped raster, half-height tail or stream-K form, and the plan carries no stream-K unit); `_sw<n>` directly after `_mg` = the paced output stores (`sw`: each epilogue warp of the bf16 TMA-store pd-2 drain delays its bulk tensor store issue, after the staging write and its fences, by a per-warp number of steps of `n` dependent u32 multiply-adds seeded by a clock sample, so each per-item eight-store burst becomes a seven-step ramp; the stores and bytes are unchanged; needs `slots` > 0, `pd` 2 and a bf16 output; 0 = off); `_w8r` / `_w8rs` / `_w8` directly after `_pro<n>` = the eight-warp CTA form (`form`, the CTA form row above)) |
-| rules | `ROW_RULES[(arch, A MN-major, B MN-major, fp32 out, transposed out, batched, N, K, M)]` (the ragged token count never keys a rule: `M = None` for forward / input gradients, `K = None` for weight gradients) lays per-row knobs over the defaults above, merged over `ARCH_RULE_DEFAULTS` (`pro` 7 on `sm_100a`, `sm_103a` and `sm_107a`).  Rounds 2-33 mirror the Cake table byte for byte; the shapes tranche (`sm_100a` and `sm_103a`: forward / input gradient / weight gradient rows at K 4096-17408, N 32-17408, measured at T 16172-16384 on GB200 / GB300 against cuBLAS) and its kernel-level round 2 (the half-tail column-grouped 4096 squares, 12-column raster groups on the N 5120 rows, the load-warp thin input gradients with the `l2_256b` promotion of the N 512 rows on `sm_103a`, the tail-first 16-way exact split of the 4096 x 12288 weight gradients) extend it per architecture.  A rule's `sk_first` / `lw` yield where the planned program cannot carry them (an exact split the arithmetic does not admit, the single-CTA form, a `pro` without bit 4, a caller-forced tile family).  Three `sm_103a` input-gradient rules (4096 -> 512, 5120 -> 512, the kv_a 6144 -> 576) carry `mg` with `sk: False` (the whole-tile tile resolve measured faster than the row's program above the pair spread at both T on GB300); a rule's `mg` yields where the plan carries stream-K units or exceeds the kernel's cluster-tile bound (a caller `sk` / `sk_max_units` / `sk_parts` / exact or synchronised split), where a caller forces a raster or tail form the `_mg` program excludes (`batch_group` / `cgrp` / `htail` / `sk_first` / `stt`), the single-CTA form or another tile family, and a caller-forced `mg` is refused on such a plan (`sk_units` is 0 on every `_mg` program).  Two `sm_103a` input-gradient rules (5120 -> 512, 5120 -> 1024) carry `sw` 25 (the paced output stores measured faster than the row's program above the pair spread at both T on GB300); a rule's `sw` yields where the planned program is not the bf16 TMA-store pd-2 drain (a caller-forced register epilogue or `slots` 0, another `pd`, the fp32 output) or the single-CTA form, and a caller-forced `sw` is refused there.  Three `sm_103a` input-gradient rules (4096 -> 512 and the kv_a 6144 -> 576 with `w8rs`, 5120 -> 512 with `w8r`) carry `form`: the eight-warp CTA form measured faster than the row's program above the pair spread at both T on GB300, with raster groups of 12 row tiles on 5120 -> 512 and kv_a; the knobs after it stay the row's program where the form yields.  Five `sm_100a` input-gradient rules (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a 6144 -> 576) carry `form` `w8`: the knob-free eight-warp program measured faster than the row's program above the pair spread at both T on GB200 (the `sm_100a` rules govern B200 as well, where no measurement exists), with raster groups of 12 row tiles on 4096 -> 512 and 12 on kv_a and 8 on the other three rows; the knobs after it stay the row's program where the form yields.  A rule's `htail` names the program (`_ht`); the half-tail fit (`0 < 2 * tail <= pairs`) selects only the plan (`plan.htail_plan`): where the half items do not fit the device's pairs (the K 5120 thin input gradients: 1280 tiles on 76 pairs, tail 64; the 4096 x 12288 projections: tail 56) the `_ht` program runs the row's plain whole-tile plan (never linearised stream-K units, whatever `sk` the row or the caller asked for), as measured.  `sm_103a` registers every `sm_100a` program and its lanes measured the shapes tranche alone: a row without an `sm_103a` rule plans with the `sm_100a` rule (`RULE_PARENT`; the same knobs, so the same program, kept where the `sm_103a` registry has it), a rule `sm_103a` measured itself always wins, and the weight-gradient orientation follows the same lookup; `sm_100a` and `sm_107a` inherit nothing |
-| exact-wave gate | a rule's `BLOCK_N` 224 (`EXACT_WAVE_BLOCK_N`) was measured for the whole-wave fit of its tiles on the 76-pair devices (`exact_waves`: 152 tall tiles of the 4096 x 4096 weight gradient = two waves, 76 tiles of 4096 -> 1024 = one); on a device whose pairs do not fit them in whole waves and where the default tile needs fewer waves (74 pairs of a 148-SM part) the rule's `BLOCK_N` yields to the default tile (`plan.wave_fallback`; the rule's other knobs stay); a caller-forced `block_n` is never touched, and the plan is the launcher's where the fit is exact or both tiles need the same waves (152 and 160 SMs) |
-| registry fallback | a plan whose template this architecture's registry lacks is redone without the batched small-M swap (`plan.swap_fallback`), then without the row's measured rule (`plan.rule_fallback`: the architecture default `pro` form), then lands on the nearest generated program of the row's layout / output class (`plan.knob_fallback`): the hand-ordered knob variants first (plain TMA L2 policy, the single-CTA form, the 64-row pair family, the tall tile, the register epilogue, BLOCK_N 128, each in the three `pro` forms), then every generated program of the class, nearest symbol first, with the knobs its symbol decodes to; a caller-forced knob always wins.  Only a class without any generated program on the architecture raises (`NotImplementedError` at binding) |
-| grid | `(num_full + sk_units) * 2` CTAs: one cluster of two CTAs per `2 * CTA_ROWS` x `BLOCK_N` output tile plus the stream-K units; under `cta1` (round 19) `num_full` CTAs, one per `CTA_ROWS` x `BLOCK_N` tile, launched with the module's recorded cluster dims (1, 1, 1) |
-| stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, the tiles' linearised K steps are cut into units of `iters_per_unit = ceil(k_blocks / 2)` (two K-aligned halves per tile on an even `k_blocks`), `sk_units = ceil(pair_tiles * k_blocks / iters_per_unit)` so that every unit holds a K step, with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters, and `check_stream_k_plan` refuses a plan outside the kernel's launch contract: a unit without a K step on the `pd` 2 / `sk_slab` 2 / `stt` programs (they hand off the work in an item's last segment, so such a unit never finishes), or synchronised collectors outside `[1, tail_tiles]` (`[1, ...)` on the other `sk_sync` programs) |
+| `deterministic=True` (default) | the deterministic package's canonical entry point with the same arguments: the same programs, the same bits, the same errors |
+| `deterministic=False` | this package's programs on the rows that carry a measured verdict for the device (below); the deterministic programs for every other row and operation |
+| `deterministic=False` under `torch.use_deterministic_algorithms(True)` | `RuntimeError`; with `warn_only=True` a `UserWarning` and the deterministic path |
 
-`plan_dense_projection_gemm(A, B, out, sm_count=..., l2_bytes=...)` exposes
-the plan (`GemmPlan`, including `wave_working_set_bytes`) without a device;
-the prepared launch resolves the template
-through `cake_jit.KERNELS[arch][template]`, owns its stream-K partial slabs
-(`(sk_units + tail_tiles) * 2 * CTA_ROWS * BLOCK_N` fp32), its slice counters
-(`max(8192, tail_tiles * 16)` u32: the lane-spread dummy counters above index
-4096 must be addressable), and binds the
-module's argument plan by keyword (`bind_launch`, fails closed on an unknown
-name).  Given the same device the result is bitwise identical to the Cake
-launcher's.
+*Table: what a call runs, by its `deterministic` argument.  The default does not read PyTorch's setting: it is
+deterministic already.*
 
-### K2 contract
+| operation | `deterministic=False` |
+|---|---|
+| K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles, or the deterministic plan's two-way split of K with the partials added in a fixed order; a recomputed forward reproduces its result) |
+| K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles, or the deterministic plan's two-way split of K with the partials added in a fixed order) |
+| K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
+| K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row -- without a split count, while no router table gives the forward a verdict, without the per-call check of the row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
+| K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) on every row: the exact-FP32 SIMT windows measured on 152-SM `sm_100a` and 212-SM `sm_107a` parts missed the FP64 error rule (the router FP64 error table below), so no router table gives the input gradient a window and this checkout registers no SIMT program |
+| K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
+| BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
 
-* `A`, `B`, `out` FP32 2-D views: `A [M, K]` with unit stride on `m` or `k`
-  (other stride a multiple of 4), `B [K, N]` with unit stride on `k` or `n`,
-  `out [M, N]` with unit inner stride and 16-byte rows; `N` a multiple of 8.
-* The operand layouts select the instance and the production split-K count:
-  `kk` (forward, 4 splits), `kn` (input gradient, 1), both MN-major -> the
-  swapped transposed-store weight gradient `nn_t` (6 splits; `out.T = B.T
-  A.T`).  An MN-major `A` with a K-major `B` has no instance.
-* Every `launch()` re-splits the second operand into the retained
-  `[3, outer, inner]` BF16 stack in the operand's own layout (exact three-way
-  split, no allocation: one launch of the fused split program
-  `split_fp32_bf16x3` when this checkout registers it for the device, else a
-  five-op torch chain through an fp32 scratch -- the same bits either way),
-  launches, and sums the split-K partials on the host in a fixed order.  Splits, chunk boundaries and the reduction order are
-  fixed: bit-exact run to run.  Error against an FP64 reference: FP32-class
-  (`rel_fro` about 2e-7 to 4e-7 on the GLM-5.2 router shapes).
+*Table: the routing of `deterministic=False` (`cake_backend.ROUTES`).*
+
+## Numerics, architectures and parallelism
+
+| property | contract |
+|---|---|
+| operands and accumulation | BF16 operands with FP32 accumulation (K1); FP32 operands split exactly into three BF16 terms with FP32 accumulation (K2), except in a K2 SIMT window (input and weight gradient): the FP32 operands as they are, one FP32 FFMA per product on the CUDA cores, no BF16x3 split.  No silent TF32 or BF16 for the router |
+| accuracy | the deterministic package's budgets against FP64 of the exact operands, worst over repeated runs: BF16 out `atol = rtol = 1e-2`; FP32 out relative Frobenius error `<= 5e-5` and max error `<= 1e-3 * max abs(ref)`; router `<= 2e-6` relative Frobenius error and no row whose top-8 experts differ from FP64 (outside near ties of the 8th and 9th logits) |
+| rounding | each output element is rounded once, from its complete FP32 sum |
+| subnormals | kept: K1 adds the partials with IEEE round-to-nearest adds, K2 reduces with the TMA reduce-add; a K2 SIMT window (input and weight gradient) accumulates with round-to-nearest FFMA, adds the sums of a CTA's slices in a fixed order through shared memory and stores every element of `out` once, with no reduce-add; nothing flushes to zero |
+| run-to-run bits, K1 | two splits (every `sm_100a` and `sm_103a` row, `sm_107a` `8192 -> 128`): repeat bit for bit (one add of two values); one split (`sm_107a` rows marked `p = 1` below): repeat bit for bit (whole tiles); three or four splits (the other `sm_107a` rows): vary in the last bits |
+| run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); a SIMT window (weight or input gradient): repeats bit for bit (every element stored once, its slices added in a fixed order); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
+| architectures | `sm_100a`, `sm_103a`, `sm_107a`: one `-gencode=arch=compute_<arch>,code=sm_<arch>` build per program, minimum CUDA 12.8 / 12.9 / 13.4 (`build.json`) |
+| streams and threads | planning takes a module lock; the convenience path keeps one workspace arena per (device, stream); prepared launches own their workspace |
+| CUDA graphs | prepared launches allocate nothing on the device and capture into a CUDA graph (K2: the split, the memset of `out`, the program); no host synchronization |
+| other kernels on the device | the programs walk their work persistently over at most `sm_count // 2` CTA pairs and wait on no CTA that is not resident; every routed row was measured next to a kernel holding 8, 16 or 32 SMs on another stream (no more than 3 % slower than the deterministic plan there) |
+| context parallelism (KCP) | not applicable: a local operator on the caller's CP-local shards; no collectives; the reduction of parameter gradients across ranks stays with the caller |
+| autograd, checkpointing, gradient accumulation | none in either package: callers compose the forward and both gradients; `out` is overwritten, not accumulated into |
+
+*Table: the numerical, architecture and parallelism matrix of `deterministic=False`.*
+
+## Planners and rule tables
+
+A planner decides, per row and device, whether `deterministic=False` runs this package's program and with which
+parameters; a row it leaves runs the deterministic program (`plan_dense_projection_gemm` / `plan_router_fp32_gemm`
+say which).  Only measured rows carry a program: a row runs this package's program where that program was faster
+than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign test
+(p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, and no more than
+3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A `None` entry is a measured
+row that missed; a row without an entry was not measured.  Both run the deterministic program.
+
+The K1 verdicts were measured at 16172 to 16384 tokens.  Those of `K1_SPLIT_RULES` hold at every token count their split
+count fits (`num_splits * 64 <= T + 63`), except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS` (the K1 token
+tables below: `sm_100a` / `sm_103a` parts of 152 SMs or more, `sm_107a` parts of 208, 212 and 216 SMs), on parts
+of exactly 148 SMs those of `K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` (the 148-SM K1 token table below), and, where the
+token count spans an odd number of 64-token K blocks, those of `K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` (the odd-block K1
+table below); the tables of
+`K1_SPLIT_RULES_BY_SM` and the overrides of `K1_SPLIT_OVERRIDES_BY_SM` hold only at 16172 to 16384 tokens
+(`K1_SPLIT_RULES_BY_SM_TOKENS`) and, for the rows of `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, at the token ranges of that
+table (the 212-SM K1 token-range table below), except those token counts; the rows of
+`K1_SPLIT_RANGE_OVERRIDES_BY_SM` run that table's program at its token ranges (the same table), and those of
+`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` at its token ranges where the token count spans an even number of 64-token K blocks
+(the same table on 212 SMs, `4096 -> 128` FP32 included; on 152-SM `sm_100a` / `sm_103a` parts the 152-SM two-split
+table below).
+The router verdicts hold only inside token windows (`ROUTER_RULES`; the last table below) and pass a stricter rule:
+measured in one long-lived process and in a fresh process per token count, and no more than 3 % slower than the
+deterministic plan next to such a kernel both in the same launch order and with the router partition launched before
+that kernel against the deterministic plan launched after it.  A router window also keeps the FP64 error of the plan
+the row takes without it: for every seed, a relative Frobenius error against FP64 of the exact operands (worst of 20
+runs) at most 1.02 times that plan's, 10 seeds per measured token count (the router FP64 error table below).  Every
+other token count of a router row runs the deterministic program.  The K1 verdicts hold from the floor of `K1_MIN_SM_COUNT` /
+`K1_RULE_MIN_SM_COUNT` up (a part with more SMs than the measured ones takes them without a measurement, a part with
+fewer runs the deterministic program); the tables of `K1_SPLIT_RULES_BY_SM` hold for exactly 208 and 212 SMs
+(`K1_SPLIT_OVERRIDES_BY_SM` has no entry).  The
+router windows hold only on the SM count they were measured on (`ROUTER_SM_COUNT`: 152 on `sm_100a` / `sm_103a`, 216 on
+`sm_107a`), and those of `ROUTER_RULES_BY_SM` only on exactly the SM count of their table (208 and 212 on `sm_107a`);
+every other SM count runs the deterministic plan, except in the `"waves"` windows, which keep the earlier SM condition
+of `"waves"` (the deterministic plan's last wave below 80 % full).  A SIMT window comes first in its row and may
+overlap the windows after it: on an SM count where it does not hold, the token count takes the next window that holds
+it.  The measured parts have 148 and 152 SMs (`sm_100a` /
+`sm_103a` K1), 152 SMs (`sm_100a` / `sm_103a` router) and 208, 212 and 216 SMs (`sm_107a`).
+
+| table | key | value |
+|---|---|---|
+| `K1_SPLIT_RULES` | `(arch, L, M, N, out_dtype)`: the transposed-store launch `out[l, n, m]` (`M` = the stored inner extent, `d_in` of a weight gradient; `N` = its rows, `d_out`), `out_dtype` `"bf16"` / `"f32"` | `(block_n, num_splits)` (this package's program; `block_n` 192 is the row-major-store program with the operands exchanged) or `None` (the deterministic program) |
+| `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for the K1 verdicts of the architecture (`sm_100a` / `sm_103a`: 148, `sm_107a`: 216) |
+| `K1_RULE_MIN_SM_COUNT` | a key of `K1_SPLIT_RULES` | the fewest SMs for that row's verdict where it is above `K1_MIN_SM_COUNT` (`sm_103a` `4096 -> 48`: 152) |
+| `K1_SPLIT_RULES_BY_SM` | `(arch, sm_count)` | the K1 verdicts of the parts with exactly `sm_count` SMs below a row's floor (keys and values as in `K1_SPLIT_RULES`), at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` and of the row's ranges in `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` only; a part without a table, and every other token count, runs every K1 row below the floor on the deterministic program (`sm_107a`: 208 and 212 SMs) |
+| `K1_SPLIT_RULE_EXCLUDED_TOKENS` | a key of `K1_SPLIT_RULES` or of a table of `K1_SPLIT_RULES_BY_SM` | `((sm_count, min_tokens, max_tokens), ...)`: the row runs the deterministic program at a token count from `min_tokens` to `max_tokens` (`None`: no upper bound) on a part of at least `sm_count` SMs (`sm_count` at or above the row's SM-count floor) or of exactly `sm_count` SMs (below it); every other token count and part keeps the verdict |
+| `K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` | `(arch, sm_count)`, then a key of `K1_SPLIT_RULES` | `((min_tokens, max_tokens), ...)`: the row runs the deterministic program at a token count from `min_tokens` to `max_tokens` (`None`: no upper bound) on a part of exactly `sm_count` SMs; every other token count and part keeps its routing (`sm_100a` / `sm_103a`: 148 SMs, the 148-SM K1 token table below) |
+| `K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` | a key of `K1_SPLIT_RULES` or of a table of `K1_SPLIT_RULES_BY_SM` | `((sm_count, min_tokens, max_tokens), ...)` (parts as in `K1_SPLIT_RULE_EXCLUDED_TOKENS`): the row runs the deterministic program at a token count from `min_tokens` to `max_tokens` (`None`: no upper bound) that spans an odd number of 64-token K blocks (`ceil(T / 64)` odd); an even number, and every other token count and part, keeps its routing (FP32 two-split rows of `sm_100a`, `sm_103a` and `sm_107a`: the odd-block K1 table below) |
+| `K1_SPLIT_RULES_BY_SM_TOKENS` | -- | `(min_tokens, max_tokens)`: the token counts (`K` of the weight gradient) the tables of `K1_SPLIT_RULES_BY_SM` and `K1_SPLIT_OVERRIDES_BY_SM` hold for, `(16172, 16384)` (where they were measured) |
+| `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` | `(arch, sm_count)`, then a key of that part's table in `K1_SPLIT_RULES_BY_SM` | `((min_tokens, max_tokens), ...)`: further token counts at which the row takes its verdict from the part's table, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; every other row, part and token count keeps `K1_SPLIT_RULES_BY_SM_TOKENS` alone (`sm_107a`: 212 SMs, the 212-SM K1 token-range table below) |
+| `K1_SPLIT_RANGE_OVERRIDES_BY_SM` | `(arch, sm_count)`, then a key of that part's table in `K1_SPLIT_RULES_BY_SM` | `((min_tokens, max_tokens, (block_n, num_splits)), ...)`: on a part of exactly `sm_count` SMs below the row's floor, a token count from `min_tokens` to `max_tokens` runs that program, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; a range lies outside `K1_SPLIT_RULES_BY_SM_TOKENS` and the row's `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` (`sm_107a`: 212 SMs, the 212-SM K1 token-range table below) |
+| `K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` | `(arch, sm_count)`, then a key as in `K1_SPLIT_RULES` (below the row's floor: a key of that part's table in `K1_SPLIT_RULES_BY_SM`) | `((min_tokens, max_tokens, (block_n, num_splits)), ...)`: on a part of exactly `sm_count` SMs, below the row's floor or at or above it, a token count from `min_tokens` to `max_tokens` that spans an even number of 64-token K blocks (`ceil(T / 64)` even) runs that program, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; an odd number keeps the routing of the tables above; a range lies outside `K1_SPLIT_RULES_BY_SM_TOKENS` and the row's ranges in `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and `K1_SPLIT_RANGE_OVERRIDES_BY_SM` (`sm_107a`: 212 SMs, the two-split rows of the 212-SM K1 token-range table below, `4096 -> 128` FP32 without a verdict in the part's table of `K1_SPLIT_RULES_BY_SM`; `sm_100a` / `sm_103a`: 152 SMs, the 152-SM two-split table below) |
+| `K1_SPLIT_OVERRIDES_BY_SM` | `(arch, sm_count)` | verdicts (keys and values as in `K1_SPLIT_RULES`) that replace a row's `K1_SPLIT_RULES` verdict on parts of exactly `sm_count` SMs at or above the row's floor, at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; every other token count and SM count keeps the `K1_SPLIT_RULES` verdict (no entry) |
+| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`), `"nn_t"` (weight gradient, `hidden` = the launch's `M`) or `"kn"` (input gradient, `hidden` = the launch's `N`), `experts` = the launch's `N` (`K` of the input gradient) | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward and of the input gradient; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"`, a unit count (this package's stream-K program) or `"simt_n<tile_n>m<tile_m>s<slices>"` (the exact-FP32 SIMT program of the row's layout, `router_simt`; the only spec of an input-gradient row) |
+| `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`; below a SIMT window too) or with a table of its own in `ROUTER_RULES_BY_SM` |
+| `ROUTER_RULES_BY_SM` | `(arch, sm_count)` | the router verdicts of the parts with exactly `sm_count` SMs (keys and values as in `ROUTER_RULES`; `router_rules` picks the table of a device); such a part takes its own table only: a row without an entry, and every token count outside its windows, runs the deterministic program (`sm_107a`: 208 and 212 SMs) |
+
+*Table: the rule tables.*
+
+| architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
+|---|---|---|---|
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) at an even K-block count from 1024 to 4096 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, hidden 5120 from 1 to 128 tokens: `"waves"` (on every SM count where it applies).  Every other token count, SM count and hidden size: deterministic (6 splits); the SIMT and head/tail windows of 152-SM parts missed the FP64 error rule (the router FP64 error table below) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed); `4096 -> 128` FP32 on 152 SMs: (64, 2) at an even K-block count from 1024 to 6144 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, hidden 5120 from 1 to 160 tokens: `"waves"` (on every SM count where it applies).  Every other token count, SM count and hidden size: deterministic (6 splits); the head/tail windows of 152-SM parts, and `"waves"` from 161 tokens, missed the FP64 error rule (the router FP64 error table below) |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table (the four FP32 rows with one split: from 961 tokens up).  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the last table: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
+| `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3), except the token counts of the `sm_107a` K1 token table.  `4096 -> 512`, `5120 -> 512`, `4096 -> 1024`, `5120 -> 1024` FP32: deterministic (their one-split verdicts, (128, 1) and (256, 1) `p = 1`, fail the FP64 comparison of the `sm_107a` K1 token table at these token counts); `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel the head/tail program missed at both hidden sizes on the parts at full SM clock |
+| `sm_107a` (212 SMs, 16172 to 16384 tokens and the ranges of the 212-SM K1 token-range table) | `4096 -> 32, 48, 64` FP32 (64, 3); `5120 -> 32, 48, 64` FP32 (64, 3); `8192 -> 128` (128, 2); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32: (192, 1) `p = 1` (row-major-store program, 176 CTAs); `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  At the two-split ranges of the 212-SM K1 token-range table, where the token count spans an even number of 64-token K blocks (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`): `4096 -> 512`, `5120 -> 512` FP32 (128, 2); `4096 -> 1024` FP32 (192, 2) (row-major-store program); `5120 -> 1024` FP32 (256, 2); `4096 -> 128` FP32 (64, 2) from 1024 to 7680 tokens (no verdict in the 212-SM table: deterministic at every other token count).  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict, as on 208 SMs); `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed; `4096 -> 4096` FP32 against the deterministic package's 160-wide tiles of the row); `5120 -> 1024` BF16: (256, 1) `p = 1` at its range of the 212-SM K1 token-range table (`K1_SPLIT_RANGE_OVERRIDES_BY_SM`), deterministic at 16172 to 16384 tokens (1.3 to 2.5 % faster there, missed on 208 SMs) | deterministic (4 splits) | 256 experts, hidden 5120 and 6144 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program with the BF16 parts of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES_BY_SM`).  Every other token count, and hidden 4096: deterministic (6 splits): the SIMT windows (hidden 4096 and 5120 from 1 to 256 tokens, hidden 6144 from 1 to 192) missed the FP64 error rule (the router FP64 error table below); next to a resident kernel `"H0.5x4"` missed at hidden 4096 with both head/tail programs, and at hidden 6144 with the three-chunk-buffer program |
+
+*Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
+holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens; on `sm_107a`, `4096 -> 512`
+BF16 (192 CTAs) and `4096 -> 4096` FP32 (216 CTAs) miss next to a kernel holding 32 SMs the same way.  `4096 -> 64`
+(`sm_103a`; `sm_107a` BF16) and `4096 -> 48` on 148-SM `sm_103a` parts are not faster than the deterministic plan in
+every run.  The `sm_107a` one-split rows store whole tiles: they win where the deterministic package's `sm_107a` program
+of the row is slower (the FP32 ones up to 960 tokens only: from 961 tokens up their FP64 error is about twice the
+deterministic program's, the `sm_107a` K1 token table).  Every K1 choice also needs `num_splits * 64 <= T + 63` (shorter
+token counts run the deterministic program); the token counts of the K1 token tables below run the deterministic program
+(`sm_100a` / `sm_103a`: parts of 152 SMs or more, and parts of exactly 148 SMs; `sm_107a`: 208, 212 and 216 SMs); the
+208-SM and 212-SM choices hold only at 16172 to 16384 tokens (`K1_SPLIT_RULES_BY_SM_TOKENS`), and the 212-SM choices
+of the rows of the 212-SM K1 token-range table also at its ranges.*
+
+| K1 row `d_in -> d_out` | `sm_100a` BF16 | `sm_100a` FP32 | `sm_103a` BF16 | `sm_103a` FP32 |
+|---|---|---|---|---|
+| `4096 -> 32` | 512; 65536 and up† | -- | 512; 65536 and up§ | 512; 32768 and up§ |
+| `4096 -> 48` | 512; 49153 and up† | 512 | 512; 32768 and up§ | 512; 32768 and up§ |
+| `4096 -> 64` | 512; 65536 and up† | 512 | no verdict | no verdict |
+| `5120 -> 32` | 512; 65537 and up† | 512 | 512; 32768 and up‡ | 512 |
+| `5120 -> 48` | 512 to 2048; 49153 and up† | 512 to 2048 | 512 to 2048; 32768 and up‡ | 512 to 2048 |
+| `5120 -> 64` | 512 to 2048; 8192 | 512 to 2048; 8192 | 512 to 2048; 32768 and up‡ | 512 to 2048 |
+| `5120 -> 128` | no verdict | no verdict | 512 to 8192; 32768 and up‡ | 512 to 4096 |
+| `6144 -> 32` | 1024 | -- | 512 | 512 |
+| `6144 -> 128` | no verdict | no verdict | 512 to 8192 | 512 to 8192 |
+
+*Table: the K1 token counts that run the deterministic program on `sm_100a` / `sm_103a` parts of 152 SMs or more
+(`K1_SPLIT_RULE_EXCLUDED_TOKENS`; `--`: none; `no verdict`: the row runs the deterministic program at every token
+count).  Every other token count keeps the row's verdict.  Measured at 512, 1024, 2048, 4096, 8192, 16231, 32768 and
+65536 tokens on two 152-SM parts per row and token count (GB200: two parts; GB300: four parts, because the strict runs
+of 8 `sm_103a` points, 3 of them in this table (`4096 -> 32` BF16, `5120 -> 32` FP32, `6144 -> 32` FP32 at 512 tokens),
+ran on two other parts than their screen): a screen of 9 paired groups per row and token count in one long-lived process
+per GPU, eager launches and CUDA graph replays, next to a kernel holding 8, 16 or 32 SMs in both launch orders (a launch
+order without paired groups: the slowest split-program time against the fastest deterministic time), with the backward
+pass and the checkpointed step timed; where a screen run failed, 15 paired groups in a long-lived process and in a fresh
+process per row, on two parts per token count (one part for `sm_100a` `6144 -> 32` FP32 at 1024 tokens); and the FP64
+error of 5 seeds on each of two parts per architecture (prepared launches, CUDA graph replays, the convenience call)
+next to the deterministic program's on the same operands.  A measured token count runs the deterministic program where
+the split program failed in at least one run (the K1 rule above; the backward pass or the checkpointed step more than
+1.3 % slower than with the deterministic program; or the deterministic package's FP64 error budget missed with an error
+above the deterministic program's) and the deterministic program leaves the backward pass and the checkpointed step no
+more than 1.3 % slower (medians and paired medians, eager launches and graph replays), or where the split program's
+error exceeded the deterministic program's by more than 2 % for the same seed on both parts (relative Frobenius error or
+BF16 error-budget ratio; marked ‡).  A token count between two consecutive such measured token counts runs the
+deterministic program too (not measured), and so does every token count above 65536 of a row marked ‡ at 65536 tokens.
+Marked §: above 65536 tokens the split program of `sm_103a` `4096 -> 32` and `4096 -> 48` gives the deterministic
+program's bits at an even number of 64-token K blocks and fails the FP64 comparison at an odd number, as on 148 SMs
+(the 148-SM K1 token table below; the deterministic plan of these rows is the same on 148 and 152 SMs; on a 148-SM
+part, 10 seeds per token count: an FP32 relative Frobenius error 1.021 to 1.024 times the deterministic program's at
+65537 tokens; where the deterministic program misses the BF16 budget, a budget ratio above 1.30 times the deterministic
+program's for some seed: `4096 -> 32` 1.305 at 65600 tokens (the 148-SM table), `4096 -> 48` up to 1.379 at 65537
+tokens), so these rows run the deterministic program from their entry up.  Marked †: `sm_100a` BF16 entries from 148
+SMs up (also in the 148-SM table below; `4096 -> 64` from 152 SMs up, its 148-SM entry is below) where the
+deterministic program misses the BF16 budget for some seed and the split program fails the rule of the 148-SM table
+there (10 seeds per token count on a 148-SM B200 part; the deterministic plan of these rows is the same on 148 and 152
+SMs): a budget ratio above 1.30 times the deterministic program's for some seed at `4096 -> 48` and `5120 -> 48` 49153
+tokens (1.473, 1.320), `5120 -> 32` 65537 tokens (1.328) and `4096 -> 32` 65600 tokens (1.305, up to 1.727 at 106497
+tokens; the entry starts at 65536 as on `sm_103a`), and for `4096 -> 64` a median ratio of 1.041 over its odd token
+counts from 65537 tokens; so these rows run the deterministic program from their entry up.
+Token counts below 512, above 65536 (other rows), between two measured token counts with different outcomes, and on
+parts with fewer than 152 SMs were not measured and keep the verdict.  Measured token counts that failed the rule but
+keep the verdict, because the deterministic program makes the backward pass or the checkpointed step more than 1.3 %
+slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`; BF16 output at 2048 tokens on
+`sm_100a` `5120 -> 32`, `6144 -> 32`; `sm_103a` `4096 -> 48`; FP32 output at 512 tokens on `sm_100a` `4096 -> 32`,
+`6144 -> 32`; FP32 output at 1024 tokens on `sm_100a` `6144 -> 32`; FP32 output at 8192 tokens on `sm_103a`
+`4096 -> 48`, `5120 -> 128`.  At 65536 tokens neither program meets the BF16 error budget.*
+
+| K1 row `d_in -> d_out` | `sm_100a` BF16 | `sm_100a` FP32 | `sm_103a` BF16 | `sm_103a` FP32 |
+|---|---|---|---|---|
+| `4096 -> 32` | 65536 and up† | -- | 65536 and up‡ | 65536 and up‡ |
+| `4096 -> 48` | 512; 49153 and up† | 512 | no verdict | no verdict |
+| `4096 -> 64` | 512; 65536 and up‡ | 512; 65536 and up‡ | no verdict | no verdict |
+| `5120 -> 32` | 65537 and up† | -- | -- | -- |
+| `5120 -> 48` | 512 to 2048; 49153 and up† | 512 | 512 to 2048 | 512 to 2048 |
+| `5120 -> 64` | 512 to 2048; 8192 | 512 to 1024; 8192 | 512 to 1024 | 512 to 1024 |
+| `5120 -> 128` | no verdict | no verdict | 512 to 4096; 32768 to 65536 | 512 to 4096; 32768 to 65536 |
+| `6144 -> 32` | -- | -- | -- | -- |
+| `6144 -> 128` | no verdict | no verdict | 512 to 8192 | 512 to 8192 |
+
+*Table: the 148-SM K1 token table: the K1 token counts that run the deterministic program on `sm_100a` / `sm_103a`
+parts of exactly 148 SMs (`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`; †: the entries of the 152-SM table above that hold
+from 148 SMs up; `--`: none; `no verdict`: the row runs the deterministic program at every token count, `sm_103a`
+`4096 -> 48` below its 152-SM floor).  Every other token count
+keeps the row's verdict, and parts of any other SM count keep their routing.  Measured with the protocol and the rule of
+the 152-SM table above at the same token counts, on B300 (`sm_103a`) and B200 (`sm_100a`) parts of 148 SMs: a screen of
+every split-routed row and token count on one part (9 paired groups, one long-lived process per GPU), the points that
+failed there again on a second part (15 paired groups in a long-lived process and in a fresh process per point; B300:
+a part of a second node, which also screened every point; B200: another part of the same node), and the FP64 error of
+5 seeds on two parts at 32768 and 65536 tokens and at the first and the last token count of every entry and one token
+either side of it (98304 and 131072 tokens too for the entries that reach 65536 tokens).  ‡: entries from the FP64
+error.  The split program fails the FP64 comparison at a token count where, for some seed, its relative Frobenius
+error is more than 2 % above the deterministic program's, or, where the deterministic program meets the error budget
+on every seed, its output is outside the budget.  Where the deterministic program misses the budget for some seed
+(BF16 output at the largest token counts), the BF16 error-budget ratio, a maximum over the elements, moves by up to
+about 25 % either way between the two programs at the same relative Frobenius error; there the split program fails
+where the median of its ratio to the deterministic program's over a row's measured token counts and seeds (10 seeds
+per token count) exceeds 1.02, or where one seed's ratio exceeds 1.30.  BF16 output of `5120 -> 32` (23 token counts
+from 57336 to 131072 tokens: median 1.000, largest 1.26) and `5120 -> 128` (65536 to 131072 tokens: 1.015, largest
+1.15) on `sm_103a` passed it.  Above 65536 tokens the split program of `4096 -> 32` (`sm_103a`) and `4096 -> 64`
+(`sm_100a`) gives other bits than the deterministic program where the token count spans an odd number of 64-token
+blocks (measured at 65537, 65538, 65600 and 65665 tokens; `4096 -> 64` BF16 on `sm_100a` also at 11 more odd counts
+from 65728 to 98240 tokens) and the same bits where it spans an even number (65601 to 131072 tokens, 12 counts measured).  At
+those odd token counts the FP32 output's relative Frobenius error is 2.1 to 2.3 % above the deterministic program's on
+every seed, and the BF16 budget ratio exceeds 1.30 times the deterministic program's for some seed (`4096 -> 32` on
+`sm_103a`: 1.305 at 65600 tokens; `4096 -> 64` on `sm_100a`: up to 1.65, at 4 of 12 odd counts from 65600 to 98240
+tokens, median 1.000).  At the even counts the split program does not make the backward pass or the checkpointed step
+1 % faster (`sm_100a`: the backward pass up to 3.5 % slower).  So these rows run the deterministic program from 65536
+tokens up.  Unmeasured token counts
+keep the verdict.  Measured token counts that failed the rule but keep the verdict, because the
+deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower there on a part:
+`sm_100a`: BF16 output at 512 tokens on `4096 -> 32`, `5120 -> 32`, `6144 -> 32`, at 1024 on `5120 -> 32`, at 2048 on
+`6144 -> 32`, at 32768 on `5120 -> 48`, at 65536 on `4096 -> 32`, `4096 -> 48`, `5120 -> 48`, `5120 -> 64`, `6144 -> 32`;
+FP32 output at 512 tokens on `4096 -> 32`, at 1024 and 2048 on `5120 -> 48`, at 2048 on `5120 -> 64`, at 65536 on
+`5120 -> 48`; `sm_103a`: BF16 output at 512 tokens on `4096 -> 32`, `5120 -> 32`, `6144 -> 32`, at 2048 on
+`5120 -> 64`, at 8192 on `5120 -> 128`, at 65536 on `5120 -> 48`, `5120 -> 64`, `6144 -> 32`, `6144 -> 128`; FP32
+output at 512 tokens on `6144 -> 32`, at 2048 on `5120 -> 64`, at 8192 on `5120 -> 128`, at 32768 on `4096 -> 32`.*
+
+| K1 row `d_in -> d_out` | parts | token counts with an odd number of 64-token K blocks that run the deterministic program |
+|---|---|---|
+| `sm_100a` `4096 -> 32` FP32 | 148 SMs and more | 1025 and up |
+| `sm_100a` `4096 -> 48` FP32 | 148 SMs and more | 1025 and up |
+| `sm_100a` `4096 -> 64` FP32 | 148 SMs and more | 1025 and up |
+| `sm_100a` `5120 -> 32` FP32 | 148 SMs and more | 12289 and up |
+| `sm_100a` `5120 -> 48` FP32 | 148 SMs and more | 12289 and up |
+| `sm_103a` `4096 -> 32` FP32 | 148 SMs and more | 1025 and up |
+| `sm_103a` `4096 -> 48` FP32 | 152 SMs and more | 1025 and up |
+| `sm_107a` `8192 -> 128` FP32 | 212 SMs; 216 SMs and more | 1025 to 8192 |
+
+*Table: the odd-block K1 table (`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS`): these rows run the deterministic program at a
+token count of the third column that spans an odd number of 64-token K blocks (`ceil(T / 64)` odd); an even number, and
+every other row, keeps the routing of the tables above.  In these ranges the deterministic program of the row cuts the
+token reduction of its tiles, taken in order, into units of half the tile's K blocks, rounded up (at an odd block count
+a unit runs on into the next tile; its automatic two-way split), and adds the partials in a fixed order: the `4096` rows
+from 961 tokens (16 K blocks) up; `sm_100a` `5120 -> 32` and `5120 -> 48` from where one wave's operands outgrow the L2
+(from 12289 tokens with 126 MiB of L2, between 12292 and 12337 tokens on a B200; below, whole tiles); `sm_107a`
+`8192 -> 128` while they fit the L2 (to 7808 tokens with 126 MiB of L2, to between 4097 and 8192 tokens on a 212-SM
+R200; above, a synchronised two-way split that the two-split program matches).  At an even block count the two-split
+program's output is the deterministic program's bit for bit; at an odd count its FP32 output's FP64 relative Frobenius
+error was more than 2 % above the deterministic program's on every seed at every measured odd token count of the
+ranges from 1025 to 65537 tokens (10 seeds each): the `4096` rows (`sm_100a` on a 148-SM B200 part, `sm_103a` on a
+148-SM B300 part; the deterministic plan of these rows is the same on 148 and 152 SMs) 1.03 to 1.15 times at 1025,
+1088, 2049, 3000, 4097, 8193, 12289, 16173, 24577, 32769 and 49153 tokens and 1.021 to 1.024 times at 65537;
+`sm_100a` `5120 -> 32` and `5120 -> 48` 1.025 to 1.075 times at 12337 to 32769 tokens; `sm_107a` `8192 -> 128` 1.04 to
+1.14 times at 1025, 1088, 2049 and 4097 tokens (212-SM R200 parts, the 212-SM and the 216-SM plan; the deterministic
+plan of the row is the same on 212 and 216 SMs).  The excess falls with the token count (`5120 -> 32` and `5120 -> 48`:
+1.7 to 1.96 % at 49153 tokens, 0.7 to 1.5 % at 65537 to 131073 tokens; the `4096` rows: 1.2 to 1.7 % at 98305 and
+131073 tokens); their ranges stay open because the two-split program is not more accurate than the deterministic
+program at any odd block count in them.  The BF16 outputs of these rows had the deterministic program's relative
+Frobenius error and met the error budget on every seed where the deterministic program met it.*
+
+| K1 row `d_in -> d_out` (FP32 out) | 152 SMs: token ranges, even K-block counts only (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`) | measured token counts outside them |
+|---|---|---|
+| `sm_100a` `4096 -> 128`: (64, 2) | 1024 to 4096 | 512; 6144; 8192 |
+| `sm_103a` `4096 -> 128`: (64, 2) | 1024 to 6144 | 512; 8192 |
+
+*Table: the 152-SM two-split table (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` on `sm_100a` / `sm_103a` parts of exactly 152
+SMs, above the SM-count floor): the FP32 row `4096 -> 128`, which has no verdict in `K1_SPLIT_RULES`, runs two splits of
+64-wide tiles, each adding half of an output's K blocks, at a token count of its range that spans an even number of
+64-token K blocks (`ceil(T / 64)` even).  At an odd number, outside the range, with BF16 output and on parts of any
+other SM count (148 SMs included) it runs the deterministic program.  At an even block count its output was the
+deterministic program's bit for bit (5 seeds at 1024, 2048, 4096, 6144 and 8192 tokens); at 1088 and 2112 tokens (17
+and 33 blocks) it was not, with an FP64 relative Frobenius error 1.107 and 1.142 times the deterministic program's (5
+seeds on three parts).  Measured at 512, 1024, 2048, 4096 and 8192 tokens on two 152-SM parts of each GPU (two GB200
+nodes, two GB300 nodes) and at 6144 tokens on one GB200 part and two GB300 parts: 15 paired groups of 20 launches in
+four runs per part (two launch orders, a long-lived process and a fresh process per row), eager launches and CUDA graph
+replays, next to a kernel holding 8, 16 or 32 SMs in both launch orders, with the backward pass and the checkpointed
+step timed.  A range runs between measured token counts at which the two-split program passed the K1 rule in every run
+on every part, left the backward pass and the checkpointed step no more than 1.3 % slower than the deterministic
+program, and met the FP64 rule of the 148-SM table above (an error no more than 2 % above the deterministic program's
+for every seed); the token counts between two consecutive measured ones inside it take the verdict too (not
+measured).  From 1024 to 4096 tokens its time was 0.70 to 0.79 times the deterministic program's (graph replays, both
+GPUs; 8.65 against 12.14 us on a GB200 part at 1024 tokens).  At 512 tokens it is slower than the deterministic
+program, and at 8192 tokens slower next to a kernel holding 32 SMs; at 6144 tokens on the GB200 part its time next to
+a kernel holding SMs on another stream was 1.099 times the deterministic program's.*
+
+| K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 208 SMs | 212 SMs | 216 SMs |
+|---|---|---|---|
+| `4096 -> 32` | -- | -- | 16231 |
+| `4096 -> 32` BF16 | -- | -- | 512¶ |
+| `4096 -> 48` | 16231; 16384 | -- | 512¶; 16231; 16384 |
+| `4096 -> 64` | 16231; 16384 | -- | 512¶; 16231; 16384 |
+| `4096 -> 512` | 16172 to 16384§ | 16172 to 16384§ | 961 and up§ |
+| `4096 -> 1024` | 16172 to 16384§ | 16172 to 16384§ | 961 and up§ |
+| `5120 -> 32` | -- | -- | 512¶ |
+| `5120 -> 32` BF16 | -- | -- | 512¶ |
+| `5120 -> 48` | 16231; 16384 | 16231 | 512¶; 16231; 16384 |
+| `5120 -> 64` | 16231 | 16231 | 512¶; 16231; 16384 |
+| `5120 -> 512` | 16172 to 16384§ | 16172 to 16384§ | 961 and up§ |
+| `5120 -> 1024` | 16172 to 16384§ | 16172 to 16384§ | 961 and up§ |
+| `5120 -> 1024` BF16 | -- | -- | 16231 |
+| `6144 -> 32` BF16 | -- | -- | 512¶ |
+| `8192 -> 128`, BF16 and FP32 | -- | -- | 512¶; 65536¶ |
+
+*Table: the K1 token counts that run the deterministic program on `sm_107a` parts (`K1_SPLIT_RULE_EXCLUDED_TOKENS`;
+`--`: none; `8192 -> 128` FP32 also at odd block counts from 1025 to 8192 tokens on 212 and 216 SMs: the odd-block K1
+table above).  Unmarked ones are token counts of the deterministic package's `sm_107a` rules for single token counts
+(16231 and 16384 tokens; `4096 -> 1024` at 16231 only), which give the row a faster deterministic plan there; every
+other token count keeps the row's verdict.  On 212 SMs `4096 -> 4096` FP32 runs the deterministic program at every token
+count (`K1_SPLIT_RULES_BY_SM`): the deterministic package's rule for that row holds at every token count.  On 208, 212
+and 216 SMs the rows were measured at 16172, 16231 and 16384 tokens against those plans: 15 paired groups of 20 steps
+per row and token count with the L2 cache flushed before every launch, in a long-lived process per GPU and in a fresh
+process per row, in both arm orders, eager launches and CUDA graph replays, next to a kernel holding 8, 16 or 32 SMs in
+both launch orders, with the backward pass and the checkpointed step timed (9 paired groups); 212 SMs: eight parts in
+two nodes (`4096 -> 1024`: sixteen parts in five nodes), 208 SMs: two parts (`5120 -> 1024`: three), 216 SMs: two parts.
+A measured token count runs the deterministic program where the row's program failed the K1 rule above in some run, or
+left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio of the
+medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  `4096 -> 1024` on 212
+SMs and `5120 -> 1024` on 208 SMs were measured twice; the rule takes the runs of both measurements together.  The
+216-SM entry of `5120 -> 1024` BF16 (16231 tokens) is not a token count of those rules: the deterministic plan there is
+the row's plan at every token count, and the row's program left the backward pass 1.5 % slower in eager launches (ratio
+of the medians over the runs).  Marked §: entries of their own, not from the rules above.  These FP32 rows run the
+deterministic program from 961 tokens up on parts of at least 216 SMs, and at 16172 to 16384 tokens on 208 and 212 SMs,
+because their one-split program fails the FP64 comparison there: it adds the whole token reduction of an output in one
+chain, while from 961 tokens (16 K blocks) up the deterministic program of these rows cuts that reduction into units of
+half an output's K blocks, rounded up (its automatic two-way split), and adds the partials in a fixed order.  The
+one-split program's FP64 relative Frobenius error is 2.0 to 2.4 times the deterministic program's on every seed from 961
+tokens up, above the 2 % the rule allows (and from 45056 tokens up above the deterministic package's FP32 error budget,
+5e-5); up to 960 tokens the deterministic program adds one chain as well, and the two errors are equal.  Measured with
+the 216-SM plan on 212-SM R200 parts (the same program and accumulation order as on 216 SMs; the deterministic plan of
+these rows is the same on 208, 212 and 216 SMs; the error does not depend on the SM count) against an FP64 reference,
+each row on two parts, 5 seeds, at 512 to 65536 tokens, and in a later run with 10 seeds at 704, 896, 960, 961 and 1024
+tokens: the same bits as the deterministic program up to 960 tokens, 2.09 to 2.11 times its error at 961 and 1024
+tokens.  The 212-SM two-split ranges of these rows (the 212-SM K1 token-range table below) lie outside 16172 to 16384
+tokens and keep their program.  Marked ¶: single token counts from a re-measurement of chosen points at 512, 8192, 32768
+and 65536 tokens on two 216-SM R200 parts per point (the protocol above: 15 paired groups, eager launches and graph
+replays, next to a kernel holding 8, 16 or 32 SMs in both launch orders, the backward pass and the checkpointed step
+timed).  A point is an entry where the row's program failed the K1 rule in some run and the deterministic program leaves
+the backward pass and the checkpointed step no more than 1.3 % slower on both parts (the worst of the ratio of the
+medians and the median of the paired ratios, eager launches and graph replays: the rule of the `sm_100a` / `sm_103a`
+entries); the neighbouring token counts were not measured and keep the verdict.  Measured points that failed but keep
+the verdict, because the deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower
+there on a part: BF16 output at 8192 tokens on `4096 -> 32`, at 32768 tokens on `4096 -> 32` and `5120 -> 1024`, at
+65536 tokens on `5120 -> 1024`; FP32 output at 512 tokens on `4096 -> 32` and `6144 -> 32`.*
+
+| K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 212 SMs: token ranges besides 16172 to 16384 | measured token counts outside them |
+|---|---|---|
+| `4096 -> 32`, `4096 -> 48`, `4096 -> 64` | 1024 to 16172; 16384 to 65536 | 512 |
+| `5120 -> 32`, `5120 -> 48`, `5120 -> 64` | 1024 to 16172; 16384 to 65536 | 512 |
+| `8192 -> 128`, BF16 and FP32 | 1024 to 16172; 16384 to 32768 | 512; 65536 |
+| `4096 -> 512`, `4096 -> 1024`, `5120 -> 512`, `5120 -> 1024` | 512 | 1024 to 8192; 32768; 65536 |
+| `5120 -> 1024` BF16: (256, 1) `p = 1` (`K1_SPLIT_RANGE_OVERRIDES_BY_SM`) | 512 to 12288 | 32768 |
+| `4096 -> 512`, `5120 -> 512`: (128, 2), even K-block counts only (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`) | 1024 to 8192; 32768 to 65536 | 512 |
+| `4096 -> 1024`: (192, 2), even K-block counts only (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`) | 2048 to 8192; 32768 to 65536 | 512; 1024 |
+| `5120 -> 1024`: (256, 2), even K-block counts only (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`) | 1024 to 8192 | 512; 32768; 65536 |
+| `4096 -> 128`: (64, 2), even K-block counts only (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`; no verdict in the 212-SM table) | 1024 to 7680 | 512; 640; 768; 896; 8000; 8192; 12288; 16384 |
+
+*Table: the 212-SM K1 token-range table (`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`): further token counts at which these rows
+of the 212-SM table of `K1_SPLIT_RULES_BY_SM` run their program (the third column runs the deterministic program),
+except the token counts of the `sm_107a` K1 token table above.  Measured at 512, 1024, 2048, 4096, 8192, 32768 and
+65536 tokens on two 212-SM R200 nodes of four parts each, with the protocol of the window above (one part per launch
+layout and row order), and the FP64 error of 5 seeds on two parts.  A measured token count joins a range where the
+row's program passed the K1 rule in every run, left the backward pass and the checkpointed step no more than 1.3 %
+slower than the deterministic program, and met the deterministic package's FP64 error budget with an error no more than
+2 % above the deterministic program's for every seed on both parts.  A range ends at a measured token count that passed
+(or at the window) and holds no measured token count that failed; the token counts between two consecutive measured
+ones inside it take the verdict too (not measured).  Token counts below 512, above 65536 and between a measured token
+count that passed and one that failed run the deterministic program.  The four one-split FP32 rows pass at 512 tokens
+only: from 1024 tokens up their FP64 error is about twice the deterministic program's (the one-split program adds an
+output's whole token reduction in one chain).  The other rows are not faster than the deterministic program in every
+run at 512 tokens, nor `8192 -> 128` at 65536.  The two-split rows (`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`) run two splits
+of the row's 212-SM tile width, each adding half of an output's K blocks, at a token count of their ranges that spans an
+even number of 64-token K blocks (`ceil(T / 64)` even); at an odd number they keep the routing above (the deterministic
+program).  So the token counts in the third column of the one-split FP32 rows run the two-split program where a
+two-split range holds them.  At an even block count from 1024 tokens up their output was the deterministic program's bit
+for bit (5 seeds on two parts at 1024, 2048, 4096, 8192, 16231, 16384, 32768 and 65536 tokens, on one part at 6000,
+12000 and 48000); at an odd count from 17 blocks up it was not, with an FP64 relative Frobenius error 1.01 to 1.17 times
+the deterministic program's (5 seeds, 1025 to 65537 tokens).  They were measured with the protocol above at 512, 1024,
+2048, 4096, 8192, 32768 and 65536 tokens (`4096 -> 512` also at 40961, which runs the deterministic program: an odd
+block count) on two 212-SM R200 nodes of four parts each; a range runs between measured token counts at which the
+two-split program passed the K1 rule in every run and left the backward pass and the checkpointed step no more than 1.3
+% slower than the deterministic program, and holds none that failed.  At 512 tokens the two-split program is slower than
+the deterministic plan; `4096 -> 1024` is not faster in every run at 1024 tokens; `5120 -> 1024` is not faster in every
+run at 32768 tokens and slower at 65536.  `4096 -> 128` FP32 has no program in the 212-SM table either; its two-split
+range was measured with the same protocol at 512, 640, 768, 896, 1024, 2048, 4096, 6144, 6656, 7168, 7680, 8000, 8192,
+12288 and 16384 tokens on two nodes of each of two R200 systems (6144, 8000, 8192, 12288 and 16384 tokens and 640 on
+one system).  From 1024 to 7680 tokens it passed in every run (0.70 to 0.76 times the deterministic program's time) and
+its output was the deterministic program's bit for bit at an even block count (5 seeds); at an odd count (1088 to
+5000 tokens) its FP64 error was 1.11 to 1.16 times the deterministic program's.  It failed the rule at 512, 640, 768
+and 896 tokens; from 8000 tokens the deterministic plan changes and the two-split error was 1.54 times its error, and
+at 12288 and 16384 tokens it was 5 to 7 % slower.  `5120 -> 1024` BF16 has no program in the 212-SM table (at 16172 to
+16384 tokens the deterministic plan is faster); its range runs the 256-wide one-split program of `K1_SPLIT_RULES` (its
+216-SM verdict), measured at 512, 1024, 2048, 4096, 8192, 12288 and 32768 tokens with the same protocol on a node of
+four parts, twice with the parts' launch layouts and orders rotated: faster than the deterministic plan in every run up to 12288 tokens, with the FP64 error of the
+deterministic program on every seed; at 32768 tokens it failed the K1 rule in every run (0.1 to 0.6 % faster than the
+deterministic plan alone), and its checkpointed step measured 2.5 to 4.3 % slower, as did a second deterministic launch
+against the first there (1.9 to 4.4 %).  On 212 SMs
+`4096 -> 1024` FP32 keeps the 192-wide program at 512 tokens: the 256-wide program is 15 % faster alone and leaves the
+backward pass 4 to 6 % faster, but the checkpointed step 0.2 to 1.2 % slower in graph replays (median of the paired
+ratios, ratio of the medians).*
+
+`"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
+units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
+splits fill their last wave below 80 % (`w / ceil(w)`, `w = 6 * tiles / pairs`); otherwise the row runs the
+deterministic program.  At hidden 5120 on 152 SMs that is 80 units at 64 tokens (at most one unit per (tile,
+K block) step) and 380 units at 16k tokens; on 148 SMs the deterministic plan's last wave is 81 % full and the row
+runs the deterministic program.
+
+`"simt_n<tile_n>m<tile_m>s<slices>"` (`router_simt`, the weight gradient only) runs the exact-FP32 program
+`router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>` on the CUDA cores: one CTA per `tile_n x tile_m` tile of the
+transposed `out` over all tokens, `slices` slices of the CTA each taking every `slices`-th 16-token block of the FP32
+operands (read in place through their row strides), one FFMA per product, the slices added in slice order, every
+element of `out` stored once (no BF16 parts, no workspace, no zero fill; the bits are fixed by the token count and the
+tile, not by the SM count).  It launches after its predecessor, never as a programmatic dependent launch: launched
+early, its CTAs took only the SMs the input gradient left and the backward pass was slower.  Its result differs from
+the deterministic program's in the last bits (FFMAs of the FP32 operands instead of products of their BF16 parts, in
+another summation order), and each slice sums its products in one FFMA chain along the tokens: from about 100 tokens
+its FP64 error is about twice the deterministic program's or more (the router FP64 error table below), so the windows
+of 152-SM `sm_100a` and 212-SM `sm_107a` parts, though faster, run the plan without them (the deterministic program; at
+hidden 5120 up to 128 tokens on `sm_100a`, `"waves"`).  This checkout registers no SIMT program (weight or input
+gradient): a SIMT spec set in a router table plans its template, which is not registered, so the row runs the
+deterministic program.
+
+On an input-gradient row (`kn`) `"simt_n<tile_n>m<tile_m>s<slices>"` runs the exact-FP32 program
+`router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`: one CTA per `tile_m x tile_n` tile of `out = G @ W` (`tile_m`
+tokens by `tile_n` hidden columns, the last row tile partial) over all experts, `slices` slices of the CTA each taking
+every `slices`-th 16-expert block of `G` and `W` (read in place through their row strides), one FFMA per product, the
+slices added in slice order, every element of `out` stored once.  Like the weight gradient's program it launches after
+its predecessor.  On 212-SM `sm_107a` parts the 32 x 64 tile in eight slices (`"simt_n64m32s8"`, 256 threads) from 1
+to 64 tokens and the 64 x 64 tile in four slices (`"simt_n64m64s4"`, 256 threads) from 65 to 128 at hidden 4096 and
+5120 (`"simt_n64m32s8"` up to 64 tokens at hidden 6144), and on 152-SM `sm_100a` parts the 32 x 64 tile in four slices
+(`"simt_n64m32s4"`, 128 threads) up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144, were faster than
+the deterministic program, but their FP64 error was 1.30 to 1.86 (`sm_107a`) and 1.66 to 2.07 (`sm_100a`) times the
+deterministic program's (the router FP64 error table below), so every part runs the deterministic program.
+
+`"H<f>x<k>"` (`router_partition_of`, the weight gradient only) runs the head/tail program
+`router_fp32_gemm_atomic_nn_t_ht_c3_nreg` (on `sm_103a` and on 212-SM `sm_107a` parts:
+`router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg`, the same products, accumulators and part segments with the BF16 parts
+of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES` / `ROUTER_HEAD_TAIL_TEMPLATES_BY_SM`):
+one head unit per CTA pair, whose spans share about the fraction `f` of
+the (row-tile pair, K block) steps, then `k` tail units per CTA pair over the rest (each count a multiple of the
+column tile count).  Every pair starts a long head span at once; the short tail spans go to the pairs that finish
+first, so a kernel holding SMs on another stream delays a short span rather than a long one.  `"H0.5x3"` is 76 head
+and 228 tail units at 152 SMs; `"H0.5x4"` is 104 head and 416 tail units at 208 SMs, 106 head and 424 tail units at
+212 SMs and 108 head and 432 tail units at 216 SMs.  A token count too short for one step per span runs the
+deterministic program.
+`"H<f>x<k>p<h>"` starts only `h` head units (at most one per CTA pair), each about `f` of a pair's even share of the
+steps; the other pairs start on the tail spans, so a kernel holding the SMs of up to `pairs - h` CTA pairs delays no
+head span.  At 152 SMs `"H1x4p44"` is 44 head and 304 tail units and `"H1x5p44"` 44 head and 380 tail units.
+
+| row of `ROUTER_RULES` (weight gradient, 256 experts) | token window | measured at (tokens) | part | time / deterministic plan, alone | worst next to a resident kernel: same launch order / router launched first |
+|---|---|---|---|---|---|
+| `sm_100a` hidden 5120 `"waves"` | 1 to 128 | 64, 128 | GB200, 152 SMs | x0.691-0.884 | x0.864 / x0.846 |
+| `sm_103a` hidden 5120 `"waves"` | 1 to 160 | 64, 128, 192 | GB300, 152 SMs | x0.706-0.919 | x1.005 / x0.917 |
+| `sm_107a` hidden 5120 `"H0.5x4"` | 16172 to 16384 | 16172, 16231, 16384 | R200, 216 SMs (two parts) | x0.793-0.819 | x0.960 / x0.963 |
+| `sm_107a` hidden 5120 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 212 SMs, the head/tail program with the `A` parts in tensor memory) | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs (four parts in two nodes) | x0.735-0.770 | x0.922 / x0.925 |
+| `sm_107a` hidden 6144 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 212 SMs, the head/tail program with the `A` parts in tensor memory) | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs (four parts in two nodes) | x0.831-0.870 | x0.981 / x0.961 |
+| `sm_107a` hidden 5120 `"H0.5x4"` (`ROUTER_RULES_BY_SM`, 208 SMs) | 16172 to 16384 | 16172, 16231, 16384 | R200, 208 SMs (two parts, and a third at a lower SM clock) | x0.816-0.830 | x1.002 / x1.015 |
+
+*Table: the token windows of the router weight gradient (eager launches and CUDA graph replays, one long-lived process
+and a fresh process per token count; the resident kernel holds 8, 16 or 32 SMs).  The `"waves"` rows are the FI-main
+`"waves"` plan (same kernel text, measured on this package's host path); the `sm_103a` `"waves"` window ends at 160
+tokens, the last token count where its FP64 error keeps the rule (the router FP64 error table below).  On the R200
+parts `nvidia-smi` read `clocks_throttle_reasons` 0x4 after some rows (sampled every 200 ms only during 6 of the 12
+runs at hidden 5120 and 6 of the 10 at hidden 6144, those on two of the four 212-SM parts: 0x4 in 17-47 % of the
+non-idle samples, median SM clock 2388-2400 MHz, no hardware slowdown or thermal reason).  The arms of each row were
+measured interleaved, in paired groups.  Inside the head/tail windows cuBLAS FP32 in
+`CUBLAS_FP32_EMULATED_BF16X9_MATH` (the benchmark's `bf16x9` arm) took x1.630-1.715 (R200, 216 SMs), x1.809-1.915
+(R200, 212 SMs, hidden 5120 and 6144) and x1.639-1.768 (R200, 208 SMs) of the partition's time: at least x1.630.
+On 212 SMs the head/tail program with
+the BF16 parts of `A` in tensor memory took x0.916-0.954 of the three-chunk-buffer program's time at hidden 5120 and
+x0.906-0.950 at hidden 6144 (same partition, alone); with the three-chunk-buffer program hidden 6144 was up to 9.2 %
+slower than the deterministic plan next to a resident kernel, so its window holds only with the tensor-memory program.
+On the 208-SM and 212-SM parts at full SM clock the three-chunk-buffer program with `"H0.5x3"` was 0.9-2.1 % faster
+than with `"H0.5x4"`, but on a 208-SM part at a lower SM clock (about 2000 MHz; there `"H0.5x4"` took x0.931-0.959
+alone) it was up to 4.9 % slower than the deterministic plan when launched before a resident kernel, so both SM counts
+take `"H0.5x4"`.  The head/tail windows hold
+only on the SM count of their part (`ROUTER_SM_COUNT`, or the part's own table in `ROUTER_RULES_BY_SM`), the
+`"waves"` windows on every SM count where `"waves"` applies (`router_waves`); every other token count and SM count runs
+the deterministic plan.
+Hidden 5120 on `sm_100a` / `sm_103a` ran `"waves"` at every token count before these windows: below 64 tokens the
+`"waves"` windows keep it without a measurement; above them the row runs the deterministic plan -- there `"waves"` was
+more than 3 % slower than that plan next to a resident kernel at every measured token count from 224 to 10240
+(x1.046-1.156 on GB200 at 224 to 12288 tokens, x1.059-1.167 on GB300 at 224 to 10240 tokens), on `sm_103a` from 161
+to 192 tokens its FP64 error missed the rule, and above 32768 tokens nothing was measured.  The head/tail windows of
+152-SM `sm_100a` / `sm_103a` parts (`"H1x5p44"`, `"H0.5x3"`, `"H1x4p44"`; 0.75 to 0.96 times the deterministic
+plan's time alone) missed the FP64 error rule and run the deterministic plan.*
+
+The router windows' FP64 error: per seed the relative Frobenius error against FP64 of the exact operands (worst of 20
+runs into a NaN-filled `out`) of the window's program, divided by that of the plan the row takes without the window
+(the deterministic program; at hidden 5120 up to 128 tokens on 152-SM `sm_100a` parts, `"waves"`), on the same
+operands (the benchmark's router inputs: FP32 activations, router weight and output gradient), 10 seeds per token
+count.  A window keeps the rule where this ratio is at most 1.02 for every seed.  The error of each program is within
+the router budget (`<= 2e-6`, at most 3.2e-7 here); the ratio measures what the window adds to it.
+
+| row (256 experts) | token window | measured at (tokens, 10 seeds each) | part | error / error without the window | verdict |
+|---|---|---|---|---|---|
+| `sm_100a` weight gradient hidden 4096 `"simt_n128m64s2"` | 1 to 224 | 1, 113, 224 | GB200, 152 SMs | x2.226-2.423 (x0.932-0.959 at 1 token) | missed |
+| `sm_100a` weight gradient hidden 5120 `"simt_n64m64s2"` | 1 to 256 | 1, 128, 129, 256 | GB200, 152 SMs | x2.300-2.536 (x0.928-0.951 at 1 token) | missed |
+| `sm_100a` weight gradient hidden 6144 `"simt_n64m64s2"` | 1 to 256 | 1, 129, 256 | GB200, 152 SMs | x2.298-2.531 (x0.927-0.951 at 1 token) | missed |
+| `sm_100a` input gradient hidden 4096 `"simt_n64m32s4"` | 1 to 128 | 1, 64, 128 | GB200, 152 SMs | x1.697-2.067 | missed |
+| `sm_100a` input gradient hidden 5120 `"simt_n64m32s4"` | 1 to 128 | 1, 64, 128 | GB200, 152 SMs | x1.679-1.967 | missed |
+| `sm_100a` input gradient hidden 6144 `"simt_n64m32s4"` | 1 to 64 | 1, 32, 64 | GB200, 152 SMs | x1.661-1.933 | missed |
+| `sm_100a` weight gradient hidden 4096 `"H1x5p44"` | 10240 to 16384 | 10240, 12288, 16384 | GB200, 152 SMs | x1.177-1.201 | missed |
+| `sm_100a` weight gradient hidden 5120 `"H0.5x3"` | 10240 to 32768 | 10240, 16384, 32768 | GB200, 152 SMs | x1.014-1.027 | missed |
+| `sm_100a` weight gradient hidden 5120 `"waves"` | 1 to 128 | 1, 64, 128 | GB200, 152 SMs | x1.000-1.002 | kept |
+| `sm_103a` weight gradient hidden 4096 `"H1x4p44"` | 20480 to 49152 | 20480, 32768, 49152 | GB300, 152 SMs | x1.198-1.294 | missed |
+| `sm_103a` weight gradient hidden 5120 `"H0.5x3"` | 16172 to 32768 | 16172, 24576, 32768 | GB300, 152 SMs | x1.013-1.021 | missed |
+| `sm_103a` weight gradient hidden 6144 `"H1x5p44"` | 16172 to 20480 | 16172, 16384, 20480 | GB300, 152 SMs | x1.354-1.399 | missed |
+| `sm_103a` weight gradient hidden 5120 `"waves"` | 1 to 160 | 1, 65, 97, 113, 128, 144, 160 | GB300, 152 SMs | x0.979-1.016 | kept |
+| `sm_103a` weight gradient hidden 5120 `"waves"` | 161 to 192 | 161, 176, 192 | GB300, 152 SMs | x1.026-1.040 | missed |
+| `sm_107a` weight gradient hidden 4096 `"simt_n128m64s2"` | 1 to 256 | 1, 129, 256 | R200, 212 SMs | x2.300-2.535 (x0.929-0.950 at 1 token) | missed |
+| `sm_107a` weight gradient hidden 5120 `"simt_n128m64s2"` | 1 to 256 | 1, 129, 256 | R200, 212 SMs | x2.301-2.536 (x0.928-0.951 at 1 token) | missed |
+| `sm_107a` weight gradient hidden 6144 `"simt_n128m64s2"` | 1 to 192 | 1, 97, 192 | R200, 212 SMs | x1.995-2.659 (x0.927-0.951 at 1 token) | missed |
+| `sm_107a` input gradient hidden 4096 `"simt_n64m32s8"` | 1 to 64 | 1, 32, 64 | R200, 212 SMs | x1.299-1.530 | missed |
+| `sm_107a` input gradient hidden 4096 `"simt_n64m64s4"` | 65 to 128 | 65, 96, 128 | R200, 212 SMs | x1.823-1.860 | missed |
+| `sm_107a` input gradient hidden 5120 `"simt_n64m32s8"` | 1 to 64 | 1, 32, 64 | R200, 212 SMs | x1.348-1.535 | missed |
+| `sm_107a` input gradient hidden 5120 `"simt_n64m64s4"` | 65 to 128 | 65, 96, 128 | R200, 212 SMs | x1.819-1.859 | missed |
+| `sm_107a` input gradient hidden 6144 `"simt_n64m32s8"` | 1 to 64 | 1, 32, 64 | R200, 212 SMs | x1.307-1.585 | missed |
+| `sm_107a` weight gradient hidden 5120 `"H0.5x4"` | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs | x0.943-0.952 | kept |
+| `sm_107a` weight gradient hidden 6144 `"H0.5x4"` | 16172 to 16384 | 16172, 16231, 16384 | R200, 212 SMs | x0.974-0.983 | kept |
+
+*Table: the router FP64 error.  The SIMT programs repeat bit for bit; an exact model of their FFMA order reproduces
+their output bit for bit, so the ratio follows from the order (each slice's products summed in one FFMA chain), not
+from the SM count.  The head/tail partitions split a tile's K range over more spans than the deterministic plan's six
+and add them with the TMA reduce-add.  At one token the SIMT weight gradient rounds each product once (below the
+deterministic program's error), but a window of one token is not kept.*
+
+`prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
+forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the
+`rule_key` / `rule_value` of the plan it measured, in the format of these tables.
+
+## Workspace
+
+A K1 launch with more than one split uses an FP32 slot workspace (`tiles * num_splits * 256 * block_n` elements,
+zero at creation: the last split of a partial tile reads the padding columns no split writes, and discards them) and
+the ticket counters (`tiles * 512` words, zero at creation, zero again after every complete launch).  A prepared
+launch owns both; the convenience path keeps them in an arena per (device, stream), so concurrent launches on
+different streams never share them.  After an aborted launch, call `PreparedAtomicGemm.reset_counters()` (or
+`clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on the launch stream (one memset) between
+the split and the program; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
+A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
+issues its launches back to back.  A cached K1 launch of the convenience path orders its arguments once per cache key
+(the PDL flag is bound, so it is part of the key) and converts its workspace once per arena growth; a call rebuilds and converts only its operand views.  A K1 call that
+runs the deterministic program -- the forward, the input gradient, a weight-gradient row without a verdict -- launches
+it through a cached binding of this package: the deterministic package's plan and program (its bits, with its `sk` /
+`cta_rows` knobs and its weight-gradient orientation), with its stream-K slabs and slice counters in this package's
+arena, keyed by the entry point's own tensors.  A batched forward that the deterministic package runs on its swapped
+small-token program makes that package's call (with `enable_pdl` and `weights_static`).
+A cached K2 launch of the convenience path orders its arguments once per cache key
+and converts the arena's BF16x3 stack once per arena growth, so a call passes only the caller's views (each
+converted in its FFI call) and enters the arena's stream context, made once.  A K2 call
+that runs the deterministic program -- the input gradient, the forward without a split count, a call without a split
+count whose row has no verdict in the router table of the device's SM count (`ROUTER_RULES`, or the part's own table
+in `ROUTER_RULES_BY_SM`; not planned here) -- launches it through a cached binding of this package: the
+deterministic package's plan, programs and `torch.sum` of its split-K partials (its bits), with the stack and the
+partials in this package's arena, bound once per arena growth, and the entry point's own tensors as the launch
+views.  It issues the same launches as the deterministic package's convenience path in fewer host operations.  Whether a row has a verdict is kept per device and view geometry, and whether any
+router table gives the forward one is kept too, until a router table changes: the router tables count their changes,
+so a verdict set or removed at run time is seen at the next call (a table rebound to a plain `dict` is read on every
+call).  The router entry points (`router_forward`, `router_dgrad`, `router_wgrad`) cache each call once more by their
+own tensors, the operation, the split count and the PDL flag: a call goes from that key to the cached launch its
+route takes, without building the transposed operand, routing the row or building the launch's own key; the key is
+routed again when a router table or `ROUTES` changes (with a table rebound to a plain `dict`, every call takes the
+full path).
+
+## Benchmark
+
+`benchmarks/bench_cake_dense_projection_gemm.py` times every row of the deterministic family's benchmark with the
+arms `det` (the deterministic package's prepared launch), `atomic` (`deterministic=False`), `atomic_p1` (the same
+program at one split), `cublas` (`torch.matmul`), `cublaslt` (a cuBLASLt heuristic sweep) and `bf16x9` (cuBLAS FP32
+in `CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs; `--resident`
+re-times `det` and `atomic` next to a kernel holding `--resident-sms` SMs on another stream.
+
+## Names
+
+This import path held the dense projection GEMM package until #8046 renamed it to `dense_projection_det_gemm`; #8046
+left it as an alias of the renamed modules.  The names keep their spelling and, with the default, their behavior:
+
+| name before #8046 (`dense_projection_gemm.cake_backend`) | deterministic package (`dense_projection_det_gemm.cake_backend`) | this path |
+|---|---|---|
+| `dense_projection_gemm` | `dense_projection_det_gemm` | `dense_projection_gemm(..., deterministic=True)` |
+| `projection_forward`, `projection_dgrad`, `projection_wgrad` | `projection_det_forward`, `projection_det_dgrad`, `projection_det_wgrad` | the same names with `deterministic=` |
+| `prepare_dense_projection_gemm`, `prepare_projection_wgrad` | `prepare_dense_projection_det_gemm`, `prepare_projection_det_wgrad` | the same names with `deterministic=` |
+| `plan_dense_projection_gemm` | `plan_dense_projection_det_gemm` | the same name with `deterministic=` |
+| `router_fp32_gemm`, `router_forward`, `router_dgrad`, `router_wgrad` | `router_fp32_det_gemm`, `router_det_forward`, `router_det_dgrad`, `router_det_wgrad` | the same names with `deterministic=` |
+| `prepare_router_fp32_gemm`, `plan_router_fp32_gemm` | `prepare_router_fp32_det_gemm`, `plan_router_fp32_det_gemm` | the same names with `deterministic=` |
+| `split_fp32_to_bf16x3_` | `split_fp32_to_bf16x3_det_` | the same name with `deterministic=` (the deterministic stage in both modes) |
+| `instance_symbol`, `router_symbol` | `instance_symbol`, `router_symbol` | the same names with `deterministic=` |
+| `GemmPlan`, `PreparedGemm` | `DetGemmPlan`, `PreparedDetGemm` | read through; `deterministic=False` plans `AtomicGemmPlan`, `PreparedAtomicGemm` |
+| `RouterPlan`, `PreparedRouterGemm` | `RouterDetPlan`, `PreparedRouterDetGemm` | read through; `deterministic=False` plans `AtomicRouterPlan`, `PreparedAtomicRouterGemm` |
+| every other module name (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | the same name | read through to the deterministic package |
+| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `dense_proj_gemm_atomic_nn_n192_f32` (row-major store, `sm_107a`), `router_fp32_gemm_atomic_{kk,nn_t,nn_t_ht_c3_nreg}`, `router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg` (`sm_103a`) |
+
+*Table: the names before #8046, their deterministic names, and what this path offers
+(`cake_backend.DETERMINISTIC_NAMES`).*
+
+| name (`flashinfer.experimental.dense_projection_gemm`) | default | `deterministic=False` |
+|---|---|---|
+| the entry points of the table above | the deterministic package's `*_det_*` object | this package's schedule (routing table above) |
+| `cake_backend.clear_convenience_caches` | clears the caches and arenas of both packages | -- |
+| `cake_jit.{MODULES, KERNELS, ARG_PLANS}` | this package's programs only | -- |
+| `cake_jit.select_module`, `cake_jit.load_cake_dense_projection_gemm_module` | a deterministic template or program resolves through the deterministic package | -- |
+| `cake_build` | this package's loader (byte-identical to every Cake package's) | -- |
+
+*Table: the names of this path and what they reach.*
+
+A module-level assignment through this path (for example `CONVENIENCE_CACHE_SIZE`) does not reach the deterministic
+package; set it there.
 
 ## Layout of this package
 
-* `cake_jit.py` -- the registry (schema v2) and the loader glue.  Three
-  literals filled by the generated-program export, each wrapped in
-  `# fmt: off` / `# fmt: on` and rendered one record per line (the export
-  replaces a literal from its head line up to the next `# fmt: on`):
-  `ARG_PLANS` (the distinct argument plans -- the ordered `[kind, name]` pairs
-  a generated entry takes -- keyed by the first 12 hex digits of the SHA-256
-  of the plan's compact JSON, `arg_plan_key`; one plan serves every K1 program
-  and one every K2 program), `MODULES` (one record per generated program:
-  template, kernel symbol, the architecture-free `library` stem, FFI entry,
-  `arg_plan` key -- `arg_plan_of` resolves it and still accepts an inline
-  list -- launch geometry, `arches`) and `KERNELS` (`arch -> template ->
-  module name`).  `ARCHES` names the registered architectures;
-  `load_cake_dense_projection_gemm_module(name, arch)` loads the build
-  `<library>_<arch>` through `cake_build`.
-* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
-  with its translation units, digests, nvcc flags, closure digest and
-  `aot/<name>.so` path.  `cake_build.load_library(name)` loads the prebuilt
-  library when `aot/` holds it and otherwise JIT-builds the entry through
-  FlashInfer (`gen_jit_spec`, sources digest-verified first);
-  `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
-  `flashinfer.jit.build_jit_specs`.  `cake_build.jit_spec(name)` /
-  `jit_specs(arch)` gate an entry on its `min_cuda` only (`sm_107a` entries
-  need CUDA 13.0): a 13.0 toolkit whose `nvcc` does not emit `compute_107a`
-  fails inside the JIT build with nvcc's own message.
-* `cake_backend.py` -- view validation, instance selection, stream-K
-  planning, argument-plan binding, the prepared launches and the eager entry
-  points.
-* `csrc/cake_dense_projection_gemm/` -- generated kernel and binding
-  translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the manifest's digests); `csrc/cake_ffi_checks.h` -- the
-  tvm-ffi tensor checks the bindings include (shipped with the package, no
-  FlashInfer header).
+| file | content |
+|---|---|
+| `__init__.py` | imports nothing; `cake_backend`, `cake_jit`, `cake_build` load on first attribute access |
+| `cake_backend.py` | entry points, mode resolution, routing, the planners, rule tables and the convenience state of this package's programs |
+| `cake_jit.py` | the registry of this package's programs (`ARG_PLANS`, `MODULES`, `KERNELS`) and the loader |
+| `cake_build.py`, `build.json`, `csrc/cake_dense_projection_gemm/` | the `cake-build/1` loader, manifest and generated sources of this package's programs (written by the Cake exporter) |
 
-## Status
-
-The registries hold the generated programs of the current export lock: the
-Cake exporter (`exports/dense_projection_gemm` of the Cake repository) emits
-one program per template, shared by `sm_100a` and `sm_107a` wherever the generated text is the same (the per-architecture
-template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
-is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
-instance).  `build.json` ships the builds of the architectures `cake_jit.KERNELS`
-lists (`sm_100a`, `sm_103a` and `sm_107a`); the eight-warp form ships for
-`sm_103a` (two programs) and `sm_100a` (the knob-free program); every program the measured
-`sm_100a` / `sm_103a` rules name is registered, so the registry fallback only
-serves a caller that forces a template no export generated.  An entry point raises
-`NotImplementedError` naming the missing instance for a template that no
-export has generated and for every template on a device whose architecture the
-registry does not list.
-
-CUDA Graphs: prepare outside capture and replay the prepared launch
-(`prepare_*` once, `launch` many times).  The convenience entry points
-(`dense_projection_gemm`, `projection_*`, `router_*`) reuse a cached planned
-launch per (device, stream, geometry) key and the shared workspace arena of its
-(device, stream); capture a prepared launch object rather than the convenience
-entry points (see "Host paths").
-
-Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
-planning tests run everywhere; the GPU tests skip without a registered
-generated instance -- a device of an architecture `cake_jit.KERNELS` lists).  Benchmark:
-`benchmarks/bench_cake_dense_projection_gemm.py` (the 11 GLM-5.2 projection
-rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
-batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the
-host time per call of the prepared launch and of the convenience entry point).
+The deterministic package is resolved as this package's sibling on first use; the package never imports `flashinfer`
+by absolute name.  A consumer that vendors this package vendors the deterministic package too and binds it with
+`cake_backend.use_deterministic_backend(<its cake_backend module>)`.

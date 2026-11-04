@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <flashinfer/math.cuh>
 #include <numeric>
 #include <string>
 
@@ -217,7 +218,7 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
   // use specialized hopper kernels without alibi support.
   // alibi or softcapping_scale cannot utilize the exp2f with fused_scale optimization.
   if (launch_params.warp_specialization && !has_alibi && !enable_attn_logit_softcapping) {
-    set_alpha(params.scale_bmm1, fused_scale_bmm1 * float(M_LOG2E), DATA_TYPE_FP32);
+    set_alpha(params.scale_bmm1, fused_scale_bmm1 * flashinfer::math::log2e_f, DATA_TYPE_FP32);
   } else {
     set_alpha(params.scale_bmm1, fused_scale_bmm1, scale_type1);
   }

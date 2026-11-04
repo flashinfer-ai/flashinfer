@@ -76,6 +76,92 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
+# Signal PID and everything below it: killing only a background subshell leaves
+# its `python -m build`, ninja and nvcc children running.
+_kill_process_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+# The pool's polling runs with xtrace off: callers use `set -x`, and a trace of
+# every 0.2 s check would bury the build output. Restoring is done by each helper.
+#
+# Collect the status of items that have finished, without blocking. Works on the
+# caller's `pids` (items still counted as running) and `failed` variables: bash
+# forgets finished jobs in `jobs`, so the pids are tracked here. A pid is waited
+# for exactly once, so its status is never lost or read twice.
+_reap_finished_items() {
+  { local pid alive=() xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    else
+      wait "$pid" || failed=1
+    fi
+  done
+  pids=(${alive[@]+"${alive[@]}"})
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until a slot is free or an item has failed (`failed` is set then).
+# Uses the caller's `limit`, `pids` and `failed`.
+_wait_for_free_slot() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while :; do
+    _reap_finished_items
+    if (( failed || ${#pids[@]} < limit )); then break; fi
+    sleep 0.2
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until every item has finished or one has failed.
+_wait_for_all_items() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while (( ${#pids[@]} > 0 && ! failed )); do
+    sleep 0.2
+    _reap_finished_items
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
+# finished item frees its slot for the next one. Output of different items
+# interleaves, so FUNCTION should prefix its own lines. On the first failure,
+# including one after the last item has started, the running items are killed
+# with their descendants and no more start. Finished items are polled every
+# 0.2 s, which is negligible against builds that take minutes.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
+# Returns 0 when every item succeeded, else 1.
+run_bounded_parallel() {
+  local limit=$1 fn=$2
+  shift 2
+  local item pid failed=0 pids=()
+  for item in "$@"; do
+    _wait_for_free_slot
+    if (( failed )); then break; fi
+    "$fn" "$item" &
+    pids+=($!)
+  done
+  # Drain what is still running, stopping it at the first failure.
+  _wait_for_all_items
+  if (( failed )); then
+    for pid in ${pids[@]+"${pids[@]}"}; do _kill_process_tree "$pid"; done
+  fi
+  # Reaps the killed items.
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    wait "$pid" || failed=1
+  done
+  return $failed
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:

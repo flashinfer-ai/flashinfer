@@ -13,6 +13,21 @@ The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 Requires a CUDA-capable GPU.
 
 Results:
+- ulysses_exchange_chunks_ws1_c256.json
+- ulysses_lowp_k_sum_v_amax_h8_d64.json
+- ulysses_lowp_q_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d64_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d64_p8.json
+- ulysses_lowp_k_sum_v_amax_h8_d128.json
+- ulysses_lowp_q_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d128_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d128_p8.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d128_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d128_p8_u513.json
 - We would get these example json files under fi_trace_out directory:
 qsa_forward_h12_kv1_d256.json
 qsa_indexed_forward_h12_kv1_d256.json
@@ -48,6 +63,8 @@ gdn_prefill_gates_q4_k4_v8_d128.json
 gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
+sdsa_gather_key_sample_page_size64_dim128.json
+group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -70,6 +87,9 @@ gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
+sdsa_indexer_scores_page_size64_dim128.json
+sdsa_indexer_scores_page_size64_dim64.json
+sdsa_indexer_threshold_select_page_size64_dim128_counters2_pair2.json
 layernorm_h768.json
 layernorm_quant_h768.json
 linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
@@ -133,6 +153,7 @@ prims_ts_fp4_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 prims_ts_fp8_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 quantize_nvfp4_smooth_N3072.json
+sdsa_quantize_write_index_qk_nvfp4_dim128_page_size64_packed_dim64_scales8.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_sigmoid_gate_nh32_h64.json
@@ -140,7 +161,9 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
+sdsa_thresholds_from_sample_counters2.json
 token_sparse_kv_indices_top_k2048_lists2.json
+sdsa_top_k_from_candidates_pair2_range2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -2790,30 +2813,33 @@ for _pts_semantic_PS in (32, 4):
         )
 
         _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-        _pts_wrapper.plan(
-            _pts_q.device,
-            _pts_B,
-            _pts_Hq,
-            _pts_Hkv,
-            _pts_D,
-            _pts_semantic_PS,
-            _pts_SK,
-            max_seq_len_q=_pts_SQ,
-            packed_query=False,
-            q_data_type=_pts_q.dtype,
-            k_data_type=_pts_k.dtype,
-            v_data_type=_pts_v.dtype,
-            o_data_type=torch.bfloat16,
-            mask_type="causal",
-            workspace_buffer=_pts_workspace,
-            storage_page_size=_pts_PS,
-        )
-        _pts_wrapper.run(
-            _pts_q,
-            _pts_cache,
-            _pts_seq_lens,
-            _pts_block_tables,
-        )
+        for _pts_plan_seq_lens in (None, [_pts_SK] * _pts_B):
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                packed_query=False,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                workspace_buffer=_pts_workspace,
+                storage_page_size=_pts_PS,
+                seq_lens_kv=_pts_plan_seq_lens,
+            )
+            _pts_wrapper.run(
+                _pts_q,
+                _pts_cache,
+                None if _pts_plan_seq_lens is not None else _pts_seq_lens,
+                _pts_block_tables,
+            )
+
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2871,7 +2897,7 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         q_dtype=_pmla_q.dtype,
         kv_dtype=_pmla_cache.dtype,
         out_dtype=torch.bfloat16,
@@ -2888,7 +2914,7 @@ with contextlib.suppress(Exception):
         max_kv_len=_pmla_SK,
         kv_lora_rank=_pmla_CKV,
         qk_rope_head_dim=_pmla_KPE,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         mask_type="causal",
     )
 
@@ -2901,11 +2927,11 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         packed_query=False,
-        q_data_type=_pmla_q.dtype,
-        kv_data_type=_pmla_cache.dtype,
-        o_data_type=torch.bfloat16,
+        q_dtype=_pmla_q.dtype,
+        kv_dtype=_pmla_cache.dtype,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         workspace_buffer=_pmla_workspace,
     )
@@ -3377,6 +3403,102 @@ with contextlib.suppress(Exception):
             _fp4_in["max_seq_len"],
         )
 
+
+# Ulysses trace schemas can be generated on CPU, independently of kernel support.
+def dump_ulysses_exchange_chunks_trace(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # A schema-only single-rank reference. No communicator construction or
+    # collective is needed; real multi-rank payloads are tested in tests/comm/.
+    definition = UlyssesCommunicator.exchange_chunks.fi_trace(
+        self=SimpleNamespace(world_size=1),
+        x=torch.empty(1, 1, 1, 256, dtype=torch.uint8),
+        dtype=torch.uint8,
+    )
+    path = save_dir / f"{definition['name']}.json"
+    path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_exchange_chunks_trace(SAVE_DIR)
+
+
+def dump_ulysses_lowp_traces(save_dir):
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    for head_dim in (64, 128):
+        q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+        mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
+        qs = torch.empty(1, 8, 3, dtype=torch.float32)
+        ks = torch.empty(1, 8, 2, dtype=torch.float32)
+        spec = lowp.payload_spec(
+            batch_size=1,
+            local_sequence=65,
+            num_heads=8,
+            head_dim=head_dim,
+            world_size=8,
+        )
+        calls = (
+            (lowp.k_sum_v_amax, dict(k=q, v=q)),
+            (lowp.q_grouped_amax, dict(q=q, rank=0, world_size=8)),
+            (lowp.k_grouped_amax, dict(k=q, k_mean_global=mean, rank=0, world_size=8)),
+            (
+                lowp.quant_qkv_pack,
+                dict(
+                    q=q,
+                    k=q,
+                    v=q,
+                    k_mean_global=mean,
+                    q_amax_final=qs,
+                    k_amax_final=ks,
+                    v_scale_global=mean.float(),
+                    rank=0,
+                    world_size=8,
+                ),
+            ),
+            (
+                lowp.unpack_for_sage,
+                dict(
+                    recv_u8=torch.empty(8, spec["chunk_bytes"], dtype=torch.uint8),
+                    batch_size=1,
+                    local_sequence=65,
+                    local_heads=1,
+                    head_dim=head_dim,
+                    world_size=8,
+                ),
+            ),
+        )
+        for fn, kwargs in calls:
+            definition = fn.fi_trace(**kwargs)
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_lowp_traces(SAVE_DIR)
+
+
+def dump_ulysses_qkv_traces(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # Schema generation only. Real execution obtains this metadata from
+    # comm.prepare_qkv(), called collectively by all ranks before inference.
+    # Do not create a communicator or launch collectives in this example.
+    for layout in ("sage2_sm90", "sage2_sm89_sm120"):
+        metadata = SimpleNamespace(layout=layout, world_size=8, used_sequence=513)
+        for head_dim in (64, 128):
+            q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+            definition = UlyssesCommunicator.scatter_qkv.fi_trace(
+                q=q, k=q, v=q, workspace=metadata
+            )
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_qkv_traces(SAVE_DIR)
+
 # ── top_k_varlen (DeepSeek sparse-attention indexer top-k) ─────────────────
 # decode shape: one row per request, per-request lengths; the radix_cutlass
 # backend runs on any GPU -> top_k_varlen_n8192_k1024.json
@@ -3455,8 +3577,8 @@ finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()
 
-# ── Token-sparse attention inputs: key positions to K/V slot lists ────────────
-from flashinfer.token_sparse import token_sparse_kv_indices
+# ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
+from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
 
 token_sparse_kv_indices.fi_trace(
     save_dir=SAVE_DIR,
@@ -3466,4 +3588,103 @@ token_sparse_kv_indices.fi_trace(
     block_tables=torch.empty(8, 2, 2048, dtype=torch.int32),
     seq_lens=torch.empty(8, dtype=torch.int32),
     requests_per_token=2,
+)
+
+group_union_masks.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(8, 2048, dtype=torch.int32),
+    query_rows=torch.arange(8, dtype=torch.int32),
+    group_unions=torch.arange(2, dtype=torch.int32),
+    requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 256, dtype=torch.int32),
+    union=torch.empty(2, 8192, dtype=torch.int32),
+    union_sizes=torch.empty(2, dtype=torch.int32),
+    mask=torch.empty(8, 256, dtype=torch.int32),
+    num_keys=16384,
+)
+
+# ── SDSA (Simplified DSA) indexer ─────────────────────────────────────────────
+from flashinfer.sdsa import (
+    gather_key_sample,
+    indexer_scores,
+    indexer_threshold_select,
+    quantize_write_index_qk_nvfp4,
+    thresholds_from_sample,
+    top_k_from_candidates,
+)
+
+indexer_scores.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+)
+
+indexer_scores.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 64, dtype=torch.uint8),
+    key_cache=torch.empty(64, 64, 64, dtype=torch.uint8),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+    query_scales=torch.empty(8, 8, dtype=torch.float8_e4m3fn),
+    key_scales=torch.empty(64, 64, 8, dtype=torch.float8_e4m3fn),
+)
+
+quantize_write_index_qk_nvfp4.fi_trace(
+    save_dir=SAVE_DIR,
+    key=torch.empty(16, 128, dtype=torch.bfloat16),
+    slots=torch.arange(16, dtype=torch.int64),
+    query=torch.empty(16, 128, dtype=torch.bfloat16),
+    query_rows=torch.arange(16, dtype=torch.int64),
+    key_cache=torch.empty(4, 64, 64, dtype=torch.uint8),
+    key_scales=torch.empty(4, 64, 8, dtype=torch.float8_e4m3fn),
+    packed_query=torch.empty(16, 64, dtype=torch.uint8),
+    query_scales=torch.empty(16, 8, dtype=torch.float8_e4m3fn),
+)
+
+indexer_threshold_select.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(256, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    row_ends=torch.empty(256, dtype=torch.int32),
+    tile_requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
+    candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
+    max_context=4096,
+    top_k=2048,
+    arrivals=torch.zeros(2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
+)
+
+gather_key_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(2, 32, dtype=torch.int32),
+    offsets=torch.empty(128, dtype=torch.uint8),
+    sample_ends=torch.empty(2, dtype=torch.int32),
+    sample_keys=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+    samples_per_run=3,
+    pages_per_run=2,
+)
+
+thresholds_from_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    sample_scores=torch.empty(256, 128),
+    sample_top=torch.empty(256, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
+)
+
+top_k_from_candidates.fi_trace(
+    save_dir=SAVE_DIR,
+    candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
+    top_keys=torch.empty(256, 2048, dtype=torch.int32),
 )
