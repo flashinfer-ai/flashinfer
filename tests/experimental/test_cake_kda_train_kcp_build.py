@@ -491,13 +491,15 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
 
 DET_PREFIX, PREFIX = "cake_kda_det_train_", "cake_kda_train_"
 # The records whose builds differ between the two packages: the deterministic package ships newer builds of the
-# affine merge (selected by its MERGE_RULE) and of the full-width offset walks (the adjoint one beside the plain build,
-# selected by its WALK_HEADS_RULE); this package keeps its own builds of these records.  The deterministic package's
+# affine merge (selected by its MERGE_RULE), of the full-width offset walks (the adjoint one beside the plain build,
+# selected by its WALK_HEADS_RULE) and of the shipped transfer walk; this package keeps its own builds of these
+# records.  The deterministic package's
 # extra records belong to those programs.  Every other record and unit is the deterministic package's under this
 # package's names.
 OWN = {
     "kcp_fwdh_offset": PREFIX + "7658fcc297c6fd906d53_kcp",
     "kcp_dhu_offset": PREFIX + "1c66573e87150245374b_kcp",
+    "kcp_transfer_walk": PREFIX + "9a3f306bacf8c8a1547d_kcp",
     "kcp_affine_merge_c8": PREFIX + "c6958a0a4ed5cb55a9a1_kcp",
     "kcp_affine_merge_c16": PREFIX + "89f5ff59f03eb170e3bf_kcp",
 }

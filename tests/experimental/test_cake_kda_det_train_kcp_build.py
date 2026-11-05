@@ -136,8 +136,9 @@ PLANS = {
     "kcp_dhu_tape_full": DHU_PLAN,
 }
 # Launch block of the records that are not 192 threads wide (the merge records: MERGE_RECORDS); the full-width fwdh
-# offset walk runs the split-role schedule (four state, four decay, one TMA and one MMA warp).
-BLOCKS = {"kcp_fwdh_offset": 320}
+# offset walk runs the split-role schedule (four state, four decay, one TMA and one MMA warp), the shipped transfer
+# walk two compute warpgroups (eight compute, one load and one MMA warp).
+BLOCKS = {"kcp_fwdh_offset": 320, "kcp_transfer_walk": 320}
 # The identity rule: ``cake_kda_det_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
 # then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
 # The digest hashes the source module path the program shipped under, so the digests are those of the previous names
@@ -173,7 +174,7 @@ IDENTITIES = {
         {"program": "tape", "vh": 64, "tape_store": "tma"},
     ),
     "kcp_transfer_walk": (
-        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
+        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_det_transfer_walk_bf16x3_v2_kcp",
         {"vh": 64},
     ),
     **{name: (MERGE_V2_MODULE, row[0]) for name, row in MERGE_RECORDS.items()},
@@ -517,7 +518,7 @@ def test_walk_heads_selection() -> None:
 def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:
     record = kcp_jit.MODULES["kcp_transfer_walk"]
     assert record["grid_rule"] == {"ctas_per_head": 2, "kind": "kcp_segments_heads"}
-    assert record["library"] == "cake_kda_det_train_9a3f306bacf8c8a1547d_kcp"
+    assert record["library"] == "cake_kda_det_train_8ffd931ca0595948b608_kcp"
     previous = kcp_jit.TEST_MODULES["kcp_transfer_walk_tf32_hilo"]
     assert previous["grid_rule"] == {"kind": "kcp_segments_heads"}
     assert previous["library"] == "cake_kda_det_train_1ac972f0cb7cc7b13cf7_kcp"

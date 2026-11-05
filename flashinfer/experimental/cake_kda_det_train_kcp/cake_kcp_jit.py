@@ -785,15 +785,15 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # Two CTAs per (segment, head): each walks one 64-column half of the state.
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_det_train_9a3f306bacf8c8a1547d_kcp",
+        "kernel_symbol": "kernel_cake_kda_det_train_8ffd931ca0595948b608_kcp",
         "launch": {
-            "block": (192, 1, 1),
+            "block": (320, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 107520,
+            "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_9a3f306bacf8c8a1547d_kcp",
+        "library": "cake_kda_det_train_8ffd931ca0595948b608_kcp",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
