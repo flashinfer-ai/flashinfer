@@ -112,9 +112,13 @@ rows; ``--rows fp8`` (the default of the mode) names ``P1``, ``glm2k_16k``
 ``s2_4x2k_packed`` (four segments of 2048 queries over 18432, 43008, 67584
 and 100352 keys) and ``s3_cold16k`` (16384 over 16384), top-k 2048, causal.
 Arms: ``cake_fp8`` (this backend's FP8 form; ``cake_fp8_aa`` /
-``cake_fp8_nosample`` as above; ``cake_fp8_wn`` the previous FP8 dispatch,
-which ran a wide decision on the narrow program with the wide decision's
-sampled first threshold and check period; ``cake_fp8_l6`` /
+``cake_fp8_nosample`` as above; ``cake_fp8_w6`` the FP8 dispatch before the
+FP8 wide program, which ran a wide decision on the l6 program with the l6
+kind's sampled first threshold and check period (the FP8 wide programs
+hidden: a twin of ``cake_fp8`` where none is registered); ``cake_fp8_wn``
+the FP8 dispatch before that, which ran a wide decision on the narrow
+program with the wide decision's sampled first threshold and check period;
+``cake_fp8_l6`` /
 ``cake_fp8_narrow`` on the l6 / narrow program on every row, and
 ``cake_l6_all`` the BF16 form on the l6 program where the architecture
 registers the l6 key the row composes), ``cake`` (the
@@ -883,6 +887,29 @@ def forced_fp8_fallback(backend, overrides: dict):
         module.fallback_knobs = saved_knobs
 
 
+@contextlib.contextmanager
+def hidden_fp8_kinds(backend, kinds):
+    """The FP8 dispatch without the FP8 scan programs of the physical ``kinds`` for an arm built inside this scope:
+    ``plan_dsa_indexer_det_topk`` looks ``fp8_programs_for`` up on the module at every call, so a decision of a hidden
+    kind runs the program of its ``cake_policy.FP8_KIND_FALLBACK`` kind with that kind's sampled first threshold and
+    check period (``cake_policy.fallback_knobs``), as on an architecture that registers none.  The process cache of
+    ``fp8_programs_for`` is read, not changed; the original function is restored on exit."""
+    original = backend.fp8_programs_for
+
+    def fp8_programs_for(arch):
+        return {
+            (kind, lsf): unrolls
+            for (kind, lsf), unrolls in original(arch).items()
+            if kind not in kinds
+        }
+
+    backend.fp8_programs_for = fp8_programs_for
+    try:
+        yield
+    finally:
+        backend.fp8_programs_for = original
+
+
 class CakeArm(Arm):
     name = "cake"
 
@@ -895,14 +922,17 @@ class CakeArm(Arm):
         name=None,
         policy=None,
         fp8_fallback=None,
+        fp8_hidden=None,
     ):
         super().__init__(inputs)
         self.backend = cake_backend if backend is None else backend
         self.knobs = dict(knobs or {})
-        # forced dispatch: registry fields replaced for this arm (empty: the package's own policy), and FP8 kind
-        # fallback entries replaced (empty: the package's own)
+        # forced dispatch: registry fields replaced for this arm (empty: the package's own policy), FP8 kind
+        # fallback entries replaced (empty: the package's own) and the FP8 programs of these physical kinds hidden
+        # (empty: every registered one)
         self.policy = dict(policy or {})
         self.fp8_fallback = dict(fp8_fallback or {})
+        self.fp8_hidden = list(fp8_hidden or ())
         if name is not None:
             self.name = name
         dev = inputs.device
@@ -911,6 +941,8 @@ class CakeArm(Arm):
             scope.enter_context(forced_policy(self.backend, self.policy))
         if self.fp8_fallback:
             scope.enter_context(forced_fp8_fallback(self.backend, self.fp8_fallback))
+        if self.fp8_hidden:
+            scope.enter_context(hidden_fp8_kinds(self.backend, self.fp8_hidden))
         with scope:  # one scope: the workspace bound, the plan record and prepare see the same policy
             self.workspace_bytes = backend_api(
                 self.backend, "dsa_indexer_det_workspace_size"
@@ -1181,9 +1213,14 @@ L6_ALL = {
 FP8_NARROW = {**NARROW, "l6_solo_rule": None, "l6_solo_unsampled_max_queries": None}
 # the FP8 kind fallback before a wide decision ran the FP8 l6 program: the narrow program
 FP8_FALLBACK_NARROW = {"wide": "narrow", "pair_wide": "narrow"}
+# the FP8 dispatch before the FP8 wide program: its programs hidden (``hidden_fp8_kinds``), a wide decision runs the
+# program of its FP8 kind fallback (the l6 program, or with FP8_FALLBACK_NARROW the narrow one)
+FP8_NO_WIDE = ("wide",)
 
 
-def _cake(name, backend=None, knobs=None, policy=None, fp8_fallback=None):
+def _cake(
+    name, backend=None, knobs=None, policy=None, fp8_fallback=None, fp8_hidden=None
+):
     def make(inputs):
         return CakeArm(
             inputs,
@@ -1192,6 +1229,7 @@ def _cake(name, backend=None, knobs=None, policy=None, fp8_fallback=None):
             name=name,
             policy=policy,
             fp8_fallback=fp8_fallback,
+            fp8_hidden=fp8_hidden,
         )
 
     return make
@@ -1207,7 +1245,9 @@ def _cake(name, backend=None, knobs=None, policy=None, fp8_fallback=None):
 # program from one round, ``cake_narrow`` the narrow program -- so the same bits are expected against ``cake`` /
 # ``cake_nosample`` while the programs (``plan``) differ.  ``cake_floor16k`` / ``cake_floor16k_aa`` run the local package
 # under the 16384-slot floor on every top_k (the record before ``cand_cap_floor_rule``): the same programs, twice the
-# candidate buffers on sm_100a's top_k <= 512 rows (the sm_103a record keeps that floor), the same bits.
+# candidate buffers on sm_100a's top_k <= 512 rows (the sm_103a record keeps that floor), the same bits.  The FP8 arms
+# ``cake_fp8_w6`` / ``cake_fp8_wn`` run the local package under a previous FP8 dispatch, the FP8 wide programs hidden
+# (a wide decision on the l6 / the narrow program): the same bits as ``cake_fp8``.
 ARMS = {
     "cake": _cake("cake"),
     "cake_nosample": _cake("cake_nosample", knobs=NOSAMPLE),
@@ -1243,7 +1283,10 @@ ARMS = {
     "cake_fp8_nosample": _cake("cake_fp8_nosample", knobs=NOSAMPLE),
     "cake_fp8_l6": _cake("cake_fp8_l6", policy=L6_ALL),
     "cake_fp8_narrow": _cake("cake_fp8_narrow", policy=FP8_NARROW),
-    "cake_fp8_wn": _cake("cake_fp8_wn", fp8_fallback=FP8_FALLBACK_NARROW),
+    "cake_fp8_w6": _cake("cake_fp8_w6", fp8_hidden=FP8_NO_WIDE),
+    "cake_fp8_wn": _cake(
+        "cake_fp8_wn", fp8_fallback=FP8_FALLBACK_NARROW, fp8_hidden=FP8_NO_WIDE
+    ),
     "cake_l6_all": _cake("cake_l6_all", policy=L6_ALL),
     DeepGemmArm.name: DeepGemmArm,
     DeepGemmRaggedArm.name: DeepGemmRaggedArm,
@@ -1256,6 +1299,7 @@ FP8_ARMS = (
     "cake_fp8_nosample",
     "cake_fp8_l6",
     "cake_fp8_narrow",
+    "cake_fp8_w6",
     "cake_fp8_wn",
     DeepGemmArm.name,
     DeepGemmRaggedArm.name,
@@ -1434,6 +1478,7 @@ def measure_row(name, inputs, arms, args, bf16_inputs=None):
             record["knobs"] = arm.knobs
             record["policy_overrides"] = arm.policy
             record["fp8_kind_fallback_overrides"] = arm.fp8_fallback
+            record["fp8_hidden_kinds"] = arm.fp8_hidden
             record["package"] = (
                 "main" if arm.backend is not cake_backend else "candidate"
             )
