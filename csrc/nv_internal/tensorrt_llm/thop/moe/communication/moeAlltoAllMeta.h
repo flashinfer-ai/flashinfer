@@ -106,13 +106,14 @@ enum MoeA2AMetaInfoIndex : int64_t
     SENTINEL_HIDDEN_SIZE_INDEX = 27,
     // Round state: int32 words (epoch, ...), then a uint64 receive-source mask per token slot.
     SENTINEL_STATE_OFFSET_INDEX = 28,
-    // Landing rows: payload, scale and weight rows, then two sets of expert-id rows.
+    // Landing rows: payload, scale and weight rows, then two sets of expert-id rows. A sentinel
+    // step's hidden states and scales are received in its payload and scale rows.
     SENTINEL_LANDING_OFFSET_INDEX = 29,
     // Combine landing rows: one bf16 partial row per (source rank, token).
     SENTINEL_COMBINE_LANDING_OFFSET_INDEX = 30,
-    // Receive buffers of a sentinel dispatch, packed like the dispatch payload region.
+    // Receive buffers of a sentinel dispatch's expert ids and weights.
     SENTINEL_RECV_OFFSET_INDEX = 31,
-    // Reserved receive capacity, including payload alignment padding.
+    // Their reserved capacity, including alignment padding.
     SENTINEL_RECV_SIZE_INDEX = 32,
 
     // Number of int64_t entries in the metadata tensor; not a stored layout field.

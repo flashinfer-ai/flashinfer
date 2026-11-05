@@ -692,16 +692,27 @@ def _fake_sentinel(monkeypatch, module) -> list:
     )
 
     extended = []
+    # Unused fields of the fake layout hold where the sentinel landing and
+    # combine landing rows start.
+    landing, combine_landing = 22, 23
 
     def extend(metainfo, max_tokens, fmt, hidden):
         extended.append(max_tokens)
-        metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] += 1 << 12
+        size = int(metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]])
+        metainfo[landing] = size
+        metainfo[combine_landing] = size + (1 << 11)
+        metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] = size + (1 << 12)
 
     module.moe_a2a_sentinel_extend_workspace_layout = extend
     monkeypatch.setattr(
         one_sided,
         "layout_constants",
-        lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT, SENTINEL_FORMAT_BF16=0),
+        lambda: SimpleNamespace(
+            **_ONE_SIDED_LAYOUT,
+            SENTINEL_FORMAT_BF16=0,
+            SENTINEL_LANDING_OFFSET_INDEX=landing,
+            SENTINEL_COMBINE_LANDING_OFFSET_INDEX=combine_landing,
+        ),
     )
     monkeypatch.setattr(one_sided, "_sentinel_unsupported_reason", lambda *a: None)
     row = one_sided._SentinelRow(16, 0, 1, 64)

@@ -138,8 +138,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     ``hidden_states``, its optional scale factors, ``topk_ids`` and
     ``topk_weights`` travel as payloads of a single dispatch. Received rows
     beyond each source rank's token count get ``invalid_expert_id`` routing;
-    after a sentinel step, row ``source_rank * tokens_per_rank + token`` holds
-    that token and rows of tokens not routed here get ``invalid_expert_id``.
+    after a sentinel step, row ``token * ep_size + source_rank`` holds that
+    token and rows of tokens not routed here get ``invalid_expert_id``.
     See :class:`NVLinkOneSidedConfig` for the sync protocols and timeouts.
     """
 
@@ -544,12 +544,15 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self._enable_pdl,
         )
 
+        # Rows by source rank, then token; a sentinel step's by token, then
+        # source rank.
+        rows = (
+            (tokens_per_rank, self.ep_size)
+            if use_sentinel
+            else (self.ep_size, tokens_per_rank)
+        )
         recv = [
-            self._workspace_view(
-                int(offset),
-                payload.dtype,
-                (self.ep_size, tokens_per_rank, payload.shape[1]),
-            )
+            self._workspace_view(int(offset), payload.dtype, (*rows, payload.shape[1]))
             for offset, payload in zip(recv_offsets, payloads, strict=True)
         ]
         if not use_sentinel:
@@ -605,6 +608,20 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self._round["combine_offset"], dtype, (rows, self.params.hidden_size)
         )
 
+    def _check_not_received_rows(self, expert_output: "torch.Tensor") -> None:
+        """Raise if ``expert_output`` overlaps this rank's sentinel landing rows."""
+        index, meta = self._index, self.metainfo
+        base = self._rank_bytes.data_ptr()
+        begin = base + int(meta[index.SENTINEL_LANDING_OFFSET_INDEX])
+        end = base + int(meta[index.SENTINEL_COMBINE_LANDING_OFFSET_INDEX])
+        start = expert_output.data_ptr()
+        stop = start + expert_output.numel() * expert_output.element_size()
+        if start < end and begin < stop:
+            raise ValueError(
+                "expert_output is a view of the rows this sentinel step received, "
+                "which its combine resets before reading them; pass a copy"
+            )
+
     def combine(
         self,
         expert_output: "torch.Tensor",
@@ -615,12 +632,17 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         """See :meth:`MoEEpCommunication.combine`.
 
         ``active_rank_mask`` must match the mask passed to :meth:`dispatch`.
+        ``expert_output`` must not be a view of the tensors :meth:`dispatch`
+        returned: a sentinel step resets its received rows before its combine
+        reads the expert output, and raises ``ValueError`` for such a view.
         """
         import torch
 
         state = self._round
         if state is None:
             raise RuntimeError("combine called before dispatch")
+        if state["sentinel"]:
+            self._check_not_received_rows(expert_output)
         self._check_rank_mask(active_rank_mask)
         tokens_per_rank = state["tokens_per_rank"]
         if expert_output.dim() == 2:

@@ -512,13 +512,20 @@ def _verify_dispatch(
     case: Case, results: list[dict], receiver: int, index: int, sentinel: bool
 ) -> None:
     """Received rows, payload bytes, routing and padding against the inputs;
-    a sentinel step's row of token ``t`` from a source is its row ``t``."""
+    a sentinel step's row of token ``t`` from source ``s`` is its row
+    ``t * ep_size + s``."""
     payload, sf, slots, weights = results[receiver]["outputs"][index]["dispatch"]
     maximum = max(case.rounds[index].tokens)
-    payload = payload.view(case.ep_size, maximum, -1)
-    sf = None if sf is None else sf.view(case.ep_size, maximum, -1)
-    slots = slots.view(case.ep_size, maximum, -1)
-    weights = weights.view(case.ep_size, maximum, -1)
+
+    def by_source(t):
+        if sentinel:
+            return t.view(maximum, case.ep_size, -1).transpose(0, 1)
+        return t.view(case.ep_size, maximum, -1)
+
+    payload = by_source(payload)
+    sf = None if sf is None else by_source(sf)
+    slots = by_source(slots)
+    weights = by_source(weights)
     begin, end = _expert_bounds(case.model.num_experts, case.ep_size, receiver)
     for source in range(case.ep_size):
         orig, orig_sf, orig_slots, orig_weights = results[source]["inputs"][index]
@@ -667,7 +674,7 @@ CASES = [
         for num_tokens in (1, 128, 1024)
     ],
     # The sentinel protocol at the model shapes it carries (hidden_size a
-    # multiple of 256).
+    # multiple of 256, of 512 for MXFP8 and DeepSeek FP8).
     *[
         pytest.param(
             Case(

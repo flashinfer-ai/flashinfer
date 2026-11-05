@@ -67,20 +67,23 @@ class NVLinkOneSidedConfig:
 
     The sentinel protocol needs compute capability 10.0, 10.3 or 10.7, at most 64 EP
     ranks, a BF16 combine and a BF16, ``MXFP8``, ``DeepSeekFp8`` or ``NVFP4``
-    dispatch format. Where a rank does not support it, every rank uses the
+    dispatch format, with ``hidden_size`` a multiple of 8, 512, 512 or 256
+    respectively. Where a rank does not support it, every rank uses the
     fence protocol (logged as a warning under ``"sentinel"``). It cannot carry
     steps with ``eplb_local_stats`` or with payloads outside the instance's
-    format; those take the fence protocol. Payload words equal to its sentinel
-    arrive rewritten to the same value (NaN stays NaN), so callers sending
-    other bytes in BF16 rows use ``"fence"``, as the split layer does for
-    kernels that pack their dispatch rows. A sentinel step places the rows it
-    receives from rank ``src`` for its token ``t`` at
-    ``src * tokens_per_rank + t``, ``tokens_per_rank`` being the step's
-    ``runtime_max_tokens_per_rank``. Like the fence protocol, it needs every
-    rank to pass ``topk_weights`` in a step or none (see
-    ``NVLinkOneSidedAlltoAll.dispatch``). Its landing, combine and receive
-    regions hold ``ep_size`` rows per token of its largest step, next to the
-    fence protocol's regions in the workspace; rank 0 logs their size.
+    format; those take the fence protocol. Payload words equal to a sentinel
+    arrive rewritten to the same value (NaN stays NaN; an ``MXFP8`` block
+    whose scale is NaN arrives as NaN values with a scale of 1), so callers
+    sending other bytes in BF16 rows use ``"fence"``, as the split layer does
+    for kernels that pack their dispatch rows. A sentinel step returns the
+    hidden states and scales in the rows its senders wrote, which keep them
+    until the step's combine and are no input for it: the row it receives
+    from rank ``src`` for its token ``t`` is ``t * ep_size + src``. Like the fence protocol, it needs
+    every rank to pass ``topk_weights`` in a step or none (see
+    ``NVLinkOneSidedAlltoAll.dispatch``). Its landing and combine rows and its
+    receive buffers of the expert ids and weights hold ``ep_size`` rows per
+    token of its largest step, next to the fence protocol's regions in the
+    workspace; rank 0 logs their size.
 
     ``timeout_sec`` bounds every wait on a peer rank, in nominal seconds at a
     2 GHz SM clock; a wait that exceeds it traps the kernel. It is recorded
