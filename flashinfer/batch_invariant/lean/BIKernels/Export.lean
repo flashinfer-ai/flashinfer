@@ -14,6 +14,7 @@ def GTerm.sexpr : GTerm → String
   | .mul x y => let (p, q) := sortPair x.sexpr y.sexpr; s!"(mul {p} {q})"
   | .sym s => s!"(sym {s})"
   | .cvt f x => s!"(cvt {f} {x.sexpr})"
+  | .bias n => s!"(bias {n.id})"
 end GEMM
 
 end BIK

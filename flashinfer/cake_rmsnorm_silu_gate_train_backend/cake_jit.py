@@ -50,12 +50,12 @@ forward is the long forward whose thread 0 also warms the CTA's next row block
 of packed rows in L2 with one bulk prefetch a tensor, on sm_103a from 3000 rows
 per SM, the long forward keeping the rows from its own start up to there, and
 on sm_107a from the long forward's 1740 rows per SM); on sm_100a and sm_103a
-from 1280 rows per SM a backward whose thread 0 warms the next row block of
+from 12000 rows per SM a backward whose thread 0 warms the next row block of
 packed rows in L2 with one bulk prefetch a tensor, launched with 5 CTAs per SM,
 and on sm_107a from 1024 the backward with 128-thread CTAs, ``dx`` and ``dz``
-the same bits.  On sm_103a the bulk backward runs from 12000 rows per SM, and
-the backward's mid roles (``bwd_bf16_mid``, ``bwd_f32_mid``) run from 700
-rows per SM up to there the same bulk backward whose threads keep their
+the same bits.  On sm_100a and sm_103a the backward's mid roles
+(``bwd_bf16_mid``, ``bwd_f32_mid``) run from 800 and 700 rows per SM
+respectively up to there the same bulk backward whose threads keep their
 folded FP32 runs, and whose CTAs add their column sums, as FP32 two-sum pairs
 converted once to FP64 (a column whose pair sum is not finite takes the sum
 alone), ``dx`` and ``dz`` the same bits.
@@ -562,9 +562,8 @@ MODULES: dict[str, dict[str, Any]] = {
     # backward's build with thread 0 prefetching the next row block of packed
     # dy, x and z into L2 with one bulk copy a tensor (build {"lanes": 16,
     # "math": "x2", "out": "bf16", "prefetch": "bulk", "rows_per_thread": 1,
-    # "slots": 4, "threads": 256, "width": 128}), 5 CTAs per SM, from 1280
-    # rows per SM on sm_100a and from 12000 on sm_103a (below it the mid
-    # backward).
+    # "slots": 4, "threads": 256, "width": 128}), 5 CTAs per SM, from 12000
+    # rows per SM (below it the mid backward).
     "cake_rmsnorm_silu_gate_train_9f2f4d1f2b85a7469a7d": {
         "arches": [
             "sm_100a",
@@ -601,7 +600,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "ctas_per_sm": 5,
             "kind": "row_claims",
             "min_rows_per_sm": {
-                "sm_100a": 1280,
+                "sm_100a": 12000,
                 "sm_103a": 12000,
             },
             "rows_per_cta": 16,
@@ -640,16 +639,17 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_bf16_long",
     },
-    # The mid backward into a BF16 weight gradient (sm_103a): the long
-    # backward's bulk build whose threads keep their folded FP32 runs, and whose
-    # CTAs add their column sums, as FP32 two-sum pairs converted once to FP64
-    # for the atomic add (a column whose pair sum is not finite takes the sum
-    # alone) (build {"fold": "ff", "lanes": 16, "math": "x2", "out": "bf16",
+    # The mid backward into a BF16 weight gradient (sm_100a and sm_103a): the
+    # long backward's bulk build whose threads keep their folded FP32 runs, and
+    # whose CTAs add their column sums, as FP32 two-sum pairs converted once to
+    # FP64 for the atomic add (a column whose pair sum is not finite takes the
+    # sum alone) (build {"fold": "ff", "lanes": 16, "math": "x2", "out": "bf16",
     # "prefetch": "bulk", "rows_per_thread": 1, "slots": 4, "threads": 256,
-    # "width": 128}), 5 CTAs per SM, from 700 rows per SM up to the long
-    # backward's 12000.
+    # "width": 128}), 5 CTAs per SM, from 800 rows per SM on sm_100a and 700 on
+    # sm_103a up to the long backward's 12000.
     "cake_rmsnorm_silu_gate_train_f14663d91454a0e833f7": {
         "arches": [
+            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -683,6 +683,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "ctas_per_sm": 5,
             "kind": "row_claims",
             "min_rows_per_sm": {
+                "sm_100a": 800,
                 "sm_103a": 700,
             },
             "rows_per_cta": 16,
@@ -952,9 +953,8 @@ MODULES: dict[str, dict[str, Any]] = {
     # backward's build with thread 0 prefetching the next row block of packed
     # dy, x and z into L2 with one bulk copy a tensor (build {"lanes": 16,
     # "math": "x2", "out": "f32", "prefetch": "bulk", "rows_per_thread": 1,
-    # "slots": 4, "threads": 256, "width": 128}), 5 CTAs per SM, from 1280
-    # rows per SM on sm_100a and from 12000 on sm_103a (below it the mid
-    # backward).
+    # "slots": 4, "threads": 256, "width": 128}), 5 CTAs per SM, from 12000
+    # rows per SM (below it the mid backward).
     "cake_rmsnorm_silu_gate_train_e6a05f4e7ec6b374d3f2": {
         "arches": [
             "sm_100a",
@@ -991,7 +991,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "ctas_per_sm": 5,
             "kind": "row_claims",
             "min_rows_per_sm": {
-                "sm_100a": 1280,
+                "sm_100a": 12000,
                 "sm_103a": 12000,
             },
             "rows_per_cta": 16,
@@ -1030,16 +1030,17 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_f32_long",
     },
-    # The mid backward into an FP32 weight gradient (sm_103a): the long
-    # backward's bulk build whose threads keep their folded FP32 runs, and whose
-    # CTAs add their column sums, as FP32 two-sum pairs converted once to FP64
-    # for the atomic add (a column whose pair sum is not finite takes the sum
-    # alone) (build {"fold": "ff", "lanes": 16, "math": "x2", "out": "f32",
+    # The mid backward into an FP32 weight gradient (sm_100a and sm_103a): the
+    # long backward's bulk build whose threads keep their folded FP32 runs, and
+    # whose CTAs add their column sums, as FP32 two-sum pairs converted once to
+    # FP64 for the atomic add (a column whose pair sum is not finite takes the
+    # sum alone) (build {"fold": "ff", "lanes": 16, "math": "x2", "out": "f32",
     # "prefetch": "bulk", "rows_per_thread": 1, "slots": 4, "threads": 256,
-    # "width": 128}), 5 CTAs per SM, from 700 rows per SM up to the long
-    # backward's 12000.
+    # "width": 128}), 5 CTAs per SM, from 800 rows per SM on sm_100a and 700 on
+    # sm_103a up to the long backward's 12000.
     "cake_rmsnorm_silu_gate_train_69d7df1dfbf3cfd61749": {
         "arches": [
+            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -1073,6 +1074,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "ctas_per_sm": 5,
             "kind": "row_claims",
             "min_rows_per_sm": {
+                "sm_100a": 800,
                 "sm_103a": 700,
             },
             "rows_per_cta": 16,
@@ -1271,9 +1273,11 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_short": "cake_rmsnorm_silu_gate_train_de5df3c9a4a5a804fcf2",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_58f1ac96c476c73ec5c8",
         "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_9f2f4d1f2b85a7469a7d",
+        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_f14663d91454a0e833f7",
         "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_26c869703d0ab9e4a39d",
         "bwd_f32_long": "cake_rmsnorm_silu_gate_train_e6a05f4e7ec6b374d3f2",
+        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_69d7df1dfbf3cfd61749",
         "bwd_f32_short": "cake_rmsnorm_silu_gate_train_c447141e8f19dd798212",
     },
     "sm_103a": {

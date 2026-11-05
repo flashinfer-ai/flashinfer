@@ -1131,7 +1131,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "6392e0d6d0c367d62083efad0d6adcc481be649e3c42d2e4cb22e54687dc7b9f",
+            "sm_107a": "56a081bf317abfb7ff19f1270b24eb569d5bee93181c46f8131f5462a4badede",
         },
     },
     "cake_dsv4_8bcdc9f41a3d74231d15": {

@@ -7,8 +7,10 @@ closure** as the key files: the transitive closure of relative imports (module- 
 root files (:data:`MODULE_ROOTS`) within the mode's directories (:data:`MODE_DIRS`) plus the ``__init__`` of every package on
 the way. A change to any file a kernel's
 generated code depends on therefore invalidates the module's cached objects, while the API module stays outside the
-closure and can change freely. Everything else (module directory, ``meta.json``, locking, ``FLASHINFER_DISABLE_JIT``,
-``FLASHINFER_CUTE_DSL_DISABLE_CACHE``) is FlashInfer's.
+closure and can change freely. Sources the walk reaches that are host-side selection code, not kernel code (the dispatcher's
+chunk rule and ranking heuristic: they choose a kernel, they never enter one), are excluded per module (:data:`MODULE_NON_KERNEL_SOURCES`)
+so an edit to them keeps every compiled object valid. Everything else (module directory, ``meta.json``, locking,
+``FLASHINFER_DISABLE_JIT``, ``FLASHINFER_CUTE_DSL_DISABLE_CACHE``) is FlashInfer's.
 """
 
 from __future__ import annotations
@@ -50,6 +52,16 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
 MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+}
+
+#: Sources within the mode's directories that the closure walk reaches but that no kernel binary depends on (host-side
+#: selection code: the dispatcher's chunk rule and ranking heuristic), relative to the flashinfer package; removed from the key after
+#: the walk, so an edit to them (or recalibrated constants) does not recompile the module's kernels.
+MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
+    "batch_invariant_gemm": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
     ),
 }
 
@@ -114,6 +126,15 @@ def module_sources(module: str) -> Tuple[Path, ...]:
         if not p.exists():
             raise FileNotFoundError(f"{module}: cache key source {r} is missing")
         seen.add(p)
+    for r in MODULE_NON_KERNEL_SOURCES.get(module, ()):
+        p = (_FI_DIR / r).resolve()
+        if p not in seen:
+            # a listed exclusion that is not in the closure is a stale entry (the file moved, or stopped being imported):
+            # silently ignoring it would let a renamed dispatcher file back into the cache key
+            raise FileNotFoundError(
+                f"{module}: non-kernel source {r} is not in the module's import closure; update MODULE_NON_KERNEL_SOURCES"
+            )
+        seen.discard(p)
     return tuple(sorted(seen))
 
 

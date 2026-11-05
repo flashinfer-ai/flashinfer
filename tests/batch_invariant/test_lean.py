@@ -124,6 +124,9 @@ def test_lean_model_matches_python_engine_and_spec():
         elif tag in ("chunks", "chunks32"):
             _, N, K, C = line.split(" ")
             lean[(tag, int(N), int(K))] = int(C)
+        elif tag == "gemmbias":
+            _, steps, C, sx = line.split(" ", 3)
+            lean[("gemmbias", int(steps), int(C))] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -142,6 +145,10 @@ def test_lean_model_matches_python_engine_and_spec():
         for N, K, C in lean_cases.chunk_table(in_fmt):
             assert lean[(f"chunks{p}", N, K)] == C, (in_fmt, N, K)
             checked += 1
+    # the biased chain of the bf16 classes
+    for K, C, sx in lean_cases.bias_cases():
+        assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)
+        checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 40
 

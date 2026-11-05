@@ -123,6 +123,14 @@ build of the session's producer build (``loader.xband_variant``: its staged
 twin for a bulk build; its tiles carry both heads' destinations).  The default
 yields where that build is not delivered.  Neither changes the stored bits.
 
+SM90 groups of 4 ranks at hidden 3072 run their calls of at most ``1024`` rows
+on the 128-column tile although the band rule gives 256 columns
+(``plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD``, :func:`plans.plan_for`): the tile
+order and ``group_m`` stay the band policy's and the row-count gates read the
+band width.  The session loads the 128-column producer beside its own; the
+table yields where that producer is not delivered.  ``describe()`` reports the
+bound (``bn128_max_m``) and the tile width of such a prepared row (``block_n``).
+
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words
 with one stream memset after the wait kernel, uses capture-local events and
@@ -793,6 +801,26 @@ class CakeQkvExchangeSession:
             and self.xband_eligible
             and self.max_tokens >= self.xband_min_m
         )
+        # 128-column tile table (plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD): a 256-column session of a table cell runs
+        # its rows up to the cell's bound on the 128-column tile with the band policy's pair flag (no such row is a
+        # cross-destination-band row: the table has no pair-architecture cell).  It yields where this delivery
+        # lacks the 128-column producer of the session's build.
+        self.bn128_max_m, self.bn128_max_m_source = 0, "default"
+        bn128_cell = plans.hopper_bn128_max_m(self.arch, self.world_size, self.hidden)
+        if bn128_cell and self.bn != plans.HOPPER_BN128_BN:
+            if all(
+                loader.has_producer(
+                    self.arch, plans.HOPPER_BN128_BN, pair, self.producer_variant
+                )
+                and (
+                    not self.fold_barrier
+                    or self._fold_producer_names(pair, bn=plans.HOPPER_BN128_BN)
+                )
+                for pair in self._reachable_pairs()
+            ):
+                self.bn128_max_m = bn128_cell
+            else:
+                self.bn128_max_m_source = "default_undelivered"
         top = plans.gate_rows(
             self.shape_gates,
             self.max_tokens,
@@ -820,6 +848,22 @@ class CakeQkvExchangeSession:
                 variant=loader.xband_variant(self.producer_variant),
             ):
                 self._producers[name] = loader.load(name, self.arch)
+        if self.bn128_max_m:
+            # The 128-column rows end at min(max_tokens, bound): their per-destination gate is read there.
+            bn128_top = plans.gate_rows(
+                self.shape_gates,
+                min(self.max_tokens, self.bn128_max_m),
+                bn=self.bn,
+                hidden=self.hidden,
+                k_table=self.k_table,
+            )
+            for pair in self._reachable_pairs():
+                for name in self._launched_producers(
+                    pair,
+                    per_dest=bn128_top.producer_launches == "per_dest",
+                    bn=plans.HOPPER_BN128_BN,
+                ):
+                    self._producers[name] = loader.load(name, self.arch)
 
         # Symmetric memory: receive slots, readiness pad, barrier flags (rendezvous = collective).  The
         # readiness pad holds ``words`` symmetric words the peers publish into, then one rank-local word: the
@@ -1075,8 +1119,14 @@ class CakeQkvExchangeSession:
             pair_available=self.pair_available[self.bn],
             words_capacity_per_dest=self.words_cap,
             group_m_scale=self.group_m_scale,
+            bn128_max_m=self.bn128_max_m,
         )
-        expected_bn = plans.XBAND_BN if plan.xband else self.bn
+        row_bn = (
+            plans.HOPPER_BN128_BN
+            if self.bn128_max_m and geometry.rows <= self.bn128_max_m
+            else self.bn
+        )
+        expected_bn = plans.XBAND_BN if plan.xband else row_bn
         if plan.bn != expected_bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
         variant = (
@@ -1148,29 +1198,33 @@ class CakeQkvExchangeSession:
         cross-destination-band plan the ``producer*`` names stay the programs of the session's tile width (the
         ``xband_min_m=0`` path of the row) and ``producer_xband`` / ``producer_xband_fold0`` /
         ``producer_xband_fold1`` name the cross-destination-band programs the call launches -- twelve names.
-        :meth:`describe` says which of them a call launches (``launch_sequence``)."""
+        :meth:`describe` says which of them a call launches (``launch_sequence``).  The ``producer*`` names are of the
+        row's tile width: the session's, or 128 columns on a row of the 128-column tile table."""
 
         row = self.prepare_rows(batch, s_local)
         pair = bool(row.policy.pair)
+        bn = int(row.policy.bn)
         bound = {
             "barrier_p0": self._barrier_names[0],
             "barrier_p1": self._barrier_names[1],
             "producer": loader.producer_program(
-                self.arch, self.bn, pair, self.producer_variant
+                self.arch, bn, pair, self.producer_variant
             ),
         }
-        folds = self._fold_producer_names(pair)
+        folds = self._fold_producer_names(pair, bn=bn)
         if folds:
             for phase, name in zip(loader.FOLD_PHASES, folds, strict=True):
                 bound[f"producer_fold{phase}"] = name
         if self.producer_variant != loader.SHIPPED_VARIANT:
             bound["producer_shipped"] = loader.producer_program(
-                self.arch, self.bn, pair, loader.SHIPPED_VARIANT
+                self.arch, bn, pair, loader.SHIPPED_VARIANT
             )
-            shipped_folds = self._fold_producer_names(pair, loader.SHIPPED_VARIANT)
+            shipped_folds = self._fold_producer_names(
+                pair, loader.SHIPPED_VARIANT, bn=bn
+            )
             if not shipped_folds:
                 raise RuntimeError(
-                    f"{self.arch} delivers the {self.producer_variant!r} build for block_n={self.bn}, "
+                    f"{self.arch} delivers the {self.producer_variant!r} build for block_n={bn}, "
                     f"pair={pair} without the baseline build's folded producers"
                 )
             for phase, name in zip(loader.FOLD_PHASES, shipped_folds, strict=True):
@@ -1512,6 +1566,13 @@ class CakeQkvExchangeSession:
                     self.arch, world_size=self.world_size
                 ),
             },
+            "bn128_max_m": {
+                "value": self.bn128_max_m,
+                "source": self.bn128_max_m_source,
+                "default": plans.hopper_bn128_max_m(
+                    self.arch, self.world_size, self.hidden
+                ),
+            },
             "producer_variant": {
                 "value": self.producer_variant,
                 "source": self.producer_variant_source,
@@ -1530,6 +1591,8 @@ class CakeQkvExchangeSession:
                     **(
                         {"xband": True, "block_n": row.plan.bn}
                         if row.plan.xband
+                        else {"block_n": row.plan.bn}
+                        if row.plan.bn != self.bn
                         else {}
                     ),
                     "num_words": row.plan.num_words,

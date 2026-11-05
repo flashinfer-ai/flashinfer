@@ -845,36 +845,79 @@ def test_serial_scan_rule_on_the_split_rows(arch, monkeypatch) -> None:
         assert selected == SERIAL_SCAN_SELECTED[arch], (sm_count, selected)
 
 
-def test_serial_scan_rule_is_cached_with_the_chunk_tables(monkeypatch) -> None:
-    # the decision is made once per layout with the tables (a hit prices nothing) and keyed by the key heads too
+# the two layouts the rule makes serial on R200, (sequence lengths, value heads, key heads): r03 and r08
+SERIAL_SCAN_CACHE_ROWS = (((4096,) * 8, 16, 8), ((4096,) * 4, 32, 16))
+
+
+def _serial_scan_tables(monkeypatch) -> list:
+    """sm_107a at 216 SMs with fresh chunk tables built on the host; returns the list ``serial_scan_pricing`` calls
+    append to."""
     monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_107a")
     monkeypatch.setattr(cake_chain, "_device_props", lambda _index: (216, 232448, 10))
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     monkeypatch.setattr(cake_chain, "_host_chunk_meta", lambda seq_lens, plans, _index, lpt: cake_chain.build_chunk_meta(
         seq_lens, "cpu", scan_plans=plans, lpt=lpt))  # fmt: skip
-    priced = []
+    priced: list = []
     pricing = cake_chain.serial_scan_pricing
     monkeypatch.setattr(
         cake_chain,
         "serial_scan_pricing",
         lambda *a, **k: priced.append(a) or pricing(*a, **k),
     )
-    seq_lens = (4096,) * 8
+    return priced
+
+
+@pytest.mark.parametrize("seq_lens, num_v_heads, num_heads", SERIAL_SCAN_CACHE_ROWS)
+def test_serial_scan_rule_is_cached_with_the_chunk_tables(
+    seq_lens, num_v_heads, num_heads, monkeypatch
+) -> None:
+    # the decision is made once per layout with the tables (a hit prices nothing) and keyed by the key heads too
+    priced = _serial_scan_tables(monkeypatch)
     cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
     options = cake_chain.make_options()
-    meta = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, 16, options, num_heads=8)
-    assert meta.bwd_segments.num_segments == meta.num_seqs == 8
+    meta = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options, num_heads=num_heads)  # fmt: skip
+    assert meta.bwd_segments.num_segments == meta.num_seqs == len(seq_lens)
     assert meta.bwd_segments.segment_len == 0
     assert len(priced) == 1
-    assert (
-        cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, 16, options, num_heads=8)
-        is meta
-    )
+    again = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options, num_heads=num_heads)  # fmt: skip
+    assert again is meta
     assert len(priced) == 1
-    split = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, 16, options)
+    split = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options)
     assert split.bwd_segments.num_segments > split.num_seqs
     assert split.fwd_segments.segment_len == meta.fwd_segments.segment_len
     assert len(priced) == 1
+
+
+@pytest.mark.parametrize("seq_lens, num_v_heads, num_heads", SERIAL_SCAN_CACHE_ROWS)
+@pytest.mark.parametrize("dhu_scan", ["tc", "reg"])
+@pytest.mark.parametrize("pinned_first", [False, True])
+def test_dhu_scan_pin_keys_the_chunk_tables(
+    seq_lens, num_v_heads, num_heads, dhu_scan, pinned_first, monkeypatch
+) -> None:
+    # a dhu_scan pin keeps the planner's split adjoint plan and the rule makes it serial: on one layout the two calls
+    # take their own tables in either order (a cached table of the other call would make the bits depend on it)
+    _serial_scan_tables(monkeypatch)
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+    plans = cake_chain.scan_plans(
+        sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+    )
+    assert plans[1].segment_len > 0
+    calls = [cake_chain.make_options(), cake_chain.make_options(dhu_scan=dhu_scan)]
+    metas = {}
+    for options in reversed(calls) if pinned_first else calls:
+        metas[options.dhu_scan] = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options,
+                                                         num_heads=num_heads)  # fmt: skip
+    rule, pinned = metas[None], metas[dhu_scan]
+    assert rule.bwd_segments.segment_len == 0
+    assert rule.bwd_segments.num_segments == rule.num_seqs
+    assert pinned.bwd_segments.segment_len == plans[1].segment_len
+    assert tuple(pinned.bwd_segments.scan_config) == tuple(plans[1].config)
+    assert pinned.bwd_segments.num_segments > pinned.num_seqs
+    assert pinned.fwd_segments.segment_len == rule.fwd_segments.segment_len
+    # each call hits its own table afterwards
+    for options in calls:
+        assert cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options,
+                                      num_heads=num_heads) is metas[options.dhu_scan]  # fmt: skip
 
 
 def test_two_stream_split_rule() -> None:
