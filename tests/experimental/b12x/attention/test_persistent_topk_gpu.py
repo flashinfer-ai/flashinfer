@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 
 from b12x._lib.runtime_control import kernel_resolution_guard
+from b12x.attention.dsa_indexer import persistent_topk as persistent_topk_module
 from b12x.attention.dsa_indexer._impl import clear_indexer_caches
 from b12x.attention.dsa_indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
@@ -222,6 +225,110 @@ def test_persistent_topk_pivot_ties_select_lowest_columns_gpu(
         for row in range(rows):
             assert set(output[row].tolist()) == expected_sets[row]
         sorted_output = torch.sort(output, dim=1).values
+        if first is None:
+            first = sorted_output
+        assert torch.equal(sorted_output, first)
+
+
+# Score whose radix key has byte 2 == 0xFF, so a stale round-2 histogram lands in bucket 255.
+_HIGH_BYTE2_SCORE = torch.tensor(0x3F80FF00, dtype=torch.int32).view(torch.float32)
+_ROTATION_ROWS = (
+    ("high_byte2_tied", _WIDTH - 1),
+    ("short", _TOPK),
+    ("all_tied", _WIDTH - 54),
+    ("short", 37),
+    ("high_byte2_tied", _WIDTH - 107),
+    ("short", _TOPK),
+    ("quantized", _WIDTH - 160),
+    ("short", 300),
+)
+
+
+def _rotation_row(kind: str, generator: torch.Generator) -> torch.Tensor:
+    if kind == "high_byte2_tied":
+        return _HIGH_BYTE2_SCORE.expand(_WIDTH).clone()
+    if kind == "quantized":
+        return torch.randint(0, 4, (_WIDTH,), generator=generator).to(torch.float32)
+    return torch.zeros((_WIDTH,), dtype=torch.float32)
+
+
+def test_persistent_topk_one_group_rotation_with_skipped_rows_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One group walks short and tied long rows; the histogram rotation stays clean across skipped rows."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(92_000)
+    rows = len(_ROTATION_ROWS)
+    logits = torch.stack(
+        tuple(_rotation_row(kind, generator) for kind, _ in _ROTATION_ROWS)
+    ).to(device=device)
+    lengths = torch.tensor(
+        [length for _, length in _ROTATION_ROWS], dtype=torch.int32, device=device
+    )
+    logical = torch.arange(_WIDTH, dtype=torch.int32, device=device)
+    page_table = torch.stack(
+        tuple(
+            torch.roll(logical, shifts=row * 31) + row * 100_000 for row in range(rows)
+        )
+    )
+
+    real_resolve = persistent_topk_module._resolve_launch_config
+
+    def one_group(num_rows: int, stride: int, dev: torch.device):
+        launch = real_resolve(num_rows, stride, dev)
+        return dataclasses.replace(
+            launch, num_groups=1, total_ctas=launch.ctas_per_group
+        )
+
+    monkeypatch.setattr(persistent_topk_module, "_resolve_launch_config", one_group)
+    assert persistent_topk2048_scratch_nbytes(rows, _WIDTH, device=device) == (
+        persistent_topk_module._STATE_WORDS * 4
+    )
+
+    columns = torch.arange(_WIDTH, device=device)
+    masked = torch.where(
+        columns.unsqueeze(0) < lengths.unsqueeze(1),
+        logits,
+        torch.full_like(logits, float("-inf")),
+    )
+    long_rows = lengths > _TOPK
+    kth = torch.topk(masked, _TOPK, dim=1).values[:, -1:]
+    slots_at_pivot = _TOPK - (masked > kth).sum(dim=1)
+    ties_at_pivot = (masked == kth).sum(dim=1)
+    assert bool((ties_at_pivot[long_rows] > slots_at_pivot[long_rows]).all().item())
+    assert int((~long_rows).sum().item()) >= 3
+
+    expected = _lowest_column_reference(logits, lengths, page_table)
+    for row in range(rows):
+        length = int(lengths[row].item())
+        if length <= _TOPK:
+            expected[row, :length] = page_table[row, :length]
+            expected[row, length:] = -1
+    expected_sorted = torch.sort(expected, dim=1).values
+
+    output = torch.full((rows, _TOPK), -1, dtype=torch.int32, device=device)
+    first: torch.Tensor | None = None
+    for _ in range(4):
+        output.fill_(-1)
+        result = run_persistent_topk2048(
+            logits,
+            lengths,
+            page_table_1=page_table,
+            output_indices=output,
+            max_seq_len=_WIDTH,
+            topk=_TOPK,
+        )
+        torch.cuda.synchronize(device)
+        assert result.data_ptr() == output.data_ptr()
+        sorted_output = torch.sort(output, dim=1).values
+        unwritten = ((output < 0).any(dim=1) & long_rows).nonzero().flatten().tolist()
+        assert unwritten == [], f"long rows left unwritten: {unwritten}"
+        bad_rows = [
+            row
+            for row in range(rows)
+            if not torch.equal(sorted_output[row], expected_sorted[row])
+        ]
+        assert bad_rows == [], f"rows differing from the lowest-column set: {bad_rows}"
         if first is None:
             first = sorted_output
         assert torch.equal(sorted_output, first)
