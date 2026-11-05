@@ -313,7 +313,7 @@ program's.*
 | `4096 -> 48` | 16231; 16384 | -- | 512¶; 16231; 16384 |
 | `4096 -> 64` | 16231; 16384 | -- | 512¶; 16231; 16384 |
 | `4096 -> 512` | 16231; 16384 | 16231; 16384 | 16231; 16384; 40961 and up§ |
-| `4096 -> 1024` | 16231 | 16231 | 16231; 40961 and up§ |
+| `4096 -> 1024` | 16231 | 16231; 16384‡ | 16231; 40961 and up§ |
 | `5120 -> 32` | -- | -- | 512¶ |
 | `5120 -> 32` BF16 | -- | -- | 512¶ |
 | `5120 -> 48` | 16231; 16384 | 16231 | 512¶; 16231; 16384 |
@@ -343,31 +343,35 @@ the 256-wide tiles and the deterministic plan: faster than both at 16172 and 163
 the deterministic package's 16231-token plan, which that token count keeps.  The 216-SM entry of `5120 -> 1024` BF16
 (16231 tokens) is not a token count of those rules: the deterministic plan there is the row's plan at every token count,
 and the row's program left the backward pass 1.5 % slower in eager launches (ratio of the medians over the runs).
-Marked §: entries of their own, not from the rules above.  On parts of at least 216 SMs these FP32 rows run the
-deterministic program from 40961 tokens up because their one-split program's FP64 relative Frobenius error exceeds the
-deterministic package's FP32 error budget (5e-5) on every seed there.  That program adds the whole token reduction of an
-output in one chain, and its error grows about linearly with the token count.  Measured with the 216-SM plan on 212-SM
-R200 parts (the same program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an
-FP64 reference, each row on two parts, 5 seeds, at 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens:
-within the budget on every seed up to 40960 tokens (1.86e-5 at 16384 tokens, 3.77e-5 at 32768), above it on every seed
-from 45056 tokens up (7.6e-5 at 65536 tokens and 1.5e-4 at 131072; the deterministic program: 3.8e-5 and 7.6e-5).  From
-961 tokens (16 K blocks) up the deterministic program of these rows cuts the token reduction into units of half an
-output's K blocks, rounded up (its automatic two-way split), so below 40961 tokens q is 2.0 to 2.4 (data; up to 960
-tokens both programs add one chain and give the same bits).  The token counts between 40960 and 45056 run the
-deterministic program too (not measured), and the range has no upper bound: the error keeps growing with the token
-count.  The deterministic program is slower there: at 65536 tokens on a 212-SM part it takes 1.81 (`4096 -> 512`), 1.05
-(`4096 -> 1024`), 1.72 (`5120 -> 512`) and 1.02 (`5120 -> 1024`) times the one-split program's time (CUDA graph replays)
-and leaves the backward pass or the checkpointed step up to 51.7, 4.8, 41.5 and 3.9 % slower.  Marked ¶: single token
-counts from a re-measurement of chosen points at 512, 8192, 32768 and 65536 tokens on two 216-SM R200 parts per point
-(the protocol above: 15 paired groups, eager launches and graph replays, next to a kernel holding 8, 16 or 32 SMs in
-both launch orders, the backward pass and the checkpointed step timed).  A point is an entry where the row's program
-failed the K1 rule in some run and the deterministic program leaves the backward pass and the checkpointed step no more
-than 1.3 % slower on both parts (the worst of the ratio of the medians and the median of the paired ratios, eager
-launches and graph replays: the rule of the `sm_100a` / `sm_103a` entries); the neighbouring token counts were not
-measured and keep the verdict.  Measured points that failed but keep the verdict, because the deterministic program
-makes the backward pass or the checkpointed step more than 1.3 % slower there on a part: BF16 output at 8192 tokens on
-`4096 -> 32`, at 32768 tokens on `4096 -> 32` and `5120 -> 1024`, at 65536 tokens on `5120 -> 1024`; FP32 output at 512
-tokens on `4096 -> 32` and `6144 -> 32`.*
+Marked ‡: an entry of a later strict re-measurement of the restored window on a 212-SM R200 part: `4096 -> 1024` at
+16384 tokens met the K1 rule at the operation (8 of 8 groups; 53.50 against 55.02 us in graph replays) but left the
+checkpointed step 4.0 % slower in graph replays and 1.4 % in eager launches (ratio of the medians; median of the paired
+ratios 0.992 and 0.994; an A/A run of the deterministic program at that point gave 1.045 in graph replays).  Marked §:
+entries of their own, not from the rules above.  On parts of at least 216 SMs these FP32 rows run the deterministic
+program from 40961 tokens up because their one-split program's FP64 relative Frobenius error exceeds the deterministic
+package's FP32 error budget (5e-5) on every seed there.  That program adds the whole token reduction of an output in one
+chain, and its error grows about linearly with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the
+same program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an FP64 reference,
+each row on two parts, 5 seeds, at 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens: within the budget
+on every seed up to 40960 tokens (1.86e-5 at 16384 tokens, 3.77e-5 at 32768), above it on every seed from 45056 tokens
+up (7.6e-5 at 65536 tokens and 1.5e-4 at 131072; the deterministic program: 3.8e-5 and 7.6e-5).  From 961 tokens (16 K
+blocks) up the deterministic program of these rows cuts the token reduction into units of half an output's K blocks,
+rounded up (its automatic two-way split), so below 40961 tokens q is 2.0 to 2.4 (data; up to 960 tokens both programs
+add one chain and give the same bits).  The token counts between 40960 and 45056 run the deterministic program too (not
+measured), and the range has no upper bound: the error keeps growing with the token count.  The deterministic program is
+slower there: at 65536 tokens on a 212-SM part it takes 1.81 (`4096 -> 512`), 1.05 (`4096 -> 1024`), 1.72
+(`5120 -> 512`) and 1.02 (`5120 -> 1024`) times the one-split program's time (CUDA graph replays) and leaves the
+backward pass or the checkpointed step up to 51.7, 4.8, 41.5 and 3.9 % slower.  Marked ¶: single token counts from a
+re-measurement of chosen points at 512, 8192, 32768 and 65536 tokens on two 216-SM R200 parts per point (the protocol
+above: 15 paired groups, eager launches and graph replays, next to a kernel holding 8, 16 or 32 SMs in both launch
+orders, the backward pass and the checkpointed step timed).  A point is an entry where the row's program failed the K1
+rule in some run and the deterministic program leaves the backward pass and the checkpointed step no more than 1.3 %
+slower on both parts (the worst of the ratio of the medians and the median of the paired ratios, eager launches and
+graph replays: the rule of the `sm_100a` / `sm_103a` entries); the neighbouring token counts were not measured and keep
+the verdict.  Measured points that failed but keep the verdict, because the deterministic program makes the backward
+pass or the checkpointed step more than 1.3 % slower there on a part: BF16 output at 8192 tokens on `4096 -> 32`, at
+32768 tokens on `4096 -> 32` and `5120 -> 1024`, at 65536 tokens on `5120 -> 1024`; FP32 output at 512 tokens on
+`4096 -> 32` and `6144 -> 32`.*
 
 | K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 212 SMs: token ranges besides 16172 to 16384 | measured token counts outside them |
 |---|---|---|
