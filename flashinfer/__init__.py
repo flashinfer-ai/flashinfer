@@ -141,6 +141,7 @@ from .fused_moe import (
     cutlass_fused_moe,
     cudnn_frost_grouped_gemm1_swiglu,
     cudnn_frost_grouped_gemm1_swiglu_workspace_size,
+    deinterleave_gated_rows,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
