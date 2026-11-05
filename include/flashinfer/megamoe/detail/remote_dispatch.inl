@@ -8,9 +8,9 @@
 //                             staging of that node (row, scales, ids, weights).
 //   remote_list_entry         the index pass writes `slot * topk + k` for an
 //                             expert on another node into the list scratch.
-//   remote_send               SM 0, after the grid sync: compacts the lists into
-//                             the outbound header and puts header and rows to
-//                             the mirror with a signal.
+//   remote_send               SM 0, after the grid sync: puts the rows, compacts
+//                             the lists, then puts scales, routing and header in
+//                             one signalled put.
 //   remote_publish_by_proxy   SM 0, before the node-local barrier: waits for the
 //                             inbox of every remote node and performs the
 //                             mirror's publication into this node's owners.
@@ -80,9 +80,10 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
   }
 };
 
-// SM 0 after the grid sync, one remote node at a time: warp 0 ships the packed
-// rows while both warps compact the lists; the header goes last and carries
-// the signal, which orders every earlier put on the same context before it.
+// SM 0 after the grid sync, one remote node at a time: two puts per node. The
+// rows leave first; the scales, routing, weights and the compacted header are
+// adjacent in the layout and leave as one put that carries the signal, which
+// orders the rows put before it on the same context.
 const auto remote_send = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     if (sm_idx != 0) return;
@@ -95,22 +96,13 @@ const auto remote_send = [&]() {
       auto* counts = remote.header_expert_counts(header);
       auto* starts = remote.header_expert_starts(header);
       auto* entries = remote.header_entries(header);
+      auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
+      auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
       const uint32_t num_packed = *remote.packed_token_count(j);
       if (thread_idx == 0) remote.header_control(header)[0] = num_packed;
-      if (warp_idx == 0 and num_packed > 0) {
-        auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
-        auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
+      if (warp_idx == 0 and num_packed > 0)
         io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
                     false, nullptr, 0);
-        io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset,
-                    static_cast<uint64_t>(num_packed) * kSFBytes, lane_idx, false, nullptr, 0);
-        io.put_warp(j, dst_block + idx_block_offset, src_block + idx_block_offset,
-                    math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kIdxBytes, 16),
-                    lane_idx, false, nullptr, 0);
-        io.put_warp(j, dst_block + weights_block_offset, src_block + weights_block_offset,
-                    math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kWeightBytes, 16),
-                    lane_idx, false, nullptr, 0);
-      }
       for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads)
         counts[e] = static_cast<uint32_t>(
             *workspace.get_expert_send_count_ptr(node * kNumExpertsPerNode + e) & 0xffffffffu);
@@ -131,9 +123,13 @@ const auto remote_send = [&]() {
         for (uint32_t k = lane_idx; k < counts[e]; k += 32) entries[starts[e] + k] = src[k];
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      if (warp_idx == 0)
-        io.put_warp(j, remote.inbox_header(at), header, remote.header_used_bytes(num_entries),
-                    lane_idx, true, remote.inbox_flag(at), comm::remote_inbox_signal(at));
+      if (warp_idx == 0) {
+        // Scales, routing ids, weights (whole regions) and the used header, contiguous.
+        const uint64_t tail = static_cast<uint64_t>(remote.input_block_bytes) - sf_block_offset +
+                              remote.header_used_bytes(num_entries);
+        io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset, tail, lane_idx,
+                    true, remote.inbox_flag(at), comm::remote_inbox_signal(at));
+      }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
     }
   }

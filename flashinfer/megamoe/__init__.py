@@ -291,7 +291,7 @@ class MegaMoESymmBuffer:
         bases = [int(p) for p in self.handle.buffer_ptrs]
         base = bases[rank]
         input_off, combine_off = layout[1], layout[11]
-        remote_base, per_node, header, inbox = layout[12], layout[13], layout[14], layout[15]
+        remote_base, per_node, inbox = layout[12], layout[13], layout[15]
         input_ptrs, combine_ptrs = [], []
         for r in range(ranks):
             node = r // local
@@ -304,7 +304,7 @@ class MegaMoESymmBuffer:
                 j = node if node < my_node else node - 1
                 mirror = r % local + my_node * local
                 region = bases[mirror] + remote_base + j * per_node
-                input_ptrs.append(region + header)
+                input_ptrs.append(region)
                 combine_ptrs.append(region + 2 * inbox)
         link_ranks, link_nodes, link_lsa = [], [], []
         for j in range(nodes - 1):

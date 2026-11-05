@@ -402,17 +402,20 @@ struct RemoteRegions {
   CUTLASS_HOST_DEVICE void* node_base(const uint32_t& node) const {
     return math::advance_ptr(base, bytes_per_node() * node);
   }
-  // Inbox: header, then the input block the mirror filled.
-  CUTLASS_HOST_DEVICE void* inbox_header(const uint32_t& node) const { return node_base(node); }
+  // Inbox: the input block the mirror filled, then the header, so that the
+  // scales, routing and header leave in one put after the rows.
   CUTLASS_HOST_DEVICE void* inbox_input_block(const uint32_t& node) const {
-    return math::advance_ptr(node_base(node), header_bytes());
+    return node_base(node);
+  }
+  CUTLASS_HOST_DEVICE void* inbox_header(const uint32_t& node) const {
+    return math::advance_ptr(node_base(node), input_block_bytes);
   }
   // Outbound: what this rank sends to that node, same shape as the inbox.
-  CUTLASS_HOST_DEVICE void* outbound_header(const uint32_t& node) const {
+  CUTLASS_HOST_DEVICE void* outbound_input_block(const uint32_t& node) const {
     return math::advance_ptr(node_base(node), inbox_bytes());
   }
-  CUTLASS_HOST_DEVICE void* outbound_input_block(const uint32_t& node) const {
-    return math::advance_ptr(outbound_header(node), header_bytes());
+  CUTLASS_HOST_DEVICE void* outbound_header(const uint32_t& node) const {
+    return math::advance_ptr(outbound_input_block(node), input_block_bytes);
   }
   // Outbox: FC2 rows of the mirror's packed tokens, combine-buffer layout.
   CUTLASS_HOST_DEVICE void* outbox(const uint32_t& node) const {
