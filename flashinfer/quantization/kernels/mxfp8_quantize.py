@@ -1354,13 +1354,9 @@ def mxfp8_quantize_cute_dsl(
     """
     from ...utils import device_support_pdl, get_compute_capability
 
-    assert input.dtype in (torch.float16, torch.bfloat16, torch.float32), (
-        f"Input dtype must be float16, bfloat16, or float32, got {input.dtype}"
-    )
-    assert input.is_cuda, "Input must be on CUDA device"
-    assert alignment % SF_VEC_SIZE == 0, (
-        f"alignment must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
-    )
+    from ..fp8_quantization import _check_mxfp8_cute_dsl_inputs
+
+    _check_mxfp8_cute_dsl_inputs(input, alignment)
 
     # Auto-detect PDL support based on device capability.
     # If caller passes True explicitly, still check hardware support.
@@ -1372,10 +1368,6 @@ def mxfp8_quantize_cute_dsl(
         input = input.reshape(m, k)
     else:
         m, k = input.shape
-
-    assert k % SF_VEC_SIZE == 0, (
-        f"K ({k}) must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
-    )
 
     padded_k = ((k + alignment - 1) // alignment) * alignment
 

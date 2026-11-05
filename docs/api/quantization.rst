@@ -238,6 +238,31 @@ FP8 Quantization
     dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
     ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
 
+MXFP8 input preflight
+~~~~~~~~~~~~~~~~~~~~
+
+``mxfp8_quantize.check_inputs`` accepts the same arguments as the quantizer
+and raises on known input violations without preparing tensors, allocating
+outputs, detecting PDL, or loading a quantization module. Benchmarks and
+integrations can reject an incompatible dtype or layout before attempting
+JIT compilation. It returns ``None`` rather than selecting another backend.
+
+For example, the CPU host path accepts contiguous 2-D float32 inputs:
+
+.. code-block:: python
+
+    import torch
+    from flashinfer import mxfp8_quantize
+
+    x = torch.empty((2, 32), dtype=torch.float32)
+    mxfp8_quantize.check_inputs(x, backend="cuda")
+
+CUDA native, CuTe-DSL and batch-invariant calls retain their distinct
+requirements. In particular, CuTe may prepare a non-contiguous input, and
+``auto`` keeps its existing route. Passing preflight does not certify build,
+storage-address alignment, launch or numerical correctness. Batch-invariant
+preflight reuses that mode's existing device and dependency checks.
+
 Fused gated-activation MXFP8 quantization
 -----------------------------------------
 
