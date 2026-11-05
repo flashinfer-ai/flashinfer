@@ -215,7 +215,11 @@ when every stamp matches and runs the tape path from it (the light path's prep
 record; no ``wy`` where the record carries ``w``); otherwise it drops the
 record and runs the light path.  ``"auto"`` (the default) engages at the head
 counts of :data:`HANDOFF_HEADS` on the (architecture, SM count, Cake build
-toolkit) devices of :data:`HANDOFF_VERIFIED`, ``"on"`` on every call it
+toolkit) devices of :data:`HANDOFF_VERIFIED`, on a problem of ``S`` tokens in
+``N`` documents at ``H`` heads with ``H * S`` at least
+:data:`HANDOFF_MIN_HEAD_TOKENS` and ``S / N`` at least
+:data:`HANDOFF_MIN_DOC_TOKENS` (a smaller step is host-bound: the record's host
+work costs more than the GPU work it saves), ``"on"`` on every call it
 supports, ``"off"`` never; ``CAKE_KDA_CKPT_HANDOFF`` (``off`` / ``on``, read
 by :func:`chunk_kda` at each call) turns every call off or ``"auto"`` into
 ``"on"``.  A per-device byte budget (two
@@ -6297,6 +6301,20 @@ HANDOFF_VERIFIED = frozenset(
 # is host-bound (the record's host work cancels its kernel savings).  A new device, toolkit or registry needs the
 # suite again on each device before it enters either set.
 HANDOFF_HEADS = frozenset({2, 4, 8, 12, 16, 32, 64})
+# ... on a problem of S tokens in N documents (zero-length ones count) at H heads with H * S >= HANDOFF_MIN_HEAD_TOKENS
+# and S >= HANDOFF_MIN_DOC_TOKENS * N (:func:`_handoff_large`).  A record adds a fixed host cost to each checkpointed
+# call (170-195 us per step on a B300 with an x86 host at 12 heads) and saves kernel time that grows with the
+# token-heads and the document length, mostly the backward's recurrence recompute, which walks each document's chunks
+# in order (115 us per step there at one 8192-token document, 48 us at four 2048-token ones).  Below the bounds the
+# step is host-bound and the saving does not cover the host cost.  Checkpointed step det / ND on B200 (sm_100a) /
+# B300 (sm_103a), 148 SMs, x86 hosts, toolkit 13.4, 12 heads, equal documents, both build orders: admitted S = 32768
+# in one document 1.140 / 1.134, in four 1.042 / 1.042, S = 16384 in one 1.088 / 1.059; refused S = 16384 in four
+# 0.975 / 0.967, S = 8192 in one 0.978 / 0.965, in four 0.939 / 0.921 (that B300 row with the hand-off off: 0.985 det
+# first, 0.981 ND first).  Each bound is the smallest value of its quantity on an admitted row.  The other head counts
+# take the token-head bound, and the other devices of HANDOFF_VERIFIED (GB200 and GB300 with a Grace host, R200) both
+# bounds, without measured rows of their own yet.
+HANDOFF_MIN_HEAD_TOKENS = 196608
+HANDOFF_MIN_DOC_TOKENS = 8192
 # Row records (the recompute launches the intra twin, the backward no prep) on these (architecture, SM count, full
 # toolkit version "major.minor.patch") devices, at the HANDOFF_HEADS head counts, with the call's own workspace.  The
 # twin's rows equal the prep's only where one toolkit compiles both to the same instructions, so the key names the
@@ -6511,18 +6529,38 @@ def _handoff_toolkit(arch: str) -> str | None:
         return None
 
 
+def _handoff_large(S: int, N: int, H: int) -> bool:
+    """Whether ``"auto"`` admits a problem of ``S`` tokens in ``N`` documents at ``H`` heads by its size: ``H * S``
+    at least :data:`HANDOFF_MIN_HEAD_TOKENS` and a mean document length ``S / N`` (zero-length documents count) at
+    least :data:`HANDOFF_MIN_DOC_TOKENS`.  A function of its arguments and the two constants (read at call time)."""
+    return H * S >= HANDOFF_MIN_HEAD_TOKENS and S >= HANDOFF_MIN_DOC_TOKENS * N
+
+
+def _handoff_auto_shape(v: torch.Tensor, cu_seqlens: torch.Tensor) -> bool:
+    """Whether ``"auto"`` may engage on the node's operands by their shapes alone (no torch state or device read):
+    ``v`` ``[..., S, H, 128]`` at a :data:`HANDOFF_HEADS` head count and ``cu_seqlens`` ``[N + 1]`` with
+    :func:`_handoff_large` true.  Malformed operands give False here and fail the operand checks after."""
+    if v.dim() < 3 or not isinstance(cu_seqlens, torch.Tensor):
+        return False
+    S, H = int(v.shape[-3]), int(v.shape[-2])
+    return H in HANDOFF_HEADS and _handoff_large(S, cu_seqlens.numel() - 1, H)
+
+
 def _handoff_engages(p: Plan, mode: str, index: int) -> bool:
     """Whether the request's mode engages on plan ``p``: never on a raw-mode plan (:attr:`Plan.gate`: no raw intra
     twin exists, and the twins and the hand-off's tape path read the activated FP32 gate), nor on an in-kernel Q/K
     L2 norm plan (:attr:`Plan.l2n`: no l2n intra twin exists, and the hand-off suite has not run the l2n class);
-    ``"on"`` always, ``"auto"`` at a :data:`HANDOFF_HEADS` head count on a :data:`HANDOFF_VERIFIED` (architecture,
-    SM count, toolkit) device; an ``"auto"`` call at those head counts on another device counts ``unverified``
-    (:func:`_handoff_request` makes no ``"auto"`` request at other head counts)."""
+    ``"on"`` always, ``"auto"`` at a :data:`HANDOFF_HEADS` head count on a problem :func:`_handoff_large` admits on
+    a :data:`HANDOFF_VERIFIED` (architecture, SM count, toolkit) device; an ``"auto"`` call at those head counts and
+    sizes on another device counts ``unverified`` (:func:`_handoff_request` makes no ``"auto"`` request at other head
+    counts or sizes, and nothing counts them)."""
     if p.gate != "g" or p.l2n != "off":
         return False
     if mode == "on":
         return True
     if mode != "auto" or p.H not in HANDOFF_HEADS:
+        return False
+    if not _handoff_large(p.S, p.N, p.H):
         return False
     if (p.arch, p.sm_count, _handoff_toolkit(p.arch)) in HANDOFF_VERIFIED:
         return True
@@ -6786,10 +6824,13 @@ def _handoff_note(index: int, counter: str) -> None:
         _handoff_devices.setdefault(index, _HandoffDevice()).stats[counter] += 1
 
 
-def _handoff_request(ctx: Any, mode: str, v: torch.Tensor) -> dict[str, Any] | None:
+def _handoff_request(
+    ctx: Any, mode: str, v: torch.Tensor, cu_seqlens: torch.Tensor
+) -> dict[str, Any] | None:
     """The autograd node's hand-off request to its forward (``None``: no record): mode ``"on"``, or ``"auto"`` with
-    ``v`` at a :data:`HANDOFF_HEADS` head count (checked first: no torch state is read where ``"auto"`` never
-    engages; a malformed ``v`` fails the operand checks after it), an input whose gradient is needed, inside a
+    ``v`` at a :data:`HANDOFF_HEADS` head count on a problem :func:`_handoff_large` admits (``v`` and ``cu_seqlens``
+    by their shapes, :func:`_handoff_auto_shape`; checked first: no torch state is read where ``"auto"`` never
+    engages; malformed operands fail the operand checks after it), an input whose gradient is needed, inside a
     backward's graph task (an original forward and the reentrant checkpoint's no-grad first pass see -1) under a
     checkpoint recompute's saved-tensor hooks (the non-reentrant recompute's, or none: the reentrant recompute; an
     inner region's original forward that an outer recompute re-runs has the region's pack hook), no capture /
@@ -6799,7 +6840,7 @@ def _handoff_request(ctx: Any, mode: str, v: torch.Tensor) -> dict[str, Any] | N
     device = v.device
     if (
         mode == "off"
-        or (mode == "auto" and (v.dim() < 2 or v.shape[-2] not in HANDOFF_HEADS))
+        or (mode == "auto" and not _handoff_auto_shape(v, cu_seqlens))
         or device.type != "cuda"
         or not any(ctx.needs_input_grad[:5])
     ):
@@ -7193,7 +7234,9 @@ class ChunkKDAFunction(torch.autograd.Function):
         # raw gate mode and with the in-kernel Q/K L2 norm, which never engage the hand-off)
         raw = use_gate_in_kernel is True
         l2n_on = use_qk_l2norm_in_kernel is True
-        request = None if (raw or l2n_on) else _handoff_request(ctx, mode, v)
+        request = (
+            None if (raw or l2n_on) else _handoff_request(ctx, mode, v, cu_seqlens)
+        )
         out, saved = _fwd_call(
             q,
             k,
