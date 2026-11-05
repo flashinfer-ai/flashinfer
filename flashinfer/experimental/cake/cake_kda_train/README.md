@@ -96,15 +96,15 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
 - Both packages' saved sets carry `gate` / `lower_bound`, so either backward
   reads the other's set of either gate mode; a backward in the other mode or
   with another `lower_bound` is refused.
-- The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, raw `q` / `k`
-  normalized inside the kernels, FlashInfer #7817) runs on the deterministic
-  package only, in either gate mode: the facade forwards the keyword to it
-  with `deterministic=True`, and this package's entry points raise
-  `ValueError` for it (`KdaWorkspace.for_problem`, `workspace_bytes` and
-  `saved_bytes` for `l2n` other than `"off"`).  `False` is accepted, so a
-  call that spells it out runs unchanged.  The saved set carries the
-  deterministic package's `qk_rstd` / `qk_l2norm` fields (`None` / `False`
-  here), and the backward refuses a set of that mode (`ValueError`).
+- This package runs the in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`,
+  raw `q` / `k` normalized inside the kernels, FlashInfer #7817) in either gate
+  mode under the deterministic package's contract for it: the same keyword and
+  modes (`cake_jit.L2N_MODES`: `"off"`, `"fused"`, and the `"fallback"` test
+  route), operands, saved `qk_rstd`, workspace and byte queries.  The mode is
+  part of the plan, the workspace and the saved set, as in the deterministic
+  package.  The registry copies the deterministic package's records of the
+  mode (see "Registry"), so an l2n call launches the deterministic programs
+  alone.
 
 ## What changes: the `S1` backward pairs
 
@@ -190,8 +190,20 @@ backward outside the capture on the workspace before the next replay.
 | `sm_103a` | `glm_intra_v20c` + `param_finalize_cast` |
 | `sm_107a` | the deterministic pair `glm_intra_raw` + `param_finalize` |
 
-`R1c` serves the raw rows with the in-kernel q / k L2 norm off, the only mode
-this package runs.
+`R1c` serves the raw rows with the in-kernel q / k L2 norm off.  In an l2n
+mode the raw backward runs the deterministic l2n GLM intra program
+(`glm_intra_raw_l2n`, or the fallback route's capture form) on every
+architecture; on `sm_100a` / `sm_103a` the pairing guard refuses such a plan
+(the `R1c` casts finish the FP64 accumulators of the `R1c` GLM intra programs
+alone, not the deterministic per-chunk partials).
+
+The in-kernel q / k L2 norm has no `S1` pair either: no GLM intra program of
+its modes (`glm_intra_l2n`, `glm_intra_raw_l2n` and the fallback route's
+`glm_intra_l2n_capture` / `glm_intra_raw_l2n_capture`) adds the `q * dq` term.
+Its backward runs the deterministic fused gradient on every row: in g mode the
+`_l2n` records of the `dqkg` stage (`dqkg_l2n`, `dqkg_int_l2n`,
+`dqkg_davq_l2n`, `dqkg_int_davq_l2n`, `dqkg_davq_nohint_l2n`,
+`dqkg_int_davq_nohint_l2n`), in raw mode the raw records above.
 
 ## Numerical contract
 
@@ -224,6 +236,12 @@ this package runs.
   the result (only per-chunk terms that nearly cancel exceed it), and their
   error against the FP64 reference stays within the deterministic package's
   plus the FP64 sum's own error.
+- With the in-kernel q / k L2 norm, in either gate mode (the raw gate mode on
+  `sm_107a`, see `R1c` above), every output (the outputs above, the raw gate
+  mode's `dA_log` / `ddt_bias` included, and the saved `qk_rstd`) is bitwise
+  the deterministic package's in the same mode, on the same paths and
+  architectures: the same programs run in the same order (the tape path's WY
+  twin below writes the same `w`).
 
 ## Checkpoint hand-off
 
@@ -294,9 +312,10 @@ saved set do not change.
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids it.
 - The record is stamped with the inputs, their versions, the plan and the
   stream.  Any mismatch, an arena option, `doc_lengths`, CUDA-graph capture,
-  `torch.compile`, compiled autograd, a Python dispatch mode or the raw gate
-  mode runs the light path (the raw mode writes and takes no record, and
-  `memory_report(..., gate="raw")` reports no hand-off bytes);
+  `torch.compile`, compiled autograd, a Python dispatch mode, the raw gate
+  mode or the in-kernel q / k L2 norm runs the light path (those modes write
+  and take no record, and `memory_report` reports no hand-off bytes for
+  them);
   `save_mode="tape"` runs the tape path without the hand-off.
   Repeated misses turn the hand-off off on the device.
 
@@ -340,7 +359,7 @@ digest under this package's prefix.
 
 ## Registry
 
-93 records naming 87 programs.  The records of the
+121 records naming 109 programs.  The records of the
 deterministic package are copied under this package's prefix, with these
 changes:
 
@@ -357,12 +376,20 @@ changes:
 | `glm_intra_v20c`, `param_finalize_cast` | new: the `R1c` pair with one replica (`sm_100a` below 32 heads, `sm_103a`) |
 | `glm_intra_v20c_r8`, `param_finalize_cast_r8` | new: the `R1c` pair with 8 replicas (`sm_100a` from 32 heads) |
 | `dqkg_raw`, `dqkg_int_raw`, `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`, `dqkg_int_davq_nohint_raw` | new: the raw gate mode's `dqkg` class (`gate: "raw"`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so the raw mode selects the deterministic fused gradient on every row (on the deterministic records' architectures: the `_nohint` forms on `sm_107a`, the others on all three) |
-| `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | not shipped (the in-kernel Q/K L2 norm, which this package refuses) |
+| `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_replay_saved_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_v30_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | the in-kernel Q/K L2 norm's records, unchanged (`fwd_intra_v37_l2n` and `glm_intra_v30_l2n` on `sm_103a`, the saved-rstd twin `bwd_prep_g8_replay_saved_l2n` on `sm_100a` / `sm_103a`, the others on all three architectures; no path selects the twin) |
+| `dqkg_l2n`, `dqkg_int_l2n`, `dqkg_davq_l2n`, `dqkg_int_davq_l2n`, `dqkg_davq_nohint_l2n`, `dqkg_int_davq_nohint_l2n` | new: the in-kernel Q/K L2 norm's `dqkg` records of the g class (`l2n: ["fused", "fallback"]`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so an l2n mode selects the deterministic pair on every row; each shares its program with the raw class record of the same build |
 | `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
 | `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
 
 The stages of `cake_jit.GATE_STAGES` select among the records of the call's
-gate mode (a record's `gate`, `"g"` when absent).
+gate mode (a record's `gate`, `"g"` when absent), and the stages of
+`cake_jit.L2N_STAGES` (the deterministic package's and `dqkg`) among the
+records of the call's in-kernel Q/K L2 norm mode (a record's `l2n`, `["off"]`
+when absent).  The copies of the plain records keep the deterministic
+records' `l2n` modes; the `S1` records, the `R1c` GLM intra records and the
+hand-off twins serve `"off"` alone; the raw class's `dqkg` records serve every
+mode, as do the tape WY twin (its stage `wy` is no l2n stage) and the
+`param_finalize` records (no l2n stage either).
 
 `build.json` has 229 entries: 77 on `sm_100a`, 74 on `sm_103a` and 78 on
 `sm_107a`.
