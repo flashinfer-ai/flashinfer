@@ -396,9 +396,11 @@ def get_megamoe_sm90_mxfp4_uri(
     fast_math,
     in_kernel_weight_copy: bool = False,
     num_nodes: int = 1,
+    phase_stamps: bool = False,
 ) -> str:
     """Module key of the MXFP4 fused kernel: every compile-time policy, the rank
-    width, whether the kernel copies the weights of a replica plan and the node count."""
+    width, whether the kernel copies the weights of a replica plan, the node count
+    and whether the phase stamps are compiled in."""
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -412,7 +414,8 @@ def get_megamoe_sm90_mxfp4_uri(
         num_ranks=num_ranks,
     ).replace("nvfp4", "mxfp4")
     uri += "_eplbcopy" if in_kernel_weight_copy else ""
-    return uri + (f"_nodes{num_nodes}" if num_nodes > 1 else "")
+    uri += f"_nodes{num_nodes}" if num_nodes > 1 else ""
+    return uri + ("_stamps" if phase_stamps else "")
 
 
 def gen_megamoe_sm90_mxfp4_module(
@@ -428,9 +431,11 @@ def gen_megamoe_sm90_mxfp4_module(
     fast_math,
     in_kernel_weight_copy: bool = False,
     num_nodes: int = 1,
+    phase_stamps: bool = False,
 ) -> JitSpec:
     """JIT spec of the MXFP4 fused kernel, with or without the in-kernel weight copy,
-    for ranks on one node or spread over ``num_nodes`` nodes."""
+    for ranks on one node or spread over ``num_nodes`` nodes, optionally with the
+    phase stamps (globaltimer slots) compiled in."""
     uri = get_megamoe_sm90_mxfp4_uri(
         plan,
         num_sms,
@@ -444,6 +449,7 @@ def gen_megamoe_sm90_mxfp4_module(
         fast_math,
         in_kernel_weight_copy,
         num_nodes,
+        phase_stamps,
     )
     return _gen_fp4_module(
         uri,
@@ -462,6 +468,7 @@ def gen_megamoe_sm90_mxfp4_module(
             fast_math=fast_math,
             in_kernel_weight_copy=in_kernel_weight_copy,
             num_nodes=num_nodes,
+            phase_stamps=phase_stamps,
         ),
         fast_math,
         extra_include_paths=[_nccl_paths()[0]] if num_nodes > 1 else (),

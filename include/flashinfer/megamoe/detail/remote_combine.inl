@@ -60,10 +60,12 @@ const auto remote_return = [&]() {
         __syncwarp();
       }
     }
+    if (epilogue_thread_idx == 0) stamp_max(16);
     // Every return row of this rank is written before SM 0 ships them.
     comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() {
       ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
     });
+    if (sm_idx == 0 and epilogue_thread_idx == 0) stamp_max(17);
     if (sm_idx == 0 and epilogue_warp_idx == 0) {
       comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
@@ -74,6 +76,7 @@ const auto remote_return = [&]() {
                     static_cast<uint64_t>(cute::max(num_packed, 1u)) * kRowBytes, lane_idx, true,
                     remote.return_flag(at), comm::remote_return_signal(at));
       }
+      if (lane_idx == 0) stamp_max(13);
     }
   }
 };
@@ -85,6 +88,7 @@ const auto remote_wait_return = [&]() {
 #pragma unroll 1
       for (uint32_t j = 0; j < kNumRemoteNodes; ++j)
         io.wait(j, remote.return_flag(j), comm::remote_return_signal(j), launch_epoch + 1);
+      stamp_max(14);
     }
     comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() {
       ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);

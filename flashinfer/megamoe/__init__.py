@@ -658,6 +658,7 @@ def mxfp4_mega_moe(
     l1_global_scales: Optional[torch.Tensor] = None,
     l2_global_scales: Optional[torch.Tensor] = None,
     expert_slots: Optional[MegaMoEExpertSlots] = None,
+    phase_stamps: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run fused MXFP4 MegaMoE with chunk-major weights and FP8 activations.
 
@@ -687,6 +688,12 @@ def mxfp4_mega_moe(
         from their resident ranks while it computes, and the weights and global
         scales must be the slots' arena views. The routing staged in the buffer
         must already be physical (:meth:`MegaMoEExpertSlots.remap`).
+    phase_stamps : torch.Tensor, optional
+        CUDA INT64 tensor of at least 32 slots. When given, a variant of the
+        kernel built with its phase stamps records globaltimer values of the
+        dispatch, GEMM, combine and inter-node steps into the slots (min slots
+        must start at -1, the others at 0; see the slot map in the kernel body).
+        Timing instrumentation only: the variant is slower than the shipped kernel.
 
     Returns
     -------
@@ -731,8 +738,13 @@ def mxfp4_mega_moe(
         num_logical_experts=None if expert_slots is None else expert_slots.num_experts,
     )
     entry = "megamoe_sm90_mxfp4_fused"
-    # Positional tail of gen_megamoe_sm90_mxfp4_module: in-kernel weight copy, nodes.
-    extra_jit_args: Tuple[Any, ...] = (expert_slots is not None, b.num_nodes)
+    # Positional tail of gen_megamoe_sm90_mxfp4_module: in-kernel weight copy,
+    # nodes, phase stamps.
+    extra_jit_args: Tuple[Any, ...] = (
+        expert_slots is not None,
+        b.num_nodes,
+        phase_stamps is not None,
+    )
     # Region pointers and mirror links precede the in-kernel copy operands.
     extra_kernel_args: Tuple[Any, ...] = b._remote_args
     if expert_slots is not None:
@@ -741,6 +753,14 @@ def mxfp4_mega_moe(
         )
         entry = "megamoe_sm90_mxfp4_fused_in_kernel_copy"
         extra_kernel_args = extra_kernel_args + tuple(expert_slots._in_kernel_copy_args())
+    if phase_stamps is not None and (
+        phase_stamps.dtype != torch.int64
+        or phase_stamps.numel() < 32
+        or phase_stamps.device != y.device
+    ):
+        raise ValueError("phase_stamps must be an INT64 tensor of at least 32 slots on the output's device")
+    # The stamp slots close the operand list of both entries.
+    extra_kernel_args = extra_kernel_args + (phase_stamps,)
     return _run_kernel(
         gen_megamoe_sm90_mxfp4_module,
         entry,

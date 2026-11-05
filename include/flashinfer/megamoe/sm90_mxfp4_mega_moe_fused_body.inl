@@ -36,8 +36,13 @@ const uint32_t lane_idx = ptx::get_lane_idx();
 //   0  min  kernel entry              1  max  dispatch barrier #1 done
 //   2  max  pool ready                3  min  first math task
 //   4  max  last L1 task end          5  max  last L2 task end
-//   6  max  combine barrier #2 done   7  max  combine end
-//   8  max  cleanup barrier #3 done
+//   6  max  combine barrier #2 done   7  max  combine end (returned rows added)
+//   8  max  cleanup barrier #3 done   9  max  index pass grid sync done
+//  15  max  node-local combine done (before the return wait)
+//  Inter-node steps: 10 remote puts issued (SM 0), 11 inbox wait done,
+//  12 proxy publication done, 13 return put issued (SM 0), 14 return wait done
+//  (SM 0), 16 mirror reduction done, 17 its grid sync done (SM 0),
+//  18 packing pass done, 19 count pass and send-offset stake-out done.
 //
 // Accumulators, summed over every CTA (value, then count):
 //  20/21 L1 task ns     22/23 L2 task ns
@@ -569,10 +574,12 @@ if (warp_idx < kNumDispatchWarps) {
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
 #include <flashinfer/megamoe/detail/remote_dispatch.inl>
+  if (thread_idx == 0) stamp_max(19);
   // Tokens with an expert on another node: packed slot and outbound copy first,
   // so the index pass can write their packed index.
   remote_pack_tokens();
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+  if (thread_idx == 0) stamp_max(18);
 
   // Write source token-topk indices to remote ranks
   read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -592,6 +599,7 @@ if (warp_idx < kNumDispatchWarps) {
   comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx, [=]() {
     ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
   });
+  if (thread_idx == 0) stamp_max(9);
 
   if (sm_idx == 0 and thread_idx < kNumActiveDispatchThreads) {
 #pragma unroll
@@ -617,12 +625,19 @@ if (warp_idx < kNumDispatchWarps) {
   // Inter-node: ship this rank's packed tokens, then publish the mirrored
   // sources' counts and lists into this node's owners before the barrier.
   remote_send();
+  if (sm_idx == 0 and thread_idx == 0) stamp_max(10);
   remote_publish_by_proxy();
+  if (thread_idx == 0) stamp_max(12);
 
+  // With remote nodes every SM published peer writes just above, so the barrier
+  // needs its grid sync before SM 0 signals the peers (the same ordering the
+  // combine barrier gives the epilogue's peer stores); on one node only SM 0
+  // wrote and the sync is skipped as before.
   comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
                        kBeforeDispatchPullBarrierTag, kNumLocalRanks>(
       workspace, sym_buffer, sm_idx, thread_idx,
-      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, false, true);
+      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+      kNumRemoteNodes > 0, true);
   if (thread_idx == 0) stamp_max(1);
 
   // Sync with epilogue warps before pulling tokens
@@ -1542,8 +1557,10 @@ if (warp_idx < kNumDispatchWarps) {
 #include <flashinfer/megamoe/detail/combine.inl>
 #undef FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES
 // clang-format on
+  if (epilogue_thread_idx == 0) stamp_max(15);
   remote_wait_return();
   remote_add_returns();
+  if (epilogue_thread_idx == 0) stamp_max(7);
 }
 #else
 if (blockIdx.x == 0 and threadIdx.x == 0)

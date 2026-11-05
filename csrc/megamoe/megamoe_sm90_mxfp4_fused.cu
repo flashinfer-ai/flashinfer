@@ -22,6 +22,7 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
             tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
             tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
             int64_t window_base, int64_t gin_context,
+            tvm::ffi::Optional<tvm::ffi::TensorView> phase_stamps,
             const eplb::InKernelCopy<cfg::kNumRanks>& in_kernel_copy) {
   TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), cfg::kNumRanks);
   TVM_FFI_ICHECK_GE(rank_idx, 0);
@@ -79,7 +80,12 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
   const float* gs1 = detail::optional_tensor_ptr<const float>(l1_global_scales);
   const float* gs2 = detail::optional_tensor_ptr<const float>(l2_global_scales);
   uint32_t tokens = static_cast<uint32_t>(num_tokens);
-  unsigned long long* stamps = nullptr;
+  // Phase stamps: 32 globaltimer slots, only read by a module built with them.
+  auto* stamps = detail::optional_tensor_ptr<unsigned long long>(phase_stamps);
+  if constexpr (cfg::kPhaseStamps) {
+    TVM_FFI_ICHECK(stamps != nullptr and phase_stamps.value().numel() >= 32)
+        << "this module records phase stamps; pass an int64 tensor of at least 32 slots";
+  }
   void* args[] = {
       &output,      &stats,  &tokens,
       &sym_buffer,  &sym_regions, &remote_links,
@@ -108,21 +114,24 @@ void megamoe_sm90_mxfp4_fused(
     tvm::ffi::Array<int64_t> input_block_ptrs, tvm::ffi::Array<int64_t> combine_block_ptrs,
     tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
     tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
-    int64_t window_base, int64_t gin_context) {
+    int64_t window_base, int64_t gin_context,
+    tvm::ffi::Optional<tvm::ffi::TensorView> phase_stamps) {
   TVM_FFI_ICHECK(!cfg::kInKernelWeightCopy)
       << "this module carries the in-kernel weight copy; call "
          "megamoe_sm90_mxfp4_fused_in_kernel_copy";
   launch(y, symm_buffer, symm_buffer_ptrs, rank_idx, l1_weights, l2_weights, offsets, num_tokens,
          cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, input_block_ptrs,
          combine_block_ptrs, link_ranks, link_nodes_at_mirror, link_lsa_offsets, dev_comm_ptr,
-         window_handle, window_base, gin_context, eplb::InKernelCopy<cfg::kNumRanks>{});
+         window_handle, window_base, gin_context, phase_stamps,
+         eplb::InKernelCopy<cfg::kNumRanks>{});
 }
 
 // Same launch with the in-kernel weight copy: the redundant expert slots listed
 // in `eplb_workspace` are copied from the resident ranks' arenas
 // (`arena_ptrs`) by the kernel itself. The weights and global scales are views
 // of this rank's arena; `l1_planes` / `l2_planes` are (byte offset, bytes per
-// slot) pairs of the arena planes each GEMM reads.
+// slot) pairs of the arena planes each GEMM reads. `phase_stamps` is the slot
+// tensor of a module built with the phase stamps, None otherwise.
 void megamoe_sm90_mxfp4_fused_in_kernel_copy(
     tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
     tvm::ffi::Array<int64_t> symm_buffer_ptrs, int64_t rank_idx, tvm::ffi::TensorView l1_weights,
@@ -135,7 +144,8 @@ void megamoe_sm90_mxfp4_fused_in_kernel_copy(
     tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
     int64_t window_base, int64_t gin_context, tvm::ffi::TensorView eplb_workspace,
     tvm::ffi::TensorView arena, tvm::ffi::Array<int64_t> arena_ptrs, int64_t num_resident_experts,
-    tvm::ffi::Array<int64_t> l1_planes, tvm::ffi::Array<int64_t> l2_planes) {
+    tvm::ffi::Array<int64_t> l1_planes, tvm::ffi::Array<int64_t> l2_planes,
+    tvm::ffi::Optional<tvm::ffi::TensorView> phase_stamps) {
   TVM_FFI_ICHECK(cfg::kInKernelWeightCopy)
       << "this module has no in-kernel weight copy; call megamoe_sm90_mxfp4_fused";
   constexpr int64_t kNumExpertsPerRank = cfg::kNumExperts / cfg::kNumRanks;
@@ -165,7 +175,7 @@ void megamoe_sm90_mxfp4_fused_in_kernel_copy(
   launch(y, symm_buffer, symm_buffer_ptrs, rank_idx, l1_weights, l2_weights, offsets, num_tokens,
          cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, input_block_ptrs,
          combine_block_ptrs, link_ranks, link_nodes_at_mirror, link_lsa_offsets, dev_comm_ptr,
-         window_handle, window_base, gin_context, in_kernel_copy);
+         window_handle, window_base, gin_context, phase_stamps, in_kernel_copy);
 }
 
 }  // namespace flashinfer::megamoe

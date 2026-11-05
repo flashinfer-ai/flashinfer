@@ -11,9 +11,9 @@
 //   remote_send               SM 0, after the grid sync: puts the rows, compacts
 //                             the lists, then puts scales, routing and header in
 //                             one signalled put.
-//   remote_publish_by_proxy   SM 0, before the node-local barrier: waits for the
-//                             inbox of every remote node and performs the
-//                             mirror's publication into this node's owners.
+//   remote_publish_by_proxy   every SM, before the node-local barrier: waits for
+//                             the inbox of every remote node and publishes its
+//                             share of the experts into this node's owners.
 // Pass over the routing: packed slots and the outbound copies. Mirrors the
 // iteration of `read_topk_idx`: `kNumTokensPerWarp` tokens per warp step, the
 // top-k entries of one token on consecutive lanes.
@@ -137,9 +137,13 @@ const auto remote_send = [&]() {
 
 // SM 0 before the node-local dispatch barrier: the mirror's publication for
 // every remote source into this node's owners, from the inbox header.
+// The experts of this node are spread over the SMs (on one SM the publication
+// took 35-40 us, a chain of peer stores issued by two warps); every SM waits
+// for the inbox signal itself, and the node-local barrier that follows orders
+// all of these peer writes before the owners read them, exactly as it orders
+// the local count publication and the epilogue's peer stores.
 const auto remote_publish_by_proxy = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
-    if (sm_idx != 0) return;
     comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
     for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
@@ -147,28 +151,26 @@ const auto remote_publish_by_proxy = [&]() {
       if (thread_idx == 0)
         io.wait(j, remote.inbox_flag(j), comm::remote_inbox_signal(j), launch_epoch + 1);
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+      if (thread_idx == 0) stamp_max(11);
       auto* header = remote.inbox_header(j);
       const auto* counts = remote.header_expert_counts(header);
       const auto* starts = remote.header_expert_starts(header);
       const auto* entries = remote.header_entries(header);
-      // Counts: one entry per expert of this node, as the source would have written.
-      for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads) {
+      // Per expert: one thread writes the count as the source would have, every
+      // thread copies a share of the list.
+      for (uint32_t e = sm_idx; e < kNumExpertsPerNode; e += kNumSMs) {
         const uint32_t expert_idx = my_node * kNumExpertsPerNode + e;
         const uint32_t owner = expert_idx / kNumExpertsPerRank;
         const uint32_t local_expert = expert_idx % kNumExpertsPerRank;
-        const uint64_t count = counts[e];
-        *sym_buffer.map(workspace.get_expert_recv_count_ptr(source_rank, local_expert), owner) =
-            count;
-        ptx::atomic_add_sys(
-            sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(local_expert), owner),
-            (static_cast<uint64_t>(kNumSMs) << 32) | count);
-      }
-      // Lists: one warp per expert.
-      for (uint32_t e = warp_idx; e < kNumExpertsPerNode; e += kNumDispatchWarps) {
-        const uint32_t expert_idx = my_node * kNumExpertsPerNode + e;
-        const uint32_t owner = expert_idx / kNumExpertsPerRank;
-        const uint32_t local_expert = expert_idx % kNumExpertsPerRank;
-        for (uint32_t k = lane_idx; k < counts[e]; k += 32)
+        const uint32_t count = counts[e];
+        if (thread_idx == 0) {
+          *sym_buffer.map(workspace.get_expert_recv_count_ptr(source_rank, local_expert), owner) =
+              static_cast<uint64_t>(count);
+          ptx::atomic_add_sys(
+              sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(local_expert), owner),
+              (static_cast<uint64_t>(kNumSMs) << 32) | count);
+        }
+        for (uint32_t k = thread_idx; k < count; k += kNumDispatchThreads)
           *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(local_expert, source_rank, k),
                           owner) = entries[starts[e] + k];
       }
