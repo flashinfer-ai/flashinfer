@@ -1904,7 +1904,8 @@ def _stream_context_query() -> Any:
 # another library), and a split count planned on more SMs than the stream holds
 # never completes.  ``FLASHINFER_CAKE_FMHA_SM_PARTITIONS=0`` or
 # ``enable_cake_fmha_sm_partitions(False)`` plans on the device's SM count
-# without reading the stream, for a process that never launches on a partition.
+# without reading the stream, for a process that never launches on a partition;
+# FlashInfer's green-context helpers (``flashinfer.green_ctx``) turn it back on.
 _SMALLM_SM_PARTITIONS = os.environ.get("FLASHINFER_CAKE_FMHA_SM_PARTITIONS") != "0"
 
 
@@ -1913,7 +1914,8 @@ def enable_cake_fmha_sm_partitions(enabled: bool = True) -> None:
     context (the default), or with ``enabled=False`` on the device's SM count
     without reading the stream.  Turn it off only in a process that never
     launches the small-M route on an SM partition: a split count planned on
-    more SMs than the stream's context holds never completes."""
+    more SMs than the stream's context holds never completes.  Creating
+    green-context streams with ``flashinfer.green_ctx`` turns it back on."""
 
     global _SMALLM_SM_PARTITIONS
     _SMALLM_SM_PARTITIONS = bool(enabled)
@@ -4836,24 +4838,6 @@ def select_cake_fmha_decode_route(
         smallm_rows = _smallm_tile_rows_for(q_len, group)
         smallm_tiles = batch_size * num_kv_heads
         smallm_sm_count = _smallm_sm_count(device)
-        # The small-M split count is planned on the SMs the launch's stream
-        # holds (a green context's partition); the other routes keep the
-        # device's SM count.  More tiles than the device's SMs take no split
-        # on any partition, so such a launch reads no stream.
-        smallm_launch_sm_count = (
-            _smallm_launch_sm_count(device, smallm_sm_count)
-            if _SMALLM_SM_PARTITIONS
-            and smallm_rows is not None
-            and query.shape[2] == 256
-            and 0 < smallm_tiles <= smallm_sm_count
-            else smallm_sm_count
-        )
-        smallm_num_split = _smallm_num_split(
-            tiles=smallm_tiles,
-            sm_count=smallm_launch_sm_count,
-            max_seq_len=max_seq_len,
-            n_rows=smallm_rows or 64,
-        )
         if (
             query.is_contiguous()
             and query.shape[2] == 64
@@ -4928,52 +4912,67 @@ def select_cake_fmha_decode_route(
             and not isinstance(bmm1_scale, torch.Tensor)
             and _tma_paged_kv_strides_supported(key_cache)
             and _tma_paged_kv_strides_supported(value_cache)
-            and smallm_num_split >= 1
-            and _smallm_workspace_supported(
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            # The small-M split count is planned on the SMs the launch's
+            # stream holds (a green context's partition); the other routes
+            # keep the device's SM count.  Only a launch this route can take
+            # reads its stream, and more tiles than the device's SMs take no
+            # split on any partition, so such a launch reads none either.
+            smallm_launch_sm_count = (
+                _smallm_launch_sm_count(device, smallm_sm_count)
+                if _SMALLM_SM_PARTITIONS and 0 < smallm_tiles <= smallm_sm_count
+                else smallm_sm_count
+            )
+            smallm_num_split = _smallm_num_split(
+                tiles=smallm_tiles,
+                sm_count=smallm_launch_sm_count,
+                max_seq_len=max_seq_len,
+                n_rows=smallm_rows,
+            )
+            if smallm_num_split >= 1 and _smallm_workspace_supported(
                 workspace_buffer,
                 query,
                 tiles=smallm_tiles,
                 num_split=smallm_num_split,
                 n_rows=smallm_rows,
                 lse=lse,
-            )
-            and no_block_scales
-            and not isinstance(bmm2_scale, torch.Tensor)
-            and float(bmm2_scale) == 1.0
-            and (o_scale is None or float(o_scale) == 1.0)
-        ):
-            smallm_program = _decode_smallm_program_select(
-                device,
-                n_rows=smallm_rows,
-                page_size=page_size,
-                q_len=q_len,
-                group=group,
-                tiles=smallm_tiles,
-                max_seq_len=max_seq_len,
-                num_split=smallm_num_split,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                whole_device=smallm_launch_sm_count >= smallm_sm_count,
-            )
-            smallm_key, smallm_split = smallm_program or (None, smallm_num_split)
-            candidate = CakeFmhaDecodeRoute(
-                target=_cake_fmha_target(device),
-                batch_size=batch_size,
-                q_len=q_len,
-                num_q_heads=num_q_heads,
-                num_kv_heads=num_kv_heads,
-                has_sink=False,
-                has_window=False,
-                use_scale_ptr=False,
-                retain_kv_l2=local_blocks <= 9,
-                component="decode_native_bf16_hd256_smallm",
-                page_size=page_size,
-                num_split=smallm_split,
-                program=smallm_key,
-            )
-            if smallm_key is not None:
-                return candidate
-            return candidate if cake_fmha_route_is_optimized(candidate) else None
+            ):
+                smallm_program = _decode_smallm_program_select(
+                    device,
+                    n_rows=smallm_rows,
+                    page_size=page_size,
+                    q_len=q_len,
+                    group=group,
+                    tiles=smallm_tiles,
+                    max_seq_len=max_seq_len,
+                    num_split=smallm_num_split,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    whole_device=smallm_launch_sm_count >= smallm_sm_count,
+                )
+                smallm_key, smallm_split = smallm_program or (None, smallm_num_split)
+                candidate = CakeFmhaDecodeRoute(
+                    target=_cake_fmha_target(device),
+                    batch_size=batch_size,
+                    q_len=q_len,
+                    num_q_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    has_sink=False,
+                    has_window=False,
+                    use_scale_ptr=False,
+                    retain_kv_l2=local_blocks <= 9,
+                    component="decode_native_bf16_hd256_smallm",
+                    page_size=page_size,
+                    num_split=smallm_split,
+                    program=smallm_key,
+                )
+                if smallm_key is not None:
+                    return candidate
+                return candidate if cake_fmha_route_is_optimized(candidate) else None
         if (
             query.is_contiguous()
             and query.shape[2] == 256

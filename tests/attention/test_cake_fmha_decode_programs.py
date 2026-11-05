@@ -1794,21 +1794,30 @@ def _driver_green_context(sms):
     )
 
 
+def _has_stream_green_context(stream):
+    """Whether the driver gives ``stream``'s green context through
+    ``cuStreamGetCtx_v2`` (CUDA 12.5), which a pre-CUDA-13 launch needs to
+    find the partition of a stream ``cuStreamGetCtx`` does not answer for."""
+
+    from cuda.bindings import driver
+
+    query = getattr(driver, "cuStreamGetCtx_v2", None)
+    if query is None:
+        return False
+    err, _, green = query(driver.CUstream(stream.cuda_stream))
+    return not int(err) and bool(int(green))
+
+
 def _without_stream_context(stream):
     """Make the module's stream query skip ``cuStreamGetCtx`` for ``stream``,
     which before CUDA 13 fails for a stream of ``cuGreenCtxStreamCreate``
     (``CUDA_ERROR_NOT_SUPPORTED``), so the module must find the stream's
     partition another way."""
 
+    query = cake_api._stream_context_query()
+    assert query, "the stream-context library did not load"
     module = cake_api.load_cake_fmha_stream_context_module()
-    query, unanswered = (
-        cake_api._stream_context_query(),
-        (module.stream_context_sm_count_unanswered),
-    )
-    raw, index = stream.cuda_stream, torch.cuda.current_device()
-    device_sms = torch.cuda.get_device_properties(index).multi_processor_count
-    if not query or not 0 < unanswered(raw, index) < device_sms:
-        raise RuntimeError("the driver gives no cuStreamGetCtx_v2 green context")
+    unanswered, raw = module.stream_context_sm_count_unanswered, stream.cuda_stream
 
     def stream_context_sm_count(handle, device):
         return (unanswered if handle == raw else query)(handle, device)
@@ -1840,8 +1849,10 @@ def _smallm_partition_child(sms, rows, api, green=None):
             stream, partition = streams[0], int(resources[0].sm.smCount)
         elif api in ("driver", "driver_without_stream_context"):
             green, stream, partition = _driver_green_context(sms)
-            if api == "driver_without_stream_context":
-                _without_stream_context(stream)
+            if api == "driver_without_stream_context" and not (
+                _has_stream_green_context(stream)
+            ):
+                raise RuntimeError("the driver gives no cuStreamGetCtx_v2")
         else:
             if isinstance(green, Exception):
                 raise green
@@ -1863,6 +1874,9 @@ def _smallm_partition_child(sms, rows, api, green=None):
     except Exception as error:  # noqa: BLE001 - any failure means no partition
         print(json.dumps({"skip": f"no green context: {error!r}"}), flush=True)
         return
+    if api == "driver_without_stream_context":
+        # Outside the skip above: a broken fallback must fail the launch.
+        _without_stream_context(stream)
     served = []
     resolve = cake_api._resolve_cake_fmha_decode_module
 
