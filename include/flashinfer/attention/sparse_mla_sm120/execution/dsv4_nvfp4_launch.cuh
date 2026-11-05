@@ -4,7 +4,7 @@
 
 #include "../kernels/dsv4_nvfp4/decode.cuh"
 #include "../kernels/dsv4_nvfp4/grouped_attention.cuh"
-#include "../kernels/dsv4_nvfp4/prefill_mega.cuh"
+#include "../kernels/cute_prefill/prefill_nvfp4.cuh"
 #include "attention_params.cuh"
 #include "attention_plan.h"
 #include "merge.cuh"
