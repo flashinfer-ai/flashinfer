@@ -33,7 +33,23 @@ def _tensor(tensor, name, *, dtype, shape, device, contiguous=True):
         raise ValueError(f"{name} must be contiguous")
 
 
-def _storage_checks(q, k, v, ks, vs, table, scratch, output):
+def _storage_checks(
+    q,
+    k,
+    v,
+    ks,
+    vs,
+    table,
+    scratch,
+    output,
+    lengths,
+    tasks,
+    requests,
+    spans,
+    header,
+    causal_mask,
+    semaphores,
+):
     # Real storage only: Dynamo/FakeTensor must not inspect pointers. Both the
     # raw eager path and registered CUDA implementation call this same check.
     for name, tensor in (
@@ -47,11 +63,29 @@ def _storage_checks(q, k, v, ks, vs, table, scratch, output):
     ):
         if tensor.data_ptr() % 16:
             raise ValueError(f"{name} must have 16-byte aligned storage")
+    output_storage = output.untyped_storage().data_ptr()
     if any(
-        output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
-        for t in (q, k, v, ks, vs, table)
+        t.numel() and output_storage == t.untyped_storage().data_ptr()
+        for t in (
+            q,
+            k,
+            v,
+            ks,
+            vs,
+            table,
+            lengths,
+            tasks,
+            requests,
+            spans,
+            header,
+            causal_mask,
+            semaphores,
+            scratch,
+        )
     ):
-        raise ValueError("out must not alias query, cache or metadata storage")
+        raise ValueError(
+            "out must not alias query, cache, metadata or workspace storage"
+        )
 
 
 def _host_lengths(lengths, batch):
@@ -142,7 +176,23 @@ def _compute(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
-    _storage_checks(q, k, v, ks, vs, table, scratch, output)
+    _storage_checks(
+        q,
+        k,
+        v,
+        ks,
+        vs,
+        table,
+        scratch,
+        output,
+        lengths,
+        tasks,
+        requests,
+        spans,
+        header,
+        causal_mask,
+        semaphores,
+    )
     # Empty headers are the factory's explicit static direct-plan representation.
     direct = header.numel() == 0
     module, _ = get_module(
@@ -606,3 +656,4 @@ def run(
         plan.query_tile,
     )
     return out
+

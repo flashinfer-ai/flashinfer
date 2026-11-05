@@ -2,7 +2,9 @@
 """Real dispatcher/Inductor qualification of the public bucket API; no model claims."""
 
 import json
+from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -277,6 +279,72 @@ class BucketCompileTests(unittest.TestCase):
             flush=True,
         )
 
+    def test_output_metadata_and_workspace_aliases(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+        from flashinfer.xqa import xqa_decode_with_buckets
+
+        plan, workspaces, banks, args, _, _, _ = _fixture(mode="aligned")
+        workspace = workspaces[0]
+        q, k, v, ks, vs, output = banks[0]
+        for name in (
+            "lengths",
+            "tasks",
+            "requests",
+            "spans",
+            "header",
+            "causal_mask",
+            "scratch",
+            "semaphores",
+        ):
+            with self.subTest(buffer=name):
+                owner = workspace if name in ("scratch", "semaphores") else plan
+                tensor = getattr(owner, name)
+                backing = torch.empty(
+                    max(
+                        output.numel() * output.element_size(),
+                        tensor.numel() * tensor.element_size(),
+                    ),
+                    dtype=torch.uint8,
+                    device=q.device,
+                )
+                aliased_tensor = (
+                    backing[: tensor.numel() * tensor.element_size()]
+                    .view(tensor.dtype)
+                    .reshape(tensor.shape)
+                )
+                aliased_tensor.copy_(tensor)
+                out = (
+                    backing[: output.numel() * output.element_size()]
+                    .view(output.dtype)
+                    .reshape(output.shape)
+                )
+                aliased_owner = replace(owner, **{name: aliased_tensor})
+                # Rejection must precede JIT lookup or a native kernel launch.
+                with (
+                    patch.object(
+                        backend,
+                        "get_module",
+                        side_effect=AssertionError(
+                            "Aliased output reached kernel lookup"
+                        ),
+                    ),
+                    self.assertRaisesRegex(ValueError, "out.*alias"),
+                ):
+                    xqa_decode_with_buckets(
+                        q,
+                        k,
+                        v,
+                        ks,
+                        vs,
+                        args[0],
+                        aliased_owner if owner is plan else plan,
+                        aliased_owner if owner is workspace else workspace,
+                        bmm1_scale=0.7 / 16,
+                        bmm2_scale=1.3,
+                        out=out,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
+
