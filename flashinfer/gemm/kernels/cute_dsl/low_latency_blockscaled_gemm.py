@@ -73,6 +73,8 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.gemm.tensor_utils import decode_float4e2m1fn
 from cutlass.pipeline import (
     PipelineAsync,
@@ -85,6 +87,38 @@ from cutlass.pipeline import (
     make_pipeline_state,
     PipelineUserType,
 )
+
+
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: "cute.Pointer",
+    phase: "cutlass.Int32",
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class WorkTileInfo(NamedTuple):
@@ -1838,7 +1872,7 @@ class LowLatencyBlockscaledGemmKernel:
                             cutlass.Int32(peer),
                         )
 
-            cute.arch.mbarrier_wait(mailbox_mbar, 0)
+            _mbarrier_wait_acquire_cluster(mailbox_mbar, cutlass.Int32(0))
 
             my_shard_start = split_rank * shard_ept
             for s in range(self.split_k - 1):
