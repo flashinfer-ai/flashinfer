@@ -74,34 +74,47 @@ DAV_PLAN = [
     ["buffer", "do_tma"], ["buffer", "vnew_tma"], ["buffer", "aqk_tma"], ["buffer", "dAqk"], ["buffer", "dv1"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
 ]  # fmt: skip
-# The K4 merge records (the register-blocked v2 builds, one per CONFIGS entry the select rule names): record ->
-# (build keywords, threads per CTA = 128 * cols_per_cta / the thread tile's outputs).
+# The K4 merge records (the register-blocked v2 builds the rule names): record -> (build keywords, threads per CTA =
+# 128 * cols_per_cta / the thread tile's outputs, architectures).  The pairs builds are scalar on sm_107a (the
+# exporter's per-architecture keywords; the program name hashes the keywords above).
 MERGE_V2_MODULE = "tart.kda_chunk_kcp_affine_merge.sm100_sm103_sm107.kda_chunk_det_affine_merge_fp32_v2_kcp"
 MERGE_RECORDS = {
-    "kcp_affine_merge_c64": (
-        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x8"},
+    "kcp_affine_merge_c8": (
+        {"chunk_k": 16, "cols_per_cta": 8, "pairs": True, "ring": 4, "tile": "4x4"},
+        64,
+        ARCHES,
+    ),
+    "kcp_affine_merge_c16": (
+        {"chunk_k": 16, "cols_per_cta": 16, "pairs": True, "ring": 4, "tile": "4x4"},
         128,
+        ARCHES,
     ),
     "kcp_affine_merge_c32": (
         {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "4x8"},
         128,
+        ARCHES,
     ),
-    "kcp_affine_merge_c16": (
-        {"chunk_k": 16, "cols_per_cta": 16, "pairs": False, "ring": 4, "tile": "4x4"},
+    "kcp_affine_merge_c64": (
+        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x8"},
         128,
+        ("sm_100a", "sm_103a"),
     ),
 }
-# The K4 select rule at sample launches: (ncols, transpose_m, n_chains) -> record.
+# The K4 rule at sample launches: (arch, ncols, n_chains) -> record; T = n_chains * ncols / 128 (the W4 merge launches
+# are T = 64; a 256-column map chain counts twice).
 MERGE_SELECT = {
-    (128, 0, 64): "kcp_affine_merge_c64",
-    (128, 1, 64): "kcp_affine_merge_c64",
-    (128, 0, 48): "kcp_affine_merge_c64",
-    (128, 1, 47): "kcp_affine_merge_c32",
-    (128, 0, 17): "kcp_affine_merge_c32",
-    (128, 0, 16): "kcp_affine_merge_c16",
-    (128, 1, 1): "kcp_affine_merge_c16",
-    (256, 0, 24): "kcp_affine_merge_c16",
-    (256, 1, 96): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 64): "kcp_affine_merge_c64",
+    ("sm_100a", 128, 57): "kcp_affine_merge_c64",
+    ("sm_107a", 128, 64): "kcp_affine_merge_c32",
+    ("sm_103a", 128, 56): "kcp_affine_merge_c16",
+    ("sm_103a", 256, 21): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 40): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 21): "kcp_affine_merge_c32",
+    ("sm_103a", 256, 10): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 13): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 12): "kcp_affine_merge_c8",
+    ("sm_107a", 256, 6): "kcp_affine_merge_c8",
+    ("sm_100a", 128, 1): "kcp_affine_merge_c8",
 }
 PLANS = {
     "kcp_fwdh_offset": FWDH_PLAN,
@@ -155,7 +168,7 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
         {"vh": 64},
     ),
-    **{name: (MERGE_V2_MODULE, kwargs) for name, (kwargs, _) in MERGE_RECORDS.items()},
+    **{name: (MERGE_V2_MODULE, row[0]) for name, row in MERGE_RECORDS.items()},
     "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
     "kcp_transfer_walk_three_mma": (
@@ -223,7 +236,9 @@ def test_the_tables_are_disjoint_and_complete() -> None:
 def test_record_matches_the_frozen_abi(name: str) -> None:
     record = _records()[name]
     assert record["arg_plan"] == PLANS[name], name
-    assert record["arches"] == list(ARCHES)
+    assert record["arches"] == list(
+        MERGE_RECORDS[name][2] if name in MERGE_RECORDS else ARCHES
+    )
     assert record["ffi_entry"] == "run"
     assert record["kernel_symbol"] == f"kernel_{record['library']}"
     assert (
@@ -276,27 +291,36 @@ def test_program_names_follow_the_identity_rule() -> None:
 
 
 def test_merge_selection_covers_every_launch_once() -> None:
-    for (ncols, transpose_m, n_chains), record in MERGE_SELECT.items():
+    assert tuple(kcp_jit.MERGE_RULE) == ARCHES
+    for (arch, ncols, n_chains), record in MERGE_SELECT.items():
         assert (
             kcp_jit.select_record(
-                "kcp_affine_merge",
-                ncols=ncols,
-                n_chains=n_chains,
-                transpose_m=transpose_m,
+                "kcp_affine_merge", ncols=ncols, n_chains=n_chains, arch=arch
             )
             == record
-        ), (ncols, transpose_m, n_chains)
-        assert kcp_jit.merge_record(ncols, n_chains, transpose_m) == record
-    # every state / map launch shape is admitted by exactly one record (select_record raises otherwise)
-    for ncols in (128, 256):
-        for transpose_m in (0, 1):
+        ), (arch, ncols, n_chains)
+        assert kcp_jit.merge_record(ncols, n_chains, arch) == record
+    # every state / map launch is admitted by exactly one record built for its architecture (select_record raises
+    # otherwise), and the rule names every merge record on every architecture it ships for
+    named: dict[str, set[str]] = {}
+    for arch in ARCHES:
+        for ncols in (128, 256):
             for n_chains in range(1, 300):
-                kcp_jit.merge_record(ncols, n_chains, transpose_m)
+                record = kcp_jit.merge_record(ncols, n_chains, arch)
+                assert arch in kcp_jit.MODULES[record]["arches"], (arch, record)
+                named.setdefault(record, set()).add(arch)
+    assert named == {name: set(MERGE_RECORDS[name][2]) for name in MERGE_RECORDS}
+    # without an architecture: the record every architecture names, refused where they differ (T > 56)
+    assert kcp_jit.merge_record(128, 8) == "kcp_affine_merge_c8"
     with pytest.raises(ValueError):
-        kcp_jit.merge_record(64, 4, 0)
-    # the chains rule needs the chain count and the layout
+        kcp_jit.merge_record(128, 64)
     with pytest.raises(ValueError):
-        kcp_jit.select_record("kcp_affine_merge", ncols=128)
+        kcp_jit.merge_record(64, 4, "sm_103a")
+    with pytest.raises(ValueError):
+        kcp_jit.merge_record(128, 4, "sm_90a")
+    # the rule needs the chain count
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_affine_merge", ncols=128, arch="sm_103a")
 
 
 def test_selection_and_grids() -> None:
@@ -452,7 +476,7 @@ def test_shipped_manifest_lists_the_kcp_programs_and_no_test_only_one() -> None:
     manifest = cake_build.manifest()
     libraries = cake_build.libraries_by_name()
     for name, record in kcp_jit.MODULES.items():
-        for arch in ARCHES:
+        for arch in record["arches"]:
             library = kcp_jit.library_name(name, arch)
             assert library == f"{record['library']}_{arch}"
             entry = libraries[library]

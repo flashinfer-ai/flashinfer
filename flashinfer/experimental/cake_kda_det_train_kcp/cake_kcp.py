@@ -1378,9 +1378,7 @@ class KernelBackend(Backend):
             cols = (
                 self.cols_per_cta
                 if self.cols_per_cta is not None
-                else _registry_merge_cols(
-                    ch.ncols, ch.n_chains, int(args["transpose_m"])
-                )
+                else _registry_merge_cols(ch.ncols, ch.n_chains, call.device)
             )
         if ch.ncols % cols:
             raise ValueError(
@@ -1415,11 +1413,17 @@ class KernelBackend(Backend):
         return abi, ch.n_chains * (ch.ncols // cols)
 
 
-def _registry_merge_cols(ncols: int, n_chains: int, transpose_m: int) -> int:
-    """``cols_per_cta`` of the K4 record the registry selects for the launch (:func:`.cake_kcp_jit.merge_record`)."""
+def _registry_merge_cols(ncols: int, n_chains: int, device: torch.device) -> int:
+    """``cols_per_cta`` of the K4 record the registry selects for the launch on ``device``
+    (:func:`.cake_kcp_jit.merge_record`; a device that is not CUDA: the record every architecture's rule names)."""
     from . import cake_kcp_jit  # noqa: PLC0415 - H3's registry; optional at import time
 
-    record = cake_kcp_jit.merge_record(ncols, n_chains, transpose_m)
+    arch = (
+        cake_kcp_jit.device_arch(device.index if device.index is not None else 0)
+        if device.type == "cuda"
+        else None
+    )
+    record = cake_kcp_jit.merge_record(ncols, n_chains, arch)
     return int(cake_kcp_jit.MODULES[record]["grid_rule"]["cols_per_cta"])
 
 
@@ -2412,9 +2416,7 @@ class _FiPrograms:
             ncols = int(abi[params.index("ncols")])
             cols = int(abi[params.index("cols_per_cta")])
             record = jit.merge_record(
-                ncols,
-                int(grid) // (ncols // cols),
-                int(abi[params.index("transpose_m")]),
+                ncols, int(grid) // (ncols // cols), jit.device_arch(device_index)
             )
             if int(jit.MODULES[record]["grid_rule"]["cols_per_cta"]) != cols:
                 raise ValueError(

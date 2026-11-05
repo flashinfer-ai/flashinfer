@@ -56,8 +56,9 @@ The programs are the eight launches of the KCP composition
   one record per register-blocked build (column block ``cols_per_cta``,
   thread tile, packed FMA pairs on sm_100a / sm_103a), every build giving
   the same bits (each output is one FP32 FMA chain in a fixed order); the
-  ``select_rule`` ``chains`` picks the build per launch from its column
-  count, operator layout and chain count (:func:`merge_record`);
+  ``select_rule`` ``merge_rule`` picks the build per launch from its
+  128-column chain blocks and the architecture (:data:`MERGE_RULE`,
+  :func:`merge_record`);
 * ``kcp_fwd_o`` -- the chunk output stage of the forward at the rank's
   shape: ``out`` from the ``h`` / ``v_new`` tapes the forward walk writes and
   the intra stage's ``qg`` / ``Aqk`` rows, one CTA per (chunk, head) tile of
@@ -249,6 +250,37 @@ LOGICAL_SCALARS = (
     "write_states",
     "cols_per_cta",
 )
+
+# The ``kcp_affine_merge`` record of a launch (:func:`merge_record`), by architecture: ``T = n_chains * ncols / 128``
+# (the launch's 128-column chain blocks; one rule for both operator layouts) -> the record of the first band whose
+# upper bound holds ``T`` (``None``: no bound).  Every record gives the same bits.  The bands are the fastest build per
+# ``T`` in the r2611 K4 A/B on GB300 (sm_103a, 152 SMs: 17 launch rows x 11 builds, every row bitwise equal to the
+# previous build); sm_100a takes the GB300 bands (not measured on sm_100a).  sm_107a has no packed FMA pairs and ships
+# no 8 x 8 build: its bands are the GB300 bands with the scalar builds and the 4 x 8 build above ``T`` 56 (a proxy, not
+# measured on sm_107a).
+MERGE_RULE: dict[str, tuple[tuple[int | None, str], ...]] = {
+    "sm_100a": (
+        (12, "kcp_affine_merge_c8"),
+        (20, "kcp_affine_merge_c16"),
+        (40, "kcp_affine_merge_c32"),
+        (56, "kcp_affine_merge_c16"),
+        (None, "kcp_affine_merge_c64"),
+    ),
+    "sm_103a": (
+        (12, "kcp_affine_merge_c8"),
+        (20, "kcp_affine_merge_c16"),
+        (40, "kcp_affine_merge_c32"),
+        (56, "kcp_affine_merge_c16"),
+        (None, "kcp_affine_merge_c64"),
+    ),
+    "sm_107a": (
+        (12, "kcp_affine_merge_c8"),
+        (20, "kcp_affine_merge_c16"),
+        (40, "kcp_affine_merge_c32"),
+        (56, "kcp_affine_merge_c16"),
+        (None, "kcp_affine_merge_c32"),
+    ),
+}
 
 # Filled mechanically by the exporter (the derived leaves ``kernel_symbol``, ``launch``, ``arg_plan``,
 # ``logical``); the host plan (``program``, ``variant``, ``select_rule``, ``grid_rule``, ``library``, ``arches``)
@@ -703,7 +735,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {"kind": "always"},
         "variant": None,
     },
-    "kcp_affine_merge_c64": {
+    "kcp_affine_merge_c8": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "m"],
@@ -725,18 +757,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # The 8 x 8 thread tile over 64 columns (packed FMA pairs on sm_100a / sm_103a): the widest
-        # launches (provisional rule).
-        "grid_rule": {"cols_per_cta": 64, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        # The 4 x 4 thread tile over 8 columns (packed FMA pairs on sm_100a / sm_103a): T <= 12
+        # (MERGE_RULE).
+        "grid_rule": {"cols_per_cta": 8, "kind": "kcp_chains"},
+        "kernel_symbol": "kernel_cake_kda_det_train_7b6b22d3423f3138baf7_kcp",
         "launch": {
-            "block": (128, 1, 1),
+            "block": (64, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 143360,
+            "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "library": "cake_kda_det_train_7b6b22d3423f3138baf7_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -754,61 +786,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "y_final": "y_final",
         },
         "program": "kcp_affine_merge",
-        "select_rule": {"kind": "chains", "regions": [[128, None, 48, None]]},
-        "variant": "c64",
-    },
-    "kcp_affine_merge_c32": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "m"],
-            ["buffer", "c"],
-            ["buffer", "x0"],
-            ["buffer", "y"],
-            ["buffer", "chain_start"],
-            ["buffer", "elem_m"],
-            ["buffer", "elem_c"],
-            ["buffer", "elem_y"],
-            ["buffer", "x0_index"],
-            ["buffer", "y_final"],
-            ["parameter", "ncols"],
-            ["parameter", "transpose_m"],
-            ["parameter", "write_states"],
-            ["parameter", "cols_per_cta"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        # The 4 x 8 thread tile over 32 columns (packed FMA pairs on sm_100a / sm_103a) (provisional rule).
-        "grid_rule": {"cols_per_cta": 32, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 110592,
-            "use_pdl": False,
-        },
-        "library": "cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
-        "logical": {
-            "c": "c",
-            "chain_start": "chain_start",
-            "cols_per_cta": "cols_per_cta",
-            "elem_c": "elem_c",
-            "elem_m": "elem_m",
-            "elem_y": "elem_y",
-            "m": "m",
-            "ncols": "ncols",
-            "transpose_m": "transpose_m",
-            "write_states": "write_states",
-            "x0": "x0",
-            "x0_index": "x0_index",
-            "y": "y",
-            "y_final": "y_final",
-        },
-        "program": "kcp_affine_merge",
-        "select_rule": {"kind": "chains", "regions": [[128, None, 17, 47]]},
-        "variant": "c32",
+        "select_rule": {"kind": "merge_rule"},
+        "variant": "c8",
     },
     "kcp_affine_merge_c16": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -832,17 +811,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # The 4 x 4 thread tile over 16 columns: few chains and the map chains (provisional rule).
+        # The 4 x 4 thread tile over 16 columns (packed FMA pairs on sm_100a / sm_103a): T 13-20 and
+        # 41-56 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 16, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_15e81414b27b4b831808_kcp",
+        "kernel_symbol": "kernel_cake_kda_det_train_9ab870ac43ee331f2dd3_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 61440,
+            "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_15e81414b27b4b831808_kcp",
+        "library": "cake_kda_det_train_9ab870ac43ee331f2dd3_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -860,11 +840,116 @@ MODULES: dict[str, dict[str, Any]] = {
             "y_final": "y_final",
         },
         "program": "kcp_affine_merge",
-        "select_rule": {
-            "kind": "chains",
-            "regions": [[128, None, 1, 16], [256, None, 1, None]],
-        },
+        "select_rule": {"kind": "merge_rule"},
         "variant": "c16",
+    },
+    "kcp_affine_merge_c32": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "m"],
+            ["buffer", "c"],
+            ["buffer", "x0"],
+            ["buffer", "y"],
+            ["buffer", "chain_start"],
+            ["buffer", "elem_m"],
+            ["buffer", "elem_c"],
+            ["buffer", "elem_y"],
+            ["buffer", "x0_index"],
+            ["buffer", "y_final"],
+            ["parameter", "ncols"],
+            ["parameter", "transpose_m"],
+            ["parameter", "write_states"],
+            ["parameter", "cols_per_cta"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # The 4 x 8 thread tile over 32 columns (packed FMA pairs on sm_100a / sm_103a): T 21-40, and
+        # above 56 on sm_107a (MERGE_RULE).
+        "grid_rule": {"cols_per_cta": 32, "kind": "kcp_chains"},
+        "kernel_symbol": "kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
+        "logical": {
+            "c": "c",
+            "chain_start": "chain_start",
+            "cols_per_cta": "cols_per_cta",
+            "elem_c": "elem_c",
+            "elem_m": "elem_m",
+            "elem_y": "elem_y",
+            "m": "m",
+            "ncols": "ncols",
+            "transpose_m": "transpose_m",
+            "write_states": "write_states",
+            "x0": "x0",
+            "x0_index": "x0_index",
+            "y": "y",
+            "y_final": "y_final",
+        },
+        "program": "kcp_affine_merge",
+        "select_rule": {"kind": "merge_rule"},
+        "variant": "c32",
+    },
+    "kcp_affine_merge_c64": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "m"],
+            ["buffer", "c"],
+            ["buffer", "x0"],
+            ["buffer", "y"],
+            ["buffer", "chain_start"],
+            ["buffer", "elem_m"],
+            ["buffer", "elem_c"],
+            ["buffer", "elem_y"],
+            ["buffer", "x0_index"],
+            ["buffer", "y_final"],
+            ["parameter", "ncols"],
+            ["parameter", "transpose_m"],
+            ["parameter", "write_states"],
+            ["parameter", "cols_per_cta"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # The 8 x 8 thread tile over 64 columns with packed FMA pairs (sm_100a / sm_103a only): T above
+        # 56 (MERGE_RULE).
+        "grid_rule": {"cols_per_cta": 64, "kind": "kcp_chains"},
+        "kernel_symbol": "kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "logical": {
+            "c": "c",
+            "chain_start": "chain_start",
+            "cols_per_cta": "cols_per_cta",
+            "elem_c": "elem_c",
+            "elem_m": "elem_m",
+            "elem_y": "elem_y",
+            "m": "m",
+            "ncols": "ncols",
+            "transpose_m": "transpose_m",
+            "write_states": "write_states",
+            "x0": "x0",
+            "x0_index": "x0_index",
+            "y": "y",
+            "y_final": "y_final",
+        },
+        "program": "kcp_affine_merge",
+        "select_rule": {"kind": "merge_rule"},
+        "variant": "c64",
     },
     "kcp_fwd_o": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -1342,27 +1427,14 @@ def records_of_program(program: str) -> tuple[str, ...]:
     return tuple(name for name, rec in MODULES.items() if rec["program"] == program)
 
 
-def _in_region(
-    region: Sequence[Any], ncols: int, n_chains: int, transpose_m: int
-) -> bool:
-    """Whether a ``chains`` region ``[ncols, transpose_m, min_chains, max_chains]`` admits the launch
-    (``transpose_m`` / ``max_chains`` ``None``: any)."""
-    width, layout, low, high = region
-    return (
-        ncols == int(width)
-        and (layout is None or transpose_m == int(layout))
-        and n_chains >= int(low)
-        and (high is None or n_chains <= int(high))
-    )
-
-
 def _admits(
+    name: str,
     rule: Mapping[str, Any],
     *,
     ncols: int | None,
     form: str | None = None,
     n_chains: int | None = None,
-    transpose_m: int | None = None,
+    arch: str | None = None,
 ) -> bool:
     kind = rule["kind"]
     if kind == "always":
@@ -1371,13 +1443,10 @@ def _admits(
         return ncols is not None and int(ncols) == int(rule["ncols"])
     if kind == "walk_form":
         return form is not None and str(form) == str(rule["form"])
-    if kind == "chains":
-        if ncols is None or n_chains is None or transpose_m is None:
+    if kind == "merge_rule":
+        if ncols is None or n_chains is None:
             return False
-        return any(
-            _in_region(region, int(ncols), int(n_chains), int(transpose_m))
-            for region in rule["regions"]
-        )
+        return _merge_rule_record(int(ncols), int(n_chains), arch) == name
     raise ValueError(f"unknown Cake KDA KCP selection rule: {kind!r}")
 
 
@@ -1387,53 +1456,74 @@ def select_record(
     ncols: int | None = None,
     form: str | None = None,
     n_chains: int | None = None,
-    transpose_m: int | None = None,
+    arch: str | None = None,
 ) -> str:
     """The one record of ``program`` the launch's scalars select.
 
     ``always`` is the rule of a single-record program; ``columns`` (``{"kind":
     "columns", "ncols": N}``) picks the variant whose column count is the
-    chain's ``ncols``; ``chains`` (``{"kind": "chains", "regions": [[ncols,
-    transpose_m, min_chains, max_chains], ...]}``) picks the merge build whose
-    regions hold the launch's ``(ncols, transpose_m, n_chains)``
-    (``transpose_m`` / ``max_chains`` ``None``: any; :func:`merge_record`);
-    ``walk_form`` (``{"kind": "walk_form", "form": F}``) picks the K1 / K2
-    walk record of form ``F`` -- ``"full"`` (one CTA per segment and head) or
-    ``"split"`` (the two-CTA record over 64 value columns each), the
-    launch's form from :func:`walk_form`; a program under a fixed rule ships
-    its one ``always`` record, the other form being test-only
-    (:func:`test_walk_record`).  Exactly one record admits every launch, or
-    the registry is inconsistent.
+    chain's ``ncols``; ``merge_rule`` (``{"kind": "merge_rule"}``) picks the
+    merge record :data:`MERGE_RULE` names for the launch's ``ncols``,
+    ``n_chains`` and architecture (:func:`merge_record`); ``walk_form``
+    (``{"kind": "walk_form", "form": F}``) picks the K1 / K2 walk record of
+    form ``F`` -- ``"full"`` (one CTA per segment and head) or ``"split"``
+    (the two-CTA record over 64 value columns each), the launch's form from
+    :func:`walk_form`; a program under a fixed rule ships its one ``always``
+    record, the other form being test-only (:func:`test_walk_record`).
+    Exactly one record admits every launch, or the registry is inconsistent.
     """
     admitted = [
         name
         for name in records_of_program(program)
         if _admits(
+            name,
             MODULES[name]["select_rule"],
             ncols=ncols,
             form=form,
             n_chains=n_chains,
-            transpose_m=transpose_m,
+            arch=arch,
         )
     ]
     if len(admitted) != 1:
         raise ValueError(
             f"program {program!r}: {len(admitted)} records admit ncols={ncols} form={form} n_chains={n_chains} "
-            f"transpose_m={transpose_m} ({admitted}); expected one"
+            f"arch={arch} ({admitted}); expected one"
         )
     return admitted[0]
 
 
-def merge_record(ncols: int, n_chains: int, transpose_m: int) -> str:
-    """The ``kcp_affine_merge`` record of a launch of ``n_chains`` chains over ``ncols`` columns with operator
-    layout ``transpose_m``: the build the records' ``chains`` regions name (every build gives the same bits, the FMA
-    order of every output being fixed; the rule picks the fastest measured build per launch shape)."""
-    return select_record(
-        "kcp_affine_merge",
-        ncols=int(ncols),
-        n_chains=int(n_chains),
-        transpose_m=int(transpose_m),
-    )
+def _merge_rule_record(ncols: int, n_chains: int, arch: str | None) -> str | None:
+    """The record :data:`MERGE_RULE` names for ``T = n_chains * ncols / 128`` on ``arch``; ``arch`` ``None``: the
+    record every architecture's bands name (``None`` where they differ or ``T`` is not a positive whole count)."""
+    if ncols < 128 or ncols % 128 or n_chains < 1:
+        return None
+    blocks = n_chains * (ncols // 128)
+    named = {
+        next(
+            record
+            for bound, record in MERGE_RULE[a]
+            if bound is None or blocks <= int(bound)
+        )
+        for a in (MERGE_RULE if arch is None else (arch,))
+    }
+    return named.pop() if len(named) == 1 else None
+
+
+def merge_record(ncols: int, n_chains: int, arch: str | None = None) -> str:
+    """The ``kcp_affine_merge`` record of a launch of ``n_chains`` chains over ``ncols`` columns on ``arch``
+    (:data:`MERGE_RULE`; every record gives the same bits, each output being one FP32 FMA chain in a fixed order).
+    ``arch`` ``None`` asks for the record every architecture's rule names (a host-side query without a device)."""
+    if arch is not None and arch not in MERGE_RULE:
+        raise ValueError(
+            f"the affine merge ships no build for {arch}; its architectures: {tuple(MERGE_RULE)}"
+        )
+    record = _merge_rule_record(int(ncols), int(n_chains), arch)
+    if record is None:
+        raise ValueError(
+            f"no affine merge record for ncols={ncols} n_chains={n_chains} arch={arch}: ncols must be a positive "
+            "multiple of 128 and n_chains >= 1 (and, without an architecture, every architecture's rule must agree)"
+        )
+    return record
 
 
 def walk_form(
@@ -2104,7 +2194,7 @@ def _merge(args: Mapping[str, Any], call: Any, device_index: int) -> None:
         return
     device = str(call.device)
     ncols = int(chains.ncols)
-    record = merge_record(ncols, n_chains, int(args["transpose_m"]))
+    record = merge_record(ncols, n_chains, _arch_of(device_index))
     dummy = _dummy_tile(device)
     values: dict[str, Any] = {
         "m": _flat_pool(args["m"], "kcp_affine_merge.m"),
@@ -2176,6 +2266,7 @@ __all__ = [
     "ARCHES",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
+    "MERGE_RULE",
     "MODULES",
     "PRECISION_MODES",
     "PROGRAMS",
