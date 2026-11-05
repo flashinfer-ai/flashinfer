@@ -2357,23 +2357,32 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p, is_deterministic):
 @pytest.mark.parametrize("vocab_size", [(1 << 20) - 1, 1 << 20])
 def test_top_p_renorm_probs_deterministic_wide_rows(vocab_size):
     # Rows below 2^20 elements accumulate split 32-bit histogram words; wider
-    # rows keep 64-bit words. Both must match the sorted reference.
+    # rows keep 64-bit words. Both must keep the sorted reference's tokens.
     torch.manual_seed(42)
     p = 0.9
     pre_norm_prob = torch.rand(1, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
-    cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask = torch.zeros(1, vocab_size, dtype=torch.int32, device="cuda:0")
-    mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
-    expected = normalized_prob.clone()
-    expected[mask == 0] = 0
-    expected = expected / expected.sum(dim=-1, keepdim=True)
+    prob64 = normalized_prob.double()
+    sorted_prob, indices = torch.sort(prob64, descending=False)
+    expected_kept = torch.zeros_like(prob64, dtype=torch.bool)
+    expected_kept.scatter_(1, indices, torch.cumsum(sorted_prob, dim=-1) >= (1 - p))
 
     renorm_prob = flashinfer.sampling.top_p_renorm_probs(
         normalized_prob, p, is_deterministic=True
     )
-    torch.testing.assert_close(expected, renorm_prob, rtol=1e-3, atol=1e-3)
+    again = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=True
+    )
+    assert torch.equal(renorm_prob, again)
+    kept = renorm_prob > 0
+    # Rounding at the cumulative-mass boundary may move a single token.
+    assert (kept != expected_kept).sum().item() <= 1
+    torch.testing.assert_close(
+        renorm_prob[kept].double(),
+        prob64[kept] / prob64[kept].sum(),
+        rtol=1e-3,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [4, 99, 989])

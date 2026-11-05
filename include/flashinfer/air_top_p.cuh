@@ -181,12 +181,12 @@ __device__ inline float calcFloatValue(uint32_t count, uint32_t exponent, uint64
   return reinterpret_cast<float&>(bitFloat);
 }
 
-// Deterministic bins sum 23-bit float mantissas as integers. On sm_90 a
-// shared-memory atomicAdd on 64-bit integers compiles to a compare-and-swap
-// loop, while 32-bit integer adds are native, so a bin can instead hold the
-// high and low mantissa parts in two 32-bit words. With fewer than
-// MAX_SPLIT_MANTISSA_LEN scanned elements neither word can overflow, and
-// hi << MANTISSA_LO_BITS + lo is the exact 64-bit sum.
+// Deterministic bins sum 23-bit float mantissas as integers. A shared-memory
+// atomicAdd on 64-bit integers compiles to a compare-and-swap loop, while
+// 32-bit integer adds are native, so a bin can instead hold the high and low
+// mantissa parts in two 32-bit words. With fewer than MAX_SPLIT_MANTISSA_LEN
+// scanned elements neither word can overflow, and
+// (hi << MANTISSA_LO_BITS) + lo is the exact 64-bit sum.
 static constexpr int MANTISSA_LO_BITS = 12;
 static_assert(MANTISSA_LO_BITS >= 23 - MANTISSA_LO_BITS, "the low part must be the wider one");
 static constexpr IdxT MAX_SPLIT_MANTISSA_LEN = IdxT(1) << (32 - MANTISSA_LO_BITS);
