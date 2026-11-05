@@ -2847,11 +2847,11 @@ def test_router_units_policy(monkeypatch):
             )
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
     # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
-    # sm_100a hidden 4096 "H1x5p44" (44 head units, then 5 tail units per CTA pair), hidden 5120 "H0.5x3" on sm_100a /
-    # sm_103a (76 head + 228 tail units), sm_103a hidden 6144 "H1x5p44" and "H0.5x4" on sm_107a (108 head + 432 tail
-    # units on 216 SMs; 106 + 424 on 212 and 104 + 416 on 208, ROUTER_RULES_BY_SM); hidden 6144 "H0.5x4" on 212-SM
-    # sm_107a parts; sm_100a hidden 6144 (its SIMT window ends at 256 tokens), hidden 6144 on the other sm_107a
-    # parts, sm_103a hidden 4096 (its window starts at 20480 tokens) and sm_107a hidden 4096: the deterministic plan
+    # hidden 5120 "H0.5x3" on sm_100a / sm_103a (76 head + 228 tail units), sm_103a hidden 6144 "H1x5p44" (44 head
+    # units, then 5 tail units per CTA pair) and "H0.5x4" on sm_107a (108 head + 432 tail units on 216 SMs; 106 + 424
+    # on 212 and 104 + 416 on 208, ROUTER_RULES_BY_SM); hidden 6144 "H0.5x4" on 212-SM sm_107a parts; sm_100a hidden
+    # 4096 and 6144 (their SIMT windows end at 224 and 256 tokens), hidden 6144 on the other sm_107a parts, sm_103a
+    # hidden 4096 (its window starts at 20480 tokens) and sm_107a hidden 4096: the deterministic plan
     assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 6144, 256)] == (
         (1, 256, "simt_n64m64s2"),
     )
@@ -2870,11 +2870,13 @@ def test_router_units_policy(monkeypatch):
     ) == (44 + 5 * 76, 22, round(24 * 508 * 44 / 76))
     assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 4096, 256)] == (
         (1, 224, "simt_n128m64s2"),
-        (10240, 16384, "H1x5p44"),
     )
-    assert cake_backend.router_partition(
-        "nn_t", arch="sm_100a", sm_count=152, M=4096, N=256, K=16231
-    ) == (44 + 5 * 76, 22, round(16 * 508 * 44 / 76))
+    assert (
+        cake_backend.router_partition(
+            "nn_t", arch="sm_100a", sm_count=152, M=4096, N=256, K=16231
+        )
+        is None
+    )
     assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 4096, 256)] == (
         (1, 288, "simt_n64m64s2"),
         (20480, 49152, "H1x4p44"),
@@ -3032,11 +3034,11 @@ def test_router_units_policy(monkeypatch):
 # other token count runs the deterministic program.  A SIMT window comes first: where the table's windows do not
 # hold, the token count takes the next window that holds it
 ROUTER_WGRAD_WINDOWS = {
-    ("sm_100a", 4096): ((1, 224, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
+    ("sm_100a", 4096): ((1, 224, "simt_n128m64s2"),),
     ("sm_100a", 5120): (
         (1, 256, "simt_n64m64s2"),
         (1, 128, "waves"),
-        (10240, 32768, "H0.5x3"),
+        (10240, 16384, "H0.5x3"),
     ),
     ("sm_100a", 6144): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", 4096): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
@@ -3134,11 +3136,14 @@ def test_router_wgrad_token_windows(arch):
                 if not str(spec).startswith("simt_"):
                     assert simt is None, (hidden, T, sms)
     if arch == "sm_100a":
-        # the first token count of the hidden 4096 window (320 K blocks); the smallest measured "waves" count on 152
-        # SMs runs the SIMT program
-        assert cake_backend.router_partition(
-            "nn_t", arch=arch, sm_count=152, M=4096, N=256, K=10240
-        ) == (44 + 5 * 76, 22, round(16 * 320 * 44 / 76))
+        # hidden 4096 at 10240 tokens (320 K blocks): the deterministic plan (no head/tail window); the smallest
+        # measured "waves" count on 152 SMs runs the SIMT program
+        assert (
+            cake_backend.router_partition(
+                "nn_t", arch=arch, sm_count=152, M=4096, N=256, K=10240
+            )
+            is None
+        )
         assert (
             cake_backend.router_partition(
                 "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
@@ -7394,8 +7399,8 @@ def test_gpu_router_d11_gate(op, splits, spec, router_rule):
 @pytest.mark.parametrize("T", [1000, 16172, 16231, 16384])
 @pytest.mark.parametrize("spec", ["H1x4p44", "H1x5p44", "H1x4p80"])
 def test_gpu_router_head_units_at_hidden_4096(spec, T, router_rule):
-    """The head/tail partitions with fewer head units than CTA pairs (``"H<f>x<k>p<h>"``: the hidden 4096 verdicts of
-    ``sm_103a`` and ``sm_100a``; 80 head units are more than a 152-SM part's CTA pairs, so there the partition is
+    """The head/tail partitions with fewer head units than CTA pairs (``"H<f>x<k>p<h>"``: the hidden 4096 verdict of
+    ``sm_103a`` and the hidden 6144 verdict of 152-SM ``sm_103a`` parts; 80 head units are more than a 152-SM part's CTA pairs, so there the partition is
     ``"H1x4"``'s) at hidden 4096, 256 experts, the measured token counts and a short one: the gate of
     :func:`test_gpu_router_d11_gate`, on the partition :func:`cake_backend.router_partition_of` gives the device."""
     plan = _router_gate("wgrad", None, spec, router_rule, T, 4096, SEED + 24)

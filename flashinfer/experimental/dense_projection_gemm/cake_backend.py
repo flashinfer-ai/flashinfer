@@ -1318,10 +1318,13 @@ ROUTER_RULES: dict[
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
     # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
-    # 10240 was not added).
-    # Hidden 4096 on sm_100a: 44 head units, one per CTA pair left next to a kernel holding 32 SMs, each a pair's
-    # whole share of the steps, then five tail units per pair ("H1x5p44"; measured at 10240, 12288, 16172, 16231 and
-    # 16384 tokens; more than 3 % slower next to a resident kernel at 8192 tokens and, launched before it, at 32768).
+    # 10240 was not added).  On sm_100a the window ends at 16384 tokens: measured again against the current
+    # deterministic plan, it was up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to
+    # 6.9 % at 32768 (16385 to 24575 tokens not measured).
+    # Hidden 4096 on sm_100a keeps the deterministic plan above its SIMT window: the head/tail partition with 44 head
+    # units and five tail units per CTA pair ("H1x5p44"), measured again against the current deterministic plan at
+    # 10240 to 16384 tokens, left the checkpointed step (two forwards and the backward pass) up to 2.7 % slower in
+    # eager launches at 10240 and 12288 tokens.
     # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
     # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
     # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
@@ -1334,8 +1337,8 @@ ROUTER_RULES: dict[
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
     # the head spans wait for), at 6144 it left the backward pass no faster
-    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 32768, "H0.5x3")),
+    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
+    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 16384, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16172, 32768, "H0.5x3")),

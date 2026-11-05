@@ -123,7 +123,7 @@ it.  The measured parts have 148 and 152 SMs (`sm_100a` /
 
 | architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
-| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) at an even K-block count from 1024 to 4096 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program (hidden 4096 `"simt_n128m64s2"` from 1 to 224 tokens, hidden 5120 and 6144 `"simt_n64m64s2"` from 1 to 256 tokens), hidden 4096 `"H1x5p44"` and hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count, and hidden 6144 above 256 tokens: deterministic (6 splits) |
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) at an even K-block count from 1024 to 4096 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program (hidden 4096 `"simt_n128m64s2"` from 1 to 224 tokens, hidden 5120 and 6144 `"simt_n64m64s2"` from 1 to 256 tokens) and hidden 5120 `"H0.5x3"` (10240 to 16384 tokens); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count, hidden 4096 above 224 tokens and hidden 6144 above 256 tokens: deterministic (6 splits) |
 | `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed); `4096 -> 128` FP32 on 152 SMs: (64, 2) at an even K-block count from 1024 to 6144 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program `"simt_n64m64s2"` (hidden 4096 from 1 to 288 tokens, hidden 5120 from 1 to 192 tokens, hidden 6144 from 1 to 256 tokens), hidden 4096 `"H1x4p44"`, hidden 5120 `"H0.5x3"` and hidden 6144 `"H1x5p44"` (the head/tail program with the BF16 parts of `A` in tensor memory); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count: deterministic (6 splits) |
 | `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table (the four FP32 rows with one split: from 961 tokens up).  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the router window tables: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
 | `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3), except the token counts of the `sm_107a` K1 token table.  `4096 -> 512`, `5120 -> 512`, `4096 -> 1024`, `5120 -> 1024` FP32: deterministic (their one-split verdicts, (128, 1) and (256, 1) `p = 1`, fail the FP64 comparison of the `sm_107a` K1 token table at these token counts); `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel the head/tail program missed at both hidden sizes on the parts at full SM clock |
@@ -520,9 +520,8 @@ head span.  At 152 SMs `"H1x4p44"` is 44 head and 304 tail units and `"H1x5p44"`
 
 | row of `ROUTER_RULES` (weight gradient, 256 experts) | token window | measured at (tokens) | part | time / deterministic plan, alone | worst next to a resident kernel: same launch order / router launched first |
 |---|---|---|---|---|---|
-| `sm_100a` hidden 4096 `"H1x5p44"` | 10240 to 16384 | 10240, 12288, 16172, 16231, 16384 | GB200, 152 SMs | x0.917-0.943 | x1.024 / x0.983 |
 | `sm_100a` hidden 5120 `"waves"` | 1 to 128 | 64, 128 | GB200, 152 SMs | x0.691-0.884 | x0.864 / x0.846 |
-| `sm_100a` hidden 5120 `"H0.5x3"` | 10240 to 32768 | 10240, 12288, 16172, 16231, 16384, 32768 | GB200, 152 SMs | x0.750-0.883 | x1.003 / x1.011 |
+| `sm_100a` hidden 5120 `"H0.5x3"` | 10240 to 16384 | 10240, 12288, 16172, 16231, 16384, 32768 | GB200, 152 SMs | x0.750-0.883 | x1.003 / x1.011 |
 | `sm_103a` hidden 5120 `"waves"` | 1 to 192 | 64, 128, 192 | GB300, 152 SMs | x0.706-0.919 | x1.005 / x0.917 |
 | `sm_103a` hidden 5120 `"H0.5x3"` | 16172 to 32768 | 16172, 16231, 16384, 32768 | GB300, 152 SMs | x0.820-0.875 | x0.984 / x1.020 |
 | `sm_103a` hidden 4096 `"H1x4p44"` | 20480 to 49152 | 20480, 24576, 32768, 49152 | GB300, 152 SMs (four or five parts) | x0.862-0.952 | x1.011 / x1.008 |
@@ -554,12 +553,17 @@ alone) it was up to 4.9 % slower than the deterministic plan when launched befor
 take `"H0.5x4"`.  The head/tail windows hold
 only on the SM count of their part (`ROUTER_SM_COUNT`, or the part's own table in `ROUTER_RULES_BY_SM`), the
 `"waves"` windows on every SM count where `"waves"` applies (`router_waves`); every other token count and SM count runs
-the deterministic plan.
+the deterministic plan.  Measured again on 152-SM `sm_100a` parts against the current deterministic plan, hidden 4096
+`"H1x5p44"` (10240 to 16384 tokens; x0.917-0.943 alone in the first GB200 measurement, the cuBLAS ratios above) left
+the checkpointed step up to 2.7 % slower in eager launches at 10240 and 12288 tokens, so that row runs the
+deterministic plan above its SIMT window; hidden 5120 `"H0.5x3"` was up to 4.5 % slower than that plan next to a
+resident kernel at 24576 tokens and up to 6.9 % at 32768, so its window ends at 16384 tokens (16385 to 24575 tokens
+were not measured).
 Hidden 5120 on `sm_100a` / `sm_103a` ran `"waves"` at every token count before these windows: below 64 tokens the
-`"waves"` windows keep it without a measurement; between the two windows and above 32768 tokens the row now runs the
-deterministic plan -- there `"waves"` was more than 3 % slower than that plan next to a resident kernel at every
-measured token count from 224 to 10240 (x1.046-1.156 on GB200 at 224 to 12288 tokens, x1.059-1.167 on GB300 at 224 to
-10240 tokens), and above 32768 tokens nothing was measured.*
+`"waves"` windows keep it without a measurement; between the two windows and above the last one (16384 tokens on
+`sm_100a`, 32768 on `sm_103a`) the row now runs the deterministic plan -- there `"waves"` was more than 3 % slower than
+that plan next to a resident kernel at every measured token count from 224 to 10240 (x1.046-1.156 on GB200 at 224 to
+12288 tokens, x1.059-1.167 on GB300 at 224 to 10240 tokens), and above 32768 tokens nothing was measured.*
 
 The router windows' FP64 error: per seed the relative Frobenius error against FP64 of the exact operands (worst of 20
 runs into a NaN-filled `out`) of the window's program, on the benchmark's router inputs (FP32 activations, router weight
@@ -576,9 +580,8 @@ up to 128 tokens on `sm_100a` and up to 192 on `sm_103a`, `"waves"`), is reporte
 | `sm_100a` input gradient hidden 4096 `"simt_n64m32s4"` | 1 to 128 | 1, 64, 128 | GB200, 152 SMs | 1.58e-7 | x1.697-2.067 |
 | `sm_100a` input gradient hidden 5120 `"simt_n64m32s4"` | 1 to 128 | 1, 64, 128 | GB200, 152 SMs | 1.55e-7 | x1.679-1.967 |
 | `sm_100a` input gradient hidden 6144 `"simt_n64m32s4"` | 1 to 64 | 1, 32, 64 | GB200, 152 SMs | 1.59e-7 | x1.661-1.933 |
-| `sm_100a` weight gradient hidden 4096 `"H1x5p44"` | 10240 to 16384 | 10240, 12288, 16384 | GB200, 152 SMs | 1.84e-7 | x1.177-1.201 |
 | `sm_100a` weight gradient hidden 5120 `"waves"` | 1 to 128 | 1, 64, 128 | GB200, 152 SMs | 6.29e-8 | x1.000-1.002 |
-| `sm_100a` weight gradient hidden 5120 `"H0.5x3"` | 10240 to 32768 | 10240, 16384, 32768 | GB200, 152 SMs | 2.08e-7 | x1.014-1.027 |
+| `sm_100a` weight gradient hidden 5120 `"H0.5x3"` | 10240 to 16384 | 10240, 16384 | GB200, 152 SMs | 1.57e-7 | x1.024-1.027 |
 | `sm_103a` weight gradient hidden 4096 `"simt_n64m64s2"` | 1 to 288 | 1, 161, 288 | GB300, 152 SMs | 2.18e-7 | x2.450-2.675 (x0.932-0.959 at 1 token) |
 | `sm_103a` weight gradient hidden 5120 `"simt_n64m64s2"` | 1 to 192 | 1, 97, 192 | GB300, 152 SMs | 1.79e-7 | x2.037-2.579 (x0.928-0.951 at 1 token) |
 | `sm_103a` weight gradient hidden 6144 `"simt_n64m64s2"` | 1 to 256 | 1, 129, 256 | GB300, 152 SMs | 2.06e-7 | x2.298-2.531 (x0.927-0.951 at 1 token) |
