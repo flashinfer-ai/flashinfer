@@ -67,7 +67,8 @@ place up to ``max_rows`` rows of its grid rule: on every architecture one
 thread-block cluster of 16 CTAs of 256 threads with the backward's row
 arithmetic, ``dx`` and ``dz`` the same bits, that sums the weight gradient on
 chip (CTA ``r`` of the cluster adds every CTA's FP32 partial of its eight
-columns in rank order in FP64 and rounds once), with no workspace, atomic or
+columns in rank order in FP64 and rounds the sum to the weight gradient's
+dtype through FP32), with no workspace, atomic or
 arrival ticket, so its weight gradient is the same bits on every call.  A
 short role's rule bounds the rows per SM (``max_rows_per_sm``: the short
 forward, whose grid of one CTA per row block grows with the rows) or the rows
@@ -97,7 +98,9 @@ The kernel folds each thread's FP32 sums into
 FP64 after at most 16 of its rows (a CTA of a few blocks adds them across its
 warps in FP32 first and converts once), so a term passes through at most 16
 FP32 roundings at any grid: within the deterministic backward's error budget
-on every input.  No
+while the gate, the terms and the sums are FP32 normal numbers or zero (FP32
+underflows gradually: with subnormal values both packages' weight gradients
+can leave that budget; see the package documentation).  No
 module is cooperative, and no CTA waits for another inside a kernel but in the
 short backward, whose cluster's CTAs are scheduled together on the SMs of one
 GPC and each wait for the other CTAs' partials of their columns.  A kernel

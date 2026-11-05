@@ -624,7 +624,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
 
     bool greater_than_u_diff[VEC_SIZE];
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
+        .template SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
     __syncthreads();
 
 #pragma unroll
@@ -875,6 +875,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  // One entry per probs row: index by row_idx, not bx (#5340).
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
 
   extern __shared__ __align__(
@@ -1138,6 +1139,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  // One entry per probs row: index by row_idx, not bx (#5340).
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[row_idx];
 
   extern __shared__ __align__(

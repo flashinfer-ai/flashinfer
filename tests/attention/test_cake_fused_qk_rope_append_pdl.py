@@ -866,7 +866,8 @@ def _kernel_graph(graph, launches=None) -> tuple[list[str], list[tuple[int, int,
         ):
             continue
         params = checked(driver.cuGraphKernelNodeGetParams(node))
-        func = params.func
+        # Copy the handle: params.func borrows storage owned by params.
+        func = driver.CUfunction(int(params.func))
         if int(func) == 0 and int(params.kern) != 0:
             func = checked(driver.cuKernelGetFunction(params.kern))
         index[int(node)] = len(names)

@@ -84,6 +84,14 @@ the eager calls that carry a workspace (its warm-up), never select the fused
 program: the program has a hard context bound and a replay does not pass the
 host's guard, while a captured decode is typically replayed as the contexts
 grow.
+
+Uniform FP8 prefill route.  A prefill call with FP8 Q, K and V is served on
+one measured box only: paged K/V, causal, no explicit ``q_offset``, one
+request of one query token over 64 Q heads and 4 KV heads, and a page table
+of one page (``_use_prefill_fp8q``).  The unfolded union program converts the
+E4M3 Q to BF16 in its Q ingress (route
+``prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any``) and writes a
+BF16 output.  Every other FP8-Q prefill call raises ``NotImplementedError``.
 """
 
 from __future__ import annotations
@@ -190,6 +198,19 @@ _DECODE_UNION_NUM_Q_HEADS = 64
 _DECODE_UNION_NUM_KV_HEADS = 4
 _DECODE_UNION_BATCHES = (64, 128)
 _DECODE_UNION_MAX_PAGES = 10
+# Uniform FP8 prefill on the union program: a paged causal prefill call with
+# FP8 Q, K and V, one request of one query token over 64 Q heads and 4 KV
+# heads, no explicit ``q_offset`` and a page table of one page is served by the
+# unfolded union program that converts the E4M3 Q to BF16 in its Q ingress
+# (route ``prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any``, BF16
+# output).  Measured on compute capability 10.0 and 10.3 at this shape only;
+# ``_use_prefill_fp8q`` admits no other FP8-Q prefill call.
+_PREFILL_FP8Q_TARGETS = ("sm100a", "sm103a")
+_PREFILL_FP8Q_BATCH_SIZE = 1
+_PREFILL_FP8Q_TOTAL_Q = 1
+_PREFILL_FP8Q_NUM_Q_HEADS = 64
+_PREFILL_FP8Q_NUM_KV_HEADS = 4
+_PREFILL_FP8Q_MAX_PAGES = 1
 # One-launch persistent K-major prefill: the fused form of the persistent
 # producer and its combine (route ``kmaj_p_fused:<layout>:gqa<g>``) runs the
 # combine in the producer's softmax warps after a grid-wide rendezvous, on a
@@ -1570,6 +1591,46 @@ def _use_decode_union(
         and int(num_kv_heads) == _DECODE_UNION_NUM_KV_HEADS
         and int(batch_size) in _DECODE_UNION_BATCHES
         and 0 < max_pages <= _DECODE_UNION_MAX_PAGES
+    )
+
+
+def _use_prefill_fp8q(
+    *,
+    paged: bool,
+    causal: bool,
+    derive_q_offset: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    total_q: int,
+    max_pages: int,
+) -> bool:
+    """Whether one FP8-Q prefill call lies in the box of the FP8-Q union program.
+
+    Every clause is a pure function of the call's shape: paged causal FP8 Q /
+    K / V, no explicit ``q_offset``, ``_PREFILL_FP8Q_BATCH_SIZE`` request of
+    ``_PREFILL_FP8Q_TOTAL_Q`` query token over ``_PREFILL_FP8Q_NUM_Q_HEADS`` Q
+    heads and ``_PREFILL_FP8Q_NUM_KV_HEADS`` KV heads and a page table of
+    ``_PREFILL_FP8Q_MAX_PAGES`` page (``topk`` is 16 on every call).  The caller
+    adds the target clause (``_PREFILL_FP8Q_TARGETS``) after the shape clauses,
+    so a call outside the box is declined before any device query.
+    """
+    fp8 = torch.float8_e4m3fn
+    return (
+        bool(paged)
+        and bool(causal)
+        and bool(derive_q_offset)
+        and q_dtype == fp8
+        and k_dtype == fp8
+        and v_dtype == fp8
+        and int(num_q_heads) == _PREFILL_FP8Q_NUM_Q_HEADS
+        and int(num_kv_heads) == _PREFILL_FP8Q_NUM_KV_HEADS
+        and int(batch_size) == _PREFILL_FP8Q_BATCH_SIZE
+        and int(total_q) == _PREFILL_FP8Q_TOTAL_Q
+        and int(max_pages) == _PREFILL_FP8Q_MAX_PAGES
     )
 
 
@@ -3407,7 +3468,8 @@ def _run_prefill(
         if q_offsets is None:
             q_offsets = cu_k
     arguments = {
-        "q": q,
+        # FP8 Q (route prefill_union:float8_e4m3fn:...) is bound as its E4M3 bytes.
+        "q": q.view(torch.uint8) if q.dtype == torch.float8_e4m3fn else q,
         "k": k.view(torch.uint8) if fp8_kv else k,
         "k_scale": scale_dummy,
         "v": v.view(torch.uint8) if fp8_kv else v,
@@ -4133,6 +4195,9 @@ def blackwell_msa_sparse_attention(
     extents) with an ``MSASparseAttentionWorkspace``; ``cu_seqlens_q[0]`` and
     ``cu_seqlens_k[0]`` must be 0 on those routes.  The union route reads no
     host lengths.
+    FP8 Q (over FP8 K/V) is served on one measured box only and writes a BF16
+    output; every other FP8-Q call raises ``NotImplementedError`` (module
+    docstring, uniform FP8 prefill route).
     """
 
     specialized, nvfp4_decline_reason = _try_nvfp4_prefill(
@@ -4172,7 +4237,31 @@ def blackwell_msa_sparse_attention(
     total_q, num_q_heads, num_kv_heads, group_size = _validate_attention_tensors(
         q, k, v, q2k_indices
     )
-    if q.dtype == torch.float8_e4m3fn:
+    if q.dtype == torch.float8_e4m3fn and not (
+        _use_prefill_fp8q(
+            paged=page_table is not None,
+            causal=causal,
+            derive_q_offset=q_offset is None,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            batch_size=(
+                int(cu_seqlens_q.numel()) - 1
+                if isinstance(cu_seqlens_q, torch.Tensor)
+                else -1
+            ),
+            total_q=total_q,
+            max_pages=(
+                int(page_table.shape[1])
+                if isinstance(page_table, torch.Tensor) and page_table.ndim == 2
+                else -1
+            ),
+        )
+        and _select_target(q.device) in _PREFILL_FP8Q_TARGETS
+    ):
+        # Uniform FP8 prefill outside the measured box (module docstring).
         raise NotImplementedError(
             "uniform FP8 Q/K/V is supported only by sparse decode"
         )
@@ -4212,7 +4301,12 @@ def blackwell_msa_sparse_attention(
             raise ValueError("lse_temperature_scale must be positive and finite")
         target = _select_target(q.device)
         out = _workspace_buffer(
-            workspace, "prefill_out", tuple(q.shape), dtype=q.dtype, device=q.device
+            workspace,
+            "prefill_out",
+            tuple(q.shape),
+            # FP8 Q (the uniform FP8 prefill box) writes a BF16 output.
+            dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
+            device=q.device,
         )
         lse = _workspace_buffer(
             workspace,
