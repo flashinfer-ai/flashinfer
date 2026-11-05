@@ -977,10 +977,11 @@ def test_k1_excluded_token_counts(no_k1_chains):
     :data:`K1_SPLIT_OVERRIDES_BY_SM` for the part's SM count, if any) one token outside a range (inside the token window
     of a per-SM-count table), on a part with fewer SMs than an entry at or above the floor, on the floor's part for an
     entry below it, and above 65536 tokens unless a range has no upper bound.  A token count with an odd number of
-    64-token blocks inside an entry of :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` for the part runs the deterministic
-    program too."""
+    64-token blocks inside an entry of :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` for the part, or inside an entry of
+    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` for the part's exact SM count, runs the deterministic program too."""
     table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
     odd_table = cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS
+    exact_table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM
     by_sm = cake_backend.K1_SPLIT_RULES_BY_SM
     overrides = cake_backend.K1_SPLIT_OVERRIDES_BY_SM
     routed = {k for k, v in cake_backend.K1_SPLIT_RULES.items() if v is not None}
@@ -1010,7 +1011,8 @@ def test_k1_excluded_token_counts(no_k1_chains):
                 on_part = sm_count >= sms if sms >= floor else sm_count == sms
                 if on_part and a <= T and (b is None or b >= T):
                     return True
-            return False
+            exact = exact_table.get((key[0], sm_count), {}).get(key, ())
+            return any(a <= T and (b is None or b >= T) for a, b in exact)
 
         def kept(sm_count, T, want, key=key, floor=floor):
             override = overrides.get((key[0], sm_count), {}).get(key)
