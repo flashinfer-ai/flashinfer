@@ -464,6 +464,72 @@ def test_l2_promotion_takes_only_problems_of_at_most_two_m_tiles():
         )
 
 
+# The swap-AB BLOCK_M 128 points: arch -> (the program they take, the (B, M, N, K) points). On SM100a the build that
+# prefetches masked_m into L2 at entry; on SM103a the build without it.
+_SWAP_BM_POINTS = {
+    "sm_100a": (
+        "cake_batch_deepgemm_fp8_c65607eda6318e4ba622",
+        (
+            (1, 1024, 7168, 2048),
+            (4, 128, 7168, 2048),
+            (4, 256, 7168, 2048),
+            (8, 128, 4096, 7168),
+            (8, 128, 7168, 2048),
+            (8, 256, 4096, 7168),
+            (64, 128, 4096, 7168),
+            (64, 256, 4096, 7168),
+            (64, 256, 7168, 2048),
+            (128, 128, 4096, 7168),
+            (128, 128, 7168, 2048),
+        ),
+    ),
+    "sm_103a": (
+        "cake_batch_deepgemm_fp8_f239d5b14db9706be968",
+        (
+            (1, 8192, 4096, 7168),
+            (8, 128, 4096, 7168),
+            (8, 256, 7168, 2048),
+            (64, 256, 4096, 7168),
+            (64, 256, 7168, 2048),
+        ),
+    ),
+}
+
+
+def test_swap_bm_points_take_the_architecture_program():
+    device = torch.device("cuda")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = device_arch(index)
+    sm_count = device_sm_count(index)
+    if arch not in _SWAP_BM_POINTS:
+        pytest.skip(f"no swap-AB BLOCK_M 128 point on {arch}")
+    program, points = _SWAP_BM_POINTS[arch]
+    assert arch in PROGRAMS[program]["arches"]
+    for groups, m, n, k in points:
+        for expected_m in (1, m // 2, m):
+            plan = select_route(arch, sm_count, groups, m, n, k, expected_m)
+            assert plan is not None and [s.program for s in plan.stages] == [program], (
+                groups,
+                m,
+                n,
+                k,
+                expected_m,
+            )
+    groups, m, n, k = points[0]
+    a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(
+        groups, m, n, k, seed=937, device=device
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.programs == (program,)
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+
+
 def test_route_chain_covers_inventory_with_registered_programs():
     device = torch.device("cuda")
     index = device.index if device.index is not None else torch.cuda.current_device()
