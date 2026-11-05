@@ -56,7 +56,9 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
 
   Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
   both modes: a recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input
-  gradient splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  On the
+  gradient splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward
+  rows of :data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another
+  plan of those programs with ``deterministic=False``: the single-CTA program, every tile's whole K in one CTA.  On the
   convenience path a call of ``deterministic=False`` that
   runs a deterministic program (the K1 forward and input gradient, a K2 row without a verdict) launches it through a
   binding of this package (the deterministic package's plan and programs, and the reduction of its split-K partials in
@@ -217,7 +219,8 @@ def _resolve_deterministic(deterministic: bool, api: str) -> bool:
 #: operations are keyed by the operand layouts of the launched GEMM (``kk`` forward, ``kn`` input gradient, ``nn``
 #: weight gradient; ``nk`` has no training use), K2 by the layout class of ``router_layout_class``.
 ROUTES: dict[str, str] = {
-    "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split
+    "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split (the
+    # rows of K1_FORWARD_RULES_BY_SM: another plan of the deterministic programs, whole K per tile)
     "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split
     "k1_nk": "det",
     "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count
@@ -929,6 +932,71 @@ def k1_block_n(N: int) -> int:
     :data:`K1_BLOCK_N_CHOICES` that pads ``N`` least (the wider tile on a tie)."""
     widths = [bn for bn in K1_BLOCK_N_CHOICES if bn not in K1_ROW_MAJOR_BLOCK_N]
     return min(widths, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
+
+
+#: The deterministic package's planner knobs of its single-CTA program for a forward row: one 128-row tile per CTA
+#: (``cta1``, no CTA pair), 128-wide column tiles and no TMA cache hints -- every output tile over the whole K, no
+#: split of K (the program ``kk_n128_c1`` of that package).
+K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
+    "cta1": True,
+    "block_n": 128,
+    "hints": ("none", "none"),
+}
+#: The K1 forward rows of ``deterministic=False`` that run another plan of the deterministic package's programs than
+#: its own plan of the row, ``(arch, sm_count) -> {(K, N, T): knobs}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`projection_forward` of ``X[T, K]`` and ``W[N, K]`` (both K-major) into a BF16 ``out`` of exactly these ``K``,
+#: ``N`` and ``T`` runs the program the deterministic planner gives the row with these knobs (:func:`k1_forward_knobs`);
+#: every other part, row, token count, layout and output dtype runs the deterministic plan.  On 152-SM ``sm_100a`` and
+#: ``sm_103a`` parts the deterministic plan of these rows splits K two ways over CTA pairs of 256-wide tiles (stream-K,
+#: the partials added in a fixed order); the single-CTA program (:data:`K1_FORWARD_SINGLE_CTA_KNOBS`) keeps every tile's
+#: whole K in one CTA, so a forward still repeats bit for bit and a recomputed forward reproduces its result, with other
+#: bits than ``deterministic=True`` (within the deterministic package's BF16 budget against FP64).  Measured at exactly
+#: these token counts (no other token count, SM count or row): the single op faster than the deterministic plan in every
+#: run (a one-sided paired sign test, p < 0.05, median ratio below 0.99, eager and CUDA graph), no more than 3 % slower
+#: than it next to a kernel holding 8, 16 or 32 SMs on another stream, and the training steps that contain the forward
+#: (forward + backward, 2 x forward + backward with an FP32 and with a BF16 weight gradient) no slower than with the
+#: deterministic plan: the median over every run of the paired step-time ratio at most 1.013, eager and CUDA graph
+#: separately, and no run above the largest ratio of the deterministic plan against itself in the same runs.
+#: ``4096 -> 512`` at 4096 tokens is not in the table: next to a kernel holding 32 SMs it was up to 4.7 % slower.
+K1_FORWARD_RULES_BY_SM: dict[
+    tuple[str, int], dict[tuple[int, int, int], dict[str, Any]]
+] = {
+    (arch, 152): {
+        (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (4096, 512, 3072): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (5120, 512, 4096): K1_FORWARD_SINGLE_CTA_KNOBS,
+    }
+    for arch in ("sm_100a", "sm_103a")
+}
+
+
+def k1_forward_knobs(*, arch: str, sm_count: int, K: int, N: int, T: int) -> tuple:
+    """The deterministic package's planner knobs of the forward ``out[T, N] = X[T, K] @ W[N, K].T`` (both operands
+    K-major, BF16 ``out``) with ``deterministic=False`` on a device of exactly ``sm_count`` SMs: the row's entry in
+    the table of :data:`K1_FORWARD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens, as sorted
+    ``(name, value)`` pairs, or ``()`` -- the deterministic plan."""
+    knobs = K1_FORWARD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(K), int(N), int(T))
+    )
+    return tuple(sorted(knobs.items())) if knobs else ()
+
+
+def _k1_forward_knobs_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> tuple:
+    """:func:`k1_forward_knobs` of the forward call ``(X, W, out)`` on ``out``'s device; ``()`` (the deterministic
+    plan) without a row of :data:`K1_FORWARD_RULES_BY_SM` of the call's shape, for an operand that is not K-major and
+    for an ``out`` that is not BF16.  The device is read only for a shape of the table."""
+    if X.dim() != 2 or W.dim() != 2:
+        return ()
+    K, N, T = int(X.shape[1]), int(W.shape[0]), int(X.shape[0])
+    if not any((K, N, T) in rows for rows in K1_FORWARD_RULES_BY_SM.values()):
+        return ()
+    if X.stride(1) != 1 or W.stride(1) != 1 or out.dtype != torch.bfloat16:
+        return ()
+    facts = deterministic_backend().device_facts(out.device)
+    if facts.arch is None:
+        return ()
+    return k1_forward_knobs(arch=facts.arch, sm_count=facts.sm_count, K=K, N=N, T=T)
 
 
 def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
@@ -4588,10 +4656,12 @@ def projection_forward(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic program in both modes (a
-    recomputed forward must reproduce its result; where the deterministic plan splits K across CTAs, it adds the
-    partials in a fixed order); with ``deterministic=False`` through this package's binding of it (:func:`_det_k1`: the
-    same plan, program and bits).
+    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic package's programs in both modes
+    (a recomputed forward must reproduce its result; where the deterministic plan splits K across CTAs, it adds the
+    partials in a fixed order); with ``deterministic=False`` through this package's binding of them (:func:`_det_k1`):
+    the deterministic plan, program and bits, except on a row of :data:`K1_FORWARD_RULES_BY_SM` for the device, which
+    runs the program the deterministic planner gives it with the table's knobs (:func:`k1_forward_knobs`; other bits,
+    still the same on every run).
     ``enable_pdl`` as for :func:`dense_projection_gemm`."""
     if _resolve_deterministic(deterministic, "projection_forward"):
         return _det_entry("projection_forward")(X, W, out, **_pdl_kw(enable_pdl))
@@ -4605,7 +4675,7 @@ def projection_forward(
     return _det_k1(
         (X, W, o),
         ("fwd",),
-        lambda: (X, W.t(), o, False, ()),
+        lambda: (X, W.t(), o, False, _k1_forward_knobs_of(X, W, o)),
         lambda: _det_entry("projection_forward")(X, W, o, **_pdl_kw(enable_pdl)),
         enable_pdl,
     )
