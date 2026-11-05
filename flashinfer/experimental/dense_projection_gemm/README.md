@@ -700,13 +700,15 @@ launch owns both; the convenience path keeps them in an arena per (device, strea
 different streams never share them.  An arena never frees a buffer before `clear_convenience_caches()`: a growth (to
 at least twice the buffer's size) retires the buffer it replaces, and an entry evicted from the caches
 (`CONVENIENCE_CACHE_SIZE`) leaves its arena, so a launch captured into a CUDA graph keeps its workspace; the retired
-buffers of a kind hold fewer bytes than its live one, which holds less than twice the largest requirement seen, so a
-kind holds less than four times that requirement.  An arena stays until `clear_convenience_caches()` even when no
-cached entry uses it, one per (device, stream) that made a call: a process that makes calls on many short-lived
+buffers of a kind hold fewer bytes than its live one, which holds less than twice the largest requirement seen or the
+16-element minimum, so a kind holds at most four times that requirement or 16 elements, whichever is more.  An arena
+stays until `clear_convenience_caches()` even when no cached entry uses it, one per (device, stream) that made a call:
+a process that makes calls on many short-lived
 streams (`torch.cuda.ExternalStream` handles) calls it once no captured graph replays.  After an aborted launch, call
 `PreparedAtomicGemm.reset_counters()` (or `clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on
 the launch stream (one memset) between the split and the program; prepared launches of both programs allocate nothing
-and can be captured in a CUDA graph.  A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
+and can be captured in a CUDA graph.
+A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
 issues its launches back to back.  A cached K1 launch of the convenience path orders its arguments once per cache key
 (the PDL flag is bound, so it is part of the key) and converts its workspace once per arena growth; a call rebuilds and converts only its operand views.  A K1 call that
 runs the deterministic program -- the forward, the input gradient, a weight-gradient row without a verdict -- launches

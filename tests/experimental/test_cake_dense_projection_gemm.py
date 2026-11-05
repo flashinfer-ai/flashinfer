@@ -6991,10 +6991,10 @@ def k1_rule(monkeypatch):
 
 
 def _arena_tickets_zero():
-    """Whether the K1 tickets of every arena hold zeros, and the counter buffers growths retired (tickets and the
-    deterministic program's slice counters: both zero between complete launches)."""
+    """Whether the K1 tickets and the deterministic program's slice counters of every arena hold zeros, live and
+    retired by a growth (both zero between complete launches)."""
     for arena in cake_backend._ATOMIC_ARENAS.values():
-        bufs = [arena.buffers.get("k1_tickets")]
+        bufs = [arena.buffers.get("k1_tickets"), arena.buffers.get("k1_det_counters")]
         # an arena without a ``retired`` list (its growths release the buffer they replace): its live buffers only
         bufs += [b for b in getattr(arena, "retired", ()) if b.dtype == torch.uint32]
         if any(b is not None and b.to(torch.int64).any() for b in bufs):

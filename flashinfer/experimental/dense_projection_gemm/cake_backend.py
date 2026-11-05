@@ -2992,12 +2992,12 @@ class _AtomicArena:
     of ``_ATOMIC_ARENA_KINDS``, grown and never shrunk, as the deterministic package's ``_Arena`` (a zeroed kind is
     allocated with ``torch.zeros`` on the current stream).
 
-    Unlike that arena, a growth retires the buffer it replaces (``retired``) instead of releasing it: a launch captured into a CUDA graph
-    replays the pointer it was bound with, and a launch in flight keeps using it, so every buffer of the arena stays
-    allocated until :func:`clear_convenience_caches` drops the arena.  A retired buffer keeps its zero contract: the
-    launches bound to it leave its tickets and counters zero.  A growth at least doubles the buffer, so the buffers a
-    kind retires hold fewer bytes than its live one, and a kind grows at most
-    ``log2(largest requirement / _ATOMIC_ARENA_MIN_ELEMS)`` times."""
+    Unlike that arena, a growth retires the buffer it replaces (``retired``) instead of releasing it: a launch captured
+    into a CUDA graph replays the pointer it was bound with, and a launch in flight keeps using it, so every buffer of
+    the arena stays allocated until :func:`clear_convenience_caches` drops the arena.  A retired buffer keeps its zero
+    contract: the launches bound to it leave its tickets and counters zero.  A growth at least doubles the buffer, so
+    the buffers a kind retires hold fewer bytes than its live one, and a kind grows at most
+    ``ceil(log2(largest requirement / _ATOMIC_ARENA_MIN_ELEMS))`` times."""
 
     device: torch.device
     key: tuple[int, int]
