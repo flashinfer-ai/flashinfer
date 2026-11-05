@@ -959,10 +959,11 @@ def test_main_grid_literal_table() -> None:
 # except for 264 <= C < 512, where its ``straddle_rows`` build (the row-group
 # program) runs, and on sm_107a for 256 <= C < 264 from S = 262144 tokens,
 # where the ``vec=8, min_blocks=2`` program (four-token copy stages) runs.
-# On sm_100a and sm_103a the SM-wide row-group program (one 384-thread CTA
-# per SM) takes the row-group program's rows on its channel bands from its
+# The SM-wide row-group program (one 384-thread CTA per SM, 256 threads on
+# sm_107a) takes the row-group program's rows on its channel bands from its
 # token floor: sm_100a 264 <= C < 280 and 344 <= C < 440 from S = 65536,
-# sm_103a 264 <= C < 472 and 480 <= C < 512 from S = 24576.  The rows are
+# sm_103a 264 <= C < 472 and 480 <= C < 512 from S = 24576, sm_107a
+# 264 <= C < 296 and 344 <= C < 416 from S = 32768.  The rows are
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
 BWD_FALLBACK = {
@@ -976,11 +977,13 @@ BWD_ROW_GROUP_R200 = "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4"
 BWD_SM_CTA = {
     "sm_100a": "cake_causal_conv1d_det_train_e057357c655024d4ff1d",
     "sm_103a": "cake_causal_conv1d_det_train_baca4c969c783d07d81f",
+    "sm_107a": "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
 }
 # arch -> (channel bands [lo, hi), token floor) of the SM-wide row-group program.
 BWD_SM_CTA_RULE = {
     "sm_100a": (((264, 280), (344, 440)), 65536),
     "sm_103a": (((264, 472), (480, 512)), 24576),
+    "sm_107a": (((264, 296), (344, 416)), 32768),
 }
 BWD_AT_512 = {
     "sm_100a": "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
@@ -992,6 +995,8 @@ BWD_SELECTION_TOKENS = (
     12288,
     24575,
     24576,
+    32767,
+    32768,
     65535,
     65536,
     250340,
@@ -1000,8 +1005,8 @@ BWD_SELECTION_TOKENS = (
     300007,
 )
 BWD_SELECTION_CHANNELS = (
-    *(128, 248, 255, 256, 264, 272, 280, 336, 344, 384, 432, 440),
-    *(464, 472, 480, 504, 511, 512),
+    *(128, 248, 255, 256, 264, 272, 280, 288, 296, 336, 344, 384, 408, 416),
+    *(432, 440, 464, 472, 480, 504, 511, 512),
 )
 
 
@@ -1052,7 +1057,7 @@ def test_backward_selection_literal_table() -> None:
         assert loader.MODULES[BWD_SM_CTA[arch]]["arches"] == [arch]
     assert loader.MODULES[BWD_ROW_GROUP]["arches"] == ["sm_100a", "sm_103a"]
     assert loader.select_rule(loader.MODULES[BWD_ROW_GROUP_R200]) == {
-        "channels": {"sm_107a": 264},
+        "channels": {"sm_107a": [264, 296, 416]},
         "kind": "channels_at_least",
     }
     assert loader.MODULES[BWD_ROW_GROUP_R200]["arches"] == ["sm_107a"]
@@ -3046,7 +3051,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     # Per architecture and route, forward or backward: exactly one fallback record, every routed record's
     # rule names the architecture with its own thresholds (distinct thresholds but for one shared by a
     # program with a token floor and one without, at most four routed programs without a token floor and at
-    # most one with one), one program selected per channel count and token count -- the highest threshold at
+    # most two with one), one program selected per channel count and token count -- the highest threshold at
     # most C whose token floor (if any) S meets, the floored program first at a shared one, the fallback
     # below the lowest.
     for arch in loader.ARCHES:
@@ -3075,7 +3080,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
                     owners.setdefault(threshold, {})[floored] = name
             unfloored = {name for name in rules if rules[name] and name not in floors}
             assert len(unfloored) <= 4, (arch, kind, unfloored)
-            assert len(floors) <= 1, (arch, kind, floors)
+            assert len(floors) <= 2, (arch, kind, floors)
             for S in sorted({1, *(floor for _, floor in floors.values())}):
                 previous = fallbacks[0]
                 for threshold in sorted(owners):
