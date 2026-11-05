@@ -1964,6 +1964,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "192,2,256": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
         },
+        "192,2,1024": {
+            "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_prg",
+        },
         "384,28,1": {
             "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
         },

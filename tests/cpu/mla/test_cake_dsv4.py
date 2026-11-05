@@ -22,6 +22,17 @@ def _cpu_sm_count(monkeypatch):
     monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM_COUNT)
 
 
+# The K=64 sibling gate as the host defines it; the tests of the gate call it.
+_K64_SIBLING_LAUNCHABLE = cake._k64_sibling_launchable
+
+
+@pytest.fixture(autouse=True)
+def _launchable_k64_siblings(monkeypatch):
+    """The K=64 gate probes the process's CUDA runtime and the device; these
+    CPU tests route as in a process that can launch every K=64 sibling."""
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", lambda arch, device: True)
+
+
 # Both cache layouts and sink settings retain the same physical selection.
 def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> int:
     """Query-token count of a canonical contract row.
@@ -2587,7 +2598,7 @@ def test_fp8_h64_two_tile_decode_rows_take_the_h64_cluster_body_on_sm100_sm103(
     partial third run the H64 cluster body where it is built (SM100 / SM103);
     width 256 and one complete tile keep the M64 body, three tiles or 13+
     tokens the persistent body, and SM107 or an unknown architecture the M64
-    body."""
+    body (SM107 runs width 252 past 12 tokens on the persistent body)."""
     for tokens in range(1, 14):
         route = _route(
             dtype=torch.float8_e4m3fn,
@@ -2602,7 +2613,9 @@ def test_fp8_h64_two_tile_decode_rows_take_the_h64_cluster_body_on_sm100_sm103(
             arch=arch,
         )
         full_tiles = sparse_topk // 128
-        if full_tiles >= (3 if tokens <= 12 else 2):
+        if full_tiles >= (3 if tokens <= 12 else 2) or (
+            tokens > 12 and arch == "sm_107a"
+        ):
             expected = "fp8_h128_prefill_source_persistent_uniform"
         elif 256 < sparse_topk < 384 and arch in ("sm_100a", "sm_103a"):
             expected = "fp8_lowhead_h64"
@@ -2968,13 +2981,19 @@ def test_sm107a_lowhead_swa_rows_launch_the_m64_program_with_dense_offsets(
     "sparse_topk,page_size,sm107_first",
     [
         # (width, page size, first M64 token count on SM107 at 208 / 216 SMs)
-        (252, 2, (13, 13)),  # one complete tile: the M64 body at every count
-        (256, 2, (27, 28)),  # two tiles: 8 * tokens > sm_count
-        (260, 2, (53, 55)),  # three tiles: 4 * tokens > sm_count
-        (320, 64, (53, 55)),
-        (384, 2, (53, 55)),
-        (400, 2, (63, 65)),  # four tiles: 10 * tokens > 3 * sm_count
-        (512, 2, (63, 65)),
+        (160, 2, (13, 13)),  # one complete tile, 32 keys more: M64 throughout
+        (175, 2, (13, 13)),
+        (176, 2, (17, 17)),  # 48 keys more: the persistent body up to 16 tokens
+        (191, 2, (17, 17)),
+        (192, 2, (32, 33)),  # 64+ keys more: 20 * tokens > 3 * sm_count
+        (252, 2, (32, 33)),
+        (256, 2, (27, 28)),  # two complete tiles: 8 * tokens > sm_count
+        (260, 2, (54, 56)),  # three tiles, two complete: 200 * t > 51 * sm
+        (320, 64, (54, 56)),
+        (384, 2, (53, 55)),  # three complete tiles: 4 * tokens > sm_count
+        (400, 2, (63, 65)),  # four tiles, three complete: 10 * t > 3 * sm
+        (500, 2, (63, 65)),
+        (512, 2, (55, 57)),  # four complete tiles: 50 * t > 13 * sm
         (516, 2, (105, 109)),  # five tiles and up: the half wave
         (640, 64, (105, 109)),
     ],
@@ -2983,7 +3002,9 @@ def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
     arch, sparse_topk, page_size, sm107_first
 ):
     """On SM107 the FP8/H64 decode rows of two to four sparse tiles take the
-    M64 body before ``2 * tokens > sm_count``, by their tile count; other
+    M64 body before ``2 * tokens > sm_count``, by their tile and complete-tile
+    counts, and the rows of one complete tile and 64 or more keys of a second
+    run the persistent body until then (48-63 keys: up to 16 tokens); other
     widths and architectures keep the half-wave rule."""
     m64 = cake._fp8_h64_m64_program(sparse_topk)
     for sm_count, sm107 in zip((208, 216), sm107_first, strict=True):
@@ -3002,10 +3023,10 @@ def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
                 arch=arch,
             )
 
-        if sparse_topk < 256:
-            first = 13
-        elif arch == "sm_107a":
+        if arch == "sm_107a":
             first = sm107
+        elif sparse_topk < 256:
+            first = 13
         else:
             first = sm_count // 2 + 1
         below = "fp8_h128_prefill_source_persistent_uniform"
@@ -3142,6 +3163,7 @@ def test_fp8_h128_persistent_launch_takes_the_twin_at_its_floors(
     route = "fp8_h128_prefill_source_persistent"
     L = _RecordingLauncher(
         arch,
+        Q=torch.empty(0),
         num_query_tokens=tokens,
         num_heads=128,
         sparse_topk=260,
@@ -3179,7 +3201,10 @@ def test_sm107a_launches_take_the_k64_sibling_from_its_floor(arch):
         for tokens in (1, 8, 32, 47, 48, 64, 96, 127):
             expected = sibling if own and tokens >= 48 else route
             assert (
-                cake._k64_variant(route, arch=arch, num_query_tokens=tokens) == expected
+                cake._k64_variant(
+                    route, arch=arch, num_query_tokens=tokens, device=_DEVICE
+                )
+                == expected
             ), tokens
         assert (
             get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
@@ -3190,19 +3215,36 @@ def test_sm107a_launches_take_the_k64_sibling_from_its_floor(arch):
         "fp8_h64_prefill_source_persistent_m64",
         "fp8_lowhead_prefill",
     ):
-        assert cake._k64_variant(other, arch=arch, num_query_tokens=64) == other
+        assert (
+            cake._k64_variant(other, arch=arch, num_query_tokens=64, device=_DEVICE)
+            == other
+        )
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
-@pytest.mark.parametrize("tokens", [8, 47, 48, 127])
+@pytest.mark.parametrize("tokens", [8, 47, 48, 127, 128, 160, 1024])
 @pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("launchable", [True, False])
 def test_fp8_h128_uniform_launch_takes_the_k64_sibling_at_its_floor(
-    arch, tokens, enable_pdl
+    monkeypatch, arch, tokens, enable_pdl, launchable
 ):
+    """SM107 runs the uniform route's launches of at least 48 rows on its K=64
+    sibling.  Where the process cannot launch the sibling on the query's device
+    (the gate is asked only there), launches below the lane-gather floor run
+    the route's own program and the others the lane-issued program, over the
+    same grid and partials."""
+    asked = []
+
+    def gate(gate_arch, device):
+        asked.append((gate_arch, device))
+        return launchable
+
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", gate)
     route = "fp8_h128_prefill_source_persistent_uniform"
     L = _RecordingLauncher(
         arch,
+        Q=torch.empty(0),
         num_query_tokens=tokens,
         num_heads=128,
         sparse_topk=1152,
@@ -3210,13 +3252,20 @@ def test_fp8_h128_uniform_launch_takes_the_k64_sibling_at_its_floor(
         enable_pdl=enable_pdl,
     )
     cake._dispatch_route(route, L)
-    program = f"{route}_k64" if arch == "sm_107a" and tokens >= 48 else route
+    sibling = arch == "sm_107a" and tokens >= 48
+    if sibling and launchable:
+        program = f"{route}_k64"
+    elif sibling and tokens >= 128:
+        program = "fp8_h128_prefill_source_persistent"
+    else:
+        program = route
     assert L.calls == [
         (
             program,
             {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
         )
     ]
+    assert asked == ([("sm_107a", _DEVICE)] if sibling else [])
 
 
 # (sparse_topk, compressed_page_size) of a topk4x, a topk128x and a SWA-only item.
@@ -3293,6 +3342,7 @@ def test_sm107a_short_query_decode_runs_the_k64_sibling(tokens):
     route = "fp8_h128_prefill_source_persistent_uniform"
     L = _RecordingLauncher(
         "sm_107a",
+        Q=torch.empty(0),
         num_query_tokens=tokens,
         num_heads=128,
         sparse_topk=1152,
@@ -3326,6 +3376,266 @@ def test_sm107a_short_query_decode_runs_the_k64_sibling(tokens):
         lane.minimum_bytes,
         lane.num_splits,
     )
+
+
+# --------------------------------------------------------------------------- #
+# K=64 sibling gate: CUDA 13.4's oversized shared-memory mode                 #
+# --------------------------------------------------------------------------- #
+
+_UNIFORM_ROUTE = "fp8_h128_prefill_source_persistent_uniform"
+
+
+@pytest.fixture
+def k64_gate():
+    """The host's K=64 gate, its per-device cache empty before and after."""
+    _K64_SIBLING_LAUNCHABLE.cache_clear()
+    yield _K64_SIBLING_LAUNCHABLE
+    _K64_SIBLING_LAUNCHABLE.cache_clear()
+
+
+def _stub_k64_gate_probes(monkeypatch, *, toolkit, runtime, ceiling):
+    """Stub the gate's probes: the CUDA toolkit (nvcc) version, the version of
+    the process's runtime and the device's oversized ceiling (one value, or a
+    dict by device index).  Returns the probe calls."""
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    asked = {"runtime": [], "ceiling": []}
+
+    def runtime_version(major):
+        asked["runtime"].append(major)
+        return runtime
+
+    def oversized_ceiling(device):
+        asked["ceiling"].append(device)
+        return ceiling[device.index] if isinstance(ceiling, dict) else ceiling
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version(toolkit))
+    monkeypatch.setattr(cake, "_cuda_runtime_version", runtime_version)
+    monkeypatch.setattr(cake, "_device_oversized_smem_per_block", oversized_ceiling)
+    return asked
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "toolkit,runtime,ceiling,launchable",
+    [
+        ("13.4", 13040, 272512, True),
+        ("13.5", 13050, 300000, True),
+        # The driver does not report the ceiling: it has no oversized mode.
+        ("13.4", 13040, None, False),
+        # A 13.0 runtime wheel next to a 13.4 toolkit: the binding's
+        # cudaFuncSetAttribute fails with "invalid argument".
+        ("13.4", 13000, 272512, False),
+        ("13.4", 13000, None, False),
+        # The runtime the JIT modules link does not load.
+        ("13.4", None, 272512, False),
+        # The oversized ceiling does not hold the program's shared memory.
+        ("13.4", 13040, 272511, False),
+        ("13.4", 13040, 0, False),
+        # The binding needs a 13.4 toolkit to build.
+        ("13.3", 13040, 272512, False),
+    ],
+)
+def test_k64_gate_needs_cuda_13_4_and_the_oversized_ceiling(
+    monkeypatch, k64_gate, toolkit, runtime, ceiling, launchable
+):
+    """SM107's K=64 sibling launches only with a CUDA toolkit and a process
+    runtime of at least 13.4 and a driver that reports an oversized ceiling of
+    at least its 272512 B; the probes stop at the first refusal and the
+    runtime is asked by the toolkit's major (the JIT modules' soname)."""
+    from packaging.version import Version
+
+    asked = _stub_k64_gate_probes(
+        monkeypatch, toolkit=toolkit, runtime=runtime, ceiling=ceiling
+    )
+    device = torch.device("cuda", 0)
+    assert k64_gate("sm_107a", device) is launchable
+    built = Version(toolkit) >= Version("13.4")
+    loaded = built and runtime is not None and runtime >= 13040
+    assert asked == {
+        "runtime": [13] if built else [],
+        "ceiling": [device] if loaded else [],
+    }
+
+
+@pytest.mark.cpu_only
+def test_k64_gate_probes_each_device_once(monkeypatch, k64_gate):
+    """The gate is cached per architecture and device: the probes run once per
+    device, and an architecture without an oversized sibling needs none."""
+    asked = _stub_k64_gate_probes(
+        monkeypatch, toolkit="13.4", runtime=13040, ceiling={0: 272512, 1: 232448}
+    )
+    first, second = torch.device("cuda", 0), torch.device("cuda", 1)
+    for _ in range(3):
+        assert k64_gate("sm_107a", first)
+        assert not k64_gate("sm_107a", second)
+    assert k64_gate("sm_100a", first) and k64_gate("sm_103a", second)
+    assert asked == {"runtime": [13, 13], "ceiling": [first, second]}
+
+
+class _FakeCudart:
+    """``libcudart`` stand-in whose cudaRuntimeGetVersion reports ``version``
+    and returns ``status``."""
+
+    def __init__(self, version, status=0):
+        self.version = version
+        self.status = status
+
+    def cudaRuntimeGetVersion(self, out):
+        out[0] = self.version
+        return self.status
+
+
+class _FakeLibcuda:
+    """``libcuda`` stand-in: device ``i`` has the handle ``100 + i`` and every
+    attribute asked (recorded with the handle) reads ``ceiling`` with
+    ``status``."""
+
+    def __init__(self, ceiling, status=0):
+        self.ceiling = ceiling
+        self.status = status
+        self.asked = []
+
+    def cuInit(self, flags):
+        return 0
+
+    def cuDeviceGet(self, out, ordinal):
+        out[0] = 100 + ordinal
+        return 0
+
+    def cuDeviceGetAttribute(self, out, attribute, handle):
+        self.asked.append((attribute, handle.value))
+        out[0] = self.ceiling
+        return self.status
+
+
+@pytest.mark.cpu_only
+def test_k64_gate_probes_read_the_process_runtime_and_the_driver(monkeypatch):
+    """The runtime probe reads cudaRuntimeGetVersion of ``libcudart.so.<major>``;
+    the ceiling probe reads the driver's attribute 150 for the device's handle.
+    A library that does not load or a call that fails reports nothing."""
+    libraries = {}
+    opened = []
+
+    def shared_library(soname):
+        opened.append(soname)
+        return libraries.get(soname)
+
+    monkeypatch.setattr(cake, "_shared_library", shared_library)
+    assert cake._cuda_runtime_version(13) is None
+    libraries["libcudart.so.13"] = _FakeCudart(13000)
+    assert cake._cuda_runtime_version(13) == 13000
+    libraries["libcudart.so.13"] = _FakeCudart(13040, status=35)
+    assert cake._cuda_runtime_version(13) is None
+    assert opened == ["libcudart.so.13"] * 3
+
+    device = torch.device("cuda", 2)
+    assert cake._device_oversized_smem_per_block(device) is None
+    libcuda = libraries["libcuda.so.1"] = _FakeLibcuda(272512)
+    assert cake._device_oversized_smem_per_block(device) == 272512
+    assert libcuda.asked == [(150, 102)]
+    # CUDA_ERROR_INVALID_VALUE: a driver that does not know the attribute.
+    libraries["libcuda.so.1"] = _FakeLibcuda(272512, status=1)
+    assert cake._device_oversized_smem_per_block(device) is None
+
+
+@pytest.mark.cpu_only
+def test_shared_library_prefers_the_copy_already_in_the_process(monkeypatch):
+    """A soname already mapped resolves without loading (the copy the JIT
+    modules bind to); otherwise the dynamic linker loads it; a library that
+    loads neither way is ``None``."""
+    import ctypes
+    import os
+
+    mapped = {"libcudart.so.13"}
+    opened = []
+
+    def cdll(soname, mode=ctypes.DEFAULT_MODE):
+        opened.append((soname, mode))
+        if mode & os.RTLD_NOLOAD and soname not in mapped:
+            raise OSError(f"{soname}: not mapped")
+        if soname == "libmissing.so.1":
+            raise OSError(f"{soname}: not found")
+        return f"handle:{soname}"
+
+    monkeypatch.setattr(cake.ctypes, "CDLL", cdll)
+    noload = os.RTLD_NOLOAD | os.RTLD_NOW
+    assert cake._shared_library("libcudart.so.13") == "handle:libcudart.so.13"
+    assert opened == [("libcudart.so.13", noload)]
+    opened.clear()
+    assert cake._shared_library("libcuda.so.1") == "handle:libcuda.so.1"
+    assert opened == [
+        ("libcuda.so.1", noload),
+        ("libcuda.so.1", ctypes.DEFAULT_MODE),
+    ]
+    opened.clear()
+    assert cake._shared_library("libmissing.so.1") is None
+    assert len(opened) == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("runtime,program", [(13000, ""), (13040, "_k64")])
+def test_sm107a_uniform_launch_follows_the_process_runtime(
+    monkeypatch, k64_gate, runtime, program
+):
+    """With a 13.4 toolkit, a 13.0 runtime in the process runs SM107's 48-row
+    uniform launches on the route's program instead of failing in the K=64
+    sibling's binding; a 13.4 runtime runs the sibling.  The probes run once."""
+    from types import SimpleNamespace
+
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", k64_gate)
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("13.4"))
+    cudart, libcuda = _FakeCudart(runtime), _FakeLibcuda(272512)
+    libraries = {"libcudart.so.13": cudart, "libcuda.so.1": libcuda}
+    monkeypatch.setattr(cake, "_shared_library", libraries.get)
+    for _ in range(2):
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=SimpleNamespace(device=torch.device("cuda", 0)),
+            num_query_tokens=48,
+            num_heads=128,
+            sparse_topk=1152,
+            max_q_len=4,
+        )
+        cake._dispatch_route(_UNIFORM_ROUTE, L)
+        assert L.calls == [
+            (
+                f"{_UNIFORM_ROUTE}{program}",
+                {"grid": (96, 1, 1), "total_work_items": 48, **L.partials(1)},
+            )
+        ]
+    assert libcuda.asked == ([(150, 100)] if runtime >= 13040 else [])
+
+
+@pytest.mark.cpu_only
+def test_k64_gate_knows_every_oversized_binding():
+    """The programs whose generated bindings launch in CUDA 13.4's oversized
+    shared-memory mode are exactly the K=64 siblings the gate holds, each with
+    the dynamic shared memory the gate compares with the device's oversized
+    ceiling; every other program, including those the gate falls back to,
+    launches in the standard mode."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import VARIANTS, _get_csrc_dir
+
+    gated = {
+        VARIANTS[arch][f"{route}_k64"]: smem
+        for arch, smem in cake._K64_SIBLING_OVERSIZED_SMEM_BYTES.items()
+        for route in cake._K64_SIBLING_ROUTES
+    }
+    oversized = {}
+    for path in sorted(_get_csrc_dir().glob("*/*_binding.cu")):
+        text = path.read_text(encoding="utf-8")
+        if "cudaSharedMemoryModeAllowOversizedSharedMemory" in text:
+            (smem,) = re.findall(r"config\.dynamicSmemBytes = (\d+);", text)
+            oversized[path.name.removesuffix("_binding.cu")] = int(smem)
+    assert oversized == gated
 
 
 # --------------------------------------------------------------------------- CAKE-957 / CAKE-939: query layout, route plan, row tiling
