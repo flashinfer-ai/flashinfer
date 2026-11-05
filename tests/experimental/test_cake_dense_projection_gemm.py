@@ -2221,7 +2221,8 @@ def test_k1_odd_block_exclusions(monkeypatch):
     # below 65538 tokens odd block counts take the two-split program with the table in place (1025, 4097, 16173 and
     # 65537 tokens); sm_107a ``8192 -> 128`` FP32 has no entry
     monkeypatch.undo()
-    assert cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS == K1_ODD_BLOCK_EXCLUDED_TOKENS
+    table = cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS
+    assert table == K1_ODD_BLOCK_EXCLUDED_TOKENS
     for key, part, T, want in (
         (("sm_100a", 1, 4096, 32, "f32"), 148, 1025, (64, 2)),
         (("sm_100a", 1, 4096, 64, "f32"), 152, 65537, (64, 2)),
@@ -8257,10 +8258,11 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
 def test_gpu_k1_sm_count_overrides_run_their_programs():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): every overridden row prepares and runs the override's
-    program at the first and the last token count of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` (``4096 -> 1024`` FP32 at
-    16172 and 16384 tokens: the 192-wide row-major-store program at one split), meets the deterministic package's
-    FP64 budget and, where both run one split, gives the bits of the row's :data:`K1_SPLIT_RULES` program (256-wide
-    transposed tiles) on the same inputs.  A part of any other SM count skips."""
+    program at the first and the last token count of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` outside the part's ranges of
+    :data:`K1_CHAIN_RANGES_BY_SM`, which come first (``4096 -> 1024`` FP32 at 16384 tokens: the 192-wide row-major-store
+    program at one split), meets the deterministic package's FP64 budget and, where both run one split, gives the bits
+    of the row's :data:`K1_SPLIT_RULES` program (256-wide transposed tiles) on the same inputs.  A part of any other SM
+    count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     table = cake_backend.K1_SPLIT_OVERRIDES_BY_SM.get((arch, sm_count), {})
@@ -8274,9 +8276,11 @@ def test_gpu_k1_sm_count_overrides_run_their_programs():
         f32 = dt == "f32"
         rule = cake_backend.K1_SPLIT_RULES[key]
         for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
-            want = cake_backend.k1_plan(
-                arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count
-            )
+            kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count)
+            # the ranges of K1_CHAIN_RANGES_BY_SM come first
+            if cake_backend.k1_chain_plan(**kw) is not None:
+                continue
+            want = cake_backend.k1_plan(**kw)
             if want is None:  # a token count of K1_SPLIT_RULE_EXCLUDED_TOKENS
                 continue
             assert want == (block_n, splits), (key, T)
@@ -8310,8 +8314,8 @@ def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): the convenience path of every overridden row binds the
     override's program (its :data:`_K1_ATOMIC_CACHE` entry) at the first and the last token count of
-    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and gives the bits of the prepared launch, the tickets zero after.  A part of
-    any other SM count skips."""
+    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` outside the part's ranges of :data:`K1_CHAIN_RANGES_BY_SM` and gives the bits of
+    the prepared launch, the tickets zero after.  A part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     table = cake_backend.K1_SPLIT_OVERRIDES_BY_SM.get((arch, sm_count), {})
@@ -8324,9 +8328,11 @@ def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
         _, L, M, N, dt = key
         f32 = dt == "f32"
         for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
-            plan = cake_backend.k1_plan(
-                arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count
-            )
+            kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count)
+            # the ranges of K1_CHAIN_RANGES_BY_SM come first
+            if cake_backend.k1_chain_plan(**kw) is not None:
+                continue
+            plan = cake_backend.k1_plan(**kw)
             if plan != (block_n, splits):  # an excluded token count
                 continue
             G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
