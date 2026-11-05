@@ -13,13 +13,13 @@ fence protocol (``sync_protocol="fence"``), and requires on every rank:
 
 Launched one process per GPU, across nodes too:
 
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_nvlink_one_sided_lamport.py
-    mpirun -np 8 pytest tests/moe_ep/test_nvlink_one_sided_lamport.py
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_nvlink_one_sided_sentinel.py
+    mpirun -np 8 pytest tests/moe_ep/test_nvlink_one_sided_sentinel.py
 
 Checks are gathered across ranks, so all ranks pass or fail each test together.
 ``test_rounds_under_rank_skew`` runs its rounds in a child process of every
 rank, so that a deadlock (the kernels trap) fails that test only.
-``FLASHINFER_TEST_MOE_A2A_LAMPORT_DEFECT=<n>`` runs the suite on a module built
+``FLASHINFER_TEST_MOE_A2A_SENTINEL_DEFECT=<n>`` runs the suite on a module built
 from a copy of the sources with planted defect ``n`` (``_DEFECTS``), which it
 must detect. The host-only tests at the end need no launcher.
 """
@@ -48,7 +48,7 @@ from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
 
 from ._mpi_launch import adopt_mpi_launch
 
-_DEFECT_ENV = "FLASHINFER_TEST_MOE_A2A_LAMPORT_DEFECT"
+_DEFECT_ENV = "FLASHINFER_TEST_MOE_A2A_SENTINEL_DEFECT"
 _IDS_SENTINEL = -2004318072  # 0x88888888, the expert-id rows' sentinel word
 # Multipliers of the expert stand-in per receiving rank (exact powers of two):
 # ranks 0 and 1 cancel and leave small residues, so the BF16 combine output
@@ -124,7 +124,7 @@ def collective(test):
 
 # Planted defects: (source file, its text, the defective text), patched into a
 # copy of the module's sources. The production sources carry no test hooks.
-_HEADER = "include/flashinfer/comm/moe_alltoall_lamport.cuh"
+_HEADER = "include/flashinfer/comm/moe_alltoall_sentinel.cuh"
 _DEFECTS = {
     1: (  # wrong target: tokens t % 7 == 3 go to the next rank
         _HEADER,
@@ -194,13 +194,13 @@ def _defect_module(defect: int):
     from flashinfer.jit.comm import gen_nvlink_one_sided_alltoall_module
 
     spec = gen_nvlink_one_sided_alltoall_module()
-    name = f"{spec.name}_lamport_test_defect{defect}"
+    name = f"{spec.name}_sentinel_test_defect{defect}"
     root = jit_env.FLASHINFER_GEN_SRC_DIR / name
     path, text, defective = _DEFECTS[defect]
     ops = "csrc/nvlink_one_sided_alltoall.cu"
     original = {
         _HEADER: jit_env.FLASHINFER_INCLUDE_DIR
-        / "flashinfer/comm/moe_alltoall_lamport.cuh",
+        / "flashinfer/comm/moe_alltoall_sentinel.cuh",
         ops: jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
     }
     copies = {
@@ -261,9 +261,9 @@ def _supported() -> str:
     module = one_sided.get_nvlink_one_sided_alltoall_module()
     if not NVLinkOneSidedAlltoAll.is_platform_supported():
         local = "NVLink one-sided is not supported here"
-    elif not module.moe_a2a_lamport_available():
+    elif not module.moe_a2a_sentinel_available():
         local = "the kernel module has no sentinel kernels for this GPU"
-    elif _group().world > one_sided.layout_constants().LAMPORT_MAX_RANKS:
+    elif _group().world > one_sided.layout_constants().SENTINEL_MAX_RANKS:
         local = "the sentinel protocol supports at most 64 ranks"
     reasons = [r for r in _all_gather(local) if r]
     return reasons[0] if reasons else ""
@@ -1129,7 +1129,7 @@ def _landing_rows(comm) -> list:
     ids) and combine, as bytes."""
     index, meta = comm._index, comm.metainfo
     bounds = [
-        int(meta[getattr(index, f"LAMPORT_{name}_OFFSET_INDEX")])
+        int(meta[getattr(index, f"SENTINEL_{name}_OFFSET_INDEX")])
         for name in ("LANDING", "COMBINE_LANDING", "RECV")
     ]
     return [comm._rank_bytes[a:b] for a, b in zip(bounds[:-1], bounds[1:], strict=True)]
@@ -1407,8 +1407,7 @@ def test_combine_takes_its_dispatch_protocol(group):
             comm.combine(expert_output)
             failures.append(f"T{tokens}: a combine on the other protocol ran")
         except Exception as exc:  # noqa: BLE001 - the op's check
-            # The op names the sentinel protocol Lamport, as the kernels do.
-            if "Lamport" not in str(exc):
+            if "sentinel combine" not in str(exc):
                 failures.append(f"T{tokens}: unexpected {type(exc).__name__}: {exc}")
         comm._round = round_state
         comm._state["round_owner"] = comm
@@ -1503,13 +1502,13 @@ def _params(**overrides):
 
 
 _LAYOUT = SimpleNamespace(
-    LAMPORT_MAX_RANKS=64,
-    LAMPORT_MAX_TOP_K=22,
-    LAMPORT_IDS_SENTINEL=_IDS_SENTINEL,
-    LAMPORT_FORMAT_BF16=0,
-    LAMPORT_FORMAT_MXFP8=1,
-    LAMPORT_FORMAT_FP8_BLOCK128=2,
-    LAMPORT_FORMAT_NVFP4=3,
+    SENTINEL_MAX_RANKS=64,
+    SENTINEL_MAX_TOP_K=22,
+    SENTINEL_IDS_SENTINEL=_IDS_SENTINEL,
+    SENTINEL_FORMAT_BF16=0,
+    SENTINEL_FORMAT_MXFP8=1,
+    SENTINEL_FORMAT_FP8_BLOCK128=2,
+    SENTINEL_FORMAT_NVFP4=3,
 )
 Row = one_sided._SentinelRow
 
@@ -1521,26 +1520,26 @@ def test_sentinel_row_geometry():
     index = one_sided.layout_constants()
 
     def row(fmt, hidden, top_k):
-        return Row(*map(int, module.moe_a2a_lamport_row_bytes(fmt, hidden, top_k)))
+        return Row(*map(int, module.moe_a2a_sentinel_row_bytes(fmt, hidden, top_k)))
 
-    assert row(index.LAMPORT_FORMAT_BF16, 7168, 8) == Row(14336, 0, 7, 43168)
-    assert row(index.LAMPORT_FORMAT_NVFP4, 7168, 8) == Row(3584, 448, 2, 22560)
-    assert row(index.LAMPORT_FORMAT_MXFP8, 3584, 16) == Row(3584, 112, 2, 14992)
-    assert row(index.LAMPORT_FORMAT_FP8_BLOCK128, 7168, 8) == Row(7168, 224, 4, 29280)
+    assert row(index.SENTINEL_FORMAT_BF16, 7168, 8) == Row(14336, 0, 7, 43168)
+    assert row(index.SENTINEL_FORMAT_NVFP4, 7168, 8) == Row(3584, 448, 2, 22560)
+    assert row(index.SENTINEL_FORMAT_MXFP8, 3584, 16) == Row(3584, 112, 2, 14992)
+    assert row(index.SENTINEL_FORMAT_FP8_BLOCK128, 7168, 8) == Row(7168, 224, 4, 29280)
     with pytest.raises(Exception, match="% 256"):
-        row(index.LAMPORT_FORMAT_MXFP8, 2880, 8)
+        row(index.SENTINEL_FORMAT_MXFP8, 2880, 8)
 
 
 class _FakeModule:
     def __init__(self, available=True):
         self.available = available
 
-    def moe_a2a_lamport_available(self):
+    def moe_a2a_sentinel_available(self):
         return self.available
 
-    def moe_a2a_lamport_row_bytes(self, fmt, hidden, top_k):
+    def moe_a2a_sentinel_row_bytes(self, fmt, hidden, top_k):
         if hidden % 256:
-            raise ValueError(f"Lamport rows need hidden_size % 256 == 0, got {hidden}")
+            raise ValueError(f"Sentinel rows need hidden_size % 256 == 0, got {hidden}")
         return [hidden, hidden // 32, 2, 4 * hidden]
 
 

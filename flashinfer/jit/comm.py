@@ -448,7 +448,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
 
     Includes the CFT counted-write path, which is compiled in when the CUDA
     toolkit provides the logical-endpoint API (13.4+) and resolved from the
-    driver at runtime, and the Lamport path for small steps.
+    driver at runtime, the fence path and the sentinel path for small steps.
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
@@ -459,7 +459,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
         "nvlink_one_sided_alltoall",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_lamport.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_sentinel.cu",
             nv_internal
             / "tensorrt_llm"
             / "kernels"

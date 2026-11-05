@@ -15,11 +15,11 @@
  * limitations under the License.
  */
 
-// Lamport transport of the NVLink one-sided MoE all-to-all (flashinfer.moe_ep
+// Sentinel protocol of the NVLink one-sided MoE all-to-all (flashinfer.moe_ep
 // NVLinkOneSidedAlltoAll) for small steps: one dispatch and one combine kernel, no completion
 // flags and no fences between data and its readiness.
 //
-// Lamport arrival. Every landing row a peer writes into is armed with a sentinel word that no
+// Sentinel arrival. Every landing row a peer writes into is armed with a sentinel word that no
 // payload word takes (senders rewrite the few words that could, see canonicalize_*). A receiver
 // polls the data itself: a 16-byte vector has arrived when none of its four 32-bit words is the
 // sentinel (32-bit stores are single-copy atomic, so a torn vector still shows one). The
@@ -76,18 +76,18 @@
 #include <cstdint>
 #include <cstdio>
 
-// The kernels are built for compute capability 10.0, 10.3 and 10.7, where the transport is
-// validated. Other architectures get kernels that trap, and moe_a2a_lamport_kernels_available()
+// The kernels are built for compute capability 10.0, 10.3 and 10.7, where the protocol is
+// validated. Other architectures get kernels that trap, and moe_a2a_sentinel_kernels_available()
 // is false.
 #if defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
-#define MOE_A2A_LAMPORT_COMPILE 1
+#define MOE_A2A_SENTINEL_COMPILE 1
 #else
-#define MOE_A2A_LAMPORT_COMPILE 0
+#define MOE_A2A_SENTINEL_COMPILE 0
 #endif
 
 namespace flashinfer {
-namespace moe_alltoall_lamport {
+namespace moe_alltoall_sentinel {
 
 constexpr int kMaxRanks = 64;  // the active-rank mask is one 64-bit word
 constexpr int kMaxTopK = 22;   // the NVLink one-sided kernels' bound
@@ -192,7 +192,7 @@ struct CombineParams {
   int64_t timeout_cycles;
 };
 
-#if MOE_A2A_LAMPORT_COMPILE
+#if MOE_A2A_SENTINEL_COMPILE
 // ================================================================================ PTX helpers
 __device__ __forceinline__ uint4 load_volatile(void const* ptr) {
   uint4 v;
@@ -266,7 +266,7 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
 [[noreturn]] static __device__ __noinline__ void report_and_trap(int32_t* round_state, int ep_rank,
                                                                  char const* what) {
   if (atomicExch(round_state + kTimeoutReported, 1) == 0)
-    printf("Lamport transport: rank %d %s\n", ep_rank, what);
+    printf("Sentinel protocol: rank %d %s\n", ep_rank, what);
   __threadfence_system();
   __trap();
 }
@@ -675,14 +675,14 @@ __device__ __forceinline__ void receive_token_slot(DispatchParams const& p, int 
   if (timed_out)
     report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (dispatch)");
 }
-#endif  // MOE_A2A_LAMPORT_COMPILE
+#endif  // MOE_A2A_SENTINEL_COMPILE
 
 // ============================================================================= dispatch kernel
 // Any payload format and top-k (fixed at compile time, or at most TOP_K_CAPACITY).
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, int PAYLOAD_KIND, bool ENABLE_RANK_MASK>
 __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
-    moeA2ALamportDispatchKernel(DispatchParams const p) {
-#if MOE_A2A_LAMPORT_COMPILE
+    moeA2ASentinelDispatchKernel(DispatchParams const p) {
+#if MOE_A2A_SENTINEL_COMPILE
   constexpr int kRowCapacity = topk_row_vectors(TOP_K_CAPACITY);
   int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
   int const ids_row_vectors = topk_row_vectors(top_k);
@@ -728,11 +728,11 @@ __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
                                                      target_mask, ids_set_offset,
                                                      s_recv_source_mask);
 #else
-  __trap();  // not built for this architecture (see MOE_A2A_LAMPORT_COMPILE)
+  __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
 }
 
-#if MOE_A2A_LAMPORT_COMPILE
+#if MOE_A2A_SENTINEL_COMPILE
 // ============================================================================= combine phases
 // C1, warp 0: the ranks of the token's target slots (topk_target_ranks >= 0) in top-k slot
 // order into s_sources[0, n); lane 0 stores n.
@@ -888,12 +888,12 @@ __device__ __forceinline__ void rearm_ids_and_advance_epoch(CombineParams const&
     }
   }
 }
-#endif  // MOE_A2A_LAMPORT_COMPILE
+#endif  // MOE_A2A_SENTINEL_COMPILE
 
 // ============================================================================== combine kernel
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
-__global__ void __launch_bounds__(kNumThreads) moeA2ALamportCombineKernel(CombineParams const p) {
-#if MOE_A2A_LAMPORT_COMPILE
+__global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(CombineParams const p) {
+#if MOE_A2A_SENTINEL_COMPILE
   constexpr int kNumGroups = (TOP_K_CAPACITY + 7) / 8;
   int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
   int const token = blockIdx.x / p.blocks_per_token, chunk = blockIdx.x % p.blocks_per_token;
@@ -929,17 +929,17 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ALamportCombineKernel(Combin
     report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (combine)");
   rearm_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
 #else
-  __trap();  // not built for this architecture (see MOE_A2A_LAMPORT_COMPILE)
+  __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
 }
 
-// Defined in csrc/nvlink_one_sided_lamport.cu (the kernels' only translation unit).
-// Whether the code loaded for the current device carries the kernels (MOE_A2A_LAMPORT_COMPILE).
-bool moe_a2a_lamport_kernels_available();
-void moe_a2a_lamport_dispatch_launch(int payload_kind, DispatchParams const& params,
-                                     bool enable_rank_mask, bool enable_pdl, cudaStream_t stream);
-void moe_a2a_lamport_combine_launch(CombineParams const& params, bool enable_rank_mask,
-                                    bool enable_pdl, cudaStream_t stream);
+// Defined in csrc/nvlink_one_sided_sentinel.cu (the kernels' only translation unit).
+// Whether the code loaded for the current device carries the kernels (MOE_A2A_SENTINEL_COMPILE).
+bool moe_a2a_sentinel_kernels_available();
+void moe_a2a_sentinel_dispatch_launch(int payload_kind, DispatchParams const& params,
+                                      bool enable_rank_mask, bool enable_pdl, cudaStream_t stream);
+void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask,
+                                     bool enable_pdl, cudaStream_t stream);
 
-}  // namespace moe_alltoall_lamport
+}  // namespace moe_alltoall_sentinel
 }  // namespace flashinfer
