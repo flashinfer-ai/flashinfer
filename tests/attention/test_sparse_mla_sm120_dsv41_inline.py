@@ -297,6 +297,20 @@ def _inline_view(footer: torch.Tensor, fmt, span: int, pitch: int = 0) -> torch.
     return view
 
 
+def _assert_prefill_output_rounding(actual, expected):
+    # CuTe and legacy FP8 prefill have different FP32 reduction trees. Bound
+    # the resulting BF16 rounding difference while retaining a global error gate.
+    def ordered(x):
+        bits = x.view(torch.int16).int() & 0xFFFF
+        return torch.where(bits & 0x8000 != 0, 0xFFFF - bits, bits + 0x8000)
+
+    assert (ordered(actual) - ordered(expected)).abs().max().item() <= 2
+    relative_l2 = (
+        actual.double() - expected.double()
+    ).norm() / expected.double().norm().clamp_min(1e-30)
+    assert relative_l2.item() < 1e-4
+
+
 @pytest.mark.parametrize("tokens", [4, 128])  # decode / prefill
 @pytest.mark.parametrize("precision", ["default", "fp8", "bf16"])
 @pytest.mark.parametrize("extra", ["none", "fp8", "fp4"])
@@ -304,8 +318,7 @@ def _inline_view(footer: torch.Tensor, fmt, span: int, pitch: int = 0) -> torch.
 def test_inline_attention_matches_footer(
     tokens, precision, extra, main_span_pad, extra_span_pad, sm12x
 ):
-    """The same records stored inline (optionally in packed blocks) give the
-    footer-form output and LSE bit for bit on every DSV4_1 route."""
+    """Compare cache placements, accounting for the FP8 prefill reduction trees."""
     heads, topk, extra_topk = 16, 128, 64
     main_bs, extra_bs = 32, 64
     footer, extra_footer = _caches(extra, main_bs, extra_bs, seed=tokens)
@@ -365,8 +378,12 @@ def test_inline_attention_matches_footer(
     )
     torch.cuda.synchronize()
     assert torch.isfinite(ref_out).all()
-    assert torch.equal(out, ref_out)
-    assert torch.equal(lse, ref_lse)
+    if tokens > 64 and precision != "bf16" and extra != "fp4":
+        _assert_prefill_output_rounding(out, ref_out)
+        torch.testing.assert_close(lse, ref_lse, atol=2e-6, rtol=0)
+    else:
+        assert torch.equal(out, ref_out)
+        assert torch.equal(lse, ref_lse)
 
 
 @pytest.mark.parametrize("tokens", [4, 128])  # decode / prefill
@@ -535,7 +552,10 @@ def test_inline_one_row_pages_with_row_pitch_match_footer(
         None if extra_footer is None else _footer_to_inline(extra_footer, *_FP4),
     )
     torch.cuda.synchronize()
-    assert torch.equal(out, ref)
+    if tokens > 64 and precision != "bf16" and extra != "fp4":
+        _assert_prefill_output_rounding(out, ref)
+    else:
+        assert torch.equal(out, ref)
 
 
 @pytest.mark.parametrize("tokens", [4, 128])  # decode / prefill
