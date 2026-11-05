@@ -1870,9 +1870,21 @@ def test_misaligned_caller_out_matches_aligned(
     (``_OUT_ALIGN_BY_ROUTE``). A contiguous caller ``out`` 2 or 16 bytes off a
     32-byte boundary gets bitwise the aligned call's result through an aligned
     staging buffer, the bytes around it stay untouched, and an aligned ``out``
-    allocates nothing."""
+    allocates nothing.  On SM107 the low-head prefill cases run the early-PV
+    sibling up to its row ceiling (12 rows) and the route's program above it
+    (66 rows); elsewhere they run the route's program."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
     calls = _count_dispatches(monkeypatch)
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
     case = _build_case(
         num_heads=num_heads,
         dtype=dtype,
@@ -1888,6 +1900,11 @@ def test_misaligned_caller_out_matches_aligned(
     case.run(workspace=workspace, out=aligned, float_scales=True)
     torch.cuda.synchronize()
     assert calls and {r for r, _ in calls} == {route}
+    if route == "fp8_lowhead_prefill":
+        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
+        early = sm107 and sum(q_lens) <= 64 * min(sm_count, 216) // 216
+        assert set(launched) == {f"{route}_overlap" if early else route}, launched
 
     again = case.nan_out()
     after_alloc = _allocation_requests()

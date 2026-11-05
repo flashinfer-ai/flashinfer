@@ -1985,10 +1985,8 @@ _KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
 # program whose P x V MMAs start once the softmax has written the low half of
 # P and whose epilogues drain the output of the first V block while the MMA of
 # the second one runs, with the route's arguments, grid and launch and the
-# same output bits.  R200 (216 SMs), CUDA graphs of back-to-back calls and
-# single cold calls: the sibling led the route's program by 0.6-3.7 % on every
-# launch of 8-64 rows and trailed it by up to 3.2 % on some launches of 96-108
-# rows.
+# same output bits.  It takes the launches of at most the row ceiling below;
+# the larger launches keep the route's program.
 _OVERLAP_SIBLING_ROUTES = frozenset({"fp8_lowhead_prefill"})
 
 # The most query rows a launch may have to take the early-PV sibling, per

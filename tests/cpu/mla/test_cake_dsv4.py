@@ -4450,10 +4450,7 @@ def test_sm107a_one_wave_lowhead_swa_rows_launch_the_overlap_sibling(monkeypatch
     assert bound["total_work_items"] == 120 and bound["num_query_tokens"] == 60
     assert bound["cum_seq_lens_q"].data_ptr() == seq_lens.data_ptr()
     assert bound["O"].data_ptr() == out.data_ptr()
-    phase = cake.cake_dsv4_out_phase(
-        _LOWHEAD_PREFILL_ROUTE, num_heads=64, sparse_topk=128
-    )
-    assert phase == 0x800
+    assert out.data_ptr() % 4096 == 0x800
 
 
 @pytest.mark.cpu_only
