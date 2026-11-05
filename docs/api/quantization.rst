@@ -281,6 +281,9 @@ but rejects non-strided layouts and an empty last dimension. ``auto`` keeps
 its existing route. Passing preflight does not certify build,
 storage-address alignment, launch or numerical correctness. Batch-invariant
 preflight reuses that mode's existing device and dependency checks.
+Native and CuTe calls reject unknown scale-factor layouts before backend
+mapping. Batch-invariant calls reject non-strided tensors with
+``BatchInvariantUnsupportedError`` before preparing input.
 
 Fused gated-activation MXFP8 quantization (Cake, deterministic)
 ----------------------------------------------------------------

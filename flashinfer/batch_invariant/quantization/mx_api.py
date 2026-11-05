@@ -157,6 +157,12 @@ def _check_mxfp8_quantize_batch_invariant_inputs(
 ) -> Tuple[int, int, str]:
     """Validate the batch-invariant contract without preparing or quantizing input."""
     check_device(input.device, CLASS_MXFP8, MXFP8_QUANT_ARCHS)
+    if input.layout != torch.strided:
+        raise unsupported(
+            CLASS_MXFP8,
+            f"a {input.layout} input",
+            "strided inputs of shape (..., K)",
+        )
     if input.dtype not in _DTYPE_STR:
         raise unsupported(
             CLASS_MXFP8, f"input dtype {input.dtype}", "bf16, f16 or fp32 inputs"
