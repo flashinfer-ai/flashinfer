@@ -58,7 +58,7 @@ to be different terms. The model gives a configuration no way to reach an output
 is instantiated on the whole enumerated configuration space); that the kernel realises the model is what the engine's
 lowering trace and the GPU configuration-agreement tests establish. What Lean cannot state is the hardware hypothesis that the instruction variants a
 configuration space selects compute the same per-element function; the GPU configuration-agreement tests check it bit
-for bit.
+for bit. A second hardware hypothesis of the block-scaled classes: the block-scaled step gives the same bits with its two operands exchanged, which the swapped decode records (`swap_ab`: the weights as the kernel's A, the tokens as its B) rely on; the dispatcher takes those records up to 64 rows and the dense records above, so the rows of a 64-row and a 65-row call are compared bit for bit in `test_batch_invariance_along_rows` of the mxfp8 and fp4 suites (M = 63, 64, 65 among the row counts), and every swapped record against the dense one in `test_swapped_decode_records_compute_the_class`, on each part.
 
 `Cases.lean` is generated from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
 the Lean model reproduces the Python S-expressions node for node, re-derives the dispatchers' shape rules and checks

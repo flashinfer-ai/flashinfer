@@ -7834,6 +7834,7 @@ def mm_mxfp8(
     backend: Literal[
         "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
+    *,
     batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)

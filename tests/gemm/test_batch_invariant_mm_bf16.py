@@ -280,6 +280,36 @@ def test_tactic_encoding_round_trips():
         )
 
 
+def test_non_kernel_source_exclusions_are_current():
+    """Every source excluded from a module's cache key (the dispatcher's host-side files) exists and is in the module's import
+    closure: a stale entry raises instead of silently letting the file back into the key."""
+    import flashinfer.batch_invariant.jit as J
+
+    clear = getattr(
+        J.module_sources, "cache_clear", lambda: None
+    )  # the closure is memoised per module
+    for module, entries in list(J.MODULE_NON_KERNEL_SOURCES.items()):
+        saved = J.MODULE_NON_KERNEL_SOURCES[module]
+        try:
+            J.MODULE_NON_KERNEL_SOURCES[module] = ()
+            clear()
+            full = set(J.relative_sources(module))
+            for r in entries:
+                assert (J._FI_DIR / r).exists(), (module, r)
+                assert r in full, (module, r)
+            J.MODULE_NON_KERNEL_SOURCES[module] = saved + (
+                "gemm/batch_invariant/does_not_exist.py",
+            )
+            clear()
+            with pytest.raises(
+                FileNotFoundError, match="not in the module's import closure"
+            ):
+                J.relative_sources(module)
+        finally:
+            J.MODULE_NON_KERNEL_SOURCES[module] = saved
+            clear()
+
+
 def test_cache_key_covers_every_kernel_source():
     """The compiled-kernel cache key is the kernel sources (the blocks, the fixup, the specification and generator they
     import, the vendored tile scheduler) and not the dispatcher's host-side selection code (chunk rule, heuristic): an edit to
@@ -782,6 +812,16 @@ def test_chunk_count_must_be_positive():
     assert not can_implement(forced, 16, 4096, 4096, "n", 1)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
         mm_bf16_batch_invariant(a, b, config=forced, chunks=1)
+    # the output may not alias an operand (the bits would depend on which CTA runs first)
+    buf = torch.empty(16, 4096, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        mm_bf16_batch_invariant(buf, b, out=buf)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
+    ):
+        mm_bf16_batch_invariant(a, b, out=b[:16])
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
         mm_bf16_batch_invariant(a, b, chunks=0)
 
@@ -791,7 +831,18 @@ def test_chunk_count_must_be_positive():
 
 @needs_device
 @pytest.mark.parametrize(
-    "M,N,K", [(1000, 4096, 4096), (37, 128, 8192), (300, 64, 16384)]
+    "M,N,K",
+    [
+        (1000, 4096, 4096),
+        (37, 128, 8192),
+        (300, 64, 16384),
+        (
+            37,
+            72,
+            8192,
+        ),  # a partial last tile: the bias read one element at a time, through the split class
+        (300, 4008, 4096),  # ... and through the unsplit class
+    ],
 )
 def test_bias_matches_the_exact_reference(M, N, K):
     """The biased chain against an exact oracle: on integer-valued operands every fp32 intermediate of the fold is exact
@@ -900,7 +951,7 @@ def test_unsupported_bias_inputs_raise():
     # class, the in-CTA fold) and on the workspace split, whose fixup reads the bias
     out = torch.empty(16, N, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
+        bi.BatchInvariantUnsupportedError, match="bias overlapping the output"
     ):
         bi_mm(a, b, bias=out[0], out=out)
     Ns, Ks = 128, 8192  # the split class: C = 4
@@ -910,13 +961,13 @@ def test_unsupported_bias_inputs_raise():
     out_s = torch.empty(16, Ns, dtype=torch.bfloat16, device="cuda")
     ws_rec = Knobs((128, 64), (1, 1), False, True, "m", 1)
     with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
+        bi.BatchInvariantUnsupportedError, match="bias overlapping the output"
     ):
         mm_bf16_batch_invariant(
             a_s, b_s, out=out_s, bias=out_s[0], config=ws_rec, chunks=Cs
         )
     with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
+        bi.BatchInvariantUnsupportedError, match="bias overlapping the output"
     ):
         bi_mm(
             a_s, b_s, bias=out_s[0], out=out_s

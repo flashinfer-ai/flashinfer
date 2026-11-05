@@ -455,19 +455,11 @@ def _run(
     b3 = b_nk.as_strided(
         (N, Kc, C), (b_nk.stride(0), b_nk.stride(1), Kc * b_nk.stride(1))
     )
-    # the output may not overlap what the chain reads while it writes the output: the scales and the bias, read by the
-    # epilogue of a direct store and by the fixup of the workspace split alike
-    for t, what in (
-        *((sc, "a scale") for sc in scales),
-        *(((bias, "the bias"),) if bias is not None else ()),
-    ):
-        if _overlaps(out, t):
-            raise unsupported(
-                cls,
-                f"the output overlapping {what}",
-                "an output disjoint from the scales and the bias (they are read while the output is written)",
-            )
+    reads = [(a, "A"), (b_nk, "B"), *((sc, "a scale") for sc in scales)]
+    if bias is not None:
+        reads.append((bias, "the bias"))
     if direct:
+        _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
@@ -475,25 +467,10 @@ def _run(
     # applied there, once)
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
+        _require_disjoint(cls, [(out, "the output")], reads)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        operands = (
-            (a, "A"),
-            (b_nk, "B"),
-            (out, "the output"),
-            *((sc, "a scale") for sc in scales),
-        )
-        if bias is not None:
-            operands += ((bias, "the bias"),)
-        for t, what in operands:
-            if _overlaps(t, ws):
-                raise unsupported(
-                    cls,
-                    f"{what} overlapping the workspace",
-                    "a workspace disjoint from the operands, the output, the scales and the bias (the partials are "
-                    "written there while the operands are read and before the fixup reads them; the test compares byte "
-                    "spans, so a workspace inside a strided tensor's gaps is rejected too)",
-                )
+        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
@@ -881,6 +858,10 @@ def bmm_fp8_batch_invariant(
             B_scale,
         )
         return out
+    if workspace is None:
+        # one fp32 workspace for every batch element, reused in stream order (one element's launches complete before the
+        # next element's are issued on the same stream), instead of an allocation per element
+        workspace = torch.empty(C * M * N, dtype=torch.float32, device=A.device)
     for i in range(b):  # the split classes: one launch of the class per batch element
         _run(
             A[i],

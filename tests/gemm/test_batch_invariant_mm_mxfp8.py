@@ -450,6 +450,59 @@ def test_flag_bypasses_the_operator_backend_selection():
 
 
 @needs_device
+def test_in_cluster_split_store_staging_is_stable_under_repeats():
+    """The in-cluster split's owner stores every C-th subtile through a staging buffer indexed by its own store count; with
+    several subtiles per owner and a stage count sharing a factor with C, a global-index scheme would reuse one buffer under
+    a store still in flight. Forced ``cluster_k = 2`` records at a shape with several subtiles per owner, repeated, against
+    the workspace split."""
+    fam = part_of(torch.device("cuda"))[1]
+    fmt = mx_class_for("mxfp8", fam)
+    M, N, K = 300, 512, 16384
+    C = chunks_for(N, K, fmt)
+    assert C == 2
+    a, sfa = adv_mx(M, K, 151)
+    b, sfb = weight(N, K, 152)
+    ref = bits(
+        mm_mxfp8_batch_invariant(
+            a,
+            b,
+            sfa,
+            sfb,
+            config=Knobs((128, 64), (1, 1), False, True, "m", 1),
+            chunks=C,
+        )
+    )
+    recs = [
+        k
+        for k in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
+        if k.cluster_k == C and k.tile_n >= 128
+    ]
+    assert recs
+    for k in recs[:: max(1, len(recs) // 4)]:
+        for _ in range(12):
+            got = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=k, chunks=C))
+            assert torch.equal(got, ref), k.describe()
+
+
+def test_unlisted_compute_capability_raises():
+    """The family selects the block-scaled instruction, hence the bits: a capability outside the mode's parts raises instead
+    of borrowing a family."""
+    from flashinfer.gemm.batch_invariant.heuristic import family_of
+
+    assert family_of((10, 7)) == "sm_107" and family_of((10, 0)) == "sm_100"
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="not a part of the mode"
+    ):
+        family_of((9, 0))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="not a part of the mode"
+    ):
+        bi.fingerprint(
+            "mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch=(12, 0)
+        )
+
+
+@needs_device
 @pytest.mark.parametrize("M,N,K", [(300, 4096, 4096), (37, 128, 8192), (8, 4096, 4096)])
 def test_determinism_and_graph_replay(M, N, K):
     a, sfa = adv_mx(M, K, 21)
@@ -483,7 +536,7 @@ def test_batch_invariance_along_rows():
     a, sfa = adv_mx(2049, K, 31)
     b, sfb = weight(N, K, 32)
     full = bits(bi_mm(a, b, sfa, sfb))
-    for M in (1, 2, 7, 16, 32, 37, 64, 128, 256, 512, 1000, 2049):
+    for M in (1, 2, 7, 16, 32, 37, 63, 64, 65, 128, 256, 512, 1000, 2049):
         sub = a[:M].contiguous()
         rows = e8m0(sfa, 2049, K)[:M]
         sfm = swizzle_sf((torch.log2(rows) + 127).to(torch.uint8))

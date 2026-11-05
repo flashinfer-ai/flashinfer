@@ -139,7 +139,14 @@ def module_sources(module: str) -> Tuple[Path, ...]:
             raise FileNotFoundError(f"{module}: cache key source {r} is missing")
         seen.add(p)
     for r in MODULE_NON_KERNEL_SOURCES.get(module, ()):
-        seen.discard((_FI_DIR / r).resolve())
+        p = (_FI_DIR / r).resolve()
+        if p not in seen:
+            # a listed exclusion that is not in the closure is a stale entry (the file moved, or stopped being imported):
+            # silently ignoring it would let a renamed dispatcher file back into the cache key
+            raise FileNotFoundError(
+                f"{module}: non-kernel source {r} is not in the module's import closure; update MODULE_NON_KERNEL_SOURCES"
+            )
+        seen.discard(p)
     return tuple(sorted(seen))
 
 

@@ -661,7 +661,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
 def test_chunk_count_and_workspace_checks():
     """``chunks`` must be positive (the typed error, not a division by zero), and a caller workspace may not overlap the
     output or a scale: the split class writes its partials there before the fixup reads them."""
-    b, M, N, K = 1, 64, 128, 8192  # N = 128: the chunk rule splits
+    b, M, N, K = (
+        3,
+        64,
+        128,
+        8192,
+    )  # N = 128: the chunk rule splits; b = 3: one workspace reused per element
     A, B = adv_fp8(b, M, K, seed=131), weights(b, N, K, 132)
     sa, sb = scales()
     # a caller-forced configuration the kernel cannot implement: the 16-wide tile of the 2-CTA pair needs a K-major weight
@@ -683,18 +688,60 @@ def test_chunk_count_and_workspace_checks():
         A, B, sa, sb, torch.bfloat16, workspace=ws[: C * M * N]
     )
     assert torch.equal(bits(got), ref)
+    for i in range(
+        b
+    ):  # every element through the one reused workspace equals its own single-element call
+        single = bmm_fp8_batch_invariant(
+            A[i : i + 1], B[i : i + 1], sa, sb, torch.bfloat16
+        )
+        assert torch.equal(bits(got[i]), bits(single[0])), i
+    # the output may not alias an input or a scale on either launch path: the bits would depend on which CTA runs first
+    buf = torch.empty(M, 2 * N, dtype=torch.uint8, device="cuda")
+    out_alias = buf.view(
+        torch.bfloat16
+    )  # (M, N) bf16 over the same bytes as the (M, K <= 2N) fp8 operand below
+    a_alias = buf[:, : min(K, 2 * N)].view(torch.float8_e4m3fn)
+    Ka = a_alias.shape[1]
+    w_alias = weights(1, N, Ka, 133)[0]
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        mm_fp8_batch_invariant(a_alias, w_alias, sa, sb, out=out_alias)
+    a2 = adv_fp8(M, 4096, seed=134)
+    w_buf = torch.empty(N, 4096, dtype=torch.float8_e4m3fn, device="cuda")
+    out_w = (
+        w_buf.view(torch.uint8).view(-1)[: 2 * M * N].view(torch.bfloat16).view(M, N)
+    )  # a contiguous output over the weight's first rows
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
+    ):
+        mm_fp8_batch_invariant(a2, w_buf.t(), sa, sb, out=out_w)
+    out_s = torch.empty(M, 4096, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="a scale overlapping the output"
+    ):
+        mm_fp8_batch_invariant(
+            a2,
+            weights(1, 4096, 4096, 135)[0],
+            out_s.view(torch.float32)[0, :1],
+            sb,
+            out=out_s,
+        )
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
     ):
         bmm_fp8_batch_invariant(A, B, ws[:1], sb, torch.bfloat16, workspace=ws)
+    big = torch.empty(
+        b * 16 * K // 4, dtype=torch.float32, device="cuda"
+    )  # a workspace holding the (b, 16, K) operand below
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
         bmm_fp8_batch_invariant(
-            ws.view(torch.float8_e4m3fn)[: b * 16 * K].view(b, 16, K),
+            big.view(torch.float8_e4m3fn).view(b, 16, K),
             B,
             sa,
             sb,
             torch.bfloat16,
-            workspace=ws,
+            workspace=big,
         )
     out = ws.view(torch.bfloat16)[: b * M * N].view(b, M, N)
     with pytest.raises(
