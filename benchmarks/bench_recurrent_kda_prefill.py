@@ -50,9 +50,9 @@ Metadata, sequence ordering, build/JIT, graph capture, and state-pool reset are
 outside the measured region.
 
 ``--host-timing`` additionally measures eager host-call return latency and
-completed-call wall time on an idle device. These warm-cache measurements
-include Python dispatch and any internal synchronization, unlike CUPTI kernel
-time. State-pool reset stays outside the timed region.
+completed-call wall time on an idle device. These measurements include Python
+dispatch and any internal synchronization, unlike CUPTI kernel time. They do
+not flush L2, and state-pool reset stays outside the timed region.
 Add ``--inference-mode`` to create and consume inference tensors as a serving
 loop would; tensors without version counters can take different metadata-cache
 paths from the default versioned tensors.

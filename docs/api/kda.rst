@@ -524,7 +524,7 @@ eager host-return and completed-call latency alongside its CUPTI GPU timings::
 counter can change metadata caching and introduce host reads in serving loops.
 Host-return time includes Python dispatch and any synchronization inside the
 call; completed-call time also waits for GPU completion. These additional
-measurements use warm caches, exclude state-pool reset, and cover only the
+measurements do not flush L2, exclude state-pool reset, and cover only the
 FlashInfer candidate. They are not directly comparable to the cold-L2 CUPTI
 kernel samples or end-to-end serving throughput. ``--host-timing`` cannot be
 combined with ``--cuda-graph``.
