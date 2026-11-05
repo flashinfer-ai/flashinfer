@@ -21,6 +21,7 @@ from .checkpointing_ssu import (
     checkpointing_ssu,
 )
 from .replayssm_materialize import replayssm_materialize
+from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 __all__ = [
     "cake_selective_state_update",
@@ -28,6 +29,8 @@ __all__ = [
     "checkpointing_ssu",
     "allocate_checkpointing_ssu_scratch",
     "replayssm_materialize",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
 ]
 
 try:

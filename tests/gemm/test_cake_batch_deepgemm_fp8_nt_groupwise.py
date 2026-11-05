@@ -638,7 +638,7 @@ def test_sm107a_cells_match_reference(row):
 
 def test_sm107a_cell_keys_and_nearest_fallback():
     """Each cell key selects its tag; a key without a cell takes the nearest cell on
-    N=128 K=512 and N=512 K=128 and no cell on N=7168 K=2048."""
+    N=128 K=512 and N=512 K=128 and no cell on N=4096 K=7168 and N=7168 K=2048."""
     for nk, cells in _SM107A_CELLS.items():
         for tag, keys in cells.items():
             for groups, em4 in keys:
@@ -654,3 +654,4 @@ def test_sm107a_cell_keys_and_nearest_fallback():
     assert _cell_tag(128, 512, 1000, 1) is not None
     assert _cell_tag(7168, 2048, 1000, 1) is None
     assert _cell_tag(4096, 7168, 1, 128) is None
+    assert _cell_tag(4096, 7168, 1000, 1) is None

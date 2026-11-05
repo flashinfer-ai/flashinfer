@@ -316,9 +316,9 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
     # ``_fastmath``, kernel key ``_fm``); the rows pin the program apart from that axis.  The pair
     # kernel is always fast-math and spells it ahead of its register and grid suffixes.
     # Round 35: a fast-math token-queue program spells ``_fastmath`` before ``_clc_token_queue``.
-    # Round 38: a ``_ROUND_38_CELLS`` cell runs the lever build of the row's program, whose label
-    # adds the lever's (test_round_38_cells_take_their_lever_programs checks it exactly).
-    lever = _round_38_lever(arch, sm_count, M, K, False, plan.kernel_key)[1]
+    # Rounds 38 and 39: a ``_LEVER_CELLS`` cell runs the lever build of the row's program, whose
+    # label adds the lever's (test_lever_cells_take_their_lever_programs checks it exactly).
+    lever = _lever_cell(arch, sm_count, M, K, False, plan.kernel_key)[1]
     token_queue = plan.schedule_id.endswith("_clc_token_queue")
     program_schedule = plan.schedule_id.removesuffix(lever).removesuffix(
         "_clc_token_queue"
@@ -452,8 +452,8 @@ def test_round_2_cells_take_their_table_program():
                 assert flags[cb._PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1"
                 # the fence-free twin (_crfnone) appends _authored_fences
                 # (a ``_clc`` program appends ``_clc_token_queue``)
-                # (a round-38 lever program appends its lever's label)
-                lever = _round_38_lever(arch, sm_count, M, K, False, key)[1]
+                # (a round-38 or round-39 lever program appends its lever's label)
+                lever = _lever_cell(arch, sm_count, M, K, False, key)[1]
                 schedule = (
                     plan.schedule_id.removesuffix(lever)
                     .split("_fastmath")[0]
@@ -499,9 +499,11 @@ def test_round_2_cells_take_their_table_program():
             # sm_100a (4096, 1), sm_103a (4096, 1) write cells at 148 SMs (``_clc``); rounds 33 and
             # 34: so do the token-queue write cells whose dense cell runs the same ``_clc`` program.
             # Round 38 builds the sm_103a (256, 7) cells at 148 SMs with ``_fplr3`` (dense) and
-            # ``_fplr2`` (write), so that write cell leaves its dense cell's program.
+            # ``_fplr2`` (write), so that write cell leaves its dense cell's program; round 39 does
+            # the same to the sm_100a (256, 7) cells at 148 SMs and builds both sm_100a (256, 4)
+            # cells at 148 SMs with ``_fplr3``, so that write cell runs its dense cell's program.
             on_dense = (arch, sm_count, M, K) in {
-                ("sm_100a", 148, 256, 7),
+                ("sm_100a", 148, 256, 4),
                 ("sm_100a", 148, 4096, 1),
                 ("sm_100a", 148, 4096, 7),
                 ("sm_103a", 148, 4096, 1),
@@ -521,9 +523,11 @@ def test_round_2_cells_take_their_table_program():
     # round 34 the token-queue write cells sm_100a [(1024, 4)] at 148 SMs and sm_103a [(1024, 1)]
     # at 152 SMs; round 37 builds the sm_103a held K1 cell (1024, 1) at 148 SMs with ``_fpl``;
     # round 38 builds the sm_103a write cells (256, 4), (256, 7) at 148 SMs and (256, 7) at 152
-    # SMs with ``_fplr2``.
+    # SMs with ``_fplr2``; round 39 the sm_100a write cells (256, 4) (``_fplr3``) and (256, 7)
+    # (``_fplr2``) and the sm_103a token-queue write cell (1024, 4) (``_fplr3``) at 148 SMs.
     assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
-        ("sm_100a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
+        ("sm_100a", 148, 256, 4, "persistent:k4_nc3_d2_f110000000000000_fm_fplr3"),
+        ("sm_100a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm_fplr2"),
         ("sm_100a", 148, 1024, 1, "persistent:k1_nc4_d2_f110000000000000_clc"),
         ("sm_100a", 148, 1024, 4, "persistent:k4_nc3_d2_f111000000000000_clc"),
         ("sm_100a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
@@ -542,7 +546,7 @@ def test_round_2_cells_take_their_table_program():
                 "persistent:k1_nc4_d3_f010000000100000_crheld_fpl",
             ],
         ),
-        ("sm_103a", 148, 1024, 4, "persistent:k4_nc3_d2_f111000000000000_clc"),
+        ("sm_103a", 148, 1024, 4, "persistent:k4_nc3_d2_f111000000000000_clc_fplr3"),
         ("sm_103a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         (
             "sm_103a",
@@ -704,9 +708,10 @@ def test_round_2_cells_take_their_table_program():
         plan_route("sm_100a", 148, 768, 5, False).kernel_key
         == "pair:k5_nc2_pbf16a_fm_cr232"
     )
+    # round 39: the ``_fplr3`` build of the (512, 5) program
     assert (
         plan_route("sm_100a", 148, 512, 5, False).kernel_key
-        == "persistent:k5_nc4_d2_f111000000000000_rcp"
+        == "persistent:k5_nc4_d2_f111000000000000_rcp_fplr3"
     )
     # Round 3: twelve sm_100a K2 / K3 cells run the fence-authored twins of their persistent
     # programs: the key of the fenced program plus ``_crfnone`` (a registered program of its own,
@@ -839,10 +844,16 @@ def test_held_release_cells_take_the_held_programs():
     for sm_count in SM_COUNTS:
         for pdl in (False, True):
             plan = plan_route("sm_103a", sm_count, 1024, 5, pdl)
-            assert (
-                plan.kernel_key == "persistent:k5_nc4_d3_f001000000000000_fm_crheld_rcp"
-            ), (sm_count, pdl, plan)
-            assert plan.schedule_id.endswith(
+            # Round 39: at 148 SMs the cell runs the ``_fplr2`` build of the held program
+            key, lever = _lever_cell(
+                "sm_103a", sm_count, 1024, 5, False, plan.kernel_key
+            )
+            assert key == "persistent:k5_nc4_d3_f001000000000000_fm_crheld_rcp", (
+                sm_count,
+                pdl,
+                plan,
+            )
+            assert plan.schedule_id.removesuffix(lever).endswith(
                 "_held_release_packed_register_carry_fastmath"
             ), plan
             assert "_early_consume" not in plan.schedule_id, plan
@@ -883,8 +894,8 @@ def test_packed_register_carry_cells_take_the_packed_programs():
         fpl = (arch, sm_count, M, K) == ("sm_103a", 148, 512, 3)
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, M, K, pdl)
-            # Round 38: a ``_ROUND_38_CELLS`` cell runs the lever build of the program
-            key, lever = _round_38_lever(arch, sm_count, M, K, False, plan.kernel_key)
+            # Rounds 38 and 39: a ``_LEVER_CELLS`` cell runs the lever build of the program
+            key, lever = _lever_cell(arch, sm_count, M, K, False, plan.kernel_key)
             assert plan.kind == "persistent" and plan.fallback_from is None, plan
             assert key.endswith("_rcp_fpl" if fpl else "_rcp"), (
                 arch,
@@ -1383,11 +1394,13 @@ def test_clc_cells_take_the_token_queue_programs():
     or snapshot-write plan runs one."""
 
     def clc_cells(table_name):
+        # (a lever build of a ``_clc`` program, ``_LEVER_CELLS``, is a token-queue program too)
+        write = table_name == "WRITE_PERSISTENT_KEY_CELLS"
         return {
             (arch, sm_count, M, K)
             for arch, sm_count, M, K, value in _r2_cells(table_name)
             if any(
-                str(key).endswith("_clc")
+                _lever_cell(arch, sm_count, M, K, write, str(key))[0].endswith("_clc")
                 for key in (value if isinstance(value, (list, tuple)) else (value,))
             )
         }
@@ -1594,10 +1607,12 @@ def test_clc_cells_take_the_token_queue_programs():
             dense_key = f"{write_key.removesuffix('_write')}_clc"
             dense = cb._persistent_plan_for_key(arch, sm_count, M, K, pdl, dense_key)
             plan = plan_route(arch, sm_count, M, K, pdl, block_write_idx=K)
+            # Round 39: the sm_103a (1024, 4) cell at 148 SMs runs the ``_fplr3`` build
+            key, lever = _lever_cell(arch, sm_count, M, K, True, plan.kernel_key)
             assert plan.kind == "persistent" and plan.fallback_from is None, plan
-            assert plan.kernel_key == f"{write_key}_clc", (arch, M, K, pdl, plan)
+            assert key == f"{write_key}_clc", (arch, M, K, pdl, plan)
             assert (plan.grid_x, plan.threads) == (M, cb.PERSISTENT_THREADS), plan
-            assert plan.schedule_id == f"{dense.schedule_id}_write", plan
+            assert plan.schedule_id == f"{dense.schedule_id}{lever}_write", plan
             assert plan.route_id.endswith(f".pdl{int(pdl)}.clc_token_queue"), plan
             assert ".write1." in plan.route_id, plan
             if MODULES:
@@ -1646,9 +1661,7 @@ def test_round_31_cells_take_their_programs():
         for pdl in (False, True):
             plan = plan_route("sm_103a", sm_count, M, K, pdl)
             # Round 38: (152, 384, 4) runs the ``_fplr3`` build of its program
-            static, _ = _round_38_lever(
-                "sm_103a", sm_count, M, K, False, plan.kernel_key
-            )
+            static, _ = _lever_cell("sm_103a", sm_count, M, K, False, plan.kernel_key)
             assert (plan.kind, static, plan.grid_x) == (kind, key, grid_x), (
                 sm_count,
                 M,
@@ -1833,7 +1846,7 @@ def test_round_33_cells_take_their_programs():
                 arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
             )
             # Round 38: (152, 384, 5) runs the ``_fplr3`` build of its program
-            static = _round_38_lever(arch, sm_count, M, K, write, plan.kernel_key)[0]
+            static = _lever_cell(arch, sm_count, M, K, write, plan.kernel_key)[0]
             assert (plan.kind, static, plan.grid_x) == (
                 "persistent",
                 key,
@@ -2289,7 +2302,9 @@ def test_round_35_cells_take_their_programs():
             plan = plan_route(
                 arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
             )
-            assert (plan.kind, plan.kernel_key) == ("persistent", key), (
+            # Round 39: the sm_103a (1024, 4) write cell at 148 SMs runs the ``_fplr3`` build
+            static = _lever_cell(arch, sm_count, M, K, write, plan.kernel_key)[0]
+            assert (plan.kind, static) == ("persistent", key), (
                 arch,
                 sm_count,
                 M,
@@ -2586,29 +2601,89 @@ _ROUND_38_LEVERS = {
     "_fpwr2": "_first_chunk_prefetch_l2_warps_first_chunk_prefetch_l2_rows2",
     "_fpwr3": "_first_chunk_prefetch_l2_warps_first_chunk_prefetch_l2_rows3",
 }
+# Round 39: thirteen more cells run the program they ran before built with a row-capped
+# first-token L2 prefetch (``_fplr<R>`` / ``_fpwr<R>``), at both PDL modes, on the program's own
+# grid; the sm_103a snapshot-write (1024, 4) cell at 148 SMs runs the ``_fplr3`` build of its
+# token-queue program (one CTA per token).  Same layout as ``_ROUND_38_CELLS``.
+_ROUND_39_CELLS = {
+    ("sm_100a", 148, 256, 4, False): (
+        ("persistent:k4_nc3_d2_f110000000000000_fm_fplr3",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 256, 4, True): (
+        ("persistent:k4_nc3_d2_f110000000000000_fm_write_fplr3",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 256, 7, False): (
+        ("persistent:k7_nc4_d2_f111000000000000_fm_fplr3",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 256, 7, True): (
+        ("persistent:k7_nc4_d2_f111000000000000_fm_write_fplr2",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 384, 4, False): (
+        ("persistent:k4_nc3_d2_f110000000000000_fm_fplr3",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 384, 6, False): (
+        ("persistent:k6_nc4_d2_f110000000000000_fm_fplr3",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 384, 7, False): (
+        ("persistent:k7_nc4_d2_f110000000000000_fm_fpwr2",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 384, 8, False): (
+        ("persistent:k8_nc5_d2_f110000000000000_fm_fplr2",) * 2,
+        148,
+    ),
+    ("sm_100a", 148, 512, 5, False): (
+        ("persistent:k5_nc4_d2_f111000000000000_rcp_fplr3",) * 2,
+        128,
+    ),
+    ("sm_100a", 148, 512, 7, False): (
+        ("persistent:k7_nc4_d2_f110000000000000_fm_fplr3",) * 2,
+        128,
+    ),
+    ("sm_103a", 148, 512, 4, False): (
+        ("persistent:k4_nc3_d2_f111000000000000_fm_rcp_fplr3",) * 2,
+        128,
+    ),
+    ("sm_103a", 148, 1024, 4, True): (
+        ("persistent:k4_nc3_d2_f111000000000000_write_clc_fplr3",) * 2,
+        1024,
+    ),
+    ("sm_103a", 148, 1024, 5, False): (
+        ("persistent:k5_nc4_d3_f001000000000000_fm_crheld_rcp_fplr2",) * 2,
+        148,
+    ),
+}
+# Every cell that runs a first-token prefetch lever build of the program it ran before.
+_LEVER_CELLS = {**_ROUND_38_CELLS, **_ROUND_39_CELLS}
 
 
-def _round_38_lever(arch, sm_count, M, K, write, key):
+def _lever_cell(arch, sm_count, M, K, write, key):
     """(the key without its lever suffix, the schedule label of the lever) for the key a
-    ``_ROUND_38_CELLS`` cell runs; ``(key, "")`` for any other cell."""
-    if (arch, sm_count, M, K, write) not in _ROUND_38_CELLS:
+    ``_LEVER_CELLS`` cell runs; ``(key, "")`` for any other cell."""
+    if (arch, sm_count, M, K, write) not in _LEVER_CELLS:
         return key, ""
     lever = next(s for s in _ROUND_38_LEVERS if key.endswith(s))
     return key.removesuffix(lever), _ROUND_38_LEVERS[lever]
 
 
-def test_round_38_cells_take_their_lever_programs():
-    """Round 38: each ``_ROUND_38_CELLS`` cell runs its lever program at both PDL modes,
+def test_lever_cells_take_their_lever_programs():
+    """Rounds 38 and 39: each ``_LEVER_CELLS`` cell runs its lever program at both PDL modes,
     registered and without a fallback, with the persistent thread count, on the grid of its
     program without the suffix.  Its schedule label is that program's label plus the lever's
     (before ``_write`` for a snapshot-write cell)."""
-    for (arch, sm_count, M, K, write), (keys, grid_x) in sorted(
-        _ROUND_38_CELLS.items()
-    ):
+    for (arch, sm_count, M, K, write), (keys, grid_x) in sorted(_LEVER_CELLS.items()):
         for pdl in (False, True):
             key = keys[int(pdl)]
             lever = next(s for s in _ROUND_38_LEVERS if key.endswith(s))
-            static = key.removesuffix(lever).removesuffix("_write" if write else "")
+            static = key.removesuffix(lever)
+            if write:  # ``_write`` sits before the ``_clc`` group of a token-queue key
+                static = static.replace("_write", "", 1)
             base = cb._persistent_plan_for_key(arch, sm_count, M, K, pdl, static)
             plan = plan_route(
                 arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
@@ -2808,9 +2883,11 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     ):
         # Rounds 33 to 35: the cell runs the token-queue build of its write program, one CTA
         # per token
-        # (test_clc_cells_take_the_token_queue_programs checks it exactly).
-        assert plan.schedule_id.endswith("_clc_token_queue_write"), plan
-        assert plan.kernel_key.endswith("_write_clc") and plan.grid_x == M, plan
+        # (test_clc_cells_take_the_token_queue_programs checks it exactly); round 39 builds the
+        # sm_103a (1024, 4) cell with ``_fplr3``.
+        key, lever = _lever_cell(arch, SM_COUNT, M, K, True, plan.kernel_key)
+        assert plan.schedule_id.endswith(f"_clc_token_queue{lever}_write"), plan
+        assert key.endswith("_write_clc") and plan.grid_x == M, plan
         return
     if (arch, SM_COUNT, M, K, True) in _ROUND_37_CELLS:
         # Round 37: the cell runs the ``_fpl`` build of its write program
@@ -2818,10 +2895,10 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
         assert plan.schedule_id.endswith("_first_chunk_prefetch_l2_lanes_write"), plan
         assert plan.kernel_key.endswith("_write_fpl"), plan
         return
-    if (arch, SM_COUNT, M, K, True) in _ROUND_38_CELLS:
-        # Round 38: the cell runs a lever build of its write program
-        # (test_round_38_cells_take_their_lever_programs checks it exactly).
-        key, lever = _round_38_lever(arch, SM_COUNT, M, K, True, plan.kernel_key)
+    if (arch, SM_COUNT, M, K, True) in _LEVER_CELLS:
+        # Rounds 38 and 39: the cell runs a lever build of its write program
+        # (test_lever_cells_take_their_lever_programs checks it exactly).
+        key, lever = _lever_cell(arch, SM_COUNT, M, K, True, plan.kernel_key)
         assert plan.schedule_id.endswith(f"{lever}_write"), plan
         assert key.endswith("_write"), plan
         return

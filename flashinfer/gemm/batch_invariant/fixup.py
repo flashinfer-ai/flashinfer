@@ -1,13 +1,17 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Split-K fixup: ``out[m, n] = cvt_rn( ((+0 + W[m,n,0]) + W[m,n,1]) + ... )`` over the C fp32 chunk partials, in
-chunk order (the ``chunk`` fold digit of the chunked specification). All math through ``CuteF32``; vectorised over n
-with 16-byte loads; columns predicated; the grid's y extent is capped (``MAX_GRID_Y``) and each block strides over the
-rows, so any M launches."""
+"""Split-K fixup: ``out[m, n] = chain( ((+0 + W[m,n,0]) + W[m,n,1]) + ... )`` over the C fp32 chunk partials, in
+chunk order (the ``chunk`` fold digit of the chunked specification), the chain being the class's epilogue chain
+(``cvt.rn`` for bf16; ``mul.rn alpha`` then ``cvt.rn`` for the fp8 classes, ``alpha = mul.rn(a_scale, b_scale)``
+formed on the device from the two per-tensor scales; ``add.rn bias`` of the output column then ``cvt.rn`` for the
+biased bf16 class: the bias enters once, here, after the whole chunk fold, and the partials are bias-free). All math through ``CuteF32``; vectorised over n with 16-byte
+loads; columns predicated; the grid's y extent is capped (``MAX_GRID_Y``) and each block strides over the rows, so
+any M launches."""
 
 from __future__ import annotations
 
 import functools
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -16,6 +20,7 @@ from cutlass import Float32, Int32
 from ...batch_invariant import jit
 from ...batch_invariant.fp_interface.cute import CuteF32, get_cutlass_dtype
 from .blocks.compile import MODULE
+from .spec import EpilogueChain
 
 VEC = 4  # fp32 per 16-byte load
 THREADS = 256
@@ -23,8 +28,8 @@ MAX_GRID_Y = 65535  # the hardware's grid.y limit; rows beyond it are strided ov
 
 
 class SplitKFixup:
-    def __init__(self, C: int, out_dtype):
-        self.C, self.out_dtype = C, out_dtype
+    def __init__(self, C: int, out_dtype, chain: EpilogueChain):
+        self.C, self.out_dtype, self.chain = C, out_dtype, chain
 
     @cute.jit
     def __call__(
@@ -32,7 +37,7 @@ class SplitKFixup:
     ):
         """``rows = min(M, MAX_GRID_Y)`` is the grid's y extent (chosen by the caller); block ``by`` handles rows ``by, by + rows, ...``."""
         n_vec = cute.ceil_div(N, VEC)
-        self.kernel(mW, mY, M, N, n_vec, rows).launch(
+        self.kernel(mW, mY, None, None, None, M, N, n_vec, rows).launch(
             grid=[cute.ceil_div(n_vec, THREADS), rows, 1],
             block=[THREADS, 1, 1],
             stream=stream,
@@ -43,6 +48,9 @@ class SplitKFixup:
         self,
         mW: cute.Tensor,
         mY: cute.Tensor,
+        mSa: Optional[cute.Tensor],
+        mSb: Optional[cute.Tensor],
+        mBias: Optional[cute.Tensor],
         M: Int32,
         N: Int32,
         n_vec: Int32,
@@ -51,6 +59,11 @@ class SplitKFixup:
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()
         v = bx * THREADS + tidx
+        alpha = None
+        if cutlass.const_expr(self.chain.scaled):
+            alpha = CuteF32.mul(
+                mSa[0], mSb[0]
+            )  # alpha = mul.rn(a_scale, b_scale), once per block
         if v < n_vec:
             n0 = v * VEC
             for m in cutlass.range(by, M, rows, unroll=1):
@@ -60,14 +73,74 @@ class SplitKFixup:
                         acc = CuteF32.const(0.0)
                         for c in cutlass.range_constexpr(self.C):
                             acc = CuteF32.add(acc, mW[m, n, c])
-                        mY[m, n] = acc.to(mY.element_type)
+                        # the chain once, after the chunk fold: the fp32 ops, then the single conversion
+                        bias = None
+                        if cutlass.const_expr(self.chain.biased):
+                            bias = CuteF32.widen(mBias[n])
+                        mY[m, n] = self.chain.apply_pre(CuteF32, acc, alpha, bias).to(
+                            mY.element_type
+                        )
+
+
+class SplitKFixupScaled(SplitKFixup):
+    """The fp8 classes' fixup: ``alpha = mul.rn(a_scale, b_scale)`` then the chain ``mul.rn alpha``, ``cvt.rn``."""
+
+    @cute.jit
+    def __call__(
+        self,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        mSa: cute.Tensor,
+        mSb: cute.Tensor,
+        M: Int32,
+        N: Int32,
+        rows: Int32,
+        stream,
+    ):
+        n_vec = cute.ceil_div(N, VEC)
+        self.kernel(mW, mY, mSa, mSb, None, M, N, n_vec, rows).launch(
+            grid=[cute.ceil_div(n_vec, THREADS), rows, 1],
+            block=[THREADS, 1, 1],
+            stream=stream,
+        )
+
+
+class SplitKFixupBias(SplitKFixup):
+    """The biased bf16 class's fixup: the chain ``add.rn bias`` of the output column, then ``cvt.rn``; the (N,) bf16 bias
+    is one more operand."""
+
+    @cute.jit
+    def __call__(
+        self,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        mBias: cute.Tensor,
+        M: Int32,
+        N: Int32,
+        rows: Int32,
+        stream,
+    ):
+        n_vec = cute.ceil_div(N, VEC)
+        self.kernel(mW, mY, None, None, mBias, M, N, n_vec, rows).launch(
+            grid=[cute.ceil_div(n_vec, THREADS), rows, 1],
+            block=[THREADS, 1, 1],
+            stream=stream,
+        )
 
 
 @functools.cache
-def get_fixup(C: int, out_dtype_name: str = "bf16"):
-    """One fixup kernel per chunk count; M and N are runtime arguments."""
+def get_fixup(
+    C: int, out_dtype_name: str = "bf16", scaled: bool = False, bias: bool = False
+):
+    """One fixup kernel per chunk count, output format and chain; M and N are runtime arguments."""
+    assert not (scaled and bias), "no class has both the scale and the bias"
     out_dt = get_cutlass_dtype(out_dtype_name)
-    name = jit.sanitize_symbol_name(f"splitk_fixup_C{C}_{out_dtype_name}")
+    chain = EpilogueChain.for_class(out_dtype_name, scaled, bias)
+    name = jit.sanitize_symbol_name(
+        f"splitk_fixup_C{C}_{out_dtype_name}"
+        + ("_scaled" if scaled else "")
+        + ("_bias" if bias else "")
+    )
 
     def compile_fn():
         sym_m, sym_n = cute.sym_int(64), cute.sym_int(32, divisibility=4)
@@ -84,8 +157,42 @@ def get_fixup(C: int, out_dtype_name: str = "bf16"):
             assumed_align=16,
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if bias:
+            bias_fake = cute.runtime.make_fake_tensor(
+                get_cutlass_dtype("bf16"), (sym_n,), (1,), assumed_align=16
+            )
+            return cute.compile(
+                SplitKFixupBias(C, out_dt, chain),
+                w_fake,
+                y_fake,
+                bias_fake,
+                Int32(1),
+                Int32(1),
+                Int32(1),
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+        if scaled:
+            sa_fake = cute.runtime.make_fake_tensor(
+                Float32, (1,), (1,), assumed_align=4
+            )
+            sb_fake = cute.runtime.make_fake_tensor(
+                Float32, (1,), (1,), assumed_align=4
+            )
+            return cute.compile(
+                SplitKFixupScaled(C, out_dt, chain),
+                w_fake,
+                y_fake,
+                sa_fake,
+                sb_fake,
+                Int32(1),
+                Int32(1),
+                Int32(1),
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
-            SplitKFixup(C, out_dt),
+            SplitKFixup(C, out_dt, chain),
             w_fake,
             y_fake,
             Int32(1),

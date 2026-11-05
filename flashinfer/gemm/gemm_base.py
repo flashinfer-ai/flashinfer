@@ -398,6 +398,20 @@ def _require_contiguous_a_column_major_b(
         )
 
 
+def _cutlass_bf16_is_aligned(k: int, n: int, out_dtype: torch.dtype) -> bool:
+    # The kernel computes out^T, so K and N are the contiguous dimensions of its
+    # TMA operands; can_implement() rejects rows that are not 16-byte aligned.
+    return k % 8 == 0 and n % (16 // out_dtype.itemsize) == 0
+
+
+def _require_cutlass_bf16_alignment(k: int, n: int, out_dtype: torch.dtype) -> None:
+    if not _cutlass_bf16_is_aligned(k, n, out_dtype):
+        raise ValueError(
+            "The CUTLASS backend requires K divisible by 8 and N divisible by "
+            f"{16 // out_dtype.itemsize} for {out_dtype} output, got K={k} and N={n}."
+        )
+
+
 @supported_compute_capability([100, 103, 107])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
@@ -422,6 +436,9 @@ def _cutlass_mm_bf16_requirement(
     _require_contiguous_a_column_major_b(a, b, "CUTLASS")
 
     _validate_bf16_output_dtype(out_dtype)
+    _require_cutlass_bf16_alignment(
+        a.shape[-1], b.shape[-1], out.dtype if out is not None else out_dtype
+    )
 
     return True
 
@@ -819,13 +836,17 @@ def mm_bf16(
 
     batch_invariant: bool
         ``True`` runs the batch-invariant bf16 GEMM class in place of the
-        backends (requires ``backend="auto"``, bf16 output and no bias): a
+        backends (requires ``backend="auto"`` and bf16 output): a
         row of the output is bit-identical whatever the number of rows, the
         row's position in the batch or the configuration chosen, and the
         result is deterministic. Under autotuning the class's top
         configurations for the shape are profiled; all of them compute the
         same bits. ``b`` may be the row-major ``(k, n)`` tensor or the
-        transpose of a row-major ``(n, k)`` weight. Unsupported inputs raise
+        transpose of a row-major ``(n, k)`` weight. A bf16 ``bias`` of shape
+        ``(n,)`` is added once, in fp32, to the fully reduced accumulator
+        before the single rounding to bf16 (a biased call is a different
+        specification: ``flashinfer.batch_invariant.fingerprint("mm_bf16", N=,
+        K=, bias=True)``). Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
@@ -932,6 +953,9 @@ def _cutlass_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    _require_cutlass_bf16_alignment(
+        A.shape[-1], B.shape[-1], out.dtype if out is not None else out_dtype
+    )
 
     return True
 
@@ -2221,6 +2245,9 @@ def get_gemm_sm100_module_cutlass_bf16():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
+                a, b, _, _, out, _ = inputs
+                if not _cutlass_bf16_is_aligned(a.shape[-1], b.shape[-1], out.dtype):
+                    return []
                 return list(range(module.bf16_gemm_tactic_num()))
 
             def forward(
@@ -10242,6 +10269,7 @@ def _cudnn_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     return _cudnn_available_or_raise_for_backend(backend)
 
@@ -10255,6 +10283,7 @@ def _cublas_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     return True
 
@@ -10268,6 +10297,7 @@ def _cutlass_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
@@ -10286,6 +10316,7 @@ def _cute_dsl_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     """Requirement check for CuTe-DSL FP8 BMM backend."""
     if not CUTE_DSL_AVAILABLE:
@@ -10323,6 +10354,7 @@ def _check_bmm_fp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     _validate_fp8_output_dtype(dtype)
     return True
@@ -10342,6 +10374,7 @@ def _heuristic_func_bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     # No e5m2 for cutlass (but cute-dsl supports it)
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -10424,6 +10457,8 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -10451,6 +10486,21 @@ def bmm_fp8(
         The backend to use for the operation. Defaults to ``"cublas"``.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
         ``"cute-dsl"`` uses CuTe-DSL kernels optimized for SM100+ (Blackwell/Rubin) architectures.
+
+    batch_invariant: bool
+        ``True`` runs the batch-invariant fp8 GEMM class in place of the
+        backends (requires ``backend="auto"``, A and B of one fp8 dtype, bf16
+        or fp16 output): every batch element is one launch of the class, so a
+        row's bits are identical whatever the number of rows, the row's
+        position, the batch size, the element's position in the batch or the
+        configuration chosen, and the result is deterministic.
+        ``A_scale * B_scale`` is formed once on the device and applied after
+        the fold. Under autotuning the class's top configurations for the
+        shape are profiled; all of them compute the same bits. Unsupported
+        inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        Defaults to ``False``.
 
     Returns
     -------
@@ -10481,6 +10531,11 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
+
+    if batch_invariant:
+        from .batch_invariant.tuning import bmm_fp8_batch_invariant_auto
+
+        return bmm_fp8_batch_invariant_auto(A, B, A_scale, B_scale, dtype, out, backend)
 
     if out is None:
         out = torch.empty(

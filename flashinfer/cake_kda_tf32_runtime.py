@@ -134,6 +134,16 @@ BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
 # there).
 BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS = 2
 BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
+# The work-bin turnover launches that take their module's 128-token turnover
+# build where the loader names one (``_RENDERED_WORK_BIN_TURN_E128_ROUTES``,
+# see _work_bin_turn_e128_program): every sequence exactly this many tokens.
+# That build loads the entering state of a bin's first task on the compute
+# warps (the loader warp starts at the bin's second task); its bits are those
+# of the turnover build.  Measured on a 152-SM sm_103a: launches of 128-token
+# sequences gain at 1.1 to 33 tasks per SM, while launches of 97 to 127 tokens
+# per sequence lose on some shapes, so every other turnover launch keeps the
+# turnover build.
+BF16_WORK_BIN_TURN_E128_LEN = 128
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
 # loop: a CTA of the one-task-per-CTA body pays it for every task, a bin of the
 # turnover build hides it beside the previous task's chunks.  An unbounded
@@ -1624,6 +1634,33 @@ def _work_bin_turn_short_program(
     for module, turnover in turn.items():
         if turnover == program and module in short:
             return short[module]
+    return None
+
+
+def _work_bin_turn_e128_scope(seq_lens) -> bool:
+    """Whether a work-bin turnover launch of ``seq_lens`` takes the 128-token
+    turnover build: every sequence holds exactly
+    ``BF16_WORK_BIN_TURN_E128_LEN`` tokens."""
+    return min(seq_lens) == max(seq_lens) == BF16_WORK_BIN_TURN_E128_LEN
+
+
+def _work_bin_turn_e128_program(program, gpu_arch: str, seq_lens):
+    """The ``_RENDERED_WORK_BIN_TURN_E128_ROUTES`` build beside the work-bin
+    turnover build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``) for a launch
+    of ``seq_lens``, or ``None``: ``None`` on an architecture whose table is
+    empty (no further work) and for a launch outside
+    _work_bin_turn_e128_scope."""
+    if program is None:
+        return None
+    e128 = getattr(_kda_registry, "_RENDERED_WORK_BIN_TURN_E128_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not e128 or not _work_bin_turn_e128_scope(seq_lens):
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in e128:
+            return e128[module]
     return None
 
 
@@ -4602,6 +4639,16 @@ class FlashKDABlackwellBF16FusedLaunch:
                     num_heads,
                     sm_count,
                 )
+                # Else a turnover launch whose sequences all hold exactly
+                # BF16_WORK_BIN_TURN_E128_LEN tokens takes the module's
+                # 128-token turnover build where the loader names one: the
+                # same bins, table and bits with the compute warps loading a
+                # bin's first entering state (swapped in below like the
+                # short-task build).
+                if turn_short_program is None:
+                    turn_short_program = _work_bin_turn_e128_program(
+                        getattr(self.module, "name", None), gpu_arch, seq_lens
+                    )
             work_bin_upload = _upload_int32_batch(
                 q.device,
                 {"seq_order": list(work_bin_table) + list(bin_mix_plan or ())},

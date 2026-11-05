@@ -56,8 +56,9 @@ its dtype is rounded to a multiple of the dtype's smallest subnormal
 its columns' weight gradient infinite or ``NaN``: ``NaN`` where the infinite
 term is in the last row and the last row block is partial (its padding rows
 reread that row and multiply it by zero), as in the deterministic backward.
-On sm_103a from 700 rows per SM up to 12000 (from 12000 the long backward,
-whose fold is the FP64 fold above) the mid backward runs instead: the long
+On sm_100a from 800 rows per SM and on sm_103a from 700, up to 12000 (from
+12000 the long backward, whose fold is the FP64 fold above), the mid backward
+runs instead: the long
 backward whose threads keep their folded FP32 runs, and whose CTAs keep their
 column sums over their row groups, as FP32 two-sum pairs (a sum and its error
 term) instead of FP64, converting a column's pair to FP64 once for the atomic
@@ -126,8 +127,8 @@ Host design (the input layout rules are the deterministic package's):
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 4104 bytes each, at most one per
   backward module (two per weight-gradient dtype: the backward and the long
-  backward; three on sm_103a, with the mid backward) for every stream that ran
-  such a backward.  Such eager calls also
+  backward; three on sm_100a and sm_103a, with the mid backward) for every
+  stream that ran such a backward.  Such eager calls also
   keep a reserve of 64 zero-filled workspaces per device (one allocation of
   about 272 KiB, filled outside any capture), from which a call during CUDA
   Graph capture takes the workspace of its capture and capture stream for
@@ -157,12 +158,12 @@ Host design (the input layout rules are the deterministic package's):
   backward launches
   ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
   ctas_per_sm * SMs)``: 256-thread CTAs of 16-row blocks with
-  ``ctas_per_sm = 4`` (one wave); on sm_100a from 1280 rows per SM and on
+  ``ctas_per_sm = 4`` (one wave); on sm_100a from 800 rows per SM and on
   sm_103a from 700 the same CTAs, whose thread 0 warms the next block of
   packed rows in L2 with one bulk prefetch a tensor, with
   ``ctas_per_sm = 5``, a quarter more than an SM holds at once (an SM starts
-  its fifth CTA as one of its first four leaves): on sm_103a the mid backward
-  up to 12000 rows per SM and the long backward from there; and on sm_107a
+  its fifth CTA as one of its first four leaves): the mid backward up to
+  12000 rows per SM and the long backward from there; and on sm_107a
   from 1024 rows per SM 128-thread CTAs of 8-row
   blocks with ``ctas_per_sm = 8`` (one wave); on every architecture up to
   256 rows the short backward launches one cluster of 16 256-thread CTAs
@@ -178,15 +179,15 @@ Host design (the input layout rules are the deterministic package's):
   after the table ran out leaves without a row.  Each thread folds its FP32
   sums into FP64 after at most 16 of its rows (a CTA of a few blocks adds them
   across its warps in FP32 first and converts once; the mid backward on
-  sm_103a folds them into FP32 two-sum pairs).  No kernel is
+  sm_100a and sm_103a folds them into FP32 two-sum pairs).  No kernel is
   cooperative, and no CTA waits for another but within the short backward's
   cluster (each CTA waits for the other CTAs' partials of its columns); no
   call synchronizes the host or the device, and every kernel runs on the
   current torch stream.
 - Beside kernels resident on other streams (FlashInfer issue #7548; observed on
   B200, sm_100a): each 256-thread CTA of the backward (every architecture),
-  of the long backward on sm_100a and sm_103a and of the mid backward on
-  sm_103a needs 20736 bytes of dynamic
+  of the long and the mid backward on sm_100a and sm_103a needs 20736 bytes
+  of dynamic
   shared memory (each 128-thread CTA of the long backward on sm_107a 10496),
   so a kernel holding every SM with a small shared-memory carveout delays the
   start of those backwards until it exits;

@@ -74,7 +74,7 @@ kernel_cake_rmsnorm_det_train_56f988dde54db37f09d9(__nv_bfloat16* __restrict__ g
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dot_slots = reinterpret_cast<float*>(smem_raw + 0);
     const int dot_slots_addr = smem + 0;
     int* flags = reinterpret_cast<int*>(smem_raw + 128);
