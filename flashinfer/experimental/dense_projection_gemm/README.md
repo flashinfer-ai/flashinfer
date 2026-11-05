@@ -32,8 +32,8 @@ deterministic already.*
 | K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles, or the deterministic plan's two-way split of K with the partials added in a fixed order) |
 | K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
 | K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row -- without a split count, while no router table gives the forward a verdict, without the per-call check of the row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
-| K2 input gradient (`router_dgrad`, `kn`) | the token windows of its `ROUTER_RULES` rows (on 212-SM `sm_107a` and 148-SM `sm_100a` / `sm_103a` parts `ROUTER_RULES_BY_SM`): the exact-FP32 SIMT program `router_fp32_dgrad_simt_*` -- one FFMA per product of the FP32 operands read in place, every element of `out` stored once; on 148-SM parts (1 to 32 tokens) its compensated form.  Every other row, token count and part: deterministic program (one split) |
-| K2 weight gradient (`router_wgrad`, `nn_t`) | the SIMT token windows of its rows in the router tables (`ROUTER_RULES`; on 212-SM `sm_107a` and 148-SM `sm_100a` / `sm_103a` parts `ROUTER_RULES_BY_SM`): the exact-FP32 SIMT program `router_fp32_gemm_simt_*` on the CUDA cores, every element of `out` stored once; on 148-SM parts (1 to 160 tokens) its compensated form.  The rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
+| K2 input gradient (`router_dgrad`, `kn`) | the token windows of its `ROUTER_RULES` rows (on 212-SM `sm_107a` and 148-SM `sm_100a` / `sm_103a` parts `ROUTER_RULES_BY_SM`): the exact-FP32 SIMT program `router_fp32_dgrad_simt_*` -- one FFMA per product of the FP32 operands read in place, every element of `out` stored once.  Every other row, token count and part: deterministic program (one split) |
+| K2 weight gradient (`router_wgrad`, `nn_t`) | the SIMT token windows of its rows in the router tables (`ROUTER_RULES`; on 212-SM `sm_107a` and 148-SM `sm_100a` / `sm_103a` parts `ROUTER_RULES_BY_SM`): the exact-FP32 SIMT program `router_fp32_gemm_simt_*` on the CUDA cores, every element of `out` stored once; on 148-SM parts at one token at hidden 4096 its compensated form.  The rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
 | BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
 
 *Table: the routing of `deterministic=False` (`cake_backend.ROUTES`).*
@@ -42,10 +42,10 @@ deterministic already.*
 
 | property | contract |
 |---|---|
-| operands and accumulation | BF16 operands with FP32 accumulation (K1); FP32 operands split exactly into three BF16 terms with FP32 accumulation (K2), except in a K2 SIMT window (input and weight gradient): the FP32 operands as they are on the CUDA cores with compensated sums (per output a sum and its compensation: Kahan adds of short FMA chains, or in the Dot2 form each product's rounding error kept; the slices merged by TwoSum with their compensations), no BF16x3 split.  No silent TF32 or BF16 for the router |
+| operands and accumulation | BF16 operands with FP32 accumulation (K1); FP32 operands split exactly into three BF16 terms with FP32 accumulation (K2), except in a K2 SIMT window (input and weight gradient): the FP32 operands as they are on the CUDA cores, one FFMA per product (in the compensated Dot2 form of the 148-SM tables' one-token window at hidden 4096, per output a sum and its compensation, each product's rounding error kept and the slices merged by TwoSum with their compensations), no BF16x3 split.  No silent TF32 or BF16 for the router |
 | accuracy | the deterministic package's budgets against FP64 of the exact operands, worst over repeated runs: BF16 out `atol = rtol = 1e-2`; FP32 out relative Frobenius error `<= 5e-5` and max error `<= 1e-3 * max abs(ref)`; router `<= 2e-6` relative Frobenius error and no row whose top-8 experts differ from FP64 (outside near ties of the 8th and 9th logits).  At the largest token counts some thin K1 rows miss the BF16 (FP32) budget with the deterministic program and with this package's program alike; there the row keeps its route.  The deterministic program: BF16 output of `sm_100a` `4096 -> 32`, `4096 -> 48`, `4096 -> 64`, `5120 -> 32`, `5120 -> 48` and of `sm_103a` `4096 -> 32`, `4096 -> 48`, `5120 -> 32`, `5120 -> 48`, `5120 -> 64`, `5120 -> 128` (from 45058, 49153, 65536 or 65537 tokens up by row: the K1 token tables below), and FP32 output of the rows of the odd-block K1 table at an odd number of K blocks from 98305 tokens up.  This package's program: BF16 output of `sm_100a` `4096 -> 64` from about 43009 to 65535 tokens and `5120 -> 32` at 47105 to 65536 tokens, of `sm_103a` `4096 -> 32` from about 49153 to 65535 tokens, and on 148-SM parts of `sm_103a` `5120 -> 48` from 49152 tokens, `5120 -> 64` at 47104 and from 49153 tokens and `5120 -> 128` from 65537 tokens |
 | rounding | each output element is rounded once, from its complete FP32 sum |
-| subnormals | kept: K1 adds the partials with IEEE round-to-nearest adds, K2 reduces with the TMA reduce-add; a K2 SIMT window (input and weight gradient) accumulates with round-to-nearest FMAs and adds, merges the sums of a CTA's slices and their compensations in a fixed order through shared memory and stores every element of `out` once, with no reduce-add; nothing flushes to zero |
+| subnormals | kept: K1 adds the partials with IEEE round-to-nearest adds, K2 reduces with the TMA reduce-add; a K2 SIMT window (input and weight gradient) accumulates with round-to-nearest FMAs and adds, merges the sums of a CTA's slices (and in the Dot2 form their compensations) in a fixed order through shared memory and stores every element of `out` once, with no reduce-add; nothing flushes to zero |
 | run-to-run bits, K1 | two splits (every `sm_100a` and `sm_103a` row, `sm_107a` `8192 -> 128`): repeat bit for bit (one add of two values); one split (`sm_107a` rows marked `p = 1` below): repeat bit for bit (whole tiles); three or four splits (the other `sm_107a` rows): vary in the last bits |
 | run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); a SIMT window (weight or input gradient): repeats bit for bit (every element stored once, its slices merged in a fixed order); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
 | architectures | `sm_100a`, `sm_103a`, `sm_107a`: one `-gencode=arch=compute_<arch>,code=sm_<arch>` build per program, minimum CUDA 12.8 / 12.9 / 13.4 (`build.json`) |
@@ -80,7 +80,9 @@ table (the 212-SM K1 token-range table below), except those token counts; the ro
 `K1_TWO_SPLIT_RANGES_BY_SM` at its token ranges, at either number of 64-token K blocks (the same table on 212 SMs,
 `4096 -> 128` FP32 included; on 152-SM `sm_100a` / `sm_103a` parts the 152-SM two-split table below).  Before all of
 these, the rows of `K1_CHAIN_RANGES_BY_SM` run the one-split program of several accumulation chains at that table's
-token ranges on parts of exactly its SM count, at both block parities (the K1 accumulation-chain table below).  A K1
+token ranges on parts of exactly its SM count, at both block parities (the K1 accumulation-chain table below); next,
+the rows of `K1_ONE_SPLIT_RANGES_BY_SM` run the one-split program of one chain at that table's token ranges on parts
+of exactly its SM count, at both block parities (the 152-SM one-split table below).  A K1
 program runs only at token counts where its output met the deterministic package's budgets against FP64 (the accuracy
 row above) on every measured seed; the ratio of its FP64 relative Frobenius error to the deterministic program's on
 the same operands (q) is reported in the tables below as data, not as a rule.  Where both programs miss the budget,
@@ -120,6 +122,7 @@ it.  The measured parts have 148 and 152 SMs (`sm_100a` /
 | `K1_TWO_SPLIT_RANGES_BY_SM` | `(arch, sm_count)`, then a key as in `K1_SPLIT_RULES` (below the row's floor: a key of that part's table in `K1_SPLIT_RULES_BY_SM`) | `((min_tokens, max_tokens, (block_n, num_splits)), ...)`: on a part of exactly `sm_count` SMs, below the row's floor or at or above it, a token count from `min_tokens` to `max_tokens` runs that program at either number of 64-token K blocks, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; a range lies outside `K1_SPLIT_RULES_BY_SM_TOKENS` and the row's ranges in `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and `K1_SPLIT_RANGE_OVERRIDES_BY_SM` (`sm_107a`: 212 SMs, the two-split rows of the 212-SM K1 token-range table below, `4096 -> 128` FP32 without a verdict in the part's table of `K1_SPLIT_RULES_BY_SM`; `sm_100a` / `sm_103a`: 152 SMs, the 152-SM two-split table below) |
 | `K1_SPLIT_OVERRIDES_BY_SM` | `(arch, sm_count)` | verdicts (keys and values as in `K1_SPLIT_RULES`) that replace a row's `K1_SPLIT_RULES` verdict on parts of exactly `sm_count` SMs at or above the row's floor, at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; every other token count and SM count keeps the `K1_SPLIT_RULES` verdict (no entry) |
 | `K1_CHAIN_RANGES_BY_SM` | `(arch, sm_count)`, then a key of `K1_SPLIT_RULES` | `((min_tokens, max_tokens, (block_n, chains)), ...)`: on a part of exactly `sm_count` SMs, a token count from `min_tokens` to `max_tokens` runs this package's one-split program of that tile width with that many accumulation chains (`k1_chain_plan`; the chain counts this package ships are `K1_CHAINS_CHOICES`), before every table above, `K1_TWO_SPLIT_RANGES_BY_SM` included (`sm_107a`: 212 and 216 SMs, the K1 accumulation-chain table below) |
+| `K1_ONE_SPLIT_RANGES_BY_SM` | `(arch, sm_count)`, then a key as in `K1_SPLIT_RULES` | `((min_tokens, max_tokens, block_n), ...)`: on a part of exactly `sm_count` SMs, a token count from `min_tokens` to `max_tokens` runs this package's one-split program of that tile width and one accumulation chain, at an even and an odd number of 64-token K blocks alike, before every table above except `K1_CHAIN_RANGES_BY_SM` (`sm_100a` / `sm_103a`: 152 SMs, the 152-SM one-split table below) |
 | `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`), `"nn_t"` (weight gradient, `hidden` = the launch's `M`) or `"kn"` (input gradient, `hidden` = the launch's `N`), `experts` = the launch's `N` (`K` of the input gradient) | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward and of the input gradient; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"`, a unit count (this package's stream-K program) or `"simt_n<tile_n>m<tile_m>s<slices>[<form>]"` (the exact-FP32 SIMT program of the row's layout, `router_simt`: plain without a form, compensated with `g<group>` or, on a weight-gradient row, `dot2`; the only spec of an input-gradient row) |
 | `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`; below a SIMT window too) or with a table of its own in `ROUTER_RULES_BY_SM` |
 | `ROUTER_RULES_BY_SM` | `(arch, sm_count)` | the router verdicts of the parts with exactly `sm_count` SMs (keys and values as in `ROUTER_RULES`; `router_rules` picks the table of a device); such a part takes its own table only: a row without an entry, and every token count outside its windows, runs the deterministic program (`sm_100a` / `sm_103a`: 148 SMs; `sm_107a`: 208 and 212 SMs) |
@@ -128,8 +131,8 @@ it.  The measured parts have 148 and 152 SMs (`sm_100a` /
 
 | architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
-| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) from 1024 to 4096 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program (hidden 4096 `"simt_n128m64s2"` from 1 to 224 tokens, hidden 5120 and 6144 `"simt_n64m64s2"` from 1 to 256 tokens) and hidden 5120 `"H0.5x3"` (10240 to 16384 tokens); on 148 SMs the compensated SIMT programs from 1 to 160 tokens at hidden 4096, 5120 and 6144 (the compensated SIMT table below); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count, hidden 4096 above 224 tokens and hidden 6144 above 256 tokens: deterministic (6 splits) |
-| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed); `4096 -> 128` FP32 on 152 SMs: (64, 2) from 1024 to 6144 tokens (the 152-SM two-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program `"simt_n64m64s2"` (hidden 4096 from 1 to 288 tokens, hidden 5120 from 1 to 192 tokens, hidden 6144 from 1 to 256 tokens), hidden 4096 `"H1x4p44"`, hidden 5120 `"H0.5x3"` and hidden 6144 `"H1x5p44"` (the head/tail program with the BF16 parts of `A` in tensor memory); on 148 SMs the compensated SIMT programs from 1 to 160 tokens at hidden 4096, 5120 and 6144 (the compensated SIMT table below); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count: deterministic (6 splits) |
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) from 1024 to 4096 tokens (the 152-SM two-split table).  FP32 on 152 SMs, first: `4096 -> 32` (64, 1) from 256 to 2048 tokens, `4096 -> 128` (64, 1) from 256 to 3328 tokens, at every K-block count (the 152-SM one-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program (hidden 4096 `"simt_n128m64s2"` from 1 to 224 tokens, hidden 5120 and 6144 `"simt_n64m64s2"` from 1 to 256 tokens) and hidden 5120 `"H0.5x3"` (10240 to 16384 tokens); on 148 SMs the SIMT programs of the 148-SM SIMT table below (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256 tokens); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count, hidden 4096 above 224 tokens and hidden 6144 above 256 tokens: deterministic (6 splits) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed); `4096 -> 128` FP32 on 152 SMs: (64, 2) from 1024 to 6144 tokens (the 152-SM two-split table).  FP32 on 152 SMs, first: `4096 -> 32` (64, 1) from 256 to 2048 tokens, `4096 -> 128` (64, 1) from 256 to 2816 tokens, at every K-block count (the 152-SM one-split table) | deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program `"simt_n64m64s2"` (hidden 4096 from 1 to 288 tokens, hidden 5120 from 1 to 192 tokens, hidden 6144 from 1 to 256 tokens), hidden 4096 `"H1x4p44"`, hidden 5120 `"H0.5x3"` and hidden 6144 `"H1x5p44"` (the head/tail program with the BF16 parts of `A` in tensor memory); on 148 SMs the SIMT programs of the 148-SM SIMT table below (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256 tokens); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count: deterministic (6 splits) |
 | `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table (the four FP32 rows with one split: from 961 tokens up).  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the router window tables: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
 | `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024`, `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel the head/tail program missed at both hidden sizes on the parts at full SM clock |
 | `sm_107a` (212 SMs, 16172 to 16384 tokens and the ranges of the 212-SM K1 token-range table) | `4096 -> 32, 48, 64` FP32 (64, 3); `5120 -> 32, 48, 64` FP32 (64, 3); `8192 -> 128` (128, 2); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32: (192, 1) `p = 1` (row-major-store program, 176 CTAs); `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  At the two-split ranges of the 212-SM K1 token-range table, at either number of 64-token K blocks (`K1_TWO_SPLIT_RANGES_BY_SM`): `4096 -> 512`, `5120 -> 512` FP32 (128, 2); `4096 -> 1024` FP32 (192, 2) (row-major-store program); `5120 -> 1024` FP32 (256, 2); `4096 -> 128` FP32 (64, 2) from 1024 to 7680 tokens (no verdict in the 212-SM table: deterministic at every other token count).  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict, as on 208 SMs); `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed; `4096 -> 4096` FP32 against the deterministic package's 160-wide tiles of the row); `5120 -> 1024` BF16: (256, 1) `p = 1` at its range of the 212-SM K1 token-range table (`K1_SPLIT_RANGE_OVERRIDES_BY_SM`), deterministic at 16172 to 16384 tokens (1.3 to 2.5 % faster there, missed on 208 SMs) | deterministic (4 splits) | 256 experts, hidden 4096 and 5120 from 1 to 256 tokens and hidden 6144 from 1 to 224 tokens: the SIMT program `"simt_n128m64s2"`; hidden 5120 and 6144 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program with the BF16 parts of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES_BY_SM`).  Every other token count, and hidden 4096 above 256 tokens: deterministic (6 splits): next to a resident kernel `"H0.5x4"` missed at hidden 4096 with both head/tail programs, and at hidden 6144 with the three-chunk-buffer program |
@@ -320,6 +323,42 @@ times the deterministic program's (graph replays, both GPUs; 8.65 against 12.14 
 512 tokens it is slower than the deterministic program, and at 8192 tokens slower next to a kernel holding 32 SMs; at
 6144 tokens on the GB200 part its time next to a kernel holding SMs on another stream was 1.099 times the deterministic
 program's.*
+
+| K1 row `d_in -> d_out` (FP32 out) | 152 SMs: token ranges, every K-block count (`K1_ONE_SPLIT_RANGES_BY_SM`) | measured token counts: passed | measured token counts: failed |
+|---|---|---|---|
+| `sm_100a` `4096 -> 32`: (64, 1) | 256 to 2048 | 256; 384; 512; 768; 800; 1024; 1025; 1536; 1600; 2048 | 2049*; 2304; 2560; 2561*; 2816; 3072; 4096 |
+| `sm_100a` `4096 -> 128`: (64, 1) | 256 to 3328 | 256; 384; 512; 768; 800; 1024; 1025; 1536; 1600; 2048; 2049; 3072; 3073; 3328 | 3584; 3585*; 3840; 4096 |
+| `sm_103a` `4096 -> 32`: (64, 1) | 256 to 2048 | 256; 384; 512; 768; 800; 1024; 1025; 1536; 1600; 2048 | 2049*; 2304; 2560; 2561*; 2816; 3072; 4096 |
+| `sm_103a` `4096 -> 128`: (64, 1) | 256 to 2816 | 256; 384; 512; 768; 800; 1024; 1025; 1536; 1600; 2048; 2049; 2304; 2560; 2561; 2816 | 3072; 4096 |
+
+*Table: the 152-SM one-split table (`K1_ONE_SPLIT_RANGES_BY_SM` on `sm_100a` / `sm_103a` parts of exactly 152 SMs):
+the FP32 rows `4096 -> 32` and `4096 -> 128` run one split of 64-wide tiles (the transposed-store program
+`dense_proj_gemm_atomic_nn_n64_f32_t`; 16 and 32 tiles, one CTA pair each), whose CTA pairs add a tile's whole token
+reduction in one accumulator and store it once (no workspace, no ticket), at every token count of the range, at an
+even and an odd number of 64-token K blocks alike.  It replaces the routing of the other tables there: two splits of
+64-wide tiles, the deterministic program at the excluded token counts (512 on `sm_103a` `4096 -> 32`), and for
+`4096 -> 128` the deterministic program outside its two-split range.  Below 256
+tokens (not measured), above a range and on parts of any other SM count (148 SMs included) these tables keep the
+routing.  Measured against that routing on one GB200 node and one GB300 node, two jobs each (four parts of the node
+per job: the four launch layouts and row orders), with the protocol of the K1 rule: in every run 15 paired groups of
+20 launches per cell, eager launches and CUDA graph replays, a long-lived process for every token count and a fresh
+process per token count, in both row orders, cold L2, the GPU span of the operation from CUPTI; faster in every cell
+(a one-sided paired sign test, p < 0.05, with a median time ratio below 0.99), no more than 3 % slower next to a kernel
+holding 8, 16 or 32 SMs in the same and in the opposite launch order, and the backward pass and the checkpointed step
+(two forwards and the backward pass) no more than 1.3 % slower (ratio of the medians and median of the paired ratios,
+eager launches and graph replays).  A range runs from its first measured token count to the last one at which the
+program passed, holds no measured token count that failed, and its token counts between two consecutive measured ones
+take it too (not measured).  \*: an odd block count at which the one-split program passed against the deterministic
+program but failed against the two-split program, which the routing runs there, so the ranges end
+below.  Inside the ranges its time (graph replays) was 0.81 to 0.97 times the routing's where that runs two splits
+(7.02 against 7.87 us for `4096 -> 32` and 7.17 against 8.63 us for `4096 -> 128` on a GB200 part at 1024 tokens) and
+0.81 to 0.87 times where it runs the deterministic program, and the checkpointed step's time 0.96 to 0.99 times the
+routing's.  Its output met the deterministic package's FP32 budget against FP64 (relative Frobenius error at most
+5e-5, max error at most 1e-3 times the largest reference element) in every one of 20 runs of 10 seeds at every
+measured token count of the ranges (worst relative Frobenius error 3.54e-6, worst max error 4.18e-6 times the largest
+reference element).  At 256 to 800 tokens that error was the deterministic program's; from 1024 tokens up, where the
+deterministic program adds the halves of an output's token reduction in two partials, it was 2.10 to 2.38 times the
+deterministic program's (reported, not a rule).*
 
 | K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 208 SMs | 212 SMs | 216 SMs |
 |---|---|---|---|
@@ -526,7 +565,8 @@ the 64 x 64 tile in four slices (`"simt_n64m64s4"`, 256 threads) from 65 to 128 
 `"simt_n64m32s8"` from 1 to 64 at hidden 6144.  At more tokens (from 192; from 128 at hidden 6144) the program was more
 than 3 % slower than the deterministic program next to a resident kernel (on `sm_100a`; the `sm_103a` windows were
 measured from 1 token to their last token count on two GB300 parts in two nodes).  The other `sm_107a` SM counts run the
-deterministic program (not measured).
+deterministic program (not measured).  148-SM `sm_100a` and `sm_103a` parts take the windows of the 148-SM SIMT table
+below.
 
 `"simt_n<tile_n>m<tile_m>s<slices><form>"` (`form` `g<group>` or `dot2`) runs a compensated exact-FP32 program with
 the plain program's tiles, slices, launch and stores: each slice keeps a sum and its compensation, and the slices merge
@@ -537,48 +577,46 @@ and group of `group` consecutive K steps, one FMA chain from the negated compens
 group` FP32 instructions per product).  With `dot2` (the weight gradient only,
 `router_fp32_gemm_simt_kahan_dot2_n<tile_n>m<tile_m>s<slices>`) each product is rounded once with its exact error kept
 and added by TwoSum, both errors going into the compensation, in blocks of 8 rows without the rows past `K` (10 FP32
-instructions per product).  An exact model of each order reproduced the programs' output bit for bit on both measured
-parts.  This checkout registers five compensated programs on `sm_100a` and `sm_103a`: the 64 x 64 weight-gradient
-tile in two slices as `dot2`, `g1` and `g4` (128 threads), the 128 x 64 tile in two slices as `g4` (256 threads), and
-the 32 x 64 input-gradient tile in four slices as `g4` (128 threads).  The 148-SM tables of `ROUTER_RULES_BY_SM` name
-them:
+instructions per product).  This checkout registers one compensated program, on `sm_100a` and `sm_103a`: the 64 x 64
+weight-gradient tile in two slices as `dot2` (128 threads).
 
-| row (256 experts) | token window: spec | deterministic / compensated time, B200; B300 | worst next to a resident kernel: same launch order / router launched first | backward / checkpointed step, worst | FP64 error / deterministic program's, worst seed |
-|---|---|---|---|---|---|
-| weight gradient, hidden 4096 | 1 to 17: `"simt_n64m64s2dot2"` | x1.79-4.59; x1.83-4.55 | x0.720 / x0.557 | x0.751 / x0.928 | x0.959 |
-| weight gradient, hidden 4096 | 18 to 32: `"simt_n64m64s2g1"` | x2.35-2.38; x2.39-2.50 | x0.484 / x0.420 | x0.671 / x0.904 | x1.009 |
-| weight gradient, hidden 4096 | 33 to 48: `"simt_n128m64s2g4"` | x2.77-2.80; x2.78-2.85 | x0.546 / x0.366 | x0.619 / x0.870 | x0.982 |
-| weight gradient, hidden 4096 | 49 to 64: `"simt_n64m64s2g4"` | x2.46-2.48; x2.52-2.54 | x0.475 / x0.411 | x0.647 / x0.881 | x0.949 |
-| weight gradient, hidden 4096 | 65 to 112: `"simt_n128m64s2g4"` | x1.69-2.13; x1.75-2.13 | x0.936 / x0.598 | x0.757 / x0.925 | x0.862 |
-| weight gradient, hidden 4096 | 113 to 160: `"simt_n64m64s2g4"` | x1.33-1.56; x1.37-1.61 | x0.923 / x0.755 | x0.855 / x0.960 | x0.794 |
-| weight gradient, hidden 5120 | 1 to 17: `"simt_n64m64s2dot2"` | x1.42-3.75; x1.40-3.71 | x0.702 / x0.695 | x0.843 / x0.965 | x0.951 |
-| weight gradient, hidden 5120 | 18 to 32: `"simt_n64m64s2g1"` | x2.03-2.06; x2.05-2.11 | x0.476 / x0.481 | x0.696 / x0.919 | x1.006 |
-| weight gradient, hidden 5120 | 33 to 160: `"simt_n64m64s2g4"` | x1.10-2.25; x1.12-2.30 | x0.900 / x0.876 | x0.952 / x1.005 | x0.975 |
-| weight gradient, hidden 6144 | 1 to 17: `"simt_n64m64s2dot2"` | x1.48-3.73; x1.45-3.58 | x0.719 / x0.644 | x0.820 / x0.961 | x0.951 |
-| weight gradient, hidden 6144 | 18 to 32: `"simt_n64m64s2g1"` | x2.15-2.20; x2.17-2.25 | x0.493 / x0.427 | x0.667 / x0.909 | x1.009 |
-| weight gradient, hidden 6144 | 33 to 160: `"simt_n64m64s2g4"` | x1.16-2.35; x1.21-2.47 | x0.902 / x0.788 | x0.912 / x0.988 | x0.974 |
-| input gradient, hidden 4096 | 1 to 32: `"simt_n64m32s4g4"` | x1.51-1.54; x1.51-1.54 | x0.685 / x0.680 | x0.907 / x0.992 | x0.640 |
-| input gradient, hidden 5120 | 1 to 32: `"simt_n64m32s4g4"` | x1.54-1.57; x1.55-1.57 | x0.677 / x0.667 | x0.905 / x0.989 | x0.665 |
-| input gradient, hidden 6144 | 1 to 32: `"simt_n64m32s4g4"` | x1.55-1.60; x1.58-1.59 | x0.658 / x0.666 | x0.907 / x0.989 | x0.657 |
+On 148-SM B200 (`sm_100a`) and B300 (`sm_103a`) parts the tables of `ROUTER_RULES_BY_SM` name the plain SIMT programs,
+which this checkout registers on both architectures (the 64 x 64 and the 128 x 64 weight-gradient tiles in two
+slices, the 32 x 64 input-gradient tile in four and in eight slices), and at one token at hidden 4096 the Dot2 program:
 
-*Table: the compensated SIMT windows of 148-SM B200 (`sm_100a`) and B300 (`sm_103a`) parts, the same windows on both
-(one node of each part).  Deterministic / compensated time: the program alone, CUDA graph replays in one long-lived
-process, cold L2, over the measured token counts of the window.  Next to a kernel holding 8, 16 or 32 SMs on another
-stream, and for the whole backward pass and the checkpointed step (2 x forward + backward): time / the deterministic
-program's, the worst of both parts, of eager launches and CUDA graph replays, and of a long-lived process and a fresh
-process per token count.  Every window's program kept the router budget at each measured token count (105 per part:
-the first, the last and inner token counts of every window): a relative Frobenius error against FP64 of at most 5.2e-8
-(10 seeds, worst of 20 runs, the same bits in all 20), and every element within the error bound of a sum of `K` FP32
-products in any order; the last column, the ratio to the deterministic program's error, is reported data.  Past the
-windows the programs missed the rule: the input gradient at 33 tokens (x1.032-1.033 next to a resident kernel at
-hidden 4096; the backward pass or the checkpointed step x1.013-1.027 at hidden 5120 and 6144), the weight gradient at
-176 tokens (x1.036-1.060 next to a resident kernel at hidden 4096 and 6144; the backward pass or the checkpointed step
-x1.024-1.035 at hidden 5120, x1.040 at 192 tokens).  At hidden 4096 the 128 x 64 and the 64 x 64 tiles alternate where
-each was faster (within 1.3 % of each other at 96 tokens).  Non-Cake FP32 GEMMs (per token count the fastest of
-`cublasSgemm`, the eight fastest cuBLASLt FP32 algorithms and `torch.mm` without TF32; cuBLAS 13.1.1) took x0.36-0.85
-of the compensated program's time in every weight-gradient window and x0.57-1.14 in the input-gradient windows (faster
-than the compensated program at one token, slower at 17 and 32 tokens at hidden 5120 and 6144).  152-SM, 212-SM and
-216-SM parts have no compensated window.*
+| row (256 experts) | token window: spec | time before / new, alone, B200; B300 | deterministic / new, alone, B200; B300 | worst next to a resident kernel, new / before: same launch order / router launched first | backward / checkpointed step, new / before, worst | FP64 relative Frobenius error, worst |
+|---|---|---|---|---|---|---|
+| weight gradient, hidden 4096 | 2 to 224: `"simt_n128m64s2"` | x1.23-2.48; x1.24-2.44 | x1.46-5.30; x1.48-5.19 | x0.997 / x0.850 | x0.979 / x1.003 | 1.93e-7 |
+| weight gradient, hidden 5120 | 1 to 256: `"simt_n64m64s2"` | x1.13-2.94; x1.18-3.10 | x1.13-5.03; x1.18-5.10 | x0.863 / x0.851 | x0.948 / x1.002 | 2.06e-7 |
+| weight gradient, hidden 6144 | 1 to 256: `"simt_n64m64s2"` | x1.16-3.07; x1.22-3.15 | x1.16-5.25; x1.22-5.48 | x0.901 / x0.791 | x0.910 / x0.989 | 2.06e-7 |
+| input gradient, hidden 4096 | 1 to 64: `"simt_n64m32s8"` | x1.32-1.98; x1.32-2.00 | x1.88-2.06; x1.80-2.05 | x0.822 / x0.776 | x0.869 / x0.971 | 1.22e-7 |
+| input gradient, hidden 5120 | 1 to 32: `"simt_n64m32s8"` | x1.26-1.35; x1.28-1.33 | x1.96-2.13; x1.99-2.07 | x0.794 / x0.798 | x0.899 / x0.988 | 1.20e-7 |
+| input gradient, hidden 5120 (B200 only) | 64 to 128: `"simt_n64m32s4"` | x1.08-1.39 | x1.08-1.39 | x0.930 / x0.939 | x0.961 / x0.994 | 1.51e-7 |
+| input gradient, hidden 6144 | 1 to 32: `"simt_n64m32s8"` | x1.25-1.31; x1.26-1.30 | x1.95-2.11; x2.00-2.06 | x0.803 / x0.807 | x0.905 / x0.986 | 1.23e-7 |
+
+*Table: the SIMT windows of 148-SM B200 (`sm_100a`) and B300 (`sm_103a`) parts (one node of each part), measured
+against the plan each token count took before -- the compensated SIMT programs up to 160 tokens of the weight gradient
+and up to 32 tokens of the input gradient, the deterministic program above -- and against the deterministic program.
+Time alone: the program by itself in CUDA graph replays, cold L2, over the measured token counts of the window, in a
+long-lived process and in a fresh process per token count.  Next to a kernel holding 8, 16 or 32 SMs on another stream,
+and for the whole backward pass and the checkpointed step (2 x forward + backward): time / the previous plan's, the
+worst of both parts, of eager launches and CUDA graph replays and of both processes.  The weight-gradient windows were
+measured at 1 (hidden 5120 and 6144), 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 18, 19, 20, 24, 32, 33, 40, 48, 56, 63, 64, 65,
+80, 96, 97, 112, 128, 129, 144, 160, 176, 192, 193, 224 and 256 (hidden 5120 and 6144) tokens, the input-gradient
+windows at 1, 2, 16, 32, 33 and 64 tokens (hidden 4096), 1, 2, 16 and 32 (hidden 5120 and 6144) and 64, 65, 96 and 128
+(hidden 5120).  A window starts and ends at measured token counts and holds at least one more timed and two more
+accuracy-checked token counts inside.  Every window's program kept the router budget at each measured token count:
+the FP64 error is the worst seed of 10 and the worst of 20 runs, 0.95 to 2.66 times the deterministic program's
+(reported data).  At one token hidden 4096 keeps the Dot2 program: there the 128 x 64 tile left the backward pass up
+to 1.9 % (B200) and 3.8 % (B300) slower; at 256 tokens it was up to 11 % (B200) and 13 % (B300) slower next to a
+resident kernel.  On B300 the 32 x 64 tile in four slices left the checkpointed step at 128 tokens 0.09 % and 0.18 %
+slower than before in eager launches, more than the plan measured against itself in the same runs, so B300 has no
+input-gradient window above 32 tokens at hidden 5120.  Past the input-gradient windows (hidden 4096 from 65 tokens,
+hidden 5120 from 33 to 63 tokens and on B300 from 33, hidden 6144 from 33) the 32 x 64 tile in four slices and the
+64 x 64 tile in four slices met the timing rule at some measured token counts, but no window there holds enough
+measured token counts inside, so these token counts run the deterministic program; at 128 tokens at hidden 6144 the
+32 x 64 tile in four slices was up to 12 % (B200) and 17 % (B300) slower next to a resident kernel.  152-SM, 212-SM
+and 216-SM parts have no compensated window.*
 
 `"H<f>x<k>"` (`router_partition_of`, the weight gradient only) runs the head/tail program
 `router_fp32_gemm_atomic_nn_t_ht_c3_nreg` (on `sm_103a` and on 212-SM `sm_107a` parts:
@@ -648,7 +686,7 @@ and output gradient), 10 seeds per token count.  A window keeps the router budge
 for every seed and run; every window below does (at most 3.3e-7).  The last column, the error divided by that of the
 plan the row takes without the window on the same operands (the deterministic program; at hidden 5120 on 152-SM parts
 up to 128 tokens on `sm_100a` and up to 192 on `sm_103a`, `"waves"`), is reported as data, not as a condition.
-The compensated SIMT windows of 148-SM parts are in the compensated SIMT table above.
+The SIMT windows of 148-SM parts are in the 148-SM SIMT table above.
 
 | row (256 experts) | token window | measured at (tokens, 10 seeds each) | part | relative Frobenius error, largest seed | error / error without the window (data) |
 |---|---|---|---|---|---|
