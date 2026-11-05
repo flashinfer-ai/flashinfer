@@ -50,9 +50,9 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     same top-k;
   - the K2 weight and input gradients in the SIMT token windows of their rows in the router tables
     (:func:`router_rules`, :func:`router_simt`): an exact-FP32 program on the CUDA cores over the FP32 operands read
-    in place (compensated in the 148-SM tables), every element of ``out`` stored once (other bits than the
-    deterministic program's BF16x3 emulation, within the deterministic package's router FP64 budget); the input
-    gradient's every other row and token count runs the deterministic program (one split);
+    in place (compensated in the 148-SM tables' one-token window at hidden 4096), every element of ``out`` stored
+    once (other bits than the deterministic program's BF16x3 emulation, within the deterministic package's router
+    FP64 budget); the input gradient's every other row and token count runs the deterministic program (one split);
   - the K2 forward in the SIMT token windows of its rows (:func:`router_forward_simt`): an exact-FP32 program on the
     CUDA cores whose cluster of CTAs splits K and adds the ranks' partials in rank order, every element of ``out``
     stored once (other bits than the deterministic program's, within the deterministic package's router FP64
@@ -1503,22 +1503,23 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096 and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144, and at
 #: 192 tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
 #: resident kernel), up to 64 tokens at hidden 6144.
-#: The 148-SM B200 (sm_100a) and B300 (sm_103a) tables hold the compensated SIMT windows (specs
-#: ``"simt_n<tile_n>m<tile_m>s<slices>g<group>"`` / ``"...dot2"``, :func:`router_simt_template`), measured on one node
-#: of each part under the rule of :data:`ROUTER_RULES` (both launch orders, eager and CUDA graphs, next to a kernel
-#: holding 8, 16 or 32 SMs, the backward pass and the checkpointed step, each window at its first, last and inner token
-#: counts).
-#: The weight gradient takes the 64 x 64 tile in two slices in the Dot2 form from 1 to 17 tokens and with one Kahan step
-#: per product from 18 to 32; from 33 tokens Kahan groups of four K steps, the 64 x 64 tile to 160 tokens at hidden 5120
-#: and 6144, and at hidden 4096 the 128 x 64 tile from 33 to 48 and 65 to 112 tokens and the 64 x 64 tile from 49 to 64
-#: and 113 to 160.  The input gradient takes the 32 x 64 tile in four slices with Kahan groups of four K steps up to 32
-#: tokens.  Every window's program keeps the router budget: a relative Frobenius error against FP64 of at most 5.2e-8
-#: at the 105 measured token counts of each part's windows (10 seeds, worst of 20 runs; 0.55 to 1.009 times the
-#: deterministic program's).  Past the windows the programs missed the rule: the input gradient at 33 tokens (3.3 %
-#: slower next to a resident kernel at hidden 4096; the backward pass or the checkpointed step 1.3 to 2.7 % slower at
-#: hidden 5120 and 6144), the weight gradient at 176 tokens (3.6 to 6.0 % slower next to a resident kernel at hidden
-#: 4096 and 6144; the backward pass or the checkpointed step 2.4 to 3.5 % slower at hidden 5120, 4.0 % at 192 tokens).
-#: Every other row and token count of these parts runs the deterministic program.
+#: The 148-SM B200 (sm_100a) and B300 (sm_103a) tables hold SIMT windows measured on one node of each part under the
+#: rule of :data:`ROUTER_RULES` against the plan the token count took before (both launch orders, eager and CUDA
+#: graphs, next to a kernel holding 8, 16 or 32 SMs, the backward pass and the checkpointed step, in a long-lived
+#: process and a fresh process per token count; the whole-step ratio also no worse than the same plan measured against
+#: itself in the same runs).  A window starts and ends at measured token counts and holds at least one more timed and
+#: two more accuracy-checked token counts inside; the token counts between them take its program.
+#: The weight gradient takes the plain 64 x 64 tile in two slices from 1 to 256 tokens at hidden 5120 and 6144, and at
+#: hidden 4096 the plain 128 x 64 tile from 2 to 224 tokens; at one token hidden 4096 keeps the 64 x 64 tile in the
+#: compensated Dot2 form (the plain 128 x 64 tile left the backward pass up to 1.9 % slower on B200 and 3.8 % on B300
+#: there), and at 256 tokens the 128 x 64 tile was up to 11 % (B200) and 13 % (B300) slower next to a resident kernel.
+#: The input gradient takes the plain 32 x 64 tile in eight slices up to 64 tokens at hidden 4096 and up to 32 at
+#: hidden 5120 and 6144, and on 148-SM sm_100a parts the 32 x 64 tile in four slices from 64 to 128 tokens at hidden
+#: 5120 (on B300 the checkpointed step at 128 tokens was 0.09 % and 0.18 % slower than before in eager launches, more
+#: than the plan measured against itself).  Every window's program keeps the router budget: a relative Frobenius error
+#: against FP64 of at most 2.1e-7 at the 124 (B200) and 120 (B300) measured token counts of the windows (10 seeds,
+#: worst of 20 runs; 0.95 to 2.66 times the deterministic program's).  Every other row and token count of these parts
+#: runs the deterministic program.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -1526,35 +1527,21 @@ ROUTER_RULES_BY_SM: dict[
 ] = _VerdictTable({
     ("sm_100a", 148): _VerdictTable({
         ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
-        ("sm_100a", "nn_t", 4096, 256): (
-            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
-            (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
-        ),
-        ("sm_100a", "nn_t", 5120, 256): (
-            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
-        ),
-        ("sm_100a", "nn_t", 6144, 256): (
-            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
-        ),
-        ("sm_100a", "kn", 4096, 256): ((1, 32, "simt_n64m32s4g4"),),
-        ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
-        ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
+        ("sm_100a", "nn_t", 4096, 256): ((1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2")),
+        ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_100a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"),),
+        ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s8"), (64, 128, "simt_n64m32s4")),
+        ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8"),),
     }),
     ("sm_103a", 148): _VerdictTable({
         ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
-        ("sm_103a", "nn_t", 4096, 256): (
-            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
-            (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
-        ),
-        ("sm_103a", "nn_t", 5120, 256): (
-            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
-        ),
-        ("sm_103a", "nn_t", 6144, 256): (
-            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
-        ),
-        ("sm_103a", "kn", 4096, 256): ((1, 32, "simt_n64m32s4g4"),),
-        ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
-        ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
+        ("sm_103a", "nn_t", 4096, 256): ((1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2")),
+        ("sm_103a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_103a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"),),
+        ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s8"),),
+        ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8"),),
     }),
     ("sm_107a", 208): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
