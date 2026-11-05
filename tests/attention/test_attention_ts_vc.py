@@ -252,6 +252,8 @@ class _VCCase:
 _CASES = (
     _VCCase("single-tile", 1, 512, 1),
     _VCCase("partial-tile", 1, 2000, 2),
+    # One token in the last tile. Every other row of that tile is past the sequence.
+    _VCCase("one-token-tail", 1, 1025, 2),
     # Odd Q-tile count (cluster padding), partial last K/V tile, two batches.
     _VCCase("two-batches", 2, 2120, 2),
     _VCCase("one-shot", 1, 2000, 2, one_shot=True),
