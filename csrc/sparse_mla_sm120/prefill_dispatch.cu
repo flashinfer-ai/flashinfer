@@ -43,15 +43,22 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     a.tokens = m.tokens; a.heads = m.heads; a.topk = m.topk; a.extra_topk = m.extra_topk;
     a.kv_stride = m.row_stride_bytes; a.extra_stride = m.extra_row_stride_bytes;
     a.sm_scale = p.sm_scale; a.lse_stride = m.lse_stride; a.lse_scale = p.lse_scale;
-    auto launch = [&](auto fused) -> PrefillLaunchResult {
+    auto launch = [&](auto fused, auto full_head_tiles) -> PrefillLaunchResult {
       constexpr bool Mega = decltype(fused)::value;
+      constexpr bool FullHeadTiles = decltype(full_head_tiles)::value;
       static bool configured[32] = {};
-      auto status = configure_dynamic_smem_per_device(prefill<Mega>, sizeof(Shared), configured);
+      auto status = configure_dynamic_smem_per_device(prefill<Mega, 32, FullHeadTiles>, sizeof(Shared), configured);
       if (!status.supported || status.error != cudaSuccess) return status;
-      prefill<Mega><<<m.tokens * ((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
+      prefill<Mega, 32, FullHeadTiles><<<m.tokens * ((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
       return {cudaGetLastError(), "CuTe sparse prefill"};
     };
-    return p.mega.output ? launch(std::true_type{}) : launch(std::false_type{});
+    // has_prefill_heads already validates H=8/16/32/64 for this route.
+    // Full CTA head tiles compile out all PV epilogue head bounds checks.
+    auto launch_heads = [&](auto fused) {
+      return m.heads % 32 == 0 ? launch(fused, std::true_type{})
+                             : launch(fused, std::false_type{});
+    };
+    return p.mega.output ? launch_heads(std::true_type{}) : launch_heads(std::false_type{});
   }
   PrefillColdParams cold{p.sm_scale,          m.tokens,
                          m.page_stride_bytes, m.extra_page_stride_bytes,

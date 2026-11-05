@@ -48,7 +48,9 @@ using MicroTransposed = decltype(composition(Swizzle<3, 4, 3>{},
 // Both use the same 64-candidate load tile and shared-memory allocation.
 // The softmax loop and reduction order differ from the original kernel, so
 // a 32-candidate quantization group does not guarantee bitwise equality.
-template <bool Mega, int PQuantGroup = 32>
+// Host validation accepts H=8/16/32/64. FullHeadTiles is selected for H%32==0;
+// the remaining cases contain only whole eight-head PV warps.
+template <bool Mega, int PQuantGroup = 32, bool FullHeadTiles = false>
 __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   static_assert(PQuantGroup == 32 || PQuantGroup == 64);
   extern __shared__ __align__(128) unsigned char raw[];
@@ -491,6 +493,11 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         }
       }
     }
+    // Supported head counts are multiples of eight. All pipeline/barrier
+    // participation is complete; each PV warp now owns eight valid heads or none.
+    if constexpr (!FullHeadTiles) {
+      if (h0 >= p.heads) return;
+    }
     const float* cs = nullptr;
     if constexpr (Mega) cs = p.cos_sin + size_t(p.positions[token]) * 64;
     // Phase 4 — PV epilogue, once all main and extra candidate tiles are consumed.
@@ -499,7 +506,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     // and zero output. Normalize with the original BF16 context rounding boundary.
     float denominator = row_l;
     float out_factor = 1.f;
-    float sink = p.sink && h0 + own_head < p.heads ? p.sink[h0 + own_head] * LOG2E : -INFINITY;
+    float sink = p.sink ? p.sink[h0 + own_head] * LOG2E : -INFINITY;
     if (sink == INFINITY) {
       out_factor = 0.f;
       denominator = 1.f;
@@ -509,12 +516,12 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       out_factor = isfinite(row_m) ? exp2f(row_m - shift) : 0.f;
       denominator = row_l * out_factor + exp2f(sink - shift);
       if ((lane % 4) == 0) p.lse[size_t(token) * p.lse_stride + h0 + own_head] = (shift + log2f(denominator)) * p.lse_scale;
-    } else if ((lane % 4) == 0 && h0 + own_head < p.heads) {
+    } else if ((lane % 4) == 0) {
       p.lse[size_t(token) * p.lse_stride + h0 + own_head] = row_l > 0.f ? (row_m + log2f(row_l)) * p.lse_scale : -INFINITY;
     }
     // Mega=false writes BF16 context. Mega=true applies inverse RoPE to the
     // normalized BF16 context, then emits FP8 output and one scale per 32 features.
-    // Output stores mask the final partial head tile.
+    // Whole inactive PV warps have exited; output stores need no head predicates.
     float norm = denominator > 0.f ? out_factor / denominator : 0.f;
     float norm0 = __shfl_sync(0xffffffff, norm, (lane % 4) * 8);
     float norm1 = __shfl_sync(0xffffffff, norm, (lane % 4) * 8 + 4);
@@ -533,8 +540,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
             vals[m * 4 + v] = mega_rotate<false>(x, y, d, cs, true);
           } else {
             int h = h0 + get<1>(coord);
-            if (h < p.heads)
-              p.bf16_output[(size_t(token) * p.heads + h) * 512 + d] = to_bf16(x);
+            p.bf16_output[(size_t(token) * p.heads + h) * 512 + d] = to_bf16(x);
           }
         }
       }
@@ -553,11 +559,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           int m = j / 2, v = (j % 2) * 2 + head_col;
           auto coord = tOcO(v, group * 2 + m, 0);
           int d = get<0>(coord), h = h0 + get<1>(coord);
-          if (h < p.heads) {
-            size_t offset = (size_t(token) * p.heads + h) * 512 + d;
-            p.output[offset] = quantize_e4m3_byte(vals[j * 2 + head_col] * inv);
-            if ((d % 32) == 0) p.scales[offset / 32] = bits >> 23;
-          }
+          size_t offset = (size_t(token) * p.heads + h) * 512 + d;
+          p.output[offset] = quantize_e4m3_byte(vals[j * 2 + head_col] * inv);
+          if ((d % 32) == 0) p.scales[offset / 32] = bits >> 23;
         }
       }
       }
