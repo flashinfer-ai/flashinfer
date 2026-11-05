@@ -12,11 +12,13 @@ contract. CPU-only config tests live in ``tests/cpu/gemm/test_unified_gemm_api.p
 from __future__ import annotations
 
 import dataclasses
+import warnings
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import flashinfer.gemm.nn as nn_mod
 from flashinfer import bmm_fp8, mm_fp4
 from flashinfer.autotuner import autotune
 from flashinfer.gemm import (
@@ -38,6 +40,7 @@ from flashinfer.gemm import (
     prepare_weight_pack,
     supported_backends,
 )
+from flashinfer.gemm import runners as R
 from flashinfer.gemm.api import BackendOptions, QuantConfig, QuantFormat
 from flashinfer.quantization.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.utils import get_compute_capability
@@ -419,3 +422,159 @@ def test_functional_linear_and_gemm(pair_name):
     assert (
         F.cosine_similarity(ref.reshape(-1), out_pack.float().reshape(-1), dim=0) > 0.98
     )
+
+
+# ---------------------------------------------------------------------------
+# Caches: winner per weight shape, layer per normalized device, pack per weight
+# ---------------------------------------------------------------------------
+
+
+def _first_usable(pair_name: str) -> str:
+    usable = _usable_backends(pair_name)
+    if not usable:
+        pytest.skip(f"no backend serves {pair_name} on sm{ARCH}")
+    return usable[0]
+
+
+def _spy_validate(monkeypatch) -> list:
+    """Record every runner.validate call as the weight view's shape."""
+    calls: list = []
+    orig = R.GemmRunner.validate
+
+    def spy(self, act, view, out):
+        calls.append(tuple(view["b"].shape))
+        return orig(self, act, view, out)
+
+    monkeypatch.setattr(R.GemmRunner, "validate", spy)
+    return calls
+
+
+@pytest.mark.parametrize("pair_name", ["nvfp4", "fp8"])
+def test_winner_is_cached_per_weight_shape(pair_name, monkeypatch):
+    """One layer serving two weights of different (N, K): each shape is admitted
+    (validate) and selected on its own, a repeat is a cache hit, and a K
+    mismatch is rejected on every call, not only on the first one of a bucket."""
+    cfg = _single(pair_name, _first_usable(pair_name))
+    calls = _spy_validate(monkeypatch)
+    x_a, w_a = _inputs(pair_name)
+    x_b, w_b = _inputs(pair_name, n=2 * N, k=2 * K, seed=1)
+    pack_a, pack_b = prepare_weight_pack(w_a, cfg), prepare_weight_pack(w_b, cfg)
+    act_a = prepare_activations(x_a, quant=cfg.quant)
+    act_b = prepare_activations(x_b, quant=cfg.quant)
+    layer = GemmLayer(cfg, device=DEVICE)
+
+    out_a = layer(act_a, pack_a)
+    per_shape = len(calls)
+    assert per_shape >= 1
+    out_b = layer(act_b, pack_b)
+    assert len(calls) == 2 * per_shape, "the second shape skipped admission"
+    assert len(layer._winners) == 2
+    for out, act, pack in ((out_a, act_a, pack_a), (out_b, act_b, pack_b)):
+        ref = _dequant_reference(act, pack.get_view(layer.winner_backend), pair_name)
+        assert (
+            F.cosine_similarity(ref.reshape(-1), out.float().reshape(-1), dim=0) > 0.99
+        )
+
+    layer(act_a, pack_a)
+    assert len(calls) == 2 * per_shape, "a repeat of a cached shape re-validated"
+
+    # act K=K against weight K=2K: rejected by validate, never launched.
+    with pytest.raises(BackendUnsupported):
+        layer(act_a, pack_b)
+    layer(act_a, pack_a)  # the cached winner of the matching pair is intact
+    with pytest.raises(BackendUnsupported):
+        layer(act_a, pack_b)
+
+
+@pytest.mark.parametrize("pair_name", ["nvfp4", "fp8"])
+def test_functional_doors_share_one_layer_per_device_and_key_per_shape(pair_name):
+    cfg = _single(pair_name, _first_usable(pair_name))
+    nn_mod._LAYER_CACHE.clear()
+    bare = nn_mod._layer_for(cfg, torch.device("cuda"))
+    indexed = nn_mod._layer_for(cfg, torch.device("cuda", torch.cuda.current_device()))
+    assert bare is indexed and len(nn_mod._LAYER_CACHE) == 1
+
+    x_a, w_a = _inputs(pair_name)
+    x_b, w_b = _inputs(pair_name, n=2 * N, k=2 * K, seed=1)
+    gemm(
+        prepare_activations(x_a, quant=cfg.quant),
+        prepare_weight_pack(w_a, cfg),
+        config=cfg,
+    )
+    gemm(
+        prepare_activations(x_b, quant=cfg.quant),
+        prepare_weight_pack(w_b, cfg),
+        config=cfg,
+    )
+    assert len(nn_mod._LAYER_CACHE) == 1
+    assert len(bare._winners) == 2
+
+
+@pytest.mark.parametrize("pair_name", ["nvfp4", "fp8"])
+def test_linear_pack_cache_holds_live_weights_and_warns_on_eviction(
+    pair_name, monkeypatch
+):
+    cfg = _single(pair_name, _first_usable(pair_name))
+    prepared = {"n": 0}
+    orig = nn_mod.prepare_weight_pack
+
+    def counting(*a, **k):
+        prepared["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(nn_mod, "prepare_weight_pack", counting)
+    x, _ = _inputs(pair_name)
+    weights = [torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16) for _ in range(3)]
+
+    # Within the limit: every weight is prepared once, however many forwards.
+    monkeypatch.setattr(nn_mod, "_PACK_CACHE_LIMIT", 3)
+    nn_mod._PACK_CACHE.clear()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for _ in range(3):
+            for w in weights:
+                linear(x, w, config=cfg)
+    assert prepared["n"] == 3
+
+    # One over the limit: the eviction is loud.
+    monkeypatch.setattr(nn_mod, "_PACK_CACHE_LIMIT", 2)
+    nn_mod._PACK_CACHE.clear()
+    prepared["n"] = 0
+    with pytest.warns(RuntimeWarning, match="prepared-weight cache"):
+        for w in weights:
+            linear(x, w, config=cfg)
+    assert prepared["n"] == 3
+    nn_mod._PACK_CACHE.clear()
+
+
+def test_nvfp4_alpha_is_formed_once_per_call_and_never_with_a_static_scale():
+    backend = _first_usable("nvfp4")
+    cfg = _single("nvfp4", backend)
+    x, w = _inputs("nvfp4")
+    pack = prepare_weight_pack(w, cfg)
+    view = pack.get_view(backend)
+    torch.testing.assert_close(
+        view["b_global_scale_inv"], (1.0 / view["b_global_scale"]).reshape(1)
+    )
+
+    # Dynamic activation scale: one alpha per (activation pack, weight view),
+    # equal to the legacy 1 / (a_gs * b_gs).
+    act = prepare_activations(x, quant=NVFP4)
+    layer = GemmLayer(cfg, device=DEVICE)
+    layer.prepare(pack)
+    layer(act)
+    ((memo_view, alpha),) = act._alpha_by_view.values()
+    assert memo_view is view
+    expected = (1.0 / (act.a_global_scale * view["b_global_scale"])).reshape(1)
+    torch.testing.assert_close(alpha, expected.to(torch.float32))
+    layer(act)
+    assert len(act._alpha_by_view) == 1
+
+    # Static activation scale folded in at load: nothing is formed per call.
+    static = prepare_weight_pack(w, cfg, activation_global_scale=act.a_global_scale)
+    act_s = prepare_activations(x, quant=NVFP4, global_scale=act.a_global_scale)
+    layer_s = GemmLayer(cfg, device=DEVICE)
+    layer_s.prepare(static)
+    out_s = layer_s(act_s)
+    assert not act_s._alpha_by_view
+    torch.testing.assert_close(out_s, layer(act), rtol=2e-2, atol=2e-2)

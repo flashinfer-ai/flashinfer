@@ -254,16 +254,32 @@ class _Nvfp4Runner(GemmRunner):
         )
 
     def _alpha(self, act: GemmActivationPack, view: Dict[str, Any]) -> Optional[Tensor]:
+        """``alpha = 1 / (a_global_scale * b_global_scale)`` as the kernels take it.
+
+        Static (``prepare_weight_pack(activation_global_scale=...)``): read from
+        the view, no kernel. Dynamic: one division of the view's precomputed
+        ``1 / b_global_scale`` by the activation's scale, formed once per
+        (activation pack, view) and memoized on the pack, so selection
+        (validate + pack_inputs over every candidate) and the serving call each
+        launch it at most once per weight.
+        """
         alpha = view.get("alpha")
         if alpha is not None:
             return alpha
-        if act.a_global_scale is not None:
-            return (
-                (1.0 / (act.a_global_scale * view["b_global_scale"]))
-                .reshape(1)
-                .to(torch.float32)
-            )
-        return None
+        a_gs = act.a_global_scale
+        if a_gs is None:
+            return None
+        memo = act._alpha_by_view.get(id(view))
+        if memo is not None and memo[0] is view:
+            return memo[1]
+        b_inv = view.get("b_global_scale_inv")
+        if b_inv is not None:
+            alpha = torch.div(b_inv, a_gs)
+        else:  # a hand-built view without the reciprocal: the legacy arithmetic
+            alpha = 1.0 / (a_gs * view["b_global_scale"])
+        alpha = alpha.reshape(1).to(torch.float32)
+        act._alpha_by_view[id(view)] = (view, alpha)
+        return alpha
 
     def pack_inputs(self, act, view, out) -> List[Any]:
         # Exactly mm_fp4's input list, so the inner runner and its cache keys

@@ -51,12 +51,29 @@ from .runners import GemmRunner, runner_class_for
 
 __all__ = ["GemmLayer", "supported_backends"]
 
-_WINNER_CACHE_LIMIT = 128
+#: Winners are keyed per (weight shape, M bucket, ...): a few hundred entries
+#: for a whole model. Entries are tuples, so the bound is a safety net only.
+_WINNER_CACHE_LIMIT = 1024
 
 
 def _arch_of(device: torch.device) -> int:
     major, minor = get_compute_capability(device)
     return major * 10 + minor
+
+
+def normalize_device(device: Optional[torch.device]) -> torch.device:
+    """``None`` / ``"cuda"`` / ``"cuda:N"`` -> ``torch.device("cuda", N)``.
+
+    ``torch.device("cuda")`` and ``torch.device("cuda", 0)`` compare unequal, so
+    every cache keyed by device (the functional doors' layer cache) goes
+    through this first.
+    """
+    if device is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def _candidate_runners(
@@ -87,7 +104,12 @@ def _candidate_runners(
 
 
 class GemmLayer:
-    """Stateful GEMM layer: one runner per usable backend, winner cached per M bucket.
+    """Stateful GEMM layer: one runner per usable backend, winner cached per problem.
+
+    A winner is cached per (weight shape, M bucket, eligible runners, activation
+    dtype and scale layout), so one layer can serve several weight packs of one
+    config (the functional doors do this) without a weight inheriting the
+    choice, or skipping the admission checks, of a different shape.
 
     Example
     -------
@@ -102,7 +124,7 @@ class GemmLayer:
 
     def __init__(self, config: GemmConfig, *, device: Optional[torch.device] = None):
         self.config = config
-        self.device = device or torch.device("cuda", torch.cuda.current_device())
+        self.device = normalize_device(device)
         self.tuner = AutoTuner.get()
         self.out_dtype = output_torch_dtype(config.quant)
         self.runners, self.rejected = _candidate_runners(
@@ -121,7 +143,8 @@ class GemmLayer:
                 )
             )
         self._weights: Optional[GemmWeightPack] = None
-        # (M bucket, eligible runner indices, activation dtype, sf layout) -> (runner, tactic)
+        # (weight (N, K), packed activation K, M bucket, eligible runner indices,
+        #  activation dtype, sf layout) -> (runner, tactic)
         self._winners: "OrderedDict[tuple, Tuple[GemmRunner, Any]]" = OrderedDict()
         self._last_winner: Optional[GemmRunner] = None
         self._last_rejections: List[str] = []
@@ -181,12 +204,13 @@ class GemmLayer:
         *,
         out: Optional[Tensor] = None,
     ) -> Tensor:
-        """Run the GEMM, selecting and caching the backend for this M bucket.
+        """Run the GEMM, selecting and caching the backend for this problem.
 
         Returns ``act @ W^T`` (plus the pack's bias when ``epilogue.bias``) in
-        ``config.quant.output``'s dtype. Selection happens on the first call per
-        (M bucket, eligible set) and inside ``autotune(True)``; every other call
-        is a dictionary lookup and one kernel launch.
+        ``config.quant.output``'s dtype. Selection (the legacy admission checks,
+        then the deterministic or measured pick) happens on the first call per
+        (weight shape, M bucket, eligible set) and inside ``autotune(True)``;
+        every other call is a dictionary lookup and one kernel launch.
         """
         weights = weights if weights is not None else self._weights
         if weights is None:
@@ -219,7 +243,17 @@ class GemmLayer:
             )
 
         bucket = map_to_hybrid_bucket(m, self.config.execution.tune_max_m)
-        key = (bucket, eligible, act.a.dtype, act.sf_layout)
+        # The weight shape and the activation's (packed) K are part of the key:
+        # a cached winner never serves a different problem, and a K mismatch
+        # is caught by validate() on every call, not only the first.
+        key = (
+            weights.logical_shape,
+            tuple(act.a.shape[1:]),
+            bucket,
+            eligible,
+            act.a.dtype,
+            act.sf_layout,
+        )
         winner = None if self.tuner.is_tuning_mode else self._winners.get(key)
         if winner is None:
             winner = self._select_winner(
@@ -310,7 +344,7 @@ def supported_backends(
     rejection reason. No kernel module is loaded. ``problem=None`` answers the
     config-level question only.
     """
-    device = device or torch.device("cuda", torch.cuda.current_device())
+    device = normalize_device(device)
     reports: List[BackendReport] = []
     rank = 0
     for cand in config.backend:

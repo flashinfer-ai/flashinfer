@@ -26,6 +26,7 @@ as ``moe_ep.MoEEpSplitLayer`` composes a ``MoELayer``.
 from __future__ import annotations
 
 import dataclasses
+import warnings
 import weakref
 from collections import OrderedDict
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
@@ -44,7 +45,7 @@ from .api import (
     prepare_activations,
     prepare_weight_pack,
 )
-from .layer import GemmLayer
+from .layer import GemmLayer, normalize_device
 
 __all__ = ["Linear", "linear", "gemm"]
 
@@ -194,15 +195,19 @@ _LAYER_CACHE_LIMIT = 64
 # id(weight) -> (weakref to the weight, {cache key: pack}). Keyed by identity
 # (a Parameter is a stable object) rather than by a WeakKeyDictionary, whose
 # lookups compare tensors with ``==``. The weakref callback drops the entry
-# when the weight is freed, and the identity check guards id() reuse.
+# when the weight is freed, and the identity check guards id() reuse. Packs
+# therefore live as long as their weight; the count limit is a safety net far
+# above any model's number of linear weights, and crossing it warns, because
+# a model with more weights than the limit would otherwise re-quantize every
+# weight on every forward (LRU thrash) without any visible sign.
 _PACK_CACHE: "OrderedDict[int, Tuple[weakref.ref, Dict[Any, GemmWeightPack]]]" = (
     OrderedDict()
 )
-_PACK_CACHE_LIMIT = 256
+_PACK_CACHE_LIMIT = 4096
 
 
 def _layer_for(config: GemmConfig, device: torch.device) -> GemmLayer:
-    key = (config, device)
+    key = (config, normalize_device(device))
     layer = _LAYER_CACHE.get(key)
     if layer is None:
         layer = GemmLayer(config, device=device)
@@ -228,6 +233,15 @@ def _pack_for(
         _PACK_CACHE[key] = (weakref.ref(weight, _evict), per_weight)
         if len(_PACK_CACHE) > _PACK_CACHE_LIMIT:
             _PACK_CACHE.popitem(last=False)
+            warnings.warn(
+                f"flashinfer.gemm.linear: more than {_PACK_CACHE_LIMIT} distinct "
+                "weights are live in the prepared-weight cache; the least recently "
+                "used pack was dropped and will be re-quantized on its next call. "
+                "Prepare each weight once with prepare_weight_pack() (or use "
+                "flashinfer.gemm.Linear) and pass the GemmWeightPack instead.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
     else:
         per_weight = entry[1]
         _PACK_CACHE.move_to_end(key)
@@ -252,8 +266,10 @@ def linear(
     """``y = input @ weight.T + bias`` through the unified GEMM API.
 
     Mirrors :func:`torch.nn.functional.linear`. ``weight`` is a ``[N, K]``
-    tensor (prepared on first use and cached by tensor identity) or a
-    :class:`GemmWeightPack` built with :func:`prepare_weight_pack`. With a plain
+    tensor (prepared on first use and cached by tensor identity for as long as
+    the tensor lives) or a :class:`GemmWeightPack` built with
+    :func:`prepare_weight_pack`, which is the form to use in a serving loop:
+    it costs no cache lookup and cannot be evicted. With a plain
     tensor and no ``config`` this is ``F.linear`` (the BF16 pair is not in the
     unified GEMM MVP). Selection is deterministic ``auto``; nothing is
     benchmarked outside ``autotune(True)``.

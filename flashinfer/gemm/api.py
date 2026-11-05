@@ -585,6 +585,12 @@ class GemmActivationPack:
     sf_layout: SfLayout = SfLayout.layout_128x4
     # Grouped form (post-MVP). Typed loosely so this file has no GroupLayout yet.
     groups: Any = None
+    # Per-call memo of the NVFP4 ``alpha = 1 / (a_global_scale * b_global_scale)``
+    # formed for each weight view this pack met: {id(view): (view, alpha)}. One
+    # small kernel per (activation, weight) instead of one per runner touch.
+    _alpha_by_view: Dict[int, Tuple[Dict[str, Any], Tensor]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     @property
     def num_rows(self) -> int:
@@ -683,6 +689,9 @@ def _prepare_weight_view(
             b=b_fp4,
             b_descale=b_sf,
             b_global_scale=b_global_scale,
+            # Its reciprocal, formed once here so the per-call alpha for a
+            # dynamic activation scale is a single division kernel.
+            b_global_scale_inv=(1.0 / b_global_scale).reshape(1).to(torch.float32),
             # (K/2, N) column-major view of the packed weight and its scales,
             # the layout mm_fp4 documents for ``b`` / ``b_descale``.
             b_t=b_fp4.T,
