@@ -774,6 +774,40 @@ Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
 .. autoclass:: UlyssesQKVWorkspace
     :members:
 
+Low-Precision Implementation Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following internal helpers support numerical tests, trace definitions,
+and kernel benchmarks. They are not exported from ``flashinfer.comm``;
+applications should use the prepared ``UlyssesCommunicator`` QKV API above.
+
+.. currentmodule:: flashinfer.comm._ulysses_lowp
+
+.. autosummary::
+    :toctree: ../generated
+
+    capability
+    payload_spec
+    k_sum_v_amax
+    q_grouped_amax
+    k_grouped_amax
+    boundary_descriptors
+    merge_boundary_amax
+    k_boundary_minmax
+    derive_k_boundary_amax
+    zero_scale_and_padding
+    quant_q_into_payload
+    quant_kv_into_payload
+    quant_qkv_pack
+    unpack_for_sage
+    local_stats
+    finalize_stats
+    quant_and_pack
+    verify_duplicate_scale_slots
+    quant_v_fp8_with_scale
+
+.. currentmodule:: flashinfer.comm
+
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
