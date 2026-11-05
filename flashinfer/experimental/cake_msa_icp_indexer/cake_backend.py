@@ -1107,10 +1107,11 @@ def prefill_score_select(
     if publish is not None:
         peers = publish["peer_rows"]
         values.update(
-            # The owners' rows as the publisher's pointer parameters recv_0 ..
-            # recv_3 in rank order; those past the world are never stored to.
+            # The owners' rows as the publisher's uint64 pointer parameters
+            # recv_0 .. recv_3 in rank order (views of the int64 rows); those
+            # past the world are never stored to.
             {
-                f"recv_{o}": peers[o] if o < tp else peers[0]
+                f"recv_{o}": (peers[o] if o < tp else peers[0]).view(torch.uint64)
                 for o in range(NUM_INDEX_HEADS)
             },
             generations=publish["generations"],
