@@ -242,13 +242,27 @@ def get_gemm_module():
                 # makes the runtime key miss the bucketed profile key, so the
                 # tuned tactic is dropped for tactic=-1. Shapes are already in
                 # the autotuner's input_shapes; add only dtypes.
-                a, b, _, _, out, _ = inputs
+                a, b, out = inputs[0], inputs[1], inputs[4]
                 return (a.dtype, b.dtype, out.dtype)
 
-            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+            @staticmethod
+            def _bias(inputs: List[torch.Tensor]) -> Optional[torch.Tensor]:
+                # fp8_gemm_sm100 appends the bias only when one is given.
+                return inputs[6] if len(inputs) > 6 else None
+
+            @staticmethod
+            def _pointer_alignment(tensor: Optional[torch.Tensor]) -> int:
+                if tensor is None:
+                    return 0
+                address = tensor.data_ptr()
+                return min(address & -address, 256)
+
+            def _algo_cache_key(
+                self, inputs: List[torch.Tensor], bias: Optional[torch.Tensor]
+            ) -> tuple:
                 # The algo list is enumerated per exact problem descriptor and
                 # filtered by the workspace size, so a smaller buffer re-queries.
-                a, b, _, _, out, workspace = inputs
+                a, b, out, workspace = inputs[0], inputs[1], inputs[4], inputs[5]
                 dev = a.device
                 major, minor = get_compute_capability(dev)
                 return (
@@ -264,11 +278,14 @@ def get_gemm_module():
                     b.dtype,
                     out.dtype,
                     workspace.numel() * workspace.element_size(),
+                    self._pointer_alignment(bias),
                 )
 
-            def _get_algos(self, inputs):
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = self._algo_cache_key(inputs)
+            def _get_algos(
+                self, inputs: List[torch.Tensor], bias: Optional[torch.Tensor]
+            ) -> tuple:
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs[:6]
+                key = self._algo_cache_key(inputs, bias)
                 with self._algo_cache_lock:
                     cached = self._algo_cache.get(key)
                     if cached is not None:
@@ -287,6 +304,7 @@ def get_gemm_module():
                     scale_b,
                     workspace_buffer,
                     algo_buf,
+                    bias,
                 )
                 result = (algo_buf, count)
                 with self._algo_cache_lock:
@@ -300,7 +318,7 @@ def get_gemm_module():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                _, count = self._get_algos(inputs)
+                _, count = self._get_algos(inputs, self._bias(inputs))
                 return list(range(count))
 
             def forward(
@@ -310,13 +328,14 @@ def get_gemm_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs[:6]
+                bias = self._bias(inputs)
                 # The cuBLASLt algo list is enumerated per-shape, so a tactic
                 # tuned at a different (bucketed) M may be out of range here.
                 # Fall back to the heuristic default (the tactic==-1 path) on an
                 # out-of-range or empty algo list rather than raising.
                 if tactic >= 0:
-                    algo_buf, count = self._get_algos(inputs)
+                    algo_buf, count = self._get_algos(inputs, bias)
                     if 0 <= tactic < count:
                         module.bmm_fp8_run_with_algo(
                             a,
@@ -327,9 +346,10 @@ def get_gemm_module():
                             workspace_buffer,
                             algo_buf,
                             tactic,
+                            bias,
                         )
                         return out
-                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
+                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer, bias)
                 return out
 
         return CublasFp8GemmRunner()
@@ -3181,6 +3201,7 @@ def fp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
     tuner = AutoTuner.get()
 
@@ -3202,6 +3223,10 @@ def fp8_gemm_sm100(
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
+    if bias is not None:
+        # Only the cuBLAS runner takes a bias. It is appended only when given,
+        # so unbiased calls keep their tuning cache keys.
+        inputs.append(bias)
     runner, tactic = tuner.choose_one(
         "fp8_gemm",
         runners,
@@ -10270,7 +10295,10 @@ def _cudnn_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
+    if bias is not None:
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -10284,6 +10312,7 @@ def _cublas_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     return True
 
@@ -10298,7 +10327,10 @@ def _cutlass_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
+    if bias is not None:
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
     return True
@@ -10317,8 +10349,11 @@ def _cute_dsl_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     """Requirement check for CuTe-DSL FP8 BMM backend."""
+    if bias is not None:
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     if not CUTE_DSL_AVAILABLE:
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
@@ -10355,8 +10390,24 @@ def _check_bmm_fp8_problem_size(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     _validate_fp8_output_dtype(dtype)
+    if bias is not None:
+        if batch_invariant:
+            raise ValueError(
+                "bmm_fp8 supports a bias only with the cublas backend, "
+                "not with batch_invariant=True."
+            )
+        if bias.shape != (B.shape[2],) or bias.dtype != dtype:
+            raise ValueError(
+                f"bias must have shape {(B.shape[2],)} and dtype {dtype}, "
+                f"got {tuple(bias.shape)} and {bias.dtype}."
+            )
+        # cuBLASLt FP8 GEMMs need 16-byte-aligned pointers, the bias included;
+        # with a bias that is not, it lists no algo.
+        if not bias.is_contiguous() or bias.data_ptr() % 16 != 0:
+            raise ValueError("bias must be contiguous and 16-byte aligned.")
     return True
 
 
@@ -10375,6 +10426,7 @@ def _heuristic_func_bmm_fp8(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     # No e5m2 for cutlass (but cute-dsl supports it)
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -10459,6 +10511,7 @@ def bmm_fp8(
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
     *,
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -10501,6 +10554,11 @@ def bmm_fp8(
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
+
+    bias: Optional[torch.Tensor]
+        Bias tensor, shape (n,), contiguous and 16-byte aligned, with the out
+        dtype, added to every batch in the GEMM epilogue. Only the ``"cublas"``
+        backend supports it (``"auto"`` picks it). Defaults to ``None``.
 
     Returns
     -------
@@ -10563,7 +10621,7 @@ def bmm_fp8(
     else:
         backends = [backend]
 
-    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
+    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends, bias)
     return out
 
 

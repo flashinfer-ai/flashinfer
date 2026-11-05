@@ -1083,11 +1083,14 @@ def _bmm_reference(A, B):
     return torch.matmul(A.to(torch.float32), B.to(torch.float32)).to(A.dtype)
 
 
-def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
-    """Reference per-tensor FP8 BMM: dequantize then matmul."""
+def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype, bias=None):
+    """Reference per-tensor FP8 BMM: dequantize then matmul (+ bias)."""
     A_f = A.to(torch.float32) * A_scale.to(torch.float32)
     B_f = B.to(torch.float32) * B_scale.to(torch.float32)
-    return torch.matmul(A_f, B_f).to(dtype)
+    res = torch.matmul(A_f, B_f)
+    if bias is not None:
+        res = res + bias.to(torch.float32)
+    return res.to(dtype)
 
 
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
@@ -1205,6 +1208,7 @@ bmm_fp8_trace = TraceTemplate(
             ["scalar"], dtype="float32", description="Per-tensor dequant scale for B."
         ),
         "dtype": Scalar("int32", description="Output dtype enum."),
+        "bias": Tensor(["N"], optional=True),
     },
     outputs={
         "C": Tensor(["batch_size", "M", "N"], dtype="bfloat16"),
