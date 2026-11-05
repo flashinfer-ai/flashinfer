@@ -243,6 +243,24 @@ theorem config_invariance32_bits {α : Type} (P : Prims α) (c₁ c₂ : Config)
     eval P (tileResult32 c₁ S₁ p a b kb nblk) = eval P (tileResult32 c₂ S₂ q a b kb nblk) := by
   rw [config_invariance32 c₁ c₂ S₁ S₂ p q a b kb nblk]
 
+/-- The in-CTA chunk fold with the bias added once after the last chunk's fold (its epilogue's chain) is the biased
+split class, as the workspace split with the bias in its fixup is (`outputBias_split_eq_kchunk`). -/
+theorem outputBias_ctaSplit_eq_kchunk (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) :
+    outputElemBias fmt (ctaSplit a b C kc) b = outputKchunkBias fmt a b C kc := by
+  unfold outputKchunkBias; rw [ctaSplit_eq_kchunk]
+
+/-- Through the biased chain: the biased output of a tile is the biased unsplit class's output, so no configuration,
+stage count or carried accumulator reaches it. -/
+theorem tileOutputBias_eq_outputKfoldBias (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemBias fmt (tileResult cfg S p a b kb nblk) b = outputKfoldBias fmt a b (nblk * kb) := by
+  unfold outputKfoldBias; rw [tileResult_eq_kfold]
+
+theorem outputBias_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemBias fmt (tileResult c₁ S₁ p a b kb nblk) b = outputElemBias fmt (tileResult c₂ S₂ q a b kb nblk) b := by
+  rw [config_invariance c₁ c₂ S₁ S₂ p q a b kb nblk]
+
 /-- Bits, not terms: under any primitives `P`, both configurations evaluate to the same value. -/
 theorem config_invariance_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
     (a : RowData) (b : ColData) (kb nblk : Nat) :

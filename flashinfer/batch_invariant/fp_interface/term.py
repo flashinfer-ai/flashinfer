@@ -156,6 +156,8 @@ def sexpr(t: Term) -> str:
             out = f"(a {A[0]} {A[1]})"  # A's row m at step t
         elif op == "op:b_cols":
             out = f"(b {A[0]} {A[1]})"  # B's column n at step t
+        elif op == "op:bias_col":
+            out = f"(bias {A[0]})"  # the bias of output column n, widened to binary32 exactly
         else:
             out = "(" + op + " " + " ".join(map(str, A)) + ")"
         memo[cur.uid] = out

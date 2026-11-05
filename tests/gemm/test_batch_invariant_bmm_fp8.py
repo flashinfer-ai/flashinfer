@@ -669,6 +669,15 @@ def test_chunk_count_and_workspace_checks():
     )  # N = 128: the chunk rule splits; b = 3: one workspace reused per element
     A, B = adv_fp8(b, M, K, seed=131), weights(b, N, K, 132)
     sa, sb = scales()
+    # a caller-forced configuration the kernel cannot implement: the 16-wide tile of the 2-CTA pair needs a K-major weight
+    # on kind::f8f6f4 (the only guard is the launch path's, for the unsplit class the batched launch's)
+    A1, B1 = adv_fp8(1, 16, 4096, seed=141), weights(1, 4096, 4096, 142)
+    forced = Knobs((256, 16), (2, 1), True, True, "m", 1)
+    assert not can_implement(forced, 16, 4096, 4096, "n", 1, "e4m3")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
+        bmm_fp8_batch_invariant(
+            A1, B1.contiguous(), sa, sb, torch.bfloat16, config=forced
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
         bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, chunks=0)
     C = chunks_for(N, K, "e4m3")
@@ -722,6 +731,18 @@ def test_chunk_count_and_workspace_checks():
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
     ):
         bmm_fp8_batch_invariant(A, B, ws[:1], sb, torch.bfloat16, workspace=ws)
+    big = torch.empty(
+        b * 16 * K // 4, dtype=torch.float32, device="cuda"
+    )  # a workspace holding the (b, 16, K) operand below
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
+        bmm_fp8_batch_invariant(
+            big.view(torch.float8_e4m3fn).view(b, 16, K),
+            B,
+            sa,
+            sb,
+            torch.bfloat16,
+            workspace=big,
+        )
     out = ws.view(torch.bfloat16)[: b * M * N].view(b, M, N)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"

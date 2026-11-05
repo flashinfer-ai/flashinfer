@@ -836,13 +836,17 @@ def mm_bf16(
 
     batch_invariant: bool
         ``True`` runs the batch-invariant bf16 GEMM class in place of the
-        backends (requires ``backend="auto"``, bf16 output and no bias): a
+        backends (requires ``backend="auto"`` and bf16 output): a
         row of the output is bit-identical whatever the number of rows, the
         row's position in the batch or the configuration chosen, and the
         result is deterministic. Under autotuning the class's top
         configurations for the shape are profiled; all of them compute the
         same bits. ``b`` may be the row-major ``(k, n)`` tensor or the
-        transpose of a row-major ``(n, k)`` weight. Unsupported inputs raise
+        transpose of a row-major ``(n, k)`` weight. A bf16 ``bias`` of shape
+        ``(n,)`` is added once, in fp32, to the fully reduced accumulator
+        before the single rounding to bf16 (a biased call is a different
+        specification: ``flashinfer.batch_invariant.fingerprint("mm_bf16", N=,
+        K=, bias=True)``). Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.

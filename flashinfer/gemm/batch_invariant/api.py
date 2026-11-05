@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch-facing entries of the GEMM classes.
 
-``mm_bf16_batch_invariant`` is what :func:`flashinfer.mm_bf16` runs under ``batch_invariant=True``: C = A @ B in bf16
-with fp32 accumulation; A is (M, K) row-major, B is (K, N) either row-major or the transpose of a row-major (N, K)
-tensor (FlashInfer's documented "column-major" weight), C is (M, N) row-major bf16.
+``mm_bf16_batch_invariant`` is what :func:`flashinfer.mm_bf16` runs under ``batch_invariant=True``: C = A @ B (+ bias)
+in bf16 with fp32 accumulation; A is (M, K) row-major, B is (K, N) either row-major or the transpose of a row-major
+(N, K) tensor (FlashInfer's documented "column-major" weight), the optional bias a bf16 (N,) vector added once in fp32
+to the reduced accumulator before the single rounding, C is (M, N) row-major bf16.
 
 ``bmm_fp8_batch_invariant`` is what :func:`flashinfer.bmm_fp8` runs under ``batch_invariant=True``: per batch element
 C[i] = cvt((A[i] @ B[i]) * mul.rn(A_scale, B_scale)) for fp8 A (b, M, K) row-major and B (b, K, N) column-major (the
@@ -306,7 +307,8 @@ def _check_workspace(
 
 
 def _byte_span(t: torch.Tensor) -> Tuple[int, int]:
-    """The half-open byte range a tensor's elements occupy."""
+    """The half-open byte range from a tensor's first to its last element. The overlap test built on it is conservative:
+    a buffer placed in the gaps of a strided tensor counts as overlapping."""
     if t.numel() == 0:
         return 0, 0
     last = sum((n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True) if n > 1)
@@ -378,14 +380,25 @@ def _run(
     scales: Tuple[torch.Tensor, ...],
     workspace: Optional[torch.Tensor],
     cls: str,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """The launch shared by the classes for one (M, K) x (K, N) product: ``b_nk`` is the (N, K) view of the weight (strides
     (1, N) for the ``n`` layout, (K, 1) for ``k``); ``scales`` the fp8 classes' two per-tensor scale tensors (empty for
-    bf16)."""
+    bf16); ``bias`` the bf16 class's (N,) bias (the biased chain: added once after the whole fold, in the epilogue of a
+    direct store or in the fixup of the workspace split, whose partials stay bias-free)."""
     from .blocks.compile import get_compiled_gemm
+    from .blocks.operands import can_implement
     from .fixup import MAX_GRID_Y, get_fixup
 
+    if not can_implement(config, M, N, K, b_major, C, in_fmt):
+        raise unsupported(
+            cls,
+            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks and a "
+            f"{'K' if b_major == 'k' else 'N'}-major weight",
+            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        )
     scaled = is_scaled(in_fmt)
+    direct = C == 1 or config.cta_chunks
     kernel = get_compiled_gemm(
         config,
         b_major,
@@ -394,7 +407,9 @@ def _run(
         in_fmt,
         out_fmt,
         family=part_of(a.device)[1],
+        bias=bias is not None and direct,
     )
+    extra = (scales if scaled else ()) + ((bias,) if bias is not None else ())
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
     Kc = K // C
@@ -403,10 +418,12 @@ def _run(
         (N, Kc, C), (b_nk.stride(0), b_nk.stride(1), Kc * b_nk.stride(1))
     )
     reads = [(a, "A"), (b_nk, "B"), *((sc, "a scale") for sc in scales)]
-    if C == 1 or config.cta_chunks:
+    if bias is not None:
+        reads.append((bias, "the bias"))
+    if direct:
         _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-        kernel(a3, b3, c3, *(scales if scaled else ()))
+        kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
     # applied there, once)
@@ -417,10 +434,43 @@ def _run(
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
         _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
-    kernel(a3, b3, ws)  # the unscaled body: raw fp32 partials
+    kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
-    get_fixup(C, out_fmt, scaled)(ws, out, *(scales if scaled else ()), M, N, rows)
+    get_fixup(C, out_fmt, scaled, bias is not None)(ws, out, *extra, M, N, rows)
     return out
+
+
+def prepare_bias(
+    bias: Optional[torch.Tensor], N: int, a: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """The class's typed checks of the bias (what the operator's backends accept): a bf16 vector of ``N`` elements on
+    A's device, contiguous, at a 16-byte-aligned base; ``None`` is the unbiased chain. Raises
+    :class:`BatchInvariantUnsupportedError`; never copies (a bias is an operand the kernel reads as given)."""
+    if bias is None:
+        return None
+    if not isinstance(bias, torch.Tensor):
+        raise unsupported(
+            CLASS, f"a bias of type {type(bias).__name__}", "a bf16 torch.Tensor bias"
+        )
+    if bias.dtype != torch.bfloat16:
+        raise unsupported(CLASS, f"a {bias.dtype} bias", "a bf16 bias")
+    if bias.dim() != 1 or bias.shape[0] != N:
+        raise unsupported(
+            CLASS, f"a bias of shape {tuple(bias.shape)}", f"a bias of shape ({N},)"
+        )
+    if bias.device != a.device:
+        raise unsupported(CLASS, "a bias on another device", "the bias on A's device")
+    if bias.stride(0) != 1:
+        raise unsupported(
+            CLASS, f"a bias with stride {bias.stride(0)}", "a contiguous bias"
+        )
+    if bias.data_ptr() % _ALIGN_BYTES:
+        raise unsupported(
+            CLASS,
+            "a bias at a base address that is not 16-byte aligned",
+            "a 16-byte-aligned bias",
+        )
+    return bias
 
 
 def mm_bf16_batch_invariant(
@@ -428,16 +478,20 @@ def mm_bf16_batch_invariant(
     b: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
+    bias: Optional[torch.Tensor] = None,
     config: Optional[Knobs] = None,
     chunks: Optional[int] = None,
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``C = A @ B`` by the class ``gemm.bf16``: ``kfold`` when the weight shape's chunk rule gives 1, else
-    ``kchunk[C]`` with ``C = chunks_for(N, K)``, a function of the weight shape only, so a row's bits never depend on
-    the batch. ``config`` forces a configuration (a member of the enumerated space: the bits never depend on it);
-    ``chunks`` forces the class's chunk count (tests); ``workspace`` (fp32, at least ``chunks * M * N`` elements) is the
-    split class's partials buffer, otherwise allocated per call from the caching allocator (stream-ordered)."""
+    """``C = A @ B`` (``+ bias`` when given) by the class ``gemm.bf16``: ``kfold`` when the weight shape's chunk rule
+    gives 1, else ``kchunk[C]`` with ``C = chunks_for(N, K)``, a function of the weight shape only, so a row's bits never
+    depend on the batch. ``bias`` (bf16, (N,)) selects the biased chain: ``cvt(add(fold, bias[n]))``, the add once in
+    fp32 after the whole fold (in the epilogue, or in the fixup for the workspace split). ``config`` forces a
+    configuration (a member of the enumerated space: the bits never depend on it); ``chunks`` forces the class's
+    chunk count (tests); ``workspace`` (fp32, at least ``chunks * M * N`` elements) is the split class's partials
+    buffer, otherwise allocated per call from the caching allocator (stream-ordered)."""
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
+    bias = prepare_bias(bias, N, a)
     if M == 0:
         return out  # no rows: nothing to launch
     C = chunks if chunks is not None else chunks_for(N, K)
@@ -452,7 +506,21 @@ def mm_bf16_batch_invariant(
     if config is None:
         config = default_config(M, N, K, C, b_major, *part_of(a.device))
     return _run(
-        a, b.t(), out, b_major, M, N, K, C, config, "bf16", "bf16", (), workspace, CLASS
+        a,
+        b.t(),
+        out,
+        b_major,
+        M,
+        N,
+        K,
+        C,
+        config,
+        "bf16",
+        "bf16",
+        (),
+        workspace,
+        CLASS,
+        bias=bias,
     )
 
 
@@ -724,7 +792,15 @@ def bmm_fp8_batch_invariant(
     out_fmt = OUT_FMT_OF_DTYPE[dtype]
     if C == 1:
         from .blocks.compile import get_compiled_gemm
+        from .blocks.operands import can_implement
 
+        if not can_implement(config, M, N, K, b_major, 1, in_fmt):
+            raise unsupported(
+                cls,
+                f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with a "
+                f"{'K' if b_major == 'k' else 'N'}-major weight",
+                "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+            )
         kernel = get_compiled_gemm(
             config,
             b_major,

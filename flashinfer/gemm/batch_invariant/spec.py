@@ -21,6 +21,9 @@ Two consistency classes per format:
 
 The fp8 classes carry the suffix ``.scaled`` (``gemm.e4m3.kfold.scaled``): the chain multiplies by ``alpha`` once,
 after the fold (the fixup applies it for the workspace split; the in-CTA fold after its last chunk).
+
+Each class has a biased variant (``BIAS_NOTE``): the bias of the output column, widened from bf16 to binary32 exactly, is
+added once with ``add.rn`` to the fully reduced accumulator before the single ``cvt.rn``; the fold is untouched.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ MMA_OP_OF = {"bf16": "mma_bf16_k16", "e4m3": "mma_fp8_k32", "e5m2": "mma_fp8_k32
 ELEM_BITS_OF = {"bf16": 16, "e4m3": 8, "e5m2": 8}
 MMA_K = MMA_K_OF["bf16"]  # the bf16 K step (the bf16 class's constant)
 MMA_OP = MMA_OP_OF["bf16"]
+BIAS_OP = "bias_col"  # the bias leaf: the bias of one output column as a binary32 value
 IN_FMT = "bf16"
 ELEM_BITS = ELEM_BITS_OF["bf16"]
 
@@ -73,6 +77,22 @@ def identity_note(in_fmt: str) -> str:
 
 
 IDENTITY_NOTE = identity_note("bf16")
+
+
+BIAS_NOTE = (
+    "The biased chain is cvt.rn(add.rn(acc, bias[n])): the bias of the output column is added once, in fp32, to the fully "
+    "reduced accumulator, then the single rounding to the output format. The bf16 bias is widened to binary32 exactly "
+    "(every bf16 value is a binary32 value), so the widening is a bit movement, not a rounding step. The add is "
+    "applied in exactly one place per class: the epilogue of the unsplit fold and of the in-CTA chunk fold, the fixup "
+    "of the workspace split (its fp32 partials stay bias-free), so no configuration, chunk count or part can move it, and "
+    "a row's bits never depend on M. A biased and an unbiased call are different specifications: the term carries the "
+    "bias leaf and the fingerprint the bias flag; bias=None is the unbiased chain, bit for bit"
+)
+
+
+def bias_leaf(fp, n: int):
+    """The bias of output column ``n`` as a binary32 value: a leaf of the term (an input, like the operand slices)."""
+    return fp.op(BIAS_OP, n)
 
 
 def kslice_leaf(m: int, n: int):
@@ -141,7 +161,8 @@ def scale_term(fp):
 
 @dataclass(frozen=True)
 class EpilogueChain:
-    """The elementwise ops after the fold, in order: ``mul.rn alpha`` for the scaled (fp8) classes, then exactly one
+    """The elementwise ops after the fold, in order: ``mul.rn alpha`` for the scaled (fp8) classes, ``add.rn bias`` for
+    the biased chain (the bias of the output column, widened to binary32 exactly: ``BIAS_NOTE``), then exactly one
     ``cvt.rn <out>``. One object, one ``apply``: the spec term (:func:`output_elem`, ``fp`` = the term algebra), the
     kernel (``blocks/epilogue.py``: ``fp`` = ``CuteF32`` for the ops before the conversion, the vector ``.to(out dtype)``
     for the conversion itself) and the fixup all run this code."""
@@ -149,9 +170,11 @@ class EpilogueChain:
     ops: Tuple[str, ...]
 
     @staticmethod
-    def for_class(out_fmt: str, scaled: bool) -> "EpilogueChain":
+    def for_class(out_fmt: str, scaled: bool, bias: bool = False) -> "EpilogueChain":
         return EpilogueChain(
-            (("mul.rn alpha",) if scaled else ()) + (f"cvt.rn {out_fmt}",)
+            (("mul.rn alpha",) if scaled else ())
+            + (("add.rn bias",) if bias else ())
+            + (f"cvt.rn {out_fmt}",)
         )
 
     @property
@@ -168,25 +191,40 @@ class EpilogueChain:
     def scaled(self) -> bool:
         return "mul.rn alpha" in self.pre
 
-    def apply_pre(self, fp, x, alpha=None):
+    @property
+    def biased(self) -> bool:
+        return "add.rn bias" in self.pre
+
+    def apply_pre(self, fp, x, alpha=None, bias=None):
+        """``alpha`` is the scaled chain's runtime scalar, ``bias`` the biased chain's bias of this element's column (a
+        binary32 value: the bf16 bias widened exactly)."""
         for op in self.pre:
             if op == "mul.rn alpha":
                 assert alpha is not None, "the scaled chain needs alpha"
                 x = fp.mul(x, alpha)
+            elif op == "add.rn bias":
+                assert bias is not None, "the biased chain needs the column's bias"
+                x = fp.add(x, bias)
             else:  # a new chain op must be added here, nowhere else
                 raise ValueError(f"unknown epilogue op {op!r}")
         return x
 
-    def apply(self, fp, x, alpha=None):
-        return fp.cvt_out(self.apply_pre(fp, x, alpha), self.out_fmt)
+    def apply(self, fp, x, alpha=None, bias=None):
+        return fp.cvt_out(self.apply_pre(fp, x, alpha, bias), self.out_fmt)
 
     def describe(self) -> str:
         return " -> ".join(self.ops)
 
 
-def output_elem(fp, acc, out_fmt: str = "bf16", alpha=None):
-    """The epilogue chain of the class: ``cvt_rn(acc)`` or, with ``alpha``, ``cvt_rn(mul.rn(acc, alpha))``."""
-    return EpilogueChain.for_class(out_fmt, alpha is not None).apply(fp, acc, alpha)
+def output_elem(
+    fp, acc, out_fmt: str = "bf16", alpha=None, bias_n: Optional[int] = None
+):
+    """The epilogue chain of the class: ``cvt_rn(acc)``; with ``alpha``, ``cvt_rn(mul.rn(acc, alpha))``; with a bias
+    (``bias_n`` the output column), one ``add.rn`` of the bias leaf to the folded accumulator before the conversion
+    (``BIAS_NOTE``)."""
+    chain = EpilogueChain.for_class(out_fmt, alpha is not None, bias_n is not None)
+    bias = bias_leaf(fp, bias_n) if bias_n is not None else None
+    return chain.apply(fp, acc, alpha, bias)
 
 
 class GemmSpec:
@@ -197,9 +235,15 @@ class GemmSpec:
         alg: Optional[TermAlgebra] = None,
         chunks: int = 1,
         in_fmt: str = "bf16",
+        bias: bool = False,
     ):
         self.K, self.out_fmt, self.chunks, self.in_fmt = K, out_fmt, chunks, in_fmt
         self.scaled = is_scaled(in_fmt)
+        if bias and in_fmt != "bf16":
+            raise ValueError(
+                f"the biased chain exists for the bf16 class only (mm_bf16's bias); no kernel implements it for {in_fmt!r}"
+            )
+        self.bias = bias
         self.alg = alg or TermAlgebra()
 
     def acc(self, m: int, n: int) -> Term:
@@ -211,20 +255,30 @@ class GemmSpec:
 
     def out(self, m: int, n: int) -> Term:
         alpha = scale_term(self.alg) if self.scaled else None
-        return output_elem(self.alg, self.acc(m, n), self.out_fmt, alpha)
+        return output_elem(
+            self.alg, self.acc(m, n), self.out_fmt, alpha, n if self.bias else None
+        )
 
 
 def spec_fingerprint(
-    K: int, out_fmt: str = "bf16", chunks: int = 1, in_fmt: str = "bf16"
+    K: int,
+    out_fmt: str = "bf16",
+    chunks: int = 1,
+    in_fmt: str = "bf16",
+    bias: bool = False,
 ) -> str:
     """The identifier of the class for one weight: the term encodes ceil(K / step) opaque steps; the raw K (hence the
-    zero-filled tail of the last step), the chunk count, the formats and the chain are part of the specification too,
-    so they enter the identifier."""
-    s = GemmSpec(K, out_fmt, chunks=chunks, in_fmt=in_fmt)
+    zero-filled tail of the last step), the chunk count, the formats, the chain and the bias flag are part of the
+    specification too, so they enter the identifier (``-bias`` in the tag; without a bias the identifier is the
+    unbiased class's, unchanged). The biased variant exists for the bf16 class only; ``bias=True`` with another format
+    raises."""
+    s = GemmSpec(K, out_fmt, chunks=chunks, in_fmt=in_fmt, bias=bias)
     tag = f"gemm-{in_fmt}-" + ("kfold" if chunks == 1 else f"kchunk{chunks}")
-    tag += "-scaled-" if s.scaled else "-"
+    tag += ("-scaled" if s.scaled else "") + ("-bias" if bias else "") + "-"
     parts = [f"K={K}", f"chunks={chunks}", f"out={out_fmt}"]
     if in_fmt != "bf16":
         parts += [f"in={in_fmt}", f"scaled={int(s.scaled)}"]
     parts += [fingerprint(s.out(0, 0)), fingerprint(s.out(1, 1))]
+    if bias:
+        parts.append("bias=1")
     return tag + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
