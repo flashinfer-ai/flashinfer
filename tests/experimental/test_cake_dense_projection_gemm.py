@@ -3244,7 +3244,7 @@ def test_router_148_sm_simt_windows_plan_their_registered_programs(arch):
                     assert plan.simt == tile, (layout, hidden, T, plan.simt)
                     assert plan.template == template, (layout, hidden, T)
                     planned += 1
-            for (_, last, _), (first, _, _) in zip(windows, windows[1:]):
+            for (_, last, _), (first, _, _) in zip(windows, windows[1:], strict=False):
                 for T in range(last + 1, first):
                     plan, _ = _plan_router_row(layout, arch, 148, hidden, T)
                     assert plan is None, (layout, hidden, T)
@@ -3570,16 +3570,10 @@ def test_k2_planner_plans_the_simt_router(monkeypatch):
 #: sm_103a parts (:data:`ROUTER_RULES_BY_SM`, :data:`ROUTER_DGRAD_WINDOWS`); every other part and row runs the
 #: deterministic program.
 DGRAD_SIMT_WINDOWS = {
-    **{
-        (arch, 148, 4096): ((1, 64, (64, 32, 8)),)
-        for arch in ("sm_100a", "sm_103a")
-    },
+    **{(arch, 148, 4096): ((1, 64, (64, 32, 8)),) for arch in ("sm_100a", "sm_103a")},
     ("sm_100a", 148, 5120): ((1, 32, (64, 32, 8)), (64, 128, (64, 32, 4))),
     ("sm_103a", 148, 5120): ((1, 32, (64, 32, 8)),),
-    **{
-        (arch, 148, 6144): ((1, 32, (64, 32, 8)),)
-        for arch in ("sm_100a", "sm_103a")
-    },
+    **{(arch, 148, 6144): ((1, 32, (64, 32, 8)),) for arch in ("sm_100a", "sm_103a")},
     ("sm_100a", 152, 4096): ((1, 128, (64, 32, 4)),),
     ("sm_100a", 152, 5120): ((1, 128, (64, 32, 4)),),
     ("sm_100a", 152, 6144): ((1, 64, (64, 32, 4)),),
