@@ -23,6 +23,7 @@ from typing import (
     Callable,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     TypeAlias,
@@ -2123,9 +2124,10 @@ class AutoTuner:
         blocklist, so such entries are dropped and become cache misses: they
         are re-profiled (without the listed tactics) inside a tuning context
         and fall back to the runner's default tactic otherwise.  The dropped
-        keys are also invalidated so the next :meth:`save_configs` does not
-        revive them from disk, and remembered so a later lookup reports the
-        miss as ``blocklisted_tactic``.  Returns the number of entries dropped.
+        keys are remembered so a later lookup reports the miss as
+        ``blocklisted_tactic`` and so :meth:`save_configs` does not write the
+        on-disk entry back while its tactic is still blocklisted.  Returns the
+        number of entries dropped.
 
         ``keys`` restricts the sweep to those cache-file keys (used by
         :meth:`load_configs` to count and attribute only the entries one call
@@ -2139,31 +2141,13 @@ class AutoTuner:
         with self._lock:
             if not self._file_configs:
                 return 0
-            candidates = list(self._file_configs if keys is None else keys)
-            for op_key in blocklist.summary():
-                # Blocklist keys are "custom_op::RunnerClass"; custom_op may
-                # itself contain "::" (e.g. "flashinfer::op"), the class name
-                # cannot.  file_key is str((custom_op, runner_class, ...)).
-                if "::" not in op_key:
-                    continue
-                custom_op, runner_name = op_key.rsplit("::", 1)
-                prefix = f"({custom_op!r}, {runner_name!r}, "
-                for file_key in candidates:
-                    if not file_key.startswith(prefix):
-                        continue
-                    entry = self._file_configs.get(file_key)
-                    if entry is None:
-                        continue
-                    stored_runner, tactic = entry
-                    if stored_runner != runner_name or not blocklist.is_blocked(
-                        custom_op, runner_name, tactic
-                    ):
-                        continue
-                    del self._file_configs[file_key]
-                    self._file_config_policies.pop(file_key, None)
-                    self._invalidated_file_keys.add(file_key)
-                    self._blocklisted_file_keys.add(file_key)
-                    dropped += 1
+            candidates = self._file_configs if keys is None else keys
+            for file_key in self._blocklisted_keys_in(self._file_configs, candidates):
+                del self._file_configs[file_key]
+                self._file_config_policies.pop(file_key, None)
+                self._file_config_selections.pop(file_key, None)
+                self._blocklisted_file_keys.add(file_key)
+                dropped += 1
         if dropped:
             logger.warning(
                 f"[Autotuner]: Dropped {dropped} cached config(s) from {source} "
@@ -2172,6 +2156,40 @@ class AutoTuner:
                 "autotuning is enabled."
             )
         return dropped
+
+    def _blocklisted_keys_in(
+        self, entries: Mapping[str, tuple[str, Any]], keys: Iterable[str]
+    ) -> list[str]:
+        """Return the *keys* whose ``entries`` tactic is in the blocklist.
+
+        ``entries`` maps cache-file keys to ``(runner_name, tactic)``; keys
+        missing from it are ignored.  Does not take the lock.
+        """
+        blocklist = self._blocklist
+        if not blocklist.is_loaded:
+            return []
+        keys = list(keys)
+        hits: list[str] = []
+        for op_key in blocklist.summary():
+            # Blocklist keys are "custom_op::RunnerClass"; custom_op may
+            # itself contain "::" (e.g. "flashinfer::op"), the class name
+            # cannot.  file_key is str((custom_op, runner_class, ...)).
+            if "::" not in op_key:
+                continue
+            custom_op, runner_name = op_key.rsplit("::", 1)
+            prefix = f"({custom_op!r}, {runner_name!r}, "
+            for file_key in keys:
+                if not file_key.startswith(prefix):
+                    continue
+                entry = entries.get(file_key)
+                if entry is None:
+                    continue
+                stored_runner, tactic = entry
+                if stored_runner == runner_name and blocklist.is_blocked(
+                    custom_op, runner_name, tactic
+                ):
+                    hits.append(file_key)
+        return hits
 
     @property
     def _active_managed_store(self):
@@ -4934,6 +4952,7 @@ class AutoTuner:
             namespaced_records = copy.deepcopy(self._namespaced_records)
             dirty_namespaces = frozenset(self._dirty_namespaces)
             invalidated_file_keys = frozenset(self._invalidated_file_keys)
+            blocklisted_file_keys = frozenset(self._blocklisted_file_keys)
 
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
@@ -5018,6 +5037,18 @@ class AutoTuner:
                 # Same environment: merge on-disk entries and preserve the
                 # original "created by" record.
                 for file_key in invalidated_file_keys:
+                    disk_configs.pop(file_key, None)
+                # An entry dropped at load time because its tactic is
+                # blocklisted is removed only while the on-disk tactic is
+                # still blocklisted: another writer may have re-tuned the
+                # key to a permitted tactic since, and that result must
+                # survive this save.
+                stale: dict[str, tuple[str, Any]] = {}
+                for file_key in blocklisted_file_keys:
+                    value = disk_configs.get(file_key)
+                    if isinstance(value, list) and len(value) >= 2:
+                        stale[file_key] = (value[0], _json_to_tactic(value[1]))
+                for file_key in self._blocklisted_keys_in(stale, stale):
                     disk_configs.pop(file_key, None)
                 disk_configs.update(configs)
                 configs = disk_configs
