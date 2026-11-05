@@ -327,10 +327,8 @@ void appendLamportRegions(meta::MoeA2AWorkspaceLayout& layout, int64_t maxNumTok
       << "The Lamport transport supports at most " << lamport::kMaxRanks << " EP ranks";
   TVM_FFI_ICHECK(topK <= lamport::kMaxTopK)
       << "The Lamport transport supports top_k <= " << lamport::kMaxTopK;
-  TVM_FFI_ICHECK(maxNumTokens > 0 && maxNumTokens <= lamport::kMaxTokensPerRank &&
-                 maxNumTokens <= layout[MAX_NUM_TOKENS_INDEX])
-      << "Lamport token capacity must be in [1, min(" << lamport::kMaxTokensPerRank
-      << ", max_num_tokens)], got " << maxNumTokens;
+  TVM_FFI_ICHECK(maxNumTokens > 0 && maxNumTokens <= layout[MAX_NUM_TOKENS_INDEX])
+      << "Lamport token capacity must be in [1, max_num_tokens], got " << maxNumTokens;
   auto const bytes = lamportRegionBytes(epSize, maxNumTokens, topK,
                                         lamportRowBytes(payloadFormat, hiddenSize), hiddenSize);
 
@@ -427,9 +425,9 @@ void moeA2ALamportExtendWorkspaceLayoutOp(TensorView metainfo, int64_t maxNumTok
   std::copy(layout.begin(), layout.end(), static_cast<int64_t*>(metainfo.data_ptr()));
 }
 
-// Row geometry of a Lamport payload format at hiddenSize, for the per-step choice and the default
-// token limit: (hidden-state row bytes, scale row bytes, dispatch blocks per token slot,
-// workspace bytes per (source rank, token) row). Raises for an unsupported hidden size.
+// Row geometry of a Lamport payload format at hiddenSize: (hidden-state row bytes, scale row bytes,
+// dispatch blocks per token slot, workspace bytes per (source rank, token) row). Raises for an
+// unsupported hidden size.
 Array<int64_t> moeA2ALamportRowBytesOp(int64_t payloadFormat, int64_t hiddenSize, int64_t topK) {
   auto const row = lamportRowBytes(payloadFormat, hiddenSize);
   Array<int64_t> geometry;
@@ -1336,8 +1334,6 @@ Tuple<Array<String>, Array<int64_t>> getMoeA2AMetaInfoIndexPairsOp() {
   std::pair<char const*, int64_t> const lamportConstants[] = {
       {"MOE_A2A_LAMPORT_MAX_RANKS", lamport::kMaxRanks},
       {"MOE_A2A_LAMPORT_MAX_TOP_K", lamport::kMaxTopK},
-      {"MOE_A2A_LAMPORT_MAX_TOKENS_PER_RANK", lamport::kMaxTokensPerRank},
-      {"MOE_A2A_LAMPORT_DISPATCH_BLOCKS_PER_SM", lamport::kDispatchBlocksPerSM},
       {"MOE_A2A_LAMPORT_IDS_SENTINEL", static_cast<int32_t>(lamport::kIdsSentinel)},
       {"MOE_A2A_LAMPORT_FORMAT_BF16", lamport::kBf16},
       {"MOE_A2A_LAMPORT_FORMAT_MXFP8", lamport::kMxfp8},

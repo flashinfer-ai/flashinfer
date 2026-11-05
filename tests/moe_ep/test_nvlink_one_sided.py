@@ -122,13 +122,13 @@ class Case:
     """A workload sharing one communicator across ``rounds``, with no host
     synchronization between rounds.
 
-    ``backend`` names the moe_ep communication backend. ``mode`` maps to
-    ``NVLinkOneSidedConfig.lamport``: auto (None) and lamport (True) take the
-    Lamport transport for the steps it carries (up to its default token limit)
-    and the fence transport for the others, fence (False) the fence transport
-    only. A lamport case skips where the Lamport transport is unavailable; an
-    auto case then runs every step on the fence transport. Cake has no
-    transport to select and only runs ``auto``. ``payload_in_workspace`` writes
+    ``backend`` names the moe_ep communication backend. ``mode`` is
+    ``NVLinkOneSidedConfig.sync_protocol``: auto and sentinel take the
+    sentinel protocol for the steps it carries (auto up to its token limit)
+    and the fence protocol for the others, fence the fence protocol only. A
+    sentinel case skips where the sentinel protocol is unavailable; an auto
+    case then runs every step on the fence protocol. Cake has no protocol to
+    select and only runs ``auto``. ``payload_in_workspace`` writes
     the expert output into the combine input region before combine.
     ``fp8_combine`` sends combine payloads as FP8. ``graph`` captures the whole
     round sequence in one CUDA graph and replays it.
@@ -136,7 +136,7 @@ class Case:
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "lamport"] = "auto"
+    mode: Literal["auto", "fence", "sentinel"] = "auto"
     payload_in_workspace: bool = False
     fp8_combine: bool = False
     graph: bool = False
@@ -287,12 +287,12 @@ def _cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 # ----------------------------------------------------------------------------
 
 
-def _transport(lamport) -> str:
-    return "lamport" if lamport else "fence"
+def _protocol(sentinel) -> str:
+    return "sentinel" if sentinel else "fence"
 
 
 class _RecordingModule:
-    """Forwards to the kernel module and records each launch's transport."""
+    """Forwards to the kernel module and records each launch's protocol."""
 
     def __init__(self, module, launches: list) -> None:
         self._module = module
@@ -303,12 +303,12 @@ class _RecordingModule:
 
     def moe_a2a_dispatch(self, *args):
         assert args[10] is False, "CFT counted writes requested"
-        self._launches.append(("dispatch", _transport(args[13])))
+        self._launches.append(("dispatch", _protocol(args[13])))
         return self._module.moe_a2a_dispatch(*args)
 
     def moe_a2a_combine(self, *args):
         assert args[11] is False, "CFT counted writes requested"
-        self._launches.append(("combine", _transport(args[17])))
+        self._launches.append(("combine", _protocol(args[17])))
         return self._module.moe_a2a_combine(*args)
 
 
@@ -356,19 +356,19 @@ def _run_case(case: Case, rank: int) -> dict:
     )
     if one_sided:
         config = NVLinkOneSidedConfig(
-            lamport={"auto": None, "fence": False, "lamport": True}[case.mode],
+            sync_protocol=case.mode,
             timeout_sec=30,
             **options,
         )
     else:
-        assert case.mode == "auto", "Cake has no transport to select"
+        assert case.mode == "auto", "Cake has no protocol to select"
         config = CakeAlltoAllConfig(**options)
     comm = create_communication(
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        if case.mode == "lamport" and not comm.lamport_enabled:
-            return {"skip": "the Lamport transport is unavailable here"}
+        if case.mode == "sentinel" and not comm.sentinel_enabled:
+            return {"skip": "the sentinel protocol is unavailable here"}
         launches: list = []
         combine_offsets: list = []
         if one_sided:
@@ -438,7 +438,7 @@ def _run_case(case: Case, rank: int) -> dict:
             outputs = sequence()
         torch.cuda.synchronize()
 
-        # Region boundaries stay fixed across token counts and transports.
+        # Region boundaries stay fixed across token counts and protocols.
         assert len(set(combine_offsets)) == 1, combine_offsets
         result = {
             "rank": rank,
@@ -454,7 +454,7 @@ def _run_case(case: Case, rank: int) -> dict:
                 for o in outputs
             ],
             "launches": launches,
-            "lamport_max_tokens": comm.lamport_max_tokens if one_sided else 0,
+            "sentinel_max_tokens": comm.sentinel_max_tokens if one_sided else 0,
         }
         dist.barrier()
         return result
@@ -509,10 +509,10 @@ def _run(case: Case) -> list[dict]:
 
 
 def _verify_dispatch(
-    case: Case, results: list[dict], receiver: int, index: int, lamport: bool
+    case: Case, results: list[dict], receiver: int, index: int, sentinel: bool
 ) -> None:
     """Received rows, payload bytes, routing and padding against the inputs;
-    a Lamport step's row of token ``t`` from a source is its row ``t``."""
+    a sentinel step's row of token ``t`` from a source is its row ``t``."""
     payload, sf, slots, weights = results[receiver]["outputs"][index]["dispatch"]
     maximum = max(case.rounds[index].tokens)
     payload = payload.view(case.ep_size, maximum, -1)
@@ -535,7 +535,7 @@ def _verify_dispatch(
         order = observed_ids.argsort()
         exact = dict(rtol=0, atol=0)
         torch.testing.assert_close(observed_ids[order], expected_ids, **exact)
-        if lamport:
+        if sentinel:
             torch.testing.assert_close(torch.where(valid)[0], observed_ids, **exact)
         torch.testing.assert_close(
             slots[source, ~valid], torch.full_like(slots[source, ~valid], -1)
@@ -595,17 +595,17 @@ def _assert_results(case: Case, results: list[dict]) -> None:
         assert len(result["outputs"]) == len(case.rounds)
         expected_launches = []
         for i, spec in enumerate(case.rounds):
-            lamport = (
-                case.mode in ("auto", "lamport")
+            sentinel = (
+                case.mode in ("auto", "sentinel")
                 and not case.eplb
-                and max(spec.tokens) <= result["lamport_max_tokens"]
+                and max(spec.tokens) <= result["sentinel_max_tokens"]
             )
             _verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
-                _verify_dispatch(case, results, rank, i, lamport)
+                _verify_dispatch(case, results, rank, i, sentinel)
             expected_launches += [
-                ("dispatch", _transport(lamport)),
-                ("combine", _transport(lamport)),
+                ("dispatch", _protocol(sentinel)),
+                ("combine", _protocol(sentinel)),
             ]
             if case.eplb:
                 expected = torch.stack(
@@ -666,23 +666,23 @@ CASES = [
         for model, ep_size in _MODEL_EP_SIZES
         for num_tokens in (1, 128, 1024)
     ],
-    # The Lamport transport at the model shapes it carries (hidden_size a
-    # multiple of 256), in steps within its default token limit.
+    # The sentinel protocol at the model shapes it carries (hidden_size a
+    # multiple of 256).
     *[
         pytest.param(
             Case(
                 model=model,
                 rounds=(Round((num_tokens,) * ep_size, Routing.SPREAD, -1),),
-                mode="lamport",
+                mode="sentinel",
             ),
-            id=f"model-{model.name}-ep{ep_size}-tokens{num_tokens}-lamport",
+            id=f"model-{model.name}-ep{ep_size}-tokens{num_tokens}-sentinel",
         )
         for model, ep_size in _MODEL_EP_SIZES
         if model.hidden_size % 256 == 0
         for num_tokens in (1, 128)
     ],
     # BF16/FP8 combine with external or workspace-resident expert output (the
-    # Lamport transport combines BF16 only).
+    # sentinel protocol combines BF16 only).
     *[
         pytest.param(
             Case(
@@ -694,9 +694,13 @@ CASES = [
             ),
             id=f"combine-{'fp8' if fp8_combine else 'bf16'}-"
             f"{'workspace' if payload_in_workspace else 'external'}"
-            f"{'-lamport' if mode == 'lamport' else ''}",
+            f"{'-sentinel' if mode == 'sentinel' else ''}",
         )
-        for mode, fp8_combine in (("auto", False), ("auto", True), ("lamport", False))
+        for mode, fp8_combine in (
+            ("auto", False),
+            ("auto", True),
+            ("sentinel", False),
+        )
         for payload_in_workspace in (False, True)
     ],
     *[
@@ -717,9 +721,9 @@ CASES = [
             ("auto", False, False),
             ("auto", True, True),
             ("fence", True, True),
-            ("lamport", False, True),
-            ("lamport", False, False),
-            ("lamport", True, True),
+            ("sentinel", False, True),
+            ("sentinel", False, False),
+            ("sentinel", True, True),
         )
     ],
     # Rank-distinct EPLB statistics, including a rank with no input tokens.

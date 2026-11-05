@@ -8,6 +8,9 @@ test_moe_ep_communication_multirank.py.
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
+
 import pytest
 import torch
 
@@ -679,9 +682,9 @@ def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
     assert combine_input == tokens * 64 * 2
 
 
-def _fake_lamport(monkeypatch, module) -> list:
-    """Lamport support on the fake one-sided module: BF16 rows of 8 values and
-    a default limit of 1 token. Returns the limits the regions were sized for."""
+def _fake_sentinel(monkeypatch, module) -> list:
+    """Sentinel-protocol support on the fake one-sided module, for BF16 rows of
+    8 values. Returns the limits the sentinel regions were sized for."""
     from types import SimpleNamespace
 
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
@@ -700,15 +703,9 @@ def _fake_lamport(monkeypatch, module) -> list:
         "layout_constants",
         lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT, LAMPORT_FORMAT_BF16=0),
     )
-    monkeypatch.setattr(one_sided, "_lamport_unsupported_reason", lambda *a: None)
-    row = one_sided._LamportRow(16, 0, 1, 64)
-    monkeypatch.setattr(one_sided, "_lamport_row", lambda *a: row)
-    monkeypatch.setattr(one_sided, "_default_lamport_max_tokens", lambda *a: 1)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=152),
-    )
+    monkeypatch.setattr(one_sided, "_sentinel_unsupported_reason", lambda *a: None)
+    row = one_sided._SentinelRow(16, 0, 1, 64)
+    monkeypatch.setattr(one_sided, "_sentinel_row", lambda *a: row)
     return extended
 
 
@@ -732,60 +729,185 @@ def test_cft_probe_failure_is_a_reason(monkeypatch) -> None:
 
 
 @pytest.mark.cpu_only
-def test_nvlink_one_sided_lamport_selection(fake_one_sided, monkeypatch) -> None:
-    """The Lamport transport takes the steps it carries and the fence path the
-    rest. lamport=None allocates the Lamport regions unless cft=True, and
-    lamport=True with cft=True is refused."""
+def test_nvlink_one_sided_config_sync_protocol() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        assert NVLinkOneSidedConfig().sync_protocol == "auto"
+        for protocol in ("auto", "fence", "sentinel"):
+            config = NVLinkOneSidedConfig(sync_protocol=protocol)
+            assert config._effective_sync_protocol() == protocol
+            assert dataclasses.replace(config, timeout_sec=5).sync_protocol == protocol
+        fence = dataclasses.replace(NVLinkOneSidedConfig(), sync_protocol="fence")
+        assert fence == NVLinkOneSidedConfig(sync_protocol="fence")
+    with pytest.raises(ValueError, match="sync_protocol must be one of"):
+        NVLinkOneSidedConfig(sync_protocol="lamport")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("cft", False),
+        ("cft_max_tokens_for_dispatch", 128),
+        ("cft_max_tokens_for_combine", 128),
+        ("lamport", True),
+        ("lamport_max_tokens", 8),
+    ],
+)
+def test_nvlink_one_sided_config_deprecated_field_warns(name, value) -> None:
+    with pytest.warns(
+        DeprecationWarning, match=rf"NVLinkOneSidedConfig\.{name} is deprecated"
+    ) as record:
+        NVLinkOneSidedConfig(**{name: value})
+    assert len(record) == 1
+    # Attributed to the code that constructs the config.
+    assert record[0].filename == __file__
+
+
+@pytest.mark.cpu_only
+def test_nvlink_one_sided_config_deprecated_fields_select_a_protocol() -> None:
+    """lamport=False and cft=True select the fence protocol; the deprecated
+    fields that select a protocol or a limit combine with "auto" only."""
+
+    def effective(**fields):
+        with pytest.warns(DeprecationWarning):
+            return NVLinkOneSidedConfig(**fields)._effective_sync_protocol()
+
+    assert effective(lamport=False) == "fence"
+    assert effective(cft=True) == "fence"
+    assert effective(lamport=False, cft=True) == "fence"
+    assert effective(lamport=True) == "auto"
+    assert effective(cft=False) == "auto"
+    assert effective(lamport=True, cft=False) == "auto"
+    assert effective(lamport_max_tokens=8) == "auto"
+    assert effective(cft_max_tokens_for_dispatch=8, sync_protocol="sentinel") == (
+        "sentinel"
+    )
+    assert effective(cft_max_tokens_for_combine=8, sync_protocol="fence") == "fence"
+    for fields in (
+        {"lamport": True, "sync_protocol": "fence"},
+        {"lamport": False, "sync_protocol": "sentinel"},
+        {"lamport_max_tokens": 8, "sync_protocol": "sentinel"},
+        {"lamport_max_tokens": 8, "sync_protocol": "fence"},
+        {"cft": False, "sync_protocol": "fence"},
+        {"cft": True, "sync_protocol": "sentinel"},
+    ):
+        with (
+            pytest.warns(DeprecationWarning),
+            pytest.raises(ValueError, match="cannot be combined with sync_protocol"),
+        ):
+            NVLinkOneSidedConfig(**fields)
+    with (
+        pytest.warns(DeprecationWarning),
+        pytest.raises(ValueError, match="lamport=True and cft=True"),
+    ):
+        NVLinkOneSidedConfig(lamport=True, cft=True)
+
+
+@pytest.mark.cpu_only
+def test_nvlink_one_sided_sentinel_selection(fake_one_sided, monkeypatch) -> None:
+    """sentinel_max_tokens under each protocol, and the steps the sentinel
+    protocol takes: those within it without EPLB statistics; the fence
+    protocol takes the rest."""
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        config as config_module,
+    )
+
+    extended = _fake_sentinel(monkeypatch, fake_one_sided.module)
+
+    def limit(capacity, **config):
+        params = _params(num_experts=8, top_k=4, max_tokens_per_rank=capacity)
+        comm = _one_sided(params, **config)
+        assert comm.sentinel_enabled == (comm.sentinel_max_tokens > 0)
+        return comm.sentinel_max_tokens
+
+    # "auto": steps of at most AUTO_SENTINEL_MAX_TOKENS (256), within the capacity.
+    assert limit(1000) == 256 and limit(3) == 3
+    assert limit(1000, sync_protocol="sentinel") == 1000
+    assert limit(3, sync_protocol="fence") == 0
+    assert extended == [256, 3, 1000]
+    monkeypatch.setattr(config_module, "AUTO_SENTINEL_MAX_TOKENS", 1)
+    assert limit(3) == 1 and limit(3, sync_protocol="sentinel") == 3
+    with pytest.warns(DeprecationWarning):
+        assert limit(1000, lamport_max_tokens=300) == 300
+        assert limit(3, lamport_max_tokens=300) == 3
+        assert limit(3, lamport=True) == 1
+        assert limit(3, lamport=False) == 0
+        assert limit(3, cft=True) == 0
+
+    comm = _one_sided(_params(num_experts=8, top_k=4))
+    hidden = torch.ones(3, 8, dtype=torch.bfloat16)
+    weights = torch.ones(3, 4)
+
+    def carries(tokens, eplb_local_stats=None):
+        return comm._sentinel_carries(tokens, hidden, None, weights, eplb_local_stats)
+
+    assert carries(1)
+    assert not carries(2)  # above the limit: fence
+    assert not carries(1, torch.zeros(8, dtype=torch.int32))  # EPLB statistics
+
+
+@pytest.mark.cpu_only
+def test_nvlink_one_sided_without_sentinel_support(
+    fake_one_sided, monkeypatch, caplog
+) -> None:
+    """Without sentinel support every step takes the fence protocol, logged
+    as a warning where the sentinel protocol was asked for."""
+    import logging
+
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
         communication as one_sided,
     )
 
-    extended = _fake_lamport(monkeypatch, fake_one_sided.module)
-    params = _params(num_experts=8, top_k=4)
-    hidden = torch.ones(3, 8, dtype=torch.bfloat16)
-    weights = torch.ones(3, 4)
-
-    def transports(comm, tokens, eplb_local_stats=None):
-        return comm._dispatch_transports(
-            tokens, hidden, None, weights, eplb_local_stats
-        )
-
-    request = one_sided._lamport_request
-    assert request(NVLinkOneSidedConfig()) is None
-    assert request(NVLinkOneSidedConfig(cft=False)) is None
-    assert request(NVLinkOneSidedConfig(cft=True)) is False
-    assert request(NVLinkOneSidedConfig(lamport=True)) is True
-    assert request(NVLinkOneSidedConfig(lamport=False)) is False
-
-    auto = _one_sided(params)
-    assert auto.lamport_max_tokens == 1 and extended == [1]
-    assert transports(auto, 1)
-    assert not transports(auto, 2)  # above the Lamport limit: fence
-    stats = torch.zeros(8, dtype=torch.int32)
-    assert not transports(auto, 1, stats)  # EPLB statistics
-    off = _one_sided(params, cft=True)
-    assert off.lamport_max_tokens == 0 and extended == [1]
-    assert not transports(off, 1)
-    forced = _one_sided(params, lamport=True)
-    assert forced.lamport_max_tokens == 1 and extended == [1, 1]
-    assert transports(forced, 1)
-    with pytest.raises(ValueError, match="lamport=True and cft=True"):
-        _one_sided(params, cft=True, lamport=True)
-    assert extended == [1, 1]
+    extended = _fake_sentinel(monkeypatch, fake_one_sided.module)
+    monkeypatch.setattr(
+        one_sided, "_sentinel_unsupported_reason", lambda *a: "no sentinel kernels"
+    )
+    for protocol, level in (("auto", logging.INFO), ("sentinel", logging.WARNING)):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=one_sided.__name__):
+            comm = _one_sided(sync_protocol=protocol)
+        assert comm.sentinel_max_tokens == 0 and not comm.sentinel_enabled
+        logged = [
+            (r.levelno, "no sentinel kernels" in r.getMessage())
+            for r in caplog.records
+            if r.name == one_sided.__name__
+        ]
+        assert logged == [(level, True)], protocol
+    assert extended == []
 
 
 @pytest.mark.cpu_only
-def test_split_layer_step_bound_selects_lamport(
+def test_nvlink_one_sided_deprecated_properties(fake_one_sided, monkeypatch) -> None:
+    _fake_sentinel(monkeypatch, fake_one_sided.module)
+    for protocol, limit in (("sentinel", 3), ("fence", 0)):
+        comm = _one_sided(sync_protocol=protocol)
+        assert comm.sentinel_max_tokens == limit
+        assert comm.sentinel_enabled is (limit > 0)
+        with pytest.warns(DeprecationWarning, match="use sentinel_max_tokens"):
+            assert comm.lamport_max_tokens == limit
+        with pytest.warns(DeprecationWarning, match="use sentinel_enabled"):
+            assert comm.lamport_enabled is (limit > 0)
+
+
+@pytest.mark.cpu_only
+def test_split_layer_step_bound_selects_sentinel(
     fake_one_sided, monkeypatch, isolated_single_rank_gloo
 ) -> None:
     """MoEEpSplitLayer passes MoEEpTensors.runtime_max_tokens_per_rank to
-    dispatch, so a layer step within lamport_max_tokens takes the Lamport
-    transport; a larger bound, or none (the capacity), does not."""
-    _fake_lamport(monkeypatch, fake_one_sided.module)
+    dispatch, so a layer step within sentinel_max_tokens takes the sentinel
+    protocol; a larger bound, or none (the capacity), does not."""
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        config as config_module,
+    )
+
+    _fake_sentinel(monkeypatch, fake_one_sided.module)
+    # Under "auto" the sentinel protocol takes steps of 1 token per rank.
+    monkeypatch.setattr(config_module, "AUTO_SENTINEL_MAX_TOKENS", 1)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)  # host workspace
     layer = _split_layer(NVLinkOneSidedConfig())
     calls = fake_one_sided.module.calls
-    for bound, lamport in ((1, True), (2, False), (None, False)):
+    for bound, sentinel in ((1, True), (2, False), (None, False)):
         layer(
             MoEEpTensors(
                 hidden_states=torch.ones(1, 8, dtype=torch.bfloat16),
@@ -795,22 +917,77 @@ def test_split_layer_step_bound_selects_lamport(
             )
         )
         _, _, tokens_per_rank, args = calls["dispatch"]
-        assert (tokens_per_rank, args[8]) == (bound or 3, lamport)
+        assert (tokens_per_rank, args[8]) == (bound or 3, sentinel)
     layer.destroy()
 
 
 @pytest.mark.cpu_only
+def test_split_layer_keeps_packed_rows_on_fence() -> None:
+    """A split-layer kernel that packs its dispatch rows into other bytes gets
+    NVLink one-sided's fence protocol, also when the comm backend is a name;
+    the deprecated fields are cleared, so the new config warns no more."""
+    from types import SimpleNamespace
+
+    from flashinfer.moe_ep.modes.split_layer import _communication_backend
+
+    packing = SimpleNamespace(packs_dispatch_payload=True)
+    plain = SimpleNamespace(packs_dispatch_payload=False)
+    fence = NVLinkOneSidedConfig(sync_protocol="fence")
+    with pytest.warns(DeprecationWarning):
+        deprecated = [
+            NVLinkOneSidedConfig(
+                lamport=True,
+                lamport_max_tokens=8,
+                cft=False,
+                cft_max_tokens_for_dispatch=64,
+                cft_max_tokens_for_combine=64,
+                timeout_sec=7,
+            ),
+            NVLinkOneSidedConfig(lamport_max_tokens=8),
+        ]
+        deprecated_fence = [
+            NVLinkOneSidedConfig(lamport=False),
+            NVLinkOneSidedConfig(cft=True),
+        ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        for config in (
+            NVLinkOneSidedConfig(),
+            NVLinkOneSidedConfig(sync_protocol="sentinel", timeout_sec=7),
+            *deprecated,
+        ):
+            fenced = _communication_backend(config, packing)
+            assert fenced is not config
+            assert fenced == dataclasses.replace(fence, timeout_sec=config.timeout_sec)
+            assert _communication_backend(config, plain) is config
+        assert _communication_backend("nvlink_one_sided", packing) == fence
+        assert _communication_backend("nvlink_one_sided", plain) == "nvlink_one_sided"
+        for config in (fence, *deprecated_fence):
+            assert _communication_backend(config, packing) is config
+        for other in (
+            CakeAlltoAllConfig(),
+            SimpleNamespace(backend_name="cake"),
+            "cake",
+        ):
+            assert _communication_backend(other, packing) is other
+
+
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
-    """Each rank votes its own Lamport decision, so a rank that turns the
-    transport off turns it off on every rank, and ranks that pass different
-    lamport_max_tokens fail alike. Every rank constructs on its own thread; the
-    group's collectives must pair up."""
+    """Every rank votes its protocol, its deprecated lamport_max_tokens and
+    whether it can run the sentinel protocol: ranks that differ in the first
+    two fail alike, and a rank that cannot run the sentinel protocol leaves
+    every rank on the fence protocol. Every rank constructs on its own thread;
+    the group's collectives must pair up."""
     import threading
     from types import SimpleNamespace
 
     from flashinfer.comm import mnnvl
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
         communication as one_sided,
+    )
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        config as config_module,
     )
 
     class Group:
@@ -826,48 +1003,33 @@ def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
             return gathered
 
     group: dict = {}
-    sms = threading.local()
+    local = threading.local()
 
     def get_comm(mapping):
         rank = mapping.rank
         return SimpleNamespace(allgather=lambda data: group["g"].allgather(rank, data))
 
     monkeypatch.setattr(mnnvl.MnnvlMemory, "get_comm", staticmethod(get_comm))
-    fake_one_sided.module.moe_a2a_lamport_extend_workspace_layout = (
-        lambda metainfo, max_tokens, fmt, hidden: None
-    )
+    _fake_sentinel(monkeypatch, fake_one_sided.module)
     monkeypatch.setattr(
         one_sided,
-        "layout_constants",
-        lambda: SimpleNamespace(
-            **_ONE_SIDED_LAYOUT, LAMPORT_FORMAT_BF16=0, LAMPORT_MAX_TOKENS_PER_RANK=512
-        ),
+        "_sentinel_unsupported_reason",
+        lambda *a: "simulated" if local.unsupported else None,
     )
-    monkeypatch.setattr(one_sided, "_lamport_unsupported_reason", lambda *a: None)
-    monkeypatch.setattr(
-        one_sided, "_lamport_row", lambda *a: one_sided._LamportRow(16, 0, 1, 64)
-    )
-    # The default limit is the group's smallest SM count here.
-    monkeypatch.setattr(
-        one_sided, "_default_lamport_max_tokens", lambda ep, num_sms, *a: num_sms
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=sms.count),
-    )
+    # "auto" takes steps of up to 2 of the capacity's 3 tokens per rank.
+    monkeypatch.setattr(config_module, "AUTO_SENTINEL_MAX_TOKENS", 2)
 
-    def construct(*configs, sm_counts=(3, 3)):
+    def construct(*configs, unsupported=()):
         group["g"] = Group(len(configs))
         results: list = [None] * len(configs)
 
         def rank_main(rank):
-            sms.count = sm_counts[rank]
+            local.unsupported = rank in unsupported
             try:
                 results[rank] = create_communication(
                     BootstrapConfig(world_size=len(configs), rank=rank),
                     _params(),
-                    NVLinkOneSidedConfig(**configs[rank]),
+                    configs[rank],
                 )
             except Exception as exc:  # noqa: BLE001 - checked by the caller
                 results[rank] = exc
@@ -881,20 +1043,41 @@ def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
             thread.join(timeout=60)
         return results
 
-    def transports(results):
+    def limits(results):
         assert all(isinstance(r, NVLinkOneSidedAlltoAll) for r in results), results
-        return [r.lamport_max_tokens for r in results]
+        return [r.sentinel_max_tokens for r in results]
 
-    assert transports(construct({}, {}, sm_counts=(3, 2))) == [2] * 2
-    assert transports(construct({}, {"lamport": False})) == [0] * 2
-    # Auto Lamport is off under cft=True, so on every rank.
-    assert transports(construct({"cft": True}, {})) == [0] * 2
-    assert transports(construct(*[{"lamport_max_tokens": 2}] * 2)) == [2] * 2
-    for limits in ((2, None), (2, 3)):
-        results = construct(*[{"lamport_max_tokens": n} for n in limits])
+    def fail(results, name):
         for result in results:
             assert isinstance(result, ValueError), results
-            assert "lamport_max_tokens must be the same on every EP rank" in str(result)
+            assert f"{name} must be the same on every EP rank" in str(result)
+
+    auto, fence, sentinel = (
+        NVLinkOneSidedConfig(sync_protocol=p) for p in ("auto", "fence", "sentinel")
+    )
+    assert limits(construct(auto, auto)) == [2] * 2
+    assert limits(construct(sentinel, sentinel)) == [3] * 2
+    assert limits(construct(fence, fence)) == [0] * 2
+    fail(construct(fence, auto), "sync_protocol")
+    fail(construct(auto, sentinel), "sync_protocol")
+    assert limits(construct(auto, auto, unsupported=(0,))) == [0] * 2
+    assert limits(construct(sentinel, sentinel, unsupported=(1,))) == [0] * 2
+
+    # The deprecated fields vote as the protocol and limit they select.
+    with pytest.warns(DeprecationWarning):
+        lamport_off = NVLinkOneSidedConfig(lamport=False)
+        lamport_off_8 = NVLinkOneSidedConfig(lamport=False, lamport_max_tokens=8)
+        lamport_on = NVLinkOneSidedConfig(lamport=True)
+        cft_on = NVLinkOneSidedConfig(cft=True)
+        limit_1, limit_3 = [NVLinkOneSidedConfig(lamport_max_tokens=n) for n in (1, 3)]
+    assert limits(construct(lamport_off, fence)) == [0] * 2
+    assert limits(construct(lamport_off_8, fence)) == [0] * 2
+    assert limits(construct(lamport_on, auto)) == [2] * 2
+    fail(construct(cft_on, auto), "sync_protocol")
+    assert limits(construct(limit_1, limit_1)) == [1] * 2
+    assert limits(construct(limit_1, limit_1, unsupported=(1,))) == [0] * 2
+    fail(construct(limit_1, auto), "lamport_max_tokens")
+    fail(construct(limit_1, limit_3), "lamport_max_tokens")
 
 
 @pytest.mark.cpu_only
@@ -963,13 +1146,13 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
         torch.int32,
         torch.float32,
     ]
-    rank, ep, top_k, num_experts, eplb, use_cft, id_index, invalid, use_lamport = args[
+    rank, ep, top_k, num_experts, eplb, use_cft, id_index, invalid, use_sentinel = args[
         :9
     ]
     assert (rank, ep, top_k, num_experts, eplb) == (0, 2, 4, 8, None)
     # A fence step leaves the padding rows' expert ids to the sanitize op.
     assert use_cft is False and id_index == -1 and invalid == -1
-    assert use_lamport is False
+    assert use_sentinel is False
     assert args[-2] == 60
     assert calls["sanitize"][0].shape == (2, 2, 4)
     assert result.tokens_per_rank == 2

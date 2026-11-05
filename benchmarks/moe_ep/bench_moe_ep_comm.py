@@ -25,10 +25,11 @@ Launch on one node, for example:
         --backend nvlink_one_sided --profile deepseek_v4_pro --perfect_router \\
         --kernel_breakdown --iter_stats -b 1 -e 1024 -f 2 --output_file out.json
 
-    # Compare nvlink_one_sided with and without its Lamport transport, which takes
-    # the small steps.
+    # nvlink_one_sided on its fence protocol for every step, to compare with the
+    # default, which takes the sentinel protocol for the small steps.
     torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/bench_moe_ep_comm.py \\
-        --backend nvlink_one_sided --profile deepseek_v3 --lamport off -b 1 -e 128 -f 2
+        --backend nvlink_one_sided --profile deepseek_v3 --sync_protocol fence \\
+        -b 1 -e 128 -f 2
 
 Omit --backend to benchmark every backend available on all ranks. Multi-node
 runs use the usual torchrun rendezvous flags instead of --standalone.
@@ -78,8 +79,8 @@ DISPATCH_FORMATS = {
     "nvfp4": "NVFP4",
 }
 QUANT_FORMATS = tuple(DISPATCH_FORMATS)
-# NVLinkOneSidedConfig.lamport for each --lamport choice.
-_LAMPORT_MODES = {"auto": None, "on": True, "off": False}
+# NVLinkOneSidedConfig.sync_protocol choices.
+SYNC_PROTOCOLS = ("auto", "fence", "sentinel")
 
 
 def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
@@ -94,7 +95,7 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     return {
         "nvlink_one_sided": lambda: NVLinkOneSidedConfig(
             use_low_precision_combine=low_precision,
-            lamport=_LAMPORT_MODES[args.lamport],
+            sync_protocol=args.sync_protocol,
         ),
         "cake": lambda: CakeAlltoAllConfig(use_low_precision_combine=low_precision),
         "nvlink_two_sided": NVLinkTwoSidedConfig,
@@ -421,11 +422,14 @@ def parse_args() -> argparse.Namespace:
         help="Send combine payloads as FP8 (NVLink one-sided backends).",
     )
     parser.add_argument(
-        "--lamport",
-        choices=sorted(_LAMPORT_MODES),
+        "--sync_protocol",
+        "--sync-protocol",
+        choices=SYNC_PROTOCOLS,
         default="auto",
-        help="Lamport transport of nvlink_one_sided, which takes the small steps: "
-        "auto (where supported), on or off.",
+        help="Sync protocol of nvlink_one_sided: fence or sentinel for every "
+        "step, or auto (default): the sentinel protocol for steps of at most 256 "
+        "tokens per rank where every rank supports it, the fence protocol for "
+        "the others.",
     )
     parser.add_argument(
         "--no_cuda_graph",
@@ -502,7 +506,10 @@ def main() -> None:
         "max_num_tokens_per_rank": max_num_tokens_per_rank,
         "perfect_router": bool(args.perfect_router),
         "use_low_precision_combine": bool(args.use_low_precision_combine),
-        "lamport": args.lamport,
+        "sync_protocol": args.sync_protocol,
+        # nvlink_one_sided's largest step on the sentinel protocol, set once
+        # its transport is up.
+        "sentinel_max_tokens": None,
         "random_seed": int(args.random_seed),
         "device": torch.cuda.get_device_name(device),
         "cuda_graph": not args.no_cuda_graph,
@@ -540,6 +547,8 @@ def main() -> None:
             if comm is not None:
                 comm.destroy()
             continue
+        if backend_name == "nvlink_one_sided":
+            metadata["sentinel_max_tokens"] = comm.sentinel_max_tokens
         use_cuda_graph = not args.no_cuda_graph and comm.supports_cuda_graph
         if not args.no_cuda_graph and not use_cuda_graph:
             print_rank0(
