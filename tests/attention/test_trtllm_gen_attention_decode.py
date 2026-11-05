@@ -2253,6 +2253,7 @@ def _assert_multi_wave_matches_fp32_reference(inp, output, q_dtype, window_left=
         atol=atol,
         max_mismatched_elements=int(5e-5 * output.numel()),
     )
+    return output_ref
 
 
 def _sentinel_workspace(num_bytes: int, offset: int = 0):
@@ -2775,6 +2776,17 @@ def wave_fill_runs(tmp_path_factory):
     return sm_count, cases, runs
 
 
+def _assert_wave_fill_matches_fp32_reference(inp, output, cfg) -> None:
+    output = output.to(GPU_DEVICE).float()
+    output_ref = _assert_multi_wave_matches_fp32_reference(
+        inp, output, cfg["q_dtype"], cfg["window_left"]
+    ).float()
+    # Long-KV outputs are ~1e-2, under the fp8 atol, so the elementwise check alone
+    # would accept an all-zero output.
+    rel_err = ((output - output_ref).norm() / output_ref.norm()).item()
+    assert rel_err < (0.1 if cfg["q_dtype"] == "fp8" else 0.05), rel_err
+
+
 @pytest.mark.parametrize("case", list(_wave_fill_cases(148)))
 def test_trtllm_batch_decode_wave_fill_kv_split(case: str, wave_fill_runs) -> None:
     sm_count, cases, runs = wave_fill_runs
@@ -2788,6 +2800,11 @@ def test_trtllm_batch_decode_wave_fill_kv_split(case: str, wave_fill_runs) -> No
         assert each[2].get("lse_guard", True), (
             f"{case}: decode wrote into the LSE guard"
         )
+        for replayed, eager, _, zeroed in each[3] or ():
+            assert zeroed, "graph replay left the multi-CTA KV counters nonzero"
+            assert torch.equal(replayed, eager), (
+                "graph replay differs from eager decode"
+            )
 
     expect = cfg["expect"]
     if expect == "rule":
@@ -2817,16 +2834,10 @@ def test_trtllm_batch_decode_wave_fill_kv_split(case: str, wave_fill_runs) -> No
             torch.testing.assert_close(lse, stock[1], rtol=1e-3, atol=1.2e-2)
 
     inp = _multi_wave_case_inputs(cfg)
-    _assert_multi_wave_matches_fp32_reference(
-        inp, output.to(GPU_DEVICE), cfg["q_dtype"], cfg["window_left"]
-    )
-    for replayed, eager, new_lens, zeroed in replay or ():
-        assert zeroed, "graph replay left the multi-CTA KV counters nonzero"
-        assert torch.equal(replayed, eager), "graph replay differs from eager decode"
+    _assert_wave_fill_matches_fp32_reference(inp, output, cfg)
+    for _, eager, new_lens, _ in replay or ():
         inp["seq_lens"] = new_lens
-        _assert_multi_wave_matches_fp32_reference(
-            inp, eager.to(GPU_DEVICE), cfg["q_dtype"], cfg["window_left"]
-        )
+        _assert_wave_fill_matches_fp32_reference(inp, eager, cfg)
 
 
 @pytest.fixture(scope="module")
