@@ -354,7 +354,7 @@
         "items_lower_bound": "batch_size * num_kv_heads",
         "key": "program",
         "near_grid_regime": {
-          "min_q_len": 8
+          "min_q_len": 4
         },
         "rule": "program = at_or_above_grid when batch_size * num_kv_heads >= grid (sm_count: one persistent CTA per multiprocessor; the idle-CTA eight-slice fold needs chunk tickets + 8 reduce tickets per split tile <= grid and every (request, KV head) is at least one chunk ticket, so the program without that fold body has the same plan and fold order); else at_or_above_grid when q_len >= near_grid_regime.min_q_len and num_kv_heads * (batch_size + min_chunks - 1 + reduce_tickets_per_tile) > grid (a split request takes at least min_chunks chunk tickets and reduce_tickets_per_tile reduce tickets per KV head beside one chunk ticket for every other (request, KV head), so no request can split and the planner's fold clauses never fire: the program without the idle-CTA fold body has the same plan and fold order); else static_one_wave when n_max = ceil(max_pages_per_seq * page_size / chunk_tokens) >= min_chunks and batch_size * num_kv_heads * (n_max + reduce_tickets_per_tile) <= grid (the plan-free static ticket assignment, ticket = CTA index, same chunk and fold order as the planner's one-wave plan); else below_grid",
         "static_one_wave": 2,
