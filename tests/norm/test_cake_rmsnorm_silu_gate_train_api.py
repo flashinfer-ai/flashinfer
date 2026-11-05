@@ -31,9 +31,11 @@ its errors, its autograd node), ``deterministic=False`` the standalone backend
   ``torch.use_deterministic_algorithms(True)`` (with ``warn_only=True``: a
   warning and the deterministic package), the alert of a ``False`` autograd
   node whose backward runs after the mode was enabled, the workspace reset of
-  both modes, and the backend's standalone form (no import of another
+  both modes, the backend's standalone form (no import of another
   flashinfer package; a copy under another name imports with flashinfer
-  blocked);
+  blocked), and the strides the backend passes for one-head and other inputs
+  (a single head's stride as 128, so packed one-head rows pass the kernels'
+  packed-rows test);
 * on a device: the default is bitwise the deterministic package;
   ``deterministic=False`` launches only the backend's modules, and on the
   backend suite's accuracy matrix and paths (accumulation,
@@ -41,7 +43,14 @@ its errors, its autograd node), ``deterministic=False`` the standalone backend
   across shapes, two streams, a side stream, CUDA Graph replays, autograd and
   non-reentrant checkpointing) its ``y``, ``dx`` and ``dz`` are the
   deterministic package's bits and its ``dw`` lies within the weight-gradient
-  budget of the deterministic ``dw``, on every repeat.
+  budget of the deterministic ``dw``, on every repeat; so are they for
+  one-head inputs of several layouts past the start of each module that warms
+  packed rows in L2, which launch with the packed-rows test passing exactly
+  when their rows follow one another; and for weight gradients in the
+  subnormal range (identical rows whose FP32 terms underflow) on the short,
+  the mid and the long backward: ``dx`` and ``dz`` the deterministic bits, a
+  BF16 ``dw`` the deterministic ``dw``'s bits, and every ``dw`` within the
+  budget widened by the underflow allowance the package documents.
 
 The numerical contract of the non-deterministic kernels against the FP64
 reference is ``test_cake_rmsnorm_silu_gate_train.py``'s; its data generators,
@@ -1345,7 +1354,7 @@ def test_forward_gate_edges_match_the_deterministic_package(
 
 
 # The rows per SM from which each architecture runs the long backward.
-LONG_BACKWARD_ROWS_PER_SM = {"sm_100a": 1280, "sm_103a": 1280, "sm_107a": 1024}
+LONG_BACKWARD_ROWS_PER_SM = {"sm_100a": 1280, "sm_103a": 12000, "sm_107a": 1024}
 # Backward inputs around and past the long backward's threshold: (tokens,
 # heads, layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one
 # flat [rows, 128] tensor.
@@ -1385,7 +1394,7 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
     if long is None:
         pytest.skip(f"{arch} routes no long backward")
     start = LONG_BACKWARD_ROWS_PER_SM[arch]
-    assert loader.MODULES[long]["grid_rule"]["min_rows_per_sm"] == start
+    assert loader.min_rows_per_sm(long, arch) == start
     sms = _sm_count()
     if heads is None:
         x, z, w, dy = suite.make(start * sms + tokens, 1, layout="flat", seed=22)
@@ -1408,7 +1417,84 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
         suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
         assert not bool(ws.any()), "the workspace is not zero"
     name = long if rows >= start * sms else loader.route_module(arch, role)
+    mid = loader.ROUTES[arch].get(f"{role}_mid")
+    if (
+        mid is not None
+        and start * sms > rows >= loader.min_rows_per_sm(mid, arch) * sms
+    ):
+        name = mid
     assert loader.module_for_rows(arch, role, rows, sms) == name
+    assert launched == [name] * suite.REPEATS, launched
+
+
+# The rows per SM from which an architecture runs the mid backward.
+MID_BACKWARD_ROWS_PER_SM = {"sm_103a": 700}
+# Backward inputs around and in the mid backward's rows: (tokens, heads,
+# layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one flat
+# [rows, 128] tensor.
+MID_BACKWARD_CASES = [
+    pytest.param(-1, None, "flat", id="threshold-1"),
+    pytest.param(0, None, "flat", id="threshold"),
+    pytest.param(1, None, "flat", id="threshold+1"),
+    pytest.param(2701, 48, "contiguous", id="2701x48"),
+    pytest.param(3091, 48, "projection", id="3091x48-projection"),
+    pytest.param(3157, 48, "head_major", id="3157x48-head_major"),
+    pytest.param(5300, 32, "contiguous", id="5300x32"),
+    pytest.param(9600, 48, "contiguous", id="9600x48"),
+    pytest.param(25000, 48, "contiguous", id="25000x48"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads,layout", MID_BACKWARD_CASES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_backward_around_the_mid_threshold_matches_the_deterministic_package(
+    tokens,
+    heads,
+    layout,
+    dw_dtype,
+    determinism_setting,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Around and in the mid backward's rows (``MID_BACKWARD_ROWS_PER_SM``,
+    on the architectures that route it): the module launched is
+    ``module_for_rows``', ``dx`` and ``dz`` are the deterministic package's
+    bits, ``dw`` lies within the budget of the deterministic ``dw`` on every
+    repeat, and the workspace is zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    mid = loader.ROUTES[arch].get(f"{role}_mid")
+    if mid is None:
+        pytest.skip(f"{arch} routes no mid backward")
+    start = MID_BACKWARD_ROWS_PER_SM[arch]
+    assert loader.min_rows_per_sm(mid, arch) == start
+    sms = _sm_count()
+    if heads is None:
+        x, z, w, dy = suite.make(start * sms + tokens, 1, layout="flat", seed=24)
+    else:
+        x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=24)
+    rows = x.numel() // D
+    mag = suite.magnitudes(dy, x, z, EPS)
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_launches(monkeypatch)
+    for _ in range(suite.REPEATS):
+        dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+        assert dw.dtype == dw_dtype
+        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
+        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
+        assert not bool(ws.any()), "the workspace is not zero"
+    name = loader.module_for_rows(arch, role, rows, sms)
+    long = loader.ROUTES[arch].get(f"{role}_long")
+    if long is None or rows < loader.min_rows_per_sm(long, arch) * sms:
+        assert name == (mid if rows >= start * sms else loader.route_module(arch, role))
     assert launched == [name] * suite.REPEATS, launched
 
 
@@ -1482,3 +1568,254 @@ def test_backward_around_the_short_threshold_matches_the_deterministic_package(
         want = short
     assert loader.module_for_rows(arch, role, rows, sms) == want
     assert launched == [want] * (suite.REPEATS + 1), launched
+
+
+# --------------------------------------------------------------------------- one head: packed rows
+
+
+def _packed(strides: dict) -> bool:
+    """The kernels' packed-rows test over the strides of one launch: every
+    input's head stride is 128 and its token stride ``heads * 128``.  The mid
+    and the extra-long forward and, on sm_100a and sm_103a, the long backward
+    warm row blocks in L2 with a bulk prefetch only when it holds."""
+    heads = int(strides["heads"])
+    inputs = [k[: -len("_head")] for k in strides if k.endswith("_head")]
+    return bool(inputs) and all(
+        strides[f"{n}_head"] == D and strides[f"{n}_tok"] == heads * D for n in inputs
+    )
+
+
+def _spy_strides(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
+    """``(module, {"heads", "<input>_tok", "<input>_head"})`` of every launch."""
+    launched: list[tuple[str, dict]] = []
+    run_module = loader.run_module
+
+    def spy(name, values, *, rows, device_index):
+        strides = {
+            k: int(v)
+            for k, v in values.items()
+            if k == "heads" or k.endswith(("_tok", "_head"))
+        }
+        launched.append((name, strides))
+        return run_module(name, values, rows=rows, device_index=device_index)
+
+    monkeypatch.setattr(loader, "run_module", spy)
+    return launched
+
+
+# One-head layouts of a [rows, 128] input: (passes the packed-rows test, read
+# in place).  ``three_d`` [rows, 1, 128], ``flat`` [rows, 128], ``transposed``
+# the transpose of [1, rows, 128] (token stride 128, head stride rows * 128),
+# ``first_of_two`` the first head of [rows, 2, 128] (token stride 256: rows
+# that do not follow one another), ``misaligned`` [rows, 128] at a storage
+# offset of 8 elements (copied once by the host).
+ONE_HEAD_LAYOUTS = {
+    "three_d": (True, True),
+    "flat": (True, True),
+    "transposed": (True, True),
+    "first_of_two": (False, True),
+    "misaligned": (True, False),
+}
+
+
+def _one_head(base: torch.Tensor, layout: str) -> torch.Tensor:
+    """``base`` ([rows, 128]) as a one-head input of ``layout``."""
+    rows = base.shape[0]
+    if layout == "three_d":
+        return base.clone().view(rows, 1, D)
+    if layout == "flat":
+        return base.clone()
+    if layout == "transposed":
+        return base.clone().view(1, rows, D).transpose(0, 1)
+    if layout == "first_of_two":
+        wide = torch.zeros(rows, 2, D, dtype=base.dtype, device=base.device)
+        wide[:, 0] = base
+        return wide[:, :1]
+    if layout == "misaligned":
+        buf = torch.zeros(rows * D + 8, dtype=base.dtype, device=base.device)
+        out = buf[8:].view(rows, D)
+        out.copy_(base)
+        return out
+    raise ValueError(layout)
+
+
+@pytest.mark.parametrize("layout", list(ONE_HEAD_LAYOUTS))
+def test_one_head_input_passes_the_packed_rows_test_when_its_rows_follow_one_another(
+    layout,
+) -> None:
+    """Without a device: a one-head input's head stride is passed as 128 (it is
+    never dereferenced), so the kernels see packed rows exactly when its token
+    stride is 128 (or the host copied it), as for ``[T, H, 128]`` inputs."""
+    base = torch.randn(7, D).bfloat16()
+    t = _one_head(base, layout)
+    view, tok, head = backend._kernel_view(t, "x", shape=t.shape, device=t.device)
+    packed, in_place = ONE_HEAD_LAYOUTS[layout]
+    assert head == D
+    assert tok == (2 * D if layout == "first_of_two" else D)
+    assert _packed({"heads": 1, "x_tok": tok, "x_head": head}) == packed
+    assert (view.data_ptr() == t.data_ptr()) == in_place
+    assert torch.equal(view.reshape(-1, D), base)
+
+
+@pytest.mark.parametrize(
+    "shape,strides,want",
+    [
+        pytest.param((1, 1, D), None, (0, D), id="1x1"),
+        pytest.param((1, D), None, (0, D), id="1-flat"),
+        pytest.param((D,), None, (0, D), id="one-row"),
+        pytest.param((1, 2, D), None, (0, D), id="1x2"),
+        pytest.param((5, 2, D), None, (2 * D, D), id="5x2"),
+        pytest.param((5, 3, D), None, (3 * D, D), id="5x3"),
+        pytest.param((5, 2, D), (4 * D, D, 1), (4 * D, D), id="5x2-projection"),
+        pytest.param((5, 2, D), (D, 5 * D, 1), (D, 5 * D), id="5x2-head_major"),
+    ],
+)
+def test_kernel_view_strides(shape, strides, want) -> None:
+    """Without a device: a single token's stride is passed as 0, a single
+    head's as 128, any other dimension's as it is."""
+    if strides is None:
+        t = torch.zeros(shape, dtype=torch.bfloat16)
+    else:
+        t = torch.empty_strided(shape, strides, dtype=torch.bfloat16)
+    _, tok, head = backend._kernel_view(t, "x", shape=t.shape, device=t.device)
+    assert (tok, head) == want
+
+
+# The modules that warm packed rows in L2, by role: the one-head inputs take
+# one row past each one's start.
+ONE_HEAD_ROUTES = [
+    pytest.param("fwd", "fwd_mid", id="fwd_mid"),
+    pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
+    pytest.param("bwd_bf16", "bwd_bf16_long", id="bwd_bf16_long"),
+    pytest.param("bwd_f32", "bwd_f32_long", id="bwd_f32_long"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("role,tier", ONE_HEAD_ROUTES)
+def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
+    role, tier, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One row past the start of the mid and the extra-long forward and of the
+    long backward: a one-head input of every layout (``ONE_HEAD_LAYOUTS``)
+    launches ``module_for_rows``' module with head stride 128, passes the
+    packed-rows test exactly when its rows follow one another (or the host
+    copied it), and returns the deterministic package's ``y``, ``dx`` and
+    ``dz`` bits and a ``dw`` within the budget of the deterministic ``dw`` on
+    every repeat, with the workspace zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    name = loader.ROUTES[arch].get(tier)
+    if name is None:
+        pytest.skip(f"{arch} routes no {tier} module")
+    sms = _sm_count()
+    rows = loader.min_rows_per_sm(name, arch) * sms + 1
+    assert loader.module_for_rows(arch, role, rows, sms) == name
+    x0, z0, w, dy0 = suite.make(rows, 1, layout="flat", seed=25)
+    dw_dtype = torch.float32 if role == "bwd_f32" else torch.bfloat16
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x0.device)
+
+    if role == "fwd":
+        y_d = det_forward(x0, z0, w, EPS)
+    else:
+        dx_d, dz_d, dw_d = det_backward(dy0, x0, z0, w, EPS, grad_weight=out())
+        mag = suite.magnitudes(dy0, x0, z0, EPS)
+        ws = nd_workspace(rows, x0.device)
+    launched = _spy_strides(monkeypatch)
+    for layout, (packed, _) in ONE_HEAD_LAYOUTS.items():
+        x, z, dy = (_one_head(t, layout) for t in (x0, z0, dy0))
+        launched.clear()
+        if role == "fwd":
+            y = nd_forward(x, z, w, EPS)
+            assert torch.equal(y.reshape(rows, D), y_d), (layout, "y")
+            calls = 1
+        else:
+            for _ in range(suite.REPEATS):
+                dx, dz, dw = nd_backward(
+                    dy, x, z, w, EPS, grad_weight=out(), workspace=ws
+                )
+                assert torch.equal(dx.reshape(rows, D), dx_d), (layout, "dx")
+                assert torch.equal(dz.reshape(rows, D), dz_d), (layout, "dz")
+                suite.assert_dw_within(
+                    dw, dw_d, mag, what=f"{layout}: dw vs the deterministic package"
+                )
+                assert not bool(ws.any()), (layout, "the workspace is not zero")
+            calls = suite.REPEATS
+        assert [n for n, _ in launched] == [name] * calls, (layout, launched)
+        for _, strides in launched:
+            assert strides["heads"] == 1, (layout, strides)
+            heads = [v for k, v in strides.items() if k.endswith("_head")]
+            assert heads and all(v == D for v in heads), (layout, strides)
+            assert _packed(strides) == packed, (layout, strides)
+
+
+# Identical rows whose weight-gradient terms ``dy * silu(z) * x * rstd`` are
+# below FP32's smallest subnormal, 2^-149 (``x`` 1, ``z`` 2^-133, the smallest
+# BF16 subnormal, so ``silu(z)`` is 2^-134 exactly; ``dy`` 2^-16 .. 2^-14 by
+# column): each term rounds to 0 or 2^-149 in FP32, the same in every row, so
+# the error grows with the rows.  Rows routed to the short, the mid and the long
+# backward on every architecture.
+SUBNORMAL_SHAPES = [
+    pytest.param(16, 1, id="short-16x1"),
+    pytest.param(4096, 1, id="mid-4096x1"),
+    pytest.param(8192, 32, id="long-8192x32"),
+]
+
+
+def _underflowing_rows(T: int, H: int) -> tuple[torch.Tensor, ...]:
+    device = torch.device("cuda")
+    col = torch.arange(D, device=device, dtype=torch.float64)
+    x = torch.ones(T, H, D, device=device).bfloat16()
+    z = torch.full((T, H, D), 2.0**-133, device=device).bfloat16()
+    scale = torch.where(
+        col < 64, 2.0**-16 * (1 + col / 64), 2.0**-15 * (1 + (col - 64) / 64)
+    )
+    dy = scale.float().bfloat16().view(1, 1, D).expand(T, H, D).contiguous()
+    w = torch.ones(D, device=device).bfloat16()
+    return x, z, w, dy
+
+
+@requires_device
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+@pytest.mark.parametrize("T,H", SUBNORMAL_SHAPES)
+def test_subnormal_weight_gradient_matches_the_deterministic_package(
+    T, H, dw_dtype, determinism_setting
+) -> None:
+    """Weight gradients in the subnormal range, where the documented budget
+    ``|dw64| * 2^-7 + sum|terms| * 2^-20`` (for FP32 normal gates, terms and
+    sums) does not hold for either package: ``dx`` and ``dz`` are the
+    deterministic package's bits, a BF16 ``dw`` the deterministic ``dw``'s
+    bits, and every ``dw`` lies within that budget widened by the documented
+    underflow allowance, ``(1 + |x * rstd|) * 2^-150`` per row plus half the
+    dtype's smallest subnormal, on every repeat, with the workspace zero."""
+    x, z, w, dy = _underflowing_rows(T, H)
+    rows = T * H
+    dx_d, dz_d, dw_d = det_backward(
+        dy, x, z, w, EPS, grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device)
+    )
+    xd, zd = x.double(), z.double()
+    n = xd * torch.rsqrt(xd.square().mean(-1, keepdim=True) + EPS)
+    terms = (dy.double() * zd * torch.sigmoid(zd) * n).reshape(rows, D)
+    dw64 = terms.sum(0)
+    smallest = 2.0**-133 if dw_dtype == torch.bfloat16 else 2.0**-149
+    allowance = (1 + n.abs().max().item()) * rows * 2.0**-150 + smallest / 2
+    budget = dw64.abs() * suite.BF16_RTOL + terms.abs().sum(0) * suite.DW_MAG_TOL
+    assert bool(((dw_d.double() - dw64).abs() > budget).any()), (
+        "the inputs no longer leave the normal-range budget"
+    )
+    ws = nd_workspace(rows, x.device)
+    for _ in range(suite.REPEATS):
+        dw = torch.empty(D, dtype=dw_dtype, device=x.device)
+        dx, dz, _ = nd_backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
+        assert torch.equal(dx, dx_d), "dx"
+        assert torch.equal(dz, dz_d), "dz"
+        if dw_dtype == torch.bfloat16:
+            assert torch.equal(dw.view(torch.int16), dw_d.view(torch.int16)), "dw bits"
+        excess = (dw.double() - dw64).abs() - budget - allowance
+        assert not bool((excess > 0).any()), (
+            f"dw beyond the floored budget by {excess.max().item():.3e}"
+        )
+        assert not bool(ws.any()), "the workspace is not zero"

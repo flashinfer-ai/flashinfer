@@ -202,6 +202,9 @@ from .jit.cake_grouped_mxfp8_quantize import (
 from .jit.cake_bf16_bmm_swap_ab import (
     aot_specs as gen_cake_bf16_bmm_swap_ab_aot_modules,
 )
+from .jit.cake_vsa_sm120 import (
+    aot_specs as gen_cake_vsa_sm120_aot_modules,
+)
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -756,6 +759,13 @@ def gen_all_modules(
         jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    # Cake SM120 block-64 block-sparse attention (backend="vsa_sm120_blk64" of
+    # BlockSparseAttentionWrapper): the bfloat16 and float16 programs, one
+    # library each per exact target.
+    if has_sm120:
+        jit_specs.extend(gen_cake_vsa_sm120_aot_modules("sm_120a"))
+    if has_sm121:
+        jit_specs.extend(gen_cake_vsa_sm120_aot_modules("sm_121a"))
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
         ("sm100a", has_blackwell_msa_sm100a),
         ("sm103a", has_blackwell_msa_sm103a),

@@ -23,9 +23,14 @@ Public fields (defaults are the shipped behaviour)::
 
     exchange        "a2a" | "ring"          cross-rank exchange scheme (ring: n_d_max - 1 <= 2 and save_transfer=False)
     save_transfer   True                    the merge owner keeps its c1 receive tensor (and M_seg at P > 1) for the backward
-    save_mode       "light" | "full"        saved set: S_in (with save_transfer also c1_recv and M_seg) and no tape (the
+    save_mode       "light" | "light_akk" | "full"
+                                            saved set: S_in (with save_transfer also c1_recv and M_seg) and no tape (the
                                             backward re-runs #1 and the tape walk), or additionally M_seg and every
-                                            forward tape ("full" is opt-in only; never the default)
+                                            forward tape ("full"); "light_akk" (use_qk_l2norm_in_kernel=True only) is
+                                            "light" plus the BF16 Akk tape of #1 (R * HV * 128 bytes), so the light
+                                            replay runs #1 without its block inverse (fwd_prep_replay_l2n, every other
+                                            output bit for bit #1's); every value but "light" is opt-in only, and under
+                                            torch.utils.checkpoint(use_reentrant=False) "light_akk" saves as "light"
     boundary_mode   "saved" | "replay"      keep the saved set, or keep nothing and re-run the whole module forward
                                             (summaries, exchange, merge) inside the backward (checkpoint replay)
     precision_mode  0 | 1 | 2               transfer-walk build record (template numbering): 0 = shipped TF32 hi/lo (2-MMA,
@@ -108,8 +113,11 @@ EXCHANGES = ("a2a", "ring")
 EXCHANGE_DEFAULT = "a2a"
 RING_MAX_HOPS = 2  # exchange="ring" needs every document chain within this many hops (n_d_max - 1 <= 2)
 SAVE_TRANSFER_DEFAULT = True
-SAVE_MODES = ("light", "full")
-SAVE_MODE_DEFAULT = "light"  # "full" is opt-in only
+SAVE_MODES = ("light", "light_akk", "full")
+SAVE_MODE_DEFAULT = "light"  # every other value is opt-in only
+# the save modes that also keep #1's BF16 Akk tape for the light replay (use_qk_l2norm_in_kernel=True only: the replay
+# program is built in its in-kernel-norm form only)
+SAVE_MODES_AKK = ("light_akk",)
 BOUNDARY_MODES = ("saved", "replay")
 BOUNDARY_MODE_DEFAULT = "saved"
 # Transfer-walk build records (template numbering shared with the KDA route): 0 = shipped TF32 hi/lo, 1 = _three_mma
@@ -334,6 +342,11 @@ class OptionsKcp:
             raise TypeError(
                 f"use_qk_l2norm_in_kernel must be a bool, got {type(self.use_qk_l2norm_in_kernel).__name__}"
             )
+        if self.save_mode in SAVE_MODES_AKK and not self.use_qk_l2norm_in_kernel:
+            raise ValueError(
+                f"save_mode={self.save_mode!r} keeps the Akk tape for the solve-free replay of #1_l2n: it needs "
+                "use_qk_l2norm_in_kernel=True"
+            )
         if self.test_knobs is not None:
             if not isinstance(self.test_knobs, dict):
                 raise TypeError(
@@ -444,6 +457,7 @@ __all__ = [
     "REUSE_RECOMPUTE_TAPES_DEFAULT",
     "RING_MAX_HOPS",
     "SAVE_MODES",
+    "SAVE_MODES_AKK",
     "SAVE_MODE_DEFAULT",
     "SAVE_TRANSFER_DEFAULT",
     "SCHEDULES",

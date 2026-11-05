@@ -17,7 +17,8 @@ module, ``_RENDERED_WORK_BIN_MIX_ROUTES`` for the bin-mix build of a module's
 work-bin turnover build, ``_RENDERED_WORK_BIN_POOL_ROUTES`` for the helper-pool build
 of its bin-mix build, ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` for the short-task build
 of its turnover build, ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` for the long-task build of
-its bin-mix build).
+its bin-mix build, ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` for the hybrid build
+of an M64 value-split module's owner/helper build).
 """
 
 from functools import cache
@@ -1563,6 +1564,73 @@ _RENDERED_MODULES = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_kda_prefill_1c0ce13d06d983d6dc62": {
+        "sources": [
+            "csrc/kda/prefill/cake_kda_prefill_1c0ce13d06d983d6dc62_kernel.cu",
+            "csrc/kda/prefill/cake_kda_prefill_1c0ce13d06d983d6dc62_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["tma_buffer", "q_tma"],
+            ["buffer", "k"],
+            ["tma_buffer", "k_tma"],
+            ["buffer", "v"],
+            ["tma_buffer", "v_tma"],
+            ["buffer", "g"],
+            ["tma_buffer", "g_tma"],
+            ["buffer", "beta"],
+            ["tma_buffer", "beta_tma"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "seq_order"],
+            ["buffer", "initial_state"],
+            ["buffer", "out"],
+            ["tma_buffer", "out_tma"],
+            ["buffer", "final_state"],
+            ["parameter", "num_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "scale"],
+            ["parameter", "lower_bound"],
+            ["parameter", "state_indices_addr"],
+            ["parameter", "state_checkpoints_addr"],
+            ["parameter", "checkpoint_cu_starts_addr"],
+            ["parameter", "beta_token_stride"],
+            ["parameter", "state_slot_stride"],
+            ["parameter", "use_state_indices"],
+            ["parameter", "checkpoint_every_n_tokens"],
+            ["buffer", "cu_chunk_offsets"],
+            ["buffer", "chunk_state"],
+            ["buffer", "state_checkpoint_needed"],
+            ["buffer", "tape_qd"],
+            ["buffer", "tape_kd"],
+            ["buffer", "tape_kr"],
+            ["buffer", "tape_j"],
+            ["buffer", "tape_restore_factor"],
+            ["buffer", "tape_e"],
+            ["buffer", "tape_x"],
+            ["buffer", "tape_r"],
+            ["buffer", "norm_inv_out"],
+            ["buffer", "decay_out"],
+            ["buffer", "beta_active_out"],
+            ["buffer", "initial_state_f32"],
+            ["buffer", "zero_workspace"],
+            ["parameter", "zero_words"],
+            ["parameter", "num_sequences"],
+            ["tma_buffer", "state_checkpoints_tma"],
+            ["buffer", "final_state_f32"],
+            ["tma_buffer", "final_state_f32_tma"],
+            ["parameter", "g_token_stride"],
+            ["workspace", "tensor_maps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a"],
+    },
     "cake_kda_prefill_1e06c9977a863d78a20d": {
         "sources": [
             "csrc/kda/prefill/cake_kda_prefill_1e06c9977a863d78a20d_kernel.cu",
@@ -2037,12 +2105,12 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_103a"],
     },
-    "cake_kda_prefill_46f060dd1ef1364317b3": {
+    "cake_kda_prefill_4864c64f7e75b9376fe3": {
         "sources": [
-            "csrc/kda/prefill/cake_kda_prefill_46f060dd1ef1364317b3_kernel.cu",
-            "csrc/kda/prefill/cake_kda_prefill_46f060dd1ef1364317b3_binding.cu",
+            "csrc/kda/prefill/cake_kda_prefill_4864c64f7e75b9376fe3_kernel.cu",
+            "csrc/kda/prefill/cake_kda_prefill_4864c64f7e75b9376fe3_binding.cu",
         ],
         "ffi_entry": "run",
         "compile_flags": ["--use_fast_math"],
@@ -4603,6 +4671,55 @@ _RENDERED_MODULES = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_kda_prefill_df6033e751431456c54b": {
+        "sources": [
+            "csrc/kda/prefill/cake_kda_prefill_df6033e751431456c54b_kernel.cu",
+            "csrc/kda/prefill/cake_kda_prefill_df6033e751431456c54b_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["tma_buffer", "q_tma"],
+            ["buffer", "k"],
+            ["tma_buffer", "k_tma"],
+            ["buffer", "v"],
+            ["tma_buffer", "v_tma"],
+            ["buffer", "g"],
+            ["tma_buffer", "g_tma"],
+            ["buffer", "beta"],
+            ["tma_buffer", "beta_tma"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "seq_order"],
+            ["buffer", "initial_state"],
+            ["buffer", "out"],
+            ["tma_buffer", "out_tma"],
+            ["buffer", "final_state"],
+            ["parameter", "state_indices_addr"],
+            ["parameter", "state_slot_stride"],
+            ["parameter", "use_state_indices"],
+            ["buffer", "initial_state_f32"],
+            ["buffer", "final_state_f32"],
+            ["parameter", "state_checkpoints_addr"],
+            ["parameter", "checkpoint_cu_starts_addr"],
+            ["buffer", "beta_active_out"],
+            ["parameter", "beta_token_stride"],
+            ["parameter", "g_token_stride"],
+            ["parameter", "checkpoint_every_n_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "scale"],
+            ["parameter", "lower_bound"],
+            ["workspace", "tensor_maps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a"],
+    },
     "cake_kda_prefill_e37381d75cc3b9e271d7": {
         "sources": [
             "csrc/kda/prefill/cake_kda_prefill_e37381d75cc3b9e271d7_kernel.cu",
@@ -5160,7 +5277,7 @@ _RENDERED_ROUTES = {
         "cake_kda_bf16_4ab394a09c63f264d7bd": "cake_kda_prefill_2b73eb595d98471e3dc5",
         "cake_kda_bf16_4e7e4609dadc8f6bcdfe": "cake_kda_prefill_cecd42adc9f960dab210",
         "cake_kda_bf16_50c0f288f4c8d7ca03a8": "cake_kda_prefill_dafc8ce62e0bc2e0f2f7",
-        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_46f060dd1ef1364317b3",
+        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_4864c64f7e75b9376fe3",
         "cake_kda_bf16_5535e79c76a18330f6f1": "cake_kda_prefill_95a598073020cb89a9e1",
         "cake_kda_bf16_5639519f5c942ed86e4f": "cake_kda_prefill_f50fae66d709dd89bc40",
         "cake_kda_bf16_5be344cbddc29563f1ee": "cake_kda_prefill_12c2268a5bbd46fcb341",
@@ -5184,7 +5301,7 @@ _RENDERED_ROUTES = {
         "cake_kda_bf16_4ab394a09c63f264d7bd": "cake_kda_prefill_f5d72724e2d84f61f5b9",
         "cake_kda_bf16_4e7e4609dadc8f6bcdfe": "cake_kda_prefill_cecd42adc9f960dab210",
         "cake_kda_bf16_50c0f288f4c8d7ca03a8": "cake_kda_prefill_4ef977be571a2b8f6aa5",
-        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_46f060dd1ef1364317b3",
+        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_4864c64f7e75b9376fe3",
         "cake_kda_bf16_5535e79c76a18330f6f1": "cake_kda_prefill_3cd00348e988fb1477d0",
         "cake_kda_bf16_5639519f5c942ed86e4f": "cake_kda_prefill_a3472ee8c82d3e2053ac",
         "cake_kda_bf16_5be344cbddc29563f1ee": "cake_kda_prefill_38c63863d6ae0019425c",
@@ -5417,7 +5534,7 @@ _RENDERED_WORK_BIN_POOL_ROUTES: dict[str, dict[str, str]] = {
 # the turnover build.
 _RENDERED_WORK_BIN_TURN_SHORT_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
-        "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_3ecb1bd9c45dac7eccff",
+        "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_1c0ce13d06d983d6dc62",
     },
     "sm_103a": {},
 }
@@ -5431,6 +5548,21 @@ _RENDERED_WORK_BIN_TURN_SHORT_ROUTES: dict[str, dict[str, str]] = {
 _RENDERED_WORK_BIN_MIX_LONG_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_d692d2b532922f2ee845",
+    },
+    "sm_103a": {},
+}
+
+# architecture -> shipped module -> generated hybrid build of the owner/helper
+# build of an M64 value-split module (``_RENDERED_M64_OWNER_HELPER_ROUTES``):
+# one helper CTA per task prepares the chunks c % 8 >= 4 and the task's two
+# value-half owner CTAs prepare the others and copy the helper's from the
+# global ring.  The runtime launches it cooperatively, grid (tasks, 3), on the
+# equal-length launches of a one-helper row of its owner/helper rule that would
+# take the pair-share build; every other launch keeps its pair-share or routed
+# program.
+_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "cake_kda_bf16_5535e79c76a18330f6f1": "cake_kda_prefill_df6033e751431456c54b",
     },
     "sm_103a": {},
 }

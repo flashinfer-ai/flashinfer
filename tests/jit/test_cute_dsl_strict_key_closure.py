@@ -369,7 +369,8 @@ def real_package(monkeypatch):
     [
         ("jit/cute_dsl_core.py", 35),
         ("gdn_kernels/gdn_decode_mtp.py", 45),
-        ("quantization/kernels/nvfp4_quantize.py", 50),
+        # cute_dsl.utils also reaches the FP4 API and batch-invariant quantizers.
+        ("quantization/kernels/nvfp4_quantize.py", 90),
     ],
 )
 def test_real_kernel_closure_stays_near_its_imports(real_package, kernel, limit):

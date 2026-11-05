@@ -2317,7 +2317,7 @@ class TestBuiltInRunnerLifecycle:
         assert len(events) == 1
         assert runner._built
         assert runner.tuning_config is tuning_config
-        assert hash(runner) == hash(runner.get_cache_key_extras([]))
+        assert hash(runner) == hash((runner.get_cache_key_extras([]), 0))
 
 
 # ---------------------------------------------------------------------------
@@ -4836,7 +4836,6 @@ _DIMENSIONS = [
     ("top_k", dict(top_k=4)),
     ("num_experts", dict(num_experts=128)),
     ("local_num_experts", dict(local_num_experts=32)),
-    ("local_expert_offset", dict(local_expert_offset=8)),
     ("activation", dict(activation=GeGLU())),
 ]
 

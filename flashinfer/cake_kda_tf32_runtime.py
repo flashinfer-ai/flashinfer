@@ -124,13 +124,14 @@ BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
 # build where the loader names one (``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES``,
 # see _work_bin_turn_short_program): at most this many 32-token chunks in the
 # longest task and at least this many tasks per SM.  That build stores each
-# task's final state with per-warp TMA boxes; on sm_100a it spills more in the
-# chunk loop than the stock store and binds a tensor map of the final state on
-# every call, which pays only where the bins turn their state over every few
-# chunks and the launch has many such tasks per SM.  Measured on a 148-SM
-# sm_100a: 64-token tasks at 768 and 1024 tasks gain; 256 tasks of 64 tokens
-# and launches of up to 255-token tasks do not.  Every other turnover launch
-# keeps the turnover build (the stock store there).
+# task's final state with per-warp TMA boxes and, for a pool updated in place,
+# loads each task's entering state with TMA boxes from a bin's second task on;
+# it binds a tensor map of the final state on every call, which pays only where
+# the bins turn their state over every few chunks and the launch has many such
+# tasks per SM.  Measured on a 148-SM sm_100a: 64-token tasks at 768 and 1024
+# tasks gain; 256 tasks of 64 tokens and launches of up to 255-token tasks do
+# not.  Every other turnover launch keeps the turnover build (the stock store
+# there).
 BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS = 2
 BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
@@ -220,11 +221,24 @@ M64_OWNER_HELPER_WORD_STRIDE = 3
 # launch takes at most as many as the device holds and needs two.  A launch
 # beyond the last row keeps its pair-share or routed program, and so does
 # every launch while a part's table is empty.  Per part:
-# M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a.  Both rows come from
-# paired timings of 8 to 36 tasks at 1024 to 16384 tokens per sequence on
-# B200 and GB300 with two helpers per task (three helpers never beat two in
-# the measured sweep); 36 tasks is the largest count measured.
-M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = ((36, 1024),)
+# M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a.  The (36, 1024) rows
+# come from paired timings of 8 to 36 tasks at 1024 to 16384 tokens per
+# sequence on B200 and GB300 with two helpers per task (three helpers never
+# beat two in the measured sweep).
+# A row of one helper takes the module's hybrid build
+# (``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES``, see
+# _m64_owner_helper_hybrid_factory): the helper prepares half of each task's
+# chunks and the two owners the other half.  It takes only a launch whose
+# sequences all have the same length and that the pair-share rule takes;
+# every other launch the row holds keeps its pair-share or routed program.
+# The B200 row (48, 2048, 1) covers the 37 to 48 tasks whose pair-share row
+# is (48, 2048): in paired timings of 144 held-out equal-length launches of
+# 38 to 48 tasks at 2049 to 14000 tokens the hybrid ran 0.87 to 0.98 times
+# the pair-share time on two B200s, every launch faster.
+M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = (
+    (36, 1024),
+    (48, 2048, 1),
+)
 M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
 # The bin-mix build of a work-bin turnover program (see _work_bin_mix_plan):
 # the work-bin table of a launch with more tasks than SMs leaves bins of two
@@ -1385,7 +1399,8 @@ def _m64_owner_helper_count(
     count holds ``total_tasks``) must hold ``min_seq_len``; its helper count
     (else ``M64_OWNER_HELPER_DEFAULT_HELPERS``) is cut to what the device holds
     at once beside two owners per task (``_m64_cooperative_capacity``, probed
-    only for a launch a row takes) and must stay at least two.
+    only for a launch a row takes) and must stay at least two, or at least one
+    on a row of one helper (the hybrid build's rows).
     """
     if gpu_arch not in ("sm_100a", "sm_103a") or total_tasks < 1:
         return 0
@@ -1403,7 +1418,7 @@ def _m64_owner_helper_count(
         M64_OWNER_HELPER_MAX_HELPERS,
         _m64_cooperative_capacity(device) // total_tasks - 2,
     )
-    return helpers if helpers >= 2 else 0
+    return helpers if helpers >= min(wanted, 2) else 0
 
 
 def _m64_owner_helper_program(name, *args, **kwargs):
@@ -1430,6 +1445,36 @@ def _m64_owner_helper_factory(name, *args, **kwargs):
         return _factory(name, *args, **kwargs)
     kernel = _kda_registry.PreparedKernel(program, detect_gpu_arch())
     kernel.m64_owner_helper = True
+    return kernel
+
+
+def _m64_owner_helper_hybrid_program(name, *args, **kwargs):
+    """The ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` build of the factory
+    row's module, or ``None``: the module needs its owner/helper build too
+    (``_m64_owner_helper_program``), and an architecture whose table is empty
+    has none."""
+    if _m64_owner_helper_program(name, *args, **kwargs) is None:
+        return None
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    routes = getattr(_kda_registry, "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES", {})
+    return routes.get(arch, {}).get(module)
+
+
+# The launches a one-helper row of the owner/helper rule takes run the loader's
+# ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` build of the module on a grid
+# (tasks, 3): the helper prepares the chunks c % 8 >= 4 of its task and the two
+# owners the others, with the same bits as the pair-share and routed programs.
+def _m64_owner_helper_hybrid_factory(name, *args, **kwargs):
+    """The hybrid owner/helper build of the factory row's M64 module, else
+    ``_m64_owner_helper_factory``."""
+    program = _m64_owner_helper_hybrid_program(name, *args, **kwargs)
+    if program is None:
+        return _m64_owner_helper_factory(name, *args, **kwargs)
+    kernel = _kda_registry.PreparedKernel(program, detect_gpu_arch())
+    kernel.m64_owner_helper = True
+    kernel.m64_owner_helper_hybrid = True
     return kernel
 
 
@@ -4116,6 +4161,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         owner_helpers = 0
         owner_helper_pool = 0
         m64_owner_helpers = 0
+        m64_owner_helper_hybrid = False
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -4390,12 +4436,35 @@ class FlashKDABlackwellBF16FusedLaunch:
                     )
                     if m64_owner_helpers < 1:
                         m64_owner_helpers = 0
+                elif m64_owner_helpers == 1:
+                    # A one-helper row takes the hybrid build, and only for a
+                    # launch of equal sequence lengths that the pair-share
+                    # rule takes; any other launch keeps today's program.
+                    m64_lengths = {
+                        end - start
+                        for start, end in zip(offsets, offsets[1:], strict=False)
+                    }
+                    m64_owner_helper_hybrid = (
+                        pair_share
+                        and len(m64_lengths) == 1
+                        and _m64_owner_helper_hybrid_program(
+                            "compiled_bf16_fused_m64", **m64_body
+                        )
+                        is not None
+                    )
+                    if not m64_owner_helper_hybrid:
+                        m64_owner_helpers = 0
             m64_factory = partial(
                 _m64_pair_share_factory if pair_share else _factory,
                 "compiled_bf16_fused_m64",
             )
+            m64_owner_helper_factory = (
+                _m64_owner_helper_hybrid_factory
+                if m64_owner_helper_hybrid
+                else _m64_owner_helper_factory
+            )
             self.module = self._build_body(
-                partial(_m64_owner_helper_factory, "compiled_bf16_fused_m64")
+                partial(m64_owner_helper_factory, "compiled_bf16_fused_m64")
                 if m64_owner_helpers
                 else m64_factory,
                 **m64_body,
@@ -4520,7 +4589,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             # A turnover launch of short tasks with many tasks per SM that
             # takes neither build takes the module's short-task turnover build
             # where the loader names one: the same bins, table and bits with
-            # the per-warp TMA final-state store.
+            # the per-warp TMA final-state store and TMA entering-state loads.
             if (
                 bin_mix_plan is None
                 and uses_default_fused_m128
@@ -4667,6 +4736,8 @@ class FlashKDABlackwellBF16FusedLaunch:
             m64_fallback_grid = self.grid
             self.grid = (total_tasks, 2 + self.m64_owner_helpers, 1)
             self.schedule += f"_owner{self.m64_owner_helpers}helper"
+            if getattr(self.module, "m64_owner_helper_hybrid", False):
+                self.schedule += "_hybrid"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
         qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {
@@ -8140,18 +8211,19 @@ def _mixlen_split(stock, args, kwargs):
         )
         <= capacity
     )
-    # "rng": one owner/helper part over the first..last long sequence, then the
-    # short head / tail parts, all on the caller stream.  "cc": one side-stream
-    # owner/helper part per run of long sequences, short runs on the caller stream.
+    # "rng": one side-stream owner/helper part over the first..last long
+    # sequence; the short head / tail parts run beside it on the caller stream.
+    # "cc": one side-stream owner/helper part per run of long sequences, short
+    # runs on the caller stream.
     if rng_fits:
         mode = "rng"
         plan = []
         if first > 0:
             plan.append((0, first - 1, False, 0))
-        plan.append((first, last, True, 0))
+        plan.append((first, last, True, 1))
         if last < num_seqs - 1:
             plan.append((last + 1, num_seqs - 1, False, 0))
-        # owner/helper part first, the short tails after it
+        # owner/helper part enqueued first, the short tails after it
         plan.sort(key=lambda part: not part[2])
     elif cc_fits:
         mode = "cc"

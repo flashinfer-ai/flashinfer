@@ -12,7 +12,9 @@ of the family: https://github.com/flashinfer-ai/flashinfer/issues/5680.
 Both the API and the backend are experimental: no compatibility guarantee,
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
-built for `sm_107a`, under the base dispatch rules).  The feature does not participate in automatic
+built for `sm_107a`, with SM103's GEMM tile rule tables except the long chunks'
+3-deep dX operand ring; its zero-gradient row skip keeps the generic 4097-row
+floor and the slice rule's dX slice counts).  The feature does not participate in automatic
 backend selection, autotuning or trace-apply.  Its libraries are loaded
 prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").
@@ -195,8 +197,8 @@ support path:
   order they finish (round to nearest, subnormals kept): an unordered FP32 sum
   within the accuracy budgets.  Every other shape, SM count and architecture
   runs one slice.  The split tail (the last wave's work items run as half
-  items) runs on the architectures with split forms (`sm_100a`, `sm_103a`)
-  and keeps the bits.
+  items) runs on the architectures with split forms (`sm_100a`, `sm_103a`,
+  `sm_107a`) and keeps the bits.
 * Sparse dW zero fill (global mode): the BF16 `dW [V, H]` is zeroed as FP32
   words (a 4-byte fill): the same bits.
 
@@ -215,7 +217,8 @@ By architecture: `sm_100a` (B200) is tested on the device.  On
 `sm_103a` (GB300) the rule has no cell, so the dense dX runs one slice
 everywhere (the deterministic bits); the support tests, forced two to four
 slices included, pass on GB300.  On `sm_107a` (R200) the rule has no cell
-either: the dense dX runs one slice everywhere.
+either: the dense dX runs one slice everywhere, with the split tail as on
+`sm_103a`.
 
 Accuracy on B200, worst of 20 runs against the FP64 oracle: the production
 row at H 5120 (T 16231, V 152064, chunks of 4096 and 3943 rows, two slices on
@@ -360,6 +363,17 @@ it handles these rows on the device, without a host synchronization:
   same set of launches for every `dlogp` and a CUDA graph capture of the
   backward replays for other `dlogp` values.  A chunk with no live row runs
   its launches without their GEMM work.
+* The one-slice dX plain store has no counted form, so on the architectures
+  of `DX_COUNTED_MIN_SLICES_BY_ARCH` (sm_100a and sm_103a: two slices) the
+  call's plan runs every dX chunk the slice rule gives one slice as a
+  two-slice K-sliced reduction in its counted form
+  (`cake_backend.counted_dx_slices`): the chunk computes no row past its
+  count.  The chunks, the other chunks' slices and the other GEMMs' forms do
+  not change.  Not raised: an
+  explicit dX `k_slices` in `gemm_tuning`, a record that serves one slice, a
+  vocabulary of one K step, and a plan whose two-slice forms would have no
+  counted form (it keeps the slice rule's counts).  sm_107a keeps the slice
+  rule's counts.
 * The fused dX finalize writes exact `+0` rows for the zero-gradient rows (as
   for an ignored row); `dX` of a live row is the same mathematics as without
   the skip.  `dW` sums the same nonzero products over the live rows in the new
@@ -417,8 +431,8 @@ Not applied: `compact_rows=False`, a backward that recounts its valid rows,
 the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
 reference backend.  A call with a temperature takes the skip with its own
 plan (above): the counted temperature form of the dz arm and the counted dX /
-dW GEMMs.  The one-slice dX chunks (the plain store) compute every row of the
-chunk.
+dW GEMMs.  A one-slice dX chunk (the plain store; on sm_107a, or pinned
+with `gemm_tuning`) computes every row of the chunk.
 
 ## Kernel structure of one token chunk
 
@@ -517,9 +531,14 @@ import is the JIT fallback of `cake_build.py`.
   record, each program built for `sm_107a` (the deterministic family's
   `sm_107a` programs under this package's prefix, the `sm_103a` reduction
   forms and the zero-gradient row skip's counted forms and partition kernel).
-  The other per-architecture rule tables do not list `sm_107a`, so its
-  rules reach the device-count logits forms and the 256-wide dX tiles of the
-  structural forms, as on the deterministic package. `dw_cast_tma_rule`
+  The per-architecture GEMM tile rule tables give `sm_107a` the `sm_103a`
+  entries (the logits and weight-gradient raster heights, the weight-gradient
+  blocked raster, the split-tail and swapped dX tiles), except the 3-deep dX
+  operand ring of the long chunks (`DX_LONG_CHUNK_STAGES`): on `sm_107a` those
+  chunks keep the table ring depth.  The zero-gradient row skip is not one of
+  them: `ZERO_DLOGP_MIN_ROWS_BY_ARCH` has no `sm_107a` entry, so `sm_107a`
+  keeps the generic 4097-row floor (`ZERO_DLOGP_MIN_ROWS_DEFAULT`; `sm_103a`:
+  3891). `dw_cast_tma_rule`
   bounds `sm_107a` as `sm_103a` (1792 rows): a short last chunk takes the
   TMA-epilogue bf16 cast, counted under the zero-gradient row skip.
 * Temperature of the log-probability entry

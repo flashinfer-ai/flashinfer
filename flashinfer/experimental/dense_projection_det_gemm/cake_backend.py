@@ -221,8 +221,30 @@ CTA_ROWS_CHOICES = (64, 128, 256)
 ROUTER_BLOCK_M = 128
 ROUTER_BLOCK_K = 32  # fp32 elements split per stage
 ROUTER_BLOCK_N = 128  # output columns per CTA pair
-# Production split-K counts per instance layout (router_det_forward / router_det_dgrad / router_det_wgrad).
+# Default split-K counts per instance layout (router_det_forward / router_det_dgrad / router_det_wgrad), where
+# ROUTER_SPLIT_RULES names no count for the device and the row.
 ROUTER_SPLITS = {"kk": 4, "kn": 1, "nn_t": 6}
+# The router rows' output width (experts) the measured split counts below apply to.
+ROUTER_RULE_N = 256
+# Measured split-K counts by device and row: (arch, SM count, layout, H) -> ((T_lo, T_hi, splits), ...), H the hidden size
+# (K of the forward ``kk``, M of the swapped weight gradient ``nn_t``) and T the token count (M of ``kk``, K of ``nn_t``) in
+# the inclusive window [T_lo, T_hi], for N = ROUTER_RULE_N.  The window T 16129-16384 holds every token count with the
+# forward's 128 M tiles (505-512 K blocks of the weight gradient).  Each count was measured faster than the default one
+# on GB200 / GB300 (152 SMs) and on B200 / B300 (148 SMs) for the whole router launch (the BF16x3 split, the program and the sum of
+# the partials); other SM counts keep the default.  A different split count is a different K partition: its outputs are
+# bit-exact run to run but not bitwise equal to the default count's.
+ROUTER_SPLIT_RULES: dict[
+    tuple[str, int, str, int], tuple[tuple[int, int, int], ...]
+] = {
+    ("sm_100a", 148, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_100a", 148, "nn_t", 6144): ((16129, 16384, 3),),
+    ("sm_100a", 152, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_100a", 152, "nn_t", 6144): ((16129, 16384, 3),),
+    ("sm_103a", 148, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_103a", 148, "nn_t", 6144): ((16129, 16384, 3),),
+    ("sm_103a", 152, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_103a", 152, "nn_t", 6144): ((16129, 16384, 3),),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1580,16 +1602,27 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
     # ---- sm_100a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
     #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
-    #      rule's 8), with the per-tile K partitions of the row's plan without them, measured on GB200 against
-    #      that plan ----
-    ('sm_100a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
-    ('sm_100a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
+    #      rule's 8; round 8 at T 16231 / 16384: the tall epilogue released by row half in place of the column-chunk
+    #      one, measured against the round-6 program), with the per-tile K partitions of the row's plan without them,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
     # ---- sm_100a: the GB T-exact rules of round 7 - the 5120 -> 17408 weight gradient at T 16231 / 16384 in its direct
     #      orientation (the half-tail program through the one-slot TMA store, 12-row raster groups: the sm_103a
     #      keys' rule of the row), with the per-tile K partitions of the row's plan without them, measured on
     #      GB200 against that plan ----
     ('sm_100a', True, True, False, False, False, 5120, 16231, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     ('sm_100a', True, True, False, False, False, 5120, 16384, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the half-tail program with
+    #      the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups, in place of the
+    #      ragged rule's overlapped half-tail program), with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_100a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16384 (the half-tail
+    #      program with the tall epilogue released by row half and the column-grouped raster in 16-column-tile groups,
+    #      in place of the ragged rule's overlapped half-tail program in the same groups), with the per-tile K
+    #      partitions of the row's plan without it, measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1725,10 +1758,28 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     # ---- sm_103a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
     #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
-    #      rule's 8), with the per-tile K partitions of the row's plan without them, measured on GB300 against
-    #      that plan ----
-    ('sm_103a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
-    ('sm_103a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
+    #      rule's 8; round 9 at T 16231 / 16384: the tall epilogue released by row half in place of the column-chunk
+    #      one, the sm_100a keys' rule, measured against the round-6 program), with the per-tile K partitions of the
+    #      row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    # ---- sm_103a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the sm_100a key's program:
+    #      the half-tail program with the tall epilogue released by row half and the column-grouped raster in
+    #      8-column-tile groups, in place of the inherited sm_100a ragged rule's overlapped half-tail program), with the
+    #      per-tile K partitions of the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_103a: the GB T-exact rules of round 9 - the 12288 -> 4096 forward at T 16231 / 16384 (the half-tail
+    #      program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups,
+    #      in place of the ragged rule's overlapped half-tail program in 16-column-tile groups), with the per-tile K
+    #      partitions of the row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_103a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16231 / 16384 (the sm_100a
+    #      key's program: the half-tail program with the tall epilogue released by row half and the column-grouped
+    #      raster in 16-column-tile groups, in place of the ragged rule's overlapped half-tail program), with the
+    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
 }
 # fmt: on
 
@@ -4895,6 +4946,28 @@ def _router_b_layout(B: torch.Tensor) -> bool:
     raise ValueError("router_fp32_det_gemm: B needs a unit stride on k or n")
 
 
+def router_splits(
+    layout: str,
+    M: int,
+    N: int,
+    K: int,
+    arch: Optional[str] = None,
+    sm_count: Optional[int] = None,
+) -> int:
+    """The split-K count of a router plan without a caller's ``splits``: the :data:`ROUTER_SPLIT_RULES` count of
+    ``(arch, sm_count, layout, H)`` whose window holds the token count (``kk``: ``H = K``, ``T = M``; ``nn_t``, the
+    swapped weight gradient's ``M`` / ``K``: ``H = M``, ``T = K``; ``N`` = :data:`ROUTER_RULE_N` only), else
+    :data:`ROUTER_SPLITS` of the layout (also for an unknown device: ``arch`` or ``sm_count`` ``None``)."""
+    if arch is not None and sm_count is not None and int(N) == ROUTER_RULE_N:
+        H, T = (int(K), int(M)) if layout == "kk" else (int(M), int(K))
+        for lo, hi, splits in ROUTER_SPLIT_RULES.get(
+            (arch, int(sm_count), layout, H), ()
+        ):
+            if lo <= T <= hi:
+                return splits
+    return ROUTER_SPLITS[layout]
+
+
 def plan_router_fp32_det_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -4906,7 +4979,8 @@ def plan_router_fp32_det_gemm(
 
     Returns ``(plan, A_eff, B_eff)``: the operands of the launched (possibly swapped) GEMM;
     ``B_eff`` is the operand the host splits into BF16x3 parts.  ``splits`` overrides the
-    production split-K count of the layout class (:data:`ROUTER_SPLITS`)."""
+    split-K count :func:`router_splits` resolves for the device of ``out`` (a CUDA tensor; on another device the
+    layout's :data:`ROUTER_SPLITS` count)."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -4956,7 +5030,15 @@ def plan_router_fp32_det_gemm(
             "router_fp32_det_gemm: out must have unit inner stride and 16-byte rows; N a multiple of 8"
         )
     if splits is None:
-        splits = ROUTER_SPLITS[layout]
+        facts = device_facts(out.device) if out.is_cuda else None
+        splits = router_splits(
+            layout,
+            M_eff,
+            N_eff,
+            K,
+            None if facts is None else facts.arch,
+            None if facts is None else facts.sm_count,
+        )
     splits = int(splits)
     if splits < 1:
         raise ValueError("router_fp32_det_gemm: splits must be >= 1")
@@ -5439,10 +5521,11 @@ def router_det_forward(
     W: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
-    splits: int = 4,
+    splits: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation."""
+    """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation; ``splits`` defaults to
+    :func:`router_splits` of the device and the row."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
     return router_fp32_det_gemm(X, W.t(), out, splits=splits, enable_pdl=enable_pdl)
@@ -5466,10 +5549,11 @@ def router_det_wgrad(
     X: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
-    splits: int = 6,
+    splits: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
+    """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store; ``splits``
+    defaults to :func:`router_splits` of the device and the row."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
     return router_fp32_det_gemm(G.t(), X, out, splits=splits, enable_pdl=enable_pdl)
