@@ -1594,10 +1594,9 @@ def _assert_matches_reference(
 
 def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
     device = _current_device()
-    from torch.profiler import ProfilerActivity, profile
-
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
+    from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     seqlen_q = 8
     batch = _two_split_batch(backend, device, seqlen_q)
@@ -1620,20 +1619,21 @@ def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
 
     calls = 200
     outputs = []
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+
+    def window():
+        outputs.clear()
         for call in range(calls):
             outputs.append(run(sets[call % 2]))
-        torch.cuda.synchronize()
+
+    # Every CUDA activity of the window, read between sentinel kernels that
+    # prove the session kept it whole (a session can lose its device records;
+    # see tests.test_helpers.cake_profiler).
+    kernels = cuda_kernel_names(window, exclude=())
     for call, actual in enumerate(outputs):
         _assert_matches_reference(actual, expected[call % 2])
     counter = _counter_storage(backend, device)
     assert counter.numel() == backend._num_sms(device) // 2
     assert int(counter.abs().sum()) == 0, "every merge reset its counter"
-    kernels = [
-        event.name
-        for event in prof.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
     assert len(kernels) == calls, sorted(set(kernels))
     assert len(set(kernels)) == 1, sorted(set(kernels))
 
@@ -1935,10 +1935,9 @@ def test_union_decode_capture_with_an_unwarmed_carrier_raises(monkeypatch):
 
 def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
     device = _current_device()
-    from torch.profiler import ProfilerActivity, profile
-
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
+    from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     sets = [_union_inputs(device, batch=64, seed=181, use_workspace=False)]
     sets.append(_union_inputs(device, batch=128, seed=191, use_workspace=False))
@@ -1952,21 +1951,21 @@ def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
     torch.cuda.synchronize()
     calls = 40
     outputs = []
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+
+    def window():
+        outputs.clear()
         for call in range(calls):
             outputs.append(run(sets[call % 2]))
-        torch.cuda.synchronize()
+
+    # Every CUDA activity of the window, read between sentinel kernels that
+    # prove the session kept it whole (tests.test_helpers.cake_profiler).
+    kernels = cuda_kernel_names(window, exclude=())
     for call, actual in enumerate(outputs):
         _assert_bitwise(actual, first[call % 2])
         torch.testing.assert_close(
             actual[0], expected[call % 2][0], atol=0.01, rtol=0.01
         )
         _assert_lse_close(actual[1], expected[call % 2][1])
-    kernels = [
-        event.name
-        for event in prof.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
     assert len(kernels) == calls, sorted(set(kernels))
     assert len(set(kernels)) == 1, sorted(set(kernels))
     for inputs in sets:

@@ -1287,7 +1287,9 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
     monkeypatch.setattr(
         cake_api, "_smallm_launch_sm_count", lambda device, count=None: 32
     )
-    monkeypatch.setattr(cake_api, "_SMALLM_SM_PARTITIONS", True)
+    # The partition-aware plan needs no setting: no partition the launch may
+    # run on has to be observed first.
+    assert cake_api._SMALLM_SM_PARTITIONS
     for row in rows:
         route = _select(_row_kwargs(row))
         assert route.component == "decode_native_bf16_hd256_smallm", row
@@ -1295,6 +1297,11 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
     # Two tiles share the partition: 16 splits each.
     route = _select(_row_kwargs("smallm_kv60008_q8_p64", **_TWO_KV_HEADS))
     assert route.program is None and route.num_split == 16, route
+    # Turned off, a launch plans on the device's SMs and reads no stream.
+    monkeypatch.setattr(cake_api, "_SMALLM_SM_PARTITIONS", False)
+    for row in rows:
+        route = _select(_row_kwargs(row))
+        assert route.program == ("decode_smallm", SHAPE_ROWS[row][-1][target]), row
 
 
 def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
@@ -1728,12 +1735,14 @@ _PARTITION_ROWS = (
 _PARTITION_CHILD = """
 import importlib.util, sys
 green = None
-if sys.argv[4] == "torch_before_import":
+if sys.argv[4] in ("torch_before_import", "torch_stream_before_import"):
     import torch
     torch.zeros(1, device="cuda")
     try:
         from torch.cuda.green_contexts import GreenContext
         green = GreenContext.create(num_sms=int(sys.argv[2]), device_id=0)
+        if sys.argv[4] == "torch_stream_before_import":
+            green = (green, green.Stream())
     except Exception as error:
         green = error
 spec = importlib.util.spec_from_file_location("cake_decode_programs", sys.argv[1])
@@ -1786,10 +1795,49 @@ def _recreated_green_context(sms):
     }
 
 
+def _driver_green_context(sms):
+    """An ``sms``-SM green context made through the CUDA driver API alone (no
+    FlashInfer or torch green-context helper), a torch stream of it, and its
+    SM count."""
+
+    from cuda.bindings import driver
+
+    def check(result):
+        err, *values = result
+        if int(err):
+            raise RuntimeError(f"CUDA driver error {err!r}")
+        return values[0] if len(values) == 1 else values
+
+    device = check(driver.cuDeviceGet(torch.cuda.current_device()))
+    resource = check(
+        driver.cuDeviceGetDevResource(
+            device, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+        )
+    )
+    groups, _, _ = check(driver.cuDevSmResourceSplitByCount(1, resource, 0, sms))
+    desc = check(driver.cuDevResourceGenerateDesc([groups[0]], 1))
+    context = check(
+        driver.cuGreenCtxCreate(
+            desc, device, driver.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM
+        )
+    )
+    stream = check(
+        driver.cuGreenCtxStreamCreate(
+            context, driver.CUstream_flags.CU_STREAM_NON_BLOCKING, 0
+        )
+    )
+    return (
+        context,
+        torch.cuda.get_stream_from_external(stream),
+        int(groups[0].sm.smCount),
+    )
+
+
 def _smallm_partition_child(sms, rows, api, green=None):
     """Run each small-M row on a stream of an ``sms``-SM green context made by
-    ``api`` (FlashInfer's green-context helpers, torch's green contexts, or a
-    torch green context ``green`` created before FlashInfer was imported; the
+    ``api`` (FlashInfer's green-context helpers, torch's green contexts, a
+    torch green context ``green`` created before FlashInfer was imported, with
+    its stream also taken before then, or the CUDA driver API alone; the
     inputs live in the primary context), with no partition setting of the
     module, and print one JSON record per row: the served route, the
     partition's SM count, the error against the FP32 reference.  The JIT
@@ -1806,6 +1854,8 @@ def _smallm_partition_child(sms, rows, api, green=None):
                 torch.device("cuda:0"), [sms]
             )
             stream, partition = streams[0], int(resources[0].sm.smCount)
+        elif api == "driver":
+            green, stream, partition = _driver_green_context(sms)
         else:
             if isinstance(green, Exception):
                 raise green
@@ -1815,6 +1865,8 @@ def _smallm_partition_child(sms, rows, api, green=None):
                 if made is None:
                     return
                 green, stream = made
+            elif api == "torch_stream_before_import":
+                green, stream = green
             else:
                 if green is None:
                     from torch.cuda.green_contexts import GreenContext
@@ -1865,14 +1917,22 @@ def _smallm_partition_child(sms, rows, api, green=None):
 
 @_GPU
 @pytest.mark.parametrize(
-    "api", ("flashinfer", "torch", "torch_before_import", "torch_recreated")
+    "api",
+    (
+        "flashinfer",
+        "torch",
+        "torch_before_import",
+        "torch_stream_before_import",
+        "torch_recreated",
+        "driver",
+    ),
 )
 def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     """On a stream of a 32-SM green context (FlashInfer's or torch's, also one
-    created before FlashInfer was imported or after a 64-SM one was planned
-    and destroyed, with no partition setting) the small-M rows plan at most 32
-    splits per tile and
-    complete (the full device's 65- and 152-way programs
+    created -- and its stream taken -- before FlashInfer was imported or after
+    a 64-SM one was planned and destroyed, or one of the CUDA driver API alone,
+    with no partition setting) the small-M rows plan at most 32 splits per tile
+    and complete (the full device's 65- and 152-way programs
     would wait forever for CTAs the partition cannot hold, and its nine-CTA
     cluster would not launch), matching the FP32 reference."""
 

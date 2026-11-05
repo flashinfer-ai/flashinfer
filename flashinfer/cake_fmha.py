@@ -1889,63 +1889,28 @@ def _stream_context_sm_count(index: int) -> int | None:
     return _context_sm_count(queries, stream)[0]
 
 
-# Whether this process may launch the small-M route on a stream of an SM
-# partition (a green context).  Set when FlashInfer's green-context helpers or
-# torch create a green context (observed below), by
-# ``FLASHINFER_CAKE_FMHA_SM_PARTITIONS=1`` or by
-# :func:`enable_cake_fmha_sm_partitions`.  Until then a launch is planned on
-# the device's SM count without reading its stream.
-_SMALLM_SM_PARTITIONS = os.environ.get("FLASHINFER_CAKE_FMHA_SM_PARTITIONS") == "1"
+# Whether a small-M launch plans its split count on the SMs of its stream's
+# CUDA context (a green context's partition) instead of the device's.  On by
+# default: FlashInfer cannot observe every partition a launch may run on (a
+# torch green context created, or its stream taken, before FlashInfer was
+# imported; torch 2.13's ``GreenContext.create`` returns the C++ base class, so
+# no Python wrapper sees its ``Stream()``; a green context of the driver API or
+# another library), and a split count planned on more SMs than the stream holds
+# never completes.  ``FLASHINFER_CAKE_FMHA_SM_PARTITIONS=0`` or
+# ``enable_cake_fmha_sm_partitions(False)`` plans on the device's SM count
+# without reading the stream, for a process that never launches on a partition.
+_SMALLM_SM_PARTITIONS = os.environ.get("FLASHINFER_CAKE_FMHA_SM_PARTITIONS") != "0"
 
 
 def enable_cake_fmha_sm_partitions(enabled: bool = True) -> None:
     """Plan small-M decode splits on the SMs of the launch stream's CUDA
-    context.  On by itself once FlashInfer's green-context helpers or torch
-    create a green context; a process that partitions the device by other
-    means (the driver API directly) enables it."""
+    context (the default), or with ``enabled=False`` on the device's SM count
+    without reading the stream.  Turn it off only in a process that never
+    launches the small-M route on an SM partition: a split count planned on
+    more SMs than the stream's context holds never completes."""
 
     global _SMALLM_SM_PARTITIONS
     _SMALLM_SM_PARTITIONS = bool(enabled)
-
-
-def _observe_torch_green_contexts() -> None:
-    """Enable the partition-aware plan when ``torch.cuda.green_contexts``
-    creates a green context or hands out its stream or context (which covers a
-    green context created before FlashInfer was imported); if torch's class
-    cannot be observed, enable it now."""
-
-    try:
-        from torch.cuda.green_contexts import GreenContext
-    except ImportError:
-        return
-
-    def observed(function):
-        @functools.wraps(function)
-        def enable_then_call(*args, **kwargs):
-            enable_cake_fmha_sm_partitions()
-            return function(*args, **kwargs)
-
-        enable_then_call._cake_fmha_observed = True  # type: ignore[attr-defined]
-        return enable_then_call
-
-    for name in ("__init__", "create", "Stream", "set_context"):
-        member = vars(GreenContext).get(name)
-        static = isinstance(member, staticmethod)
-        function = member.__func__ if static else member
-        if not callable(function) or getattr(function, "_cake_fmha_observed", False):
-            continue
-        try:
-            setattr(
-                GreenContext,
-                name,
-                staticmethod(observed(function)) if static else observed(function),
-            )
-        except (AttributeError, TypeError):
-            enable_cake_fmha_sm_partitions()
-            return
-
-
-_observe_torch_green_contexts()
 
 
 def _smallm_launch_sm_count(

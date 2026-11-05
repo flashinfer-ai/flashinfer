@@ -615,9 +615,8 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     profiler, independently of the host's module selection.  An architecture
     whose every backward route is listed in ``DET_PAIR_ROUTES`` ships no single
     kernel to count."""
-    from torch.profiler import ProfilerActivity, profile
-
     from flashinfer.cake_rmsnorm_train_backend import cake_windows as windows
+    from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     arch = loader.device_arch(_device().index or 0)
     found = _single_window(arch)
@@ -657,15 +656,10 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
 
     call()
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        call()
-        torch.cuda.synchronize()
-    activities = [
-        event
-        for event in prof.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-    names = [event.name for event in activities]
+    # Every CUDA activity of the call, memsets and copies included, read
+    # between sentinel kernels that prove the session kept the whole window (a
+    # session can lose its device records; see tests.test_helpers.cake_profiler).
+    names = cuda_kernel_names(call, exclude=())
     assert len(names) == 1, names
     assert "rmsnorm" in names[0] and "reduce" not in names[0], names
     assert _at_rest(ws)
