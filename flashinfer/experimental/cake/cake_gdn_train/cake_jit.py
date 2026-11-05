@@ -46,7 +46,7 @@ cumsum, FP32 beta), ``prep_tma`` / ``prep_tma_bf16beta`` (the same prep with
 the q / k tiles staged by TMA, one CTA per (chunk, key head); same bits),
 ``wy_tc`` (the WY representation, tcgen05), ``wy_tc2`` (the same chains and
 outputs in a five-CTA-per-SM form: a 64-column TMEM accumulator and packed
-lower-triangular operands; on SM107 it is the ``wy_tc`` program), the forward
+lower-triangular operands), the forward
 register scans ``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the
 segment-parallel route; the serial and split scans serve the backward's
 recompute), ``stitch``
