@@ -45,6 +45,7 @@ from tests.cpu.trace_apply.seal_helpers import (
     DEFINITION,
     GOLDEN_DIGEST,
     GOLDEN_ROOT,
+    GOLDEN_SETUP_DIGEST,
     OPERATION,
     PREPARE_KERNEL_SOURCE,
     PREPARE_SOURCE,
@@ -62,6 +63,11 @@ from tests.cpu.trace_apply.seal_helpers import (
 #: fields existed; a Solution without a setup must keep it.
 GOLDEN_SOLUTION_HASH = (
     "7d32249988c08eca0bf0cb24879925a8e20fbba5fcdded8d93bc9965ec823aac"
+)
+#: Solution.from_dict(golden setup bundle/solution.json).hash(): the hash tail
+#: the four setup fields add, pinned.
+GOLDEN_SETUP_SOLUTION_HASH = (
+    "995a8cb44c501521ee048c4e04fc6eea10dd39c9ac9e09a9cb663d5a4ac43c74"
 )
 FI_API = "flashinfer.norm.rmsnorm"
 
@@ -1031,3 +1037,77 @@ def test_enable_apply_runs_setup_once_per_weight_set(tmp_path, monkeypatch):
     bound = _get_loaded_solution(solution)
     assert isinstance(bound, SetupBoundCallable)
     assert bound.stats()["runs"] == 2 and bound.stats()["weight_sets"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The preserved setup-bearing package: the reference example of the format
+# ---------------------------------------------------------------------------
+
+
+def test_golden_setup_package_verifies_unchanged():
+    directory = GOLDEN_ROOT / GOLDEN_SETUP_DIGEST
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["schema_version"] == 1
+    assert set(manifest["files"]) == {
+        "definition.json",
+        "kernel.py",
+        "prepare.py",
+        "solution.json",
+    }
+    assert set(manifest["sealed_files"]) == {"qualification.json"}
+    assert "qualification_sha256" not in manifest  # the canonical spelling
+
+    sealed = pk.verify_package(GOLDEN_ROOT, GOLDEN_SETUP_DIGEST)
+    assert sealed.operation == "rmsnorm_h16"
+    assert sealed.entry_point == ("kernel", "run")
+    assert sealed.setup_entry_point == ("prepare", "setup")
+    assert sealed.teardown_entry_point == ("prepare", "teardown")
+    assert sealed.setup_inputs == ("weight",)
+    assert sealed.setup_state_param == "state"
+    assert sealed.definition is not None and sealed.definition["name"] == "rmsnorm_h16"
+
+    solution = Solution.from_dict(
+        json.loads((directory / "bundle" / "solution.json").read_text())
+    )
+    assert solution.hash() == GOLDEN_SETUP_SOLUTION_HASH
+    assert (
+        solution.setup_file() == "prepare.py"
+        and solution.teardown_file() == "prepare.py"
+    )
+
+    bound = pk.import_entry(sealed)
+    assert isinstance(bound, SetupBoundCallable)
+    assert bound.setup_inputs == ("weight",) and bound.state_param == "state"
+    namespace = bound.__module__.rsplit(".", 1)[0]
+    assert namespace.startswith("_flashinfer_sealed_")
+    assert f"{namespace}.prepare" in sys.modules  # setup came from the same namespace
+    assert [p.name for p in inspect.signature(bound).parameters.values()] == [
+        "hidden_states",
+        "weight",
+        "output",
+    ]
+
+
+def test_golden_setup_package_serves_rmsnorm_end_to_end(sm_gate_off):
+    result = pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    assert result.applied >= 1 and not result.errors
+    hidden, weight = torch.randn(4, 16), torch.randn(16)
+
+    def reference(x, w):
+        x = x.to(torch.float32)
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * w
+
+    first = flashinfer.norm.rmsnorm(hidden, weight)
+    assert torch.allclose(first, reference(hidden, weight))
+    again = flashinfer.norm.rmsnorm(torch.randn(2, 16), weight)  # same weight set
+    assert again.shape == (2, 16)
+    assert pk.setup_stats()["rmsnorm_h16"]["runs"] == 1  # prepare.py ran once
+    other_weight = torch.randn(16)
+    other = flashinfer.norm.rmsnorm(hidden, other_weight)
+    assert torch.allclose(other, reference(hidden, other_weight))
+    stats = pk.setup_stats()["rmsnorm_h16"]
+    assert stats["runs"] == 2 and stats["weight_sets"] == 2
+    assert stats["refused_in_capture"] == 0
+    assert ta.stats()[FI_API]["hit"] == 3
+    pk.release_packages()  # teardown(state) per weight set, bindings forgotten
+    assert pk.setup_stats() == {}

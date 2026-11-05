@@ -24,6 +24,10 @@ from typing import Any
 
 GOLDEN_ROOT = Path(__file__).with_name("data") / "kernel_package"
 GOLDEN_DIGEST = "59a6a6628b685f1becd920fd2fbf07845abe72bacce7f1935c6ff197c41a984d"
+#: The preserved setup-bearing package: ``kernel.py`` (``run``), ``prepare.py``
+#: (``setup``/``teardown``), ``solution.json`` with the four setup fields, a sealed
+#: ``definition.json`` and a manifest in the canonical ``sealed_files`` spelling.
+GOLDEN_SETUP_DIGEST = "48812d76b7d3073a961dc996d6968e09998bae895ff83f3a175fe7f98cb26280"
 
 OPERATION = "test_kernel_op"
 SOURCE = b"def run(x, out):\n    out.copy_(x)\n"
