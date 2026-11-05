@@ -391,7 +391,7 @@ hand-off twins serve `"off"` alone; the raw class's `dqkg` records serve every
 mode, as do the tape WY twin (its stage `wy` is no l2n stage) and the
 `param_finalize` records (no l2n stage either).
 
-`build.json` has 229 entries: 77 on `sm_100a`, 74 on `sm_103a` and 78 on
+`build.json` has 290 entries: 97 on `sm_100a`, 96 on `sm_103a` and 97 on
 `sm_107a`.
 
 ## Layout of this package
