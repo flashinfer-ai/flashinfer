@@ -74,7 +74,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL, if_generate
+from cutlass.cutlass_dsl import BaseDSL, dsl_user_op, if_generate
+from cutlass._mlir.dialects import llvm
 
 # Production path: diagnostics remain in the frozen baseline bundle.
 
@@ -159,6 +160,41 @@ def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None
     wait (SASS has no cluster membar scope).
     """
     cute.arch.mbarrier_wait(mbar_ptr, phase)
+
+
+@dsl_user_op
+def _wait_cluster_mbarrier_acquire(
+    mbar_ptr: "cute.Pointer",
+    phase: "cutlass.Int32",
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``mbarrier.try_wait.parity.acquire.cluster`` spin on a local mbarrier.
+
+    Needed when the data read after the wait was written by a PEER CTA's
+    thread via ``st.async`` (its complete-tx releases at cluster scope). The
+    default ``.acquire.cta`` wait only synchronizes with releases by this
+    CTA's own threads (and its own async proxy), so the plain wait gives no
+    happens-before edge to the peer's store. Used only on the corr RAW site.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -5077,8 +5113,9 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
                 common_params.cor_full_mbar.arrive_mbarrier(p_cor_consumer_state.index)
 
         if_generate(is_sync_warp, _arrive_cor_full)
-        common_params.cor_full_mbar.wait(
-            p_cor_consumer_state.index, p_cor_consumer_state.phase
+        _wait_cluster_mbarrier_acquire(
+            common_params.cor_full_mbar.get_barrier(p_cor_consumer_state.index),
+            cutlass.Int32(p_cor_consumer_state.phase),
         )
 
         # Each thread reads its own row's metadata from the corr SMEM stage.
