@@ -38,9 +38,7 @@ part where the profiler raises or returns no device records, the census
 helper skips, so the census tests (the strict xfail included) report skipped
 there rather than a false pass or XPASS.
 
-The state-dtype contract is pinned as well: the serving frameworks hold
-float32 state pools, and the CuTe decode path must refuse them with a
-``TypeError`` (#6893) rather than crash.
+Float32 state pools are covered by ``test_recurrent_kda_fp32_state.py``.
 """
 
 import pytest
@@ -252,16 +250,3 @@ def test_batched_indexed_decode_is_one_launch(B):
     removes the xfail mark. Where the profiler cannot read launches, the
     census helper skips, so this never XPASSes for lack of records."""
     _assert_single_launch(B, "batched", indexed=True)
-
-
-@pytest.mark.parametrize("layout", ("packed", "batched"))
-def test_fp32_state_pool_raises_type_error(layout):
-    """The serving frameworks hold float32 state pools; the CuTe decode path
-    requires bfloat16 state and must refuse fp32 with a TypeError naming the
-    state-dtype contract (#6893). A future fp32-state decode variant replaces
-    this test (with dtype-parametrized equivalence cases) rather than
-    flipping it."""
-    p = _inputs(8, layout, torch.float32)
-    with pytest.raises(TypeError, match="bfloat16 state"):
-        _call(p)
-        torch.cuda.synchronize()

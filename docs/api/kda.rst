@@ -205,6 +205,10 @@ The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
 
+The CuTe DSL decode kernels accept a BF16 or FP32 ``initial_state`` pool and read and
+write it in its own dtype. Any other dtype raises ``TypeError``. ``backend="cake"``,
+``fused_kda_decode`` and ``packed_fused_kda_decode`` still require a BF16 state.
+
 ``fused_kda_decode`` combines width-four causal convolution, one KDA update,
 and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
 pipeline to packed ragged speculative decode, retaining one recurrent
