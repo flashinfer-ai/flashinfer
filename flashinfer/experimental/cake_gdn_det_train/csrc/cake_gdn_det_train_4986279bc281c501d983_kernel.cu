@@ -233,7 +233,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_kn_addr = smem + 0;
     __nv_bfloat16* s_qn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -271,8 +271,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
     float* s_gl = reinterpret_cast<float*>(smem_raw + 222720);
     const int s_gl_addr = smem + 222720;
 
-    // Mbarrier init (20 pipeline groups, 0 ordered-sequence groups, 29 barriers)
-    // Mbarriers at smem_raw[222736..222968)
+    // Mbarrier init (29 barriers at smem_raw[222736..222968))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -346,13 +345,11 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tm_state = taddr;
-    const int tm_accv = taddr + 128;
-    const int tm_dvl = taddr + 192;
-    const int tm_s = taddr + 320;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tm_state = taddr;
+    const unsigned int tm_accv = taddr + 128;
+    const unsigned int tm_dvl = taddr + 192;
+    const unsigned int tm_s = taddr + 320;
 
     // ---- Role: chain ----
     if (warp <= 3) {
@@ -380,9 +377,9 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
             int warp_c = warp;
             int vrow = warp_c * 32 + lane_c;
             int quad = lane_c % 4;
-            unsigned int ta_state = (unsigned int)tm_state + (unsigned int)(warp_c * 32 << 16);
-            unsigned int ta_accv = (unsigned int)tm_accv + (unsigned int)(warp_c * 32 << 16);
-            unsigned int ta_dvl = (unsigned int)tm_dvl + (unsigned int)(warp_c * 32 << 16);
+            unsigned int ta_state = tm_state + (unsigned int)(warp_c * 32 << 16);
+            unsigned int ta_accv = tm_accv + (unsigned int)(warp_c * 32 << 16);
+            unsigned int ta_dvl = tm_dvl + (unsigned int)(warp_c * 32 << 16);
             int st_v = lane_c / 8 % 2 * 8 + lane_c % 8;
             int st_t = lane_c / 16 * 8;
             int stT_t = lane_c / 16 * 8 + lane_c % 8;
@@ -587,7 +584,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
             int row_a = q_a * 16 + lane_a / 4;
             int row_b = row_a + 8;
             int col_q = lane_a % 4 * 2;
-            unsigned int ta_s = (unsigned int)tm_s + (unsigned int)(q_a * 32 << 16);
+            unsigned int ta_s = tm_s + (unsigned int)(q_a * 32 << 16);
             int st_row = q_a * 16 + lane_a / 8 % 2 * 8 + lane_a % 8;
             int st_col = lane_a / 16 * 8;
             int t_dog = tid_a / 16;

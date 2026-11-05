@@ -868,9 +868,9 @@ def test_repeated_launches_against_fp64_and_det(
 # H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE, the
 # deterministic package's compensated det pair (compensated per-chunk dw sums)
 # from there up to H5120_ACCURACY_EDGE, and the FP64-accumulating single kernel
-# (on sm_103a its twosum form) above it; a single kernel also runs from T 1 up
-# to T 22 with FP32 weight on sm_100a and with both weight dtypes on sm_103a,
-# up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
+# (on sm_103a and sm_107a its kblock form) above it; a single kernel also runs
+# from T 1 up to T 22 with FP32 weight on sm_100a and with both weight dtypes on
+# sm_103a, up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
 # weight up to T 896 on sm_100a.  The plain
 # edge is the deterministic package's own switch to its compensated pair.  The
 # accuracy edge is T 65536, the top of the qualified range, on
@@ -888,14 +888,16 @@ def test_repeated_launches_against_fp64_and_det(
 # kernel's rstd, 60 or more inputs of each of three input families, BF16 and
 # FP32 weight: B200 plain pair <= 0.236 up to T 6144, compensated pair
 # <= 0.781 up to T 65536, single <= 0.643 at T 65537; GB300 plain pair
-# <= 0.245 up to T 5120, compensated pair <= 0.739 up to T 61952, twosum
-# single <= 0.0006 at the sampled T from 61953 to 81920; R200 plain pair
+# <= 0.245 up to T 5120, compensated pair <= 0.739 up to T 61952, kblock
+# single <= 0.688 at the sampled T from 61953 to 131072; R200 plain pair
 # <= 0.499 (216 SMs) and <= 0.545 (212 SMs) up to T 19968, compensated pair up
 # to T 49152 <= 0.825 (both weights) on 212 SMs, <= 0.759 (BF16 weight) and
 # <= 0.787 (FP32 weight) on 216 SMs (<= 0.818 at T 49152 over 200 inputs of
 # each of three families, both weights), single <= 0.703 (BF16 weight) and
 # <= 0.633 (FP32 weight) at the sampled T from 49152 to 65537 (212 SMs;
-# <= 0.608 and <= 0.646 from 49152 to 65537 on 216 SMs).
+# <= 0.608 and <= 0.646 from 49152 to 65537 on 216 SMs); its sm_107a kblock form
+# above T 49152 <= 0.807 (BF16 weight) and <= 0.719 (FP32 weight) at the sampled
+# T from 49153 to 131072 (212 SMs).
 H5120_PLAIN_EDGE = {"sm_100a": 6144, "sm_103a": 5120, "sm_107a": 19968}
 H5120_ACCURACY_EDGE = {
     "sm_100a": {"bf16": 65536, "f32": 65536},

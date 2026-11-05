@@ -1263,8 +1263,9 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
         (32, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (16, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (16, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
-        # 8-head prefill rows keep the low-head prefill producer (unmeasured
-        # on the M64 body).
+        # Without an architecture (as on SM100 / SM103) 8-head prefill rows
+        # keep the low-head prefill producer; SM107 runs them on the M64 body
+        # (test_sm107a_fp8_h8_prefill_rows_take_the_m64_body).
         (8, 1, 64, "fp8_lowhead_prefill"),
         # FP8/H128 rows with 16+ tokens use the persistent body for every
         # batch size and cache layout (measured 1.12-1.75x vs trtllm-gen on
@@ -1308,6 +1309,7 @@ def test_sm107a_registers_the_fp8_decode_route_only():
     assert set(_ARCH_REGISTRATIONS["sm_107a"]["variants"]) == {
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h128_prefill_source_persistent_uniform_k64",
         "fp8_h64_prefill_source_persistent_m64",
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
         "fp8_lowhead_prefill",
@@ -2679,6 +2681,342 @@ def test_fp8_h64_decode_rows_take_the_m64_body_once_two_ctas_per_token_exceed_th
         assert route(tokens) == m64
 
 
+# The SM count of the R200 board the SM107 low-head rules were measured on.
+_SM107_SM_COUNT = 216
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("sm_count", [_SM_COUNT, _SM107_SM_COUNT])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,m64",
+    [
+        (128, 256, "fp8_h64_prefill_source_persistent_m64"),
+        (640, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (1152, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (260, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+    ],
+)
+def test_sm107a_fp8_h8_prefill_rows_take_the_m64_body(
+    arch, sm_count, sparse_topk, page_size, m64
+):
+    """FP8 8-head prefill rows (``max_q_len >= 257``) run the M64 body on SM107
+    at every token count: the single-tile program for the SWA-only width, the
+    multi-tile program for wider items of either compressed cache layout.
+    SM100, SM103 and an unknown architecture keep the low-head prefill
+    producer; 16- and 32-head prefill rows run the M64 body everywhere."""
+    expected = m64 if arch == "sm_107a" else "fp8_lowhead_prefill"
+    for batch_size, max_q_len, tokens, ragged in (
+        (1, 257, 257, True),
+        (2, 257, 386, True),
+        (2, 512, 1024, False),
+        (2, 1024, 2048, True),
+        (1, 2048, 2048, True),
+    ):
+        for num_heads in (8, 16, 32):
+            route = _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=num_heads,
+                batch_size=batch_size,
+                max_q_len=max_q_len,
+                ragged=ragged,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+            want = expected if num_heads == 8 else m64
+            assert route == want, (num_heads, batch_size, max_q_len, tokens, route)
+            if arch is not None:
+                assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_fp8_h8_prefill_wider_than_1152_is_rejected(arch, page_size):
+    """8-head prefill items wider than 1152 sparse slots have no FP8 kernel:
+    the low-head prefill producer stages at most 1152 indices per item (nine
+    tiles of 128) and the M64 bindings require ``sparse_topk <= 1152``.  The
+    route raises instead of launching a producer that writes past its
+    shared-memory index buffer.  1152 itself still routes: the multi-tile M64
+    program on SM107, the low-head prefill producer elsewhere."""
+    assert cake._FP8_M64_MAX_WIDTH == 1152
+    assert cake._FP8_LOWHEAD_PREFILL_MAX_WIDTH == 1152
+    kwargs = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=8,
+        batch_size=1,
+        max_q_len=1024,
+        ragged=True,
+        compressed_page_size=page_size,
+        num_query_tokens=1024,
+        sm_count=_SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT,
+        arch=arch,
+    )
+    expected = (
+        "fp8_h64_prefill_source_persistent_m64_multi_tile"
+        if arch == "sm_107a"
+        else "fp8_lowhead_prefill"
+    )
+    assert _route(sparse_topk=1152, **kwargs) == expected
+    for sparse_topk in (1156, 1280, 2048):
+        with pytest.raises(ValueError, match=r"sparse_topk \d+ > 1152"):
+            _route(sparse_topk=sparse_topk, **kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("sm_count", [_SM_COUNT, _SM107_SM_COUNT])
+def test_sm107a_lowhead_swa_decode_rows_take_the_m64_body_past_one_wave(
+    arch, num_heads, sm_count
+):
+    """FP8 SWA-only decode rows (``max_q_len < 257``) of 8, 16 and 32 heads run
+    the single-tile M64 program on SM107 once the low-head prefill producer's
+    two CTAs per token exceed the SM count (216 SMs: 108 tokens keep the
+    producer, 109 take the M64 program); SM100, SM103 and an unknown
+    architecture keep the producer at every token count."""
+    m64 = "fp8_h64_prefill_source_persistent_m64"
+    assert cake._fp8_h64_m64_program(128) == m64
+    for tokens in (1, 12, 96, sm_count // 2, sm_count // 2 + 1, 112, 144, 256, 1024):
+        two_waves = 2 * tokens > sm_count
+        expected = m64 if arch == "sm_107a" and two_waves else "fp8_lowhead_prefill"
+        for max_q_len, ragged in ((1, False), (4, True), (256, True)):
+            if max_q_len > tokens:
+                continue
+            route = _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=num_heads,
+                batch_size=-(-tokens // max_q_len),
+                max_q_len=max_q_len,
+                ragged=ragged,
+                sparse_topk=128,
+                compressed_page_size=256,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+            assert route == expected, (tokens, max_q_len, route)
+            if arch is not None:
+                assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
+
+
+@pytest.mark.cpu_only
+def test_sm107a_lowhead_m64_rule_does_not_follow_the_h64_rule(monkeypatch):
+    """The SM107 low-head decode rule is its own: a different 64-head wave rule,
+    stricter or looser, moves the 64-head rows only."""
+
+    def route(num_heads, tokens):
+        return _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=num_heads,
+            batch_size=tokens,
+            max_q_len=1,
+            ragged=False,
+            sparse_topk=128,
+            compressed_page_size=256,
+            num_query_tokens=tokens,
+            sm_count=_SM107_SM_COUNT,
+            arch="sm_107a",
+        )
+
+    m64 = "fp8_h64_prefill_source_persistent_m64"
+    for num_heads in (8, 16, 32, 64):
+        assert route(num_heads, 108) == "fp8_lowhead_prefill"
+        assert route(num_heads, 109) == m64
+    monkeypatch.setattr(cake, "_fp8_h64_uses_m64_body", lambda *a, **kw: False)
+    assert route(64, 109) == "fp8_lowhead_prefill"
+    for num_heads in (8, 16, 32):
+        assert route(num_heads, 108) == "fp8_lowhead_prefill"
+        assert route(num_heads, 109) == m64
+    monkeypatch.setattr(cake, "_fp8_h64_uses_m64_body", lambda *a, **kw: True)
+    assert route(64, 108) == m64
+    for num_heads in (8, 16, 32):
+        assert route(num_heads, 108) == "fp8_lowhead_prefill"
+        assert route(num_heads, 109) == m64
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_heads,num_query_tokens,max_q_len,batch_size,sparse_topk,page_size",
+    [
+        (8, 257, 257, 1, 128, 256),
+        (8, 386, 257, 2, 640, 64),
+        (8, 2048, 1024, 2, 1152, 64),
+        (8, 112, 4, 28, 128, 256),
+        (16, 144, 4, 36, 128, 256),
+        (32, 256, 4, 64, 128, 256),
+    ],
+)
+def test_sm107a_lowhead_m64_routes_need_the_low_head_workspace(
+    num_heads, num_query_tokens, max_q_len, batch_size, sparse_topk, page_size
+):
+    """The sizing API routes by the architecture as the launch does; the M64
+    routes that replace the low-head prefill producer on SM107 carve the same
+    one-split workspace (LSE region only)."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=num_heads,
+        num_query_tokens=num_query_tokens,
+        sm_count=_SM107_SM_COUNT,
+        sparse_topk=sparse_topk,
+        compressed_page_size=page_size,
+        max_q_len=max_q_len,
+        batch_size=batch_size,
+        ragged=True,
+    )
+    low = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_103a")
+    m64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    assert low.route == "fp8_lowhead_prefill"
+    assert m64.route == cake._fp8_h64_m64_program(sparse_topk)
+    assert m64.num_splits == 1 and m64.uses_workspace
+    assert (low.single_launch_bytes, low.minimum_bytes) == (
+        m64.single_launch_bytes,
+        m64.minimum_bytes,
+    )
+    assert m64.single_launch_bytes == cake._PARTIAL_OFFSET + cake._align_up(
+        num_query_tokens * num_heads * 4
+    )
+
+
+def _run_fake_lowhead_swa_fp8(monkeypatch, *, arch, num_heads, batch_size, q_len):
+    """Drive run_cake_dsv4 on CPU tensors for a dense FP8 SWA-only call on
+    ``arch`` (216 SMs); return the launched program and its bound arguments."""
+    plans = {
+        route: _PERSISTENT_PLAN
+        for route in (
+            "fp8_lowhead_prefill",
+            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        )
+    }
+    recorder = _install_fake_variants(monkeypatch, plans)
+    seen = []
+
+    def module(variant, **kwargs):
+        seen.append(variant)
+        return recorder
+
+    monkeypatch.setattr(cake, "_variant_module", module)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    rows = batch_size * q_len
+    table, lens = _combined_metadata(rows, 0)
+    seq_lens = torch.full((batch_size,), 1000, dtype=torch.int32)
+    out = cake.run_cake_dsv4(
+        query=torch.zeros((rows, num_heads, 512), dtype=torch.float8_e4m3fn),
+        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        workspace_buffer=_aligned_u8(
+            get_cake_dsv4_workspace_bytes(rows, num_heads, 128, torch.float8_e4m3fn)
+        ),
+        out=None,
+        bmm1_scale=0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        max_q_len=q_len,
+        cum_seq_lens_q=None,
+        seq_lens=seq_lens,
+        backend="cake",
+        sparse_indices=table,
+        sparse_topk_lens=lens,
+    )
+    (program,) = seen
+    (call,) = recorder.calls
+    bound = dict(zip((name for _, name in _PERSISTENT_PLAN), call, strict=True))
+    return program, bound, seq_lens, out
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+def test_sm107a_lowhead_swa_rows_launch_the_m64_program_with_dense_offsets(
+    monkeypatch, num_heads
+):
+    """A dense SWA-only call of two waves (60 x 2 = 120 tokens on 216 SMs) runs
+    the single-tile M64 program on SM107: one CTA per token and the cached
+    dense request offsets (the M64 programs read cum_seq_lens_q
+    unconditionally); SM103 runs the low-head prefill producer (two CTAs per
+    token, seq_lens in place of the never-read offsets).  Neither pins the
+    output phase for these head counts."""
+    route, bound, _, out = _run_fake_lowhead_swa_fp8(
+        monkeypatch, arch="sm_107a", num_heads=num_heads, batch_size=60, q_len=2
+    )
+    assert route == "fp8_h64_prefill_source_persistent_m64"
+    assert route in cake._RAGGED_ONLY_ROUTES
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (120, 1, 1)
+    assert bound["total_work_items"] == bound["num_query_tokens"] == 120
+    assert bound["cum_seq_lens_q"].tolist() == list(range(0, 122, 2))
+    assert bound["O"].data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == (120, num_heads, 512)
+    route, bound, seq_lens, _ = _run_fake_lowhead_swa_fp8(
+        monkeypatch, arch="sm_103a", num_heads=num_heads, batch_size=60, q_len=2
+    )
+    assert route == "fp8_lowhead_prefill"
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (240, 1, 1)
+    assert bound["total_work_items"] == 240
+    assert bound["cum_seq_lens_q"].data_ptr() == seq_lens.data_ptr()
+    for name in ("fp8_lowhead_prefill", "fp8_h64_prefill_source_persistent_m64"):
+        phase = cake.cake_dsv4_out_phase(name, num_heads=num_heads, sparse_topk=128)
+        assert phase is None and cake._OUT_ALIGN_BY_ROUTE[name] == 32
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,sm107_first",
+    [
+        # (width, page size, first M64 token count on SM107 at 208 / 216 SMs)
+        (252, 2, (13, 13)),  # one complete tile: the M64 body at every count
+        (256, 2, (27, 28)),  # two tiles: 8 * tokens > sm_count
+        (260, 2, (53, 55)),  # three tiles: 4 * tokens > sm_count
+        (320, 64, (53, 55)),
+        (384, 2, (53, 55)),
+        (400, 2, (63, 65)),  # four tiles: 10 * tokens > 3 * sm_count
+        (512, 2, (63, 65)),
+        (516, 2, (105, 109)),  # five tiles and up: the half wave
+        (640, 64, (105, 109)),
+    ],
+)
+def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
+    arch, sparse_topk, page_size, sm107_first
+):
+    """On SM107 the FP8/H64 decode rows of two to four sparse tiles take the
+    M64 body before ``2 * tokens > sm_count``, by their tile count; other
+    widths and architectures keep the half-wave rule."""
+    m64 = cake._fp8_h64_m64_program(sparse_topk)
+    for sm_count, sm107 in zip((208, 216), sm107_first, strict=True):
+
+        def route(tokens):
+            return _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                batch_size=tokens // 4 + 1,
+                max_q_len=4,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+
+        if sparse_topk < 256:
+            first = 13
+        elif arch == "sm_107a":
+            first = sm107
+        else:
+            first = sm_count // 2 + 1
+        below = "fp8_h128_prefill_source_persistent_uniform"
+        for tokens in range(13, first):
+            assert route(tokens) == below, (sm_count, tokens)
+        for tokens in range(first, sm_count // 2 + 2):
+            assert route(tokens) == m64, (sm_count, tokens)
+        if arch is not None:
+            assert m64 in _ARCH_REGISTRATIONS[arch]["variants"]
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_query_tokens", [128, 256, 512])
 @pytest.mark.parametrize(
@@ -2821,6 +3159,173 @@ def test_fp8_h128_persistent_launch_takes_the_twin_at_its_floors(
             {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
         )
     ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_launches_take_the_k64_sibling_from_its_floor(arch):
+    """SM107 routes the FP8 H128 uniform-gather route's K=64 sibling to a
+    program of its own, with the route's arguments, and runs it on launches of
+    at least 48 rows; SM100 and SM103 route the sibling to the route's program
+    and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {"fp8_h128_prefill_source_persistent_uniform"} == cake._K64_SIBLING_ROUTES
+    assert cake._K64_SIBLING_MIN_TOKENS == {"sm_107a": 48}
+    for route in sorted(cake._K64_SIBLING_ROUTES):
+        sibling = f"{route}_k64"
+        own = arch == "sm_107a"
+        assert (VARIANTS[arch][sibling] != VARIANTS[arch][route]) == own
+        for tokens in (1, 8, 32, 47, 48, 64, 96, 127):
+            expected = sibling if own and tokens >= 48 else route
+            assert (
+                cake._k64_variant(route, arch=arch, num_query_tokens=tokens) == expected
+            ), tokens
+        assert (
+            get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+            == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+        )
+    for other in (
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_lowhead_prefill",
+    ):
+        assert cake._k64_variant(other, arch=arch, num_query_tokens=64) == other
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("tokens", [8, 47, 48, 127])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_h128_uniform_launch_takes_the_k64_sibling_at_its_floor(
+    arch, tokens, enable_pdl
+):
+    route = "fp8_h128_prefill_source_persistent_uniform"
+    L = _RecordingLauncher(
+        arch,
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=4,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    program = f"{route}_k64" if arch == "sm_107a" and tokens >= 48 else route
+    assert L.calls == [
+        (
+            program,
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+
+
+# (sparse_topk, compressed_page_size) of a topk4x, a topk128x and a SWA-only item.
+_SHORT_QUERY_ITEMS = {"topk4x": (1152, 64), "topk128x": (1152, 2), "swa": (128, 64)}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", [None, "sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_short_query_decode_keeps_the_uniform_route(arch):
+    """On SM107, FP8 H128 launches of at least 160 rows keep the uniform-gather
+    route (its K=64 sibling runs them) when their requests hold one query row
+    (at most 2 from 256 rows), or on topk4x items at most 4 (at most 8 from 256
+    rows); fewer rows, longer requests and the other architectures take the
+    lane-gather route from 128 rows."""
+    assert cake._FP8_PERSISTENT_SHORT_QUERY_UNIFORM == {
+        "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True))
+    }
+    for item, tokens, max_q_len, sm107_uniform in (
+        ("topk4x", 127, 8, True),
+        ("topk4x", 128, 1, False),
+        ("topk4x", 159, 4, False),
+        ("topk4x", 160, 1, True),
+        ("topk4x", 160, 4, True),
+        ("topk4x", 160, 5, False),
+        ("topk4x", 255, 8, False),
+        ("topk4x", 256, 8, True),
+        ("topk4x", 4096, 8, True),
+        ("topk4x", 4096, 9, False),
+        ("topk4x", 514, 257, False),
+        ("topk4x", 255, 2, True),
+        ("topk128x", 127, 4, True),
+        ("topk128x", 159, 1, False),
+        ("topk128x", 160, 1, True),
+        ("topk128x", 1024, 1, True),
+        ("topk128x", 255, 2, False),
+        ("topk128x", 256, 2, True),
+        ("topk128x", 1024, 3, False),
+        ("topk128x", 1024, 4, False),
+        ("swa", 160, 1, True),
+        ("swa", 160, 2, False),
+        ("swa", 4096, 2, True),
+        ("swa", 384, 4, False),
+    ):
+        sparse_topk, page_size = _SHORT_QUERY_ITEMS[item]
+        uniform = tokens < 128 or (arch == "sm_107a" and sm107_uniform)
+        expected = (
+            "fp8_h128_prefill_source_persistent_uniform"
+            if uniform
+            else "fp8_h128_prefill_source_persistent"
+        )
+        assert (
+            _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=128,
+                batch_size=max(1, tokens // max_q_len),
+                max_q_len=max_q_len,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=_SM_COUNT,
+                arch=arch,
+            )
+            == expected
+        ), (item, tokens, max_q_len)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [160, 1024])
+def test_sm107a_short_query_decode_runs_the_k64_sibling(tokens):
+    """The short-query launches the uniform route keeps on SM107 run its K=64
+    sibling over the same grid and partials, and need the workspace the
+    lane-gather route needs on the other architectures."""
+    route = "fp8_h128_prefill_source_persistent_uniform"
+    L = _RecordingLauncher(
+        "sm_107a",
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=4,
+        enable_pdl=True,
+    )
+    cake._dispatch_route(route, L)
+    assert L.calls == [
+        (
+            f"{route}_k64",
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=128,
+        num_query_tokens=tokens,
+        sm_count=_SM_COUNT,
+        sparse_topk=1152,
+        compressed_page_size=64,
+        max_q_len=4,
+        batch_size=tokens // 4,
+        ragged=False,
+    )
+    short = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    lane = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_103a")
+    assert short.route == route
+    assert lane.route == "fp8_h128_prefill_source_persistent"
+    assert (short.single_launch_bytes, short.minimum_bytes, short.num_splits) == (
+        lane.single_launch_bytes,
+        lane.minimum_bytes,
+        lane.num_splits,
+    )
 
 
 # --------------------------------------------------------------------------- CAKE-957 / CAKE-939: query layout, route plan, row tiling
@@ -3104,6 +3609,7 @@ def test_workspace_requirement_is_exact_per_route():
         max_q_len=1,
         batch_size=1024,
         ragged=False,
+        arch="sm_103a",
     )
     assert fp8.route == "fp8_h128_prefill_source_persistent" and fp8.num_splits == 1
     assert fp8.single_launch_bytes == cake._PARTIAL_OFFSET + 1024 * 128 * 4

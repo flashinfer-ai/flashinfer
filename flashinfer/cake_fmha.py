@@ -584,6 +584,96 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         16,
         False,
     ),
+    ("context_nvfp4", "RUNTIME_PACK1_SM100A"): (
+        "cake_fmha_context_nvfp4_86d0c41d97852b032e2b",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK1_SM103A"): (
+        "cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK2_SM100A"): (
+        "cake_fmha_context_nvfp4_85759514a21c2f7af98e",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK2_SM103A"): (
+        "cake_fmha_context_nvfp4_06d8cd436fe722542cfe",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK4_SM100A"): (
+        "cake_fmha_context_nvfp4_72dab1767cf5d92e3932",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK4_SM103A"): (
+        "cake_fmha_context_nvfp4_dfc2b69916b570e5656e",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK5_SM100A"): (
+        "cake_fmha_context_nvfp4_3dc30e785b083d6ab935",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK5_SM103A"): (
+        "cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK6_SM100A"): (
+        "cake_fmha_context_nvfp4_e214794d1c7e780bbb9b",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK6_SM103A"): (
+        "cake_fmha_context_nvfp4_183aa672fdfdebe90f8c",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK7_SM100A"): (
+        "cake_fmha_context_nvfp4_8238132fab08fc8a1519",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK7_SM103A"): (
+        "cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK8_SM100A"): (
+        "cake_fmha_context_nvfp4_9c67cb54b6dcaeda2935",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK8_SM103A"): (
+        "cake_fmha_context_nvfp4_a7e740ed276553b8299f",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK12_SM100A"): (
+        "cake_fmha_context_nvfp4_069ac3e5e2f6bba89935",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK12_SM103A"): (
+        "cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK16_SM100A"): (
+        "cake_fmha_context_nvfp4_db6cae7b4015feede42b",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK16_SM103A"): (
+        "cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd",
+        None,
+        False,
+    ),
     # The FP8 runtime-size programs: the m-block count is a launch argument.
     ("context_fp8", "RUNTIME_PACK8"): (
         "cake_fmha_context_fp8_27799c2f9548e951013e",
@@ -1004,7 +1094,7 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
 # pack (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g,
 # page_size)`` names the program (``None``: every page size 16 .. 1024).  The
 # host consults them only for a causal call without LSE or sink that no exact
-# route serves.
+# route serves, except the calls of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
 _CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     "sm100a": {
         (16, None): "RUNTIME_PACK16",
@@ -1027,6 +1117,50 @@ _CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (4, None): "RUNTIME_PACK4",
         (2, None): "RUNTIME_PACK2",
         (1, None): "RUNTIME_PACK1",
+    },
+}
+# Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
+# JIT pack above 1 whose ``max_q_len`` is a power of two of at least
+# ``queries``, over at least ``keys`` cache keys, keeps the JIT module.  The
+# JIT module, compiled for the call's sizes, runs a power-of-two query length
+# faster than its neighbours; there the runtime-size program ran slower than
+# it beyond the A/A band (B200, 10 layouts, batch x queries x keys at 32 query
+# and 4 KV heads: 1 x 8192 x 14336 .. 24576, 2 and 4 x 8192 x 16384, 1 x 16384
+# x 16384; also packs 2, 4 and 16 at 8192 queries and pack 16 at 4096 and
+# 16384), while 8064, 8320, 12288 and 24576 queries ran faster on the program.
+_CONTEXT_BF16_RUNTIME_POW2_Q: dict[str, tuple[int, int]] = {"sm100a": (4096, 14336)}
+
+# The runtime-size NVFP4 programs (``RUNTIME_PACK<g>_SM100A`` /
+# ``RUNTIME_PACK<g>_SM103A``): the persistent programs of the fused NVFP4
+# kernel with every size and the scale source a launch argument, one per
+# target with that target's schedule options.  Their tile work is that of the
+# JIT module of the same pack, so their output is the JIT module's bit for
+# bit; a program serves only the calls whose JIT pack
+# (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g, page_size)``
+# names the program (``None``: the page size of every NVFP4 route, 16).  The
+# host consults them only for a call that no exact route serves.
+_CONTEXT_NVFP4_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_SM100A",
+        (12, None): "RUNTIME_PACK12_SM100A",
+        (8, None): "RUNTIME_PACK8_SM100A",
+        (7, None): "RUNTIME_PACK7_SM100A",
+        (6, None): "RUNTIME_PACK6_SM100A",
+        (5, None): "RUNTIME_PACK5_SM100A",
+        (4, None): "RUNTIME_PACK4_SM100A",
+        (2, None): "RUNTIME_PACK2_SM100A",
+        (1, None): "RUNTIME_PACK1_SM100A",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_SM103A",
+        (12, None): "RUNTIME_PACK12_SM103A",
+        (8, None): "RUNTIME_PACK8_SM103A",
+        (7, None): "RUNTIME_PACK7_SM103A",
+        (6, None): "RUNTIME_PACK6_SM103A",
+        (5, None): "RUNTIME_PACK5_SM103A",
+        (4, None): "RUNTIME_PACK4_SM103A",
+        (2, None): "RUNTIME_PACK2_SM103A",
+        (1, None): "RUNTIME_PACK1_SM103A",
     },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
@@ -1315,6 +1449,21 @@ _CONTEXT_BF16_RUNTIME_PARAMS = (
 )
 
 
+# A runtime-size NVFP4 program takes the sizes after the NVFP4 parameters: the
+# scale source (0: the host scalars, 1: the device scalars), the m-block count,
+# the whole 8-unit L2 sections of the tile order, the work units per request,
+# the query heads and the GQA group.
+_CONTEXT_NVFP4_RUNTIME_PARAMS = (
+    *_CONTEXT_HOST_PARAMS["context_nvfp4"],
+    "scale_source",
+    "m_blocks",
+    "full_sections",
+    "bh_units",
+    "q_heads",
+    "heads_group",
+)
+
+
 # A split-KV FP8 program takes the runtime-size parameters, then the split
 # plan, the FP32 partials and the per-tile arrival counters.
 _CONTEXT_FP8_SPLIT_PARAMS = (
@@ -1339,6 +1488,8 @@ def _context_program_params(
     if num_m_blocks is None:
         if component == "context_bf16":
             return _CONTEXT_BF16_RUNTIME_PARAMS
+        if component == "context_nvfp4":
+            return _CONTEXT_NVFP4_RUNTIME_PARAMS
         return _CONTEXT_FP8_RUNTIME_PARAMS
     return _CONTEXT_HOST_PARAMS[component]
 
@@ -7356,10 +7507,39 @@ def select_cake_fmha_context_route(
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
         # A BF16 call no exact route serves: the runtime-size program of its
-        # JIT pack and page size (the same tile work as the JIT module).
+        # JIT pack and page size (the same tile work as the JIT module), but
+        # not for the power-of-two query lengths of
+        # :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
         runtime_bf16 = _CONTEXT_BF16_RUNTIME_ROUTES.get(target)
-        if program is None and component == "context_bf16" and runtime_bf16:
+        pow2_q = _CONTEXT_BF16_RUNTIME_POW2_Q.get(target)
+        jit_pow2 = (
+            pow2_q is not None
+            and pack_g > 1
+            and max_q_len >= pow2_q[0]
+            and max_q_len & (max_q_len - 1) == 0
+            and max_kv_len >= pow2_q[1]
+        )
+        if (
+            program is None
+            and component == "context_bf16"
+            and runtime_bf16
+            and not jit_pow2
+        ):
             program = runtime_bf16.get((pack_g, page_size)) or runtime_bf16.get(
+                (pack_g, None)
+            )
+        # An NVFP4 call no exact route serves: the runtime-size program of its
+        # JIT pack (the same tile work as the JIT module), where the CUDA
+        # toolkit builds the NVFP4 programs; else the JIT module, which needs
+        # no PTX ISA 9.4 instruction.
+        runtime_nvfp4 = _CONTEXT_NVFP4_RUNTIME_ROUTES.get(target)
+        if (
+            program is None
+            and component == "context_nvfp4"
+            and runtime_nvfp4
+            and context_nvfp4_programs_unavailable() is None
+        ):
+            program = runtime_nvfp4.get((pack_g, page_size)) or runtime_nvfp4.get(
                 (pack_g, None)
             )
         # An FP8 call of at most the keys of its route's short-KV entry, where
@@ -7861,10 +8041,18 @@ class CakeFmhaContextProgramModule:
                 bmm1_ptr,
                 bmm2_ptr,
                 bmm1_is_log2,
-                num_ctas,
-                1,
-                1,
             )
+            if self.runtime:
+                arguments = (
+                    *arguments,
+                    1 if device_scales else 0,
+                    num_m_blocks,
+                    total_bh // 8,
+                    units_per_batch,
+                    num_q_heads,
+                    num_q_heads // key_cache.shape[1],
+                )
+            arguments = (*arguments, num_ctas, 1, 1)
         elif self.runtime:
             arguments = (
                 query.view(torch.uint8),

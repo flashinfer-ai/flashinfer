@@ -196,7 +196,7 @@ kernel_cake_gdn_train_2f42874614b85ffc14fe_kcp(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* w_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int w_panel_addr = smem + 1024;
     __nv_bfloat16* k_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
@@ -216,8 +216,7 @@ kernel_cake_gdn_train_2f42874614b85ffc14fe_kcp(const __grid_constant__ CUtensorM
     float* rsb = reinterpret_cast<float*>(smem_raw + 197632);
     const int rsb_addr = smem + 197632;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 10 barriers)
-    // Mbarriers at smem_raw[0..80)
+    // Mbarrier init (10 barriers at smem_raw[0..80))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -261,13 +260,11 @@ kernel_cake_gdn_train_2f42874614b85ffc14fe_kcp(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_x_acc = taddr;
-    const int tmem_x_split = taddr + 128;
-    const int tmem_b_hi = taddr + 384;
-    const int tmem_b_lo = taddr + 448;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_x_acc = taddr;
+    const unsigned int tmem_x_split = taddr + 128;
+    const unsigned int tmem_b_hi = taddr + 384;
+    const unsigned int tmem_b_lo = taddr + 448;
 
     // ---- Role: compute ----
     if (warp <= 3) {
@@ -2071,7 +2068,7 @@ kernel_cake_gdn_train_2f42874614b85ffc14fe_kcp(const __grid_constant__ CUtensorM
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_1), "r"(tmem_x_split), "r"(1) : "memory");
+                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_1), "r"(tmem_x_split + 0), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_2 = (((wf_addr) >> 4) & 0x7FFF) + (0) * 2048;
 #else
@@ -2153,7 +2150,7 @@ kernel_cake_gdn_train_2f42874614b85ffc14fe_kcp(const __grid_constant__ CUtensorM
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_2), "r"(tmem_x_split), "r"(1) : "memory");
+                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_2), "r"(tmem_x_split + 0), "r"(1) : "memory");
                     tcgen05_commit(vp_ready_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0);
                     _phase_bv_ready_0 ^= 1;

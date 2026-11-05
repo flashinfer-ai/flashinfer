@@ -994,6 +994,51 @@ def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o(fused_o: int) -> 
     assert not {"qn", "kn"} & set(ws._tapes)
 
 
+@pytest.mark.parametrize("fused_o_tape", (0, 1))
+def test_full_forward_reads_both_rows_in_the_tape_and_output_walk(
+    fused_o_tape: int,
+) -> None:
+    """``save_mode="full"``: the shipped forward (``fused_o_tape`` = 1) reads ``qn`` and ``kn`` in its tape-and-output
+    walks and drops both after them; the split form (0) reads both in the tape walk and ``qn`` in #5.  Either form
+    leaves neither row in the arena (the saved ``r`` is a fresh tensor)."""
+    ctx, ops = _setup()
+    seen = {}
+    ws = kcp.WorkspaceKcp()
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            call = args["_call"]
+            if not call.backward:
+                seen[name] = sorted(set(call.ws._tapes) & {"qn", "kn", kcp.QK_RSTD})
+            super().run(name, args)
+
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        kcp.chunk_gdn_fwd_kcp(
+            *_ops(ops),
+            ctx,
+            backend="fake",
+            workspace=ws,
+            save_mode="full",
+            use_qk_l2norm_in_kernel=True,
+            test_knobs={"fused_o_tape": fused_o_tape},
+            deterministic=False,
+        )
+    finally:
+        kcp.set_backend("fake", previous)
+    assert seen["fwd_prep_l2n"] == ["kn", "qn"]
+    if fused_o_tape and kcp.fused_o_tape_shipped():
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "fused_tape"
+        assert seen["kcp_fwdh_out_tape"] == ["kn", "qn"]
+        assert not {"kcp_fwdh_tape", "kcp_fwdh_out", "fwd_o"} & set(seen)
+    else:
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
+        assert seen["fwd_o"] == ["qn"]
+        assert not {"kcp_fwdh_out", "kcp_fwdh_out_tape"} & set(seen)
+    assert not {"qn", "kn"} & set(ws._tapes)
+
+
 def test_saved_count_and_the_recompute_output_skip() -> None:
     """``_saved_count`` counts ``qk_rstd`` (``5 + len(saved.tensors())``), so the checkpoint frame proof still holds:
     the recompute of a region the node closes skips #5 with the norm on."""

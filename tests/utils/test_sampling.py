@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -1502,6 +1504,74 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("api", ["online_softmax", "sampling", "logits_pipe"])
+def test_softmax_concurrent_streams(api):
+    torch.manual_seed(42)
+    shape = (128, 131072)
+    logits = [
+        torch.randn(shape, device="cuda"),
+        torch.randn(shape, device="cuda") * 2 + 3,
+    ]
+    references = [value.softmax(dim=-1) for value in logits]
+
+    if api == "online_softmax":
+        # Public APIs dispatch to a different kernel on Blackwell. Exercise
+        # OnlineSoftmax directly with the same workspace for both graphs.
+        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+        run = partial(
+            flashinfer.sampling.get_sampling_module().softmax,
+            workspace,
+            maybe_temperature_arr=None,
+            temperature_val=1.0,
+            enable_pdl=False,
+        )
+    elif api == "sampling":
+        run = partial(flashinfer.sampling.softmax, enable_pdl=False)
+    else:
+        from flashinfer.logits_processor import LogitsPipe, Softmax, Temperature
+
+        pipe = LogitsPipe([Temperature(), Softmax(enable_pdl=False)], compile=True)
+        run = partial(pipe, temperature=1.0)
+
+    run(logits[0])  # Compile before capture.
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    outputs = []
+    for graph, stream, value in zip(graphs, streams, logits, strict=True):
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(run(value))
+
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for output, reference in zip(outputs, references, strict=True):
+            torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("offset", [0, 4, -4, 32768])
+def test_softmax_split_output_overlap(offset):
+    from flashinfer.jit.sampling import gen_sampling_module
+
+    vocab_size = 32768
+    storage = torch.randn(vocab_size + abs(offset), device="cuda")
+    logits = storage.narrow(0, max(-offset, 0), vocab_size).view(1, vocab_size)
+    output = storage.narrow(0, max(offset, 0), vocab_size).view(1, vocab_size)
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = gen_sampling_module().build_and_load().softmax
+    if offset == vocab_size:
+        softmax(workspace, logits, output, None, 1.0, False)
+        torch.testing.assert_close(output, logits.softmax(dim=-1), atol=1e-5, rtol=1e-5)
+    else:
+        with pytest.raises(
+            RuntimeError, match="OnlineSoftmax failed with error code invalid argument"
+        ):
+            softmax(workspace, logits, output, None, 1.0, False)
 
 
 # Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting

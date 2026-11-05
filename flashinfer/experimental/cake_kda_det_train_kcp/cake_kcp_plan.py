@@ -3199,6 +3199,41 @@ def qk_l2norm_twin(record: str) -> bool:
     return list(cake_jit.MODULES[record].get("l2n", ("off",))) == ["fused"]
 
 
+# The saved-rstd twins of the existing backend's records: a launch that reads the saved rstd (``read_rstd = 1``, the
+# first q / k reader of a saved-mode backward) runs the twin in the record's place (:func:`saved_rstd_record`).  The
+# twin's selection rule admits no problem, so no plan selects it.
+SAVED_RSTD_TWINS: dict[str, str] = {
+    "bwd_prep_g8_replay_l2n": "bwd_prep_g8_replay_saved_l2n"
+}
+
+
+@functools.cache
+def saved_rstd_record(record: str, arch: str | None) -> str:
+    """The record a launch that reads the saved rstd runs in place of ``record`` on architecture ``arch``: the twin of
+    :data:`SAVED_RSTD_TWINS` where the existing backend's registry has it as an ``_l2n`` twin of the same stage
+    (:func:`qk_l2norm_twin`) delivered for ``arch`` with a ``build.json`` library, else ``record`` (another record,
+    another architecture, a registry or build without the twin).  The twin takes the record's arguments and keeps
+    its place as the replay's first q / k reader, so the capability check of the mode holds for it too.  Read once
+    per record and architecture (the registry and the build are fixed per process)."""
+    twin = SAVED_RSTD_TWINS.get(record)
+    if twin is None or arch is None:
+        return record
+    from ..cake_kda_det_train import cake_build, cake_jit
+
+    try:
+        entry = cake_jit.MODULES[twin]
+    except KeyError:
+        return record
+    if (
+        entry.get("stage") != cake_jit.MODULES[record].get("stage")
+        or not qk_l2norm_twin(twin)
+        or arch not in entry.get("arches", ())
+        or cake_jit.library_name(twin, arch) not in cake_build.libraries_by_name()
+    ):
+        return record
+    return twin
+
+
 def _qk_l2norm_problem(
     mode: str,
     modes: dict[str, Any],
@@ -3248,13 +3283,19 @@ def _qk_l2norm_problem(
 # workspace (``workspace=None``) host-bound.  A replaced input (a test's monkeypatch) is another object, so the
 # check runs again; a refusal is never kept.
 _QK_L2NORM_SERVED: dict[tuple[str, str, str | None], tuple[Any, ...]] = {}
+# The existing backend's modules the check reads, imported on its first call (their attributes are read per call)
+_QK_L2NORM_MODULES: tuple[Any, ...] = ()
 
 
 def _qk_l2norm_inputs() -> tuple[Any, ...]:
     """The objects :func:`qk_l2norm_missing` reads: the existing backend's entry point, plan, layout table, registry
     and libraries query, and this module's stages, grid, SM counts, layouts, slots and helpers."""
-    from ..cake_kda_det_train import cake_backend, cake_build, cake_jit
+    global _QK_L2NORM_MODULES
+    if not _QK_L2NORM_MODULES:
+        from ..cake_kda_det_train import cake_backend, cake_build, cake_jit
 
+        _QK_L2NORM_MODULES = (cake_backend, cake_build, cake_jit)
+    cake_backend, cake_build, cake_jit = _QK_L2NORM_MODULES
     return (
         cake_backend.chunk_kda_det_fwd,
         cake_backend.plan,
@@ -3294,7 +3335,11 @@ def qk_l2norm_missing(
     key = (mode, gate, arch)
     inputs = _qk_l2norm_inputs()
     kept = _QK_L2NORM_SERVED.get(key)
-    if kept is not None and all(a is b for a, b in zip(kept, inputs, strict=True)):
+    if (
+        kept is not None
+        and len(kept) == len(inputs)
+        and all(map(operator.is_, kept, inputs))
+    ):
         return None
     why = _qk_l2norm_missing(mode, gate, arch)
     if why is None:
