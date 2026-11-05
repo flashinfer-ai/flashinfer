@@ -137,6 +137,75 @@ def test_public_entry_point_matches_backend_and_warns_once():
         )
 
 
+def _fp8_host_call(**extra):
+    """The public entry point on host FP8 tensors (every rule checked here comes before the device rule)."""
+    q = torch.zeros((6, 32, 128), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    k = torch.zeros((10, 128), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    w = torch.zeros((6, 32), dtype=torch.float32)
+    cu_q = torch.tensor((0, 2, 6), dtype=torch.int32)
+    cu_k = torch.tensor((0, 3, 10), dtype=torch.int32)
+    with _quiet_experimental():
+        return dsa_indexer_det_topk(q, k, w, cu_q, cu_k, top_k=4, **extra)
+
+
+def test_public_entry_point_fp8_argument_rules():
+    """``backend="cake"`` takes ``k_scale`` for float8_e4m3fn q / k with ``softmax_scale=None``; ``q_scale`` (the
+    MXFP4 form) stays ``backend="sm120"``'s, a BF16 call takes no ``k_scale``, and another backend still rejects both
+    scales by name."""
+    k_scale = torch.ones(10, dtype=torch.float32)
+    with pytest.raises(ValueError, match="CUDA"):
+        _fp8_host_call(k_scale=k_scale)
+    with pytest.raises(ValueError, match="q_scale"):
+        _fp8_host_call(k_scale=k_scale, q_scale=torch.ones((6, 32), dtype=torch.int32))
+    with pytest.raises(ValueError, match="softmax_scale=None"):
+        _fp8_host_call(k_scale=k_scale, softmax_scale=0.5)
+    with pytest.raises(ValueError, match="k_scale"):
+        _fp8_host_call()
+    with pytest.raises(ValueError, match="only used by backend='sm120'"):
+        _fp8_host_call(k_scale=k_scale, backend="other")
+    bf16 = (
+        torch.zeros((6, 32, 128), dtype=torch.bfloat16),
+        torch.zeros((10, 128), dtype=torch.bfloat16),
+        torch.zeros((6, 32), dtype=torch.float32),
+        torch.tensor((0, 2, 6), dtype=torch.int32),
+        torch.tensor((0, 3, 10), dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="k_scale"), _quiet_experimental():
+        dsa_indexer_det_topk(*bf16, top_k=4, k_scale=k_scale)
+
+
+def test_public_entry_point_fp8_matches_backend():
+    _require_program()
+    if not generated_program_available(torch.device("cuda"), dtype=torch.float8_e4m3fn):
+        pytest.skip("generated FP8 DSA indexer programs not registered for this device")
+    inputs = ref.make_fp8_inputs(
+        [200, 300], [200, 2500], top_k=128, seed=71, device="cuda"
+    )
+    expected = _run(inputs)
+    with _quiet_experimental():
+        got = dsa_indexer_det_topk(
+            inputs.q,
+            inputs.k,
+            inputs.w,
+            inputs.cu_seqlens_q,
+            inputs.cu_seqlens_k,
+            **inputs.kwargs(),
+        )
+    assert ref.same_bits(got, expected)
+    sizes = [
+        fn(
+            inputs.num_queries,
+            inputs.num_keys,
+            inputs.num_segments,
+            top_k=128,
+            device=inputs.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        for fn in (dsa_indexer_det_topk_workspace_size, dsa_indexer_det_workspace_size)
+    ]
+    assert sizes[0] == sizes[1]
+
+
 # -- previous names: aliases of the canonical objects (identity, not copies) ----------------------------------------
 
 PUBLIC_ALIASES = (

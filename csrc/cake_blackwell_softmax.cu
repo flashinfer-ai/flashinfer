@@ -93,10 +93,12 @@ constexpr uint64_t kNarrowChunkC16TripFillDen = 10;
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
 constexpr uint64_t kSharedTilesRowsPerCluster = 4;
-// A shared-tile launch whose rows fit two waves of the shared-tile kernel's
-// resident clusters takes its low-latency form: on GB300, grids past two waves
-// run faster with the shared-tile kernel, while grids of one or two waves run
-// faster with the low-latency kernel (measured on B200 and GB300).
+// A shared-tile launch takes its low-latency form on sm_100 at every row count,
+// and elsewhere when its rows fit two waves of the shared-tile kernel's
+// resident clusters: on GB300, grids past two waves run faster with the
+// shared-tile kernel, while grids of one or two waves run faster with the
+// low-latency kernel; on B200 the low-latency kernel is faster at every wave
+// count (measured on B200 and GB300).
 constexpr uint64_t kSharedTilesLatencyMaxWaves = 2;
 // sm_103, 5- and 6-tile 8-CTA chunks whose CTA share exceeds 5 tiles: the
 // persistent kernel stays from 4 up to 6 rows per shared-tile cluster (296 to
@@ -887,7 +889,7 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
   }
   if (shared_resident > 0 && use_shared_tiles) {
     const void* kernel = shared_tiles;
-    if (rows64 <= kSharedTilesLatencyMaxWaves * shared_clusters) {
+    if (device_minor == 0 || rows64 <= kSharedTilesLatencyMaxWaves * shared_clusters) {
       kernel = cached_shared_tiles_latency_kernel(variant, pdl);
       status = configure_shared_tiles_latency_kernel(kernel, variant.cluster_ctas, pdl, device);
       if (status != cudaSuccess) {

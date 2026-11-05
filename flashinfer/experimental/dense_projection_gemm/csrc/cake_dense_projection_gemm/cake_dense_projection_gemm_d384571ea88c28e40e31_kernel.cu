@@ -238,7 +238,7 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* a32 = reinterpret_cast<float*>(smem_raw + 1024);
     const int a32_addr = smem + 1024;
     __nv_bfloat16* b1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
@@ -251,10 +251,11 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
     const int box_addr = smem + 173056;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 189440);
     const int work_response_addr = smem + 189440;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-    // Mbarrier init (13 pipeline groups, 0 ordered-sequence groups, 48 barriers)
-    // Mbarriers at smem_raw[0..384)
+    // Mbarrier init (48 barriers at smem_raw[0..384))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -346,14 +347,14 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_chunk_acc = taddr;
+    const unsigned int tmem_small_acc = taddr + 256;
+    const unsigned int tmem_a1 = taddr + 384;
+    const unsigned int tmem_a2 = taddr + 416;
+    const unsigned int tmem_a3 = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_chunk_acc = taddr;
-    const int tmem_small_acc = taddr + 256;
-    const int tmem_a1 = taddr + 384;
-    const int tmem_a2 = taddr + 416;
-    const int tmem_a3 = taddr + 448;
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
@@ -539,7 +540,11 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                                     int big_col = chunk_stage * 128;
                                     int small_col = 0 * 128;
                                     unsigned int a_part = a_stage * 16;
+#if __CUDA_ARCH__ == 1070
+                                    int _mma_b_lo = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (b_stage) * 768;
+#else
                                     int _mma_b_lo = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (b_stage) * 768;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -560,8 +565,12 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_chunk_acc + (big_col))), "r"(_mma_b_lo), "r"((unsigned int)tmem_a1 + a_part), "r"(((big_init) ? 0 : 1)) : "memory");
+                    :: "r"((tmem_chunk_acc + (big_col))), "r"(_mma_b_lo), "r"(tmem_a1 + a_part), "r"(((big_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                                    int _mma_b_lo_0 = ((((b2_addr) >> 4) & 0x7FFF) | 0x800000) + (b_stage) * 768;
+#else
                                     int _mma_b_lo_0 = ((((b2_addr) >> 4) & 0x3FFF) | 0x800000) + (b_stage) * 768;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -582,8 +591,12 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_0), "r"((unsigned int)tmem_a1 + a_part), "r"(((small_init) ? 0 : 1)) : "memory");
+                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_0), "r"(tmem_a1 + a_part), "r"(((small_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                                    int _mma_b_lo_1 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (b_stage) * 768;
+#else
                                     int _mma_b_lo_1 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (b_stage) * 768;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -604,8 +617,12 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_1), "r"((unsigned int)tmem_a2 + a_part), "r"(1) : "memory");
+                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_1), "r"(tmem_a2 + a_part), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                                    int _mma_b_lo_2 = ((((b3_addr) >> 4) & 0x7FFF) | 0x800000) + (b_stage) * 768;
+#else
                                     int _mma_b_lo_2 = ((((b3_addr) >> 4) & 0x3FFF) | 0x800000) + (b_stage) * 768;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -626,8 +643,12 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_2), "r"((unsigned int)tmem_a1 + a_part), "r"(1) : "memory");
+                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_2), "r"(tmem_a1 + a_part), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                                    int _mma_b_lo_3 = ((((b2_addr) >> 4) & 0x7FFF) | 0x800000) + (b_stage) * 768;
+#else
                                     int _mma_b_lo_3 = ((((b2_addr) >> 4) & 0x3FFF) | 0x800000) + (b_stage) * 768;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -648,8 +669,12 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_3), "r"((unsigned int)tmem_a2 + a_part), "r"(1) : "memory");
+                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_3), "r"(tmem_a2 + a_part), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                                    int _mma_b_lo_4 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (b_stage) * 768;
+#else
                                     int _mma_b_lo_4 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (b_stage) * 768;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -670,7 +695,7 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_4), "r"((unsigned int)tmem_a3 + a_part), "r"(1) : "memory");
+                    :: "r"((tmem_small_acc + (small_col))), "r"(_mma_b_lo_4), "r"(tmem_a3 + a_part), "r"(1) : "memory");
                                     uint32_t _elected_4 = elect_sync();
                                     tcgen05_commit_cg2_multicast_leader(a_empty_addr + (a_stage) * 8, (uint16_t)(3), _elected_4);
                                     tcgen05_commit_cg2_multicast_leader(b_empty_addr + (b_stage) * 8, (uint16_t)(3), _elected_4);

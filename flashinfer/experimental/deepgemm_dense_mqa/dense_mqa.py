@@ -1492,6 +1492,7 @@ def fp8_mqa_logits(
                 kv_scales=kv_scales,
                 output=output[start:stop],
                 sm_count=sm_count,
+                clean_logits=bool(clean_logits),
             ).run()
         return output[:, :keys]
     plan = DenseMqaPlan(

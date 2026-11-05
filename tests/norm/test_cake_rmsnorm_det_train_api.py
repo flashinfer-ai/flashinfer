@@ -133,10 +133,12 @@ def test_facade_entry_points_match_the_backend(hidden: int) -> None:
 # "Beside kernels resident on other streams" in the facade docstring lists, per
 # architecture, the calls whose kernels need a whole SM.  A list item names an
 # architecture set ("SM100 / SM103:") and the calls: "the residual-fused H <h>
-# backward" (every token count) or "the forward / backward of H <h> above <t>
-# tokens" (every program window above ``t``).
+# backward" (every token count; "... above <t> tokens": every program window
+# above ``t``) or "the forward / backward of H <h> above <t> tokens" (every
+# program window above ``t``).
 _WHOLE_SM_ITEM = re.compile(
-    r"the residual-fused H (\d+) backward|the (forward|backward) of H (\d+) above (\d+) tokens"
+    r"the residual-fused H (\d+) backward(?: above (\d+) tokens)?"
+    r"|the (forward|backward) of H (\d+) above (\d+) tokens"
 )
 
 
@@ -152,9 +154,17 @@ def _documented_whole_sm() -> dict[str, set[tuple[str, int, bool, int]]]:
             continue
         for sm in re.findall(r"SM1\d\d", head.group(1)):
             entries = out.setdefault(f"sm_{sm[2:]}a", set())
-            for residual_hidden, kind, hidden, above in _WHOLE_SM_ITEM.findall(text):
+            for (
+                residual_hidden,
+                residual_above,
+                kind,
+                hidden,
+                above,
+            ) in _WHOLE_SM_ITEM.findall(text):
                 if residual_hidden:
-                    entries.add(("bwd", int(residual_hidden), True, 0))
+                    entries.add(
+                        ("bwd", int(residual_hidden), True, int(residual_above or 0))
+                    )
                 else:
                     entries.add(
                         (

@@ -44,6 +44,21 @@ def get_rope_module():
     return gen_rope_module().build_and_load()
 
 
+def _set_rope_launch_override(
+    two_heads: Optional[bool] = None, split: Optional[int] = None
+) -> None:
+    """Test-only: force the token-parallel RoPE launch schedule.
+
+    ``two_heads`` picks the one- or two-heads-per-step kernel (``None``: automatic,
+    which is two heads only on SM107). ``split`` forces ``gridDim.y`` and the
+    token-parallel kernel (``None``: automatic). The setting is process-wide;
+    call with no arguments to restore the automatic schedule.
+    """
+    get_rope_module().rope_set_launch_override(
+        -1 if two_heads is None else int(two_heads), 0 if split is None else split
+    )
+
+
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
 def _apply_rope(
     q: torch.Tensor,
@@ -1597,7 +1612,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
         For GQA/MHA: ``(k_cache, v_cache)`` where:
             - k_cache: ``(max_pages, page_size, num_kv_heads, head_dim)`` or
               ``(max_pages, num_kv_heads, page_size, head_dim)`` depending on layout, in FP8
-            - v_cache: same shape as k_cache, in FP8
+            - v_cache: same page size, head count and head dim as k_cache, in FP8; its
+              strides may differ from k_cache's, e.g. padded rows. Both caches are indexed
+              with the same ``kv_indices``, so each must hold every page listed there.
     kv_indices : torch.Tensor
         Page indices mapping, shape: ``(total_pages,)``. Typically ``torch.arange(total_pages)``.
     kv_indptr : torch.Tensor
@@ -1643,6 +1660,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
     - The ``batch_indices`` and ``positions`` tensors are typically obtained from
       ``flashinfer.get_batch_indices_positions()``.
     - Cache tensors must already be allocated in the target FP8 dtype.
+    - ``rope_dim`` and ``no_rope_dim`` must be multiples of 16, and the rows of every input,
+      Q output and cache tensor must start on 16-byte boundaries (strides that are multiples
+      of 16 bytes); otherwise a ``ValueError`` is raised.
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")

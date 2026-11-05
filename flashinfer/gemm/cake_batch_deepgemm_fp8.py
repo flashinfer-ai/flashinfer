@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared masked batch FP8 GEMM launches of the generated Cake programs (SM100a, SM103a).
+"""Prepared masked batch FP8 GEMM launches of the generated Cake programs (SM100a, SM103a, SM107a).
 
 The same mathematical contract as :func:`flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise`:
 ``out[g, :masked_m[g], :] = (a[g] . b[g]^T)`` with FP8 E4M3 operands, per-row
@@ -60,8 +60,15 @@ SUPPORTED_NK = frozenset(
         (4096, 2048),
     }
 )
-# The zero-copy packed-scale serving programs are specialised on (N, K, B).
+# The geometries an architecture's route chain owns when it owns fewer than
+# SUPPORTED_NK: SM107a runs the masked BLOCK_N programs alone.
+ARCH_SUPPORTED_NK = {
+    "sm_107a": frozenset({(128, 512), (512, 128), (4096, 7168), (7168, 2048)}),
+}
+# The zero-copy packed-scale serving programs are specialised on (N, K, B), on these
+# architectures.
 PACKED_NK = frozenset({(4096, 7168), (7168, 2048)})
+PACKED_ARCHS = frozenset({"sm_100a", "sm_103a"})
 PACKED_GROUPS = frozenset({32, 64})
 PACKED_K_GRANULE = 512
 SERVING_ROUTE = "seed_serving_m32_packed"
@@ -71,6 +78,11 @@ WORKSPACE_DTYPES = {
     "sfa_m32_packed": torch.uint32,
     "sfb_m32_packed": torch.uint32,
 }
+
+
+def supported_nk(arch: str) -> frozenset[tuple[int, int]]:
+    """The ``(N, K)`` geometries the route chain of ``arch`` owns."""
+    return ARCH_SUPPORTED_NK.get(arch, SUPPORTED_NK)
 
 
 def serving_config(
@@ -222,7 +234,7 @@ def _resolve(
     arch = device_arch(index)
     if arch is None:
         raise ValueError(
-            "the Cake batch DeepGEMM FP8 backend requires an SM100a or SM103a device "
+            "the Cake batch DeepGEMM FP8 backend requires an SM100a, SM103a or SM107a device "
             f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
             f"got {torch.cuda.get_device_capability(index)}"
         )
@@ -245,9 +257,10 @@ def _resolve(
             f"the Cake batch DeepGEMM FP8 backend requires positive, {BLOCK}-aligned M, N and K; "
             f"got B={B}, M={M}, N={N}, K={K}"
         )
-    if (N, K) not in SUPPORTED_NK:
+    if (N, K) not in supported_nk(arch):
         raise ValueError(
-            f"the Cake batch DeepGEMM FP8 backend owns (N, K) in {sorted(SUPPORTED_NK)}; got ({N}, {K})"
+            f"the Cake batch DeepGEMM FP8 backend owns (N, K) in {sorted(supported_nk(arch))} "
+            f"on {arch}; got ({N}, {K})"
         )
     if (
         isinstance(expected_m, bool)
@@ -272,6 +285,11 @@ def _resolve(
         if a_scale.dtype != torch.int32 or b_scale.dtype != torch.int32:
             raise ValueError(
                 "packed UE8M0 scales require both a_scale and b_scale to be int32"
+            )
+        if arch not in PACKED_ARCHS:
+            raise ValueError(
+                f"packed UE8M0 scales have no Cake batch DeepGEMM FP8 program on {arch}; "
+                "pass float32 scales"
             )
         if (N, K) not in PACKED_NK or B not in PACKED_GROUPS or N % 256 or K % 256:
             raise ValueError(
@@ -684,6 +702,8 @@ def run_batch_deepgemm_fp8_nt_groupwise(
 
 
 __all__ = [
+    "ARCH_SUPPORTED_NK",
+    "PACKED_ARCHS",
     "PACKED_GROUPS",
     "PACKED_NK",
     "PreparedBatchDeepGemmFp8NtGroupwise",
@@ -699,4 +719,5 @@ __all__ = [
     "serving_config",
     "serving_plan",
     "serving_program_key",
+    "supported_nk",
 ]

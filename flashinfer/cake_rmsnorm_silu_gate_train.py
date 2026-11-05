@@ -25,7 +25,8 @@ shared by every token and head)::
 
 The backward recomputes the statistics and the gate from ``x`` and ``z`` and
 returns BF16 ``dx`` and ``dz`` and the weight gradient summed over every token
-and head, rounded once into BF16 or FP32.  The autograd functions save only
+and head, its FP64 sum rounded to FP32 (and that to BF16 for a BF16 weight
+gradient: FP64 -> FP32 -> BF16).  The autograd functions save only
 their inputs, which keeps ``torch.utils.checkpoint(..., use_reentrant=False)``
 free of FP32 temporaries.  No call synchronizes the host or the device; ``T``
 and ``H`` are runtime values.
@@ -43,9 +44,10 @@ dispatches on it here:
   node.
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
-  (it has no reduction, so ``y`` has the same bits; on SM100 and SM103 up to
-  12 rows per SM a forward with 16 threads to a row, and from 976 rows per SM
-  on SM100 and SM103, 800 on SM107, a forward whose CTAs each walk several row
+  (it has no reduction, so ``y`` has the same bits; up to 12 rows per SM on
+  SM100 and SM103, 59 on SM107, a forward with 16 threads to a row, and from
+  976 rows per SM on SM100 and SM103, 800 on SM107, a forward whose CTAs each
+  walk several row
   blocks, also the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
   deterministic backward's bits.  Its CTAs take row blocks (one block each
   when the grid has a CTA for every block;
@@ -54,16 +56,44 @@ dispatches on it here:
   blocks adds its runs across its warps in FP32 and converts once: at most 16
   FP32 roundings a term either way), and add their FP64 column sums into FP64
   accumulators with atomics; the CTA that arrives last
-  rounds the sum once into the weight gradient.  Which blocks each CTA claims,
-  and so the rows of each FP32 run, and the order of the FP64 additions depend
-  on scheduling: the weight gradient can differ between calls, always within
-  the deterministic backward's error bound ``|dw64| * 2^-7 + sum|terms| *
-  2^-20`` per column (``dw64`` the exact sum of the ``terms``).  On SM100 and
-  SM103 up to 256 rows the backward is one thread-block cluster of 16 CTAs
-  with the same row arithmetic, which adds the CTAs' FP32 partials of each
-  column in a fixed order in FP64 and rounds once: there the weight gradient
-  is the same bits on every call, within the same bound, and no workspace is
-  used.  That
+  rounds the sum into the weight gradient (FP64 -> FP32 -> BF16 for BF16).
+  Which blocks each CTA claims, and so the rows of each FP32 run, and the
+  order of the FP64 additions depend on scheduling: the weight gradient can
+  differ between calls, always within the deterministic backward's error
+  bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column (``dw64`` the exact
+  sum of the ``terms``) when the gate ``silu(z)``, the terms and the column
+  sums are FP32 normal numbers or zero.  FP32 underflows gradually: a
+  subnormal gate, term or sum is rounded to a multiple of ``2^-149``, an
+  error that a later product scales (by ``|dy|`` for the gate, by
+  ``|x * rstd| <= sqrt(128)`` for ``dy * silu(z)``), so with subnormal values
+  the weight gradient of either package can lie outside that bound (by up to
+  about ``(1 + |x * rstd|) * 2^-150`` per row when only ``dy * silu(z)`` and
+  the terms underflow), and a weight gradient below the smallest normal
+  number of its dtype is rounded to a multiple of the dtype's smallest
+  subnormal (``2^-133`` for BF16, ``2^-149`` for FP32).  An infinite
+  ``grad_out`` makes its columns' weight gradient infinite or ``NaN``:
+  ``NaN`` where the infinite term is in the last row and the last row block
+  is partial (its padding rows reread that row and multiply it by zero), as
+  in the deterministic backward.  On SM103 from 700 rows per SM up to 12000
+  (from 12000 the backward above), each thread keeps its folded FP32 runs,
+  and each CTA its column sums over its row groups, as FP32 two-sum pairs
+  (a sum and its error term) instead of FP64, and converts a column's pair
+  to FP64 once for the atomic add.  The error that fold itself adds to a
+  CTA's column sum ``S`` of its FP32 runs is at most
+  ``C(k) * 2^-48 * A + 2^-53 * |S|`` (``k`` the folds of a thread, ``A``
+  the sum of the runs' magnitudes, ``C(k) = (k - 1)(k - 2) + 16 (k + 14)``;
+  the FP64 fold's is ``(k + 14) * 2^-53 * A``): a bound on the fold alone,
+  not on the weight gradient's error, which the bound above states.  A
+  column whose pair sum is not finite takes the FP64 value of the sum
+  alone, so an infinite or ``NaN`` term gives the column the class the FP64
+  fold gives it.  With finite terms whose FP32 pair sum in a thread or in a
+  CTA's column passes the FP32 range, the weight gradient can be ``+-inf``
+  or ``NaN`` where the deterministic backward returns a finite value.  Up to
+  256 rows the backward is one
+  thread-block cluster of 16 CTAs with the same row arithmetic, which adds
+  the CTAs' FP32 partials of each column in a fixed order in FP64 and rounds
+  the sum the same way: there the weight gradient is the same bits on every
+  call, within the same bound, and no workspace is used.  That
   package's entry points take ``deterministic=False`` only (any other value is
   a ``ValueError``).
 * ``deterministic=False`` while ``torch.use_deterministic_algorithms(True)`` is
@@ -88,8 +118,8 @@ deterministic=False)``, 4104 bytes whatever ``T * H``) holds the FP64
 accumulators, the arrival ticket and the claim counter the backward's CTAs
 claim row blocks from when the rows have more blocks than one wave of CTAs;
 every launch of that backward uses one, also with
-``compute_grad_weight=False``, but the one-cluster backward of up to 256 rows
-on SM100 and SM103, which reads none.  The kernel leaves it zero: allocate
+``compute_grad_weight=False``, but the one-cluster backward of up to 256 rows,
+which reads none.  The kernel leaves it zero: allocate
 it once, reuse it across calls, shapes, both weight-gradient dtypes and CUDA
 Graph replays without a reset, and give each stream that may run a backward at
 the same time its own buffer.  A buffer that did not come from that factory, or
@@ -98,8 +128,8 @@ that anything else wrote into, must be zeroed with
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
 per device, stream and backward kernel (one per weight-gradient dtype, two
-from 1024 rows per SM on SM107 and from 1280 on SM100 and SM103), kept for
-later calls; the
+from 1024 rows per SM on SM107 and from 1280 on SM100, and on SM103 two from
+700 rows per SM and three from 12000), kept for later calls; the
 autograd node retains nothing else.  They also keep a reserve of 64
 zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
 capture): a call during CUDA Graph capture takes one per capture and capture
@@ -108,8 +138,8 @@ no fill kernel (with none ready, the graph zero-fills a buffer of its own).
 
 Beside kernels resident on other streams (FlashInfer issue #7548; observed on
 B200, sm_100a, with the 20736-byte CTAs and on R200, sm_107a, with the
-20736-byte and the 10496-byte CTAs): above 256 rows on SM100 and SM103, and
-below 1024 rows per SM on SM107, each CTA of the non-deterministic backward
+20736-byte and the 10496-byte CTAs): above 256 rows, and on SM107 below 1024
+rows per SM, each CTA of the non-deterministic backward
 needs 20736 bytes of dynamic shared memory (an SM of sm_100a holds four such
 CTAs; from 1024 rows per SM on SM107 each CTA of the long backward needs 10496
 bytes), and an SM serves it only once it can switch to a shared-memory
@@ -126,13 +156,16 @@ beside it whatever its carveout.  On SM100 and SM103 the one-cluster backward
 (up to 256 rows; 16 CTAs of 6144 bytes whatever the rows), measured at 48 and
 240 rows, started at once beside a kernel holding every SM with one 128-thread
 CTA, no shared memory and the default, the maximum-L1 or the maximum-shared
-carveout (B200 and GB300).  The non-deterministic backward launches at most one
-wave of CTAs, or on SM100 and SM103 from 1280 rows per SM 5 CTAs per SM, a
-quarter more than an SM holds at once.  When the grid has a CTA for every row
-block, CTA ``c`` takes block ``c``; past one wave the CTAs claim every block in
-chunks from the workspace's claim counter, each CTA its next chunk as the last
-block of its current one starts, so a CTA that starts late takes fewer blocks
-(none when every chunk was claimed before it started).
+carveout (B200 and GB300).  On SM107 it waits for such a kernel with the default
+or the maximum-L1 carveout, as the other backwards do, and starts beside it with
+the maximum-shared carveout (R200).  The non-deterministic backward launches at
+most one wave of CTAs, or on SM100 from 1280 rows per SM and on SM103 from 700
+5 CTAs per SM, a quarter more than an SM holds at once.  When the grid has a
+CTA for every row block, CTA ``c`` takes block ``c``; past one wave the CTAs
+claim every block
+in chunks from the workspace's claim counter, each CTA its next chunk as the
+last block of its current one starts, so a CTA that starts late takes fewer
+blocks (none when every chunk was claimed before it started).
 
 Usage::
 
@@ -290,9 +323,10 @@ def cake_rmsnorm_silu_gate_train_forward(
         ``True`` (default) runs the deterministic package's forward
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`)
         with these arguments.  ``False`` runs the non-deterministic package's
-        forward program, the same kernel rendered there, or on SM100 / SM103
-        up to 12 rows per SM a forward with 16 threads to a row, and from 976
-        rows per SM on SM100 / SM103 (800 on SM107) a forward whose CTAs each
+        forward program, the same kernel rendered there, or up to 12 rows per
+        SM on SM100 / SM103 (59 on SM107) a forward with 16 threads to a row,
+        and from 976 rows per SM on SM100 / SM103 (800 on SM107) a forward
+        whose CTAs each
         walk several row blocks, with the same arithmetic (the forward has no reduction, so
         both return the same bits); it is refused while
         ``torch.use_deterministic_algorithms(True)`` is in effect (with
@@ -484,18 +518,19 @@ def cake_rmsnorm_silu_gate_train_backward(
         Preallocated BF16 outputs of ``x``'s shape.
     grad_weight : torch.Tensor, optional
         A BF16 or FP32 ``[128]`` tensor that receives the weight gradient
-        (rounded once into its dtype).  Without it a new BF16 tensor is returned.
+        (the FP64 sum rounded to FP32, and to BF16 from there for a BF16
+        tensor).  Without it a new BF16 tensor is returned.
     accumulate_grad_weight : bool
-        Add the gradient to ``grad_weight``'s current value before the one
-        rounding (needs ``grad_weight``).  A call with no rows leaves the
-        accumulator as it is.
+        Add the gradient to ``grad_weight``'s current value before the
+        rounding (in FP64; needs ``grad_weight``).  A call with no rows leaves
+        the accumulator as it is.
     compute_grad_weight : bool
         ``False`` skips the weight-gradient reduction and returns ``None`` for
         it; the non-deterministic kernel then touches neither ``grad_weight``
         nor the workspace's accumulators, but its CTAs still take the arrival
         ticket (and past one wave of row blocks claim their blocks from the
         claim counter), so it uses a workspace too (and leaves it zero); the
-        one-cluster backward of up to 256 rows on SM100 and SM103 uses none.
+        one-cluster backward of up to 256 rows uses none.
     workspace : torch.Tensor, optional
         Caller-owned buffer from :func:`cake_rmsnorm_silu_gate_train_backward_workspace`
         called with the same ``deterministic`` flag: the deterministic
@@ -513,8 +548,9 @@ def cake_rmsnorm_silu_gate_train_backward(
         ``True`` (default) runs the deterministic package's backward
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`)
         with these arguments: ``dw`` accumulated in FP32 per CTA chunk and in
-        FP64 over the chunks in an order fixed by the row count, rounded once,
-        so repeated calls return the same bits.  ``False`` runs one kernel of
+        FP64 over the chunks in an order fixed by the row count, rounded to
+        FP32 (and to BF16 from there for BF16), so repeated calls return the
+        same bits.  ``False`` runs one kernel of
         the non-deterministic package: the same ``dx`` and ``dz`` bits, and each
         CTA sums the rows of the blocks it takes (its own block when the grid
         has a CTA for every block, else the chunks it claims) in FP32 runs of
@@ -522,12 +558,18 @@ def cake_rmsnorm_silu_gate_train_backward(
         across its warps in FP32 and converts once: at most 16 FP32 roundings
         a term either way) and adds its FP64 column sums into FP64
         accumulators with atomics; the CTA that
-        arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s
+        arrives last rounds the sum into ``dw`` (adding ``grad_weight``'s
         value first when accumulating).  The claimed blocks, and so the FP32
         runs, and the order of the FP64 additions depend on scheduling: ``dw``
         can differ between calls, always within the deterministic backward's
-        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.  On
-        SM100 and SM103 up to 256 rows one cluster of 16 CTAs runs instead: the
+        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column while the
+        gate, the terms and the sums are FP32 normal numbers or zero (subnormal
+        values and infinities: see the module documentation).  On SM103 from
+        700 rows per SM up to 12000 the runs are folded, and a CTA's column
+        sums kept, as FP32 two-sum pairs, converted to FP64 once per column
+        (that fold's own error bound and its finite-overflow case: see the
+        module documentation).  Up to 256 rows
+        one cluster of 16 CTAs runs instead: the
         CTAs' FP32 partials of a column are added in a fixed order in FP64, so
         ``dw`` is the same bits on every call (within the same bound), and the
         workspace is not used.

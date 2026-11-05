@@ -464,6 +464,46 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "gemm_logits_dz_dcnt_tau": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "ldc"],
+        ["parameter", "group_m"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "dlogp"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["buffer", "temperature"],
+        ["buffer", "CNT"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_dz_dcnt_tau_tma": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "ldc"],
+        ["parameter", "group_m"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "dlogp"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["buffer", "temperature"],
+        ["buffer", "CNT"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "gemm_dx_red_dcnt": [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -832,6 +872,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_logits_dz_tau": [
                 "91c52039389b3bb39d02",
                 "gemm_logits_dz_tau",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_dz_dcnt_tau": [
+                "a2b7a68c3235d45a1b06",
+                "gemm_logits_dz_dcnt_tau",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//256))*2",
                 1,
@@ -1317,6 +1365,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_logits_dz_tau": [
                 "cdf6cb4552b6385ac483",
                 "gemm_logits_dz_tau_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_dz_dcnt_tau": [
+                "f9bdd4cff5189fe26c30",
+                "gemm_logits_dz_dcnt_tau_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//256))*2",
                 1,
@@ -1818,6 +1874,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_logits_dz_tau": [
                 "cdf6cb4552b6385ac483",
                 "gemm_logits_dz_tau_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_dz_dcnt_tau": [
+                "f9bdd4cff5189fe26c30",
+                "gemm_logits_dz_dcnt_tau_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//256))*2",
                 1,
@@ -2350,6 +2414,10 @@ MODULES: dict[str, dict[str, Any]] = _expand_registry(_REGISTRY, _ARG_PLANS, _LA
 #                          same way (``logp = z_y / tau_t - lse``).  The other
 #                          kernels are unchanged: temperature reaches dX and
 #                          dW only through ``dz``.
+# ``gemm_logits_dz_dcnt_tau``  the ``dz`` arm's temperature form bounded by the
+#                          chunk's device count of live rows (the zero-gradient
+#                          row skip's recompute of a call with a temperature;
+#                          the same ``dz`` on the rows below the count).
 #
 # A record registers the subset its program uses; the host refuses an entry
 # point whose stages are missing.
@@ -2463,14 +2531,15 @@ ROW_STAGES = (
     "scale_cast_scatter_bf16",
 )
 
-# The temperature forms (``_tau``) of the log-probability entry: the logits GEMM arms and the device-count logits GEMM
-# with the statistics (``TEMPERATURE_GEMM_STAGES``) and ``row_finalize`` (``TEMPERATURE_ROW_STAGES``).  They stay out
-# of ``STAGES`` / ``GEMM_STAGES`` / ``ROW_STAGES``, the tables a call without a temperature reads per launch; a call
-# with a temperature reads ``STAGES_WITH_TEMPERATURE``, every stage name in launch order (the GEMM forms after the
-# logits GEMMs, ``row_finalize_tau`` after ``row_finalize``).
+# The temperature forms (``_tau``) of the log-probability entry: the logits GEMM arms (the ``dz`` arm's counted form too)
+# and the device-count logits GEMM with the statistics (``TEMPERATURE_GEMM_STAGES``) and ``row_finalize``
+# (``TEMPERATURE_ROW_STAGES``).  They stay out of ``STAGES`` / ``GEMM_STAGES`` / ``ROW_STAGES``, the tables a call
+# without a temperature reads per launch; a call with a temperature reads ``STAGES_WITH_TEMPERATURE``, every stage name
+# in launch order (the GEMM forms after the logits GEMMs, ``row_finalize_tau`` after ``row_finalize``).
 TEMPERATURE_GEMM_STAGES = (
     "gemm_logits_mcnt_tau",
     "gemm_logits_dz_tau",
+    "gemm_logits_dz_dcnt_tau",
     "gemm_logits_lbl_tau",
 )
 TEMPERATURE_ROW_STAGES = ("row_finalize_tau",)

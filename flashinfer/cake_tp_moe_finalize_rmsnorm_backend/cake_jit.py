@@ -4720,7 +4720,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     ],
                     [
                         576,
-                        639,
+                        632,
                     ],
                     [
                         1008,
@@ -4967,1839 +4967,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 8,
     },
-    "cake_tp_moe_finalize_rmsnorm_19d7bdd185b0109424d2": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": False,
-            "lag": 2,
-            "mxa": True,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": True,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_19d7bdd185b0109424d2",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_19d7bdd185b0109424d2",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        687,
-                        719,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_1bf27fa3bec3403ca2ba": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": False,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_1bf27fa3bec3403ca2ba",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_1bf27fa3bec3403ca2ba",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        384,
-                        447,
-                    ],
-                    [
-                        576,
-                        687,
-                    ],
-                    [
-                        719,
-                        16384,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_478f0dd1a0dd84d7953b": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": False,
-            "lag": 3,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_478f0dd1a0dd84d7953b",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_478f0dd1a0dd84d7953b",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        447,
-                        576,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_521167690750dddf8184": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "rs",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "pre",
-            "gwl": True,
-            "ipf": False,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_521167690750dddf8184",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_521167690750dddf8184",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        224,
-                        384,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_5e31f006db68283b29ef": {
-        "arches": [
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": False,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "lane",
-            "rsq": "all",
-            "w256": False,
-            "wred": "end",
-            "x2": False,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_5e31f006db68283b29ef",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_5e31f006db68283b29ef",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        16384,
-                        None,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        32768,
-                        None,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": True,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": False,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 67584,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        1024,
-                        32768,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_75007e91ada8af5c1687": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": True,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": True,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_75007e91ada8af5c1687",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 67584,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_75007e91ada8af5c1687",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        639,
-                        1024,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_d08ac1d1069afe35231c": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "warp",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": False,
-            "entry": "loop",
-            "gwl": False,
-            "ipf": True,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_d08ac1d1069afe35231c",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_d08ac1d1069afe35231c",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        212,
-                        639,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_46f6c9934b346e59b790": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "max_ctas",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "parameter",
-                "c_mcast",
-            ],
-            [
-                "buffer",
-                "ctl",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "bfly": "rs",
-            "bkp": False,
-            "broadcast": "multicast",
-            "cache": "normal",
-            "cpair": True,
-            "entry": "pre",
-            "gwl": True,
-            "ipf": False,
-            "lag": 2,
-            "mxa": False,
-            "pdl": False,
-            "ptest": "min",
-            "rsq": "lane",
-            "w256": False,
-            "wred": "group",
-            "x2": True,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tokown",
-            "world": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_46f6c9934b346e59b790",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                2,
-                1,
-                1,
-            ),
-            "cooperative": True,
-            "dynamic_smem_bytes": 1024,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_46f6c9934b346e59b790",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "max_ctas": "max_ctas",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "c_mcast": "bcast_multicast",
-            "ctl": "ctl",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "tokown",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        152,
-                        224,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "tokown",
-            "world": 4,
-            "slot_parameter": "max_ctas",
-            "buffers": [
-                {
-                    "name": "push",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1048576,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "bcast",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 65536,
-                    "fill": 2147516416,
-                    "multicast": "c_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "ctl_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctl",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "push",
-                        "bcast",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
     "cake_tp_moe_finalize_rmsnorm_5b3aebdbe78cde560137": {
         "arches": [
             "sm_100a",
@@ -6950,7 +5117,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         288,
                     ],
                     [
-                        639,
+                        632,
                         1008,
                     ],
                 ],
@@ -6999,6 +5166,2051 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 8,
     },
+    "cake_tp_moe_finalize_rmsnorm_11ca2bbd813c9cd1149a": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": True,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": True,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": True,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_11ca2bbd813c9cd1149a",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 133120,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_11ca2bbd813c9cd1149a",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        639,
+                        864,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_351788a277c5011e6376": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": False,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_351788a277c5011e6376",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_351788a277c5011e6376",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        384,
+                        447,
+                    ],
+                    [
+                        576,
+                        687,
+                    ],
+                    [
+                        719,
+                        16384,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_3a2664cb7311d9311458": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": True,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_3a2664cb7311d9311458",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_3a2664cb7311d9311458",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        212,
+                        639,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_54835bf05d9ae6bf612c": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": True,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": False,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_54835bf05d9ae6bf612c",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 67584,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_54835bf05d9ae6bf612c",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        1024,
+                        32768,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_79333cfd795f5c3917ea": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "rs",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "pre",
+            "gwl": True,
+            "ipf": False,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_79333cfd795f5c3917ea",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_79333cfd795f5c3917ea",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        224,
+                        384,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_8ecd9d2ece93ebcf7117": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": False,
+            "lag": 3,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_8ecd9d2ece93ebcf7117",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_8ecd9d2ece93ebcf7117",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        447,
+                        576,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_a431833eac58aa1e53d1": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": False,
+            "lag": 2,
+            "mxa": True,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": True,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_a431833eac58aa1e53d1",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_a431833eac58aa1e53d1",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        687,
+                        719,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_a48d10c399d1af528a33": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": True,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": True,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_a48d10c399d1af528a33",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 67584,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_a48d10c399d1af528a33",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        864,
+                        1024,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_cb2b216c913a88037716": {
+        "arches": [
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "warp",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": False,
+            "entry": "loop",
+            "gwl": False,
+            "ipf": False,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "lane",
+            "rsq": "all",
+            "tfd": False,
+            "w256": False,
+            "wred": "end",
+            "x2": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_cb2b216c913a88037716",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_cb2b216c913a88037716",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        16384,
+                        None,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        32768,
+                        None,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_ea864bad8f53834c7e59": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "max_ctas",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "parameter",
+                "c_mcast",
+            ],
+            [
+                "buffer",
+                "ctl",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "bfly": "rs",
+            "bkp": False,
+            "broadcast": "multicast",
+            "cache": "normal",
+            "cpair": True,
+            "entry": "pre",
+            "gwl": True,
+            "ipf": False,
+            "lag": 2,
+            "mxa": False,
+            "pdl": False,
+            "ptest": "min",
+            "rsq": "lane",
+            "tfd": False,
+            "w256": False,
+            "wred": "group",
+            "x2": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokown",
+            "world": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_ea864bad8f53834c7e59",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                2,
+                1,
+                1,
+            ),
+            "cooperative": True,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_ea864bad8f53834c7e59",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "max_ctas": "max_ctas",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "c_mcast": "bcast_multicast",
+            "ctl": "ctl",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "tokown",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        152,
+                        224,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "tokown",
+            "world": 4,
+            "slot_parameter": "max_ctas",
+            "buffers": [
+                {
+                    "name": "push",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1048576,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "bcast",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 65536,
+                    "fill": 2147516416,
+                    "multicast": "c_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "ctl_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctl",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "push",
+                        "bcast",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
 }
 
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -7041,12 +7253,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_tp_moe_finalize_rmsnorm_a518b8ead2e395b00eeb",
             "cake_tp_moe_finalize_rmsnorm_796f08510bd47a117fe5",
             "cake_tp_moe_finalize_rmsnorm_84ac8b5dd4ab0a63227f",
-            "cake_tp_moe_finalize_rmsnorm_46f6c9934b346e59b790",
-            "cake_tp_moe_finalize_rmsnorm_521167690750dddf8184",
-            "cake_tp_moe_finalize_rmsnorm_1bf27fa3bec3403ca2ba",
-            "cake_tp_moe_finalize_rmsnorm_478f0dd1a0dd84d7953b",
-            "cake_tp_moe_finalize_rmsnorm_19d7bdd185b0109424d2",
-            "cake_tp_moe_finalize_rmsnorm_5e31f006db68283b29ef",
+            "cake_tp_moe_finalize_rmsnorm_ea864bad8f53834c7e59",
+            "cake_tp_moe_finalize_rmsnorm_79333cfd795f5c3917ea",
+            "cake_tp_moe_finalize_rmsnorm_351788a277c5011e6376",
+            "cake_tp_moe_finalize_rmsnorm_8ecd9d2ece93ebcf7117",
+            "cake_tp_moe_finalize_rmsnorm_a431833eac58aa1e53d1",
+            "cake_tp_moe_finalize_rmsnorm_cb2b216c913a88037716",
         ],
     },
     "sm_107a": {
@@ -7056,10 +7268,11 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_tp_moe_finalize_rmsnorm_b5b7351771974b74e6b5",
             "cake_tp_moe_finalize_rmsnorm_796f08510bd47a117fe5",
             "cake_tp_moe_finalize_rmsnorm_84ac8b5dd4ab0a63227f",
-            "cake_tp_moe_finalize_rmsnorm_d08ac1d1069afe35231c",
-            "cake_tp_moe_finalize_rmsnorm_75007e91ada8af5c1687",
-            "cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2",
-            "cake_tp_moe_finalize_rmsnorm_5e31f006db68283b29ef",
+            "cake_tp_moe_finalize_rmsnorm_3a2664cb7311d9311458",
+            "cake_tp_moe_finalize_rmsnorm_11ca2bbd813c9cd1149a",
+            "cake_tp_moe_finalize_rmsnorm_a48d10c399d1af528a33",
+            "cake_tp_moe_finalize_rmsnorm_54835bf05d9ae6bf612c",
+            "cake_tp_moe_finalize_rmsnorm_cb2b216c913a88037716",
         ],
     },
 }

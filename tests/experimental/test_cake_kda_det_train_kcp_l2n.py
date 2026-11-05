@@ -67,10 +67,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.experimental.test_cake_kda_det_train_kcp_dist import (
-    _free_port,
+    _init_group,
     _local_slices,
     _partition,
     _programs_exported,
+    _rendezvous,
     _requested,
     _to_global,
 )
@@ -1924,15 +1925,19 @@ def test_l2n_kernel_path_raises_until_bound() -> None:
 REFUSAL_ROWS = [(2, "ragged:3000,0"), (4, "ragged:1200,0,900,900")]
 
 
-def _refusal_rank(rank: int, W: int, layout: str, port: int, out_dir: str) -> None:
+def _refusal_rank(
+    rank: int, W: int, layout: str, rdzv: str | None, out_dir: str
+) -> None:
     """One spawned rank of a CPU gloo group: the flag-on entries on this rank's operands, each run to its exception;
     then one all-gather of the outcomes (a rank that had entered a collective alone would hold this gather until
     the group's timeout); rank 0 writes them.  Once the existing backend serves the mode, one rank-independent
     reason stands in for the check (the rows test where the refusal fires, not the reason)."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
-        "gloo", rank=rank, world_size=W, timeout=datetime.timedelta(seconds=120)
+        "gloo",
+        init_method=rdzv,
+        rank=rank,
+        world_size=W,
+        timeout=datetime.timedelta(seconds=120),
     )
     try:
         part, _ = _partition((3000,), W, layout)
@@ -2014,7 +2019,7 @@ def test_l2n_refusal_is_rank_symmetric(W, layout) -> None:
     with tempfile.TemporaryDirectory(prefix="cake_kcp_l2n_refusal_") as tmp:
         mp.start_processes(
             _refusal_rank,
-            args=(W, layout, _free_port(), tmp),
+            args=(W, layout, _rendezvous(tmp), tmp),
             nprocs=W,
             join=True,
             start_method="spawn",
@@ -2257,6 +2262,17 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
         for s, r in on_l:
             if s == "backend" and (s, r) not in off_l:
                 assert own(r), (kind, r)
+        if kind.startswith("bwd"):
+            # the prep is the plan's, or its saved-rstd twin where the launch reads the saved rstd
+            prep = plans[form].record("bwd_prep", cake_kcp.LOCAL_PATH_BWD)
+            if kind == "bwd_saved" and form == "fused":
+                prep = cake_kcp_plan.saved_rstd_record(prep, arch)
+            ran = {
+                r
+                for s, r in on_l
+                if s == "backend" and mod(s, r)["stage"] == "bwd_prep"
+            }
+            assert ran == {prep}, (kind, ran)
         if form == "fallback":
             names = [r for s, r, _g, _v in res if s == "backend"]
             first_qk = "qk_l2norm_apply" if kind == "bwd_saved" else "qk_l2norm"
@@ -2265,6 +2281,89 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
                 i = names.index("qk_pullback")
                 assert "_l2n_capture" in names[i - 1], names
                 assert names[i + 1 :] == (["param_finalize"] if gate == "raw" else [])
+
+
+SAVED_RSTD_BASE = "bwd_prep_g8_replay_l2n"
+SAVED_RSTD_TWIN = "bwd_prep_g8_replay_saved_l2n"
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a", None))
+def test_l2n_saved_rstd_record(arch, monkeypatch, request) -> None:
+    """:func:`cake_kcp_plan.saved_rstd_record`: the replay prep runs its saved-rstd twin on sm_100a / sm_103a (the
+    twin's architectures, each with a ``build.json`` library) and stays itself on sm_107a and without an
+    architecture; every other record is its own.  The twin is kept only while the registry has it as an ``_l2n``
+    twin of the same stage delivered for the architecture with a library: each condition alone keeps the record
+    (the per-process cache cleared around each changed registry)."""
+    pick = cake_kcp_plan.saved_rstd_record
+    request.addfinalizer(pick.cache_clear)
+
+    def fresh(record: str) -> str:
+        pick.cache_clear()
+        return pick(record, arch)
+
+    assert cake_kcp_plan.SAVED_RSTD_TWINS == {SAVED_RSTD_BASE: SAVED_RSTD_TWIN}
+    ships = arch in ("sm_100a", "sm_103a")
+    want = SAVED_RSTD_TWIN if ships else SAVED_RSTD_BASE
+    assert fresh(SAVED_RSTD_BASE) == want
+    for other in (SAVED_RSTD_TWIN, "bwd_prep_g8_noqg_l2n", "glm_intra_l2n"):
+        assert fresh(other) == other
+    if not ships:
+        return
+    entry = cake_jit.MODULES[SAVED_RSTD_TWIN]
+    others = [a for a in entry["arches"] if a != arch]
+    for change in (
+        {"l2n": ["off", "fused"]},
+        {"stage": "fwd_intra"},
+        {"arches": others},
+    ):
+        with monkeypatch.context() as m:
+            m.setitem(cake_jit.MODULES, SAVED_RSTD_TWIN, {**entry, **change})
+            assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_BASE, change
+    with monkeypatch.context() as m:
+        m.delitem(cake_jit.MODULES, SAVED_RSTD_TWIN)
+        assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_BASE
+    lib = cake_jit.library_name(SAVED_RSTD_TWIN, arch)
+    libs = {k: v for k, v in cake_build.libraries_by_name().items() if k != lib}
+    with monkeypatch.context() as m:
+        m.setattr(cake_build, "libraries_by_name", lambda: libs)
+        assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_BASE
+    assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_TWIN  # the registry and build restored
+
+
+@pytest.mark.parametrize("host_trim", (0, 1))
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_l2n_saved_read_launch_runs_the_twin(arch, host_trim, monkeypatch) -> None:
+    """:meth:`cake_kcp.KernelBackend._launch`: a launch that reads the saved rstd (``read_rstd = 1``) runs
+    :func:`cake_kcp_plan.saved_rstd_record` of its record, through the arena's launcher and through the trimmed host
+    path alike, and the call keeps ``(record, twin)`` for its launch record; ``read_rstd = 0``, no ``read_rstd`` and
+    any other record run as selected and keep nothing."""
+    launched: list = []
+
+    def launcher(record, values, *, grid, device_index) -> None:
+        launched.append(record)
+
+    if host_trim:
+        monkeypatch.setattr(
+            cake_kcp, "_launch_record_trim", lambda local, record, grid, values: launched.append(record)
+        )  # fmt: skip
+        # the arena's own launcher selects the trimmed path
+        launcher = cake_jit.run_module
+    twin = cake_kcp_plan.saved_rstd_record(SAVED_RSTD_BASE, arch)
+    assert (twin == SAVED_RSTD_TWIN) == (arch != "sm_107a")
+    cases = (
+        (SAVED_RSTD_BASE, {"read_rstd": 1}, twin),
+        (SAVED_RSTD_BASE, {"read_rstd": 0}, SAVED_RSTD_BASE),
+        (SAVED_RSTD_BASE, {}, SAVED_RSTD_BASE),
+        ("bwd_prep_g8_noqg_l2n", {"read_rstd": 1}, "bwd_prep_g8_noqg_l2n"),
+    )
+    for record, values, expect in cases:
+        local = types.SimpleNamespace(arch=arch, launcher=launcher, device_index=0)
+        call = types.SimpleNamespace(local=local, host_trim=host_trim, scratch={})
+        launched.clear()
+        cake_kcp.KernelBackend._launch(call, record, (1, 1, 1), values)
+        assert launched == [expect], (record, values)
+        kept = (record, expect) if expect != record else None
+        assert call.scratch.get("l2n_twin") == kept, (record, values)
 
 
 L2N_ROW_CASES = [c for c in LOCAL_RECORD_CASES if c[0] == 4]
@@ -2498,7 +2597,8 @@ def _skip_unless_runnable(W: int, *, gate: str | None = "g") -> None:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     if not _programs_exported():
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
-    if cake_jit.device_arch(torch.cuda.current_device()) not in cake_jit.ARCHES:
+    capability = torch.cuda.get_device_capability()
+    if cake_jit.arch_for_capability(capability) not in cake_jit.ARCHES:
         pytest.skip("the current device's architecture is not covered by the package")
 
 
@@ -2586,7 +2686,7 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
             )
             rec_b = dict(cake_kcp.LAST_CALL["bwd"])
             # as on the base of this change: a flag-off launch record carries no key of the mode
-            assert not {"l2n", "l2n_rstd"} & (set(rec_f) | set(rec_b)), tag
+            assert not {"l2n", "l2n_rstd", "l2n_twin"} & (set(rec_f) | set(rec_b)), tag
             got[tag] = {
                 "tensors": {"out": out, **dict(zip(TOKEN_GRADS, grads, strict=True))},
                 "record": {
@@ -2663,7 +2763,12 @@ def _gather(x: torch.Tensor, W: int) -> list:
 
 
 def _run_rank(
-    rank: int, W: int, row, port: int, result_dir: str | None, raw_gate: bool = False
+    rank: int,
+    W: int,
+    row,
+    rdzv: str | None,
+    result_dir: str | None,
+    raw_gate: bool = False,
 ) -> dict:
     """One rank: the flag-on KCP passes (both forms) and their bitwise flags, the saved rstd, the flag-off comparison of
     the collectives and stages, the retained bytes; gathered to rank 0 and compared with the single-rank flag-on path
@@ -2674,9 +2779,7 @@ def _run_rank(
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if W > 1 and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
@@ -2762,6 +2865,18 @@ def _run_rank(
     flags["first_reader_rstd"] = T == 0 or (
         tuple(rec_f["l2n_rstd"]) == (0, 1) and tuple(rec_b["l2n_rstd"]) == (1, 0)
     )
+    # the saved-mode backward ran the saved-rstd twin of its plan's prep exactly where one ships for the device (the
+    # call's local plan: its (T_r, n_frag, H) key on this device); the twin's bits are checked by saved_eq_replay
+    reported["saved_rstd_twin"] = rec_b.get("l2n_twin")
+    want_twin = None
+    if T > 0:
+        arch = cake_jit.device_arch(device.index)
+        prep = cake_backend.plan(
+            T, int(ctx.n_frag), H, cake_jit.sm_count(device.index), arch, gate=gate, l2n="fused"
+        ).record("bwd_prep", cake_kcp.LOCAL_PATH_BWD)  # fmt: skip
+        twin = cake_kcp_plan.saved_rstd_record(prep, arch)
+        want_twin = None if twin == prep else (prep, twin)
+    flags["saved_rstd_twin"] = rec_b.get("l2n_twin") == want_twin
     rep, saved_rep, _ = saved_pass()
     flags["rstd_repeat_bitwise"] = _bits_equal(saved_rep.qk_rstd, rstd)
     del saved_rep
@@ -2834,7 +2949,9 @@ def _run_rank(
         _local_stages(rec_b) == _local_stages(rec_bo)
     )
     # a flag-off launch record carries no key of the mode
-    flags["flag_off_records"] = not ({"l2n", "l2n_rstd"} & (set(rec_fo) | set(rec_bo)))
+    flags["flag_off_records"] = not (
+        {"l2n", "l2n_rstd", "l2n_twin"} & (set(rec_fo) | set(rec_bo))
+    )
     flags["zero_token_rank_no_stage"] = T > 0 or (
         rec_f["n_stages"] == 0 and rec_b["n_stages"] == 0
     )
@@ -2973,10 +3090,10 @@ def _run_rank(
 
 
 def _spawn_entry(
-    rank: int, W: int, row, port: int, result_dir: str, raw_gate: bool
+    rank: int, W: int, row, rdzv: str | None, result_dir: str, raw_gate: bool
 ) -> None:
     try:
-        report = _run_rank(rank, W, row, port, result_dir, raw_gate)
+        report = _run_rank(rank, W, row, rdzv, result_dir, raw_gate)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -2993,7 +3110,7 @@ def _drive(row, raw_gate: bool) -> None:
     if slurm and int(os.environ.get("SLURM_NTASKS", "1")) == W and W > 1:
         _skip_unless_runnable(1, gate=gate)
         report = _run_rank(
-            int(os.environ["SLURM_PROCID"]), W, row, int(os.environ.get("MASTER_PORT", "29500")),
+            int(os.environ["SLURM_PROCID"]), W, row, None,
             os.environ.get("KCP_TEST_RESULT_DIR"), raw_gate,
         )  # fmt: skip
         assert report["pass"], report
@@ -3001,7 +3118,7 @@ def _drive(row, raw_gate: bool) -> None:
     _skip_unless_runnable(W, gate=gate)
     if W == 1:
         report = _run_rank(
-            0, 1, row, 0, os.environ.get("KCP_TEST_RESULT_DIR"), raw_gate
+            0, 1, row, None, os.environ.get("KCP_TEST_RESULT_DIR"), raw_gate
         )
         assert report["pass"], report
         return
@@ -3009,7 +3126,7 @@ def _drive(row, raw_gate: bool) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_entry,
-            args=(W, row, _free_port(), result_dir, raw_gate),
+            args=(W, row, _rendezvous(tmp), result_dir, raw_gate),
             nprocs=W,
             join=True,
             start_method="spawn",

@@ -1285,3 +1285,53 @@ def test_l2n_refusals_on_device() -> None:
     ]
     with pytest.raises(ValueError, match="never copied"):
         _fwd(dict(inputs, q=bad_q))
+
+
+@pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
+@pytest.mark.parametrize("H", [16, 32])
+@pytest.mark.parametrize(
+    "lengths, batch_tokens",
+    [((100, 126, 50), 226), ((100, 128, 50), 228)],
+    ids=["overhang", "aligned"],
+)
+def test_l2n_batched_replay_reads_no_unwritten_row_of_the_next_group(
+    lengths, batch_tokens: int, H: int, raw_gate: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batched arena's replay with use_qk_l2norm_in_kernel=True on the serial route (H 32 on every
+    architecture, H 16 on sm_100a): the plain intra program of group 0 box-reads up to BT - 1 rows past the group
+    end of the per-call qn / kn (``"overhang"``: document 1 ends 62 rows into its last chunk), which group 1's
+    prep writes only later.  With every per-call float tensor and the arena filled with NaN, the replay before and
+    after a forward and a saved-set backward on the workspace gives finite gradients bitwise the per-call whole
+    problem's (``"aligned"``: the group ends on a chunk boundary, the control)."""
+    device = _l2n_device()
+    gate = "raw" if raw_gate else "g"
+    S, N = sum(lengths), len(lengths)
+    assert cake_backend.doc_batches(lengths, batch_tokens) == ((0, 2), (2, 3))
+    inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
+    ref = [t.clone() for t in _bwd(inputs, None, raw_gate)]
+    alloc = cake_backend._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = alloc(shape, dtype, dev)
+        if t.is_floating_point() and t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(cake_backend, "_alloc", nan_alloc)
+    arena = cake_backend.KdaDetArena(batch_tokens=batch_tokens)
+    for case in ("replay first", "replay after"):
+        ws = cake_backend.KdaDetWorkspace.for_problem(
+            S, N, H, device, arena=arena, doc_lengths=lengths, gate=gate, l2n="fused"
+        )
+        ws.arena.fill_(0xFF)
+        kw = {"workspace": ws, "doc_lengths": lengths}
+        runs = []
+        if case == "replay after":
+            _, saved = _fwd(inputs, raw_gate, **kw)
+            runs.append(("saved", _bwd(inputs, saved, raw_gate, **kw)))
+        runs.append((case, _bwd(inputs, None, raw_gate, **kw)))
+        for tag, got in runs:
+            for i, (a, b) in enumerate(zip(got, ref, strict=True)):
+                assert bool(torch.isfinite(a).all()), (H, gate, tag, i)
+                assert _bits(a).equal(_bits(b)), (H, gate, tag, i)
+        del ws
