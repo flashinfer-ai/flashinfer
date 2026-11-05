@@ -100,7 +100,9 @@ def test_work_table_covers_every_row(group_size, num_sms, kernel, pack):
             assert len(set(rows[:, 4].tolist())) == 1
             groups.add(int(rows[0, 4]))
             assert sorted(rows[:, 6].tolist()) == list(range(parts))
-            slots.update(rows[:, 7].tolist())
+            row_slots = set(rows[:, 7].tolist())
+            assert len(row_slots) == parts and not row_slots & slots
+            slots |= row_slots
     assert groups == set(range(len(groups)))
     assert slots == set(range(len(slots)))
     assert plan["split_counters"].numel() == max(1, len(groups))
@@ -335,7 +337,10 @@ def test_both_kernels_give_the_same_bits(dtype, num_sms, part, pack):
         block_mask, hq // hkv, num_sms, device, part=part, kernel=KERNELS[0], pack=pack
     )
     if pack:
-        assert table["total_work"] > hq * (m // R), "the packed plan cuts rows"
+        uniform = cake_vsa_sm120.plan_block_mask(
+            block_mask, hq // hkv, num_sms, device, kernel=KERNELS[0], pack=False
+        )
+        assert not torch.equal(table["work"], uniform["work"]), "the plan is packed"
     for kernel in KERNELS:
         ctas = 2 * num_sms // GROUPS[kernel]
         grid = (max(1, min(table["total_work"], ctas)), 1, 1)
@@ -349,6 +354,37 @@ def test_both_kernels_give_the_same_bits(dtype, num_sms, part, pack):
     ref_out, ref_lse = _reference(q, k, v, block_mask, 1.0 / math.sqrt(HEAD_DIM))
     torch.testing.assert_close(out_a.float(), ref_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse_a, ref_lse, atol=1e-2, rtol=1e-2)
+
+
+@requires_sm12x
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_packed_plan_of_each_kernel(dtype, kernel):
+    """Each kernel's own packed plan (its pieces sized by that kernel's item
+    cost) on the device's SMs: within the FP32 reference's tolerance."""
+    device = torch.device("cuda")
+    generator = torch.Generator().manual_seed(13)
+    hq, hkv, m, n = 8, 2, 1024, 4096
+    q = torch.randn(m, hq, HEAD_DIM, generator=generator).to(dtype).to(device)
+    k = torch.randn(n, hkv, HEAD_DIM, generator=generator).to(dtype).to(device)
+    v = torch.randn(n, hkv, HEAD_DIM, generator=generator).to(dtype).to(device)
+    block_mask = _ragged_mask(hq, m // R, n // C, generator, device)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    plans = [
+        cake_vsa_sm120.plan_block_mask(
+            block_mask, hq // hkv, num_sms, device, kernel=kernel, pack=pack
+        )
+        for pack in (True, False)
+    ]
+    assert plans[0]["kernel"] == kernel
+    assert not torch.equal(plans[0]["work"], plans[1]["work"]), "the plan is packed"
+    out, lse = cake_vsa_sm120.run(plans[0], q, k, v, None, None, None, True)
+    assert torch.equal(
+        plans[0]["split_counters"], torch.zeros_like(plans[0]["split_counters"])
+    )
+    ref_out, ref_lse = _reference(q, k, v, block_mask, 1.0 / math.sqrt(HEAD_DIM))
+    torch.testing.assert_close(out.float(), ref_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=1e-2)
 
 
 @requires_sm12x
