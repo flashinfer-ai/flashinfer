@@ -123,8 +123,10 @@ DeepGEMM arms run one logits call and one top-k call per segment and are
 reported unavailable where ``deep_gemm`` does not import or the call fails.
 Timing boundary: a Cake arm's span is the complete operator (scan, merge,
 finalize into caller-owned outputs and workspace); a DeepGEMM arm's span is
-its logits allocation and kernel (and a contiguous copy of row-padded logits,
-recorded as ``logits_copied``) plus its top-k kernel per segment, and the
+its logits allocation and kernel plus its top-k kernel per segment (the
+``deepgemm_topk`` arm also copies the row-padded logits to contiguous rows for
+``flashinfer.top_k``, recorded as ``logits_copied``; the ragged arm reads the
+padded rows in place), and the
 conversion of their output to the contract's ascending segment-local ids
 with aligned scores and ``-1`` / ``-inf`` padding (the score gather of the
 ragged arm included) is outside it.  ``same_bits`` / ``all_cake_arms_identical``
@@ -766,6 +768,10 @@ class Arm:
         """The contract's ``(indices, scores)`` of one timed call's output (outside the timed span)."""
         return out
 
+    def outputs(self, out):
+        """The tensors of one timed call's output that are the arm's results (``peak_extra_bytes`` counts the rest)."""
+        return out
+
 
 def row_extra(inputs) -> dict:
     """Backend keywords a row adds beyond ``inputs.kwargs()`` (``max_seqlen_k`` for the bounded sink rows)."""
@@ -998,6 +1004,14 @@ class DeepGemmArm(Arm):
         values, ids = first, second.to(torch.int64)
         return ids, values, ids < seg["ends"].unsqueeze(1).to(torch.int64)
 
+    def outputs(self, out):
+        """The top-k results of every segment, each tensor once; the logits are the arm's working memory."""
+        unique = {}
+        for i in range(0, len(out), 3):
+            for t in out[i + 1 : i + 3]:
+                unique.setdefault(t.data_ptr(), t)
+        return list(unique.values())
+
     def finish(self, out):
         inputs = self.inputs
         T, K, dev = inputs.num_queries, inputs.top_k, inputs.device
@@ -1020,10 +1034,28 @@ class DeepGemmRaggedArm(DeepGemmArm):
     name = "deepgemm_ragged_topk"
     clean_logits = False
 
+    def _segment_logits(self, seg):
+        """The logits buffer as DeepGEMM allocated it: ``top_k_ragged_transform`` reads ``[0, ends)`` of each row of a
+        contiguous ``(Lq, row_stride)`` input, so the row-padded buffer serves it without a copy."""
+        logits = self.logits(
+            seg["q"],
+            seg["kv"],
+            seg["w"],
+            seg["starts"],
+            seg["ends"],
+            clean_logits=self.clean_logits,
+        )
+        lq, stride = logits.shape[0], logits.stride(0)
+        needed = (logits.storage_offset() + lq * stride) * logits.element_size()
+        if logits.stride(1) == 1 and logits.untyped_storage().nbytes() >= needed:
+            return logits.as_strided((lq, stride), (stride, 1))
+        self.logits_copied = True
+        return logits[:, : seg["lk"]].contiguous()
+
     def _segment_topk(self, seg, logits):
         ids = flashinfer.top_k_ragged_transform(
             logits,
-            torch.zeros_like(seg["ends"]),
+            seg["starts"],
             seg["ends"],
             self.inputs.top_k,
             deterministic=True,
@@ -1138,7 +1170,8 @@ DEFAULT_ARMS = {
 TIMING_BOUNDARY = (
     "cake arms: the complete operator (scan, merge, finalize) of a prepared runner into caller-owned outputs and "
     "workspace; deepgemm arms: per segment the fp8_mqa_logits call (its logits allocation included, and a contiguous "
-    "copy of row-padded logits where an arm records logits_copied) and the top-k call, without the conversion of their "
+    "copy of row-padded logits where an arm records logits_copied: the dense top-k arm; the ragged arm reads the padded "
+    "rows in place) and the top-k call, without the conversion of their "
     "output to ascending segment-local ids with aligned scores and padding; "
     "CUPTI GPU span of every launched kernel per iteration, cold L2"
 )
@@ -1226,7 +1259,7 @@ def peak_extra_bytes(fn):
     out = fn()
     torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - base
-    return extra - sum(t.numel() * t.element_size() for t in out)
+    return extra - sum(t.numel() * t.element_size() for t in fn.outputs(out))
 
 
 def measure_row(name, inputs, arms, args, bf16_inputs=None):
@@ -1446,6 +1479,10 @@ def main():
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
     fp8 = args.form == "fp8"
+    if fp8 and args.strided_k:
+        raise SystemExit(
+            "--strided-k measures the BF16 rows: the FP8 mode's BF16 and DeepGEMM arms take contiguous keys"
+        )
     if args.rows is None:
         args.rows = FP8_ROWS if fp8 else DEFAULT_ROWS
     if args.arms is None:
