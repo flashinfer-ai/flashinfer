@@ -1767,19 +1767,19 @@ def _fake_registry(
 
 def test_l2n_capability_check() -> None:
     """:func:`cake_kcp_plan.qk_l2norm_missing` (form, gate, arch): rank-independent inputs only (no context, no token
-    count, no plan).  It selects through the existing backend's ``select_record(..., l2n=form)`` (and ``gate=`` in
-    the raw gate mode) every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` of the form on the route's two local
-    paths (this package's fused gradient ``dqkg`` among them), over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at each SM count of the architecture
-    (:data:`cake_kcp_plan.QK_L2NORM_SMS`; every exported architecture for ``None``), each problem once; the grid
-    holds both document regimes (at most and above 256) on both recurrence routes (segmented and serial) on every
-    architecture.  A reason while the existing backend's entry points lack ``use_qk_l2norm_in_kernel``, its plan or
-    layout table lacks ``l2n`` or the mode, its selection takes no ``l2n`` (the base of this change) or no ``gate``
-    in the raw gate mode, a stage selects nothing (``ValueError`` or ``None``) for any problem of the grid -- also
-    one only above or at most 256 documents, or on one architecture --, selects a record not delivered or not
-    exported for the architecture, the fused form's readers do not give exactly one normalizing first reader on
-    each path (the fallback form's none), or a layout of the route lacks the ``qn_int`` / ``kn_int`` views (named
-    in the reason); ``None`` once all hold.  The signature reads are cached per callable (a passed check is kept:
-    :func:`test_l2n_capability_check_is_kept`)."""
+    count, no plan).  It selects through the existing backend's ``select_record(..., l2n=form)`` (and ``gate=`` in the
+    raw gate mode) every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` of the form on the route's two local paths
+    (this package's fused gradient ``dqkg`` among them), over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at
+    each SM count of the architecture (:data:`cake_kcp_plan.QK_L2NORM_SMS`; every exported architecture for ``None``),
+    each problem once; the grid holds both document regimes (at most and above 256) on both recurrence routes (segmented
+    and serial) on every architecture.  A reason while the existing backend's entry points lack
+    ``use_qk_l2norm_in_kernel``, its plan or layout table lacks ``l2n`` or the mode, its selection takes no ``l2n`` (the
+    base of this change) or no ``gate`` in the raw gate mode, a stage selects nothing (``ValueError`` or ``None``) for
+    any problem of the grid -- also one only above or at most 256 documents, or on one architecture --, selects a record
+    not delivered or not exported for the architecture, the fused form's readers do not give exactly one normalizing
+    first reader on each path (the fallback form's none), or a layout of the route lacks the ``qn_int`` / ``kn_int``
+    views (named in the reason); ``None`` once all hold.  The signature reads are cached per callable (a passed check is
+    kept: :func:`test_l2n_capability_check_is_kept`)."""
     assert list(inspect.signature(cake_kcp_plan.qk_l2norm_missing).parameters) == [
         "mode",
         "gate",
@@ -1876,7 +1876,11 @@ def test_l2n_capability_check() -> None:
         ),
         ({"pick": _pick_but(lambda s, p, *k: s == "qk_l2norm" and p == F, bad)}, "fallback", f"qk_l2norm on {F}"),
         # a twin with a version suffix (the registry's l2n key decides, not the name)
-        ({"pick": _pick_but(lambda s, p, m, *k: s == "fwd_intra" and p == F and m == "fused", "fwd_intra_l2n_v37")}, None, None),
+        (
+            {"pick": _pick_but(lambda s, p, m, *k: s == "fwd_intra" and p == F and m == "fused", "fwd_intra_l2n_v37")},
+            None,
+            None,
+        ),
         # the fused form's first readers: both / neither on the replay, a plain forward intra program
         (
             {"pick": _pick_but(lambda s, p, m, *k: s == "bwd_prep" and m == "fused", "bwd_prep_g8_replay_l2n")},
@@ -3060,7 +3064,8 @@ def _l2n_inputs(
 ) -> dict:
     """``make_inputs``' operands with raw q / k: its L2-normalized rows times ``2^e`` per (token, head), ``e`` uniform
     in ``[-6, 6]``, about 1/64 of the rows zero (rstd ``1 / sqrt(1e-6)``) or subnormal (the normalized row times
-    ``2^-126``).  ``raw_gate``: ``g`` is a raw BF16 gate with ``A_log`` FP32 ``[H]`` and ``dt_bias`` FP32 ``[H * 128]``."""
+    ``2^-126``).  ``raw_gate``: ``g`` is a raw BF16 gate with ``A_log`` FP32 ``[H]`` and ``dt_bias`` FP32
+    ``[H * 128]``."""
     glob = make_inputs(lengths, H, device, seed=seed)
     S = int(glob["q"].shape[0])
     gen = torch.Generator(device="cpu")

@@ -139,7 +139,8 @@ from the deterministic arm's by an FP32 ulp: the step records their largest
 distance in FP32 values over the ranks (``param_max_ulp``) and does not gate on
 it (the test suite holds them to the R1c bound).  The checkpoint hand-off
 never engages in this mode (with ``nd_off`` or ``--ckpt-handoff on`` the
-``ckpt`` comparison expects no engagement), and the workspace bytes are those
+``ckpt`` comparison expects no engagement; the hand-off byte figures
+``saved_handoff`` / ``handoff`` are ``None``), and the workspace bytes are those
 of the raw mode (with the FP64 accumulators of an ``R1c`` rank).
 
 In-kernel Q/K L2 norm (``--l2n``, in either ``--gate`` mode): ``q`` / ``k`` of
@@ -153,7 +154,8 @@ flash-linear-attention's ``chunk_kda(use_qk_l2norm_in_kernel=True, ...)``.
 This package's in-kernel-norm mode runs the deterministic programs in the same
 order, so the agreement step requires every result to have the deterministic
 arm's bit pattern, ``dg`` included.  The checkpoint hand-off never engages in
-this mode, and the workspace and saved-set bytes are those of the mode.
+this mode (the hand-off byte figures are ``None``), and the workspace and
+saved-set bytes are those of the mode.
 
 Build order (``--build-order``: ``det-first``, the default, or ``nd-first``): the arm
 of the two built first builds its context first, runs its first call (the
@@ -1166,6 +1168,8 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     raw = args.gate == "raw"
     # the gate and in-kernel Q/K L2 norm modes of the workspace and saved-set queries
     modes = {"use_gate_in_kernel": raw, "use_qk_l2norm_in_kernel": args.l2n}
+    # the checkpoint hand-off engages in neither mode: no hand-off figures there
+    handoff_mode = not (raw or args.l2n)
     ctx_det, ctx_nd = problem["ctx"]["det"], problem["ctx"]["nd"]
     nbytes = {
         "det": {
@@ -1180,10 +1184,18 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "saved": kda_saved_bytes_kcp(
                 ctx_nd, H=H, C=C, deterministic=False, **modes
             ),
-            "saved_handoff": kda_saved_bytes_kcp(
-                ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
+            "saved_handoff": (
+                kda_saved_bytes_kcp(
+                    ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
+                )
+                if handoff_mode
+                else None
             ),
-            "handoff": kda_handoff_bytes_kcp(ctx_nd, H=H, deterministic=False),
+            "handoff": (
+                kda_handoff_bytes_kcp(ctx_nd, H=H, deterministic=False)
+                if handoff_mode
+                else None
+            ),
             "comm": kda_comm_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
         },
     }

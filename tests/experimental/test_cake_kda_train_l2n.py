@@ -1345,9 +1345,10 @@ def test_l2n_launch_sequences_are_the_deterministic_l2n(
     by their deterministic names) with the same grids and l2n scalars (``num_tokens``, ``read_rstd``,
     ``write_rstd``, ``write_qkn``); each list has the plan's launch count, launches the l2n records of the mode
     (the first q / k reader and the GLM intra program of the class) and no S1 record, hand-off twin or gate
-    epilogue; the tape backward with the tape WY twin's rule gives the same bits."""
+    epilogue; the tape backward with the tape WY twin's rule and with the twin forced (launched wherever the tape plan
+    has one, on some row at least) gives the same bits."""
     device = _l2n_device(mode)
-    launches = 0
+    launches = twins = 0
     for lengths, heads in L2N_LAUNCH_ROWS:
         S, N = sum(lengths), len(lengths)
         inputs = _l2n_inputs(lengths, heads, device, gate)
@@ -1451,8 +1452,24 @@ def test_l2n_launch_sequences_are_the_deterministic_l2n(
             heads,
             "tape wy rule",
         )
-        assert count.n == 4 * len(_names(gate))
-    assert launches > 0
+        # the twin forced (the device, build and load checks skipped): the same bits from the twin's w
+        twin = tape_ws.plan.tape_wy_twin
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", True)
+        count.grads(
+            _bwd(inputs, saved_t, gate, workspace=tape_ws), ref, gate, "tape wy twin"
+        )
+        names = [n for n, *_ in nd_log]
+        nd_log.clear()
+        assert [_det_name(n) for n in names] == [_det_name(n) for n in seq], (
+            lengths,
+            heads,
+            "tape wy twin",
+        )
+        assert (twin in names) == (twin is not None), (lengths, heads, twin, names)
+        twins += twin is not None
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", None)
+        assert count.n == 5 * len(_names(gate))
+    assert launches > 0 and twins > 0
 
 
 @pytest.mark.parametrize("mode", L2N_ON)

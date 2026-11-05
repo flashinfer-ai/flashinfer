@@ -3178,16 +3178,16 @@ def local_tail_count_words(arena_bytes: int, H: int) -> int:
 # given rstd) before the first reader, the plain records, the GLM intra program's capture form and a separate pullback
 # (``qk_pullback``) after it.  The KCP programs, the collectives and their bytes do not change.
 # The route needs, for every problem, a record of the mode's class on each of its stages: the existing backend's
-# ``cake_jit.select_record(..., l2n=mode)`` (a stage of its ``L2N_STAGES`` selects among the records whose ``l2n``
-# modes hold the mode) for the stages of :data:`QK_L2NORM_STAGES` on the route's two local paths (the forward's
+# ``cake_jit.select_record(..., l2n=mode)`` (a stage of its ``L2N_STAGES`` selects among the records whose ``l2n`` modes
+# hold the mode) for the stages of :data:`QK_L2NORM_STAGES` on the route's two local paths (the forward's
 # ``fwd_nosave``, the backward's ``replay``): the deterministic package's stages and this package's fused gradient
-# (``dqkg``, an l2n stage of its registry, whose ``dqkg_*_l2n`` class the mode selects); in the fused form the forward's intra program normalizes and on the
-# replay exactly one first q / k reader does, the intra program or the prep, as the existing order of the problem
-# gives (:func:`qk_l2norm_intra_first`; in the fallback form none of them does).  The check selects over the
-# fixed grid :data:`QK_L2NORM_GRID` x :data:`QK_L2NORM_SMS` (no rank's tokens: at most and above the intra programs'
-# 256-document switch, head counts of both recurrence routes, one and sixteen chunks per document, SM counts of the
-# architecture's devices), and every selected record must be delivered for the architecture and exported there.  Until
-# all hold, every call, workspace and byte query with the flag on raises ``NotImplementedError``
+# (``dqkg``, an l2n stage of its registry, whose ``dqkg_*_l2n`` class the mode selects); in the fused form the forward's
+# intra program normalizes and on the replay exactly one first q / k reader does, the intra program or the prep, as the
+# existing order of the problem gives (:func:`qk_l2norm_intra_first`; in the fallback form none of them does).  The
+# check selects over the fixed grid :data:`QK_L2NORM_GRID` x :data:`QK_L2NORM_SMS` (no rank's tokens: at most and above
+# the intra programs' 256-document switch, head counts of both recurrence routes, one and sixteen chunks per document,
+# SM counts of the architecture's devices), and every selected record must be delivered for the architecture and
+# exported there.  Until all hold, every call, workspace and byte query with the flag on raises ``NotImplementedError``
 # (:data:`QK_L2NORM_PENDING`) before any workspace build, plan or collective, decided from rank-independent inputs only
 # (:func:`qk_l2norm_missing`, :func:`require_qk_l2norm`), so every rank -- one without tokens too -- raises the same
 # error.
@@ -3571,12 +3571,12 @@ def kda_workspace_bytes_kcp(
     (``WorkspaceKcp(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
     layout carries no gate epilogue buffers on any architecture) and is the replay arena (``local_arena="lean"`` is
     refused in this mode, as by the workspace); the pools do not depend on it.  ``use_qk_l2norm_in_kernel``: the
-    workspace's in-kernel Q / K L2 norm mode (``WorkspaceKcp(use_qk_l2norm_in_kernel=True)``, issue #7817): the
-    local arena is planned in the form of the flag (``l2n="fused"``, :func:`qk_l2norm_plan_kwargs`: on sm_100a a backward
-    layout without the gate epilogue's buffers) and is the replay arena (``local_arena="lean"`` is refused in this
-    mode, as by the workspace); the pools do not depend on it.  The mode's per-call tensors (the backward's normalized
-    q / k, the rstd of a call without a saved set) are not workspace bytes.  While the single-rank programs of the
-    mode are absent it raises ``NotImplementedError`` before any plan, as the workspace does (:func:`require_qk_l2norm`)."""
+    workspace's in-kernel Q / K L2 norm mode (``WorkspaceKcp(use_qk_l2norm_in_kernel=True)``, issue #7817): the local
+    arena is planned in the form of the flag (``l2n="fused"``, :func:`qk_l2norm_plan_kwargs`: on sm_100a a backward
+    layout without the gate epilogue's buffers) and is the replay arena (``local_arena="lean"`` is refused in this mode,
+    as by the workspace); the pools do not depend on it.  The mode's per-call tensors (the backward's normalized q / k,
+    the rstd of a call without a saved set) are not workspace bytes.  While the single-rank programs of the mode are
+    absent it raises ``NotImplementedError`` before any plan, as the workspace does (:func:`require_qk_l2norm`)."""
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
     if not isinstance(use_gate_in_kernel, bool):

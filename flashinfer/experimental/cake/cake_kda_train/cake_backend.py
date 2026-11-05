@@ -1709,11 +1709,11 @@ def _lean_slots(
 
 # The layouts another route registers on this module's arenas (:func:`_register_route_slots`): mode -> its slots at
 # ``(tail_passes, R, H, NC, NSEG, gate_fused)`` (the context-parallel route's lean backward layout,
-# ``cake_kda_train_kcp.cake_kcp_plan``), with ``l2n`` as a seventh argument in an in-kernel Q/K L2 norm mode
-# only, so a route that serves no l2n mode keeps the six-argument form.  This module registers none and runs none; a registered mode is never one
-# of its own (:data:`MODES`, :data:`LEAN_MODES`, :data:`FWD_LAYOUTS`), so their layouts and bytes do not depend on the
-# registry.  A mode keeps the one function it was registered with, so the cached :func:`_layout` of a registered
-# mode never changes (a mode looked up before its registration raised, which is not cached).
+# ``cake_kda_train_kcp.cake_kcp_plan``), with ``l2n`` as a seventh argument in an in-kernel Q/K L2 norm mode only, so a
+# route that serves no l2n mode keeps the six-argument form.  This module registers none and runs none; a registered
+# mode is never one of its own (:data:`MODES`, :data:`LEAN_MODES`, :data:`FWD_LAYOUTS`), so their layouts and bytes do
+# not depend on the registry.  A mode keeps the one function it was registered with, so the cached :func:`_layout` of a
+# registered mode never changes (a mode looked up before its registration raised, which is not cached).
 _RouteSlots = Callable[..., tuple[tuple[Occupant, ...], ...]]
 _ROUTE_SLOTS: dict[str, _RouteSlots] = {}
 
@@ -1800,9 +1800,9 @@ _L2N_PULLBACK_BUFFERS = ("dq_f", "dk_f")
 def _l2n_slots(
     slots: tuple[tuple[Occupant, ...], ...], mode: str, l2n: str
 ) -> tuple[tuple[Occupant, ...], ...]:
-    """``slots`` of layout ``mode`` under the in-kernel Q/K L2 norm mode ``l2n``: the forward and replay layouts
-    gain ``qn_int`` / ``kn_int`` on the ``u`` / ``w`` slots (lifetime ``(0, 1)``); in ``"fallback"`` the backward's ``dq_f`` / ``dk_f``
-    live until the pullback (``(6, 8)``).  ``"off"`` returns ``slots`` unchanged."""
+    """``slots`` of layout ``mode`` under the in-kernel Q/K L2 norm mode ``l2n``: the forward and replay layouts gain
+    ``qn_int`` / ``kn_int`` on the ``u`` / ``w`` slots (lifetime ``(0, 1)``); in ``"fallback"`` the backward's
+    ``dq_f`` / ``dk_f`` live until the pullback (``(6, 8)``).  ``"off"`` returns ``slots`` unchanged."""
     if l2n == "off":
         return slots
     out: list[tuple[Occupant, ...]] = []
@@ -2053,10 +2053,9 @@ def workspace_bytes(
     :func:`_r1c_stripes`) also holds the FP64 accumulators ``param_acc`` outside the arena
     (:attr:`KdaWorkspace.param_acc_bytes`), which this query adds: it is :attr:`KdaWorkspace.bytes` (the arena) +
     :attr:`KdaWorkspace.param_acc_bytes`.  The outputs, the saved set and the deterministic pair's per-call parameter
-    partials are allocated per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`.  ``l2n`` is the in-kernel Q/K
-    L2 norm mode (:attr:`Plan.l2n`): any mode but ``"off"`` drops ``dg_int`` / ``db_int`` on every
-    architecture and puts the transient ``qn`` / ``kn`` on the forward layout's ``u`` / ``w`` slots (the same
-    bytes)."""
+    partials are allocated per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`.  ``l2n`` is the
+    in-kernel Q/K L2 norm mode (:attr:`Plan.l2n`): any mode but ``"off"`` drops ``dg_int`` / ``db_int`` on every
+    architecture and puts the transient ``qn`` / ``kn`` on the forward layout's ``u`` / ``w`` slots (the same bytes)."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"workspace_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"

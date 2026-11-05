@@ -49,15 +49,15 @@ device, architecture, SM count, torch, CUDA and flash-linear-attention versions
 ``det2`` is the deterministic arm again, the row's A/A arm (as the
 context-parallel benchmark's ``control``): the same programs and calls on the
 deterministic arm's workspace, built after the two Cake arms (its saved set is
-its own), timed after ``nd`` in every round (``det``, ``nd``, ``det2``,
-``fla``, then reversed).  Per boundary the row reports ``det2 / det``
+its own), timed in every round in the order ``det``, ``nd``, ``det2``, ``fla``,
+reversed on every other round.  Per boundary the row reports ``det2 / det``
 (``ratio_det2_over_det``), the A/A band ``[1 - w, 1 + w]`` (``aa_band``; ``w``
 is the largest ``|det2 / det - 1|`` over the rounds' medians and the row's
 medians) and whether ``det / nd`` lies outside it (``det_over_nd_beyond_aa``):
 a ``det / nd`` difference inside the band is within the protocol's own noise.
 With ``--build-order both`` the row's band covers both orders' bands and the
-``det2 / det`` of the means.  With ``--arms-alone`` the arm runs alone like the others, on a workspace of
-its own.
+``det2 / det`` of the means.  With ``--arms-alone`` the arm runs alone like the
+others, on a workspace of its own.
 
 ``--gate`` selects the forget gate's form per row: ``g`` (the default) the
 activated FP32 gate the caller passes, ``raw`` the raw gate mode
