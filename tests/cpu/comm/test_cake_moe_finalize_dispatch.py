@@ -218,7 +218,9 @@ def _program_table(binding: str, name: str) -> list[str | None]:
         ("kLargeTokenKernels", "_lt", (2,)),
         ("kTwoShotKernels", "_ts", (4, 8)),
         ("kTwoShotDeferKernels", "_tsd", (4, 8)),
+        ("kTwoShotDeferSharedKernels", "_tsds", (4,)),
         ("kTwoShotEarlyKernels", "_tse", (4, 8)),
+        ("kW2QuadKernels", "_quad", (2,)),
     ],
 )
 def test_program_tables_list_one_program_kind(
@@ -255,7 +257,9 @@ def test_program_tables_cover_the_module_records() -> None:
             "kLargeTokenKernels",
             "kTwoShotKernels",
             "kTwoShotDeferKernels",
+            "kTwoShotDeferSharedKernels",
             "kTwoShotEarlyKernels",
+            "kW2QuadKernels",
         )
         for kernel in _program_table(binding, table)
         if kernel is not None
@@ -394,8 +398,10 @@ def test_two_shot_early_program_runs_up_to_128_tokens(world_size: int) -> None:
         r"\} else if \((two_shot != nullptr && world_size == 8)\) \{", binding
     )
     assert early_now is not None and first is not None and above_small is not None
-    two_shot_kernel = "kernel = two_shot_deferred ? two_shot_defer : two_shot_now;"
-    assert binding.count(two_shot_kernel) == 2
+    two_shot_kernel = re.findall(
+        r"kernel = two_shot_deferred \? .*? : two_shot_now;", binding
+    )
+    assert len(two_shot_kernel) == 2
     _, branch_expression = _small_token_test(binding)
     codes = {
         name: compile(_as_python(expression), name, "eval")
@@ -433,3 +439,234 @@ def test_two_shot_early_program_runs_up_to_128_tokens(world_size: int) -> None:
     assert program(129) == "_ts"
     assert program(16) == "_small"
     assert program(17) == ("_tse" if world_size == 8 else "persistent")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_world_size_2_quad_program_runs_up_to_142_tokens(small_token_max: int) -> None:
+    """At world size 2, a batch the small-token program does not take runs the quad
+    program up to 142 tokens and the persistent program from 143 tokens, below the
+    large-token program's range; the choice reads the token count and the world size
+    alone. World sizes 4 and 8 have no quad program."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (k\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kW2QuadMaxTokens"] == 142
+    quad = re.search(
+        r"\} else if \((w2_quad != nullptr && tokens <= kW2QuadMaxTokens)\) \{", binding
+    )
+    large = re.search(
+        r"\} else if \((large_token != nullptr &&.*?)\) \{", binding, re.S
+    )
+    assert quad is not None and large is not None
+    # The quad test follows the large-token test and precedes the persistent default.
+    assert large.start() < quad.start()
+    assert re.search(
+        r"kernel = w2_quad;\s*\} else \{\s*kernel = kKernels\[", binding[quad.start() :]
+    )
+    _, branch_expression = _small_token_test(binding)
+    shared_choice = re.compile(r"\(v_has_shared_expert != 0 \? (\w+) : (\w+)\)")
+    codes = {
+        name: compile(
+            _as_python(
+                shared_choice.sub(
+                    r"(\1 if v_has_shared_expert != 0 else \2)",
+                    " ".join(expression.split()),
+                )
+            ),
+            name,
+            "eval",
+        )
+        for name, expression in (
+            ("quad", quad.group(1)),
+            ("large_token", large.group(1)),
+            ("small_token", branch_expression),
+        )
+    }
+
+    def program(world_size: int, tokens: int, top_k: int, use_shared: bool) -> str:
+        scope: dict[str, object] = {
+            **constants,
+            "world_size": world_size,
+            "top_k": top_k,
+            "v_has_shared_expert": int(use_shared),
+            "tokens": tokens,
+            "small_token_max": small_token_max,
+            "small_token_extended": world_size == 4
+            or (world_size == 2 and (top_k != 4 or use_shared)),
+            "capacity": 71,
+            "large_token": "_lt" if world_size == 2 else None,
+            "w2_quad": "_quad" if world_size == 2 else None,
+        }
+        if eval(codes["small_token"], {"__builtins__": {}}, scope):
+            return "_small"
+        if eval(codes["large_token"], {"__builtins__": {}}, scope):
+            return "_lt"
+        if eval(codes["quad"], {"__builtins__": {}}, scope):
+            return "_quad"
+        return "persistent"
+
+    for top_k in (4, 8):
+        for use_shared in (False, True):
+            extended = top_k != 4 or use_shared
+            for tokens in (64, 65, 71, 72):
+                expected = (
+                    "_small"
+                    if tokens <= small_token_max or (extended and tokens <= 71)
+                    else "_quad"
+                )
+                assert program(2, tokens, top_k, use_shared) == expected, (
+                    top_k,
+                    use_shared,
+                    tokens,
+                )
+            assert program(2, 141, top_k, use_shared) == "_quad"
+            assert program(2, 142, top_k, use_shared) == "_quad"
+            assert program(2, 143, top_k, use_shared) == "persistent"
+            assert program(2, small_token_max + 1, top_k, use_shared) == (
+                "_small" if extended and small_token_max < 71 else "_quad"
+            )
+            for world_size in (4, 8):
+                assert program(world_size, 100, top_k, use_shared) != "_quad"
+
+
+def _two_shot_select(binding: str) -> str:
+    """The binding's choice among the deferred two-shot programs and two_shot_now, at
+    both two-shot call sites, as a Python expression."""
+    selects = re.findall(r"kernel = (two_shot_deferred \? .*?);", binding)
+    assert len(selects) == 2 and selects[0] == selects[1], selects
+    select = re.fullmatch(
+        r"two_shot_deferred \? \(\((.*)\) \? (\w+) : (\w+)\) : (\w+)", selects[0]
+    )
+    assert select is not None, selects[0]
+    shared, shared_program, defer_program, now = select.groups()
+    assert (shared_program, defer_program, now) == (
+        "defer_shared",
+        "two_shot_defer",
+        "two_shot_now",
+    )
+    return (
+        f"(({shared_program} if ({_as_python(shared)}) else {defer_program})"
+        f" if two_shot_deferred else {now})"
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_world_size_4_shared_expert_runs_the_deferred_shared_program(
+    small_token_max: int,
+) -> None:
+    """At world size 4, from kTwoShotDeferMinTokensWorldSize4 (1536) tokens, a rank with
+    a shared expert runs the deferred program that also prefetches the shared-expert row
+    (_tsds) and a rank without one the deferred program (_tsd); below 1536 tokens the
+    shared expert changes nothing. Whether a call runs a deferred form reads the token
+    count and the world size alone at world size 4, so ranks with and without a shared
+    expert run forms of the same exchange. World sizes 2 and 8 choose as before."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (k\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kTwoShotDeferMinTokensWorldSize4"] == 1536
+    assert constants["kTwoShotDeferMinTokensWorldSize8"] == 768
+    expressions = {
+        name: re.search(rf"const (?:bool|void\*) {name} =\s*([^;]+);", binding)
+        for name in ("defer_excluded", "two_shot_deferred", "two_shot_now")
+    }
+    first = re.search(r"if \((two_shot != nullptr &&.*?)\) \{", binding, re.S)
+    above_small = re.search(
+        r"\} else if \((two_shot != nullptr && world_size == 8)\) \{", binding
+    )
+    assert first is not None and above_small is not None
+    assert all(match is not None for match in expressions.values())
+    _, branch_expression = _small_token_test(binding)
+    sources = {name: match.group(1) for name, match in expressions.items()}
+    sources.update(
+        two_shot_first=first.group(1),
+        two_shot_above_small=above_small.group(1),
+        small_token=branch_expression,
+    )
+    codes = {
+        name: compile(re.sub(r"!(?!=)", "not ", _as_python(source)), name, "eval")
+        for name, source in sources.items()
+    }
+    select = compile(_two_shot_select(binding), "two_shot_select", "eval")
+
+    def program(
+        world_size: int, tokens: int, top_k: int, use_shared: bool, quantize: bool
+    ) -> str:
+        two_shot_world = world_size in (4, 8)
+        scope: dict[str, object] = {
+            **constants,
+            "world_size": world_size,
+            "top_k": top_k,
+            "v_has_shared_expert": int(use_shared),
+            "quantize": quantize,
+            "tokens": tokens,
+            "small_token_max": small_token_max,
+            "small_token_extended": world_size == 4
+            or (world_size == 2 and (top_k != 4 or use_shared)),
+            "capacity": 71,
+            "two_shot": "_ts" if two_shot_world else None,
+            "two_shot_defer": "_tsd" if two_shot_world else None,
+            "defer_shared": "_tsds" if world_size == 4 else None,
+            "two_shot_early": "_tse" if two_shot_world else None,
+        }
+        for name in ("defer_excluded", "two_shot_deferred", "two_shot_now"):
+            scope[name] = eval(codes[name], {"__builtins__": {}}, scope)
+        if eval(codes["two_shot_first"], {"__builtins__": {}}, scope):
+            return eval(select, {"__builtins__": {}}, scope)
+        if eval(codes["small_token"], {"__builtins__": {}}, scope):
+            return "_small"
+        if eval(codes["two_shot_above_small"], {"__builtins__": {}}, scope):
+            return eval(select, {"__builtins__": {}}, scope)
+        return "one_shot"
+
+    for top_k in (4, 8):
+        for quantize in (False, True):
+            for use_shared in (False, True):
+                for tokens in (1535, 1536, 1537, 2048, 4096):
+                    deferred = "_tsds" if use_shared else "_tsd"
+                    assert program(4, tokens, top_k, use_shared, quantize) == (
+                        deferred if tokens >= 1536 else "_ts"
+                    ), (tokens, top_k, use_shared, quantize)
+                for tokens in (72, 128):
+                    assert program(4, tokens, top_k, use_shared, quantize) == "_tse"
+                for tokens in (767, 768, 1536, 2048):
+                    excluded = top_k == 4 and not use_shared and not quantize
+                    assert program(8, tokens, top_k, use_shared, quantize) == (
+                        "_tsd" if tokens >= 768 and not excluded else "_ts"
+                    ), (tokens, top_k, use_shared, quantize)
+                for tokens in (1535, 1536, 2048):
+                    assert program(2, tokens, top_k, use_shared, quantize) not in (
+                        "_ts",
+                        "_tsd",
+                        "_tsds",
+                        "_tse",
+                    )
+            # Mixed shared-expert presence among the four ranks of one call.
+            for present in ({0}, {0, 1}, {2, 3}, {1, 2, 3}, {0, 2}):
+                for tokens in (1535, 1536, 2048):
+                    programs = [
+                        program(4, tokens, top_k, rank in present, quantize)
+                        for rank in range(4)
+                    ]
+                    expected = [
+                        ("_tsds" if rank in present else "_tsd")
+                        if tokens >= 1536
+                        else "_ts"
+                        for rank in range(4)
+                    ]
+                    assert programs == expected, (present, tokens, top_k, quantize)

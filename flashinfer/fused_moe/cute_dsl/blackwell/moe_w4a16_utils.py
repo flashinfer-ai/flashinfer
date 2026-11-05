@@ -33,14 +33,15 @@ def e2m1x16_e4m3_to_bf16x16(
     if _HAS_DIRECT_FP4_TO_BF16_CVT:
         asm = """
         {
-            .reg .b8 q0, q1, q2, q3, q4, q5, q6, q7, scale;
+            .reg .b8 q0, q1, q2, q3, q4, q5, q6, q7;
+            .reg .b32 scale_bytes;
             .reg .b16 scale_pair;
             .reg .b32 scale_bf16x2;
 
             mov.b32 {q0, q1, q2, q3}, $8;
             mov.b32 {q4, q5, q6, q7}, $9;
-            mov.b32 {scale, _, _, _}, $10;
-            mov.b16 scale_pair, {scale, scale};
+            prmt.b32 scale_bytes, $10, 0, 0x4400;
+            mov.b32 {scale_pair, _}, scale_bytes;
             cvt.rn.bf16x2.e4m3x2 scale_bf16x2, scale_pair;
 
             cvt.rn.bf16x2.e2m1x2 $0, q0;
@@ -64,15 +65,16 @@ def e2m1x16_e4m3_to_bf16x16(
     else:
         asm = """
         {
-            .reg .b8 q0, q1, q2, q3, q4, q5, q6, q7, scale;
+            .reg .b8 q0, q1, q2, q3, q4, q5, q6, q7;
+            .reg .b32 scale_bytes;
             .reg .b16 scale_pair, lo, hi;
             .reg .b32 scale_f16x2;
             .reg .f32 lo_f32, hi_f32;
 
             mov.b32 {q0, q1, q2, q3}, $8;
             mov.b32 {q4, q5, q6, q7}, $9;
-            mov.b32 {scale, _, _, _}, $10;
-            mov.b16 scale_pair, {scale, scale};
+            prmt.b32 scale_bytes, $10, 0, 0x4400;
+            mov.b32 {scale_pair, _}, scale_bytes;
             cvt.rn.f16x2.e4m3x2 scale_f16x2, scale_pair;
 
             cvt.rn.f16x2.e2m1x2 $0, q0;

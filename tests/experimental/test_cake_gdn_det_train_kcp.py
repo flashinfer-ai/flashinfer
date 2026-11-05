@@ -15,7 +15,8 @@ limitations under the License.
 
 CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake_gdn_det_train_kcp``: the package-local plan
 module against ``cake_kda_train.cake_kcp_plan`` (field-identical partitions and contexts on the step-0 rows with
-``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing counts and
+``H := HV``, except the b1 buffer with maps, ``B1_DM_FIELDS``, which has this package's own dense layout; the KDA
+package is imported HERE only, never by the package), the per-rank crossing counts and
 exchange bytes against the rows of record, the table builders (pool addressing, segment lists, chains), head
 ownership incl. the padded ``(HV, W) = (3, 2)`` case, the byte queries, the registry seed, and the fake backend
 against the FP64 reference (bitwise repeatable, saved == replay).
@@ -40,6 +41,7 @@ import os
 import pathlib
 import random
 import re
+import threading
 
 import pytest
 import torch
@@ -206,6 +208,35 @@ def _context_record(ctx, HV: int) -> dict:
     return rec
 
 
+# The b1 buffer with re-sent maps is this package's own compact layout (the d_f plane of the crossing-in slots, then
+# the maps of the fragments crossing in and out); the KDA module keeps one [d_f | M_f^T] pair per crossing-in slot,
+# whose map half of a document's last fragment is never written.  The parity record leaves that buffer out.
+B1_DM_FIELDS = (
+    "b1_d_tile_dm",
+    "b1_m_tile_dm",
+    "b1_m_index",
+    "n_io_by_rank",
+    "adj_d_off_dm",
+    "adj_m_off_b1",
+)
+B1_DM_KEYS = (*B1_DM_FIELDS, "b1_send_dm", "b1_recv_dm", "b1_dm")
+
+
+def _drop_b1_dm(rec: dict) -> dict:
+    """``rec`` (a :func:`_context_record`) without the fields and table keys of the b1 buffer with maps."""
+    for heads in (rec["heads"], rec["describe"].get("heads", {})):
+        for name in B1_DM_FIELDS:
+            heads.pop(name, None)
+        for table in ("splits", "numel", "pad_numel", "hg_stride", "tile_stride"):
+            if isinstance(heads.get(table), dict):
+                for key in B1_DM_KEYS:
+                    heads[table].pop(key, None)
+        if isinstance(heads.get("device_tables"), dict):
+            for key in B1_DM_KEYS:
+                heads["device_tables"].pop(key, None)
+    return rec
+
+
 def _sha(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
@@ -214,11 +245,12 @@ def _sha(obj) -> str:
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     """Result 1: ``cake_gdn_det_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
-    step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
-    fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the exchange bytes of
-    ``gdn_det_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they share,
-    ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected explicitly
-    here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
+    step-0 row (partition, every rank's context and head plan at ``H := HV``), except the b1 buffer with maps
+    (``B1_DM_FIELDS`` and its split / table keys, checked here for tile coverage and offset range instead), and
+    reproduces the row's recorded fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the
+    exchange bytes of ``gdn_det_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they
+    share, ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected
+    explicitly here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     kp = importlib.import_module(
         "flashinfer.experimental.cake_kda_train.cake_kcp_plan"
     )  # the test only
@@ -260,12 +292,27 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
             sm_count=SM_COUNT,
             _kcp_test_knobs={"p_rule": "wave_fill1"},
         )
-        mine, theirs = _context_record(ctx, HV), _rename_h(_context_record(kctx, HV))
+        mine = _drop_b1_dm(_context_record(ctx, HV))
+        theirs = _drop_b1_dm(_rename_h(_context_record(kctx, HV)))
         records.append(mine)
         assert mine == theirs, (
             f"rank {r}: context / head plan differ from the KDA module (HV={HV})"
         )
         assert (ctx.n_in, ctx.n_out) == (n_in[r], n_out[r])
+        # the b1 buffer with maps: every send tile written once (d_f tiles + the maps of the fragments crossing in
+        # and out), the owner offsets inside the receive buffer
+        hp = ctx.heads(HV)
+        n_io = sum(1 for f in part.fragments[r] if f.crossing_in and f.crossing_out)
+        dm_tiles = sorted(
+            t
+            for rows in (hp.b1_d_tile_dm, hp.b1_m_tile_dm)
+            for row in rows
+            for t in row
+        )
+        assert dm_tiles == list(range(sum(hp.splits["b1_send_dm"]) // gp.TILE))
+        assert len(hp.b1_m_tile_dm) == hp.n_io_by_rank[r] == n_io
+        assert all(0 <= o < hp.numel["b1_recv_dm"] for o in hp.adj_d_off_dm)
+        assert all(o == -1 or 0 <= o < hp.numel["b1_recv_dm"] for o in hp.adj_m_off_b1)
         cb = gb.gdn_det_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
         entry = {
             "rank": r,
@@ -1210,8 +1257,8 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         total += ctx.n_in * s_pad
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
-            if hp.P > 1:
-                total += (hp.P - 1) * ctx.n_frag * s
+        if (save_transfer or save_mode == "full") and hp.P > 1:
+            total += hp.P * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -1271,22 +1318,39 @@ def test_byte_queries(W) -> None:
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False
         )
         s_owner = hp.Hg_r * gp.STATE_TILE_BYTES
-        # lower-bound form ("b1_design"): b1_send = s n_in + s n_out [not save_transfer]; owner
-        # b1_recv in d / m halves
-        assert maps["b1_design"]["send"] == s * (ctx.n_in + ctx.n_out)
-        assert maps["b1_design"]["recv"] == (ctx.N_in + ctx.N_out) * s_owner
+        # "b1_design": b1_send = s n_in + s n_io [not save_transfer] (n_io = fragments crossing in AND
+        # out: the maps the owner's adjoint chain reads; a document's last fragment sends none); owner
+        # b1_recv in d / m planes
+        n_io = sum(1 for f in part.fragments[r] if f.crossing_in and f.crossing_out)
+        N_io = sum(
+            1 for frs in part.fragments for f in frs if f.crossing_in and f.crossing_out
+        )
+        assert hp.n_io_by_rank[r] == n_io and sum(hp.n_io_by_rank) == N_io
+        assert maps["b1_design"]["send"] == s * (ctx.n_in + n_io)
+        assert maps["b1_design"]["recv"] == (ctx.N_in + N_io) * s_owner
         assert (
             maps["b1_d"] == cb["b1"] == cb["b1_replay"] == cb["b1_design"] == cb["b1_d"]
         )
-        assert maps["b1_m"] == {"send": s * ctx.n_out, "recv": ctx.N_out * s_owner}
+        assert maps["b1_m"] == {"send": s * n_io, "recv": N_io * s_owner}
         assert cb["b1_m"] == {"send": 0, "recv": 0}
         assert maps["B3"] == cb["B3"]  # the replay never re-sends maps
-        # "b1" = the plan's split tables: the re-sent maps are paired with the crossing-IN slots (2 s per
-        # crossing-in fragment); they differ from the design form per rank, the rank sums agree
+        # "b1" = the plan's split tables = the design form (both count any padding; none at (6, W)): the d_f
+        # plane of the crossing-in slots + the map plane of the fragments crossing in and out
+        assert maps["b1"] == maps["b1_design"]
         assert maps["b1"] == {
-            "send": 2 * s * ctx.n_in,
-            "recv": 2 * ctx.N_in * s_owner,
+            "send": s * (ctx.n_in + n_io),
+            "recv": (ctx.N_in + N_io) * s_owner,
         }
+        # every tile of the b1 send buffer with maps is written: the d_f tiles and the M_f^T tiles cover
+        # it exactly once (no never-written element reaches the collective)
+        dm_tiles = [
+            t
+            for rows in (hp.b1_d_tile_dm, hp.b1_m_tile_dm)
+            for row in rows
+            for t in row
+        ]
+        assert sorted(dm_tiles) == list(range(sum(hp.splits["b1_send_dm"]) // gp.TILE))
+        assert len(hp.b1_m_tile_dm) == n_io and len(hp.b1_d_tile_dm) == ctx.n_in
         assert cb["padding"]["b1"] == {
             "send": hp.pad_numel["b1_send_d"] * 4,
             "recv": hp.pad_numel["b1_recv_d"] * 4,
@@ -1402,10 +1466,24 @@ def test_byte_queries(W) -> None:
                         ws["fwd.c1_send"] == cb["c1"]["send"]
                         and ws["bwd.b2_send"] == cb["b2"]["send"]
                     )
-                    if save_mode == "light":
+                    if save_mode == "light" and boundary_mode == "saved":
+                        # the shipped forward is fused: no h tape, #1's akk still bound at its peak
+                        assert (
+                            "fwd.h_tape" not in ws
+                            and ws["fwd.akk"] == ctx.R * HV * 128
+                            and ws["bwd.h_tape"] == ctx.NC_pad * HV * 32768
+                            and ws["forward_split"]
+                            == ws["forward"]
+                            + ws["bwd.h_tape"]
+                            + ws["bwd.v_new"]
+                            - ws["fwd.akk"]
+                            - ws["fwd.gcum"]
+                        )
+                    elif save_mode == "light":
                         assert (
                             ws["fwd.h_tape"] == ctx.NC_pad * HV * 32768
                             and ws["bwd.h_tape"] == ws["fwd.h_tape"]
+                            and ws["forward_split"] == ws["forward"]
                         )
                     else:
                         assert (
@@ -1465,11 +1543,109 @@ def test_byte_queries(W) -> None:
     )
 
 
+# Three ranks, two documents.  Rank 1 holds the last fragment of document 0 (crossing in only: in_slot 0) before a
+# middle fragment of document 1 (crossing in and out: in_slot 1, io_slot 0), so there the index of the b1 map plane
+# (io_slot) differs from the crossing-in index (in_slot).  Contiguous layouts never give such a rank.
+B1_MAP_CU = (0, 200, 500)
+B1_MAP_FRAGMENTS = (
+    ((0, 0, 100), (1, 0, 100)),
+    ((0, 100, 100), (1, 100, 100)),
+    ((1, 200, 100),),
+)
+
+
+@pytest.mark.parametrize("HV", (4, 5))
+def test_b1_map_plane_index_on_a_middle_fragment(HV) -> None:
+    """The b1 buffer with maps (``save_transfer=False``) is indexed by ``io_slot`` in its ``M_f^T`` plane, not by
+    ``in_slot``.  Pinned on every rank of :data:`B1_MAP_FRAGMENTS`: ``b1_m_index``, the send / receive split sizes,
+    the ``d_f`` and ``M_f^T`` tiles (every send tile written once; only the padding tiles of the padded owner stay
+    unwritten), the owner offsets ``adj_m_off_b1`` (where rank 1's map lands after the all-to-all) and the byte
+    query (``b1 == b1_design``, padding included).  ``HV = 4``: ``Hg = 2``, owners ``(2, 2, 0)``; ``HV = 5``: owners
+    ``(2, 2, 1)``, owner 2 padded by one tile per slot."""
+    W = 3
+    part = gp.partition_det_kcp(
+        torch.tensor(B1_MAP_CU, dtype=torch.int64), W, fragments=B1_MAP_FRAGMENTS
+    )
+    ctxs = [
+        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        for r in range(W)
+    ]
+    hps = [ctx.heads(HV) for ctx in ctxs]
+    assert tuple(ctxs[1].in_slot) == (0, 1)
+    assert [tuple(hp.n_io_by_rank) for hp in hps] == [(0, 1, 0)] * W
+    # b1_m_index per segment: the io_slot at segment 0 of a fragment crossing in and out, else -1
+    per_slot = ((-1, -1), (-1, 0), (-1,))
+    for r, hp in enumerate(hps):
+        want = [v if p == 0 else -1 for v in per_slot[r] for p in range(hp.P)]
+        assert list(hp.b1_m_index) == want, r
+    # split sizes in tiles: send [dst owner j] = (n_in + n_io) Hg_pad_j, receive [src i] = (n_in_i + n_io_i) Hg
+    send = {
+        4: ((0, 0, 0), (6, 6, 0), (2, 2, 0)),
+        5: ((0, 0, 0), (6, 6, 6), (2, 2, 2)),
+    }[HV]
+    recv = {4: ((0, 6, 2), (0, 6, 2), (0, 0, 0)), 5: ((0, 6, 2),) * W}[HV]
+    for r, hp in enumerate(hps):
+        b1_send, b1_recv = hp.b1_splits(True)
+        assert all(x % gp.TILE == 0 for x in (*b1_send, *b1_recv))
+        assert tuple(x // gp.TILE for x in b1_send) == send[r], r
+        assert tuple(x // gp.TILE for x in b1_recv) == recv[r], r
+    assert all(send[i][j] == recv[j][i] for i in range(W) for j in range(W))
+    # send tiles: the d_f plane by in_slot, then the M_f^T plane by io_slot, per owner block
+    d_tiles = {
+        4: ((), ((0, 1, 6, 7), (2, 3, 8, 9)), ((0, 1, 2, 3),)),
+        5: ((), ((0, 1, 6, 7, 12), (2, 3, 8, 9, 14)), ((0, 1, 2, 3, 4),)),
+    }[HV]
+    m_tiles = {
+        4: ((), ((4, 5, 10, 11),), ()),
+        5: ((), ((4, 5, 10, 11, 16),), ()),
+    }[HV]
+    never_written = {4: ((), (), ()), 5: ((), (13, 15, 17), (5,))}[HV]
+    for r, hp in enumerate(hps):
+        assert hp.b1_d_tile_dm == d_tiles[r] and hp.b1_m_tile_dm == m_tiles[r], r
+        written = [
+            t
+            for rows in (hp.b1_d_tile_dm, hp.b1_m_tile_dm)
+            for row in rows
+            for t in row
+        ]
+        assert len(written) == len(set(written)), r  # no send tile written twice
+        n_tiles = sum(hp.b1_splits(True)[0]) // gp.TILE
+        assert sorted((*written, *never_written[r])) == list(range(n_tiles)), r
+    # owner side: the adjoint chains (doc 0: rank 1 slot 0; doc 1: rank 2 slot 0, rank 1 slot 1) read the map of
+    # rank 1's middle fragment behind rank 1's n_in = 2 d_f slots
+    for o, hp in enumerate(hps):
+        if hp.Hg_r == 0:
+            assert list(hp.adj_m_off_b1) == []
+            continue
+        assert list(hp.adj_m_off_b1) == [-1, -1, 4 * gp.TILE], o
+        sent = hps[1].b1_m_tile_dm[0][o * hp.Hg] * gp.TILE - sum(
+            hps[1].b1_splits(True)[0][:o]
+        )
+        assert hp.adj_m_off_b1[2] - sum(hp.b1_splits(True)[1][:1]) == sent, o
+    for r, (ctx, hp) in enumerate(zip(ctxs, hps, strict=True)):
+        maps = gb.gdn_det_comm_bytes_kcp(
+            ctx, H_qk=1, HV=HV, C=C_CONV, save_transfer=False
+        )
+        b1_send, b1_recv = hp.b1_splits(True)
+        assert (
+            maps["b1"]
+            == maps["b1_design"]
+            == {"send": sum(b1_send) * 4, "recv": sum(b1_recv) * 4}
+        ), r
+        pad = maps["padding"]["b1"]  # inside b1_design, not on top of it
+        n_io, N_io = hp.n_io_by_rank[r], sum(hp.n_io_by_rank)
+        s_owner = hp.Hg_r * gp.STATE_TILE_BYTES
+        assert maps["b1_design"] == {
+            "send": (ctx.n_in + n_io) * HV * gp.STATE_TILE_BYTES + pad["send"],
+            "recv": (ctx.N_in + N_io) * s_owner + pad["recv"],
+        }, r
+
+
 # --------------------------------------------------------------------------- registry seed and package hygiene
 
 
 def test_registry_seed() -> None:
-    """The ``cake_jit`` seed: the shipped records of the nine programs (one library per record and exported arch
+    """The ``cake_jit`` seed: the shipped records of the nine programs and the output walk (one library per record and exported arch
     in ``build.json``; + the two test-only transfer walks of ``build.test.json``), the knob vocabulary,
     every record's logical names in the vocabulary, the grid / selection rules, literal
     tables (``ast.literal_eval`` of the module source equals the runtime dicts; frozen 20-hex library names; no
@@ -1490,11 +1666,13 @@ def test_registry_seed() -> None:
         not in (
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
+            "kcp_fwdh_out",
             "kcp_dhu_offset",
             "kcp_dhu_tape",
             "kcp_affine_merge",
         )
-    )  # the vh=64 forms of the state walks #2 (L8A) / #7 and the c8 / c16 merges are the only multi-record programs
+    )  # the vh=64 forms of the state walks #2 (L8A, the output walk too) / #7 and the c8 / c16 merges are the only
+    # multi-record programs
     assert set(gj.TEST_MODULES) == {
         "kcp_transfer_walk_three_mma",
         "kcp_transfer_walk_plain_tf32",
@@ -1960,12 +2138,138 @@ def test_dhu_offset_walk_defers_the_dh_tape_to_the_first_tape_walk() -> None:
     )  # a tape live by then: saved (full) or replayed (light)
 
 
+@pytest.mark.parametrize("fused_o", (0, 1))
+def test_fwdh_offset_walk_defers_its_tapes_to_the_first_tape_walk(fused_o: int) -> None:
+    """The #2 offset walk hands the kernel ``u`` as its never-dereferenced ``h_tape`` / ``v_new`` pointers
+    (``FWDH_OFFSET_TAPE_STANDIN``), so the arena allocates ``h_tape`` / ``v_new`` at the first tape walk and never at an
+    offset walk.  CP = 1 with two segments per fragment (P = 2) runs the offset walk over every segment before the
+    tape walk, in the forward (the summaries) and in the light backward's replay; the fake backend on the CPU records
+    the arena's tapes and the pointers at every #2 launch.  The stand-in has the dtype the offset binding checks for
+    both pointers, and #1 writes it before any walk.  The fused forward (``fused_o`` = 1, the shipped form) runs the
+    output walk in place of the tape walk: it takes neither pointer, so its forward never allocates the two tapes;
+    the backward's replay is the split form either way."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    seen: list[tuple[str, bool, int, bool, bool]] = []
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            if name == "kcp_fwdh_out":
+                call = args["_call"]
+                assert "h_tape" not in args and "v_new" not in args
+                bound = sum(n in call.ws._tapes for n in ("h_tape", "v_new"))
+                seen.append((name, call.backward, bound, False, False))
+            elif name in kcp.FWDH_PROGRAMS:
+                call = args["_call"]
+                standin = call.tape(kcp.FWDH_OFFSET_TAPE_STANDIN).data_ptr()
+                ptrs = (args["h_tape"].data_ptr(), args["v_new"].data_ptr())
+                bound = sum(n in call.ws._tapes for n in ("h_tape", "v_new"))
+                real = name == "kcp_fwdh_tape" and ptrs == (
+                    call.tape("h_tape").data_ptr(),
+                    call.tape("v_new").data_ptr(),
+                )
+                seen.append(
+                    (name, call.backward, bound, ptrs == (standin, standin), real)
+                )
+            super().run(name, args)
+
+    previous = kcp._BACKENDS.get("fake")
+    kcp._BACKENDS["fake"] = Recording()
+    try:
+        out, saved = kcp.chunk_gdn_det_fwd_kcp(
+            ops["q"],
+            ops["k"],
+            ops["v"],
+            ops["g"],
+            ops["beta"],
+            ctx,
+            backend="fake",
+            segments=2,
+            test_knobs={"fused_o": fused_o},
+        )
+        grads = kcp.chunk_gdn_det_bwd_kcp(
+            ops["q"],
+            ops["k"],
+            ops["v"],
+            ops["g"],
+            ops["beta"],
+            ctx,
+            ops["dout"],
+            saved=saved,
+            backend="fake",
+            segments=2,
+            test_knobs={"fused_o": fused_o},
+        )
+    finally:
+        if previous is None:
+            kcp._BACKENDS.pop("fake", None)
+        else:
+            kcp._BACKENDS["fake"] = previous
+    assert out.shape[0] == cu[-1] and all(
+        torch.isfinite(g.float()).all() for g in (out, *grads)
+    )
+    fused = bool(fused_o) and kcp.fused_o_shipped()
+    forward = [s for s in seen if not s[1]]
+    assert ("kcp_fwdh_out" in [s[0] for s in forward]) == fused
+    assert all(s[0] != "kcp_fwdh_out" for s in seen if s[1])  # the replay is split
+    if fused:
+        assert "kcp_fwdh_tape" not in [s[0] for s in forward]
+        assert any(s[0] == "kcp_fwdh_offset" for s in forward)
+        assert all(s[3] for s in forward if s[0] == "kcp_fwdh_offset")
+        assert all(s[2] == 0 for s in forward), (
+            "a fused forward bound h_tape / v_new",
+            forward,
+        )
+    for backward in (True,) if fused else (False, True):
+        phase = [s for s in seen if s[1] == backward]
+        names = [s[0] for s in phase]
+        assert "kcp_fwdh_offset" in names and "kcp_fwdh_tape" in names, (
+            backward,
+            names,
+        )
+        first_tape = names.index("kcp_fwdh_tape")
+        offsets = [s for s in phase if s[0] == "kcp_fwdh_offset"]
+        assert names.index("kcp_fwdh_offset") < first_tape, (
+            "the offset walk must run before the first tape walk in this form",
+            backward,
+        )
+        assert all(s[3] for s in offsets), (
+            "the offset walk's h_tape / v_new pointers are not the stand-in tape",
+            backward,
+        )
+        assert all(s[2] == 0 for s in phase[:first_tape]), (
+            "h_tape / v_new sat in the arena at an offset walk",
+            backward,
+        )
+        assert phase[first_tape][2] == 2 and phase[first_tape][4], (
+            "the first tape walk must allocate and receive the real h_tape / v_new",
+            backward,
+        )
+        assert all(s[4] and not s[3] for s in phase if s[0] == "kcp_fwdh_tape"), (
+            backward
+        )
+    standin = kcp.FWDH_OFFSET_TAPE_STANDIN
+    assert standin in kcp.FWD_TAPES and standin not in kcp.FWD_DEAD_AFTER_PREP
+    dims = dict(R=ctx.R, NC_pad=ctx.NC_pad, HV=HV, T=ctx.T_r)
+    assert (
+        kcp.tape_spec(standin, **dims)[1]
+        == kcp.tape_spec("h_tape", **dims)[1]
+        == kcp.tape_spec("v_new", **dims)[1]
+        == torch.bfloat16
+    )
+
+
 def test_persistent_programs_receive_the_workspace_ticket_slots() -> None:
     """#5 / #6 / #8 receive the caller workspace's ticket slot of their site as the logical ``ticket``: a 128-byte
     aligned u32 slot that is zero at every launch (the kernels leave it so; the emulation never touches it), the
     same slot across the forward and the backward of a caller-held workspace and across repeated backwards.  The
     #7 walks launch the record the registry provides for the form rule (the ``_vh64`` record where it ships, else
-    the full-head record), and the test knob ``dhu_vh`` forces the full-head form."""
+    the full-head record), and the test knob ``dhu_vh`` forces the full-head form.  The forward is the split form
+    (``fused_o`` = 0): the fused forward launches no #5 (its output walk takes no ticket)."""
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
@@ -2010,6 +2314,7 @@ def test_persistent_programs_receive_the_workspace_ticket_slots() -> None:
             backend="fake",
             segments=2,
             workspace=ws,
+            test_knobs={"fused_o": 0},
         )
         bwd = dict(saved=saved, backend="fake", segments=2, workspace=ws)
         grads = kcp.chunk_gdn_det_bwd_kcp(
@@ -2339,6 +2644,225 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     assert "S_in" not in kcp.LAST_CALL["bwd"]["fresh_bytes"]
 
 
+@pytest.mark.parametrize(
+    "save_mode,save_transfer",
+    [("light", True), ("full", True), ("full", False)],
+    ids=["light-st", "full-st", "full-nost"],
+)
+@pytest.mark.parametrize("P", (2, 3))
+def test_saved_byte_query_counts_the_whole_m_seg_plane(
+    save_mode, save_transfer, P
+) -> None:
+    """The saved set keeps ``M_seg`` as the whole ``M_seg^T`` staging plane: ``[NSEG, HV]`` FP32 states with
+    ``NSEG = n_frag * P``, under ``save_transfer`` and under ``save_mode="full"``.  The byte query's ``M_seg`` term
+    (``P n_frag s``) equals the bytes of that saved tensor."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        ops["q"],
+        ops["k"],
+        ops["v"],
+        ops["g"],
+        ops["beta"],
+        ctx,
+        backend="fake",
+        segments=P,
+        save_mode=save_mode,
+        save_transfer=save_transfer,
+    )
+    assert saved is not None and saved.P == P and saved.M_seg is not None
+    plane = saved.M_seg.numel() * saved.M_seg.element_size()
+    assert plane == P * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    q = {
+        "H_qk": H_qk,
+        "HV": HV,
+        "save_mode": save_mode,
+        "save_transfer": save_transfer,
+        "P": P,
+    }
+    assert gb.gdn_det_saved_layout_kcp(ctx, **q)["M_seg"] == plane
+
+
+# README saved-set table row (by its item cell's start) -> the gdn_det_saved_layout_kcp terms it states
+README_SAVED_ROWS = {
+    "inputs ": (),
+    "`S_in`": ("S_in",),
+    "received summary pairs": ("c1_recv",),
+    "`M_seg`": ("M_seg",),
+    "convolution history rows": ("hist",),
+    "`gamma`, `gcum`, `Akk`": ("gamma", "gcum", "akk"),
+    "`rowscale`, `qscale`": ("rowscale", "qscale"),
+    "`h` tape, `v_new`, `w`, `u`, `Aqk`": ("h_tape", "v_new", "w", "u", "aqk"),
+    "`qk_rstd`": ("qk_rstd",),
+}
+
+
+def test_readme_saved_set_table_matches_the_saved_layout() -> None:
+    """The README's saved-set table states what ``gdn_det_saved_layout_kcp`` counts: every layout term sits in one
+    row; a ``yes`` column is a nonzero term on some rank (under ``save_transfer`` and without it, unless the row is
+    conditional on ``save_transfer=True``), a ``**no**`` column a zero term on every rank; the ``M_seg`` row's light
+    column holds under ``save_transfer=True`` only (two ranks, a crossing fragment, ``P = 2``, the in-kernel norm
+    on).  The per-token figures are the layout's bytes of the row per padded token row at ``HV = 48``."""
+    readme = pathlib.Path(gb.__file__).with_name("README.md").read_text()
+    lines = readme[
+        readme.index("### Saved set, replay and byte queries") :
+    ].splitlines()
+    head = lines.index(
+        '| item | `save_mode="full"` | `save_mode="light"` | bytes per rank |'
+    )
+    table = []
+    for line in lines[head + 2 :]:
+        if not line.startswith("|"):
+            break
+        table.append([c.strip() for c in line.strip().strip("|").split("|")])
+    rows = {}
+    for item, full_cell, light_cell, bytes_cell in table:
+        (prefix,) = [k for k in README_SAVED_ROWS if item.startswith(k)]
+        rows[prefix] = (item, {"full": full_cell, "light": light_cell}, bytes_cell)
+    assert set(rows) == set(README_SAVED_ROWS)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 2, "contiguous")
+    ctxs = [gp.build_context_det_kcp(part, None, r, CPU) for r in range(2)]
+    assert sum(c.n_in for c in ctxs) > 0  # a crossing fragment: S_in / hist terms exist
+
+    def terms(save_mode: str, save_transfer: bool) -> list[dict[str, int]]:
+        return [
+            gb.gdn_det_saved_layout_kcp(
+                c,
+                H_qk=H_qk,
+                HV=HV,
+                save_mode=save_mode,
+                save_transfer=save_transfer,
+                P=2,
+                use_qk_l2norm_in_kernel=True,
+            )
+            for c in ctxs
+        ]
+
+    keys = [k for ks in README_SAVED_ROWS.values() for k in ks]
+    assert sorted(keys) == sorted(terms("full", True)[0])  # each term in one row
+    for prefix, (item, cells, _) in rows.items():
+        st_only = "`save_transfer=True`" in item
+        for mode, cell in cells.items():
+            on, off = terms(mode, True), terms(mode, False)
+            for k in README_SAVED_ROWS[prefix]:
+                if cell == "yes":
+                    assert any(t[k] > 0 for t in on), (item, mode, k)
+                    assert any(t[k] > 0 for t in off) != st_only, (item, mode, k)
+                elif cell.startswith("**no**"):
+                    assert all(t[k] == 0 for t in on + off), (item, mode, k)
+                else:
+                    assert cell.startswith("`save_transfer=True` only"), (item, cell)
+                    assert any(t[k] > 0 for t in on), (item, mode, k)
+                    assert all(t[k] == 0 for t in off), (item, mode, k)
+    # the per-token figures: the layout's bytes per padded token row (R = 64 NC_pad rows) at (16, 48)
+    part = gp.partition_det_kcp(
+        torch.tensor([0, 4096], dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    assert 64 * ctx.NC_pad == ctx.R
+    lay = gb.gdn_det_saved_layout_kcp(ctx, H_qk=16, HV=48, save_mode="full", P=1)
+    n_per_token = 0
+    for prefix, (item, _, bytes_cell) in rows.items():
+        if bytes_cell.endswith("B per token"):
+            n_per_token += 1
+            row_bytes = sum(lay[k] for k in README_SAVED_ROWS[prefix])
+            assert row_bytes % ctx.R == 0, item
+            assert f"{row_bytes // ctx.R:,} B per token" in bytes_cell, (
+                item,
+                row_bytes,
+            )
+    assert n_per_token == 3
+
+
+def _nan_filled_allocations(monkeypatch, kcp) -> None:
+    """Fill every tensor the package allocates (``kcp._alloc``: workspace pools, tapes, fresh saved-set tensors) with
+    NaN bytes, so a read of a buffer no program of the call wrote shows up as a non-finite result."""
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real_alloc(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+
+
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", (False, True))
+def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
+    monkeypatch, use_qk_l2norm_in_kernel
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` at ``P > 1`` (also the only form of ``exchange="ring"``): the
+    backward's merges read the forward's ``M_seg^T`` plane (``stage_m``), which the full backward does not rebuild (no
+    transfer walk), so the saved set carries it as ``M_seg`` and the backward binds it.  Every tensor the package
+    allocates is filled with NaN bytes: an unwritten read shows up as a non-finite result.  The full form gives the
+    light form's bits on a ``None``, a fresh and a shared workspace (twice) and under a non-reentrant checkpoint; the
+    byte query counts ``M_seg``; a full saved set without it is refused."""
+    kcp = _package("cake_kcp")
+    _nan_filled_allocations(monkeypatch, kcp)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    base = {
+        "segments": 2,
+        "save_transfer": False,
+        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+    }
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        *args, backend="fake", save_mode="full", **base
+    )
+    assert saved is not None and saved.P == 2 and saved.c1_recv is None
+    assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
+    m_seg_bytes = gb.gdn_det_saved_layout_kcp(
+        ctx,
+        H_qk=H_qk,
+        HV=HV,
+        save_mode="full",
+        save_transfer=False,
+        P=2,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )["M_seg"]
+    # the query counts the saved plane itself: NSEG = n_frag P states
+    assert m_seg_bytes == 2 * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
+    # an older full saved set without M_seg would read an unwritten plane: refused
+    with pytest.raises(ValueError, match="needs M_seg"):
+        kcp.chunk_gdn_det_bwd_kcp(
+            *args,
+            ops["dout"],
+            saved=dataclasses.replace(saved, M_seg=None),
+            backend="fake",
+            save_mode="full",
+            **base,
+        )
+    light = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
+    for n, t in light.items():
+        assert torch.isfinite(t.float()).all(), ("light", n)
+    shared = kcp.WorkspaceDetKcp()
+    arms = (
+        (None, False),
+        (kcp.WorkspaceDetKcp(), False),
+        (shared, False),
+        (shared, False),
+        (None, True),
+    )
+    for i, (ws, ckpt) in enumerate(arms):
+        full = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=ckpt, workspace=ws, save_mode="full", **base
+        )
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
+        _assert_same(full, light, f"save_mode=full without save_transfer, arm {i}")
+
+
 def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
     """R2-L1 1a: the ``M_f -> M_f^T`` scatter with the gather in a caller scratch (the carry plane during the
     summaries) writes the same bytes as the fresh-temporary form and leaves the gathered tiles in the scratch."""
@@ -2372,9 +2896,11 @@ def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
 
 
 def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None:
-    """R2-L1 1a: ``gdn_det_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (replay
-    boundary or ``save_transfer=False``); under the shipped saved + ``save_transfer`` form the saved ``M_seg^T``
-    stands in for it and the workspace holds ``stage_b`` alone (the ring pools are never workspace terms)."""
+    """R2-L1 1a: ``gdn_det_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (the replay
+    boundary, or the light saved form without ``save_transfer``); when the saved set carries ``M_seg`` -- the shipped
+    saved + ``save_transfer`` form and ``save_mode="full"`` with either ``save_transfer`` -- the saved ``M_seg^T``
+    stands in for it and the workspace holds ``stage_b`` alone (the ring pools are never workspace terms).  The full
+    form without ``save_transfer`` is also checked against the pools a call at ``P = 2`` actually sizes."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)
     part = gp.partition_det_kcp(cu, 2, "contiguous")
     H_qk, HV = 2, 6
@@ -2405,9 +2931,13 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
         two_b = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, save_transfer=False
         )
+        full_no_st = gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", save_transfer=False
+        )
         assert one["fwd.staging"] == one["bwd.staging"] == plane
         assert two_a["fwd.staging"] == two_a["bwd.staging"] == 2 * plane
         assert two_b["fwd.staging"] == two_b["bwd.staging"] == 2 * plane
+        assert full_no_st["fwd.staging"] == full_no_st["bwd.staging"] == plane
         assert one["fwd.c1_recv"] == 0 and two_b["fwd.c1_recv"] > 0
         assert not any(k.endswith("ring_out") or k.endswith("ring_in") for k in one)
         assert (
@@ -2415,6 +2945,51 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
             == 0
         )
     assert seen_segmented  # the row has a segmented rank: the plane term was exercised
+    # save_mode="full" without save_transfer at a forced P = 2, against the pools the call sizes: the forward binds a
+    # fresh M_seg^T plane and the backward the saved one for stage_m, so both lifetimes size stage_b alone.  The
+    # context's own plan is P = 2 (the layout's staging term reads the plan's NSEG).
+    kcp = _package("cake_kcp")
+    cu2 = [0, 2000, 4096]
+    part2 = gp.partition_det_kcp(torch.tensor(cu2, dtype=torch.int64), 1, "contiguous")
+    ctx2 = gp.build_context_det_kcp(
+        part2, None, 0, CPU, 4, sm_count=16, p_rule="wave_fill1"
+    )
+    assert ctx2.heads(HV).P == 2
+    plane2 = ctx2.heads(HV).NSEG * HV * gp.STATE_TILE_BYTES
+    ops = _inputs(cu2, H_qk, HV)
+    held: dict[str, dict[str, int]] = {"fwd": {}, "bwd": {}}
+    phase = ["fwd"]
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            pools = args["_call"].ws.pool_bytes
+            for pool in ("stage_b", "stage_m"):
+                if pool in pools:
+                    got = held[phase[0]]
+                    got[pool] = max(got.get(pool, 0), pools[pool])
+            super().run(name, args)
+
+    opts = dict(backend="fake", segments=2, save_mode="full", save_transfer=False)
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx2)
+    previous = kcp._BACKENDS.get("fake")
+    kcp._BACKENDS["fake"] = Recording()
+    try:
+        _, saved = kcp.chunk_gdn_det_fwd_kcp(*args, **opts)
+        phase[0] = "bwd"
+        kcp.chunk_gdn_det_bwd_kcp(*args, ops["dout"], saved=saved, **opts)
+    finally:
+        if previous is None:
+            kcp._BACKENDS.pop("fake", None)
+        else:
+            kcp._BACKENDS["fake"] = previous
+    assert kcp.LAST_CALL["fwd"]["P"] == kcp.LAST_CALL["bwd"]["P"] == 2
+    assert saved is not None and saved.M_seg is not None
+    assert saved.M_seg.numel() * saved.M_seg.element_size() == plane2
+    assert held["fwd"] == held["bwd"] == {"stage_b": plane2}, held
+    full2 = gb.gdn_det_workspace_layout_kcp(
+        ctx2, H_qk=H_qk, HV=HV, save_mode="full", save_transfer=False, P=2
+    )
+    assert full2["fwd.staging"] == full2["bwd.staging"] == plane2
 
 
 def test_backward_allocates_the_gradients_right_before_dqkg() -> None:
@@ -2645,7 +3220,13 @@ def test_checkpoint_backward_reuses_the_recompute_tapes(
     assert light_seq[0] == "fwd_prep", light_seq[:4]
     kept_seq = list(kcp.LAST_CALL["bwd"]["sequence"])
     assert kept_seq[0] == "bwd_prep", kept_seq[:4]
-    forward_programs = {"fwd_prep", "kcp_fwdh_offset", "kcp_fwdh_tape", "fwd_o"}
+    forward_programs = {
+        "fwd_prep",
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "fwd_o",
+    }
     assert not (forward_programs & set(kept_seq)), kept_seq
     bwd_launches = [n for n, bwd, _, _ in seen if bwd]
     assert (
@@ -2653,13 +3234,19 @@ def test_checkpoint_backward_reuses_the_recompute_tapes(
         and bwd_launches[0] == "bwd_prep"
         and not (forward_programs & set(bwd_launches))
     )
-    # two forwards ran (the checkpointed one, then torch's recompute = the hand-off forward); on a verified torch
-    # the recompute's #5 is left out (recompute_output="auto": this node is the segment's last saver), so fwd_o ran
-    # in the first one only; any other torch build launches it in both
+    # two forwards ran (the checkpointed one, then torch's recompute = the hand-off forward); the first hands no
+    # tape over, so it writes the output with the output walk (fused, where the registry ships it); on a verified
+    # torch the recompute's #5 is left out (recompute_output="auto": this node is the segment's last saver); any
+    # other torch build launches it after the hand-off forward's tape walk
     assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_prep"] == [False, True]
-    assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_o"] == (
-        [False] if kcp.torch_release_verified() else [False, True]
+    fused = kcp.fused_o_shipped()
+    assert [h for n, bwd, h, _ in seen if not bwd and n == "kcp_fwdh_out"][:1] == (
+        [False] if fused else []
     )
+    assert all(not h for n, bwd, h, _ in seen if not bwd and n == "kcp_fwdh_out")
+    assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_o"] == (
+        [] if fused else [False]
+    ) + ([] if kcp.torch_release_verified() else [True])
     # the hand-off forward's #2 tape launches are the replay's (same list lengths in the same order)
     kept_walks = [
         w for n, bwd, h, w in seen if (not bwd) and h and n == "kcp_fwdh_tape"
@@ -2928,13 +3515,14 @@ def test_switch_is_a_no_op_outside_the_light_saved_checkpoint_backward() -> None
 
 def _fwd_o_launches(kcp):
     """A recording fake backend: ``(program, hand-off forward?, the call's scratch)`` of every forward ``fwd_prep`` /
-    ``fwd_o`` launch; the scratch carries that forward's ``fwd_o`` decision and reason once it has run."""
+    ``fwd_o`` / ``kcp_fwdh_out`` launch; the scratch carries that forward's ``fwd_o`` decision and reason once it has
+    run."""
     seen: list[tuple[str, bool, dict]] = []
 
     class Recording(kcp.FakeBackend):
         def run(self, name, args):
             call = args["_call"]
-            if not call.backward and name in ("fwd_prep", "fwd_o"):
+            if not call.backward and name in ("fwd_prep", "fwd_o", "kcp_fwdh_out"):
                 seen.append(
                     (name, bool(call.scratch.get("hand_off", False)), call.scratch)
                 )
@@ -2945,6 +3533,29 @@ def _fwd_o_launches(kcp):
 
 def _launches(seen, name: str) -> list[bool]:
     return [h for n, h, _ in seen if n == name]
+
+
+def _o_writes(seen) -> list[bool]:
+    """The hand-off flags of the forwards that wrote the output, in launch order: by #5 (decision ``launched``) or by
+    the output walk (``fused``); each forward's own launches agree with its decision (``fwd_o`` once when launched,
+    ``kcp_fwdh_out`` when fused, neither when skipped)."""
+    writes = []
+    for i, (name, hand_off, scratch) in enumerate(seen):
+        if name != "fwd_prep":
+            continue
+        own = [n for n, _, s in seen[i + 1 :] if s is scratch and n != "fwd_prep"]
+        decision = scratch["fwd_o"]
+        assert own.count("fwd_o") == int(decision == "launched"), (decision, own)
+        assert ("kcp_fwdh_out" in own) == (decision == "fused"), (decision, own)
+        if decision != "skipped":
+            writes.append(hand_off)
+    return writes
+
+
+def _wrote(kcp, hand_off: bool) -> str:
+    """The ``fwd_o`` decision of a forward that writes the output: ``fused`` (the output walk) unless it hands its
+    tapes to the backward or the registry ships no output walk (``launched``: the tape walk, then #5)."""
+    return "fused" if not hand_off and kcp.fused_o_shipped() else "launched"
 
 
 def _forwards(seen) -> list[tuple[bool, str, str]]:
@@ -2969,15 +3580,24 @@ def _frame_delta(kcp, skipped: int, launched: int) -> dict[str, int]:
     return {"skipped": 0, "launched": 0}
 
 
-def _dead_decision(kcp) -> str:
-    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch, else ``launched``."""
-    return "skipped" if _verified_torch(kcp) else "launched"
+def _auto_hand_off(kcp) -> bool:
+    """Whether the shipped ``reuse_recompute_tapes="auto"`` hands the recompute's tapes to the backward when the node
+    closes the segment: the frame proof is read on a verified torch only; elsewhere every recompute takes the replay
+    form (no hand-off, no kept entry)."""
+    return _verified_torch(kcp)
 
 
-def _fwd_o_after_recompute(kcp) -> list[bool]:
+def _dead_decision(kcp, hand_off: bool = True) -> str:
+    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch; elsewhere the
+    recompute writes the output, as :func:`_wrote` gives for a forward with or without the hand-off (``launched``
+    with the hand-off of ``reuse_recompute_tapes=True``)."""
+    return "skipped" if _verified_torch(kcp) else _wrote(kcp, hand_off)
+
+
+def _fwd_o_after_recompute(kcp, hand_off: bool = True) -> list[bool]:
     """``fwd_o`` hand-off flags of one original forward and one recompute whose output is dead: the original's only on
-    a verified torch, the recompute's too elsewhere."""
-    return [False] if _verified_torch(kcp) else [False, True]
+    a verified torch, the recompute's too elsewhere (``hand_off``: whether that recompute hands its tapes off)."""
+    return [False] if _verified_torch(kcp) else [False, hand_off]
 
 
 def _skip_delta(kcp, before: dict[str, int]) -> dict[str, int]:
@@ -2993,16 +3613,19 @@ def _ckpt_leaves(ops) -> list[torch.Tensor]:
 
 def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> None:
     """A segment whose last saver is the GDN call: the recompute leaves #5 out exactly once per checkpoint step --
-    fwd_prep runs in both forwards, fwd_o in the original only -- the outputs and the gradients are bitwise the
+    fwd_prep runs in both forwards, the output program (the output walk) in the original only -- the outputs and the gradients are bitwise the
     ``recompute_output="always"`` form's and the direct autograd's, the kept-tape accounting is unchanged, and the
     skip does not rest on the kept tapes (the replay form skips too).  A later op of the segment that saves nothing
     (``.sum()``) keeps the skip: torch's early stop ends the recompute right after this node's tensors are re-saved,
-    before that op runs.  On a torch build outside the verified set every recompute launches #5 instead (reason
-    ``torch_version``, counters untouched) and the same bitwise equalities hold."""
+    before that op runs.  On a torch build outside the verified set every recompute writes the output instead (reason
+    ``torch_version``, counters untouched): the shipped ``reuse_recompute_tapes="auto"`` takes the replay form
+    there, so the recompute hands nothing off, puts no kept entry and writes the output as a plain forward; the same
+    bitwise equalities hold."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
-    fwd_o, decision = _fwd_o_after_recompute(kcp), _dead_decision(kcp)
+    hand = _auto_hand_off(kcp)
+    fwd_o, decision = _fwd_o_after_recompute(kcp, hand), _dead_decision(kcp, hand)
     reason, delta = _frame_reason(kcp, "dead"), _frame_delta(kcp, 1, 0)
 
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
@@ -3026,23 +3649,23 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         always = _ckpt_autograd(
             kcp, ctx, ops, ckpt=True, segments=2, recompute_output="always"
         )
-        assert _launches(seen, "fwd_prep") == [False, True]
-        assert _launches(seen, "fwd_o") == [False, True]
-        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert _launches(seen, "fwd_prep") == [False, hand]
+        assert _o_writes(seen) == [False, hand]
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == _wrote(kcp, hand)
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "always"
         seen.clear()
         before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
         auto = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
-        assert _launches(seen, "fwd_prep") == [False, True]
-        assert _launches(seen, "fwd_o") == fwd_o
+        assert _launches(seen, "fwd_prep") == [False, hand]
+        assert _o_writes(seen) == fwd_o
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason
         assert _skip_delta(kcp, before) == delta
         assert _stats_delta(kcp, kept_before) == {
-            "put": 1,
-            "take": 1,
+            "put": int(hand),
+            "take": int(hand),
             "miss": 0,
-            "released": 1,
+            "released": int(hand),
             "callback": 0,
             "evicted": 0,
         }
@@ -3053,15 +3676,13 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         )
         # no hand-off without reuse_recompute_tapes: on a verified torch the recompute still skips #5; elsewhere it
         # launches #5 as a plain (non hand-off) forward
-        assert _launches(seen, "fwd_o") == (
-            [False] if _verified_torch(kcp) else [False, False]
-        )
+        assert _o_writes(seen) == ([False] if _verified_torch(kcp) else [False, False])
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "replay"
         assert _skip_delta(kcp, before) == delta
         seen.clear()
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
         ckpt_sum = seg_sum(True)
-        assert _launches(seen, "fwd_o") == fwd_o
+        assert _o_writes(seen) == fwd_o
         assert _skip_delta(kcp, before) == delta
     finally:
         kcp.set_backend("fake", previous)
@@ -3076,6 +3697,7 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
 # The recompute_output tests below pin reuse_recompute_tapes=True: they check the output program's gate under the
 # kept-tape form (the recompute launches #1 and hands the tapes off); the shipped default "auto" takes the replay form
 # in several of these scenarios (a later saver, a failed frame proof), which the reuse_recompute_tapes tests cover.
+# The untaken-node test runs the default "auto" (its hand-off holds on a verified torch only: _auto_hand_off).
 def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_output() -> (
     None
 ):
@@ -3121,7 +3743,7 @@ def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_outp
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
         auto = run(True)
         assert _launches(seen, "fwd_prep") == [False, True]
-        assert _launches(seen, "fwd_o") == [False, True]
+        assert _o_writes(seen) == [False, True]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == _frame_reason(
             kcp, "holders_remain"
@@ -3155,7 +3777,7 @@ def test_recompute_output_multi_layer_segment_skips_only_the_last_layer() -> Non
         fwds = _forwards(seen)
         # the original forwards all launch; in the recompute layers 1-2 launch (the next layer holds their output)
         # and layer 3, the last saver, leaves #5 out
-        assert [f[:2] for f in fwds[:layers]] == [(False, "launched")] * layers
+        assert [f[:2] for f in fwds[:layers]] == [(False, _wrote(kcp, False))] * layers
         assert fwds[layers:] == [
             (True, "launched", _frame_reason(kcp, "holders_remain"))
         ] * (layers - 1) + [(True, _dead_decision(kcp), _frame_reason(kcp, "dead"))]
@@ -3172,7 +3794,7 @@ def test_recompute_output_multi_layer_segment_skips_only_the_last_layer() -> Non
         always = _ckpt_autograd(
             kcp, ctx, ops, ckpt=True, recompute_output="always", **base
         )
-        assert _launches(seen, "fwd_o") == [False] * layers + [True] * layers
+        assert _o_writes(seen) == [False] * layers + [True] * layers
     finally:
         kcp.set_backend("fake", previous)
     _assert_same(auto, direct, f"{layers} layers, auto vs direct")
@@ -3184,10 +3806,13 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     """(a) The segment is recomputed for another saved tensor while the GDN node itself is not in the backward: the
     node is still the segment's last saver, so #5 is left out, and the kept-tape accounting is the shipped one (the
     untaken entry goes at the task's end).  (b) ``retain_graph`` and a second ``.backward()``: two recomputes, two
-    skips, two kept entries put and taken, gradients exactly twice the direct ones."""
+    skips, two kept entries put and taken, gradients exactly twice the direct ones.  Both parts run the shipped
+    ``reuse_recompute_tapes="auto"``: on a torch build outside the verified set it takes the replay form (no kept
+    entry is put, taken or dropped), the recompute writes the output as a plain forward and the counters stay."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
+    hand = int(_auto_hand_off(kcp))  # kept entries per recompute
     leaves = _ckpt_leaves(ops)
     a = torch.randn(3, requires_grad=True)
 
@@ -3200,14 +3825,14 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
     b.sum().backward()
     assert a.grad is not None and all(lf.grad is None for lf in leaves)
-    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp)
+    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp, bool(hand))
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 1, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 1,
+        "put": hand,
         "take": 0,
         "miss": 0,
         "released": 0,
-        "callback": 1,
+        "callback": hand,
         "evicted": 0,
     }
     assert kcp.kept_registry_size() == 0
@@ -3219,10 +3844,10 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
         assert torch.equal(twice[n], direct[n] + direct[n]), n
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 2, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 2,
-        "take": 2,
+        "put": 2 * hand,
+        "take": 2 * hand,
         "miss": 0,
-        "released": 2,
+        "released": 2 * hand,
         "callback": 0,
         "evicted": 0,
     }
@@ -3245,7 +3870,7 @@ def test_recompute_output_needs_the_verified_torch_version(monkeypatch) -> None:
         res = _ckpt_autograd(
             kcp, ctx, ops, ckpt=True, segments=2, reuse_recompute_tapes=True
         )
-        assert _launches(seen, "fwd_o") == [False, True]
+        assert _o_writes(seen) == [False, True]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "torch_version"
         assert _skip_delta(kcp, before) == {"skipped": 0, "launched": 0}
@@ -3288,7 +3913,7 @@ def test_recompute_output_launched_under_a_reentrant_checkpoint() -> None:
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
         res = run(True)
         assert _launches(seen, "fwd_prep") == [False, True]
-        assert _launches(seen, "fwd_o") == [False, True]
+        assert _o_writes(seen) == [False, True]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == _frame_reason(kcp, "no_hooks")
         assert _skip_delta(kcp, before) == {"skipped": 0, "launched": 0}
@@ -3344,8 +3969,8 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
         fwds = _forwards(seen)
         # layer 1 original, layer 2 original, layer 1 recompute, layer 2 recompute
         assert [f[:2] for f in fwds] == [
-            (False, "launched"),
-            (False, "launched"),
+            (False, _wrote(kcp, False)),
+            (False, _wrote(kcp, False)),
             (True, "launched"),
             (True, _dead_decision(kcp)),
         ]
@@ -3354,7 +3979,9 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
         assert _skip_delta(kcp, before) == _frame_delta(kcp, 1, 0)
         seen.clear()
         always = run(True, recompute_output="always")
-        assert [f[1:] for f in _forwards(seen)] == [("launched", "always")] * 4
+        assert [f[1:] for f in _forwards(seen)] == [
+            (_wrote(kcp, False), "always")
+        ] * 2 + [("launched", "always")] * 2
     finally:
         kcp.set_backend("fake", previous)
     for a, d, w in zip(auto, direct, always, strict=True):
@@ -3407,14 +4034,14 @@ def test_recompute_output_launched_under_no_grad_inside_the_recompute() -> None:
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
         auto = run(True)
         assert _forwards(seen) == [
-            (False, "launched", "not_executable"),
+            (False, _wrote(kcp, False), "not_executable"),
             (True, "launched", "not_executable"),
         ]
         assert _skip_delta(kcp, before) == {"skipped": 0, "launched": 0}
         seen.clear()
         always = run(True, recompute_output="always")
         assert _forwards(seen) == [
-            (False, "launched", "always"),
+            (False, _wrote(kcp, False), "always"),
             (True, "launched", "always"),
         ]
     finally:
@@ -3462,7 +4089,7 @@ def test_recompute_output_launched_when_early_stop_is_off() -> None:
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
         res = run(True)
         assert _launches(seen, "fwd_prep") == [False, True]
-        assert _launches(seen, "fwd_o") == [False, True]
+        assert _o_writes(seen) == [False, True]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == _frame_reason(
             kcp, "no_early_stop"
@@ -3519,7 +4146,7 @@ def test_recompute_output_launched_under_a_users_saved_tensors_hooks() -> None:
         res = run(True)
         reason = _frame_reason(kcp, "user_hooks")
         assert _forwards(seen) == [
-            (False, "launched", reason),
+            (False, _wrote(kcp, False), reason),
             (True, "launched", reason),
         ]
         assert _skip_delta(kcp, before) == {"skipped": 0, "launched": 0}
@@ -3692,7 +4319,7 @@ def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
             )
             assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason, build
             assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision, build
-            assert _launches(seen, "fwd_o") == fwd_o, build
+            assert _o_writes(seen) == fwd_o, build
         finally:
             kcp.set_backend("fake", previous)
         _assert_same(res, direct, build)
@@ -3738,10 +4365,12 @@ class _PeakWorkspace:
 
 
 def test_workspace_layout_follows_the_arena_lifetimes() -> None:
-    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds: the forward's tape-walk peak, and the
-    backward's phase maximum of the form -- the kept-tape form ends with the four re-adopted forward tapes beside the
-    backward tapes (the ten kept tapes are hand-off tensors outside the workspace, ``bwd.kept_tapes``), the replay
-    form holds the ten light tapes through the backward; both forms need the same transient bytes."""
+    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds: the forward's peak (the shipped fused
+    forward: #1; with test knob ``fused_o=0``: the tape walk, ``forward_split``), and the backward's phase maximum of
+    the form -- the kept-tape form ends with the re-adopted forward tapes (the fused set ``aqk`` / ``qscale``; the
+    split forward's four with ``fused_o=0``) beside the backward tapes (the ten kept tapes are hand-off tensors outside
+    the workspace, ``bwd.kept_tapes``), the replay form holds the ten light tapes through the backward; both forms need
+    the same transient bytes."""
     kcp, ctx, ops = _ckpt_setup()
     gb = _package("cake_bytes")
     H_qk, HV = 2, 6
@@ -3753,11 +4382,15 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         tuple(gb.TAPE_NAME_OF.get(n, n) for n in gb.FWD_TAPES_ARENA_AFTER_FWD)
         == kcp.FWD_TAPES_ARENA_AFTER_FWD
     )
+    assert (
+        tuple(gb.TAPE_NAME_OF.get(n, n) for n in gb.FWD_TAPES_ARENA_AFTER_FUSED)
+        == kcp.FWD_TAPES_ARENA_AFTER_FUSED
+    )
     assert gb.EYE_BYTES == gb.STATE_TILE_BYTES == 128 * 128 * 4
     from torch.utils.checkpoint import checkpoint
 
     layouts = {}
-    for form in (True, False):
+    for form, fused in itertools.product((True, False), (0, 1)):
         layout = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
         )
@@ -3768,7 +4401,7 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
             for n in ("q", "k", "v", "g", "beta")
         ]
 
-        def fn(q, k, v, g, beta, _ws=ws, _form=form):
+        def fn(q, k, v, g, beta, _ws=ws, _form=form, _fused=fused):
             return kcp.chunk_gdn_det_kcp(
                 q,
                 k,
@@ -3779,12 +4412,22 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
                 workspace=_ws,
                 backend="fake",
                 reuse_recompute_tapes=_form,
+                test_knobs={"fused_o": _fused},
             )
 
         out = checkpoint(fn, *leaves, use_reentrant=False)
-        assert ws.peak == layout["forward"], (form, ws.peak, layout["forward"])
+        want = layout["forward"] if fused else layout["forward_split"]
+        assert ws.peak == want, (form, fused, ws.peak, want)
         ws.peak = 0
         out.backward(ops["dout"])
+        if not fused:
+            # the split forward's kept backward re-adopts its four tapes (the layout reports the shipped fused form)
+            left = set(ws._tapes) & set(kcp.FWD_TAPES)
+            assert left == set(
+                kcp.FWD_TAPES_ARENA_AFTER_FWD if form else kcp.FWD_TAPES
+            ), (form, sorted(left))
+            assert kcp.kept_registry_size() == 0
+            continue
         assert ws.peak == layout["backward"], (form, ws.peak, layout["backward"])
         assert ws.bytes == layout["bwd.phase.end"], (
             form,
@@ -3799,7 +4442,7 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         ) + sum(
             layout[f"bwd.{n}"]
             for n in (
-                gb.FWD_TAPES_ARENA_AFTER_FWD
+                gb.FWD_TAPES_ARENA_AFTER_FUSED
                 if form
                 else tuple(k for k in gb.FWD_TAPES_ARENA_AFTER_FWD)
                 + ("w", "u", "akk", "gamma", "gcum", "rowscale")
@@ -3807,6 +4450,17 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         )
         assert kcp.kept_registry_size() == 0
     kept, replay = layouts[True], layouts[False]
+    # the fused forward binds no h / v_new at any moment (its peak is #1, akk / gcum still bound)
+    assert (
+        replay["forward_split"] - replay["forward"]
+        == (
+            replay["bwd.h_tape"]
+            + replay["bwd.v_new"]
+            - replay["bwd.akk"]
+            - replay["bwd.gcum"]
+        )
+        > 0
+    )
     assert kept["backward"] < replay["backward"]
     assert kept["bwd.kept_tapes"] == sum(
         replay[f"bwd.{n}"]
@@ -3851,23 +4505,82 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         )
 
 
+@pytest.mark.parametrize("segments", (1, 2))
+def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
+    """A caller-held workspace and ``chunk_gdn_det_fwd_kcp`` with the norm: without a saved set
+    (``save_for_backward=False``) the fused forward's #1 binds the arena ``r`` (``fwd.qk_rstd``, ``8 T_r H_qk``) and the
+    workspace pools a saved set replaces (the ``stage_m`` plane at ``P > 1``).  The forward's peak is the ``forward`` of
+    ``gdn_det_workspace_layout_kcp(..., save_for_backward=False, backward=False)`` exactly (with ``fused_o=0`` its
+    ``forward_split``: ``r`` goes before the tape walk); the saved-set forward's peak is the default layout's, which the
+    keyword leaves unchanged."""
+    kcp, ctx, ops = _ckpt_setup()
+    gb = _package("cake_bytes")
+    H_qk, HV = 2, 6
+    leaves = [ops[n] for n in LEAVES]
+    o = dict(use_qk_l2norm_in_kernel=True)
+    default = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=segments, **o)
+    for save in (False, True):
+        layout = gb.gdn_det_workspace_layout_kcp(
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            P=segments,
+            backward=save,
+            save_for_backward=save,
+            **o,
+        )
+        for fused in (1, 0):
+            ws = _PeakWorkspace(kcp)
+            _out, saved = kcp.chunk_gdn_det_fwd_kcp(
+                *leaves,
+                ctx,
+                workspace=ws,
+                backend="fake",
+                save_for_backward=save,
+                segments=segments,
+                test_knobs={"fused_o": fused},
+                **o,
+            )
+            assert (saved is not None) == save
+            assert kcp.LAST_CALL["fwd"]["fwd_o"] == ("fused" if fused else "launched")
+            assert kcp.LAST_CALL["fwd"]["P"] == segments
+            want = layout["forward"] if fused else layout["forward_split"]
+            assert ws.peak == want, (save, fused, ws.peak, want)
+            assert not {*kcp.QK_TAPES, kcp.QK_RSTD} & set(ws._tapes), sorted(ws._tapes)
+        assert layout["fwd.qk_rstd"] == (0 if save else 8 * ctx.T_r * H_qk), save
+    assert layout == default
+    # the replay boundary keeps no saved set either way; a saved boundary without one has no backward
+    replay = dict(boundary_mode="replay", P=segments, **o)
+    assert gb.gdn_det_workspace_layout_kcp(
+        ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **replay
+    ) == gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **replay)
+    with pytest.raises(ValueError, match="backward=False"):
+        gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **o
+        )
+
+
 # --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"
 # The recompute's tapes are kept only when the GDN node closes the checkpointed region (the frame proof); with a later saver the
 # kept set would live through that operation's backward and raise the region's peak by the full tape set, so "auto" replays there.
 
 
 def _ckpt_autograd_region(
-    kcp, ctx, ops, *, ckpt: bool, later_saver: bool, **opts
+    kcp, ctx, ops, *, ckpt: bool, later_saver: bool, handle=None, **opts
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
     """``out`` and the gradients of a region that ends with the GDN call (``later_saver=False``) or continues with an
     operation that saves tensors for its backward (a scaling by a leaf, ``later_saver=True``), directly or under a
-    non-reentrant checkpoint; the leaf's gradient comes beside the result."""
+    non-reentrant checkpoint (``handle``: the GDN call's ``recompute_handle``); the leaf's gradient comes beside the
+    result."""
     leaves = [
         ops[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
     scale = torch.full((), 1.5, dtype=torch.bfloat16, requires_grad=True)
     o = {"backend": "fake", **opts}
+    if handle is not None:
+        assert ckpt, "a recompute handle needs the checkpoint"
+        o["recompute_handle"] = handle
 
     def fn(q, k, v, g, beta):
         out = kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
@@ -3995,17 +4708,34 @@ def _handle_autograd(
     }, modes
 
 
-@pytest.mark.parametrize("segments", [1, 2])
+@pytest.mark.parametrize(
+    "segments,save_mode", [(1, "light"), (2, "light"), (2, "full")]
+)
 @pytest.mark.parametrize("reuse", [True, False, "auto"])
 def test_recompute_handle_is_bitwise_the_checkpoint_and_the_direct_pass(
-    segments, reuse
+    monkeypatch, segments, save_mode, reuse
 ) -> None:
     """The original forward stores ``S_in`` ("capture"), torch's recompute reads it ("replay"): out and the five
     gradients are bitwise the plain checkpoint's and the direct pass's at the same options, at ``P = 1`` and
-    ``P = 2`` (the carries rebuilt locally), with and without the kept tapes."""
+    ``P = 2`` (the carries rebuilt locally), with and without the kept tapes.  ``save_mode="full"`` at ``P = 2``
+    (its backward runs no transfer walk and reads the saved ``M_seg^T`` plane) runs with every package allocation
+    filled with NaN bytes and gives the light direct pass's bits."""
     kcp, ctx, ops = _ckpt_setup()
-    base = dict(segments=segments, reuse_recompute_tapes=reuse)
+    if save_mode == "full":
+        _nan_filled_allocations(monkeypatch, kcp)
+    base = dict(segments=segments, reuse_recompute_tapes=reuse, save_mode=save_mode)
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_transfer=False, **base)
+    if save_mode == "full":
+        light = _ckpt_autograd(
+            kcp,
+            ctx,
+            ops,
+            ckpt=False,
+            save_transfer=False,
+            segments=segments,
+            reuse_recompute_tapes=reuse,
+        )
+        _assert_same(direct, light, "full direct vs light direct")
     plain, plain_modes = _handle_autograd(kcp, ctx, ops, handle=None, **base)
     handle = kcp.RecomputeHandleDetKcp()
     got, modes = _handle_autograd(kcp, ctx, ops, handle=handle, **base)
@@ -4223,3 +4953,448 @@ def test_packed_qkv_views_det_kcp_rejects_a_bad_row() -> None:
         kcp.packed_qkv_views_det_kcp(
             torch.zeros(5, 9 * 128, dtype=torch.bfloat16), H_qk=2, HV=5
         )
+
+
+# --------------------------------------------------------------------------- the output walk kcp_fwdh_out (fused_o)
+# A forward whose h / v_new tapes have no reader runs kcp_fwdh_out (#2 with #5 folded into each chunk step, no tape
+# written) on every tape-walk launch list.  On the fake backend these are host-plumbing checks (launch lists, output
+# coverage, arena); the kernels' bitwise check is the GPU suites' (fused_o 1 vs 0 in one build).
+FUSED_TO_SPLIT = {
+    "kcp_fwdh_out": "kcp_fwdh_tape",
+    "kcp_fwdh_out_vh64": "kcp_fwdh_tape_vh64",
+}
+
+
+# The fused output walk on the W = 8 row (the multi-rank harness of the non-deterministic twin's tests).
+LEAVES = ("q", "k", "v", "g", "beta")
+EXPLICIT_GRADS = ("dq", "dk", "dv", "dbeta", "dg")  # the backward entries' output order
+
+# The exchange (the owner chains of the families fwd, adj_b1, adj_c1) exists only with W > 1: the host orchestration of
+# W ranks runs here in one process on W threads, on the fake backend, with an in-process stand-in of the one collective
+# the a2a exchange issues (all_to_all_single with explicit split sizes, matched across the ranks by issue order).  The
+# stand-in moves bytes only; every rank's arithmetic is the package's own.
+
+MR_CU = [
+    0,
+    1201,
+]  # one long document: 2 W ragged pieces per document under zigzag_per_document
+MR_W = 8
+MR_HEADS = (2, 8)  # one owned value head per rank (Hg = 1)
+# Mild decays for the multi-rank row: ``_inputs``' gate (-exp(A) softplus(x), mean about -0.7 .. -11 per token) makes
+# the transfer of a ~75-token fragment underflow to ~0.  At 1/200 of it a fragment keeps exp(-0.3 .. -4) of its incoming
+# state: the owner chains carry state across all W ranks.
+MR_G_SCALE = 1.0 / 200.0
+
+
+class _ThreadWork:
+    """The pending receive of one rank in one collective: ``wait()`` copies the peers' chunks once all have issued."""
+
+    def __init__(self, comm, seq: int, rank: int, output, recv_splits) -> None:
+        self.comm, self.seq, self.rank = comm, seq, rank
+        self.output, self.recv_splits = output, recv_splits
+
+    def wait(self) -> None:
+        comm = self.comm
+        with comm.cond:
+            done = comm.cond.wait_for(
+                lambda: comm.failure is not None
+                or len(comm.deposits.get(self.seq, {})) == comm.world,
+                timeout=comm.timeout,
+            )
+            if comm.failure is not None:
+                raise RuntimeError(
+                    f"rank {self.rank}: another rank failed"
+                ) from comm.failure
+            if not done:
+                raise TimeoutError(
+                    f"rank {self.rank}: collective {self.seq} incomplete after {comm.timeout} s"
+                )
+            got = [comm.deposits[self.seq][src][self.rank] for src in range(comm.world)]
+            comm.reads[self.seq] = comm.reads.get(self.seq, 0) + 1
+            if comm.reads[self.seq] == comm.world:
+                del comm.deposits[self.seq]
+        offset = 0
+        for src, (n, chunk) in enumerate(zip(self.recv_splits, got, strict=True)):
+            assert chunk.shape[0] == n, (self.rank, src, n, tuple(chunk.shape))
+            self.output.narrow(0, offset, n).copy_(chunk)
+            offset += n
+
+
+class _ThreadDist:
+    """The ``torch.distributed`` surface the host module reads during an a2a call (``is_available``,
+    ``is_initialized``, ``all_to_all_single``) for ``world`` ranks on as many threads of this process; the rank of a
+    call is its thread's.  ``exchange="ring"`` and ``debug_sequence`` are not emulated."""
+
+    def __init__(self, world: int, timeout: float = 900.0) -> None:
+        self.world, self.timeout = int(world), float(timeout)
+        self.cond = threading.Condition()
+        self.deposits: dict[int, dict[int, list[torch.Tensor]]] = {}
+        self.reads: dict[int, int] = {}
+        self.issued = [0] * self.world
+        self.local = threading.local()
+        self.failure: BaseException | None = None
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+    @staticmethod
+    def is_initialized() -> bool:
+        return True
+
+    def all_to_all_single(
+        self,
+        output,
+        input,  # noqa: A002 - torch.distributed's keyword
+        output_split_sizes=None,
+        input_split_sizes=None,
+        group=None,
+        async_op=False,
+    ):
+        rank = self.local.rank
+        seq = self.issued[rank]
+        self.issued[rank] += 1
+        send = [int(x) for x in input_split_sizes]
+        recv = [int(x) for x in output_split_sizes]
+        assert len(send) == len(recv) == self.world, (rank, send, recv)
+        chunks = [c.clone() for c in torch.split(input, send)]
+        with self.cond:
+            self.deposits.setdefault(seq, {})[rank] = chunks
+            self.cond.notify_all()
+        work = _ThreadWork(self, seq, rank, output, recv)
+        if async_op:
+            return work
+        work.wait()
+        return None
+
+    def fail(self, exc: BaseException) -> None:
+        with self.cond:
+            if self.failure is None:
+                self.failure = exc
+            self.cond.notify_all()
+
+
+def _run_threaded(kcp, world: int, fn, monkeypatch) -> list:
+    """``fn(rank, comm)`` on ``world`` threads with ``cake_kcp.dist`` replaced by a :class:`_ThreadDist`; the per-rank
+    results, or the first rank's failure."""
+    comm = _ThreadDist(world)
+    monkeypatch.setattr(kcp, "dist", comm)
+    results: list = [None] * world
+    errors: list = []
+
+    def worker(rank: int) -> None:
+        comm.local.rank = rank
+        try:
+            results[rank] = fn(rank, comm)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the main thread
+            errors.append((rank, exc))
+            comm.fail(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(r,), name=f"kcp-rank-{r}")
+        for r in range(world)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(comm.timeout + 60)
+    assert not any(t.is_alive() for t in threads), "a rank thread did not finish"
+    if errors:
+        rank, exc = errors[0]
+        raise AssertionError(f"rank {rank} failed: {exc!r}") from exc
+    return results
+
+
+def _call_recorder(kcp, comm_of=lambda: None):
+    """A recording fake backend: per rank (the calling thread's, 0 without threads) the :class:`CallDetKcp` objects in
+    first-launch order and, per call, the program names it launched."""
+    calls: dict[int, list] = {}
+    launched: dict[int, list[str]] = {}
+    lock = threading.Lock()
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            call = args["_call"]
+            comm = comm_of()
+            rank = getattr(comm.local, "rank", 0) if comm is not None else 0
+            with lock:
+                seen = calls.setdefault(rank, [])
+                if all(c is not call for c in seen):
+                    seen.append(call)
+                launched.setdefault(id(call), []).append(name)
+            super().run(name, args)
+
+    return calls, launched, Recording()
+
+
+def _mr_setup():
+    kcp = _package("cake_kcp")
+    part = gp.partition_det_kcp(
+        torch.tensor(MR_CU, dtype=torch.int64), MR_W, "zigzag_per_document"
+    )
+    return kcp, part, _mr_inputs()
+
+
+def _mr_inputs() -> dict[str, torch.Tensor]:
+    ops = dict(_inputs(MR_CU, *MR_HEADS))
+    ops["g"] = (ops["g"] * MR_G_SCALE).contiguous()
+    return ops
+
+
+def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT, knobs=None):
+    """Forward + saved-set backward of every rank of the multi-rank row on the shipped options (plus ``knobs`` on both
+    entries): the global-order results, the per-rank calls (forward, backward) and the launched programs per call."""
+    knobs = dict(knobs or {})
+    holder: dict = {}
+    calls, launched, rec = _call_recorder(kcp, lambda: holder.get("comm"))
+    # group None: the stand-in collective ignores the group (the rank is the calling thread's)
+    ctxs = [
+        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=sm_count)
+        for r in range(MR_W)
+    ]
+
+    def rank_fn(r, comm):
+        holder["comm"] = comm
+        loc = fake.slice_local(ops, part, r)
+        args = [loc[n] for n in LEAVES]
+        out, saved = kcp.chunk_gdn_det_fwd_kcp(*args, ctxs[r], backend="fake", **knobs)
+        grads = kcp.chunk_gdn_det_bwd_kcp(
+            *args,
+            ctxs[r],
+            loc["dout"],
+            saved=saved,
+            backend="fake",
+            **knobs,
+        )
+        return out, grads
+
+    previous = kcp.set_backend("fake", rec)
+    try:
+        per_rank = _run_threaded(kcp, MR_W, rank_fn, monkeypatch)
+    finally:
+        kcp.set_backend("fake", previous)
+        monkeypatch.undo()
+    res = {"out": fake.gather_global(part, [o for o, _ in per_rank])}
+    for i, n in enumerate(EXPLICIT_GRADS):
+        res[n] = fake.gather_global(part, [g[i] for _, g in per_rank])
+    return res, ctxs, calls, launched
+
+
+def _nan_output(kcp, monkeypatch) -> None:
+    """``CallDetKcp.output`` pre-fills a new output with NaN, so a row that neither an output walk nor #5 writes shows."""
+    original = kcp.CallDetKcp.output
+
+    def output(self):
+        fresh = self.out is None
+        t = original(self)
+        if fresh:
+            t.fill_(float("nan"))
+        return t
+
+    monkeypatch.setattr(kcp.CallDetKcp, "output", output)
+
+
+def _split_view(call) -> tuple[list, list]:
+    """A forward call's program sequence and launch records with every output-walk launch named as the tape walk it
+    replaces and #5 left out: a fused forward's view equals its split twin's."""
+    seq = [FUSED_TO_SPLIT.get(n, n) for n in call.sequence if n != "fwd_o"]
+    recs = [
+        (FUSED_TO_SPLIT.get(r, r), tuple(g)) for r, g in call.records if r != "fwd_o"
+    ]
+    return seq, recs
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        {},
+        {"use_qk_l2norm_in_kernel": True},
+        {"test_knobs": {"schedule": "wait_first"}},
+        {"test_knobs": {"fused_walks": 0}},
+        {"test_knobs": {"fwdh_vh": 64}},
+        {"test_knobs": {"fwdh_vh": 128}},
+        {"save_transfer": False},
+    ],
+    ids=(
+        "shipped",
+        "l2n",
+        "wait_first",
+        "fused_walks0",
+        "vh64",
+        "vh128",
+        "no_save_transfer",
+    ),
+)
+def test_fused_output_walk_reproduces_the_split_forward(monkeypatch, knobs) -> None:
+    """The W = 8 row with the shipped fused forward and with test knob ``fused_o=0``: out (pre-filled with NaN when it
+    is allocated) and the five gradients equal bitwise; each rank's fused forward runs ``kcp_fwdh_out`` on exactly the
+    launch lists (records modulo the program, grids) the split forward runs ``kcp_fwdh_tape`` on, and no #5; its
+    ``fwd_o`` evidence is ``"fused"``, and its arena ends without ``h_tape`` / ``v_new``.  The backward calls are
+    the same launches either way."""
+    kcp, part, ops = _mr_setup()
+    runs = {}
+    for fused in (1, 0):
+        k = {**knobs, "test_knobs": {**knobs.get("test_knobs", {}), "fused_o": fused}}
+        _nan_output(kcp, monkeypatch)
+        runs[fused] = _mr_run(kcp, part, ops, monkeypatch, knobs=k)
+    (res1, _, calls1, _), (res0, _, calls0, _) = runs[1], runs[0]
+    assert not torch.isnan(res1["out"].float()).any(), (
+        "a row of the fused output was never written"
+    )
+    for n in ("out",) + EXPLICIT_GRADS:
+        assert torch.equal(res1[n], res0[n]), n
+    for r in range(MR_W):
+        (f1,) = [c for c in calls1[r] if not c.backward]
+        (f0,) = [c for c in calls0[r] if not c.backward]
+        assert f1.scratch["fwd_o"] == "fused" and f0.scratch["fwd_o"] == "launched", r
+        assert "fwd_o" not in f1.sequence and "kcp_fwdh_tape" not in f1.sequence, r
+        assert "kcp_fwdh_out" in f1.sequence and "fwd_o" in f0.sequence, r
+        assert _split_view(f1) == _split_view(f0), r
+        assert not ({"h_tape", "v_new"} & set(f1.ws._tapes)), (r, sorted(f1.ws._tapes))
+        assert {"h_tape", "v_new"} <= set(f0.ws._tapes), (r, sorted(f0.ws._tapes))
+        b1 = [(c.sequence, c.records) for c in calls1[r] if c.backward]
+        b0 = [(c.sequence, c.records) for c in calls0[r] if c.backward]
+        assert b1 == b0, r
+
+
+@pytest.mark.parametrize("segments", (1, 2))
+def test_fused_output_walk_under_checkpoints_and_handles(segments) -> None:
+    """One rank (no exchange), P = 1 / 2: direct autograd, non-reentrant checkpoints of a region the GDN node closes and
+    of one with a later saver under every ``reuse_recompute_tapes`` form (the mixed case: a fused first forward, a
+    split hand-off recompute with ``True``), the recompute handle with a later saver (its recompute writes the output
+    the saver reads: the ``S_in`` branch's tape walks run fused), ``save_mode="full"`` and the replay boundary: out
+    and every gradient equal bitwise with the shipped options and with ``fused_o=0`` (the handle form: and the direct
+    pass); the first forward of a light region is fused, a recompute is fused exactly when it launches #5 without a
+    hand-off (the frame proof is read on a verified torch only), a hand-off or a full / replay-boundary forward never
+    is, and no kept entry is left."""
+    kcp, ctx, ops = _ckpt_setup()
+    opt = _package("cake_options")
+    base = {"segments": segments}
+    forms = [
+        ("direct", dict(ckpt=False, later_saver=False)),
+        ("closing_auto", dict(ckpt=True, later_saver=False)),
+        ("later_auto", dict(ckpt=True, later_saver=True)),
+        ("later_true", dict(ckpt=True, later_saver=True, reuse_recompute_tapes=True)),
+        ("later_false", dict(ckpt=True, later_saver=True, reuse_recompute_tapes=False)),
+        (
+            "closing_true",
+            dict(ckpt=True, later_saver=False, reuse_recompute_tapes=True),
+        ),
+        ("full", dict(ckpt=True, later_saver=True, save_mode="full")),
+        (
+            "replay_boundary",
+            dict(ckpt=False, later_saver=False, boundary_mode="replay"),
+        ),
+        ("handle_later", dict(ckpt=True, later_saver=True, handle=True)),
+    ]
+    for name, form in forms:
+        got = {}
+        for fused in (1, 0):
+            run = dict(form)
+            if run.pop("handle", False):
+                run["handle"] = kcp.RecomputeHandleDetKcp()
+            seen: list[str] = []
+            previous = kcp._BACKENDS.get("fake")
+
+            class Recording(kcp.FakeBackend):
+                def run(self, prog, args, _seen=seen):
+                    if not args["_call"].backward:
+                        _seen.append(prog)
+                    super().run(prog, args)
+
+            kcp._BACKENDS["fake"] = Recording()
+            try:
+                res, scale_grad = _ckpt_autograd_region(
+                    kcp, ctx, ops, **run, **base, test_knobs={"fused_o": fused}
+                )
+            finally:
+                kcp._BACKENDS["fake"] = previous
+            # the last forward's record: the recompute's under a checkpoint
+            got[fused] = (res, scale_grad, seen, dict(kcp.LAST_CALL["fwd"]))
+        (r1, s1, seen1, rec1), (r0, s0, seen0, rec0) = got[1], got[0]
+        for n in ("out",) + CKPT_GRADS:
+            assert torch.equal(r1[n], r0[n]), (name, n)
+        assert (s1 is None and s0 is None) or torch.equal(s1, s0), name
+        light = (
+            form.get("save_mode", "light") == "light"
+            and form.get("boundary_mode", "saved") == "saved"
+        )
+        assert ("kcp_fwdh_out" in seen1) == light, (name, seen1)
+        assert "kcp_fwdh_out" not in seen0, name
+        if light:
+            # the first forward is fused (one #5 fewer); a recompute that launches #5 without a hand-off is fused too
+            # (one more): it launches #5 unless the frame proof finds its output dead (a closing node, verified torch),
+            # and it hands its tapes off with True, or with "auto" when the frame proof keeps them (_auto_hand_off)
+            reuse = form.get("reuse_recompute_tapes", opt.REUSE_RECOMPUTE_TAPES_DEFAULT)
+            later = form["later_saver"]
+            hand_off = reuse is True or (
+                reuse == "auto" and not later and _auto_hand_off(kcp)
+            )
+            recompute_fused = (
+                form["ckpt"] and (later or not _verified_torch(kcp)) and not hand_off
+            )
+            assert seen0.count("fwd_o") - seen1.count("fwd_o") == (
+                2 if recompute_fused else 1
+            ), (name, recompute_fused, seen0, seen1)
+            assert seen1.count("fwd_o") + seen1.count("kcp_fwdh_out") >= 1, name
+        else:
+            assert seen1 == seen0, name  # no forward of these forms fuses
+        if "handle" in form:
+            # the recompute read S_in from the handle and its walks wrote the output the later saver consumes
+            direct, direct_scale = _ckpt_autograd_region(
+                kcp, ctx, ops, ckpt=False, later_saver=True, save_transfer=False, **base
+            )
+            for n in ("out",) + CKPT_GRADS:
+                assert torch.equal(r1[n], direct[n]), (name, n)
+            assert torch.equal(s1, direct_scale), name
+            assert rec1["recompute_handle"] == rec0["recompute_handle"] == "replay"
+            assert (rec1["fwd_o"], rec0["fwd_o"]) == ("fused", "launched"), name
+            assert rec1["P"] == segments, name
+        assert kcp.kept_registry_size() == 0, name
+
+
+def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_the_fused_set(
+    monkeypatch,
+) -> None:
+    """A caller-held workspace: a split forward (``fused_o=0``) leaves ``aqk`` / ``qscale`` / ``h_tape`` / ``v_new``
+    bound; the next fused forward drops ``h_tape`` / ``v_new`` before #1 and leaves ``aqk`` / ``qscale``
+    (:data:`FWD_TAPES_ARENA_AFTER_FUSED`); a kept-tape checkpoint backward re-adopts that fused set only, and the
+    split one re-adopts the four.  Every arm's out and gradients are the same bits."""
+    kcp, ctx, ops = _ckpt_setup()
+    assert kcp.FWD_TAPES_ARENA_AFTER_FUSED == ("aqk", "qscale")
+    ws = kcp.WorkspaceDetKcp()
+    leaves = [ops[n] for n in LEAVES]
+    o0, _ = kcp.chunk_gdn_det_fwd_kcp(
+        *leaves,
+        ctx,
+        workspace=ws,
+        backend="fake",
+        test_knobs={"fused_o": 0},
+    )
+    assert set(ws._tapes) & set(kcp.FWD_TAPES) == set(kcp.FWD_TAPES_ARENA_AFTER_FWD)
+    o1, _ = kcp.chunk_gdn_det_fwd_kcp(*leaves, ctx, workspace=ws, backend="fake")
+    assert kcp.LAST_CALL["fwd"]["fwd_o"] == "fused"
+    assert set(ws._tapes) & set(kcp.FWD_TAPES) == set(kcp.FWD_TAPES_ARENA_AFTER_FUSED)
+    assert torch.equal(o0, o1)
+    arms = {}
+    for fused in (1, 0):
+        wsk = kcp.WorkspaceDetKcp()
+        arms[fused] = _ckpt_autograd(
+            kcp,
+            ctx,
+            ops,
+            ckpt=True,
+            workspace=wsk,
+            reuse_recompute_tapes=True,
+            test_knobs={"fused_o": fused},
+        )
+        want = (
+            kcp.FWD_TAPES_ARENA_AFTER_FUSED if fused else kcp.FWD_TAPES_ARENA_AFTER_FWD
+        )
+        assert set(wsk._tapes) & set(kcp.FWD_TAPES) == set(want), (
+            fused,
+            sorted(wsk._tapes),
+        )
+        assert kcp.kept_registry_size() == 0
+    for n in ("out",) + CKPT_GRADS:
+        assert torch.equal(arms[1][n], arms[0][n]), n

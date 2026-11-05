@@ -181,7 +181,7 @@ kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168(const __grid_constant__ CU
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* a_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int a_s_addr = smem + 1024;
     __nv_bfloat16* b1_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -193,8 +193,7 @@ kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168(const __grid_constant__ CU
     __nv_bfloat16* b01_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int b01_s_addr = smem + 17408;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -242,10 +241,8 @@ kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168(const __grid_constant__ CU
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_big = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_big = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {

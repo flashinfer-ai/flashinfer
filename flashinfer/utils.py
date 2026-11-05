@@ -272,6 +272,8 @@ def _get_cache_buf(
 
 
 _stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
+# Per-device private pools keep these long-lived buffers out of CUDA graph pools.
+_stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
 
 
 def _get_stream_cache_buf(
@@ -287,18 +289,27 @@ def _get_stream_cache_buf(
     (flashinfer-ai/flashinfer#3618). PyTorch draws stream handles from a fixed
     per-device pool, which bounds the number of buffers.
 
-    Not for use during CUDA graph capture: a captured kernel replays on
-    whatever stream replays the graph, so the capture stream is not its owner.
+    Under CUDA graph capture the key is the capture stream, so graphs captured
+    on one stream share the buffer. That is safe only for stateless scratch and
+    only if those graphs never replay concurrently.
     """
     key = (name, device, torch.cuda.current_stream(device).cuda_stream)
     buf = _stream_cache_buf.get(key)
     if buf is None or buf.size(0) < num_bytes:
         if buf is not None:
             _cache_buf_retired.append(buf)
-        if zero_init:
-            buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
-        else:
-            buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+        pool = _stream_cache_mem_pools.get(index)
+        if pool is None:
+            with torch.cuda.device(index):
+                pool = _stream_cache_mem_pools[index] = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool, device=index):
+            if zero_init:
+                buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+            else:
+                buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
         _stream_cache_buf[key] = buf
     return buf
 
@@ -351,6 +362,16 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
         raise ValueError("device must be a cuda device")
     properties = get_device_properties(device)
     return properties.major, properties.minor
+
+
+def _check_block_scale_quantization_support(device: torch.device, op_name: str) -> None:
+    # The CUDA quantization kernels have no implementation below SM100.
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                f"{op_name} requires SM100 or newer; got SM{major}{minor}"
+            )
 
 
 # trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
@@ -1113,6 +1134,15 @@ def get_shuffle_block_size(epilogue_tile_m: int) -> int:
     return shuffle_block_size
 
 
+def _unaligned_rows_message(M: int, alignment: int) -> str:
+    return (
+        f"input_tensor.shape[0]={M} must be a multiple of {alignment}. For the trtllm "
+        "block-scale MoE ops (FP8, FP4, MXINT4), zero-pad the unaligned dimension "
+        "(intermediate_size for FC1, hidden_size for FC2) to a multiple of 128 and "
+        "pass valid_intermediate_size / valid_hidden_size."
+    )
+
+
 def get_shuffle_matrix_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int
 ) -> torch.Tensor:
@@ -1132,9 +1162,7 @@ def get_shuffle_matrix_a_row_indices(
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
     row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
 
-    assert M % shuffle_block_size == 0, (
-        f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
-    )
+    assert M % shuffle_block_size == 0, _unaligned_rows_message(M, shuffle_block_size)
 
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
@@ -1163,7 +1191,7 @@ def get_shuffle_matrix_sf_a_row_indices(
 
     # M, K from the input
     M, K = input_tensor.shape
-    assert M % 128 == 0
+    assert M % 128 == 0, _unaligned_rows_message(M, 128)
     # K % 4 alignment is not required here, downstream block_scale_interleave kernel pads K to a multiple of 4 internally
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 

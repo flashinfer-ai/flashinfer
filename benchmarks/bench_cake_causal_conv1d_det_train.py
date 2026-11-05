@@ -428,7 +428,10 @@ def _partial_rows(
     if bwd_grid_mult == 1:
         return layout["rows"]
     _, _, n_ch_tiles = loader.channel_split(
-        channels, geometry=record["grid_rule"]["geometry"], role=record["role"]
+        channels,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+        route=loader.record_route(record, loader.device_arch(device_index)),
     )
     return loader.partial_rows(int(layout["grid"]) * bwd_grid_mult, n_ch_tiles)
 

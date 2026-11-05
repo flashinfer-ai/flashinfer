@@ -121,6 +121,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_nvfp4_ptilemax_attention" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_fp8_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
@@ -130,6 +131,7 @@ exclude = [
 "flashinfer.experimental.cake_dsa_indexer_det" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_msa_icp_indexer" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
+"flashinfer.experimental.deepgemm_mega_gate" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]

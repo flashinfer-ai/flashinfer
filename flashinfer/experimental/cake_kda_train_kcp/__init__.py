@@ -18,8 +18,8 @@ limitations under the License.
 # Delta Attention) chunked training on SM100 / SM103 / SM107, the counterpart of the deterministic package
 # ``flashinfer.experimental.cake_kda_det_train_kcp``.  The public entry points are in ``flashinfer.cake_kda_train_kcp``
 # (``chunk_kda_kcp``, ``chunk_kda_fwd_kcp``, ``chunk_kda_bwd_kcp``, ``partition_kcp``, ``build_context_kcp``, the
-# byte queries, the checkpoint hand-off's ``kda_handoff_bytes_kcp`` / ``kcp_handoff_stats``; ``deterministic=False``
-# selects this package); the per-rank launch sequences and the autograd
+# byte queries, the checkpoint hand-off's ``kda_handoff_bytes_kcp`` / ``kcp_handoff_stats``, the raw gate mode's
+# ``reduce_gate_param_grads_kcp``; ``deterministic=False`` selects this package); the per-rank launch sequences and the autograd
 # Function (``cake_kcp``), the partition and context plan (``cake_kcp_plan``), the registry of the KCP programs
 # (``cake_kcp_jit``) and their generated sources live here.  The chunk stages a rank runs at its own shape are
 # those of the non-deterministic single-rank package ``flashinfer.experimental.cake.cake_kda_train``; this package
@@ -41,6 +41,7 @@ _SUBMODULE_OF = {
     "chunk_kda_fwd_kcp": "cake_kcp",
     "chunk_kda_kcp": "cake_kcp",
     "kcp_handoff_stats": "cake_kcp",
+    "reduce_gate_param_grads_kcp": "cake_kcp",
     "ContextKcp": "cake_kcp_plan",
     "FragmentKcp": "cake_kcp_plan",
     "PartitionKcp": "cake_kcp_plan",
@@ -84,4 +85,5 @@ __all__ = [
     "kda_saved_bytes_kcp",  # noqa: F822 - resolved by __getattr__
     "kda_workspace_bytes_kcp",  # noqa: F822 - resolved by __getattr__
     "partition_kcp",  # noqa: F822 - resolved by __getattr__
+    "reduce_gate_param_grads_kcp",  # noqa: F822 - resolved by __getattr__
 ]

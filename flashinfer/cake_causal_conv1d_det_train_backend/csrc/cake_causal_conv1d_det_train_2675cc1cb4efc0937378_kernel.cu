@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_OFF 1024
-#define SMEM_RED_STAGE_BYTES 16384
-#define SMEM_RED_STRIDE 16384
-#define SMEM_STAGE_BUF_OFF 17408
-#define SMEM_STAGE_BUF_STAGE_BYTES 65536
-#define SMEM_STAGE_BUF_STRIDE 65536
-#define SMEM_TOTAL 82944
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -222,14 +213,13 @@ kernel_cake_causal_conv1d_det_train_2675cc1cb4efc0937378(__nv_bfloat16* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red = reinterpret_cast<float*>(smem_raw + 1024);
     const int red_addr = smem + 1024;
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 17408);
     const int stage_buf_addr = smem + 17408;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (8 barriers at smem_raw[0..64))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();

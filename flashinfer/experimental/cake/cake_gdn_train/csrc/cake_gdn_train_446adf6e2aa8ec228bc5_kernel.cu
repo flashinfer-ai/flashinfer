@@ -47,55 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ALL_OFFSET 0
-#define NUM_RING_STAGES 2
-#define NUM_ONE_STAGES 1
-#define SMEM_S_W_OFF 0
-#define SMEM_S_W_STAGE_BYTES 16384
-#define SMEM_S_W_STRIDE 65536
-#define SMEM_S_U_OFF 16384
-#define SMEM_S_U_STAGE_BYTES 16384
-#define SMEM_S_U_STRIDE 65536
-#define SMEM_S_KN_OFF 32768
-#define SMEM_S_KN_STAGE_BYTES 16384
-#define SMEM_S_KN_STRIDE 65536
-#define SMEM_S_KNT_OFF 32768
-#define SMEM_S_KNT_STAGE_BYTES 16384
-#define SMEM_S_KNT_STRIDE 65536
-#define SMEM_S_QN_OFF 49152
-#define SMEM_S_QN_STAGE_BYTES 16384
-#define SMEM_S_QN_STRIDE 65536
-#define SMEM_S_GT_OFF 131072
-#define SMEM_S_GT_STAGE_BYTES 2048
-#define SMEM_S_GT_STRIDE 2048
-#define SMEM_S_HS0_OFF 133120
-#define SMEM_S_HS0_STAGE_BYTES 16384
-#define SMEM_S_HS0_STRIDE 16384
-#define SMEM_S_HS1_OFF 149504
-#define SMEM_S_HS1_STAGE_BYTES 16384
-#define SMEM_S_HS1_STRIDE 16384
-#define SMEM_S_VP0_OFF 165888
-#define SMEM_S_VP0_STAGE_BYTES 8192
-#define SMEM_S_VP0_STRIDE 8192
-#define SMEM_S_VP1_OFF 174080
-#define SMEM_S_VP1_STAGE_BYTES 8192
-#define SMEM_S_VP1_STRIDE 8192
-#define SMEM_S_VN_OFF 182272
-#define SMEM_S_VN_STAGE_BYTES 16384
-#define SMEM_S_VN_STRIDE 16384
-#define SMEM_S_VNT_OFF 182272
-#define SMEM_S_VNT_STAGE_BYTES 16384
-#define SMEM_S_VNT_STRIDE 16384
-#define SMEM_S_PG_OFF 198656
-#define SMEM_S_PG_STAGE_BYTES 8192
-#define SMEM_S_PG_STRIDE 8192
-#define SMEM_S_OST_OFF 206848
-#define SMEM_S_OST_STAGE_BYTES 16384
-#define SMEM_S_OST_STRIDE 16384
-#define SMEM_TOTAL 223488
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -255,7 +206,7 @@ kernel_cake_gdn_train_446adf6e2aa8ec228bc5(const __grid_constant__ CUtensorMap q
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_w = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_w_addr = smem + 0;
     __nv_bfloat16* s_u = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -285,8 +236,7 @@ kernel_cake_gdn_train_446adf6e2aa8ec228bc5(const __grid_constant__ CUtensorMap q
     __nv_bfloat16* s_ost = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
     const int s_ost_addr = smem + 206848;
 
-    // Mbarrier init (20 pipeline groups, 0 ordered-sequence groups, 31 barriers)
-    // Mbarriers at smem_raw[223232..223480)
+    // Mbarrier init (31 barriers at smem_raw[223232..223480))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -365,10 +315,10 @@ kernel_cake_gdn_train_446adf6e2aa8ec228bc5(const __grid_constant__ CUtensorMap q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_all = taddr;
 
     // Kernel post-init ops
-    const int tmem_all = taddr;
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
     } else if (warp >= 4 && warp <= 7) {

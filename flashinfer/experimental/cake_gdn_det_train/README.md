@@ -68,7 +68,10 @@ grid needs a second, short wave: with `slots = 6 x SMs` and
 `CTAs = chunks x H`, the plain prep runs for `slots < CTAs <= 2.5 x slots`
 (`sm_100a`, `sm_103a`; `sm_107a` has no plain-prep band and runs `prep_tma`
 for every grid), and
-for Q or K not 16-byte aligned.  Both preps give the same bits.  A long sequence can be
+for Q or K not 16-byte aligned.  Both preps give the same bits.  The WY stage
+runs `wy_tc2`: the chains and outputs of `wy_tc` (the same bits) with a
+64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
+on an SM where `wy_tc` fits four.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
 state.  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),
@@ -89,13 +92,19 @@ half the SMs, the backward runs the two as a wavefront pair: the scan counts
 each (chunk, value head) tile in a workspace once it has stored that tile's
 `dh` and `dv2`, and the tail visits the chunks in the order the scan finishes
 them and waits for each count before it reads the tile.  The tail runs on the
-side stream once every scan CTA has started.  The pair runs on `sm_103a`, and
-on `sm_100a` with at least 32 value heads.  On `sm_100a` the pair also runs
-the second pass of a split plan whose `segments x HV` CTAs outnumber the SMs,
-at any value-head count, on a call of at least 393216 (3 x 2^17) tokens x
-value heads (below that the pair's host cost outlasts the GPU time it saves):
-the pre-scan and the stitch run before the fork, and the tail starts once the
-last scan CTA of the second round has started.  A
+side stream once every scan CTA has started.  The pair runs on `sm_103a` and
+`sm_107a`, and on `sm_100a` with at least 32 value heads.  On `sm_100a` and
+`sm_103a` the pair also runs the second pass of a split plan whose `segments x HV` CTAs
+outnumber the SMs, at any value-head count, on a call of at least 393216
+(3 x 2^17) tokens x value heads (below that the pair's host cost outlasts the
+GPU time it saves): the pre-scan and the stitch run before the fork, and the
+tail starts once the last scan CTA of the second round has started.  That
+scan is `dhu_tc2_wavefront_split`, whose store warps meet at a barrier every
+four chunks and let one thread fence and add the counts of those chunks;
+the scan of at most half the SMs keeps `dhu_tc2_wavefront`, whose store
+threads each fence every two chunks and add one per chunk (on `sm_107a` its
+store warps meet every eight chunks and one thread fences and adds the counts,
+as the split pass 2's scan does every four).  A
 CUDA graph does not order its two branches, so under a capture the backward
 records the separate launches.  The tail reads the values it reads without the pair: the
 same bits.
