@@ -434,7 +434,11 @@ def _check_mxfp8_cute_dsl_inputs(input, alignment):
     )
     if input.dim() < 2:
         raise ValueError("CuTe-DSL MXFP8 input must have at least two dimensions")
+    if input.layout != torch.strided:
+        raise ValueError("CuTe-DSL MXFP8 input must use strided layout")
     k = input.shape[-1]
+    if k == 0:
+        raise ValueError("CuTe-DSL MXFP8 input must have a nonempty last dimension")
     assert k % 32 == 0, f"K ({k}) must be divisible by SF_VEC_SIZE=32"
 
 
@@ -502,7 +506,8 @@ def mxfp8_quantize(
         Contiguous CUDA input of shape ``[..., M, K]`` with dtype fp16/bf16
         for ``"cuda"``. Its CPU host path takes a 2-D fp32 input.
         The ``"cute-dsl"`` backend additionally supports fp32 CUDA input and
-        prepares non-contiguous inputs when necessary.
+        prepares non-contiguous strided inputs when necessary. It requires
+        a nonempty last dimension divisible by 32.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -582,6 +587,7 @@ def mxfp8_quantize(
         backend = "cuda"
 
     if backend == "cute-dsl":
+        _check_mxfp8_cute_dsl_inputs(input, alignment)
         from ..cute_dsl import is_cute_dsl_available
 
         if not is_cute_dsl_available():

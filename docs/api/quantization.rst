@@ -258,8 +258,9 @@ For example, the CPU host path accepts contiguous 2-D float32 inputs:
     mxfp8_quantize.check_inputs(x, backend="cuda")
 
 CUDA native, CuTe-DSL and batch-invariant calls retain their distinct
-requirements. In particular, CuTe may prepare a non-contiguous input, and
-``auto`` keeps its existing route. Passing preflight does not certify build,
+requirements. In particular, CuTe may prepare a non-contiguous strided input,
+but rejects non-strided layouts and an empty last dimension. ``auto`` keeps
+its existing route. Passing preflight does not certify build,
 storage-address alignment, launch or numerical correctness. Batch-invariant
 preflight reuses that mode's existing device and dependency checks.
 
