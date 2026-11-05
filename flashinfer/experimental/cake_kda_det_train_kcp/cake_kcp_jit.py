@@ -190,13 +190,17 @@ WALK_FORMS = ("auto", "full", "split")
 #     93.9 / 83.6 | z2 366.3 / 236.3 | w1 134.6 / 90.1; H = 8: w4 86.3 / 63.0;
 #     H = 4: w4 84.5 / 55.9 | z2 362.7 / 230.2 | w1 132.2 / 85.0 | w2d 314.8 /
 #     200.5 -> the two-CTA record up to 32 heads, the full-width one above;
-#   sm_100a (GB200, 152 SMs; back to back), H = 64: w4 254.3 / 266.9 | z2
-#     411.5 / 455.6 | c14 406.3 / 444.7 | d4 219.2 / 232.9 -> the full-width
-#     record at 64 heads; the bands of sm_103a (the same SM count) below;
+#   sm_100a (GB200, 152 SMs; cold L2), H = 64: w4 253.6 / 267.7 | z2 412.6 /
+#     462.2 | c14 409.1 / 447.9 | d4 219.7 / 233.3 | w2d 517.9 / 538.0; H =
+#     32: w4 145.6 / 147.3 | z2 374.1 / 266.9 | w2d 342.9 / 307.3; H = 16: w4
+#     97.1 / 87.0 | z2 369.0 / 239.0 | w1 136.1 / 91.6; H = 8: w4 87.4 / 63.9;
+#     H = 4: w4 84.7 / 57.1 | z2 363.6 / 231.3 | w1 133.0 / 85.2 | w2d 315.7 /
+#     200.9 -> the same bands;
 #   sm_107a (an R200 board with 208 SMs; back to back; the kernel before its
 #     plain u loads), H = 64: w4 222.3 / 211.5 | z2 620.8 / 445.9 | c14 355.0
-#     / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (its lead grows as the
-#     heads, and so the CTAs, get fewer).
+#     / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (fewer heads not
+#     measured there; on sm_100a / sm_103a the two-CTA lead grows as the heads
+#     get fewer).
 FWDH_O_FORM_RULE: dict[str, Any] = {
     "sm_100a": ((32, "split"), (None, "full")),
     "sm_103a": ((32, "split"), (None, "full")),
