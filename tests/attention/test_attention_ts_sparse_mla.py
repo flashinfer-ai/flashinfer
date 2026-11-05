@@ -2183,12 +2183,13 @@ def test_sparse_mla_global_scales_graph_replay(monkeypatch):
     check(values)
     graph = torch.cuda.CUDAGraph()
     previous_sync_mode = torch.cuda.get_sync_debug_mode()
-    try:
-        torch.cuda.set_sync_debug_mode("error")
-        with torch.cuda.graph(graph):
+    # Graph setup may synchronize; guard only the attention call.
+    with torch.cuda.graph(graph):
+        try:
+            torch.cuda.set_sync_debug_mode("error")
             run()
-    finally:
-        torch.cuda.set_sync_debug_mode(previous_sync_mode)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_sync_mode)
     changed = tuple(
         value * (1.5 if kind else 1.0)
         for value, kind in zip(values, kinds, strict=True)
