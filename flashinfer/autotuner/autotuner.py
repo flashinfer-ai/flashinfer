@@ -934,8 +934,9 @@ def autotune(
         tuning_buckets: Optional sequence of integer measurement points.
             When provided, replaces the default power-of-2 buckets for all
             operations within this context.  For example,
-            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles exactly
-            those batch sizes.  Duplicates are removed and values are sorted
+            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles those batch
+            sizes.  Listed sizes that an op maps to the same bucket share one
+            tuned entry.  Duplicates are removed and values are sorted
             automatically.  Must contain **at least one** value when provided;
             pass ``None`` (or omit) to inherit the current buckets.
 
@@ -1013,8 +1014,8 @@ def autotune(
 
     **Using both parameters together** -- ``round_up`` has no effect.  Each
     op's own mapper decides which bucket a runtime size uses, and a size whose
-    op bucket is not in the list finds no tuned entry inside the context and
-    uses the default tactic.
+    op bucket no listed size maps to finds no tuned entry inside the context
+    and uses the default tactic.
 
     Examples::
 
