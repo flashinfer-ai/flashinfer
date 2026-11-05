@@ -295,9 +295,11 @@ def _check_case(
         y_ref, S_ref, u_ref, khat, gam = _ref_fp32(
             q[r], k[r], v[r], a[r], b[r], A_log, dt_bias, pool0[r], kc_l, uc_l, gc_l, P
         )
+        assert torch.isfinite(y[r].float()).all(), f"row {r}: non-finite y"
         errs["y"] = max(errs["y"], (y[r].float() - y_ref).abs().max().item())
         flushed = P >= flush_min
         if flushed:
+            assert torch.isfinite(pool[r].float()).all(), f"row {r}: non-finite S"
             errs["S"] = max(errs["S"], (pool[r].float() - S_ref).abs().max().item())
         else:
             assert torch.equal(pool[r], pool0[r]), (
@@ -312,6 +314,9 @@ def _check_case(
             win = torch.tensor(
                 [(bases[r] + j) % RING for j in range(P)], dtype=torch.long, device=DEV
             )
+            assert torch.isfinite(uc[r][:, app].float()).all(), f"row {r}: non-finite u"
+            assert torch.isfinite(kc[r][:, app].float()).all(), f"row {r}: non-finite k"
+            assert torch.isfinite(gc[r][:, app]).all(), f"row {r}: non-finite g"
             errs["u"] = max(
                 errs["u"],
                 (uc[r][:, app].float() - u_ref.transpose(0, 1)).abs().max().item(),
@@ -590,6 +595,7 @@ def test_multistep_horizon_with_commits(T):
                 gc[r],
                 0,
             )
+            assert torch.isfinite(y[r].float()).all(), f"row {r}: non-finite y"
             worst = max(worst, (y[r].float() - ref_y).abs().max().item())
             # advance the fp32 truth by the T tokens
             khat = F.normalize(k[r].float(), dim=-1)
@@ -812,6 +818,7 @@ def test_multistep_partial_acceptance_wraps_the_ring(T):
                 gc[r],
                 0,
             )
+            assert torch.isfinite(y[r].float()).all(), f"row {r}: non-finite y"
             worst = max(worst, (y[r].float() - ref_y).abs().max().item())
             khat = F.normalize(k[r].float(), dim=-1)
             for t in range(int(acc[r])):
@@ -1070,6 +1077,7 @@ def test_vf_multistep_horizon_with_commits(T):
                 gc[r],
                 0,
             )
+            assert torch.isfinite(y[r].float()).all(), f"row {r}: non-finite y"
             worst = max(worst, (y[r].float() - ref_y).abs().max().item())
             khat = F.normalize(k[r].float(), dim=-1)
             for t in range(T):
