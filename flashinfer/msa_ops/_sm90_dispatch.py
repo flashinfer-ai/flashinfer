@@ -36,8 +36,9 @@ default and explicit f16 accumulation through ``use_fp32_acc=False``.
 
 Measured shapes on which a class served by Cake is not faster than the CuTe
 DSL kernel (H100 SXM, sm_90a, kernel time; CuTe DSL kernels as of commit
-df4d2b03, later CuTe changes not re-measured). Each entry gives CuTe time /
-Cake time, then the CuTe and Cake times; below 1 means CuTe is faster.
+df4d2b03, later CuTe changes not re-measured). Each entry with a ratio gives
+CuTe time / Cake time, then the CuTe and Cake times; below 1 means CuTe is
+faster. Parity entries without numbers were recorded only as within 0.06 us.
 The top-k, proxy-score and sparse-decode shapes below still route to Cake.
 K = 1024 tokens.
 
