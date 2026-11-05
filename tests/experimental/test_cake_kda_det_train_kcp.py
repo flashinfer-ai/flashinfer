@@ -4418,7 +4418,8 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
     full-width launches of the capped programs only (a two-CTA launch runs uncapped), so the expectations follow the
     forms the calls launched (``LAST_CALL[kind]["walk_forms"]``): under ``walk_form="auto"`` the registry's rule
     decides per launch, under ``"full"`` every launch is full-width and the bracket / skip / node-attribute paths are
-    exercised."""
+    exercised.  The forward's state walk is the fused ``kcp_fwdh_o`` (no tape, never capped): the capped launches
+    are the backward's tape walks."""
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap, "walk_form": walk_form}}
     backend = cake_kcp.get_backend()
@@ -4495,10 +4496,18 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
         eager_cc(recs0[0]),
         eager_cc(recs0[1]),
     ), recs0
+    if isinstance(programs, cake_kcp._FiPrograms):
+        # the forward's state walk is the fused kcp_fwdh_o (no tape program: never capped); the tape walks are the
+        # backward's
+        assert any(
+            cake_kcp._PROGRAM_OF[name] == "fwdh_o"
+            for name, _, _ in recs0[0]["walk_forms"]
+        ), recs0
+        assert n_capped(recs0[0]) == 0, recs0
     if (
         capped and walk_form == "full"
-    ):  # every tape launch full-width: the eager bracket on both calls
-        assert n_capped(recs0[0]) >= 1 and n_capped(recs0[1]) >= 1, recs0
+    ):  # every tape launch full-width: the eager bracket on the backward
+        assert n_capped(recs0[1]) >= 1, recs0
     fallback0 = cake_kcp.GRAPH_STATS["fallback"]
     skips0 = programs.capture_skips if capped else None
     nodes0 = programs.node_attrs if capped else None
@@ -4546,9 +4555,9 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
             caps[1][0] + caps[cap_b][1]
         )  # the capped (full-width tape) launches inside the two captures
         if capped and walk_form == "full":
-            assert n_cap_captured >= 2, (
+            assert caps[1][0] == 0 and caps[cap_b][1] >= 1, (
                 caps
-            )  # both captures hold full-width tape launches
+            )  # the backward's capture holds full-width tape launches, the forward's none (its fused walk)
         if capped and graph_cap in cake_kcp.GRAPH_NODE_CAPS:
             # kernel-node cap forms: nothing launched bare; every captured capped launch carries the node attribute
             assert programs.capture_skips == skips0, (programs.capture_skips, skips0)
