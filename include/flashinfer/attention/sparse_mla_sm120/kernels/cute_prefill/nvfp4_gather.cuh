@@ -4,16 +4,16 @@
 
 #include <cutlass/arch/barrier.h>
 
-#include "nvfp4_copy.cuh"
-
 #include "../../common/zero_row.cuh"
 #include "../../model/dsv4_nvfp4_layout.cuh"
 #include "../dsv4_nvfp4/resources.cuh"
+#include "nvfp4_copy.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 template <int PageSize, bool Dual>
-__device__ __forceinline__ void cute_page_location(int index, bool extra, int page_size, int& page, int& local) {
+__device__ __forceinline__ void cute_page_location(int index, bool extra, int page_size, int& page,
+                                                   int& local) {
   // PageSize==0 is the runtime-page variant (mirrors the fp8 prefill idiom); a
   // nonzero PageSize keeps the compile-time divisor on the canonical path.
   // Extra-candidate chunks always resolve through the runtime extra page size.
@@ -32,12 +32,11 @@ __device__ __forceinline__ void cute_page_location(int index, bool extra, int pa
 }
 
 template <int PageSize, bool Dual, int Stride, int GatherThreads>
-__device__ __forceinline__ void cute_gather_tile(const uint8_t* cache, const int32_t* indices, int chunk,
-                                 int length, bool extra, int page_size, size_t page_stride,
-                                 int entry, uint8_t* packed, bf16* rope, uint8_t* scales,
-                                 uint64_t* ready, int main_chunks, int extra_length,
-                                 const uint8_t* extra_cache, const int32_t* extra_indices,
-                                 int extra_page_size, size_t extra_stride) {
+__device__ __forceinline__ void cute_gather_tile(
+    const uint8_t* cache, const int32_t* indices, int chunk, int length, bool extra, int page_size,
+    size_t page_stride, int entry, uint8_t* packed, bf16* rope, uint8_t* scales, uint64_t* ready,
+    int main_chunks, int extra_length, const uint8_t* extra_cache, const int32_t* extra_indices,
+    int extra_page_size, size_t extra_stride) {
   if constexpr (Dual) {
     if (chunk >= main_chunks) {
       extra = true;
@@ -79,9 +78,9 @@ __device__ __forceinline__ void cute_gather_tile(const uint8_t* cache, const int
   cutlass::arch::NamedBarrier::sync(
       GatherThreads, static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::GATHER));
   cute::SM120_BULK_COPY_G2S::copy(source, ready, packed + size_t(entry) * Stride,
-                                 Layout::PACKED_NOPE_BYTES);
+                                  Layout::PACKED_NOPE_BYTES);
   cute::SM120_BULK_COPY_G2S::copy(source + Layout::PACKED_NOPE_BYTES, ready,
-                                 rope + size_t(entry) * Layout::D_ROPE, Layout::ROPE_BYTES);
+                                  rope + size_t(entry) * Layout::D_ROPE, Layout::ROPE_BYTES);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4

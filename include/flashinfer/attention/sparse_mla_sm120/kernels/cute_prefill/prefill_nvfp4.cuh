@@ -16,14 +16,15 @@
 
 #pragma once
 
+#include <cutlass/arch/barrier.h>
+
 #include "../../common/lse.cuh"
 #include "../../common/zero_row.cuh"
 #include "../../compute/nvfp4_vt.cuh"
+#include "../dsv4_nvfp4/resources.cuh"
 #include "nvfp4_gather.cuh"
 #include "nvfp4_mma.cuh"
-#include <cutlass/arch/barrier.h>
 #include "nvfp4_q_stage.cuh"
-#include "../dsv4_nvfp4/resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
@@ -43,16 +44,14 @@ __device__ __forceinline__ float2 prefill_sink_normalization(float lse, float si
 }
 
 template <int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, bool DUAL_CACHE, bool Mega>
-__global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
-    sparse_mla_prefill_dsv4_nvfp4_kernel(
-        const bf16* __restrict__ q, const uint8_t* __restrict__ kv_cache,
-        const int32_t* __restrict__ indices, bf16* __restrict__ output, float* __restrict__ out_lse,
-        const float* __restrict__ attn_sink, const int* __restrict__ topk_length_ptr,
-        const uint8_t* __restrict__ extra_kv_cache, const int32_t* __restrict__ extra_indices,
-        const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
-        size_t extra_page_stride_bytes, int num_tokens,
-        float sm_scale, int page_block_size, size_t page_stride_bytes,
-        float lse_scale, SparseMlaMegaParams mega = {}) {
+__global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill_dsv4_nvfp4_kernel(
+    const bf16* __restrict__ q, const uint8_t* __restrict__ kv_cache,
+    const int32_t* __restrict__ indices, bf16* __restrict__ output, float* __restrict__ out_lse,
+    const float* __restrict__ attn_sink, const int* __restrict__ topk_length_ptr,
+    const uint8_t* __restrict__ extra_kv_cache, const int32_t* __restrict__ extra_indices,
+    const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
+    size_t extra_page_stride_bytes, int num_tokens, float sm_scale, int page_block_size,
+    size_t page_stride_bytes, float lse_scale, SparseMlaMegaParams mega = {}) {
   static_assert(NUM_HEADS <= STREAMING_HEADS_PER_CTA || NUM_HEADS % STREAMING_HEADS_PER_CTA == 0);
   static_assert(NUM_HEADS % HPB == 0,
                 "streaming kernel processes full HPB head groups; thinner heads use the decode "
@@ -138,7 +137,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   }
 
   auto issue_gather = [&](int chunk, int buf) {
-    cute_gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE, STREAMING_GATHER_WARPS * 32>(
+    cute_gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE,
+                     STREAMING_GATHER_WARPS * 32>(
         kv_cache, idx_base, chunk, topk_len, false, page_block_size, page_stride_bytes,
         (warp_id - STREAMING_N_WARPS) * 32 + lane, sm.kv_fp4(buf), sm.kv_rope(buf), sm.kv_sc(buf),
         sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
@@ -169,7 +169,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       prepare_nvfp4_vt_from_smem<STREAMING_IO_WARPS * 32, STREAMING_KV_SMEM_STRIDE,
                                  STREAMING_MATH_THREADS>(sm.kv_fp4(buf), sm.kv_sc(buf),
                                                          sm.vt_data(vt_slot), sm.vt_sc(vt_slot));
-      cutlass::arch::NamedBarrier::sync(STREAMING_IO_WARPS * 32,
+      cutlass::arch::NamedBarrier::sync(
+          STREAMING_IO_WARPS * 32,
           static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::VT_PRODUCER));
       Barrier::arrive(sm.mbar_vt_full(vt_slot));
       vt_free_phase[vt_slot] ^= 1;
@@ -193,8 +194,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     const bf16* q_base =
         q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)(h_start + group * HPB) * D_QK;
     cute_quantize_prefill_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
-                             STREAMING_Q_SCALE_STRIDE>(
-        sm.q_fp4(group), sm.q_sc(group), sm.q_rope(group), q_base, HPB, (Mega ? mega.cos_sin + size_t(mega.positions[token_idx]) * 64 : nullptr));
+                                          STREAMING_Q_SCALE_STRIDE>(
+        sm.q_fp4(group), sm.q_sc(group), sm.q_rope(group), q_base, HPB,
+        (Mega ? mega.cos_sin + size_t(mega.positions[token_idx]) * 64 : nullptr));
   }
 
   float acc_nope[STREAMING_HEAD_GROUPS][PV_GROUPS_PER_WARP][PV_N8_TILES_PER_GROUP][4] = {0};
@@ -232,7 +234,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 
     float qk[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4] = {0};
     cute_qk_nvfp4<VALID_HEAD_GROUPS, STREAMING_Q_FP4_STRIDE, STREAMING_Q_SCALE_STRIDE,
-                       STREAMING_KV_SMEM_STRIDE, STREAMING_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
+                  STREAMING_KV_SMEM_STRIDE, STREAMING_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
         qk, sm.q_fp4(0), sm.q_sc(0), sm_kv_fp4, sm_kv_sc, warp_first_cand, lane);
 
 #pragma unroll
@@ -247,8 +249,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
         const int col = ks * 16 + (lane >> 4) * 8;
         cute_ldsm4(a0, a1, a2, a3, sm.q_rope(group) + CutePrefillQRopeLayout{}(row, col));
-        CuteMmaResult r = cute_mma_rope(a0, a1, a2, a3, b0, b1, qk[group][0][0],
-                                            qk[group][0][1], qk[group][0][2], qk[group][0][3]);
+        CuteMmaResult r = cute_mma_rope(a0, a1, a2, a3, b0, b1, qk[group][0][0], qk[group][0][1],
+                                        qk[group][0][2], qk[group][0][3]);
         qk[group][0][0] = r.d0;
         qk[group][0][1] = r.d1;
         qk[group][0][2] = r.d2;
@@ -302,7 +304,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         sm.reduce_scratch()[base + gid + 8] = local_max[group][1];
       }
     }
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     if (threadIdx.x < HEADS_PER_CTA) {
@@ -316,7 +319,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       const int group_base = group * REDUCE_GROUP_STRIDE;
       sm.reduce_scratch()[group_base + head] = block_max;
     }
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
@@ -327,7 +331,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     }
     // All warps must retain block max in registers before warp 0's slots are
     // recycled for the rescaled local sums.
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
@@ -340,7 +345,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
             local_sum[group][1] * exp2f(local_max[group][1] - block_max_value[group][1]);
       }
     }
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     if (threadIdx.x < HEADS_PER_CTA) {
@@ -352,7 +358,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         block_sum += sm.reduce_scratch()[(group * STREAMING_N_WARPS + w) * HPB + head];
       sm.reduce_scratch()[group * REDUCE_GROUP_STRIDE + head] = block_sum;
     }
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
@@ -416,7 +423,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 
     // Math warps form P while IO warps transpose and requantize the
     // 64-candidate V tile in shared memory.
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     for (int task = threadIdx.x; task < HEADS_PER_CTA * NVFP4_VT_SCALE_GROUPS;
@@ -431,7 +439,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
               cand_group * FP4_PACKED_PER_GROUP,
           sm.w_sc(group) + head_in_group * NVFP4_VT_SCALE_GROUPS + cand_group);
     }
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
     const int vt_slot = chunk % STREAMING_VT_PIPE_STAGES;
     Barrier::wait(sm.mbar_vt_full(vt_slot), vt_ready_phase[vt_slot]);
@@ -439,7 +448,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     cute_pv_nvfp4<VALID_HEAD_GROUPS, STREAMING_W_PACKED_STRIDE, STREAMING_N_WARPS>(
         acc_nope, sm.p_fp4(0), sm.w_sc(0), sm.vt_data(vt_slot), sm.vt_sc(vt_slot), warp_id, lane);
 
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
     Barrier::arrive(sm.mbar_vt_empty(vt_slot));
     vt_ready_phase[vt_slot] ^= 1;
@@ -452,7 +462,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
         cute_load_rope_a(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group],
-                             sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane);
+                         sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane);
       }
 #pragma unroll
       for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
@@ -476,9 +486,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 #pragma unroll
         for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
           CuteMmaResult r =
-              cute_mma_rope(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group], b0,
-                                b1, acc_rope[group][nt][0], acc_rope[group][nt][1],
-                                acc_rope[group][nt][2], acc_rope[group][nt][3]);
+              cute_mma_rope(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group], b0, b1,
+                            acc_rope[group][nt][0], acc_rope[group][nt][1], acc_rope[group][nt][2],
+                            acc_rope[group][nt][3]);
           acc_rope[group][nt][0] = r.d0;
           acc_rope[group][nt][1] = r.d1;
           acc_rope[group][nt][2] = r.d2;
@@ -487,7 +497,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       }
     }
 
-    cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
+    cutlass::arch::NamedBarrier::sync(
+        STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
     Barrier::arrive(sm.mbar_empty(raw_consumer_slot));
     if (++raw_consumer_slot == STREAMING_KV_BUF_COUNT) {
@@ -522,8 +533,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       out_lse[(size_t)token_idx * NUM_HEADS + h0 + 8] = scale_output_lse(lse1, lse_scale);
     }
   }
-  cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
-        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
+  cutlass::arch::NamedBarrier::sync(
+      STREAMING_MATH_THREADS,
+      static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
 #pragma unroll
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
@@ -565,15 +577,17 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
     }
     if constexpr (Mega) {
-      cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
-        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
+      cutlass::arch::NamedBarrier::sync(
+          STREAMING_MATH_THREADS,
+          static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
       for (int i = threadIdx.x; i < HPB * D_V / 8; i += STREAMING_MATH_THREADS) {
         mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
                     ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V + i * 8, token_idx, mega);
       }
       // Release epilogue scratch before the next head group reuses raw KV.
-      cutlass::arch::NamedBarrier::sync(STREAMING_MATH_THREADS,
-        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
+      cutlass::arch::NamedBarrier::sync(
+          STREAMING_MATH_THREADS,
+          static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
     }
   }
 }

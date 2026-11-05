@@ -14,8 +14,10 @@ struct SM120_BULK_COPY_G2S {
     uint32_t dst = cast_smem_ptr_to_uint(destination);
     uint32_t bar = cast_smem_ptr_to_uint(ready);
     asm volatile(
-        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-        :: "r"(dst), "l"(source), "r"(bytes), "r"(bar) : "memory");
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+            dst),
+        "l"(source), "r"(bytes), "r"(bar)
+        : "memory");
   }
 };
 }  // namespace cute

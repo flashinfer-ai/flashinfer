@@ -240,13 +240,14 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
             plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan, lse_scale);
 }
 void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorView cache,
-                              TensorView indices, Optional<TensorView> mid,
-                              Optional<TensorView> mlse, TensorView output, TensorView lse,
-                              double scale, Optional<TensorView> lengths, Optional<TensorView> sink,
-                              Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
-                              Optional<TensorView> extra_lengths, double lse_scale,
-                              TensorView positions, TensorView cos_sin, TensorView fp8_output,
-                              TensorView output_scales) {
+                                 TensorView indices, Optional<TensorView> mid,
+                                 Optional<TensorView> mlse, TensorView output, TensorView lse,
+                                 double scale, Optional<TensorView> lengths,
+                                 Optional<TensorView> sink, Optional<TensorView> extra_cache,
+                                 Optional<TensorView> extra_indices,
+                                 Optional<TensorView> extra_lengths, double lse_scale,
+                                 TensorView positions, TensorView cos_sin, TensorView fp8_output,
+                                 TensorView output_scales) {
   const auto& plan = execution::unpack_plan(descriptor, true);
   TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) == plan.metadata.tokens &&
                  q.size(1) == plan.metadata.heads)

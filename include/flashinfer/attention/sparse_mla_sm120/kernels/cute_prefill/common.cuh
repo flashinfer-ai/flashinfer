@@ -1,14 +1,15 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
-#include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/mma_traits_sm89.hpp>
-#include "copy_atom.cuh"
-#include "../../arch/common.cuh"
+#include <cute/tensor.hpp>
+
 #include "../../arch/barrier.cuh"
+#include "../../arch/common.cuh"
 #include "../../arch/cp_async.cuh"
 #include "../../compute/mega.cuh"
+#include "copy_atom.cuh"
 
 namespace flashinfer::sparse_mla_sm120::cute_prefill {
 using namespace cute;

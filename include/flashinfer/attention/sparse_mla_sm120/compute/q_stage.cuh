@@ -181,7 +181,8 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
       const int h = v / ROPE_VECS_PER_HEAD, r = v % ROPE_VECS_PER_HEAD;
       uint4 val = make_uint4(0, 0, 0, 0);
       if (h < valid_hpb) val = *reinterpret_cast<const uint4*>(q_base + h * DIM + D_NOPE + r * 8);
-      if constexpr (Rotation != 1) val = mega_rotate8<Rotation != 2>(val, D_NOPE + r * 8, mega_cs);
+      if constexpr (Rotation != 1)
+        val = mega_rotate8 < Rotation != 2 > (val, D_NOPE + r * 8, mega_cs);
       *reinterpret_cast<uint4*>(q_rope + h * D_ROPE + r * 8) = val;
     }
   }
@@ -214,7 +215,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
 
     uint4 pk = make_uint4(0, 0, 0, 0);
     if (load) pk = *reinterpret_cast<const uint4*>(q_base + h * DIM + d0);
-    if constexpr (Rotation != 1) pk = mega_rotate8<Rotation != 2>(pk, d0, mega_cs);
+    if constexpr (Rotation != 1) pk = mega_rotate8 < Rotation != 2 > (pk, d0, mega_cs);
     const bf16* e = reinterpret_cast<const bf16*>(&pk);
 
     // Per-thread absmax over this thread's 8 elements, then across the tile's

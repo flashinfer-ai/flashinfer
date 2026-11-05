@@ -1,9 +1,10 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
-#include "common.cuh"
 #include <cute/atom/copy_traits_sm75.hpp>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
+
+#include "common.cuh"
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
 // CTA: one query token, up to 32 heads, 64 sparse candidates/tile, 512 features.
 // All heads of this query use the same candidate indices. Head ranges below are
@@ -29,17 +30,17 @@ struct alignas(128) Shared {
   uint8_t v[3][64 * 128];     // (stage, candidate, feature)
   uint8_t k_sf[2][64 * 16];   // (tile parity, candidate, 32-feature scale group)
   uint8_t v_sf[2][64 * 16];   // Same (candidate, feature-group) layout as the cache.
-  float scores[2][32 * 64];  // (tile parity, head, candidate), swizzled below.
+  float scores[2][32 * 64];   // (tile parity, head, candidate), swizzled below.
   Pipeline::SharedStorage k_pipeline, v_pipeline;
 };
 static_assert(sizeof(Shared) == 94336);
 // K and V use three ring slots independently of the feature-loop extent.
 // K: (candidate=64, micro-feature=128, feature-half=2, ring-slot=3).
 // V: (candidate=64, micro-feature=128, ring-slot=3).
-using MicroLayout = decltype(composition(Swizzle<3, 4, 3>{},
-    Layout<Shape<_64, _128>, Stride<_128, _1>>{}));
-using MicroTransposed = decltype(composition(Swizzle<3, 4, 3>{},
-    Layout<Shape<_128, _64>, Stride<_1, _128>>{}));
+using MicroLayout =
+    decltype(composition(Swizzle<3, 4, 3>{}, Layout<Shape<_64, _128>, Stride<_128, _1>>{}));
+using MicroTransposed =
+    decltype(composition(Swizzle<3, 4, 3>{}, Layout<Shape<_128, _64>, Stride<_1, _128>>{}));
 
 // Score swizzle (float elements): row bit0 -> column bit4, row bit1 -> column bit3.
 // It preserves QK's 2-float stores and PV's 4-float loads.
@@ -58,16 +59,22 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   const int lane = threadIdx.x % 32;
   const int wg = threadIdx.x / 128;
   const int warp = (threadIdx.x % 128) / 32;
-  const Role role = wg == 0 ? Role::mma_qk : wg == 1 ? Role::mma_pv
-      : warp < 2 ? Role::load_k : Role::load_v;
+  const Role role = wg == 0    ? Role::mma_qk
+                    : wg == 1  ? Role::mma_pv
+                    : warp < 2 ? Role::load_k
+                               : Role::load_v;
   Pipeline::Params k_params, v_params;
   k_params.producer_arv_count = v_params.producer_arv_count = 64;
   k_params.consumer_arv_count = v_params.consumer_arv_count = 128;
   k_params.dst_blockid = v_params.dst_blockid = 0;
-  k_params.role = role == Role::mma_qk ? Pipeline::ThreadCategory::Consumer
-      : (role == Role::load_k ? Pipeline::ThreadCategory::Producer : Pipeline::ThreadCategory::NonParticipant);
-  v_params.role = role == Role::mma_pv ? Pipeline::ThreadCategory::Consumer
-      : (role == Role::load_v ? Pipeline::ThreadCategory::Producer : Pipeline::ThreadCategory::NonParticipant);
+  k_params.role = role == Role::mma_qk
+                      ? Pipeline::ThreadCategory::Consumer
+                      : (role == Role::load_k ? Pipeline::ThreadCategory::Producer
+                                              : Pipeline::ThreadCategory::NonParticipant);
+  v_params.role = role == Role::mma_pv
+                      ? Pipeline::ThreadCategory::Consumer
+                      : (role == Role::load_v ? Pipeline::ThreadCategory::Producer
+                                              : Pipeline::ThreadCategory::NonParticipant);
   Pipeline k_pipeline(sm.k_pipeline, k_params);
   Pipeline v_pipeline(sm.v_pipeline, v_params);
   __syncthreads();
@@ -77,7 +84,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   const int token = blockIdx.x / ((p.heads + 31) / 32);
   const int head_base = blockIdx.x % ((p.heads + 31) / 32) * 32;
   const int main_len = max(0, min(p.topk, p.lengths ? p.lengths[token] : p.topk));
-  const int extra_len = max(0, min(p.extra_topk, p.extra_lengths ? p.extra_lengths[token] : p.extra_topk));
+  const int extra_len =
+      max(0, min(p.extra_topk, p.extra_lengths ? p.extra_lengths[token] : p.extra_topk));
   const int main_tiles = (main_len + 63) / 64;
   const int tiles = main_tiles + (extra_len + 63) / 64;
   Mma mma;
@@ -94,7 +102,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     // halves share one K pipeline state; K advances independently of V.
     auto write_state = cutlass::make_producer_start_state<Pipeline>();
     const int loader_tid = threadIdx.x % 64;
-    #pragma unroll 1
+#pragma unroll 1
     for (int tile = 0; tile < tiles; ++tile) {
       const bool extra = tile >= main_tiles;
       const int tile_start = (extra ? tile - main_tiles : tile) * 64;
@@ -106,7 +114,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
-      #pragma unroll 1
+#pragma unroll 1
       for (int micro = 0; micro < 2; ++micro) {
         // Acquire FREE before writing either scales or payload. Scale factors
         // are copied once per candidate tile; payload slots advance per microtile.
@@ -117,25 +125,29 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           uint8_t* dst = sm.k_sf[tile & 1] + loader_tid * 16;
           uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
           const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
+                       "r"(id >= 0 ? 16 : 0)
+                       : "memory");
         }
         uint8_t* dst = sm.k[stage][warp];
         const int feature_base = micro * 128 + warp * 256;
-        #pragma unroll 1
+#pragma unroll 1
         for (int i = lane; i < 64 * 8; i += 32) {
           int n = i / 8, d = (i % 8) * 16;
           int id = __shfl_sync(0xffffffff, n < 32 ? id_lo : id_hi, n % 32);
-          uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
+          uint32_t address =
+              static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
           const uint8_t* src = cache + size_t(max(id, 0)) * stride + feature_base + d;
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
+                       "r"(id >= 0 ? 16 : 0)
+                       : "memory");
         }
         // Publish READY through hardware completion of the preceding async
         // copies. The loader can advance without waiting for those copies here.
         k_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
           unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
-          cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
+          cutlass::arch::cpasync_barrier_arrive(
+              reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
         });
         ++write_state;
       }
@@ -147,7 +159,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     // four 128-feature microtiles per candidate tile on their own pipeline.
     auto write_state = cutlass::make_producer_start_state<Pipeline>();
     const int loader_tid = threadIdx.x % 64;
-    #pragma unroll 1
+#pragma unroll 1
     for (int tile = 0; tile < tiles; ++tile) {
       const bool extra = tile >= main_tiles;
       const int tile_start = (extra ? tile - main_tiles : tile) * 64;
@@ -159,7 +171,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
-      #pragma unroll 1
+#pragma unroll 1
       for (int micro = 0; micro < 4; ++micro) {
         // Acquire FREE before issuing async writes to scales or payload.
         // Copy the scale tile only on the first microtile, in cache order.
@@ -170,25 +182,29 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           uint8_t* dst = sm.v_sf[tile & 1] + loader_tid * 16;
           uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
           const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
+                       "r"(id >= 0 ? 16 : 0)
+                       : "memory");
         }
         uint8_t* dst = sm.v[stage];
         const int feature_base = micro * 128;
-        #pragma unroll 1
+#pragma unroll 1
         for (int i = loader_tid; i < 64 * 8; i += 64) {
           int n = i / 8, d = (i % 8) * 16;
           int id = __shfl_sync(0xffffffff, n < 32 ? id_lo : id_hi, n % 32);
-          uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
+          uint32_t address =
+              static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
           const uint8_t* src = cache + size_t(max(id, 0)) * stride + feature_base + d;
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
+                       "r"(id >= 0 ? 16 : 0)
+                       : "memory");
         }
         // Publish the async scale and payload copies through the same READY
         // handshake; hardware completes the copy-dependent arrival.
         v_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
           unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
-          cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
+          cutlass::arch::cpasync_barrier_arrive(
+              reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
         });
         ++write_state;
       }
@@ -211,19 +227,20 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     auto rQScale = make_tensor<float>(Shape<_2, _8>{});
     const int h0 = head_base + (warp % 2) * 16;
     const int d0 = (warp / 2) * 256;
-    // No Q SMEM stage. Each A fragment has two rows, eight features/row/lane.
-    #pragma unroll
+// No Q SMEM stage. Each A fragment has two rows, eight features/row/lane.
+#pragma unroll
     for (int k = 0; k < 8; ++k) {
       float q[16];
-      #pragma unroll
+#pragma unroll
       for (int v = 0; v < 16; v += 4) {
         auto coord = tQcQ(v, 0, k);
         int h = h0 + get<0>(coord), d = d0 + get<1>(coord);
-        uint2 packed = h < p.heads
-            ? *reinterpret_cast<const uint2*>(p.q + (size_t(token) * p.heads + h) * 512 + d)
-            : make_uint2(0, 0);
+        uint2 packed =
+            h < p.heads
+                ? *reinterpret_cast<const uint2*>(p.q + (size_t(token) * p.heads + h) * 512 + d)
+                : make_uint2(0, 0);
         auto q4 = make_tensor(make_rmem_ptr(reinterpret_cast<bf16*>(&packed)), Layout<_4>{});
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < 4; ++j) {
           float x = to_float(q4(j));
           if (Mega && d + j >= 448) {
@@ -233,21 +250,21 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           q[v + j] = x;
         }
       }
-      #pragma unroll
+#pragma unroll
       for (int row = 0; row < 2; ++row) {
         float amax = 1.e-4f;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(q[(j / 4) * 8 + row * 4 + j % 4]));
         amax = row_max4(amax);
         uint32_t bits = (__float_as_uint(amax / 448.f) + 0x007fffff) & 0x7f800000;
         float scale = __uint_as_float(bits);
         rQScale(row, k) = scale;
         auto rQ_packed = recast<uint32_t>(tQrQ);
-        #pragma unroll
+#pragma unroll
         for (int part = 0; part < 2; ++part) {
           int v = part * 8 + row * 4;
-          rQ_packed(part * 2 + row, 0, k) = cvt_e4m3x4(q[v] / scale, q[v + 1] / scale,
-                                                    q[v + 2] / scale, q[v + 3] / scale);
+          rQ_packed(part * 2 + row, 0, k) =
+              cvt_e4m3x4(q[v] / scale, q[v + 1] / scale, q[v + 2] / scale, q[v + 3] / scale);
         }
       }
     }
@@ -270,41 +287,42 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Each READY microtile supplies four steps; release it after the last read.
       // Capture all scales for this feature half on the first READY microtile.
       auto rKScale = make_tensor<uint32_t>(Shape<_2, _2, _8>{});  // (micro, candidate-pair, N tile)
-      #pragma unroll
+#pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int micro = k / 4;
         const int stage = read_state.index();
         if (k % 4 == 0) {
           k_pipeline.consumer_wait(read_state);
           if (k == 0) {
-            #pragma unroll
+#pragma unroll
             for (int n = 0; n < 8; ++n) {
-              #pragma unroll
+#pragma unroll
               for (int c = 0; c < 2; ++c) {
                 int candidate = get<1>(tScS(c, 0, n));
-                uint2 packed = *reinterpret_cast<const uint2*>(sm.k_sf[slot] + candidate * 16 + d0 / 32);
+                uint2 packed =
+                    *reinterpret_cast<const uint2*>(sm.k_sf[slot] + candidate * 16 + d0 / 32);
                 rKScale(0, c, n) = packed.x;
                 rKScale(1, c, n) = packed.y;
               }
             }
           }
         }
-        auto sK = make_tensor(make_smem_ptr(reinterpret_cast<E4*>(sm.k[stage][warp / 2])),
-            MicroLayout{});
+        auto sK =
+            make_tensor(make_smem_ptr(reinterpret_cast<E4*>(sm.k[stage][warp / 2])), MicroLayout{});
         auto sKTile = local_tile(sK, Shape<_64, _32>{}, make_coord(_0{}, k % 4));
         auto tSrK = make_tensor<E4>(Shape<Shape<_4, _2>, _8, _1>{});
         auto rPartial = thr_mma.partition_fragment_C(cS);
         clear(rPartial);
         auto copy_mma = make_tiled_mma(SM89_16x8x32_F32E4M3E4M3F32_TN{},
-            Layout<Shape<_1, _1, _1>>{}, Tile<_16, _16, _32>{});
+                                       Layout<Shape<_1, _1, _1>>{}, Tile<_16, _16, _32>{});
         auto copy_k = make_tiled_copy_B(Copy_Atom<SM75_U32x4_LDSM_N, E4>{}, copy_mma);
         auto thr_copy_k = copy_k.get_slice(lane);
         auto tSrK_cv = thr_copy_k.retile_D(tSrK);
         copy(copy_k, thr_copy_k.partition_S(sKTile), tSrK_cv);
         gemm(mma, tQrQ(_, _, k), tSrK(_, _, 0), rPartial);
-        #pragma unroll
+#pragma unroll
         for (int n = 0; n < 8; ++n) {
-          #pragma unroll
+#pragma unroll
           for (int v = 0; v < 4; ++v) {
             auto coord = tScS(v, 0, n);
             int row = get<0>(coord) / 8;
@@ -321,27 +339,29 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Combine feature halves: warps 0/1 store their partial scores; warps 2/3
       // add the other half, apply attention scaling and mask invalid candidates.
       // Publish S-ready only after all 512 features have contributed.
-      auto sS = make_tensor(make_smem_ptr(sm.scores[slot] + (warp % 2) * 16 * 64),
-          composition(Swizzle<2, 3, 3>{}, make_layout(
-              Layout<Shape<_2, _2, _4>, Stride<_128, _64, _256>>{}, Layout<_64>{})));
+      auto sS = make_tensor(
+          make_smem_ptr(sm.scores[slot] + (warp % 2) * 16 * 64),
+          composition(
+              Swizzle<2, 3, 3>{},
+              make_layout(Layout<Shape<_2, _2, _4>, Stride<_128, _64, _256>>{}, Layout<_64>{})));
       auto tSsS = thr_mma.partition_C(sS);
       if (warp < 2) copy_aligned(tSrS, tSsS);
       bar_sync_t<1, 128>();
       if (warp >= 2) {
         auto rOther = make_tensor_like(tSrS);
         copy_aligned(tSsS, rOther);
-        // A visited tile has length > 0. Clamp only the index load to keep
-        // tail accesses in bounds; retain the original position for masking.
-        // Each candidate occurs in two head rows of the C fragment.
-        #pragma unroll
+// A visited tile has length > 0. Clamp only the index load to keep
+// tail accesses in bounds; retain the original position for masking.
+// Each candidate occurs in two head rows of the C fragment.
+#pragma unroll
         for (int n = 0; n < 8; ++n) {
-          #pragma unroll
+#pragma unroll
           for (int c = 0; c < 2; ++c) {
             int candidate = get<1>(tScS(c, 0, n));
             int position = tile_start + candidate;
             int id = ids[min(position, length - 1)];
             int valid = int(position < length) & int(id >= 0);
-            #pragma unroll
+#pragma unroll
             for (int row = 0; row < 2; ++row) {
               int v = row * 2 + c;
               float score = (rOther(v, 0, n) + tSrS(v, 0, n)) * (p.sm_scale * LOG2E);
@@ -378,20 +398,22 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Acquire S-ready, copy the score tile to registers, then return S-free.
       // QK may reuse SMEM while this warp computes softmax and PV from registers.
       bar_sync_alt<2, 3, 256>(slot);
-      auto sS = make_tensor(make_smem_ptr(sm.scores[slot] + warp * 8 * 64),
-          composition(Swizzle<2, 3, 3>{}, make_layout(
-              Layout<Shape<_2, _2, _2>, Stride<_128, _64, _256>>{}, Layout<_64>{})));
+      auto sS = make_tensor(
+          make_smem_ptr(sm.scores[slot] + warp * 8 * 64),
+          composition(
+              Swizzle<2, 3, 3>{},
+              make_layout(Layout<Shape<_2, _2, _2>, Stride<_128, _64, _256>>{}, Layout<_64>{})));
       copy(thr_mma.partition_B(sS), rP);
       bar_arrive_alt<4, 5, 256>(slot);
       // Scores use log2 units: P=exp2(S-new_m). Rescale the old denominator
       // and output by alpha=exp2(old_m-new_m) before adding this tile.
       float tile_m = -INFINITY;
-      #pragma unroll
+#pragma unroll
       for (int i = 0; i < size(rP); ++i) tile_m = fmaxf(tile_m, rP(i));
       float new_m = fmaxf(row_m, row_max4(tile_m));
       float alpha = isfinite(row_m) ? exp2f(row_m - new_m) : 0.f;
       float tile_l = 0.f;
-      #pragma unroll
+#pragma unroll
       for (int i = 0; i < size(rP); ++i) {
         rP(i) = isfinite(rP(i)) ? exp2f(rP(i) - new_m) : 0.f;
         tile_l += rP(i);
@@ -402,9 +424,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // once to avoid repeating shuffles for every feature tile.
       float alpha0 = __shfl_sync(0xffffffff, alpha, (lane % 4) * 8);
       float alpha1 = __shfl_sync(0xffffffff, alpha, (lane % 4) * 8 + 4);
-      #pragma unroll
+#pragma unroll
       for (int m = 0; m < 32; ++m) {
-        #pragma unroll
+#pragma unroll
         for (int v = 0; v < 4; ++v) {
           rO(v, m, 0) *= (v % 2 == 0 ? alpha0 : alpha1);
         }
@@ -414,18 +436,19 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // A native-layout word holds four adjacent feature-group scales for one
       // candidate. Load it once per microtile and select its byte per group.
       auto rVScale = make_tensor<uint32_t>(Shape<_8, _2>{});  // (candidate fragment, K tile)
-      #pragma unroll
+#pragma unroll
       for (int group = 0; group < 16; ++group) {
         const int micro = group / 4;
         const int stage = read_state.index();
         if (group % 4 == 0) {
           v_pipeline.consumer_wait(read_state);
-          #pragma unroll
+#pragma unroll
           for (int k = 0; k < 2; ++k) {
-            #pragma unroll
+#pragma unroll
             for (int v = 0; v < 8; ++v) {
               int n = get<1>(tPcP(v, 0, k));
-              rVScale(v, k) = *reinterpret_cast<const uint32_t*>(sm.v_sf[slot] + n * 16 + micro * 4);
+              rVScale(v, k) =
+                  *reinterpret_cast<const uint32_t*>(sm.v_sf[slot] + n * 16 + micro * 4);
             }
           }
         }
@@ -433,37 +456,38 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         // rScaled[h,n] = P[h,n] * V_scale[n,group]. Requantize that product
         // over PQuantGroup candidates; MMA consumes the stored FP8 V bytes.
         auto rScaled = make_tensor_like(rP);
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < 2; ++k) {
-          #pragma unroll
+#pragma unroll
           for (int v = 0; v < 8; ++v)
             rScaled(v, 0, k) = rP(v, 0, k) * ue8((rVScale(v, k) >> ((group % 4) * 8)) & 255);
         }
         // B's K mode is (candidate=32, candidate-group=2). Keep the
         // 64-candidate load tile independent of the P quantization extent.
         float p_scale[64 / PQuantGroup];
-        #pragma unroll
+#pragma unroll
         for (int g = 0; g < 64 / PQuantGroup; ++g) {
           float amax = 1.e-10f;
-          #pragma unroll
+#pragma unroll
           for (int k = 0; k < PQuantGroup / 32; ++k) {
-            #pragma unroll
+#pragma unroll
             for (int v = 0; v < 8; ++v)
               amax = fmaxf(amax, fabsf(rScaled(v, 0, g * (PQuantGroup / 32) + k)));
           }
           p_scale[g] = row_max4(amax) / 448.f;
         }
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < 2; ++k) {
           auto rP8_packed = recast<uint32_t>(rP8(_, _, k));
           float scale = p_scale[k / (PQuantGroup / 32)];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < size(rP8_packed); ++i)
-            rP8_packed(i) = cvt_e4m3x4(rScaled(i * 4, 0, k) / scale,
-                rScaled(i * 4 + 1, 0, k) / scale, rScaled(i * 4 + 2, 0, k) / scale,
-                rScaled(i * 4 + 3, 0, k) / scale);
+            rP8_packed(i) =
+                cvt_e4m3x4(rScaled(i * 4, 0, k) / scale, rScaled(i * 4 + 1, 0, k) / scale,
+                           rScaled(i * 4 + 2, 0, k) / scale, rScaled(i * 4 + 3, 0, k) / scale);
         }
-        auto sVStage = make_tensor(make_smem_ptr(reinterpret_cast<E4*>(sm.v[stage])), MicroTransposed{});
+        auto sVStage =
+            make_tensor(make_smem_ptr(reinterpret_cast<E4*>(sm.v[stage])), MicroTransposed{});
         auto sV = local_tile(sVStage, Shape<_32, _64>{}, make_coord(group % 4, _0{}));
         auto rV = thr_mma.partition_fragment_A(sV);
         auto tiled_copy = make_tiled_copy_A(Copy_Atom<SM120_U8x16_LDSM_T_RAW, E4>{}, mma);
@@ -471,7 +495,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         auto rV_cv = thr_copy.retile_D(rV);
         copy(tiled_copy, thr_copy.partition_S(sV), rV_cv);
         auto rPV = thr_mma.partition_fragment_C(make_identity_tensor(Shape<_32, _8>{}));
-        #pragma unroll
+#pragma unroll
         for (int g = 0; g < 64 / PQuantGroup; ++g) {
           clear(rPV);
           if constexpr (PQuantGroup == 64)
@@ -480,9 +504,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
             gemm(mma, rV(_, _, g), rP8(_, _, g), rPV);
           float scale0 = __shfl_sync(0xffffffff, p_scale[g], (lane % 4) * 8);
           float scale1 = __shfl_sync(0xffffffff, p_scale[g], (lane % 4) * 8 + 4);
-          #pragma unroll
+#pragma unroll
           for (int m = 0; m < 2; ++m) {
-            #pragma unroll
+#pragma unroll
             for (int v = 0; v < 4; ++v)
               rO(v, group * 2 + m, 0) += rPV(v, m, 0) * (v % 2 == 0 ? scale0 : scale1);
           }
@@ -515,9 +539,12 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       float shift = fmaxf(row_m, sink);
       out_factor = isfinite(row_m) ? exp2f(row_m - shift) : 0.f;
       denominator = row_l * out_factor + exp2f(sink - shift);
-      if ((lane % 4) == 0) p.lse[size_t(token) * p.lse_stride + h0 + own_head] = (shift + log2f(denominator)) * p.lse_scale;
+      if ((lane % 4) == 0)
+        p.lse[size_t(token) * p.lse_stride + h0 + own_head] =
+            (shift + log2f(denominator)) * p.lse_scale;
     } else if ((lane % 4) == 0) {
-      p.lse[size_t(token) * p.lse_stride + h0 + own_head] = row_l > 0.f ? (row_m + log2f(row_l)) * p.lse_scale : -INFINITY;
+      p.lse[size_t(token) * p.lse_stride + h0 + own_head] =
+          row_l > 0.f ? (row_m + log2f(row_l)) * p.lse_scale : -INFINITY;
     }
     // Mega=false writes BF16 context. Mega=true applies inverse RoPE to the
     // normalized BF16 context, then emits FP8 output and one scale per 32 features.
@@ -525,12 +552,12 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     float norm = denominator > 0.f ? out_factor / denominator : 0.f;
     float norm0 = __shfl_sync(0xffffffff, norm, (lane % 4) * 8);
     float norm1 = __shfl_sync(0xffffffff, norm, (lane % 4) * 8 + 4);
-    #pragma unroll
+#pragma unroll
     for (int group = 0; group < 16; ++group) {
       float vals[8];
-      #pragma unroll
+#pragma unroll
       for (int m = 0; m < 2; ++m) {
-        #pragma unroll
+#pragma unroll
         for (int v = 0; v < 4; ++v) {
           auto coord = tOcO(v, group * 2 + m, 0);
           int d = get<0>(coord);
@@ -545,29 +572,30 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         }
       }
       if constexpr (Mega) {
-      #pragma unroll
-      for (int head_col = 0; head_col < 2; ++head_col) {
-        float amax = 1.e-4f;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(vals[j * 2 + head_col]));
-        #pragma unroll
-        for (int delta = 4; delta <= 16; delta *= 2) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
-        uint32_t bits = (__float_as_uint(amax / 448.f) + 0x007fffff) & 0x7f800000;
-        float inv = __uint_as_float(0x7f000000u - bits);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          int m = j / 2, v = (j % 2) * 2 + head_col;
-          auto coord = tOcO(v, group * 2 + m, 0);
-          int d = get<0>(coord), h = h0 + get<1>(coord);
-          size_t offset = (size_t(token) * p.heads + h) * 512 + d;
-          p.output[offset] = quantize_e4m3_byte(vals[j * 2 + head_col] * inv);
-          if ((d % 32) == 0) p.scales[offset / 32] = bits >> 23;
+#pragma unroll
+        for (int head_col = 0; head_col < 2; ++head_col) {
+          float amax = 1.e-4f;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(vals[j * 2 + head_col]));
+#pragma unroll
+          for (int delta = 4; delta <= 16; delta *= 2)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
+          uint32_t bits = (__float_as_uint(amax / 448.f) + 0x007fffff) & 0x7f800000;
+          float inv = __uint_as_float(0x7f000000u - bits);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            int m = j / 2, v = (j % 2) * 2 + head_col;
+            auto coord = tOcO(v, group * 2 + m, 0);
+            int d = get<0>(coord), h = h0 + get<1>(coord);
+            size_t offset = (size_t(token) * p.heads + h) * 512 + d;
+            p.output[offset] = quantize_e4m3_byte(vals[j * 2 + head_col] * inv);
+            if ((d % 32) == 0) p.scales[offset / 32] = bits >> 23;
+          }
         }
-      }
       }
     }
   } else {
     CUTE_INVALID_CONTROL_PATH("Unreachable prefill role");
   }
 }
-}
+}  // namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated

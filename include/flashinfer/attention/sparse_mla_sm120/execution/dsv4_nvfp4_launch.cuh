@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "../kernels/cute_prefill/prefill_nvfp4.cuh"
 #include "../kernels/dsv4_nvfp4/decode.cuh"
 #include "../kernels/dsv4_nvfp4/grouped_attention.cuh"
-#include "../kernels/cute_prefill/prefill_nvfp4.cuh"
 #include "attention_params.cuh"
 #include "attention_plan.h"
 #include "merge.cuh"
@@ -91,14 +91,16 @@ cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params,
   constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
   auto launch = [&](auto fused) {
     constexpr bool Mega = decltype(fused)::value;
-    auto kernel = sparse_mla_prefill_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE, Mega>;
+    auto kernel =
+        sparse_mla_prefill_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE, Mega>;
     auto status =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES);
     if (status != cudaSuccess) return status;
-    kernel<<<dim3(num_tokens, HEAD_BLOCKS), dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
-        q, cache, indices, output, out_lse, attn_sink, topk_length, extra_cache,
-        extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
-        num_tokens, sm_scale, page_size, page_stride_bytes, lse_scale, mega);
+    kernel<<<dim3(num_tokens, HEAD_BLOCKS), dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES,
+             stream>>>(q, cache, indices, output, out_lse, attn_sink, topk_length, extra_cache,
+                       extra_indices, extra_topk_length, extra_topk, extra_page_size,
+                       extra_page_stride_bytes, num_tokens, sm_scale, page_size, page_stride_bytes,
+                       lse_scale, mega);
     return cudaGetLastError();
   };
   return mega.output ? launch(std::true_type{}) : launch(std::false_type{});

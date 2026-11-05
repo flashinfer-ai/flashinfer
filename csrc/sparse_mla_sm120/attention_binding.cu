@@ -492,14 +492,12 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                            sink, extra_cache, extra_indices, extra_lengths, lse_scale, {});
 }
 
-void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorView cache,
-                              TensorView indices, TensorView mid, TensorView mlse,
-                              TensorView output, TensorView lse, double scale,
-                              Optional<TensorView> lengths, Optional<TensorView> sink,
-                              Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
-                              Optional<TensorView> extra_lengths, double lse_scale,
-                              TensorView positions, TensorView cos_sin, TensorView fp8_output,
-                              TensorView output_scales) {
+void ExecuteAttentionRopeFp8Plan(
+    ffi::Module descriptor, TensorView q, TensorView cache, TensorView indices, TensorView mid,
+    TensorView mlse, TensorView output, TensorView lse, double scale, Optional<TensorView> lengths,
+    Optional<TensorView> sink, Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
+    Optional<TensorView> extra_lengths, double lse_scale, TensorView positions, TensorView cos_sin,
+    TensorView fp8_output, TensorView output_scales) {
   const auto& plan = execution::unpack_plan(descriptor, false);
   const auto mt = static_cast<ModelType>(plan.metadata.model);
   TVM_FFI_ICHECK(mt == ModelType::DSV4 || is_dsv41(mt))
