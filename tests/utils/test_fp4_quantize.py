@@ -2830,6 +2830,8 @@ def test_nvfp4_per_token_linear_scales_need_no_zero_fill(dtype, m, k, seed):
     torch.manual_seed(seed)
     x = torch.randn((m, k), dtype=dtype, device=device) * 3
     x[0, :16] = 0  # an all-zero block: scale byte 0
+    if m > 1:
+        x[1] = 0  # an all-zero row: its scale bytes must still be written
     linear = SfLayout.layout_linear.value
 
     def run(fill):
