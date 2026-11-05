@@ -684,7 +684,7 @@ def no_k1_chains(monkeypatch):
     "arch, sm_count, rows",
     [
         ("sm_100a", 148, 28),
-        ("sm_103a", 152, 32),
+        ("sm_103a", 152, 31),
         ("sm_103a", 148, 28),
         ("sm_107a", 216, 26),
         ("sm_107a", 212, 19),
@@ -693,11 +693,12 @@ def no_k1_chains(monkeypatch):
     ],
 )
 def test_k1_planners_take_the_measured_rows(arch, sm_count, rows):
-    """The verdicts of the three architectures (on sm_107a with the chain ranges of 216 SMs) take 28 / 32 / 26 of the
+    """The verdicts of the three architectures (on sm_107a with the chain ranges of 216 SMs) take 28 / 31 / 26 of the
     124 weight-gradient rows (the MLA head rows, ``L = 64``, run the deterministic program), at 16172 and 16231 tokens;
     on 148 SMs sm_103a leaves ``4096 -> 48`` to the deterministic program (28 rows).  16172 tokens span an odd number of
     64-token K blocks (253), below the first token count of :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` (65538), so the
-    FP32 rows of that table run their two-split program there.  On sm_107a the token counts of
+    FP32 rows of that table run their two-split program there, except sm_103a ``4096 -> 48`` on 152 SMs (its range from
+    14338 to 32767 tokens).  On sm_107a the token counts of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` run the deterministic program (seven FP32 rows and one BF16 row at 16231
     tokens on 216 SMs; on 212 and 216 SMs outside their ranges in :data:`K1_CHAIN_RANGES_BY_SM`: 16231 tokens for
     ``4096 -> 512``, ``4096 -> 1024`` and ``5120 -> 512`` on 212 SMs and for ``4096 -> 512`` and ``4096 -> 1024`` on 216
@@ -2170,18 +2171,22 @@ K1_ODD_BLOCK_EXCLUDED_TOKENS = {
     ("sm_100a", 1, 5120, 32, "f32"): ((148, 65538, None),),
     ("sm_100a", 1, 5120, 48, "f32"): ((148, 65538, None),),
     ("sm_103a", 1, 4096, 32, "f32"): ((148, 65538, None),),
-    ("sm_103a", 1, 4096, 48, "f32"): ((152, 65538, None),),
+    ("sm_103a", 1, 4096, 48, "f32"): ((152, 14338, 32767), (152, 65538, None)),
 }
+#: The ranges of ``K1_ODD_BLOCK_EXCLUDED_TOKENS`` that come from the time (the backward pass or the checkpointed
+#: step more than 1.3 % slower at an odd block count), not from the FP32 budget.
+K1_ODD_BLOCK_TIME_RANGES = {("sm_103a", 1, 4096, 48, "f32"): ((152, 14338, 32767),)}
 
 
 def test_k1_odd_block_exclusions(monkeypatch):
     """A row of :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` runs the deterministic program at a token count of an entry's
     range that spans an odd number of 64-token K blocks, on a part of the entry's SM count or more where the entry is at
     or above the row's SM-count floor and on exactly that SM count below it; at an even number and below the range the
-    row keeps the route it takes without the table.  Every entry names an FP32 two-split row with a verdict on its part,
-    starts at 65538 tokens (above the largest measured token count at which the two-split program met the FP32 accuracy
-    budget, 65537) and has no upper bound; BF16 rows have no entry.  Below 65538 tokens these rows run their two-split
-    program at either number of K blocks."""
+    row keeps the route it takes without the table.  Every entry names an FP32 two-split row with a verdict on its part
+    and starts at 65538 tokens (above the largest measured token count at which the two-split program met the FP32
+    accuracy budget, 65537) with no upper bound, except the ranges of ``K1_ODD_BLOCK_TIME_RANGES`` (sm_103a
+    ``4096 -> 48`` from 14338 to 32767 tokens on 152 SMs: the time); BF16 rows have no entry.  Below 65538 tokens and
+    outside those ranges these rows run their two-split program at either number of K blocks."""
     table = cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS
     assert table == K1_ODD_BLOCK_EXCLUDED_TOKENS
 
@@ -2201,6 +2206,17 @@ def test_k1_odd_block_exclusions(monkeypatch):
             cake_backend.K1_RULE_MIN_SM_COUNT.get(key, 0),
         )
         for sms, lo, hi in entries:
+            if (sms, lo, hi) in K1_ODD_BLOCK_TIME_RANGES.get(key, ()):
+                assert sms >= floor and hi is not None and _k1_blocks(lo) % 2 == 1, key
+                odd = (lo, 64 * _k1_blocks(lo), 16173, 20481, 28673, hi - 64)
+                even = (64 * _k1_blocks(lo) + 1, 20480, hi)
+                outside = (lo - 1, 1025)  # odd block counts below the range
+                assert all(_k1_blocks(T) % 2 == 1 for T in odd + outside), key
+                assert all(_k1_blocks(T) % 2 == 0 for T in even), key
+                for part in (sms, sms + 1, sms + 64):
+                    cases += [(key, part, T, True) for T in odd]
+                    cases += [(key, part, T, False) for T in even + outside]
+                continue
             assert lo == 65538 and _k1_blocks(lo) % 2 == 1 and hi is None, key
             if sms >= floor:
                 rule = cake_backend.K1_SPLIT_RULES[key]
@@ -2235,8 +2251,8 @@ def test_k1_odd_block_exclusions(monkeypatch):
     ):
         assert got[(key, part, T)] is None, (key, part, T)
         assert p(key, part, T) == (64, 2), (key, part, T)
-    # below 65538 tokens odd block counts take the two-split program with the table in place (1025, 4097, 16173 and
-    # 65537 tokens); sm_107a ``8192 -> 128`` FP32 has no entry
+    # below 65538 tokens odd block counts take the two-split program with the table in place (1025, 4097, 14337, 16173
+    # and 65537 tokens; sm_103a 4096 -> 48 on 152 SMs not at 14338 to 32767); sm_107a ``8192 -> 128`` FP32 has no entry
     monkeypatch.undo()
     table = cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS
     assert table == K1_ODD_BLOCK_EXCLUDED_TOKENS
@@ -2245,7 +2261,8 @@ def test_k1_odd_block_exclusions(monkeypatch):
         (("sm_100a", 1, 4096, 64, "f32"), 152, 65537, (64, 2)),
         (("sm_100a", 1, 5120, 32, "f32"), 148, 16173, (64, 2)),
         (("sm_103a", 1, 4096, 32, "f32"), 148, 4097, (64, 2)),
-        (("sm_103a", 1, 4096, 48, "f32"), 152, 16173, (64, 2)),
+        (("sm_103a", 1, 4096, 48, "f32"), 152, 14337, (64, 2)),
+        (("sm_103a", 1, 4096, 48, "f32"), 152, 16173, None),
         (("sm_107a", 1, 8192, 128, "f32"), 212, 4097, (128, 2)),
         (("sm_107a", 1, 8192, 128, "f32"), 216, 1025, (128, 2)),
     ):

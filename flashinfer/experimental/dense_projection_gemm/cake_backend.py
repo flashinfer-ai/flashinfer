@@ -576,11 +576,16 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
 #: neither program's FP32 output met the budget on every seed (98305 and 131073 tokens), so the ranges start above the
 #: last measured odd token count at which the two-split program met it (65537; the token counts up to 98305 were not
 #: measured).  The BF16 outputs of these rows had the deterministic program's relative Frobenius error and met the error
-#: budget on every seed where the deterministic program met it.  sm_107a ``8192 -> 128`` FP32 (two splits on 212 and 216
-#: SMs) has no entry: at an odd block count from 1025 to 8192 tokens, where its deterministic program's two-way split
-#: runs while one wave's operands fit the L2 (to 7808 tokens with 126 MiB of L2, to between 4097 and 8192 tokens on a
-#: 212-SM R200), its output differs from the deterministic program's and met the FP32 budget on every seed (10 seeds; an
-#: error 1.04 to 1.14 times the deterministic program's at 1025 to 4097 tokens: reported).
+#: budget on every seed where the deterministic program met it.  The sm_103a ``4096 -> 48`` range from 14338 to 32767
+#: tokens comes from the time instead: on a 152-SM GB300 part, at odd block counts the two-split program left the
+#: checkpointed step 2.0 to 2.3 % slower in graph replays at 16173 tokens (two measurements), the backward pass 1.6 and
+#: 2.0 % slower in eager launches at 20481 and 28673 tokens, and failed the K1 rule in one of 8 groups at 18433 tokens,
+#: while it kept the rule and the 1.3 % bound at 1025, 4097, 6145, 8193, 10241, 12289 and 14337 tokens.  sm_107a
+#: ``8192 -> 128`` FP32 (two splits on 212 and 216 SMs) has no entry: at an odd block count from 1025 to 8192 tokens,
+#: where its deterministic program's two-way split runs while one wave's operands fit the L2 (to 7808 tokens with 126
+#: MiB of L2, to between 4097 and 8192 tokens on a 212-SM R200), its output differs from the deterministic program's and
+#: met the FP32 budget on every seed (10 seeds; an error 1.04 to 1.14 times the deterministic program's at 1025 to 4097
+#: tokens: reported).
 # fmt: off
 K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -591,7 +596,7 @@ K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS: dict[
     ("sm_100a", 1, 5120, 32, "f32"): ((148, 65538, None),),
     ("sm_100a", 1, 5120, 48, "f32"): ((148, 65538, None),),
     ("sm_103a", 1, 4096, 32, "f32"): ((148, 65538, None),),
-    ("sm_103a", 1, 4096, 48, "f32"): ((152, 65538, None),),
+    ("sm_103a", 1, 4096, 48, "f32"): ((152, 14338, 32767), (152, 65538, None)),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
