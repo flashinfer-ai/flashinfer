@@ -5,7 +5,16 @@
 #include <cute/atom/copy_traits_sm75.hpp>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
-// 32-head x 64-candidate tile with compile-time prologue/epilogue fusion.
+// CTA: one query token, up to 32 heads, 64 sparse candidates/tile, 512 features.
+// All heads of this query use the same candidate indices. Head ranges below are
+// relative to head_base; warp numbers are local to their 128-thread warpgroup.
+//
+// Phase 1: WG2 loads K (warps 0/1) and V (warps 2/3) on independent pipelines.
+// Phase 2: WG0 computes QK and publishes complete score tiles to WG1.
+// Phase 3: WG1 maintains online softmax and accumulates PV in registers.
+// Phase 4: WG1 normalizes and writes the output after all candidate tiles.
+// Phases 1-3 overlap; the numbering describes dataflow, not CTA-wide barriers.
+// Mega specializes Q RoPE and inverse-output-RoPE/FP8 conversion at compile time.
 // Broadcast each warp-uniform arrival address to avoid the predicated/address-offset
 // code generation that produces async-copy racecheck reports.
 struct Params : cute_prefill::Params {
@@ -18,9 +27,9 @@ using Pipeline = cutlass::PipelineAsync<3>;
 struct alignas(128) Shared {
   uint8_t k[3][2][64 * 128];  // (stage, feature-half, candidate, feature)
   uint8_t v[3][64 * 128];     // (stage, candidate, feature)
-  uint8_t k_sf[2][64 * 16];   // independent candidate-tile parity
-  uint8_t v_sf[2][64 * 16];
-  float scores[2][32 * 64];
+  uint8_t k_sf[2][64 * 16];   // (tile parity, candidate, 32-feature scale group)
+  uint8_t v_sf[2][64 * 16];   // Same scales, transposed in 4x4 byte blocks for PV.
+  float scores[2][32 * 64];  // (tile parity, head, candidate), swizzled below.
   Pipeline::SharedStorage k_pipeline, v_pipeline;
 };
 static_assert(sizeof(Shared) == 94336);
@@ -60,6 +69,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   Pipeline k_pipeline(sm.k_pipeline, k_params);
   Pipeline v_pipeline(sm.v_pipeline, v_params);
   __syncthreads();
+  // Traverse the main selection, then the extra selection; each has its own
+  // length and padded index width. Round each selection up to a 64-row tile.
+  // Loaders zero-fill negative IDs and tails; QK masks their scores to -infinity.
   const int token = blockIdx.x / ((p.heads + 31) / 32);
   const int head_base = blockIdx.x % ((p.heads + 31) / 32) * 32;
   const int main_len = max(0, min(p.topk, p.lengths ? p.lengths[token] : p.topk));
@@ -74,7 +86,10 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   if (wg == 2) asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
 
   if (role == Role::load_k) {
-    // WG2 warps 0/1 own feature halves 0:256 and 256:512.
+    // Phase 1a — K loader: WG2, warps 0/1.
+    // Warp 0: K[0:64,   0:256]; warp 1: K[0:64, 256:512].
+    // Each warp copies two 128-feature microtiles per candidate tile. Both
+    // halves share one K pipeline state; K advances independently of V.
     auto write_state = cutlass::make_producer_start_state<Pipeline>();
     const int loader_tid = threadIdx.x % 64;
     #pragma unroll 1
@@ -91,6 +106,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
       #pragma unroll 1
       for (int micro = 0; micro < 2; ++micro) {
+        // Acquire FREE before writing either scales or payload. Scale factors
+        // are copied once per candidate tile; payload slots advance per microtile.
         k_pipeline.producer_acquire(write_state);
         const int stage = write_state.index();
         if (micro == 0) {
@@ -112,6 +129,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
               :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
+        // Publish READY through hardware completion of the preceding async
+        // copies. The loader can advance without waiting for those copies here.
         k_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
           unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
           cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
@@ -121,7 +140,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     }
     k_pipeline.producer_tail(write_state);
   } else if (role == Role::load_v) {
-    // WG2 warps 2/3 cooperatively gather the full feature range.
+    // Phase 1b — V loader: WG2, warps 2/3.
+    // The 64 loader threads cooperate on V[0:64, 0:512], advancing through
+    // four 128-feature microtiles per candidate tile on their own pipeline.
     auto write_state = cutlass::make_producer_start_state<Pipeline>();
     const int loader_tid = threadIdx.x % 64;
     #pragma unroll 1
@@ -136,7 +157,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
-      // Scale loads and transpose use registers only; shared stores wait for FREE.
+      // Prefetch SF[candidate, feature-group] and transpose 4x4 byte blocks
+      // in registers before waiting for FREE. Only scale factors take this
+      // register path; the V payload still goes directly GMEM -> SMEM via cp.async.
       int sf_id = (warp % 2) ? id_hi : id_lo;
       uint4 packed = sf_id >= 0
           ? *reinterpret_cast<const uint4*>(cache + size_t(sf_id) * stride + 512)
@@ -156,6 +179,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       }
       #pragma unroll 1
       for (int micro = 0; micro < 4; ++micro) {
+        // Wait for the consumers to release this payload slot before any STS.
+        // Store the prefetched scale tile only on the first microtile.
         v_pipeline.producer_acquire(write_state);
         const int stage = write_state.index();
         if (micro == 0) {
@@ -175,6 +200,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
               :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
+        // Publish the SF stores and async payload through the same READY
+        // handshake; hardware completes the copy-dependent arrival.
         v_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
           unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
           cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
@@ -184,10 +211,16 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     }
     v_pipeline.producer_tail(write_state);
   } else if (role == Role::mma_qk) {
+    // Phase 2 — QK: WG0. Each warp computes a partial S[16 heads, 64 candidates].
+    // warp 0: heads  0:16, features   0:256
+    // warp 1: heads 16:32, features   0:256
+    // warp 2: heads  0:16, features 256:512
+    // warp 3: heads 16:32, features 256:512
     const float* cs = nullptr;
     if constexpr (Mega) cs = p.cos_sin + size_t(p.positions[token]) * 64;
     asm volatile("setmaxnreg.inc.sync.aligned.u32 208;" ::: "memory");
-    // QK role (WG0). Ownership: (head-half, feature-half) = (warp % 2, warp / 2).
+    // Prologue: load Q once, optionally apply RoPE on features 448:512, then
+    // retain FP8 Q fragments and their 32-feature scales across all candidate tiles.
     auto cQ = make_identity_tensor(Shape<_16, _256>{});
     auto tQcQ = thr_mma.partition_A(cQ);
     auto tQrQ = make_tensor<E4>(shape(tQcQ));
@@ -241,6 +274,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     Pipeline::PipelineState read_state;
     for (int tile = 0; tile < tiles; ++tile) {
       const int slot = tile & 1;
+      // Reuse a score slot only after PV has copied its previous contents.
       if (tile >= 2) bar_sync_alt<4, 5, 256>(slot);
       const bool extra = tile >= main_tiles;
       const int tile_start = (extra ? tile - main_tiles : tile) * 64;
@@ -248,6 +282,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       const int width = extra ? p.extra_topk : p.topk;
       const int* ids = (extra ? p.extra_indices : p.indices) + size_t(token) * width;
       clear(tSrS);
+      // Contract the warp's 256 features in eight 32-feature MMA steps.
+      // Each READY microtile supplies four steps; release it after the last read.
+      // Capture all scales for this feature half on the first READY microtile.
       auto rKScale = make_tensor<uint32_t>(Shape<_2, _2, _8>{});  // (micro, candidate-pair, N tile)
       #pragma unroll
       for (int k = 0; k < 8; ++k) {
@@ -297,6 +334,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           ++read_state;
         }
       }
+      // Combine feature halves: warps 0/1 store their partial scores; warps 2/3
+      // add the other half, apply attention scaling and mask invalid candidates.
+      // Publish S-ready only after all 512 features have contributed.
       auto sS = make_tensor(make_smem_ptr(sm.scores[slot] + (warp % 2) * 16 * 64),
           composition(Swizzle<2, 3, 3>{}, make_layout(
               Layout<Shape<_2, _2, _4>, Stride<_128, _64, _256>>{}, Layout<_64>{})));
@@ -321,8 +361,12 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       bar_arrive_alt<2, 3, 256>(slot);
     }
   } else if (role == Role::mma_pv) {
+    // Phase 3 — Online softmax and PV: WG1.
+    // Warp w owns heads [8*w, 8*(w+1)) and all 512 output features.
+    // Running max, denominator and unnormalized output survive across tiles.
     asm volatile("setmaxnreg.inc.sync.aligned.u32 256;" ::: "memory");
-    // PV role (WG1): C=(features,heads), A=V^T, B=P. Four lanes own one head's P.
+    // CuTe GEMM modes: M=features, N=heads, K=candidates.
+    // A=V^T[512,64], B=P[8,64], C=O^T[512,8]. Four lanes own one head's P.
     const int h0 = head_base + warp * 8;
     auto cP = make_identity_tensor(Shape<_8, _64>{});
     auto tPcP = thr_mma.partition_B(cP);
@@ -337,12 +381,16 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     Pipeline::PipelineState read_state;
     for (int tile = 0; tile < tiles; ++tile) {
       int slot = tile & 1;
+      // Acquire S-ready, copy the score tile to registers, then return S-free.
+      // QK may reuse SMEM while this warp computes softmax and PV from registers.
       bar_sync_alt<2, 3, 256>(slot);
       auto sS = make_tensor(make_smem_ptr(sm.scores[slot] + warp * 8 * 64),
           composition(Swizzle<2, 3, 3>{}, make_layout(
               Layout<Shape<_2, _2, _2>, Stride<_128, _64, _256>>{}, Layout<_64>{})));
       copy(thr_mma.partition_B(sS), rP);
       bar_arrive_alt<4, 5, 256>(slot);
+      // Scores use log2 units: P=exp2(S-new_m). Rescale the old denominator
+      // and output by alpha=exp2(old_m-new_m) before adding this tile.
       float tile_m = -INFINITY;
       #pragma unroll
       for (int i = 0; i < size(rP); ++i) tile_m = fmaxf(tile_m, rP(i));
@@ -367,6 +415,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           rO(v, m, 0) *= (v % 2 == 0 ? alpha0 : alpha1);
         }
       }
+      // Visit all 16 output-feature groups (32 features each). Four groups
+      // consume one 128-feature V microtile, followed by its FREE release.
       auto rVScale = make_tensor<uint32_t>(Shape<_2, _4>{});  // (group-in-micro, candidate-quartet)
       #pragma unroll
       for (int group = 0; group < 16; ++group) {
@@ -384,6 +434,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
             copy_aligned(sSF, rVScale(_, pack));
           }
         }
+        // Fold V's per-candidate scale into P for this output-feature group:
+        // rScaled[h,n] = P[h,n] * V_scale[n,group]. Requantize that product
+        // over PQuantGroup candidates; MMA consumes the stored FP8 V bytes.
         auto rScaled = make_tensor_like(rP);
         #pragma unroll
         for (int k = 0; k < 2; ++k) {
@@ -453,7 +506,10 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     }
     const float* cs = nullptr;
     if constexpr (Mega) cs = p.cos_sin + size_t(p.positions[token]) * 64;
-    // Normalize including the sink; preserve the original BF16 context boundary.
+    // Phase 4 — PV epilogue, once all main and extra candidate tiles are consumed.
+    // The sink contributes to the softmax denominator but has no value vector.
+    // Write LSE in the caller's units; an empty row without a sink gets -infinity
+    // and zero output. Normalize with the original BF16 context rounding boundary.
     float denominator = row_l;
     float out_factor = 1.f;
     float sink = p.sink && h0 + own_head < p.heads ? p.sink[h0 + own_head] * LOG2E : -INFINITY;
@@ -469,6 +525,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     } else if ((lane % 4) == 0 && h0 + own_head < p.heads) {
       p.lse[size_t(token) * p.lse_stride + h0 + own_head] = row_l > 0.f ? (row_m + log2f(row_l)) * p.lse_scale : -INFINITY;
     }
+    // Mega=false writes BF16 context. Mega=true applies inverse RoPE to the
+    // normalized BF16 context, then emits FP8 output and one scale per 32 features.
+    // Output stores mask the final partial head tile.
     float norm = denominator > 0.f ? out_factor / denominator : 0.f;
     float norm0 = __shfl_sync(0xffffffff, norm, (lane % 4) * 8);
     float norm1 = __shfl_sync(0xffffffff, norm, (lane % 4) * 8 + 4);
