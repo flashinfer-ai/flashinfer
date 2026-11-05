@@ -22,7 +22,7 @@ For ``t < B``, ``h < H`` and ``v < 128``, one launch computes::
     S[t, h, v]        = sum_k latent[t, h, k] * w_uv[h, k, v]          (FP32 accumulation, k < 512)
     out[t, h*128 + v] = bf16(f32(bf16(S[t, h, v])) * sigmoid(f32(gate[t, h*128 + v])))
                                                        if valid_lengths[t // q] > 0
-    out[t, h*128 + v] = +0.0                           otherwise
+    out[t, h*128 + v] = +0.0                           if valid_lengths[t // q] <= 0
 
 The sigmoid is evaluated in FP32 and is not rounded to BF16
 (``sigmoid_precision="fp32"``, the only mode offered).  :func:`prepare_mla_value_gate`

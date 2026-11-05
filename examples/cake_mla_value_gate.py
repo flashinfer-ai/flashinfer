@@ -33,9 +33,10 @@ def main():
     # The gate logits are the last 1536 columns of the fused [B, 3648] projection output.
     projected = torch.randn(max_rows, 3648, device="cuda").to(torch.bfloat16)
     out_buf = torch.empty(max_rows, heads * 128, dtype=torch.bfloat16, device="cuda")
-    # One length per request; 0 marks a padded request, whose row is written as zero.
+    # One length per request; a length <= 0 marks a padded request, whose row is
+    # written as zero.
     valid_lengths = torch.tensor(
-        [17, 5, 0, 9, 33, 0, 1, 2], dtype=torch.int32, device="cuda"
+        [17, 5, 0, 9, 33, -1, 1, 2], dtype=torch.int32, device="cuda"
     )
 
     # Prepare once, outside CUDA graph capture: binds w_uv and loads the program.
@@ -56,7 +57,7 @@ def main():
     value = torch.einsum("bhk,hkv->bhv", latent.float(), w_uv.float())
     value = value.to(torch.bfloat16).float().reshape(rows, heads * 128)
     reference = (value * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    reference[valid_lengths == 0] = 0
+    reference[valid_lengths <= 0] = 0
     torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
     print(
         "MLA value gate:",

@@ -17,7 +17,7 @@ For the token rows `t < B` of one rank with `H` heads, `h < H`, `v < 128`:
 ```text
 S[t, h, v]        = sum_k latent[t, h, k] * w_uv[h, k, v]                 (k < 512, FP32 accumulation)
 out[t, h*128 + v] = bf16( f32(bf16(S[t, h, v])) * sigmoid_fp32(f32(gate[t, h*128 + v])) )   if valid_lengths[t // q] > 0
-out[t, h*128 + v] = +0.0                                                    otherwise
+out[t, h*128 + v] = +0.0                                                    if valid_lengths[t // q] <= 0
 ```
 
 ```python
@@ -63,7 +63,8 @@ Kimi-K3 TP8 rank) and `B` in {1..9, 16, 17, 32, 33, 48, 64}.
 
 ## Valid and padded rows
 
-Row `t` is valid if and only if `valid_lengths[t // q] > 0`.  An invalid row is
+Row `t` is valid if and only if `valid_lengths[t // q] > 0`; a zero or negative
+length marks an invalid (padded) request.  An invalid row is
 written as `+0.0` (bits `0x0000`) whatever its latent or gate holds (padded
 requests may carry NaN gates).  A valid row with a NaN input gives NaN.  Rows
 `t >= B` of the caller's buffers, and gate bytes between rows (the pitch

@@ -24,7 +24,8 @@ accumulation error, the FP32 sigmoid error and the final BF16 rounding, and at
 most ``MAX_MISMATCH_FRACTION`` of the valid elements may differ from the
 model's BF16-rounded value; the second check catches a wrong rounding mode or
 a BF16-rounded sigmoid that the per-element bound alone would admit.  Invalid
-rows must be +0.0 bit for bit, rows past ``B`` must stay untouched.
+rows (request length <= 0) must be +0.0 bit for bit, rows past ``B`` must stay
+untouched.
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ SIGMOID_REL_ERROR_PER_UNIT = 2.0**-22
 MAX_MISMATCH_FRACTION = 0.01
 # The out sentinel: rows past B must keep it.
 SENTINEL = -777.0
+# Lengths of padded requests: a request is padded iff its length is < 1.
+PADDED_LENGTHS = (0, -1, -(2**31), -4096)
 
 
 def _arch() -> str | None:
@@ -160,7 +163,10 @@ def make_case(
         invalid[torch.randint(0, requests, (1,), generator=g)] = True
     if invalid.all():
         invalid[0] = False
-    lengths[invalid] = 0
+    # A request is padded iff its length is < 1: mix zero and negative lengths.
+    padded = torch.nonzero(invalid).flatten()
+    cycle = torch.tensor(PADDED_LENGTHS, dtype=torch.int32)
+    lengths[padded] = cycle[torch.arange(padded.numel()) % cycle.numel()]
     # Padded requests carry garbage: NaN latent and NaN gates must still give +0.0.
     for r in torch.nonzero(invalid).flatten().tolist():
         latent_buf[r * q : (r + 1) * q] = nan
@@ -391,6 +397,25 @@ def test_invalid_rows_are_positive_zero_and_tail_untouched(prod_w_uv):
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, "invalid rows")
     assert torch.all(case.out.view(torch.int16)[0] == 0)
+
+
+@requires_kernel
+def test_negative_lengths_are_padded(prod_w_uv):
+    """A request is padded iff its length is < 1: negative lengths give +0.0 rows."""
+    case = make_case(8, PROD_HEADS, seed=12, invalid_fraction=0.0)
+    lengths = [-1, -(2**31), 7, -4096, 1, 0, -2, 2**31 - 1]
+    case.lengths.copy_(torch.tensor(lengths, dtype=torch.int32))
+    padded = [t for t, n in enumerate(lengths) if n < 1]
+    case.latent_buf[padded] = float("nan")
+    case.gate[padded] = float("nan")
+    _prepare(prod_w_uv).launch(*case.args())
+    torch.cuda.synchronize()
+    check_case(case, prod_w_uv, "negative lengths")
+    bits = case.out.view(torch.int16)
+    for t in padded:
+        assert torch.all(bits[t] == 0), f"row {t} (length {lengths[t]}) is not +0.0"
+    for t in (2, 4, 7):
+        assert torch.isfinite(case.out[t]).all(), f"row {t} (length {lengths[t]})"
 
 
 # ----------------------------------------------------------------------------------------------

@@ -47,7 +47,7 @@ def prepare_mla_value_gate(
         out[t, h*128 + v] = bf16(f32(bf16(S[t, h, v])) * sigmoid(f32(gate[t, h*128 + v])))
 
     for every valid row, and ``out[t, :] = +0.0`` for every row whose request has
-    ``valid_lengths[t // rows_per_request] == 0`` (whatever the row's latent or
+    ``valid_lengths[t // rows_per_request] <= 0`` (whatever the row's latent or
     gate holds, NaN included).  The projection is rounded to BF16 once before the
     gate; the sigmoid is evaluated in FP32 and is not rounded to BF16.  Rows
     ``t >= B`` of the caller's buffers are neither read nor written.  The kernel
@@ -88,7 +88,8 @@ def prepare_mla_value_gate(
         * ``gate``: BF16 ``[B, H * 128]`` gate logits with unit column stride and an even
           row pitch ``gate.stride(0) >= H * 128`` (e.g. a column slice of a fused
           projection output), rows 4-byte aligned;
-        * ``valid_lengths``: contiguous int32 ``[B // q]``;
+        * ``valid_lengths``: contiguous int32 ``[B // q]``; a zero or negative
+          length marks a padded request;
         * ``out``: caller-owned contiguous BF16 ``[B, H * 128]``, 16-byte aligned, not
           overlapping any input;
 
