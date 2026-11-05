@@ -42,10 +42,19 @@ def test_bmm_fp8_reference_correctness(shape_kwargs, with_bias):
             inputs["A_scale"],
             inputs["B_scale"],
             dtype=torch.bfloat16,
-            bias=bias,
         )
     except Exception as exc:
         pytest.skip(f"bmm_fp8 unavailable: {exc}")
+    if with_bias:
+        # Outside the skip above, so a failing bias path fails the test.
+        api = flashinfer.bmm_fp8(
+            inputs["A"],
+            b_fp8_kmaj,
+            inputs["A_scale"],
+            inputs["B_scale"],
+            dtype=torch.bfloat16,
+            bias=bias,
+        )
     ref = bmm_fp8_trace.reference(
         inputs["A"],
         inputs["B"],
