@@ -74,6 +74,35 @@ DAV_PLAN = [
     ["buffer", "do_tma"], ["buffer", "vnew_tma"], ["buffer", "aqk_tma"], ["buffer", "dAqk"], ["buffer", "dv1"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
 ]  # fmt: skip
+# The K4 merge records (the register-blocked v2 builds, one per CONFIGS entry the select rule names): record ->
+# (build keywords, threads per CTA = 128 * cols_per_cta / the thread tile's outputs).
+MERGE_V2_MODULE = "tart.kda_chunk_kcp_affine_merge.sm100_sm103_sm107.kda_chunk_det_affine_merge_fp32_v2_kcp"
+MERGE_RECORDS = {
+    "kcp_affine_merge_c64": (
+        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x8"},
+        128,
+    ),
+    "kcp_affine_merge_c32": (
+        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "4x8"},
+        128,
+    ),
+    "kcp_affine_merge_c16": (
+        {"chunk_k": 16, "cols_per_cta": 16, "pairs": False, "ring": 4, "tile": "4x4"},
+        128,
+    ),
+}
+# The K4 select rule at sample launches: (ncols, transpose_m, n_chains) -> record.
+MERGE_SELECT = {
+    (128, 0, 64): "kcp_affine_merge_c64",
+    (128, 1, 64): "kcp_affine_merge_c64",
+    (128, 0, 48): "kcp_affine_merge_c64",
+    (128, 1, 47): "kcp_affine_merge_c32",
+    (128, 0, 17): "kcp_affine_merge_c32",
+    (128, 0, 16): "kcp_affine_merge_c16",
+    (128, 1, 1): "kcp_affine_merge_c16",
+    (256, 0, 24): "kcp_affine_merge_c16",
+    (256, 1, 96): "kcp_affine_merge_c16",
+}
 PLANS = {
     "kcp_fwdh_offset": FWDH_PLAN,
     "kcp_fwdh_offset_vh64": FWDH_PLAN,
@@ -82,8 +111,7 @@ PLANS = {
     "kcp_dhu_offset_vh64": DHU_PLAN,
     "kcp_dhu_tape": DHU_PLAN,
     "kcp_transfer_walk": TRANSFER_PLAN,
-    "kcp_affine_merge_c8": MERGE_PLAN,
-    "kcp_affine_merge_c16": MERGE_PLAN,
+    **dict.fromkeys(MERGE_RECORDS, MERGE_PLAN),
     "kcp_fwd_o": FWD_O_PLAN,
     "kcp_dav": DAV_PLAN,
     "kcp_transfer_walk_three_mma": TRANSFER_PLAN,
@@ -127,14 +155,7 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
         {"vh": 64},
     ),
-    "kcp_affine_merge_c8": (
-        f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
-        {"cols_per_cta": 8},
-    ),
-    "kcp_affine_merge_c16": (
-        f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
-        {"cols_per_cta": 16},
-    ),
+    **{name: (MERGE_V2_MODULE, kwargs) for name, (kwargs, _) in MERGE_RECORDS.items()},
     "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
     "kcp_transfer_walk_three_mma": (
@@ -211,8 +232,15 @@ def test_record_matches_the_frozen_abi(name: str) -> None:
     )
     assert record["launch"]["cluster"] == (1, 1, 1)
     assert record["launch"]["block"] == (
-        (128, 1, 1) if record["program"] == "kcp_affine_merge" else (192, 1, 1)
+        (MERGE_RECORDS[name][1], 1, 1)
+        if record["program"] == "kcp_affine_merge"
+        else (192, 1, 1)
     )
+    if record["program"] == "kcp_affine_merge":
+        assert record["grid_rule"] == {
+            "cols_per_cta": MERGE_RECORDS[name][0]["cols_per_cta"],
+            "kind": "kcp_chains",
+        }
     assert isinstance(record["launch"]["dynamic_smem_bytes"], int)
     expected_name = (
         record["program"]
@@ -247,13 +275,31 @@ def test_program_names_follow_the_identity_rule() -> None:
     )
 
 
-def test_selection_and_grids() -> None:
-    assert kcp_jit.select_record("kcp_affine_merge", ncols=128) == "kcp_affine_merge_c8"
-    assert (
-        kcp_jit.select_record("kcp_affine_merge", ncols=256) == "kcp_affine_merge_c16"
-    )
+def test_merge_selection_covers_every_launch_once() -> None:
+    for (ncols, transpose_m, n_chains), record in MERGE_SELECT.items():
+        assert (
+            kcp_jit.select_record(
+                "kcp_affine_merge",
+                ncols=ncols,
+                n_chains=n_chains,
+                transpose_m=transpose_m,
+            )
+            == record
+        ), (ncols, transpose_m, n_chains)
+        assert kcp_jit.merge_record(ncols, n_chains, transpose_m) == record
+    # every state / map launch shape is admitted by exactly one record (select_record raises otherwise)
+    for ncols in (128, 256):
+        for transpose_m in (0, 1):
+            for n_chains in range(1, 300):
+                kcp_jit.merge_record(ncols, n_chains, transpose_m)
     with pytest.raises(ValueError):
-        kcp_jit.select_record("kcp_affine_merge", ncols=64)
+        kcp_jit.merge_record(64, 4, 0)
+    # the chains rule needs the chain count and the layout
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_affine_merge", ncols=128)
+
+
+def test_selection_and_grids() -> None:
     assert kcp_jit.select_record("kcp_fwdh_offset", form="full") == "kcp_fwdh_offset"
     assert (
         kcp_jit.select_record("kcp_fwdh_offset", form="split") == "kcp_fwdh_offset_vh64"
@@ -287,8 +333,13 @@ def test_selection_and_grids() -> None:
         1,
         1,
     )
-    assert kcp_jit.launch_grid("kcp_affine_merge_c8", n_chains=2, ncols=128) == (
-        32,
+    assert kcp_jit.launch_grid("kcp_affine_merge_c64", n_chains=2, ncols=128) == (
+        4,
+        1,
+        1,
+    )
+    assert kcp_jit.launch_grid("kcp_affine_merge_c32", n_chains=3, ncols=256) == (
+        24,
         1,
         1,
     )

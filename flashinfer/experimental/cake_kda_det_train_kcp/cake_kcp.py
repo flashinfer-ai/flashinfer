@@ -842,13 +842,20 @@ class KernelBackend(Backend):
         self,
         programs: Any | None = None,
         *,
-        cols_per_cta: int = 8,
+        cols_per_cta: int | None = None,
         path: str = "fi-rendered",
     ) -> None:
         self._programs = programs
-        if cols_per_cta not in (8, 16, 32) or D % cols_per_cta:
-            raise ValueError(f"cols_per_cta must be 8, 16 or 32, got {cols_per_cta}")
-        self.cols_per_cta = int(cols_per_cta)
+        if cols_per_cta is not None and (
+            cols_per_cta not in (8, 16, 32, 64) or D % cols_per_cta
+        ):
+            raise ValueError(
+                f"cols_per_cta must be None (the registry's merge record per launch) or 8, 16, 32 or 64, got {cols_per_cta}"
+            )
+        # The K4 column block of the positional merge ABI: None = the column block of the registry record the
+        # launch's (ncols, n_chains, transpose_m) selects (cake_kcp_jit.merge_record), the same record the
+        # registry's run_program launches.
+        self.cols_per_cta = None if cols_per_cta is None else int(cols_per_cta)
         self.path = path
         self._dev: dict[tuple[Any, ...], torch.Tensor] = {}
         self._checked_chains: set[int] = set()
@@ -1367,7 +1374,14 @@ class KernelBackend(Backend):
         call.merge_log.append(
             (str(args.get("family")), int(ch.ncols), int(ch.n_chains), cols)
         )  # D1 evidence: None = registry record
-        cols = self.cols_per_cta if cols is None else cols
+        if cols is None:
+            cols = (
+                self.cols_per_cta
+                if self.cols_per_cta is not None
+                else _registry_merge_cols(
+                    ch.ncols, ch.n_chains, int(args["transpose_m"])
+                )
+            )
         if ch.ncols % cols:
             raise ValueError(
                 f"ncols {ch.ncols} is not a multiple of cols_per_cta {cols}"
@@ -1399,6 +1413,14 @@ class KernelBackend(Backend):
             cols,
         ]
         return abi, ch.n_chains * (ch.ncols // cols)
+
+
+def _registry_merge_cols(ncols: int, n_chains: int, transpose_m: int) -> int:
+    """``cols_per_cta`` of the K4 record the registry selects for the launch (:func:`.cake_kcp_jit.merge_record`)."""
+    from . import cake_kcp_jit  # noqa: PLC0415 - H3's registry; optional at import time
+
+    record = cake_kcp_jit.merge_record(ncols, n_chains, transpose_m)
+    return int(cake_kcp_jit.MODULES[record]["grid_rule"]["cols_per_cta"])
 
 
 def merge_cols_per_cta(ncols: int, n_chains: int, rule: str) -> int | None:
@@ -2385,9 +2407,20 @@ class _FiPrograms:
             elif transfer_walk != TRANSFER_WALKS[0]:
                 record += f"_{transfer_walk}"
         elif program == "affine_merge":
-            record += (
-                "_c8" if int(abi[ABI_PARAMS[program].index("ncols")]) == D else "_c16"
+            # the registry's record of the launch; the positional ABI carries its column block
+            params = ABI_PARAMS[program]
+            ncols = int(abi[params.index("ncols")])
+            cols = int(abi[params.index("cols_per_cta")])
+            record = jit.merge_record(
+                ncols,
+                int(grid) // (ncols // cols),
+                int(abi[params.index("transpose_m")]),
             )
+            if int(jit.MODULES[record]["grid_rule"]["cols_per_cta"]) != cols:
+                raise ValueError(
+                    f"the merge ABI carries cols_per_cta {cols}; the registry's record {record} is built for "
+                    f"{jit.MODULES[record]['grid_rule']['cols_per_cta']}"
+                )
         values = dict(zip(ABI_PARAMS[program], abi, strict=True))
         jit.run_module(
             record, values, grid=(int(grid), 1, 1), device_index=device_index
