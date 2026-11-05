@@ -464,7 +464,8 @@ def test_capture_refuses_first_use_freezes_and_never_releases(tmp_path, monkeypa
 
 def test_a_state_does_not_survive_fork(monkeypatch):
     wrapper = bind(_Lifecycle())
-    monkeypatch.setattr(os, "getpid", lambda pid=os.getpid(): pid + 1)
+    pid = os.getpid()
+    monkeypatch.setattr(os, "getpid", lambda: pid + 1)
     with pytest.raises(SetupStateError, match="does not survive fork"):
         wrapper(x=torch.ones(2), out=torch.empty(2))
 
