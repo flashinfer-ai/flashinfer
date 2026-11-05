@@ -464,19 +464,48 @@ class _Paged:
     """A paged indexer cache ([num_pages, P, row + 4] bytes: P key rows, then
     their P scales) holding each request's keys at shuffled pages."""
 
-    def __init__(self, fp4, B, max_len, P, gen, dev, zero_frac=0.0, crowd=False):
+    def __init__(
+        self,
+        fp4,
+        B,
+        max_len,
+        P,
+        gen,
+        dev,
+        zero_frac=0.0,
+        crowd=False,
+        block_bytes=None,
+        page_offset=0,
+    ):
         row = _D // 2 if fp4 else _D
         blocks = (max_len + P - 1) // P
         num_pages = B * blocks + 3
         self.keys = _keys(fp4, (num_pages * P,), gen, dev, zero_frac, crowd)
-        cache = torch.zeros(num_pages, P * (row + 4), dtype=torch.uint8, device=dev)
+        page_bytes = P * (row + 4)
+        if block_bytes is None:
+            cache = torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=dev)
+        else:
+            # Each page at page_offset in a larger block, the storage ending
+            # with the last page (one layer's cache inside per-block buffers).
+            pool = torch.full(
+                ((num_pages - 1) * block_bytes + page_offset + page_bytes,),
+                0xFF,
+                dtype=torch.uint8,
+                device=dev,
+            )
+            cache = pool.as_strided(
+                (num_pages, page_bytes), (block_bytes, 1), page_offset
+            )
+            cache.zero_()
         cache[:, : P * row] = self.keys.data.view(torch.uint8).reshape(
             num_pages, P * row
         )
         cache[:, P * row :] = self.keys.scale.view(torch.uint8).reshape(
             num_pages, P * 4
         )
-        self.cache = cache.view(num_pages, P, row + 4)
+        self.cache = cache.as_strided(
+            (num_pages, P, row + 4), (cache.stride(0), row + 4, 1)
+        )
         perm = torch.randperm(num_pages, generator=gen, device=dev)[: B * blocks]
         self.table = perm.int().view(B, blocks)
         self.P = P
@@ -562,6 +591,22 @@ def test_paged(fp4, heads, top_k, B, next_n, lens, P, zero_frac):
     gen = torch.Generator(device=dev).manual_seed(B * 131 + next_n + heads + top_k)
     paged = _Paged(fp4, B, max(lens), P, gen, dev, zero_frac)
     q, w, ctx = _decode_inputs(fp4, B, next_n, heads, lens, gen, dev)
+    idx, sc = _run_decode(q, w, ctx, paged, top_k)
+    _check_decode(idx, sc, q, w, ctx, paged, top_k)
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+@pytest.mark.parametrize("heads,top_k", _HK)
+def test_paged_block_view(fp4, heads, top_k):
+    """Pages viewed inside larger blocks, as when a layer's indexer cache
+    shares each block with other caches."""
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(heads + top_k)
+    lens = [9000, 300, 20000]
+    paged = _Paged(
+        fp4, len(lens), max(lens), 64, gen, dev, block_bytes=212256, page_offset=101376
+    )
+    q, w, ctx = _decode_inputs(fp4, len(lens), 2, heads, lens, gen, dev)
     idx, sc = _run_decode(q, w, ctx, paged, top_k)
     _check_decode(idx, sc, q, w, ctx, paged, top_k)
 

@@ -417,10 +417,13 @@ def dsa_indexer_det_topk_paged(
     w = w.contiguous()
     if fp4:
         q_scale = q_scale.contiguous().view(torch.int32).reshape(num_rows, num_heads)
-    # The cache as [num_pages, page_stride] bytes (pages may carry a gap).
+    # The cache as [num_pages, page bytes] with its page stride: pages may be
+    # views into larger blocks, so the last page may end before a full stride.
     page_stride = kv_cache.stride(0) * kv_cache.element_size()
     pages = torch.as_strided(
-        kv_cache.view(torch.uint8), (kv_cache.shape[0], page_stride), (page_stride, 1)
+        kv_cache.view(torch.uint8),
+        (kv_cache.shape[0], page_rows * (row_bytes + 4)),
+        (page_stride, 1),
     )
     row_len = context_lens.reshape(num_rows).contiguous()
     indices, scores = _outputs(indices, scores, return_scores, num_rows, top_k, dev)
