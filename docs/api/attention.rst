@@ -280,6 +280,13 @@ PageAttention for MLA
     layout, not FlashMLA's GEMM-permuted layout. Query normalization, cache
     insertion, sparse selection, and learned projections remain outside.
 
+    CuTe FP8 prefill uses 32-candidate probability quantization groups by
+    default, independently of its 64-candidate memory tile. Set
+    ``FLASHINFER_SM120_PREFILL_P_QUANT_GROUP=64`` to use a single group per
+    tile, or ``32`` for the default. This changes FP8 rounding before PV;
+    it applies to both mega and BF16-output specializations. The choice is
+    made at launch; CUDA graphs retain the choice made during capture.
+
     The CuTe FP8 prefill path has unresolved async-copy racecheck reports;
     this development route is not yet ready for production use.
 

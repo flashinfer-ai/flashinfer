@@ -34,8 +34,9 @@ using MicroTransposed = decltype(composition(Swizzle<3, 4, 3>{},
 // Express the row-bit permutation as a hierarchical row layout, then apply one swizzle.
 // Compatible with both QK 2-float stores and PV 4-float loads.
 // Named barriers: 1 QK-local; 2/3 S-ready; 4/5 S-free.
-template <bool Mega>
+template <bool Mega, int PQuantGroup = 32>
 __global__ __launch_bounds__(384, 1) void prefill(Params p) {
+  static_assert(PQuantGroup == 32 || PQuantGroup == 64);
   extern __shared__ __align__(128) unsigned char raw[];
   auto& sm = *reinterpret_cast<Shared*>(raw);
   const int lane = threadIdx.x % 32;
@@ -342,7 +343,6 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           }
         }
         auto rScaled = make_tensor_like(rP);
-        float amax = 1.e-10f;
         #pragma unroll
         for (int k = 0; k < 2; ++k) {
           #pragma unroll
@@ -352,16 +352,32 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
             for (int byte = 0; byte < 4; ++byte) {
               int v = quartet * 4 + byte;
               rScaled(v, 0, k) = rP(v, 0, k) * ue8((scales >> (byte * 8)) & 255);
-              amax = fmaxf(amax, fabsf(rScaled(v, 0, k)));
             }
           }
         }
-        float scale = row_max4(amax) / 448.f;
-        auto rP8_packed = recast<uint32_t>(rP8);
+        // B's K mode is (candidate=32, candidate-group=2). Keep the
+        // 64-candidate load tile independent of the P quantization extent.
+        float p_scale[64 / PQuantGroup];
         #pragma unroll
-        for (int i = 0; i < size(rP8_packed); ++i) {
-          rP8_packed(i) = cvt_e4m3x4(rScaled(i * 4) / scale, rScaled(i * 4 + 1) / scale,
-                                   rScaled(i * 4 + 2) / scale, rScaled(i * 4 + 3) / scale);
+        for (int g = 0; g < 64 / PQuantGroup; ++g) {
+          float amax = 1.e-10f;
+          #pragma unroll
+          for (int k = 0; k < PQuantGroup / 32; ++k) {
+            #pragma unroll
+            for (int v = 0; v < 8; ++v)
+              amax = fmaxf(amax, fabsf(rScaled(v, 0, g * (PQuantGroup / 32) + k)));
+          }
+          p_scale[g] = row_max4(amax) / 448.f;
+        }
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) {
+          auto rP8_packed = recast<uint32_t>(rP8(_, _, k));
+          float scale = p_scale[k / (PQuantGroup / 32)];
+          #pragma unroll
+          for (int i = 0; i < size(rP8_packed); ++i)
+            rP8_packed(i) = cvt_e4m3x4(rScaled(i * 4, 0, k) / scale,
+                rScaled(i * 4 + 1, 0, k) / scale, rScaled(i * 4 + 2, 0, k) / scale,
+                rScaled(i * 4 + 3, 0, k) / scale);
         }
         auto sVStage = make_tensor(make_smem_ptr(reinterpret_cast<E4*>(sm.v[stage])), MicroTransposed{});
         auto sV = local_tile(sVStage, Shape<_32, _64>{}, make_coord(group % 4, _0{}));
@@ -371,15 +387,20 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         auto rV_cv = thr_copy.retile_D(rV);
         copy(tiled_copy, thr_copy.partition_S(sV), rV_cv);
         auto rPV = thr_mma.partition_fragment_C(make_identity_tensor(Shape<_32, _8>{}));
-        clear(rPV);
-        gemm(mma, rV, rP8, rPV);
-        float scale0 = __shfl_sync(0xffffffff, scale, (lane % 4) * 8);
-        float scale1 = __shfl_sync(0xffffffff, scale, (lane % 4) * 8 + 4);
         #pragma unroll
-        for (int m = 0; m < 2; ++m) {
+        for (int g = 0; g < 64 / PQuantGroup; ++g) {
+          clear(rPV);
+          if constexpr (PQuantGroup == 64)
+            gemm(mma, rV, rP8, rPV);
+          else
+            gemm(mma, rV(_, _, g), rP8(_, _, g), rPV);
+          float scale0 = __shfl_sync(0xffffffff, p_scale[g], (lane % 4) * 8);
+          float scale1 = __shfl_sync(0xffffffff, p_scale[g], (lane % 4) * 8 + 4);
           #pragma unroll
-          for (int v = 0; v < 4; ++v) {
-            rO(v, group * 2 + m, 0) += rPV(v, m, 0) * (v % 2 == 0 ? scale0 : scale1);
+          for (int m = 0; m < 2; ++m) {
+            #pragma unroll
+            for (int v = 0; v < 4; ++v)
+              rO(v, group * 2 + m, 0) += rPV(v, m, 0) * (v % 2 == 0 ? scale0 : scale1);
           }
         }
         if (group % 4 == 3) {

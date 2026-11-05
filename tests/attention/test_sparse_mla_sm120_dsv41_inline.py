@@ -672,3 +672,55 @@ def test_cake_rejects_inline_formats(sm12x):
             kv_cache_format="fp8_dsv41_inline_fp4_ca",
             backend="cake",
         )
+
+
+def test_inline_prefill_probability_quant_group(monkeypatch, sm12x):
+    """Quantization extent is selectable and retained by a captured graph."""
+    from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1
+
+    footer, _ = _caches("none", 32, 64, seed=128)
+    cache = _inline_view(footer, _FP8, 32)
+    torch.manual_seed(135)
+    q = torch.randn(128, 16, 512, device="cuda", dtype=torch.bfloat16) / 10
+    indices = torch.randint(192, (128, 128), device="cuda", dtype=torch.int32)
+    decoded = dequantize_kv_dsv4_1(footer).reshape(-1, 512).double()
+    selected = decoded[indices.long()]
+    scores = q.double() @ selected.transpose(1, 2) * 512**-0.5
+    reference = torch.softmax(scores, dim=-1) @ selected
+    wrapper = flashinfer.mla.SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32_inline", compute_precision="fp8"
+    )
+    out = torch.empty_like(q)
+
+    def run():
+        return wrapper.run(q, cache, indices, out, 512**-0.5, return_lse=True)
+
+    env = "FLASHINFER_SM120_PREFILL_P_QUANT_GROUP"
+    snapshots, graphs = {}, {}
+    for group in (32, 64):
+        monkeypatch.setenv(env, str(group))
+        lse = run()
+        snapshots[group] = out.clone(), lse.clone()
+        assert ((out.double() - reference).norm() / reference.norm()).item() < 0.07
+        torch.testing.assert_close(
+            lse.double(),
+            torch.logsumexp(scores, -1) * 1.4426950408889634,
+            atol=0.06,
+            rtol=0,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graphs[group] = graph
+    monkeypatch.delenv(env)
+    lse = run()
+    torch.testing.assert_close(out, snapshots[32][0], atol=0, rtol=0)
+    torch.testing.assert_close(lse, snapshots[32][1], atol=0, rtol=0)
+    assert not torch.equal(snapshots[32][0], snapshots[64][0])
+    for group, graph in graphs.items():
+        graph.replay()
+        torch.testing.assert_close(out, snapshots[group][0], atol=0, rtol=0)
+        torch.testing.assert_close(lse, snapshots[group][1], atol=0, rtol=0)
+    monkeypatch.setenv(env, "16")
+    with pytest.raises(Exception, match="must be 32 or 64"):
+        run()
