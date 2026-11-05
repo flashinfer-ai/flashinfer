@@ -328,13 +328,23 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       if (warp >= 2) {
         auto rOther = make_tensor_like(tSrS);
         copy_aligned(tSsS, rOther);
+        // A visited tile has length > 0. Clamp only the index load to keep
+        // tail accesses in bounds; retain the original position for masking.
+        // Each candidate occurs in two head rows of the C fragment.
         #pragma unroll
         for (int n = 0; n < 8; ++n) {
           #pragma unroll
-          for (int v = 0; v < 4; ++v) {
-            int candidate = get<1>(tScS(v, 0, n));
-            bool valid = tile_start + candidate < length && ids[tile_start + candidate] >= 0;
-            tSrS(v, 0, n) = valid ? (rOther(v, 0, n) + tSrS(v, 0, n)) * (p.sm_scale * LOG2E) : -INFINITY;
+          for (int c = 0; c < 2; ++c) {
+            int candidate = get<1>(tScS(c, 0, n));
+            int position = tile_start + candidate;
+            int id = ids[min(position, length - 1)];
+            int valid = int(position < length) & int(id >= 0);
+            #pragma unroll
+            for (int row = 0; row < 2; ++row) {
+              int v = row * 2 + c;
+              float score = (rOther(v, 0, n) + tSrS(v, 0, n)) * (p.sm_scale * LOG2E);
+              tSrS(v, 0, n) = valid ? score : -INFINITY;
+            }
           }
         }
         copy_aligned(tSrS, tSsS);
