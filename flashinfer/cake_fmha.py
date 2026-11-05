@@ -1807,7 +1807,8 @@ _PRIMARY_SM_COUNTS: dict[int, int] = {}
 # new ``CUstream`` on every call.
 _CU_STREAMS: dict[int, Any] = {}
 # ``(cuStreamGetCtx, cuCtxGetCurrent, cuCtxGetId, cuCtxGetDevResource, SM
-# resource type, CUstream, device index -> its retained primary context)`` of
+# resource type, CUstream, device index -> its retained primary context,
+# CUstream -> the context of its green context or None)`` of
 # ``cuda.bindings.driver`` once resolved; ``False`` without them (then a launch
 # is planned on the device's SM count).
 _CONTEXT_QUERIES: Any = None
@@ -1825,6 +1826,23 @@ def _context_queries() -> Any:
                     return err, None
                 return driver.cuDevicePrimaryCtxRetain(device)
 
+            # Before CUDA 13, ``cuStreamGetCtx`` returns
+            # ``CUDA_ERROR_NOT_SUPPORTED`` for a stream of
+            # ``cuGreenCtxStreamCreate``; ``cuStreamGetCtx_v2`` (CUDA 12.5)
+            # gives its green context, whose ``cuCtxFromGreenCtx`` context holds
+            # the partition.  (Its other output is then the primary context.)
+            stream_contexts = getattr(driver, "cuStreamGetCtx_v2", None)
+            from_green = getattr(driver, "cuCtxFromGreenCtx", None)
+
+            def green_context(stream: Any) -> Any:
+                if stream_contexts is None or from_green is None:
+                    return None
+                err, _, green = stream_contexts(stream)
+                if int(err) or not int(green):
+                    return None
+                err, context = from_green(green)
+                return None if int(err) or not int(context) else context
+
             _CONTEXT_QUERIES = (
                 driver.cuStreamGetCtx,
                 driver.cuCtxGetCurrent,
@@ -1833,6 +1851,7 @@ def _context_queries() -> Any:
                 driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
                 driver.CUstream,
                 primary_context,
+                green_context,
             )
         except (ImportError, AttributeError):
             _CONTEXT_QUERIES = False
@@ -1842,7 +1861,7 @@ def _context_queries() -> Any:
 def _context_sm_count(queries: Any, context: Any) -> int | None:
     """The SM count of CUDA ``context``, read once per context ID."""
 
-    _, _, context_id, context_resource, sm_type, _, _ = queries
+    _, _, context_id, context_resource, sm_type = queries[:5]
     err, key = context_id(context)
     count = None if int(err) else _CONTEXT_SM_COUNTS.get(key)
     if count is None:
@@ -1872,10 +1891,11 @@ def _stream_context_sm_count(index: int) -> int | None:
     per-thread default streams run on the thread's current context); ``None``
     when the driver cannot tell.
 
-    Every launch resolves its stream's context (``cuStreamGetCtx``, else the
-    thread's current context).  The device's primary context is known by its
-    handle, so a launch on one of its streams makes no other driver call; any
-    other context's count is cached per context ID (``cuCtxGetId``).  The
+    Every launch resolves its stream's context (``cuStreamGetCtx``; where that
+    does not answer, the stream's green context, else the thread's current
+    context).  The device's primary context is known by its handle, so a
+    launch on one of its streams makes no other driver call; any other
+    context's count is cached per context ID (``cuCtxGetId``).  The
     stream is not keyed by ``cuStreamGetId``: on a stream being captured into
     a CUDA graph that query returns ``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED``
     and invalidates the capture (driver 580, in global and relaxed capture
@@ -1893,8 +1913,12 @@ def _stream_context_sm_count(index: int) -> int | None:
     err, context = queries[0](cu_stream)
     handle = 0 if int(err) else int(context)
     if not handle:
-        err, context = queries[1]()
-        handle = 0 if int(err) else int(context)
+        context = queries[7](cu_stream)
+        if context is None:
+            err, context = queries[1]()
+            if int(err):
+                return None
+        handle = int(context)
         if not handle:
             return None
     count = _PRIMARY_SM_COUNTS.get(handle)
@@ -4831,12 +4855,14 @@ def select_cake_fmha_decode_route(
         smallm_sm_count = _smallm_sm_count(device)
         # The small-M split count is planned on the SMs the launch's stream
         # holds (a green context's partition); the other routes keep the
-        # device's SM count.
+        # device's SM count.  More tiles than the device's SMs take no split
+        # on any partition, so such a launch reads no stream.
         smallm_launch_sm_count = (
             _smallm_launch_sm_count(device, smallm_sm_count)
             if _SMALLM_SM_PARTITIONS
             and smallm_rows is not None
             and query.shape[2] == 256
+            and 0 < smallm_tiles <= smallm_sm_count
             else smallm_sm_count
         )
         smallm_num_split = _smallm_num_split(

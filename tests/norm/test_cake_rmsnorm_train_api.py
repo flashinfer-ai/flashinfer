@@ -659,10 +659,18 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     # Every CUDA activity of the call, memsets and copies included, read
     # between sentinel kernels that prove the session kept the whole window (a
     # session can lose its device records; see tests.test_helpers.cake_profiler).
-    names = cuda_kernel_names(call, exclude=())
+    # When every session lost them, the workspace is still checked before the
+    # launch count is skipped.
+    lost = None
+    try:
+        names = cuda_kernel_names(call, exclude=())
+    except pytest.skip.Exception as skipped:
+        lost = skipped
+    assert _at_rest(ws)
+    if lost is not None:
+        raise lost
     assert len(names) == 1, names
     assert "rmsnorm" in names[0] and "reduce" not in names[0], names
-    assert _at_rest(ws)
 
 
 @requires_device
