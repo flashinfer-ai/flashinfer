@@ -193,14 +193,14 @@ part; the deterministic plan of these rows is the same on 148 and 152 SMs): at 4
 The deterministic program misses it there too (`4096 -> 48` 9 of 10 seeds and `5120 -> 48` 8 of 10 at 49153 tokens,
 `4096 -> 32` 3 of 10 at 65536 tokens and none from 65537 tokens up), so these rows keep the deterministic program from
 their entry up, except `5120 -> 32`: there the deterministic program met it on all 10 seeds at 49153 tokens, and the
-entry moves from 65537 to 49153 tokens, provisional until 36865 to 57345 tokens are measured with 10 seeds. Token counts
-below 512, above 65536 (other rows), between two measured token counts with different outcomes, and on parts with fewer
-than 152 SMs were not measured and keep the verdict.  Measured token counts that failed the rule but keep the verdict,
-because the deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower there: BF16
-output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`; BF16 output at 2048 tokens on `sm_100a` `5120 -> 32`,
-`6144 -> 32`; `sm_103a` `4096 -> 48`; FP32 output at 512 tokens on `sm_100a` `4096 -> 32`, `6144 -> 32`; FP32 output at
-1024 tokens on `sm_100a` `6144 -> 32`; FP32 output at 8192 tokens on `sm_103a` `4096 -> 48`, `5120 -> 128`.  At 65536
-tokens neither program meets the BF16 error budget.*
+entry moves from 65537 to 49153 tokens, provisional until 36865 to 57345 tokens are measured with 10 seeds.  Token
+counts below 512, above 65536 (other rows), between two measured token counts with different outcomes, and on parts with
+fewer than 152 SMs were not measured and keep the verdict.  Measured token counts that failed the rule but keep the
+verdict, because the deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower
+there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`; BF16 output at 2048 tokens on `sm_100a`
+`5120 -> 32`, `6144 -> 32`; `sm_103a` `4096 -> 48`; FP32 output at 512 tokens on `sm_100a` `4096 -> 32`, `6144 -> 32`;
+FP32 output at 1024 tokens on `sm_100a` `6144 -> 32`; FP32 output at 8192 tokens on `sm_103a` `4096 -> 48`,
+`5120 -> 128`.  At 65536 tokens neither program meets the BF16 error budget.*
 
 | K1 row `d_in -> d_out` | `sm_100a` BF16 | `sm_100a` FP32 | `sm_103a` BF16 | `sm_103a` FP32 |
 |---|---|---|---|---|
@@ -266,7 +266,7 @@ tokens, `sm_100a` on a 148-SM B200 part and `sm_103a` on a 148-SM B300 part, the
 the same on 148 and 152 SMs; `sm_100a` `5120 -> 32` and `5120 -> 48` at 12337 to 65537 tokens), so those token counts
 run the two-split program; q was 1.03 to 1.15, 1.021 to 1.024 at 65537 tokens and 1.007 to 1.075 for the `5120` rows
 (data).  From 98305 tokens up both programs miss the FP32 budget at an odd count; no odd token count from 65538 to 98304
-was measured, and the rows run the deterministic program at an odd count from 65538 tokens up. `sm_107a` `8192 -> 128`
+was measured, and the rows run the deterministic program at an odd count from 65538 tokens up.  `sm_107a` `8192 -> 128`
 FP32 has no entry: at odd block counts from 1025 to 8191 tokens its two-split program met the FP32 budget on every seed
 (10 seeds on 212-SM R200 parts; q 1.04 to 1.14 at 1025, 1088, 2049 and 4097 tokens).  The BF16 outputs of these rows had
 the deterministic program's relative Frobenius error and met the error budget on every seed where the deterministic
