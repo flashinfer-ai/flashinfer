@@ -51,10 +51,8 @@ def device_caps(device: torch.device) -> tuple[int, int]:
 
 
 def tuning_enabled(is_dsv4_nvfp4: bool) -> bool:
-    tuner = AutoTuner.get()
-    stack = tuner._get_skip_ops_stack()
     name = "sparse_mla_sm120_nvfp4" if is_dsv4_nvfp4 else "sparse_mla_sm120"
-    return tuner.is_tuning_mode and not (stack and name in stack[-1])
+    return AutoTuner.get().tuning_enabled(name)
 
 
 def tensor_signature(tensor: torch.Tensor | None) -> tuple | None:

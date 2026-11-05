@@ -224,12 +224,6 @@ def _canonical_profile_layout(
     return True
 
 
-def _autotune_skipped() -> bool:
-    tuner = AutoTuner.get()
-    skip_stack = tuner._get_skip_ops_stack()
-    return bool(skip_stack) and _AUTOTUNE_OP in skip_stack[-1]
-
-
 def _maybe_calibrate(
     *,
     device: torch.device,
@@ -243,10 +237,8 @@ def _maybe_calibrate(
     has_extra_topk_length: bool,
     has_attn_sink: bool,
 ) -> None:
-    tuner = AutoTuner.get()
     if (
-        not tuner.is_tuning_mode
-        or _autotune_skipped()
+        not AutoTuner.get().tuning_enabled(_AUTOTUNE_OP)
         or _cpb._target_capturing(device)
         or _cpb.is_calibration_failed(device, key)
     ):
@@ -373,8 +365,7 @@ def plan_nvfp4_sparse_mla_sm120(
         and profile is not None
         and decode_ok
         and str(num_tokens) not in profile["buckets"]
-        and AutoTuner.get().is_tuning_mode
-        and not _autotune_skipped()
+        and AutoTuner.get().tuning_enabled(_AUTOTUNE_OP)
         and not _cpb._target_capturing(device)
         and not _cpb.is_refine_failed(device, key, num_tokens)
     ):

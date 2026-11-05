@@ -710,6 +710,7 @@ def autotune_v2(
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
     skip_ops: Optional[Union[str, Set[str]]] = None,
+    only_ops: Optional[Union[str, Set[str]]] = None,
 ):
     """Autotune with FlashInfer-managed on-disk persistence (experimental v2).
 
@@ -791,6 +792,9 @@ def autotune_v2(
         skip_ops: Forwarded to :func:`flashinfer.autotune`; quarantines
             specific ``custom_op`` names (e.g. an op whose tuning
             crashes) without losing autotune for everything else.
+        only_ops: Forwarded to :func:`flashinfer.autotune`; tunes only the
+            named ``custom_op`` names while every other op consumes its
+            published entries. Requires a tuning ``mode``.
         measurement_policy: Optional :class:`MeasurementPolicy` -- measure
             tactics the way the deployment runs:
             ``MeasurementPolicy(execution_mode="cuda_graph")`` or
@@ -877,6 +881,7 @@ def autotune_v2(
         tuning_buckets=tuning_buckets,
         round_up=round_up,
         skip_ops=skip_ops,
+        only_ops=only_ops,
     ):
         if persistent_cache:
             manifest = _collect_metadata()
