@@ -57,6 +57,7 @@ DispatchPolicy = cake_policy.DispatchPolicy
 fp8_policy_record = cake_policy.fp8_policy_record
 fp8_program_choice = cake_policy.fp8_program_choice
 fp8_scan_programs = cake_policy.fp8_scan_programs
+sample_class_for = cake_policy.sample_class_for
 scan_key = cake_policy.scan_key
 scan_key_fields = cake_policy.scan_key_fields
 scan_key_form = cake_policy.scan_key_form
@@ -327,7 +328,8 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
     """The FP8 dispatch runs the BF16 decision procedure under the FP8 record and maps its kind to a registered FP8
     kind (``FP8_KIND_FALLBACK``); on a geometry grid every program it selects is an FP8 key of the registry, never a
     CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow that decision where an
-    FP8 program carries them, and every FP8 key is selected by some call."""
+    FP8 program carries them, the sampled first threshold and the check period are those of the kind that runs, and
+    every FP8 key is selected by some call."""
     if not fp8_keys:
         pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
     policy = _fp8_policy(arch)
@@ -367,6 +369,39 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
                     if decided.tile_unroll in unrolls
                     else min(unrolls)
                 ), where
+                tiles = (
+                    policy.sample_tiles_for(T, Tkv, S, ratio)
+                    if sample is None
+                    else sample
+                )
+                assert (
+                    c.sample_tiles_max,
+                    c.sample_shift_permille,
+                ) == sample_class_for(
+                    policy,
+                    physical,
+                    T,
+                    Tkv,
+                    S,
+                    ratio,
+                    tiles,
+                    policy.sample_shift_for(top_k),
+                    tiles_knob=sample is not None,
+                    shift_knob=False,
+                ), where
+                assert c.check_period == policy.check_period_for(
+                    top_k, c.cand_cap, c.kind
+                ), where
+                if physical == decided.physical_kind:
+                    assert (
+                        c.sample_tiles_max,
+                        c.sample_shift_permille,
+                        c.check_period,
+                    ) == (
+                        decided.sample_tiles_max,
+                        decided.sample_shift_permille,
+                        decided.check_period,
+                    ), where
                 if arch == "sm_107a":
                     assert not c.lsf, where
                 reached.add(c.scan_key)
@@ -397,6 +432,38 @@ def test_fp8_wide_call_runs_the_l6_program(arch, grid):
     fp8 = select_fp8_program(_fp8_policy(arch), **call)
     assert fp8.scan_key == "scan:l6:u1:s0:f1:fp8", fp8.scan_key
     assert (fp8.block_q, fp8.pair, fp8.n_split, fp8.grid_ctas) == (6, False, 1, grid)
+
+
+def test_fp8_wide_fallback_takes_the_sampling_class_of_l6():
+    """s2_4x2k_packed on sm_100a (four segments of 2048 queries over 229376 keys, the longest 100352): the BF16 record
+    plans a wide unit with the wide-unit sample shift of ``sample_class_rule``; the FP8 l6 program that runs instead
+    takes the l6 kind's shift and check period, as an l6 decision of the call would.  Explicit knobs stay."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_100a") or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip("this checkout registers no FP8 scan program for sm_100a")
+    policy = _fp8_policy("sm_100a")
+    call = dict(
+        num_queries=8192,
+        num_keys=229376,
+        num_segments=4,
+        ratio=1,
+        top_k=2048,
+        grid=148,
+        max_seqlen_k=100352,
+        scan_keys=keys,
+    )
+    decided = select_program(policy, **call)
+    assert decided.physical_kind == "wide", decided.scan_key
+    assert decided.sample_shift_permille == policy.sample_class_rule[1]
+    c = select_fp8_program(policy, **call)
+    assert c.scan_key == "scan:l6:u1:s0:f1:fp8:lsf", c.scan_key
+    assert c.sample_shift_permille == policy.sample_shift_for(2048)
+    assert c.sample_tiles_max == decided.sample_tiles_max
+    assert c.check_period == policy.check_period_for(2048, c.cand_cap, "l6")
+    knobbed = select_fp8_program(
+        policy, sample_shift_permille=500, check_period=8, **call
+    )
+    assert (knobbed.sample_shift_permille, knobbed.check_period) == (500, 8)
 
 
 def test_bf16_plans_and_workspace_bounds_are_the_unchanged_procedure():

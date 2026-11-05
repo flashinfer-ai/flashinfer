@@ -146,7 +146,10 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   runs without a CTA pair, in the plain unit order, in its sampled-fit form,
   with the decided tile unroll where an FP8 program of it is registered
   (else the smallest registered one) and in the longest-first order where
-  the BF16 rule picks it and an FP8 copy exists.  On `sm_107a` every FP8
+  the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its
+  own `sample_class_rule` class and `check_period_kind_overrides` period
+  (`cake_policy.fallback_knobs`): an `l6` program run for a `wide` decision
+  samples like an `l6` decision; explicit knobs stay.  On `sm_107a` every FP8
   kind keeps the static unit enumeration (`static_scan_kinds`): no ticket
   tail, nothing zeroed.  An architecture without FP8 programs raises
   `NotImplementedError`.

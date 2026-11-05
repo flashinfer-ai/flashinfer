@@ -224,6 +224,45 @@ CLASS_RULE_MAX_QUERIES_PER_SEGMENT = 4096
 # lever LSF: the longest-first segment order copy of a scan program runs on calls of at least this many segments
 LSF_MIN_SEGMENTS = 2
 
+
+def sample_class_for(
+    policy: "DispatchPolicy",
+    physical: str,
+    num_queries: int,
+    num_keys: int,
+    num_segments: int,
+    ratio: int,
+    tiles: int,
+    shift: int,
+    *,
+    tiles_knob: bool,
+    shift_knob: bool,
+) -> tuple[int, int]:
+    """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
+    record's ``sample_class_rule``, from the call's ``tiles`` / ``shift``: the wide-unit programs take the rule's shift,
+    the tiny dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count.  A knob
+    the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rule or with sampling off nothing changes."""
+    class_rule = policy.sample_class_rule
+    T, S = int(num_queries), int(num_segments)
+    if class_rule is None or tiles <= 0:
+        return tiles, shift
+    # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
+    if "wide" in physical:
+        if not shift_knob and S >= CLASS_RULE_MIN_SEGMENTS:
+            shift = int(class_rule[1])
+    elif (
+        not tiles_knob
+        and policy.mean_unit_tiles(T, num_keys, S, ratio)
+        <= policy.sample_dispatch_tiny_tiles_max
+        and S >= CLASS_RULE_MIN_SEGMENTS
+        and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
+    ):
+        tiles = int(class_rule[0])
+        if not shift_knob:
+            shift = int(class_rule[1])
+    return tiles, shift
+
+
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
         "candidate_multiplier_unsampled", "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
         "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille", "far_sample",
@@ -1610,22 +1649,18 @@ def select_program(
     unroll = policy.tile_unroll_for(kind, K, snake, block_q)
     grid_ctas = grid - grid % 2 if pair else grid
     physical = physical_kind(kind, unit)
-    class_rule = policy.sample_class_rule
-    if class_rule is not None and tiles > 0:
-        # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
-        if "wide" in physical:
-            if sample_shift_permille is None and S >= CLASS_RULE_MIN_SEGMENTS:
-                shift = int(class_rule[1])
-        elif (
-            sample_tiles_max is None
-            and policy.mean_unit_tiles(T, Tkv, S, r)
-            <= policy.sample_dispatch_tiny_tiles_max
-            and S >= CLASS_RULE_MIN_SEGMENTS
-            and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
-        ):
-            tiles = int(class_rule[0])
-            if sample_shift_permille is None:
-                shift = int(class_rule[1])
+    tiles, shift = sample_class_for(
+        policy,
+        physical,
+        T,
+        Tkv,
+        S,
+        r,
+        tiles,
+        shift,
+        tiles_knob=sample_tiles_max is not None,
+        shift_knob=sample_shift_permille is not None,
+    )
     fit = policy.sample_fit_for(T, Tkv, S, r, cap, physical)
     if check_period is None:
         period = policy.check_period_for(K, cap, kind)
@@ -1776,6 +1811,45 @@ def fp8_program_choice(
     )
 
 
+def fallback_knobs(
+    policy: DispatchPolicy, choice: ProgramChoice, physical: str, call: dict
+) -> ProgramChoice:
+    """``choice`` with the sampled first threshold and the check period of the scan kind ``physical`` that runs in place
+    of the decided one (``FP8_KIND_FALLBACK``): the record's ``sample_class_rule`` and ``check_period_kind_overrides``
+    key on the program kind, so a wide decision's wide-unit shift and check period do not carry over to the l6
+    program.  The knobs ``call`` sets stay."""
+    T, Tkv, S, r, K = (
+        choice.num_queries,
+        choice.num_keys,
+        choice.num_segments,
+        choice.ratio,
+        choice.top_k,
+    )
+    tiles_knob = call.get("sample_tiles_max")
+    shift_knob = call.get("sample_shift_permille")
+    tiles, shift = sample_class_for(
+        policy,
+        physical,
+        T,
+        Tkv,
+        S,
+        r,
+        policy.sample_tiles_for(T, Tkv, S, r)
+        if tiles_knob is None
+        else int(tiles_knob),
+        policy.sample_shift_for(K) if shift_knob is None else int(shift_knob),
+        tiles_knob=tiles_knob is not None,
+        shift_knob=shift_knob is not None,
+    )
+    period = choice.check_period
+    if call.get("check_period") is None:
+        kind = "split" if physical.startswith("split_") else physical
+        period = policy.check_period_for(K, choice.cand_cap, kind)
+    return replace(
+        choice, sample_tiles_max=tiles, sample_shift_permille=shift, check_period=period
+    )
+
+
 def select_fp8_program(
     policy: DispatchPolicy,
     *,
@@ -1785,11 +1859,12 @@ def select_fp8_program(
 ) -> ProgramChoice:
     """The host dispatch of one FP8 call: the decision procedure of ``select_program`` (``call``: its keywords) under the
     architecture's FP8 record ``policy`` (``fp8_policy_record``) with the registry's ``scan_keys``, run by the FP8
-    program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind where no FP8
-    program of that kind is registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered) and
-    with the decided tile unroll where an FP8 program of it is registered, else the smallest registered one.
-    ``fp8_programs``: ``fp8_scan_programs(scan_keys)``, made once by the caller.  Raises ``NotImplementedError`` when no
-    FP8 program serves the kind."""
+    program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind, with that
+    kind's sampled first threshold and check period (``fallback_knobs``), where no FP8 program of the decided kind is
+    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered) and with the decided tile
+    unroll where an FP8 program of it is registered, else the smallest registered one.  ``fp8_programs``:
+    ``fp8_scan_programs(scan_keys)``, made once by the caller.  Raises ``NotImplementedError`` when no FP8 program
+    serves the kind."""
     choice = select_program(policy, scan_keys=scan_keys, **call)
     programs = fp8_scan_programs(scan_keys) if fp8_programs is None else fp8_programs
     physical = choice.physical_kind
@@ -1802,6 +1877,8 @@ def select_fp8_program(
             f"(registered FP8 kinds: {sorted({kind for kind, _lsf in programs})})"
         )
     key = unrolls.get(choice.tile_unroll, unrolls[min(unrolls)])
+    if physical != choice.physical_kind:
+        choice = fallback_knobs(policy, choice, physical, call)
     return fp8_program_choice(policy, choice, key)
 
 
@@ -1821,12 +1898,14 @@ __all__ = [
     "DispatchPolicy",
     "ProgramChoice",
     "ScanKeyFields",
+    "fallback_knobs",
     "finalize_key",
     "finalize_role",
     "fp8_policy_record",
     "fp8_program_choice",
     "fp8_scan_programs",
     "physical_kind",
+    "sample_class_for",
     "scan_key",
     "scan_key_fields",
     "scan_key_form",
