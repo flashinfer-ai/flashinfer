@@ -2474,7 +2474,8 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and old_o.ovl
         and not old_o.ovr
     )
-    # the sm_100a dense_down / o_proj forwards carry no ovr rule and keep their round-21 programs
+    # the sm_100a dense_down / o_proj forwards carry no ovr rule and keep their round-21 programs (o_proj at T 16231:
+    # the round-8 T-exact key's row-half-release program, test_gb_t_exact_rules_plan_their_programs)
     pd100, *_ = plan_dense_projection_det_gemm(d["A"], d["B"], d["out"], **kw)
     assert (
         _nopro(pd100.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
@@ -2482,12 +2483,20 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and not pd100.cgrp
     )
     po100, *_ = plan_dense_projection_det_gemm(o["A"], o["B"], o["out"], **kw)
-    assert (
-        _nopro(po100.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
-        and not po100.ovr
-        and not po100.cgrp
-        and po100.group_m == 8
-    )
+    if T == 16231:
+        assert (
+            _nopro(po100.template) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
+            and po100.ovr
+            and po100.cgrp
+            and po100.group_m == 8
+        )
+    else:
+        assert (
+            _nopro(po100.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
+            and not po100.ovr
+            and not po100.cgrp
+            and po100.group_m == 8
+        )
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
@@ -3183,18 +3192,21 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # test_gb_t_exact_rules_plan_their_programs); their round 5 adds 2 sm_100a keys (the 12288 -> 4096
     # forward: test_gb_t_exact_rules_plan_their_programs); their round 6 adds 2 sm_100a and 2 sm_103a keys
     # (the 17408 -> 5120 forward: test_gb_t_exact_rules_plan_their_programs); their round 7 adds
-    # 2 sm_100a keys (the 5120 -> 17408 weight gradient: test_gb_t_exact_wgrad_rules_plan_their_programs);
+    # 2 sm_100a keys (the 5120 -> 17408 weight gradient: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 8
+    # adds one sm_100a key and one sm_103a key (the 16384 -> 6144 forward: test_gb_t_exact_rules_plan_their_programs)
+    # and re-values two round-6 keys;
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
     assert (
         len(ROW_RULES)
-        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 1
+        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 2 + 1
     )
     assert (
-        sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2
+        sum(k[0] == "sm_100a" for k in ROW_RULES)
+        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1
     )
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
-    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2 + 2 + 2
+    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
         "sm_100a": {"pro": 7},
@@ -3772,7 +3784,7 @@ def test_round21_cgrp_knob(T):
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
-def test_round24_ovr_knob(T):
+def test_round24_ovr_knob(T, monkeypatch):
     # field 30 of the key - the LAST field through round 26, 31 fields since round 27 (round 24; the round-20 W3 knob ported in round 23 by W4, Cake 8d837b1ac8): the overlapped tall
     # epilogue released by ROW HALF (symbol ``_or``, after ``_cg``): the eight epilogue warps drain TMEM buffer 0 and release it to the next
     # tile's half-0 MMAs while buffer 1 drains; the B stage keeps the plain tall layout (one N = 256 MMA per row half per K step).  Tall
@@ -3825,44 +3837,54 @@ def test_round24_ovr_knob(T):
     # launcher's round-24 precedence rule, asserted below on the sm_107a o_proj / dense_down forwards)
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     v = _views("proj", "o_proj", "fwd", "bf16", T)
-    base, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
-    assert (
-        base.ovl
-        and base.htail
-        and not base.ovr
-        and _nopro(base.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
-    )
-    forced, *_ = plan_dense_projection_det_gemm(
-        v["A"], v["B"], v["out"], ovr=True, **kw
-    )
-    assert (
-        forced.ovr
-        and not forced.ovl
-        and forced.htail
-        and _nopro(forced.template) == "dense_proj_det_gemm_kk_n256_m256_ht_or"
-    )
-    for f in (
-        "m_tiles",
-        "n_tiles",
-        "pair_tiles",
-        "sm_pairs",
-        "num_full",
-        "tail_tiles",
-        "sk_units",
-        "iters_per_unit",
-        "stages",
-        "epi",
-        "slots",
-        "hints",
-        "group_m",
-        "grid",
-        "ws_f32_elems",
-    ):
-        assert getattr(forced, f) == getattr(base, f), f
-    with pytest.raises(ValueError):
-        plan_dense_projection_det_gemm(
-            v["A"], v["B"], v["out"], ovr=True, ovl=True, **kw
+    # the round-8 T-exact key of this row at T 16231 plans the row-half-release program; (1) reads the ragged rule, so
+    # it plans without that key
+    with monkeypatch.context() as m:
+        m.delitem(
+            ROW_RULES,
+            ("sm_100a", False, False, False, False, False, 6144, 16384, 16231),
+            raising=False,
         )
+        cake_backend.clear_convenience_caches()
+        base, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        assert (
+            base.ovl
+            and base.htail
+            and not base.ovr
+            and _nopro(base.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
+        )
+        forced, *_ = plan_dense_projection_det_gemm(
+            v["A"], v["B"], v["out"], ovr=True, **kw
+        )
+        assert (
+            forced.ovr
+            and not forced.ovl
+            and forced.htail
+            and _nopro(forced.template) == "dense_proj_det_gemm_kk_n256_m256_ht_or"
+        )
+        for f in (
+            "m_tiles",
+            "n_tiles",
+            "pair_tiles",
+            "sm_pairs",
+            "num_full",
+            "tail_tiles",
+            "sk_units",
+            "iters_per_unit",
+            "stages",
+            "epi",
+            "slots",
+            "hints",
+            "group_m",
+            "grid",
+            "ws_f32_elems",
+        ):
+            assert getattr(forced, f) == getattr(base, f), f
+        with pytest.raises(ValueError):
+            plan_dense_projection_det_gemm(
+                v["A"], v["B"], v["out"], ovr=True, ovl=True, **kw
+            )
+    cake_backend.clear_convenience_caches()
     # (2) the reverse direction (Cake 95da40d6e8 L2745-L2746, `if ovr and ovl and not rule_ovl: ovr = False` inside the rule read of ovr): a
     # caller-forced ovl=True on the sm_107a o_proj fwd row (rule {cta_rows 256, htail, ovr, cgrp, group_m 8}) drops the rule's ovr - the
     # rule's cgrp / htail / group_m stay and the plan is the `_ov_ht_cg` program of test_round21_cgrp_knob, not a ValueError (ovl + ovr);
@@ -6649,8 +6671,8 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # whose choice is the planner's default, the default) must plan exactly this program.  The (key, T) pairs the GB T-exact
 # rules re-measured (the sm_100a 4096 -> 48 input gradient and 4096 -> 512 forward, the sm_103a 4096 -> 512 and
 # 5120 -> 512 forwards, at T 16231 / 16384; round 4: the 5120 -> 17408 input gradient; round 5: the sm_100a
-# 12288 -> 4096 forward; round 6: the 17408 -> 5120 forward, the ragged rule's program) name their T-exact key and
-# its program.
+# 12288 -> 4096 forward; round 6: the 17408 -> 5120 forward, the ragged rule's program; round 8: its form with the tall
+# epilogue released by row half) name their T-exact key and its program.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -6688,8 +6710,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_tma1_cg_pro7'),
     (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
-    (('sm_100a', False, False, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
-    (('sm_100a', False, False, False, False, False, 5120, 17408, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
+    (('sm_100a', False, False, False, False, False, 5120, 17408, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
     (('sm_100a', False, False, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 12288, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 16384, 2048, None), 16172, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
@@ -7142,7 +7164,8 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
             a_mn, b_mn, out_f32, out_t, batched, N, K, M = key
             dims = (N, 16231 if K is None else K, 16231 if M is None else M)
             # an own sm_103a rule of the row at these dims wins over the parent's: the GB T-exact keys of the 6144 x 2048
-            # rows at T 16231 over the sm_100a ragged rules, the ragged 4096 -> 48 rule over the sm_100a T-exact keys;
+            # rows and of the 16384 -> 6144 forward at T 16231 over the sm_100a ragged rules, the ragged 4096 -> 48 rule
+            # over the sm_100a T-exact keys;
             # an own T-exact key wins over the row's own ragged rule (the 5120 -> 17408 input gradient and the
             # 17408 -> 5120 forward at T 16231)
             src = (arch_of,) + key
@@ -8230,7 +8253,10 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
 # gradient (the overlapped half-tail program with the column-grouped raster in place of the ragged rule's row-half
 # program), with the bf16 tiles through the one-slot TMA store; round 5 adds the sm_100a 12288 -> 4096 forward (the
 # ragged rule's overlapped half-tail program with the column-grouped raster), the same way; round 6 adds the
-# 17408 -> 5120 forward (the ragged rule's own program, 12-column-tile raster groups in place of its 8).
+# 17408 -> 5120 forward (the ragged rule's own program, 12-column-tile raster groups in place of its 8); round 8 moves
+# it to the tall epilogue released by row half on sm_100a and adds the 16384 -> 6144 forward at T 16231 (the half-tail
+# program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups, in place of
+# the ragged rule's overlapped half-tail program).
 GB_T_EXACT_ROWS = {
     ("sm_100a", True, 2048, 16384): (
         (16172, 16231),
@@ -8286,19 +8312,25 @@ GB_T_EXACT_ROWS = {
     ),
     ("sm_100a", False, 5120, 17408): (
         (16231, 16384),
-        "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7",
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", False, 5120, 17408): (
         (16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7",
     ),
+    ("sm_100a", False, 6144, 16384): (
+        (16231,),
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
+    ),
+    ("sm_103a", False, 6144, 16384): (
+        (16231,),
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
+    ),
 }
 # The GB T-exact rows whose keys keep the ragged rule's program and change only its raster group (round 6: the
-# 17408 -> 5120 forward in 12-column-tile groups, the ragged rule's 8): the row's plan without the key runs the same
-# program at the ragged rule's raster group.
-GB_T_EXACT_RASTER_ROWS = frozenset(
-    {("sm_100a", False, 5120, 17408), ("sm_103a", False, 5120, 17408)}
-)
+# 17408 -> 5120 forward in 12-column-tile groups, the ragged rule's 8; sm_103a only since round 8):
+# the row's plan without the key runs the same program at the ragged rule's raster group.
+GB_T_EXACT_RASTER_ROWS = frozenset({("sm_103a", False, 5120, 17408)})
 GB_T_EXACT_KEYS = sorted(
     (arch, False, b_mn, False, False, False, N, K, T)
     for (arch, b_mn, N, K), (Ts, _template) in GB_T_EXACT_ROWS.items()
@@ -8326,7 +8358,8 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
     round 2 on both: the q_b 2048 x 16384 input gradient with the column-grouped raster at the rule's raster group;
     round 4: the 5120 -> 17408 input gradient with the overlapped half-tail program through the one-slot
     TMA store; round 5 on sm_100a: the 12288 -> 4096 forward, the same way; round 6: the 17408 -> 5120 forward
-    with the ragged rule's program in 12-column-tile raster groups)
+    with the ragged rule's program in 12-column-tile raster groups; round 8: on sm_100a the tall
+    epilogue released by row half, and the 16384 -> 6144 forward at T 16231 with that form in 8-column-tile groups)
     plan their program at their T on every SM count of the architecture's parts, with whole K per output tile like
     the row's plan without the key (another program, or for round 6 the same program at another raster group);
     one token more or less plans that plan.  The sm_103a 4096 -> 48 input gradient
