@@ -47,7 +47,7 @@ import json, sys
 report = json.load(sys.stdin)
 for item in report["install"]:
     meta = item["metadata"]
-    print(f"{meta[\"name\"]}=={meta[\"version\"]}")
+    print(meta["name"] + "==" + meta["version"])
 '
 }
 
