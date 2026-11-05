@@ -89,3 +89,42 @@ orders and the chains; `lake exe quantconformance` prints its terms for the gene
 (`lean/BIKernels/QuantCases.lean`, rendered by `quantization/lean_cases.py`), which the device-free test
 `tests/batch_invariant/test_quant_lean.py` compares with the Python specification. Tests:
 `tests/quantization/test_batch_invariant_mx_quantize.py` (both MX formats) and `test_batch_invariant_nvfp4_quantize.py`.
+
+## Sampling
+
+`flashinfer.sampling.softmax(logits, temperature, batch_invariant=True)` and the new entry
+`flashinfer.sampling.log_probs(logits, token_ids, temperature, return_lse=)` run one class, `lse.row`: the row maximum
+`m` and the sum `s` of the exponentials as the engine's canonical trees over the vocabulary (an 8-element fold per slot,
+pairwise over the blocks of 256 elements, pairwise over the 32 lanes: a function of the vocabulary alone, never of the
+batch, the configuration or the device), and fixed chains over them. The operator's own softmax selects its reduction
+path by batch size, so a row's bits there depend on the batch; the class is what the mode promises instead.
+
+| API | Class and fingerprint | Numerics | Supported inputs |
+|---|---|---|---|
+| `softmax(..., batch_invariant=True)` | `lse.row`; `fingerprint("softmax", N=, dtype=, temperature=)` (the vocabulary, the input dtype and whether a temperature enters the scale are the specification's dimensions) | `c = log2(e)` or `div.rn(log2(e), T)`; `z_j = mul.rn(add.rn(x_j, neg(m)), c)`; `e_j = ex2.approx.ftz(z_j)`; `s` the `add.rn` tree over the `e_j`; `p_j = cvt.rn(mul.rn(e_j, div.rn(1, s)))` in the input dtype. `m` is the `max.f32` tree (a NaN operand yields the other; a NaN logit then propagates through the sum), a `-inf` logit weighs `+0` | bf16 / f16 / fp32 logits `(..., N)`, any `N`; temperature `None`, a positive scalar, or one per row (f16 / bf16 / f32 / f64, the last rounded to f32); same-dtype output; `enable_pdl`; SM100 / SM103 / SM107 |
+| `log_probs(logits, token_ids, temperature, return_lse=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`) | from the same `m`, `s` and `z`: `logp_t = mul.rn(add.rn(z_t, neg(lg2.approx.ftz(s))), ln 2)` for the row's token id (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of shape `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]`; this entry has no non-invariant implementation (`batch_invariant=False` raises) |
+
+`ex2.approx.ftz.f32` and `lg2.approx.ftz.f32` are the class's two opaque primitives: deterministic per architecture,
+pinned as inline PTX in the kernel, and tabulated on the device for the exact CPU model (`sampling/mufu_device.py`).
+Everything else is a correctly rounded `.rn` operation or exact. The chains are the contract, named by the
+fingerprints, stated in Lean and checked against the exact CPU model (`sampling/reference.py`); nothing is promised
+relative to the operator's other softmax kernels or to torch.
+
+The kernel (`sampling/kernel.py`) runs the two trees as the engine's plan over a placement of the configuration space
+(`sampling/schedule.py`: 32 .. 1024 threads per row, rows per CTA, the vector width, fragments kept in registers /
+re-read from L2 / staged in shared memory, and clusters of 2 .. 16 CTAs per row whose per-lane partials cross the
+cluster through distributed shared memory), then writes the requested outputs in a third pass; the vocabulary is a
+runtime argument (one kernel per power-of-two block count; elements beyond the row read `-inf`, the identity of both
+trees). The dispatcher is a closed form of `(N, M, element bytes, SM count, which outputs)` with empirical constants
+(`default_config`): clusters when there are fewer rows than SMs, one CTA per 64 / 128 KB of the row otherwise; every
+pick is a member of the enumerated space and every member computes the class (the configuration-agreement tests).
+
+The Lean model (`lean/BIKernels/Sampling.lean`) instantiates the engine's invariance theorems on the two trees
+(`max_invariance`, `sum_invariance`), carries them through the chains (`lse_end_to_end`: for every valid placement and
+unit the kernel's probabilities, log-softmax elements and `lse` are the spec's up to the commutativity the engine
+normalises, hence `lse_bits_equal` under any commutative interpretation), and states the `-inf`-padded bucket kernel
+bit for bit under the restricted identity hypotheses the spec's digits claim (`max_padded_bits`, `sum_padded_bits`).
+`lake exe samplingconformance` prints its terms for the generated cases (`lean/BIKernels/SamplingCases.lean`,
+rendered by `sampling/lean_cases.py`; kernel `decide` only), which the device-free test
+`tests/batch_invariant/test_sampling_lean.py` compares with the Python specification. Tests:
+`tests/utils/test_batch_invariant_sampling.py`.
