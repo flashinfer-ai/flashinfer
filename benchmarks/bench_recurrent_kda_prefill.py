@@ -53,6 +53,9 @@ outside the measured region.
 completed-call wall time on an idle device. These warm-cache measurements
 include Python dispatch and any internal synchronization, unlike CUPTI kernel
 time. State-pool reset stays outside the timed region.
+Add ``--inference-mode`` to create and consume inference tensors as a serving
+loop would; tensors without version counters can take different metadata-cache
+paths from the default versioned tensors.
 """
 
 import argparse
@@ -929,6 +932,11 @@ def main() -> None:
         help="Also report eager candidate host-return and completed-call latency.",
     )
     parser.add_argument(
+        "--inference-mode",
+        action="store_true",
+        help="Create inputs and run all measurements under torch.inference_mode.",
+    )
+    parser.add_argument(
         "--cuda-graph",
         action="store_true",
         help="CUPTI-time cold-L2 replays of one pre-captured call per path.",
@@ -995,7 +1003,11 @@ def main() -> None:
         help="Optionally write the result list as JSON.",
     )
     args = parser.parse_args()
+    with torch.inference_mode(args.inference_mode):
+        _run(args, parser)
 
+
+def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
         parser.error("--dry-run-iters and --repeat-iters must be positive")
     if args.host_timing and args.cuda_graph:
@@ -1224,6 +1236,7 @@ def main() -> None:
                 "timing_backend": "cupti",
                 "cold_l2": True,
                 "cuda_graph": args.cuda_graph,
+                "inference_mode": args.inference_mode,
                 "timing_scope": (
                     "cuda_graph_replay_with_inplace_state_update"
                     if args.cuda_graph
