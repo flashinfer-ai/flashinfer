@@ -934,6 +934,13 @@ class MaterializedArm(Arm):
         return materialized_fp32(self.inputs)
 
 
+def _aligned(t):
+    """``t`` contiguous at a 16-byte aligned address (DeepGEMM asserts it of its operands): a segment slice of a packed
+    call that starts off that alignment is copied once, when the arm is built."""
+    t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
 def deep_gemm_fp8_mqa_logits(deep_gemm):
     """DeepGEMM's FP8 MQA logits with FP32 per-key scales and FP32 logits as ``f(q, (k, k_scale), w, starts, ends, *,
     clean_logits)``: ``fp8_mqa_logits`` where the build has it, else ``fp8_fp4_mqa_logits`` with an FP8 ``q`` (no
@@ -991,18 +998,18 @@ class DeepGemmArm(Arm):
         visible = ref.visible_rows(inputs).to(torch.int32)
         self.segments = []
         for q0, lq, k0, lk, _visible, _visible_cpu in _segments(inputs):
-            ends = visible[q0 : q0 + lq].contiguous()
+            ends = _aligned(visible[q0 : q0 + lq])
             self.segments.append(
                 dict(
                     q0=q0,
                     lq=lq,
                     lk=lk,
-                    q=inputs.q[q0 : q0 + lq],
+                    q=_aligned(inputs.q[q0 : q0 + lq]),
                     kv=(
-                        inputs.k[k0 : k0 + lk].contiguous(),
-                        inputs.k_scale[k0 : k0 + lk].contiguous(),
+                        _aligned(inputs.k[k0 : k0 + lk]),
+                        _aligned(inputs.k_scale[k0 : k0 + lk]),
                     ),
-                    w=inputs.w[q0 : q0 + lq],
+                    w=_aligned(inputs.w[q0 : q0 + lq]),
                     starts=torch.zeros_like(ends),
                     ends=ends,
                 )
