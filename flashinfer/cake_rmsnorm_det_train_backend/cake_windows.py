@@ -248,7 +248,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
     },
     "sm_103a": {
         "bwd_h1536": (
-            (0, 214, "cake_rmsnorm_det_train_53285b9598170177d3e0"),
+            (0, 31, "cake_rmsnorm_det_train_ad547a3cd25e6cd640a3"),
+            (31, 214, "cake_rmsnorm_det_train_53285b9598170177d3e0"),
             (214, 1024, "cake_rmsnorm_det_train_7dc29629ff21625607f8"),
             (1024, 4096, "cake_rmsnorm_det_train_c1a9efdf06c3087b4efe"),
             (4096, 14928, "cake_rmsnorm_det_train_1df7db17277d363b5168"),
@@ -257,7 +258,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (40448, None, "cake_rmsnorm_det_train_cbeae168d70edd196417"),
         ),
         "bwd_w32_h1536": (
-            (0, 214, "cake_rmsnorm_det_train_5c5be9a6aeac20fd2776"),
+            (0, 31, "cake_rmsnorm_det_train_775d9130f3ce2d46f118"),
+            (31, 214, "cake_rmsnorm_det_train_5c5be9a6aeac20fd2776"),
             (214, 1024, "cake_rmsnorm_det_train_baff9ecbafe7de1e6030"),
             (1024, 4096, "cake_rmsnorm_det_train_17d9cdfd157ba4b86c2b"),
             (4096, 14928, "cake_rmsnorm_det_train_a99e2b380514c4d86d60"),
@@ -266,7 +268,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (40448, None, "cake_rmsnorm_det_train_ca6211f3ea2ce8c86a05"),
         ),
         "bwd_h2048": (
-            (0, 171, "cake_rmsnorm_det_train_2b4c0f5b0e9c312fa43e"),
+            (0, 2, "cake_rmsnorm_det_train_ce65889518ffd6340c59"),
+            (2, 171, "cake_rmsnorm_det_train_2b4c0f5b0e9c312fa43e"),
             (171, 3072, "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9"),
             (3072, 4096, "cake_rmsnorm_det_train_9ac8d21e46a658e7913f"),
             (4096, 16384, "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9"),
@@ -275,7 +278,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (55296, None, "cake_rmsnorm_det_train_018f0cd723106f709f11"),
         ),
         "bwd_w32_h2048": (
-            (0, 171, "cake_rmsnorm_det_train_2e9171b7753650cda515"),
+            (0, 2, "cake_rmsnorm_det_train_28c46db39116f7f718a0"),
+            (2, 171, "cake_rmsnorm_det_train_2e9171b7753650cda515"),
             (171, 3072, "cake_rmsnorm_det_train_07f9f2fbea7163639c27"),
             (3072, 4096, "cake_rmsnorm_det_train_d96a14fe8882bbd9ec2e"),
             (4096, 16384, "cake_rmsnorm_det_train_07f9f2fbea7163639c27"),
@@ -322,14 +326,16 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (48640, None, "cake_rmsnorm_det_train_cb164a27c0157ed0712d"),
         ),
         "bwd_h512": (
-            (0, 227, "cake_rmsnorm_det_train_877751ba915bbc261064"),
+            (0, 4, "cake_rmsnorm_det_train_117a66e423695c124202"),
+            (4, 227, "cake_rmsnorm_det_train_877751ba915bbc261064"),
             (227, 1024, "cake_rmsnorm_det_train_09601d42628de24f6f87"),
             (1024, 4096, "cake_rmsnorm_det_train_8e7f4d811e55a351a22e"),
             (4096, 32768, "cake_rmsnorm_det_train_274b0055aace183f2367"),
             (32768, None, "cake_rmsnorm_det_train_cfaae3cec98f8501832b"),
         ),
         "bwd_w32_h512": (
-            (0, 227, "cake_rmsnorm_det_train_81d9adbf31a26a4ebc02"),
+            (0, 4, "cake_rmsnorm_det_train_df3b2da5a4185e19ebbf"),
+            (4, 227, "cake_rmsnorm_det_train_81d9adbf31a26a4ebc02"),
             (227, 1024, "cake_rmsnorm_det_train_9f07cea1d13b923ed91e"),
             (1024, 4096, "cake_rmsnorm_det_train_dfcbd32cdb8108643fba"),
             (4096, 32768, "cake_rmsnorm_det_train_56ee8e66479625fd078a"),
@@ -788,6 +794,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
     },
     "sm_103a": {
         "bwd_h1536": (
+            (31, "unmeasured"),
             (214, "unmeasured"),
             (1024, "same"),
             (4096, "same"),
@@ -796,6 +803,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (40448, "same"),
         ),
         "bwd_w32_h1536": (
+            (31, "unmeasured"),
             (214, "unmeasured"),
             (1024, "same"),
             (4096, "same"),
@@ -804,6 +812,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (40448, "same"),
         ),
         "bwd_h2048": (
+            (2, "unmeasured"),
             (171, "unmeasured"),
             (3072, "same"),
             (4096, "ulp"),
@@ -812,6 +821,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (55296, "same"),
         ),
         "bwd_w32_h2048": (
+            (2, "unmeasured"),
             (171, "unmeasured"),
             (3072, "same"),
             (4096, "ulp"),
@@ -854,12 +864,14 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (48640, "same"),
         ),
         "bwd_h512": (
+            (4, "unmeasured"),
             (227, "unmeasured"),
             (1024, "ulp"),
             (4096, "same"),
             (32768, "same"),
         ),
         "bwd_w32_h512": (
+            (4, "unmeasured"),
             (227, "unmeasured"),
             (1024, "ulp"),
             (4096, "same"),
@@ -1308,14 +1320,14 @@ its own windows.
 * ``sm_100a`` ``bwd_h6144``: (0, 20] e60cfafd ? (20, 256] b93bf060 =
   (256, 4096] 5c804aed = (4096, 42496] b93bf060 = (42496, inf) c440e57b
 * ``sm_100a`` ``bwd_residual_h6144``: (0, 32] d2749326 ? (32, inf) 0dcdc563
-* ``sm_103a`` ``bwd_h1536``: (0, 214] 53285b95 ? (214, 1024] 7dc29629 =
-  (1024, 4096] c1a9efdf = (4096, 14928] 1df7db17 = (14928, 15566] 4df08ce5 =
-  (15566, 40448] f522f5b8 = (40448, inf) cbeae168
-* ``sm_103a`` ``bwd_w32_h1536``: (0, 214] 5c5be9a6 ? (214, 1024] baff9ecb =
-  (1024, 4096] 17d9cdfd = (4096, 14928] a99e2b38 = (14928, 15566] 7a72e97b =
-  (15566, 40448] 109f19bb = (40448, inf) ca6211f3
-* ``sm_103a`` ``bwd_h2048``: (0, 171] 2b4c0f5b ? (171, 3072] caf6978e =
-  (3072, 4096] 9ac8d21e ~ (4096, 16384] caf6978e = (16384, 32768] caf6978e =
+* ``sm_103a`` ``bwd_h1536``: (0, 31] ad547a3c ? (31, 214] 53285b95 ?
+  (214, 1024] 7dc29629 = (1024, 4096] c1a9efdf = (4096, 14928] 1df7db17 =
+  (14928, 15566] 4df08ce5 = (15566, 40448] f522f5b8 = (40448, inf) cbeae168
+* ``sm_103a`` ``bwd_w32_h1536``: (0, 31] 775d9130 ? (31, 214] 5c5be9a6 ?
+  (214, 1024] baff9ecb = (1024, 4096] 17d9cdfd = (4096, 14928] a99e2b38 =
+  (14928, 15566] 7a72e97b = (15566, 40448] 109f19bb = (40448, inf) ca6211f3
+* ``sm_103a`` ``bwd_h2048``: (0, 2] ce658895 ? (2, 171] 2b4c0f5b ? (171, 3072] caf6978e
+  = (3072, 4096] 9ac8d21e ~ (4096, 16384] caf6978e = (16384, 32768] caf6978e =
   (32768, 55296] 302f64db = (55296, inf) 018f0cd7
 * ``sm_103a`` ``bwd_h256``: (0, 1680] 083ea823 ? (1680, 2048] a385ae16 =
   (2048, 5120] af005462 = (5120, 12288] a385ae16 = (12288, 40960] af005462 =
@@ -1324,7 +1336,7 @@ its own windows.
 * ``sm_103a`` ``bwd_h4096``: (0, 152] ff0156d5 ? (152, 256] 50044ee3 =
   (256, 1024] ad2bb26e = (1024, 4096] 24643edc = (4096, 48640] 35a0b0ca =
   (48640, inf) 850eec3a
-* ``sm_103a`` ``bwd_h512``: (0, 227] 877751ba ? (227, 1024] 09601d42 ~
+* ``sm_103a`` ``bwd_h512``: (0, 4] 117a66e4 ? (4, 227] 877751ba ? (227, 1024] 09601d42 ~
   (1024, 4096] 8e7f4d81 = (4096, 32768] 274b0055 = (32768, inf) cfaae3ce
 * ``sm_103a`` ``bwd_h5120``: (0, 25] 505283a5 ? (25, 5120] 2fc4932f =
   (5120, inf) 7ffb443a
