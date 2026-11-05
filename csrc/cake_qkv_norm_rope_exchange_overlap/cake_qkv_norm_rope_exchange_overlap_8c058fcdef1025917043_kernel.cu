@@ -140,7 +140,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_qkv_norm_rope_exchange_overlap_338093757d2ad7fe7cf4(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
+kernel_cake_qkv_norm_rope_exchange_overlap_8c058fcdef1025917043(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -514,10 +514,16 @@ kernel_cake_qkv_norm_rope_exchange_overlap_338093757d2ad7fe7cf4(const __grid_con
                     asm volatile("" : "+f"(accum[61]) :: "memory");
                     asm volatile("" : "+f"(accum[62]) :: "memory");
                     asm volatile("" : "+f"(accum[63]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-                    mbarrier_arrive(empty_addr + (stage_c) * 8);
+                    asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
+                    if (k_c > 0) {
+                        unsigned int prev_stage_c = (it_c + 5) % 6;
+                        mbarrier_arrive(empty_addr + (prev_stage_c) * 8);
+                    }
                     it_c = it_c + 1;
                 }
+                asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
+                unsigned int last_stage_c = (it_c + 5) % 6;
+                mbarrier_arrive(empty_addr + (last_stage_c) * 8);
                 unsigned int local_lo = mt_c * 128 + math_wg_idx * 64 + warp_in_wg * 16 + lane_row;
                 unsigned int local_hi = local_lo + 8;
                 unsigned int safe_lo = ((local_lo < rows_m) ? local_lo : rows_m - 1);

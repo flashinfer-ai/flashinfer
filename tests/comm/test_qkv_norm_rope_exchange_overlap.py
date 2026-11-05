@@ -256,6 +256,84 @@ def test_xband_plan_for_keeps_the_band_policy():
             plans.plan_for(small, "bshd", 0, arch=arch, xband=True)
 
 
+def test_hopper_bn128_tile_table():
+    """The 128-column tile table (``HOPPER_BN128_MAX_M_BY_ARCH_WORLD``: SM90 with 4 ranks at hidden 3072, up to 1024
+    rows): a row of the cell at or below the bound runs the 128-column tile with the band policy's tile order,
+    ``group_m`` and pair flag; a larger row, another cell and ``bn128_max_m=0`` keep the band tile; ``plan_row``
+    reads its gates with the band width."""
+
+    assert plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD == {("sm_90a", 4): {3072: 1024}}
+    assert plans.HOPPER_BN128_BN == 128
+    assert plans.hopper_bn128_max_m("sm_90a", 4, 3072) == 1024
+    for arch, world_size, hidden in (
+        ("sm_90a", 4, 4096),
+        ("sm_90a", 4, 6144),
+        ("sm_90a", 8, 3072),
+        ("sm_90a", 2, 3072),
+        ("sm_100a", 4, 3072),
+        ("sm_103a", 4, 3072),
+        ("sm_107a", 4, 3072),
+    ):
+        assert plans.hopper_bn128_max_m(arch, world_size, hidden) == 0
+    gates = plans.default_shape_gates("sm_90a", world_size=4)
+    for s_local, swapped in (
+        (1, True),
+        (256, True),
+        (1024, True),
+        (1025, False),
+        (2048, False),
+    ):
+        geometry = plans.Geometry(world_size=4, batch=1, s_local=s_local, hidden=3072)
+        assert plans.block_n_for(geometry) == 256
+        band_policy, band = plans.plan_for(
+            geometry,
+            "bshd",
+            1,
+            arch="sm_90a",
+            bn128_max_m=0,
+        )
+        policy, plan = plans.plan_for(geometry, "bshd", 1, arch="sm_90a")
+        assert band_policy.bn == band.bn == 256
+        assert policy.bn == plan.bn == (128 if swapped else 256)
+        assert (policy.order, policy.group_m, policy.pair) == (
+            band_policy.order,
+            band_policy.group_m,
+            band_policy.pair,
+        )
+        assert (plan.order, plan.group_m, plan.pair) == (
+            band.order,
+            band.group_m,
+            band.pair,
+        )
+        if swapped:
+            assert policy.reasons[:-1] == band_policy.reasons
+            assert "HOPPER_BN128_MAX_M_BY_ARCH_WORLD" in policy.reasons[-1]
+            assert plan.num_tiles == 2 * band.num_tiles
+        else:
+            assert policy == band_policy
+        verdict, row_policy, row_plan = plans.plan_row(
+            geometry, "bshd", 1, arch="sm_90a", gates=gates
+        )
+        assert verdict.bn == 256 and row_policy == policy and row_plan.bn == plan.bn
+        explicit_policy, _plan = plans.plan_for(
+            geometry, "bshd", 1, arch="sm_90a", bn128_max_m=1024
+        )
+        assert explicit_policy == policy
+    # The swapped plan writes every destination element once, like the band plan.
+    geometry = plans.Geometry(world_size=4, batch=1, s_local=200, hidden=3072)
+    for rank in range(4):
+        _policy, plan = plans.plan_for(geometry, "fused", rank, arch="sm_90a")
+        assert plan.bn == 128
+        counts = _destination_writes(plan)
+        per_dest = plan.M * 3 * geometry.h_local * HEAD_DIM
+        for dest in range(4):
+            assert int((counts[dest] == 1).sum()) == per_dest
+            assert int(counts[dest].max()) == 1
+    for bad in (-1, True, 1.5, plans.SHAPE_GATE_ALL_ROWS):
+        with pytest.raises(ValueError, match="bn128_max_m"):
+            plans.plan_for(geometry, "bshd", 0, arch="sm_90a", bn128_max_m=bad)
+
+
 def test_plan_policy_rules():
     small = plans.Geometry(world_size=8, batch=1, s_local=512, hidden=3072)
     assert plans.block_n_for(small) == 128
@@ -1640,6 +1718,20 @@ def test_loader_tables_are_consistent():
             ) == loader.fold_producers_delivered(arch)
             assert loader.has_producer(arch, policy.bn, policy.pair)
             assert loader.has_fold_producer(arch, policy.bn, policy.pair)
+            # The row's plan (with the 128-column tile table) selects a delivered producer too.
+            row_policy, _plan = plans.plan_for(
+                geometry,
+                "bshd",
+                0,
+                arch=arch,
+                pair_available=loader.has_producer(
+                    arch, plans.block_n_for(geometry), True, variant
+                ),
+            )
+            assert loader.has_producer(arch, row_policy.bn, row_policy.pair, variant)
+            assert loader.has_fold_producer(
+                arch, row_policy.bn, row_policy.pair, variant
+            ) == loader.fold_producers_delivered(arch)
 
 
 # --------------------------------------------------------------------------- multi-GPU
@@ -2605,6 +2697,77 @@ def _run_worker(rank, world_size, port):
             finally:
                 xband_path.close()
                 band_path.close()
+            torch.cuda.synchronize(device)
+            dist.barrier(group=group)
+
+        # 10. 128-column tile table (``HOPPER_BN128_MAX_M_BY_ARCH_WORLD``: SM90 with 4 ranks at hidden 3072): one
+        #     256-column session runs a row at the bound on the 128-column producer and a larger row on its own; both
+        #     against the reference, the bound programs and the prepared rows name the row's tile width.
+        bn128_hidden = 3072
+        bn128_bound = plans.hopper_bn128_max_m(arch, world_size, bn128_hidden)
+        if bn128_bound:
+            bn128_session = QkvNormRopeExchangeOverlap(
+                group,
+                hidden=bn128_hidden,
+                num_heads=bn128_hidden // HEAD_DIM,
+                layout="bshd",
+                max_tokens=2 * bn128_bound,
+                backend="nvlink",
+                device=device,
+            )
+            try:
+                info = bn128_session.describe()
+                assert info["block_n"] == 256
+                assert info["bn128_max_m"] == {
+                    "value": bn128_bound,
+                    "source": "default",
+                    "default": bn128_bound,
+                }
+                launched = {
+                    name
+                    for bn in (plans.HOPPER_BN128_BN, 256)
+                    for name in (
+                        [
+                            loader.fold_producer_program(
+                                arch, bn, False, phase, default_variant
+                            )
+                            for phase in loader.FOLD_PHASES
+                        ]
+                        if fold_default
+                        else [loader.producer_program(arch, bn, False, default_variant)]
+                    )
+                }
+                assert launched <= set(info["programs"]["producers"])
+                for s_local, row_bn in (
+                    (bn128_bound, plans.HOPPER_BN128_BN),
+                    (2 * bn128_bound, 256),
+                ):
+                    x, w_qkv, q_scale, k_scale, cos_sin = _operands(
+                        device,
+                        batch=1,
+                        s_local=s_local,
+                        hidden=bn128_hidden,
+                        seed=61 + rank,
+                    )
+                    expected = _expected(
+                        x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
+                    )
+                    bound = bn128_session.bound_programs(1, s_local)
+                    assert bound["producer"] == loader.producer_program(
+                        arch, row_bn, False, default_variant
+                    )
+                    row = bn128_session.describe()["prepared_row_plans"][f"1x{s_local}"]
+                    assert row.get("block_n", 256) == row_bn
+                    assert "xband" not in row
+                    for _call in range(2):
+                        _check_outputs(
+                            bn128_session,
+                            bn128_session(x, w_qkv, q_scale, k_scale, cos_sin),
+                            expected,
+                        )
+                    torch.cuda.synchronize(device)
+            finally:
+                bn128_session.close()
             torch.cuda.synchronize(device)
             dist.barrier(group=group)
     finally:
