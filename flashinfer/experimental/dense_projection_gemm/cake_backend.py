@@ -275,6 +275,11 @@ K1_BLOCK_N_CHOICES = (64, 128, 192, 256)
 #: exchanged (:attr:`AtomicGemmPlan.out_t` false): a CTA pair's tile is 256 rows of the transposed-store launch's ``N``
 #: by ``block_n`` columns of its ``M``.  The other widths run as transposed-store programs.
 K1_ROW_MAJOR_BLOCK_N: tuple[int, ...] = (192,)
+#: Accumulation chains of a one-split K1 program: with ``c`` chains each tile's K blocks are cut into ``c`` contiguous
+#: ranges, each summed in a TMEM accumulator of its own from an ``init`` MMA, and the epilogue adds them once, in order
+#: (no workspace, the same bits on every run).  This package ships the one-chain programs and, for the FP32 rows of
+#: :data:`K1_CHAIN_RANGES_BY_SM`, three-chain programs (templates ``..._c3``).
+K1_CHAINS_CHOICES: tuple[int, ...] = (1, 3)
 
 # ---------------------------------------------------------------------------
 # K1 planner: the measured verdicts
@@ -694,7 +699,8 @@ K1_SPLIT_RANGE_OVERRIDES_BY_SM: dict[
 #: ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, num_splits)), ...)}`` (keys and values as in
 #: :data:`K1_SPLIT_RULES`): on a part of exactly ``sm_count`` SMs, below the row's SM-count floor or at or above it, a
 #: token count from ``min_tokens`` to ``max_tokens`` with an even block count runs that range's program, except the
-#: token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part.  A token count with an odd block count, and every
+#: token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part and the token counts of the row's ranges in
+#: :data:`K1_CHAIN_RANGES_BY_SM` for the part, which come first.  A token count with an odd block count, and every
 #: other token count, part and row, keeps the routing of the tables above.  A range lies outside
 #: :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and outside the row's ranges in :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and
 #: :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM`.  On 152-SM sm_100a and sm_103a parts the FP32 row ``4096 -> 128`` (no verdict
@@ -754,12 +760,82 @@ K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM: dict[
 K1_SPLIT_OVERRIDES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
 ] = {}
+#: Token ranges at which a row runs this package's one-split program with several accumulation chains on the parts of
+#: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, chains)), ...)}`` (keys as in
+#: :data:`K1_SPLIT_RULES`): a token count from ``min_tokens`` to ``max_tokens`` runs the program of that tile width at
+#: one split with that many chains (:func:`k1_chain_plan`) in place of the routing of the tables above, whose entries
+#: for these rows keep their one-chain program off these token counts on accuracy, and in place of the two splits of
+#: :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` at an even number of 64-element K blocks: at the even block counts of those
+#: ranges both programs were timed at on 212 SMs (1024 to 8192 and 32768 to 40960 tokens), three chains ran the weight
+#: gradient 7 to 52 % and the checkpointed step 2 to 21 % faster than two splits (medians, eager and graph), with an
+#: FP64 error below the deterministic program's, which two splits match bit for bit.  The FP32 rows
+#: ``4096 / 5120 -> 512 / 1024``: from 961 tokens up their one-chain program adds an output's whole token reduction in
+#: one chain, about twice the deterministic program's FP64 error; three chains of a third of the K blocks each had an
+#: FP64 relative Frobenius error 0.31 to 0.73 times the deterministic program's on every seed (5 seeds on a 212-SM R200
+#: part at 960, 961, 1024, 2048, 4096, 8192, 16172, 16231, 16384, 32768 and 40961 tokens, even and odd block counts; the
+#: error does not depend on the SM count) and ran within 5 % of the one-chain program.  Measured as the ranges of
+#: :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` (the rule, the bound on the backward pass and the checkpointed step, and
+#: the construction of a range are that table's): on 212 SMs in two jobs on four parts of one node each, at 960, 4096,
+#: 16172, 16384, 32768 and 40961 tokens and at 960, 1024, 2048, 4096, 4097, 8192, 16172, 16384, 32768, 32769, 40960 and
+#: 40961 tokens; on 216 SMs at 960, 961, 1024, 2048, 4096, 8192, 16172, 16231, 16384, 32768 and 40961 tokens on one
+#: part.  Up to 960 tokens on 216 SMs the one-chain program keeps its :data:`K1_SPLIT_RULES` verdict (the deterministic
+#: program adds one chain there too).  ``4096 -> 512`` and ``5120 -> 512`` are not faster than the deterministic plan in
+#: every run at 16384 tokens on 212 SMs, nor are ``4096 -> 512`` and ``4096 -> 1024`` at 16231 and 16384 tokens on 216
+#: SMs; ``4096 -> 1024`` at 16384 tokens on 212 SMs (in one of the two jobs) and ``5120 -> 1024`` at 32768 tokens on 216
+#: SMs left the checkpointed step more than 1.3 % slower than the deterministic program.
+# fmt: off
+K1_CHAIN_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
+] = {
+    ("sm_107a", 212): {
+        ("sm_107a", 1, 4096, 512, "f32"): ((960, 16172, (128, 3)), (32768, 40961, (128, 3))),
+        ("sm_107a", 1, 4096, 1024, "f32"): ((960, 16172, (192, 3)), (32768, 40961, (192, 3))),
+        ("sm_107a", 1, 5120, 512, "f32"): ((960, 16172, (128, 3)), (32768, 40961, (128, 3))),
+        ("sm_107a", 1, 5120, 1024, "f32"): ((960, 40961, (256, 3)),),
+    },
+    ("sm_107a", 216): {
+        ("sm_107a", 1, 4096, 512, "f32"): ((961, 16172, (128, 3)), (32768, 40961, (128, 3))),
+        ("sm_107a", 1, 4096, 1024, "f32"): ((961, 16172, (192, 3)), (32768, 40961, (192, 3))),
+        ("sm_107a", 1, 5120, 512, "f32"): ((961, 40961, (128, 3)),),
+        ("sm_107a", 1, 5120, 1024, "f32"): ((961, 16384, (256, 3)), (40961, 40961, (256, 3))),
+    },
+}
+# fmt: on
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
     """Whether ``splits`` K ranges each get at least one 64-element K block of ``K`` (``splits * 64 <= K + 63``,
     the program's requirement)."""
     return int(splits) >= 1 and int(splits) * K1_BLOCK_K <= int(K) + K1_BLOCK_K - 1
+
+
+def k1_chains_fit(chains: int, K: int) -> bool:
+    """Whether ``chains`` accumulation chains each get at least one 64-element K block of ``K`` (``chains * 64 <= K +
+    63``, the program's requirement)."""
+    return int(chains) >= 1 and int(chains) * K1_BLOCK_K <= int(K) + K1_BLOCK_K - 1
+
+
+def k1_chain_plan(
+    *,
+    arch: str,
+    L: int,
+    M: int,
+    N: int,
+    K: int,
+    out_f32: bool,
+    sm_count: int,
+) -> Optional[tuple[int, int]]:
+    """``(block_n, chains)`` of the one-split program of several accumulation chains the row runs at ``K`` on a device
+    of exactly ``sm_count`` SMs (its range in :data:`K1_CHAIN_RANGES_BY_SM`), or ``None``: the row keeps the routing
+    of :func:`k1_plan`'s other tables -- outside those ranges, or at a ``K`` too short for the chains
+    (:func:`k1_chains_fit`).  ``M``, ``N`` and ``K`` as in :func:`k1_plan`."""
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    part = (arch, int(sm_count))
+    for lo, hi, (block_n, chains) in K1_CHAIN_RANGES_BY_SM.get(part, {}).get(key, ()):
+        if lo <= int(K) <= hi:
+            return (int(block_n), int(chains)) if k1_chains_fit(chains, K) else None
+    return None
 
 
 def k1_plan(
@@ -789,7 +865,14 @@ def k1_plan(
     exactly ``sm_count``, or, at a ``K`` that spans an odd number of 64-element K blocks, in
     :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` for this part (as the first table).  A row without a verdict, a ``K`` of
     those entries, every other ``K`` below the floor and a ``K`` too short for the split count (:func:`k1_splits_fit`)
-    run the deterministic program."""
+    run the deterministic program.  A ``K`` of the row's ranges in :data:`K1_CHAIN_RANGES_BY_SM` for exactly
+    ``sm_count`` (:func:`k1_chain_plan`) returns that range's tile width at one split before any of these tables: the
+    program of :func:`k1_chain_plan`'s chain count."""
+    chained = k1_chain_plan(
+        arch=arch, L=L, M=M, N=N, K=K, out_f32=out_f32, sm_count=sm_count
+    )
+    if chained is not None:
+        return chained[0], 1
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
     floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
     first, last = K1_SPLIT_RULES_BY_SM_TOKENS
@@ -847,13 +930,15 @@ def k1_block_n(N: int) -> int:
     return min(widths, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
 
 
-def atomic_k1_template(block_n: int, out_f32: bool) -> str:
+def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
     """The registry template of this package's K1 program (both operands MN-major): the transposed-store program of
-    the tile width, or the row-major-store one for a width of :data:`K1_ROW_MAJOR_BLOCK_N`."""
+    the tile width, or the row-major-store one for a width of :data:`K1_ROW_MAJOR_BLOCK_N`; ``_c<chains>`` for more
+    than one accumulation chain."""
     return (
         f"{cake_jit.TEMPLATE_PREFIXES[0]}nn_n{int(block_n)}"
         + ("_f32" if out_f32 else "")
         + ("" if int(block_n) in K1_ROW_MAJOR_BLOCK_N else "_t")
+        + (f"_c{int(chains)}" if int(chains) > 1 else "")
     )
 
 
@@ -867,8 +952,9 @@ class AtomicGemmPlan:
     """The host plan of one K1 launch of this package: the transposed-store GEMM ``out[l, n, m] = sum_k A[l, k, m]
     B[l, k, n]`` (``out_t``), or the row-major-store GEMM ``out[l, m, n]`` (``out_t`` false: the widths of
     :data:`K1_ROW_MAJOR_BLOCK_N`), over the launch's ``[L, K, M]`` / ``[L, K, N]`` operand views, ``L x m_tiles x
-    n_tiles`` tiles of ``256 x block_n`` each cut into ``splits`` K ranges, walked persistently by at most ``sm_pairs``
-    CTA pairs.  ``M`` and ``N`` are the launch's.  ``transposed_out`` is the caller's: the launch takes the caller's
+    n_tiles`` tiles of ``256 x block_n`` each cut into ``splits`` K ranges (or, at one split, its K blocks into
+    ``chains`` accumulation chains), walked persistently by at most ``sm_pairs`` CTA pairs.  ``M`` and ``N`` are the
+    launch's.  ``transposed_out`` is the caller's: the launch takes the caller's
     operands exchanged (``swapped``) when its store form differs from the caller's output layout."""
 
     L: int
@@ -884,6 +970,7 @@ class AtomicGemmPlan:
     sm_pairs: int
     template: str
     out_t: bool = True
+    chains: int = 1
 
     @property
     def swapped(self) -> bool:
@@ -939,6 +1026,7 @@ def plan_atomic_gemm(
     sm_count: int,
     splits: Optional[int] = None,
     block_n: Optional[int] = None,
+    chains: Optional[int] = None,
 ) -> tuple[Optional[AtomicGemmPlan], Any, Any, Any, str]:
     """Plan this package's K1 GEMM ``out = A @ B`` (``A [L, M, K]`` with unit stride on ``m``, ``B [L, K, N]`` with
     unit stride on ``n``; ``out [L, M, N]``, or ``[L, N, M]`` with ``transposed_out``).
@@ -951,8 +1039,10 @@ def plan_atomic_gemm(
     for ``arch``, or the planner (:func:`k1_plan`).  An explicit ``splits`` / ``block_n`` replaces the planner's
     choice (the other one from the planner, else ``1`` split / :func:`k1_block_n`) and runs this package's program of
     that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
-    registry allow it.  Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an
-    explicit choice the program cannot run."""
+    registry allow it.  The planner's choice runs :func:`k1_chain_plan`'s accumulation chains where it has them; an
+    explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names more, at one split.
+    Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an explicit choice the
+    program cannot run."""
     det = deterministic_backend()
     A3, B3, O3 = (
         det.as_batched(A, "A"),
@@ -1000,13 +1090,19 @@ def plan_atomic_gemm(
             "output view (unit inner stride, row and batch strides multiples of 8, 16-byte aligned)",
         )
     out_f32 = out.dtype == torch.float32
-    if splits is None and block_n is None:
+    c = 1 if chains is None else int(chains)
+    if splits is None and block_n is None and chains is None:
         choice = k1_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
         )
         if choice is None:
             return (*none, "the planner keeps the row on the deterministic program")
         bn, p = choice
+        chained = k1_chain_plan(
+            arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+        )
+        if chained is not None:
+            c = chained[1]
     else:
         planned = k1_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
@@ -1018,7 +1114,14 @@ def plan_atomic_gemm(
         if splits is not None:
             p = int(splits)
         else:
-            p = planned[1] if planned is not None else 1
+            p = 1 if c > 1 else planned[1] if planned is not None else 1
+        if c not in K1_CHAINS_CHOICES:
+            raise ValueError(f"chains is one of {K1_CHAINS_CHOICES}, got {chains}")
+        if c > 1 and (p != 1 or not k1_chains_fit(c, K)):
+            raise ValueError(
+                f"dense_projection_gemm: {c} chains run at one split (got {p}) with a 64-element K block each "
+                f"(K={K})"
+            )
         if bn not in K1_BLOCK_N_CHOICES:
             raise ValueError(f"block_n is one of {K1_BLOCK_N_CHOICES}, got {block_n}")
         if not k1_splits_fit(p, K) or p > 65536:
@@ -1026,7 +1129,7 @@ def plan_atomic_gemm(
                 f"dense_projection_gemm: splits must be in [1, {_ceil_div(K, K1_BLOCK_K)}] (the 64-element K blocks "
                 f"of K={K}), got {p}"
             )
-    template = atomic_k1_template(bn, out_f32)
+    template = atomic_k1_template(bn, out_f32, c)
     if template not in cake_jit.KERNELS.get(arch, {}):
         return (*none, f"{template} is not registered for {arch}")
     out_t = bn not in K1_ROW_MAJOR_BLOCK_N
@@ -1047,6 +1150,7 @@ def plan_atomic_gemm(
         sm_pairs=max(1, int(sm_count) // 2),
         template=template,
         out_t=out_t,
+        chains=c,
     )
     return plan, a_launch, b_launch, O3, ""
 
@@ -2468,7 +2572,7 @@ def _device_and_arch(A, B, out) -> tuple[torch.device, str, int]:
 
 #: The K1 knobs of this package's planner (the others are the deterministic planner's, applied when a row runs the
 #: deterministic program).
-_K1_OWN_KNOBS = ("splits", "block_n")
+_K1_OWN_KNOBS = ("splits", "block_n", "chains")
 
 
 def _split_knobs(knobs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2550,10 +2654,11 @@ def _atomic_k1(
 ) -> Any:
     """This package's K1 GEMM ``out = A @ B`` (both MN-major): ``op`` is ``"plan"`` (returns the plan),
     ``"prepare"`` (the prepared launch) or ``"launch"`` (the convenience path, returns ``out``); ``own`` holds this
-    package's knobs (``splits``, ``block_n``).  A plan or a prepared launch of a row :func:`plan_atomic_gemm` keeps
-    on the deterministic program returns ``det_call()``: the deterministic package's object of the entry point and
-    ``op``, with its knobs; a launch of such a row runs the deterministic package's convenience call ``det_args()``
-    through this package's binding (:func:`_launch_cached_atomic_k1`; ``det_knobs``: that call's knobs).
+    package's knobs (``splits``, ``block_n``, ``chains``).  A plan or a prepared launch of a row
+    :func:`plan_atomic_gemm` keeps on the deterministic program returns ``det_call()``: the deterministic package's
+    object of the entry point and ``op``, with its knobs; a launch of such a row runs the deterministic package's
+    convenience call ``det_args()`` through this package's binding (:func:`_launch_cached_atomic_k1`; ``det_knobs``:
+    that call's knobs).
     ``enable_pdl`` (default: the device supports it) launches the program as a programmatic dependent launch;
     ``weights_static`` is the deterministic call's (:func:`dense_projection_gemm`)."""
     if op == "launch":
@@ -4288,8 +4393,8 @@ def plan_dense_projection_gemm(
     """Validate the views and plan the K1 launch: the deterministic package's ``plan_dense_projection_det_gemm``
     with the same keywords (``sm_count``, ``l2_bytes``, ``transposed_out``, the planner knobs, ``arch``); with
     ``deterministic=False`` a weight-gradient layout (both operands MN-major) is planned for this package's split-K
-    program (:class:`AtomicGemmPlan`; the knobs ``splits`` / ``block_n`` are this package's, the others apply when
-    the row runs the deterministic program)."""
+    program (:class:`AtomicGemmPlan`; the knobs ``splits`` / ``block_n`` / ``chains`` are this package's, the others
+    apply when the row runs the deterministic program)."""
     if (
         _resolve_deterministic(deterministic, "plan_dense_projection_gemm")
         or _route(_k1_layout(A, B)) == "det"
@@ -4322,7 +4427,8 @@ def prepare_dense_projection_gemm(
     """Validate one K1 binding, plan it for the device and prepare its allocation-free launch: the deterministic
     package's ``prepare_dense_projection_det_gemm`` with the same keywords (``transposed_out`` and the planner
     knobs); with ``deterministic=False`` a weight-gradient layout prepares this package's split-K program (its
-    workspace is owned by the prepared object; ``splits`` / ``block_n`` as for :func:`plan_dense_projection_gemm`).
+    workspace is owned by the prepared object; ``splits`` / ``block_n`` / ``chains`` as for
+    :func:`plan_dense_projection_gemm`).
     ``enable_pdl`` (default: the device supports it) makes either launch a programmatic dependent launch."""
     if (
         _resolve_deterministic(deterministic, "prepare_dense_projection_gemm")

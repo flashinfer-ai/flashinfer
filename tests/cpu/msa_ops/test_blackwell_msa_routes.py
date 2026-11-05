@@ -1651,6 +1651,153 @@ def test_decode_union_program_is_the_registered_gqa16_mask64_union_prefill():
     assert backend._DECODE_UNION_MAX_PAGES <= 64
 
 
+_FP8Q_ROUTE = "prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any"
+
+
+def _fp8q(**over):
+    # one request of one query token over 64 Q heads and 4 KV heads, FP8 Q / K
+    # / V on a paged cache with a one-page table: the measured box of the
+    # uniform FP8 prefill route
+    fp8 = torch.float8_e4m3fn
+    inputs = dict(
+        paged=True,
+        causal=True,
+        derive_q_offset=True,
+        q_dtype=fp8,
+        k_dtype=fp8,
+        v_dtype=fp8,
+        num_q_heads=64,
+        num_kv_heads=4,
+        batch_size=1,
+        total_q=1,
+        max_pages=1,
+    )
+    return backend._use_prefill_fp8q(**{**inputs, **over})
+
+
+@pytest.mark.cpu_only
+def test_prefill_fp8q_constants_and_boundaries():
+    assert backend._PREFILL_FP8Q_TARGETS == ("sm100a", "sm103a")
+    assert backend._PREFILL_FP8Q_BATCH_SIZE == 1
+    assert backend._PREFILL_FP8Q_TOTAL_Q == 1
+    assert backend._PREFILL_FP8Q_NUM_Q_HEADS == 64
+    assert backend._PREFILL_FP8Q_NUM_KV_HEADS == 4
+    assert backend._PREFILL_FP8Q_MAX_PAGES == 1
+    assert _fp8q()
+    # the calls just outside the box: two requests, two query tokens, a
+    # two-page table, GQA 8
+    assert not _fp8q(batch_size=2, total_q=2)
+    assert not _fp8q(total_q=2)
+    assert not _fp8q(max_pages=2)
+    assert not _fp8q(num_kv_heads=8)
+    for pages in (-1, 0, 2, 64, 65):
+        assert not _fp8q(max_pages=pages), pages
+    for total_q in (0, 2, 8, 146, 8192):
+        assert not _fp8q(total_q=total_q), total_q
+    for batch_size in (-1, 0, 2, 64):
+        assert not _fp8q(batch_size=batch_size), batch_size
+    for heads in ((32, 4), (64, 8), (128, 8), (16, 1), (128, 4), (64, 64)):
+        assert not _fp8q(num_q_heads=heads[0], num_kv_heads=heads[1]), heads
+    assert not _fp8q(paged=False, max_pages=0)
+    assert not _fp8q(paged=False)
+    assert not _fp8q(causal=False)
+    assert not _fp8q(derive_q_offset=False)
+    bf16 = torch.bfloat16
+    assert not _fp8q(q_dtype=bf16)
+    assert not _fp8q(k_dtype=bf16, v_dtype=bf16)
+    assert not _fp8q(q_dtype=bf16, k_dtype=bf16, v_dtype=bf16)
+    assert not _fp8q(v_dtype=bf16)
+
+
+@pytest.mark.cpu_only
+def test_prefill_fp8q_program_is_the_registered_unfolded_fp8q_union_prefill():
+    fp8 = torch.float8_e4m3fn
+    route = backend._prefill_route(
+        q_dtype=fp8,
+        k_dtype=fp8,
+        paged=True,
+        folded_gqa_group=0,
+        causal=True,
+        max_pages=backend._PREFILL_FP8Q_MAX_PAGES,
+    )
+    assert route == _FP8Q_ROUTE
+    assert route not in backend._UNION_PERSISTENT_ROUTES
+    bf16_q = "prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any:main"
+    for target in backend._PREFILL_FP8Q_TARGETS:
+        keys = _route_keys(target)
+        assert f"{route}:main" in keys
+        name = loader.route_program(f"{route}:main", target)
+        other = loader.route_program(bf16_q, target)
+        assert name != other
+        # the FP8-Q program takes the union prefill programs' argument plan
+        assert loader.MODULES[name]["arg_plan"] == loader.MODULES[other]["arg_plan"]
+        # no other FP8-Q prefill key: flat and folded FP8-Q stay unregistered
+        fp8q_keys = [key for key in keys if key.startswith("prefill_union:float8")]
+        assert fp8q_keys == [f"{route}:main"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_prefill_fp8q_launch_binds_the_e4m3_q_as_bytes(target, monkeypatch):
+    launches = []
+    monkeypatch.setattr(
+        backend, "_program", lambda route, _t: _RecordedProgram(route, launches)
+    )
+    monkeypatch.setattr(backend, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(backend, "_device_index", lambda _device: 0)
+    # a fresh carrier cache: the CPU carriers never reach a device call
+    monkeypatch.setattr(backend, "_eager_dummies", {})
+    fp8 = torch.float8_e4m3fn
+    q = torch.zeros((1, 64, backend._HEAD_DIM), dtype=fp8)
+    k = torch.zeros((1, 4, backend._BLOCK_SIZE, backend._HEAD_DIM), dtype=fp8)
+    out = torch.empty((1, 64, backend._HEAD_DIM), dtype=torch.bfloat16)
+    lse = torch.empty((1, 64), dtype=torch.float32)
+    backend._run_prefill(
+        target=target,
+        q=q,
+        k=k,
+        v=k,
+        out=out,
+        lse=lse,
+        temperature_lse=lse,
+        q2k_indices=torch.zeros((4, 1, backend._TOPK), dtype=torch.int32),
+        cu_q=torch.tensor([0, 1], dtype=torch.int32),
+        cu_k=None,
+        q_offsets=None,
+        kv_lens=torch.tensor([97], dtype=torch.int32),
+        page_table=torch.zeros((1, 1), dtype=torch.int32),
+        paged=True,
+        folded_gqa_group=0,
+        batch_size=1,
+        max_pages=1,
+        causal=True,
+        derive_q_offset=True,
+        softmax_scale_log2=1.0,
+        lse_temperature_scale=1.0,
+        return_softmax_lse=True,
+        return_temperature_lse=False,
+        workspace=None,
+        capturing=False,
+    )
+    ((route, grid, arguments),) = launches
+    assert route == f"{_FP8Q_ROUTE}:main"
+    assert arguments["q"].dtype == torch.uint8
+    assert arguments["q"].data_ptr() == q.data_ptr()
+    assert arguments["k"].dtype == arguments["v"].dtype == torch.uint8
+    assert arguments["out"] is out and out.dtype == torch.bfloat16
+    names = [name for kind, name in loader.ARG_PLANS["prefill_union"] if kind != "grid"]
+    assert sorted(arguments) == sorted(names)
+    assert tuple(grid) == backend._prefill_launch_grid(
+        total_q=1,
+        batch_size=1,
+        folded_gqa_group=0,
+        num_q_heads=64,
+        num_kv_heads=4,
+        num_sms=148,
+        persistent=False,
+    )
+
+
 @pytest.mark.cpu_only
 def test_uniform_fp8_grid_is_the_lean_launch_plan_grid():
     # The single-token program took an even 128-CTA wave when it matched the
