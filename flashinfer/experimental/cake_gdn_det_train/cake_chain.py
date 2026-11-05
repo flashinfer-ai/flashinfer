@@ -2441,12 +2441,15 @@ def _chunk_meta(
         )  # fmt: skip
     else:
         layout = _host_offsets(cu_seqlens_cpu)
+    # the key carries everything the tables depend on: the dhu_scan pin too, which keeps the planner's adjoint plan
+    # where the serial-scan rule would make it serial (:func:`_serial_adjoint_plan`)
     key = (
         layout,
         int(num_v_heads),
         int(index),
         total_tokens,
         options.pins,
+        options.dhu_scan,
         options.lpt,
         options.streams,
         num_heads,
