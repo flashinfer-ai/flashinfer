@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 from collections import Counter, OrderedDict
 import logging
+import operator
 import os
 import threading
 import warnings
@@ -24,7 +25,17 @@ import weakref
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Callable, cast, List, Literal, NamedTuple, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    cast,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from packaging.version import Version
 import torch
@@ -59,6 +70,7 @@ from ..autotuner import (
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
+    make_hybrid_bucket_fns_with_extras,
     map_to_hybrid_bucket_uncapped,
 )
 from .gemm_mm_fp4_cute_dsl import (
@@ -6648,6 +6660,7 @@ def _check_mm_mxfp8_problem_size(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -6767,6 +6780,7 @@ def _cutlass_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ):
     # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
@@ -6797,6 +6811,7 @@ def _trtllm_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["trtllm", "auto"] = "auto",
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ):
     if out_dtype != torch.bfloat16:
         return False
@@ -6825,6 +6840,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
@@ -6847,6 +6863,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ):
     if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
         if backend != "cutedsl_low_latency":
@@ -6878,6 +6895,7 @@ def _cudnn_mm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cudnn", "auto"] = "cudnn",
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ):
     # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
     # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
@@ -7657,7 +7675,7 @@ def _cute_dsl_mxfp8_runners_sm107(
 
 
 @functools.lru_cache(maxsize=64)
-def _cudnn_mm_mxfp8_runner():
+def _cudnn_mm_mxfp8_runner(tuning_config):
     """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
 
     The cuDNN MXFP8 GEMM graph operates on batched (3D) tensors, so the 2D mm
@@ -7671,12 +7689,16 @@ def _cudnn_mm_mxfp8_runner():
     compiled per ``cache_m`` bucket and reused for any runtime M, with the real
     shapes supplied through ``override_shapes`` at execute time.  Otherwise a
     per-shape graph is built (HEURISTICS_CHOICE).
+
+    ``tuning_config`` is the config ``mm_mxfp8`` passes to the autotuner; the
+    override-shape ``cache_m`` uses its mapper, so the graph and the tactic
+    cache key share one bucket (see ``_cudnn_gemm_fp4_runner``).
     """
 
     class CudnnMmMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._tuning_config = _MM_MXFP8_TUNING_CONFIG
+            self._tuning_config = tuning_config
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -7803,6 +7825,7 @@ def _heuristic_func_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
+    extra_tuning_buckets: Optional[Sequence[int]] = None,
 ) -> List[str]:
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
@@ -7844,6 +7867,8 @@ def mm_mxfp8(
     backend: Literal[
         "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
+    *,
+    extra_tuning_buckets: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -7903,6 +7928,19 @@ def mm_mxfp8(
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
+
+    extra_tuning_buckets: Optional[Sequence[int]]
+        Extra M buckets for the autotuner, added to its default hybrid M
+        buckets (``flashinfer.fused_moe.utils.get_hybrid_num_tokens_buckets``).
+        Defaults to ``None`` (default buckets only). With extra buckets,
+        autotuning also profiles every extra bucket up to the tuned M, and a
+        runtime M uses the tactic of the smallest bucket ``>= M`` in either set
+        instead of the tactic of the next default bucket. Pass the same buckets
+        when tuning and when serving: tactics are stored per bucket, so an M
+        mapped to an untuned bucket below the largest tuned one runs the
+        default tactic. Inside ``autotune(tuning_buckets=...)`` the context's
+        list replaces these buckets, as it replaces the default ones. Must be
+        positive integers.
 
     Returns
     -------
@@ -7974,6 +8012,10 @@ def mm_mxfp8(
         workspace_buffer,
     ]
 
+    tuning_config = _mm_mxfp8_tuning_config(
+        backends in (["cute-dsl"], ["cutedsl_low_latency"]), extra_tuning_buckets
+    )
+
     backend_to_runner_factory = {
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
@@ -7989,7 +8031,7 @@ def mm_mxfp8(
         "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
             major * 10 + minor, True
         ),
-        "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
+        "cudnn": lambda: _cudnn_mm_mxfp8_runner(tuning_config),
         "b12x": lambda: _b12x_gemm_mxfp8_runner(major, minor, True, out_dtype),
     }
 
@@ -7999,12 +8041,6 @@ def mm_mxfp8(
         runners.extend(built if isinstance(built, list) else [built])
 
     tuner = AutoTuner.get()
-
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
-        else _MM_MXFP8_TUNING_CONFIG
-    )
 
     runner, tactic = tuner.choose_one(
         custom_op="mxfp8_gemm",
@@ -10026,6 +10062,65 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
 )
+
+
+def _mm_mxfp8_tuning_config(
+    cute_dsl: bool, extra_tuning_buckets: Optional[Sequence[int]]
+) -> TuningConfig:
+    """The ``mm_mxfp8`` tuning config: the cute-dsl-only one when ``cute_dsl``,
+    with ``extra_tuning_buckets`` added to its M buckets when given."""
+    if not extra_tuning_buckets:
+        return _MM_MXFP8_CUTE_DSL_TUNING_CONFIG if cute_dsl else _MM_MXFP8_TUNING_CONFIG
+    # Convert to ints before the cached call: the cache would treat 288.0 as a
+    # hit for 288 and reject unhashable elements with TypeError.
+    try:
+        buckets = tuple(map(operator.index, extra_tuning_buckets))
+    except TypeError:
+        raise ValueError(
+            "mm_mxfp8: extra_tuning_buckets must be positive integers, "
+            f"got {extra_tuning_buckets!r}"
+        ) from None
+    return _mm_mxfp8_tuning_config_with_extras(
+        cute_dsl, _normalize_extra_tuning_buckets(buckets)
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _normalize_extra_tuning_buckets(buckets: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Sorted unique buckets; ValueError unless every bucket is positive."""
+    values = sorted(set(buckets))
+    if values[0] <= 0:
+        raise ValueError(
+            f"mm_mxfp8: extra_tuning_buckets must be positive integers, got {buckets!r}"
+        )
+    return tuple(values)
+
+
+@functools.lru_cache(maxsize=64)
+def _mm_mxfp8_tuning_config_with_extras(
+    cute_dsl: bool, extra_buckets: Tuple[int, ...]
+) -> TuningConfig:
+    """``_mm_mxfp8_tuning_config`` with sorted, unique ``extra_buckets``.
+
+    The M spec keeps the hybrid buckets and adds ``extra_buckets``: tuning
+    profiles both sets up to the tuned M, and a runtime M maps up to the
+    smallest bucket ``>= M`` of either. The gen/map callables come from the
+    cached ``make_hybrid_bucket_fns_with_extras``, so equal bucket sets share one
+    spec and the autotuner's nearest-profile cache stays bounded.
+    """
+    base = _MM_MXFP8_CUTE_DSL_TUNING_CONFIG if cute_dsl else _MM_MXFP8_TUNING_CONFIG
+    gen_buckets, map_to_bucket = make_hybrid_bucket_fns_with_extras(extra_buckets)
+    (m_spec,) = base.dynamic_tensor_specs
+    return replace(
+        base,
+        dynamic_tensor_specs=(
+            replace(
+                m_spec,
+                gen_tuning_buckets=gen_buckets,
+                map_to_tuning_buckets=map_to_bucket,
+            ),
+        ),
+    )
 
 
 @backend_requirement(

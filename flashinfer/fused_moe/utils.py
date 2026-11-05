@@ -1,3 +1,4 @@
+import bisect
 import contextlib
 import functools
 import logging
@@ -322,6 +323,49 @@ def map_to_hybrid_bucket_uncapped(x: int) -> int:
     if x <= _PHASE3_END:
         return _ceil_to_step(x, _PHASE3_STEP)
     return next_positive_power_of_2(x)
+
+
+def get_hybrid_num_tokens_buckets_with_extras(
+    max_num_tokens: int, extra_buckets: Tuple[int, ...]
+) -> Tuple[int, ...]:
+    """:func:`get_hybrid_num_tokens_buckets` plus the ``extra_buckets`` that do
+    not exceed ``max_num_tokens``."""
+    hybrid = get_hybrid_num_tokens_buckets(max_num_tokens)
+    return tuple(
+        sorted(set(hybrid).union(b for b in extra_buckets if b <= max_num_tokens))
+    )
+
+
+def map_to_hybrid_bucket_with_extras(x: int, extra_buckets: Tuple[int, ...]) -> int:
+    """Round ``x`` up to the smallest bucket ``>= x`` among the hybrid buckets
+    (:func:`map_to_hybrid_bucket_uncapped`) and ``extra_buckets``.
+
+    ``extra_buckets`` must be sorted ascending.
+    """
+    hybrid = map_to_hybrid_bucket_uncapped(x)
+    i = bisect.bisect_left(extra_buckets, x)
+    return min(hybrid, extra_buckets[i]) if i < len(extra_buckets) else hybrid
+
+
+@functools.cache
+def make_hybrid_bucket_fns_with_extras(
+    extra_buckets: Tuple[int, ...],
+) -> Tuple[Callable[[int], Tuple[int, ...]], Callable[[int], int]]:
+    """Return ``(gen_tuning_buckets, map_to_tuning_buckets)`` for the hybrid
+    buckets extended by ``extra_buckets`` (sorted ascending, unique).
+
+    Cached by ``extra_buckets`` so every caller gets the same two objects, which
+    keeps AutoTuner._find_nearest_profile's lru_cache key stable (see
+    :func:`make_hybrid_bucket_mapper`).
+    """
+    return (
+        functools.partial(
+            get_hybrid_num_tokens_buckets_with_extras, extra_buckets=extra_buckets
+        ),
+        functools.partial(
+            map_to_hybrid_bucket_with_extras, extra_buckets=extra_buckets
+        ),
+    )
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
