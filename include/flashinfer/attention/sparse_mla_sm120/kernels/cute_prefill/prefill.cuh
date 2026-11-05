@@ -12,6 +12,7 @@ struct Params : cute_prefill::Params {
   size_t lse_stride;
   float lse_scale;
 };
+enum class Role { load_k, load_v, mma_qk, mma_pv };
 using Pipeline = cutlass::PipelineAsync<3>;
 struct alignas(128) Shared {
   uint8_t k[3][2][64 * 128];  // (stage, feature-half, candidate, feature)
@@ -45,14 +46,16 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   const int lane = threadIdx.x % 32;
   const int wg = threadIdx.x / 128;
   const int warp = (threadIdx.x % 128) / 32;
+  const Role role = wg == 0 ? Role::mma_qk : wg == 1 ? Role::mma_pv
+      : warp < 2 ? Role::load_k : Role::load_v;
   Pipeline::Params k_params, v_params;
   k_params.producer_arv_count = v_params.producer_arv_count = 64;
   k_params.consumer_arv_count = v_params.consumer_arv_count = 128;
   k_params.dst_blockid = v_params.dst_blockid = 0;
-  k_params.role = wg == 0 ? Pipeline::ThreadCategory::Consumer
-      : (wg == 2 && warp < 2 ? Pipeline::ThreadCategory::Producer : Pipeline::ThreadCategory::NonParticipant);
-  v_params.role = wg == 1 ? Pipeline::ThreadCategory::Consumer
-      : (wg == 2 && warp >= 2 ? Pipeline::ThreadCategory::Producer : Pipeline::ThreadCategory::NonParticipant);
+  k_params.role = role == Role::mma_qk ? Pipeline::ThreadCategory::Consumer
+      : (role == Role::load_k ? Pipeline::ThreadCategory::Producer : Pipeline::ThreadCategory::NonParticipant);
+  v_params.role = role == Role::mma_pv ? Pipeline::ThreadCategory::Consumer
+      : (role == Role::load_v ? Pipeline::ThreadCategory::Producer : Pipeline::ThreadCategory::NonParticipant);
   Pipeline k_pipeline(sm.k_pipeline, k_params);
   Pipeline v_pipeline(sm.v_pipeline, v_params);
   __syncthreads();
@@ -65,12 +68,12 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   Mma mma;
   auto thr_mma = mma.get_slice(lane);
 
-  if (wg == 2) {
-    // Loader role: local warps 0/1 gather K, local warps 2/3 gather V.
-    // Keep register-allocation regions inside disjoint role branches.
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
-    const bool load_k = warp < 2;
-    auto& pipeline = load_k ? k_pipeline : v_pipeline;
+  // Register redistribution must execute uniformly across the loader warpgroup,
+  // before its two-warp K and V roles diverge.
+  if (wg == 2) asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
+
+  if (role == Role::load_k) {
+    // WG2 warps 0/1 own feature halves 0:256 and 256:512.
     auto write_state = cutlass::make_producer_start_state<Pipeline>();
     const int loader_tid = threadIdx.x % 64;
     #pragma unroll 1
@@ -85,50 +88,22 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
-      const int micro_steps = load_k ? 2 : 4;
       #pragma unroll 1
-      for (int micro = 0; micro < micro_steps; ++micro) {
-        pipeline.producer_acquire(write_state);  // Wait only for a FREE slot.
+      for (int micro = 0; micro < 2; ++micro) {
+        k_pipeline.producer_acquire(write_state);
         const int stage = write_state.index();
-        // Scale factors use two candidate-tile slots. Reusing a slot for
-        // tile+2 depends on producer_acquire retiring the earlier tile's
-        // feature stages: two for K, four for V.
         if (micro == 0) {
-          int id = (warp % 2) ? id_hi : id_lo;
-          if (load_k) {
-            // QK consumes four adjacent feature-group scales per 128-feature stage.
-            uint8_t* dst = sm.k_sf[tile & 1] + loader_tid * 16;
-            uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-            const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-                :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
-          } else {
-            // Transpose [candidate, group] -> [group, candidate] in registers.
-            // Four lanes transpose a 4x4 byte tile, then each writes one u32.
-            uint4 packed = id >= 0 ? *reinterpret_cast<const uint4*>(cache + size_t(id) * stride + 512)
-            : make_uint4(0, 0, 0, 0);
-            auto words = make_tensor(make_rmem_ptr(reinterpret_cast<uint32_t*>(&packed)), Layout<_4>{});
-            #pragma unroll
-            for (int g = 0; g < 4; ++g) {
-              uint32_t w = words(g);
-              uint32_t a = __shfl_sync(0xffffffff, w, lane & ~3);
-              uint32_t b = __shfl_sync(0xffffffff, w, (lane & ~3) + 1);
-              uint32_t c = __shfl_sync(0xffffffff, w, (lane & ~3) + 2);
-              uint32_t d = __shfl_sync(0xffffffff, w, (lane & ~3) + 3);
-              int shift = (lane & 3) * 8;
-              uint32_t transposed = ((a >> shift) & 255) | (((b >> shift) & 255) << 8)
-              | (((c >> shift) & 255) << 16) | (((d >> shift) & 255) << 24);
-              *reinterpret_cast<uint32_t*>(sm.v_sf[tile & 1] + (g * 16 + loader_tid / 4) * 16 + (lane & 3) * 4) = transposed;
-            }
-          }
+          int id = warp ? id_hi : id_lo;
+          uint8_t* dst = sm.k_sf[tile & 1] + loader_tid * 16;
+          uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+          const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
-        const int workers = load_k ? 32 : 64;
-        const int tid = load_k ? lane : loader_tid;
-        uint8_t* dst = load_k ? sm.k[stage][warp] : sm.v[stage];
-        int feature_base = micro * 128 + (load_k ? warp * 256 : 0);
-        // Each 128-feature vector is cooperatively copied in 16-byte units.
+        uint8_t* dst = sm.k[stage][warp];
+        const int feature_base = micro * 128 + warp * 256;
         #pragma unroll 1
-        for (int i = tid; i < 64 * 8; i += workers) {
+        for (int i = lane; i < 64 * 8; i += 32) {
           int n = i / 8, d = (i % 8) * 16;
           int id = __shfl_sync(0xffffffff, n < 32 ? id_lo : id_hi, n % 32);
           uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
@@ -136,16 +111,72 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
               :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
-        // Hardware completes this arrival after this thread's prior LDGSTS.
-        // producer_commit also publishes ordinary SF stores with a release arrival.
-        pipeline.producer_commit(write_state, cutlass::arch::cpasync_barrier_arrive);
+        k_pipeline.producer_commit(write_state, cutlass::arch::cpasync_barrier_arrive);
         ++write_state;
       }
     }
-    pipeline.producer_tail(write_state);  // Drain by waiting for FREE slots.
-    return;
-  }
-  if (wg == 0) {
+    k_pipeline.producer_tail(write_state);
+  } else if (role == Role::load_v) {
+    // WG2 warps 2/3 cooperatively gather the full feature range.
+    auto write_state = cutlass::make_producer_start_state<Pipeline>();
+    const int loader_tid = threadIdx.x % 64;
+    #pragma unroll 1
+    for (int tile = 0; tile < tiles; ++tile) {
+      const bool extra = tile >= main_tiles;
+      const int tile_start = (extra ? tile - main_tiles : tile) * 64;
+      const int length = extra ? extra_len : main_len;
+      const int width = extra ? p.extra_topk : p.topk;
+      const int* ids = (extra ? p.extra_indices : p.indices) + size_t(token) * width;
+      const uint8_t* cache = extra ? p.extra_kv : p.kv;
+      const int stride = extra ? p.extra_stride : p.kv_stride;
+      // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
+      const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
+      const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
+      // Scale loads and transpose use registers only; shared stores wait for FREE.
+      int sf_id = (warp % 2) ? id_hi : id_lo;
+      uint4 packed = sf_id >= 0
+          ? *reinterpret_cast<const uint4*>(cache + size_t(sf_id) * stride + 512)
+          : make_uint4(0, 0, 0, 0);
+      auto words = make_tensor(make_rmem_ptr(reinterpret_cast<uint32_t*>(&packed)), Layout<_4>{});
+      auto rSF = make_tensor<uint32_t>(Layout<_4>{});
+      #pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        uint32_t w = words(g);
+        uint32_t a = __shfl_sync(0xffffffff, w, lane & ~3);
+        uint32_t b = __shfl_sync(0xffffffff, w, (lane & ~3) + 1);
+        uint32_t c = __shfl_sync(0xffffffff, w, (lane & ~3) + 2);
+        uint32_t d = __shfl_sync(0xffffffff, w, (lane & ~3) + 3);
+        int shift = (lane & 3) * 8;
+        rSF(g) = ((a >> shift) & 255) | (((b >> shift) & 255) << 8)
+            | (((c >> shift) & 255) << 16) | (((d >> shift) & 255) << 24);
+      }
+      #pragma unroll 1
+      for (int micro = 0; micro < 4; ++micro) {
+        v_pipeline.producer_acquire(write_state);
+        const int stage = write_state.index();
+        if (micro == 0) {
+          #pragma unroll
+          for (int g = 0; g < 4; ++g) {
+            *reinterpret_cast<uint32_t*>(sm.v_sf[tile & 1] + (g * 16 + loader_tid / 4) * 16 + (lane & 3) * 4) = rSF(g);
+          }
+        }
+        uint8_t* dst = sm.v[stage];
+        const int feature_base = micro * 128;
+        #pragma unroll 1
+        for (int i = loader_tid; i < 64 * 8; i += 64) {
+          int n = i / 8, d = (i % 8) * 16;
+          int id = __shfl_sync(0xffffffff, n < 32 ? id_lo : id_hi, n % 32);
+          uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst + MicroLayout{}(n, d)));
+          const uint8_t* src = cache + size_t(max(id, 0)) * stride + feature_base + d;
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
+        }
+        v_pipeline.producer_commit(write_state, cutlass::arch::cpasync_barrier_arrive);
+        ++write_state;
+      }
+    }
+    v_pipeline.producer_tail(write_state);
+  } else if (role == Role::mma_qk) {
     const float* cs = nullptr;
     if constexpr (Mega) cs = p.cos_sin + size_t(p.positions[token]) * 64;
     asm volatile("setmaxnreg.inc.sync.aligned.u32 208;" ::: "memory");
@@ -282,7 +313,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       bar_sync_t<1, 128>();
       bar_arrive_alt<2, 3, 256>(slot);
     }
-  } else {
+  } else if (role == Role::mma_pv) {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 256;" ::: "memory");
     // PV role (WG1): C=(features,heads), A=V^T, B=P. Four lanes own one head's P.
     const int h0 = head_base + warp * 8;
@@ -334,7 +365,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       for (int group = 0; group < 16; ++group) {
         const int micro = group / 4;
         const int stage = read_state.index();
-        if (group % 4 == 0) v_pipeline.consumer_wait(read_state);
+        if (group % 4 == 0) {
+          v_pipeline.consumer_wait(read_state);
+        }
         if (group % 2 == 0) {
           #pragma unroll
           for (int pack = 0; pack < 4; ++pack) {
@@ -476,6 +509,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       }
       }
     }
+  } else {
+    CUTE_INVALID_CONTROL_PATH("Unreachable prefill role");
   }
 }
 }
