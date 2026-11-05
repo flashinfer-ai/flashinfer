@@ -309,10 +309,15 @@ LOGICAL_SCALARS = (
 # The ``kcp_affine_merge`` record of a launch (:func:`merge_record`), by architecture: ``T = n_chains * ncols / 128``
 # (the launch's 128-column chain blocks; one rule for both operator layouts) -> the record of the first band whose
 # upper bound holds ``T`` (``None``: no bound).  Every record gives the same bits.  The bands are the fastest build per
-# ``T`` in an A/B on GB300 (sm_103a, 152 SMs: 17 launch rows x 11 builds, every row bitwise equal to the
-# previous build); sm_100a takes the GB300 bands (not measured on sm_100a).  sm_107a has no packed FMA pairs and ships
-# no 8 x 8 build: its bands are the GB300 bands with the scalar builds and the 4 x 8 build above ``T`` 56 (a proxy, not
-# measured on sm_107a).
+# ``T`` in kernel A/Bs over 17 launch rows, every row of every build bitwise equal to v1's 8-column build: on GB300
+# (sm_103a) and GB200 (sm_100a), 152 SMs, 14 builds each (238 of 238 rows equal on each part), and on an R200 board
+# (sm_107a, 208 SMs) 11 scalar builds (187 of 187).  Kernel time against the previous pick: on sm_100a / sm_103a the
+# 8 x 4 tile over 64 columns 0.93-0.99 on the T = 64 rows (the previous pick: the 8 x 8 tile) and over 32 columns
+# 0.93-0.97 on the T = 24 and 32 rows (the previous pick: the 4 x 8 tile); the T = 48 rows and those up to 16 keep
+# their builds, and the 16-warp 4 x 4 tile over 64 columns is the fastest on no row.  sm_107a has no packed FMA pairs
+# and ships no 64-column build; on its 208 SMs the build that keeps about one CTA per SM wins: the 4 x 4 tile over 16
+# columns 0.758-0.829 at T = 24 and 0.832-0.896 at T = 64, the 8 x 4 tile over 32 columns 0.936-0.947 at T = 32 and
+# 0.865-0.884 at T = 48.
 MERGE_RULE: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (12, "kcp_affine_merge_c8"),
@@ -330,10 +335,9 @@ MERGE_RULE: dict[str, tuple[tuple[int | None, str], ...]] = {
     ),
     "sm_107a": (
         (12, "kcp_affine_merge_c8"),
-        (20, "kcp_affine_merge_c16"),
-        (40, "kcp_affine_merge_c32"),
-        (56, "kcp_affine_merge_c16"),
-        (None, "kcp_affine_merge_c32"),
+        (24, "kcp_affine_merge_c16"),
+        (48, "kcp_affine_merge_c32"),
+        (None, "kcp_affine_merge_c16"),
     ),
 }
 # The full-width record of a K1 / K2 offset walk under the ``walk_heads`` rule: walk program -> bands ``(upper bound
@@ -945,7 +949,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         # The 4 x 4 thread tile over 16 columns (packed FMA pairs on sm_100a / sm_103a): T 13-20 and
-        # 41-56 (MERGE_RULE).
+        # 41-56; on sm_107a T 13-24 and above 48 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 16, "kind": "kcp_chains"},
         "kernel_symbol": "kernel_cake_kda_det_train_9ab870ac43ee331f2dd3_kcp",
         "launch": {
@@ -998,10 +1002,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # The 4 x 8 thread tile over 32 columns (packed FMA pairs on sm_100a / sm_103a): T 21-40, and
-        # above 56 on sm_107a (MERGE_RULE).
+        # The 8 x 4 thread tile over 32 columns (packed FMA pairs on sm_100a / sm_103a): T 21-40; on
+        # sm_107a T 25-48 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 32, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
+        "kernel_symbol": "kernel_cake_kda_det_train_7634c7541a6836a5146a_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1009,7 +1013,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 110592,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
+        "library": "cake_kda_det_train_7634c7541a6836a5146a_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -1052,18 +1056,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # The 8 x 8 thread tile over 64 columns with packed FMA pairs (sm_100a / sm_103a only): T above
+        # The 8 x 4 thread tile over 64 columns with packed FMA pairs (sm_100a / sm_103a only): T above
         # 56 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 64, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "kernel_symbol": "kernel_cake_kda_det_train_8cda0d1f1291e740f798_kcp",
         "launch": {
-            "block": (128, 1, 1),
+            "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 143360,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "library": "cake_kda_det_train_8cda0d1f1291e740f798_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",

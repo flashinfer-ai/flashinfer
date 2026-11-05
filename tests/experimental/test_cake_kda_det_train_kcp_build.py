@@ -97,13 +97,13 @@ MERGE_RECORDS = {
         ARCHES,
     ),
     "kcp_affine_merge_c32": (
-        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "4x8"},
+        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "8x4"},
         128,
         ARCHES,
     ),
     "kcp_affine_merge_c64": (
-        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x8"},
-        128,
+        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x4"},
+        256,
         ("sm_100a", "sm_103a"),
     ),
 }
@@ -112,11 +112,15 @@ MERGE_RECORDS = {
 MERGE_SELECT = {
     ("sm_103a", 128, 64): "kcp_affine_merge_c64",
     ("sm_100a", 128, 57): "kcp_affine_merge_c64",
-    ("sm_107a", 128, 64): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 64): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 49): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 48): "kcp_affine_merge_c32",
     ("sm_103a", 128, 56): "kcp_affine_merge_c16",
     ("sm_103a", 256, 21): "kcp_affine_merge_c16",
     ("sm_103a", 128, 40): "kcp_affine_merge_c32",
-    ("sm_107a", 128, 21): "kcp_affine_merge_c32",
+    ("sm_107a", 256, 13): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 24): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 21): "kcp_affine_merge_c16",
     ("sm_103a", 256, 10): "kcp_affine_merge_c16",
     ("sm_103a", 128, 13): "kcp_affine_merge_c16",
     ("sm_103a", 128, 12): "kcp_affine_merge_c8",
@@ -344,7 +348,8 @@ def test_merge_selection_covers_every_launch_once() -> None:
                 assert arch in kcp_jit.MODULES[record]["arches"], (arch, record)
                 named.setdefault(record, set()).add(arch)
     assert named == {name: set(MERGE_RECORDS[name][2]) for name in MERGE_RECORDS}
-    # without an architecture: the record every architecture names, refused where they differ (T > 56)
+    # without an architecture: the record every architecture names, refused where they differ (T 21-24, 41-48 and
+    # above 56)
     assert kcp_jit.merge_record(128, 8) == "kcp_affine_merge_c8"
     with pytest.raises(ValueError):
         kcp_jit.merge_record(128, 64)

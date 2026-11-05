@@ -70,7 +70,7 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float* __restrict__ c, float* __restrict__ x0, float* __restrict__ y, int* __restrict__ chain_start, long long* __restrict__ elem_m, long long* __restrict__ elem_c, long long* __restrict__ elem_y, long long* __restrict__ x0_index, long long* __restrict__ y_final, int ncols, int transpose_m, int write_states, int cols_per_cta)
+kernel_cake_kda_det_train_7634c7541a6836a5146a_kcp(float* __restrict__ m, float* __restrict__ c, float* __restrict__ x0, float* __restrict__ y, int* __restrict__ chain_start, long long* __restrict__ elem_m, long long* __restrict__ elem_c, long long* __restrict__ elem_y, long long* __restrict__ x0_index, long long* __restrict__ y_final, int ncols, int transpose_m, int write_states, int cols_per_cta)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -103,15 +103,15 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
     int col_tile = col0 / 128;
     int v0 = col0 % 128;
     int warp_1 = warp;
-    int g = lane / 4;
-    int cg = lane % 4;
+    int g = lane / 8;
+    int cg = lane % 8;
     int e_begin = chain_start[chain];
     int e_end = chain_start[chain + 1];
     unsigned int ring_w = ms_addr + (unsigned int)(warp_1 * 18432);
     float acc[32];
     float cn[32];
-    float mv[16];
-    float xv[8];
+    float mv[32];
+    float xv[4];
     if (transpose_m == 0) {
         int row0 = warp_1 * 32 + g * 4;
         long long g_off = (long long)col_tile * 16384 + (long long)(row0 * 128 + v0 + cg * 4);
@@ -195,49 +195,49 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     cn[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 16);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 128);
                     cn[4 + 0] = _v4.x;
                     cn[4 + 1] = _v4.y;
                     cn[4 + 2] = _v4.z;
                     cn[4 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 128);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 256);
                     cn[8 + 0] = _v4.x;
                     cn[8 + 1] = _v4.y;
                     cn[8 + 2] = _v4.z;
                     cn[8 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 144);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 384);
                     cn[12 + 0] = _v4.x;
                     cn[12 + 1] = _v4.y;
                     cn[12 + 2] = _v4.z;
                     cn[12 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 256);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 2048);
                     cn[16 + 0] = _v4.x;
                     cn[16 + 1] = _v4.y;
                     cn[16 + 2] = _v4.z;
                     cn[16 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 272);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 2176);
                     cn[20 + 0] = _v4.x;
                     cn[20 + 1] = _v4.y;
                     cn[20 + 2] = _v4.z;
                     cn[20 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 384);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 2304);
                     cn[24 + 0] = _v4.x;
                     cn[24 + 1] = _v4.y;
                     cn[24 + 2] = _v4.z;
                     cn[24 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 400);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first + g_off + 2432);
                     cn[28 + 0] = _v4.x;
                     cn[28 + 1] = _v4.y;
                     cn[28 + 2] = _v4.z;
@@ -288,49 +288,49 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 acc[0 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 16);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 128);
                 acc[4 + 0] = _v4.x;
                 acc[4 + 1] = _v4.y;
                 acc[4 + 2] = _v4.z;
                 acc[4 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 128);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 256);
                 acc[8 + 0] = _v4.x;
                 acc[8 + 1] = _v4.y;
                 acc[8 + 2] = _v4.z;
                 acc[8 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 144);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 384);
                 acc[12 + 0] = _v4.x;
                 acc[12 + 1] = _v4.y;
                 acc[12 + 2] = _v4.z;
                 acc[12 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 256);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 2048);
                 acc[16 + 0] = _v4.x;
                 acc[16 + 1] = _v4.y;
                 acc[16 + 2] = _v4.z;
                 acc[16 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 272);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 2176);
                 acc[20 + 0] = _v4.x;
                 acc[20 + 1] = _v4.y;
                 acc[20 + 2] = _v4.z;
                 acc[20 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 384);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 2304);
                 acc[24 + 0] = _v4.x;
                 acc[24 + 1] = _v4.y;
                 acc[24 + 2] = _v4.z;
                 acc[24 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 400);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off + g_off + 2432);
                 acc[28 + 0] = _v4.x;
                 acc[28 + 1] = _v4.y;
                 acc[28 + 2] = _v4.z;
@@ -345,43 +345,43 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
             acc[1] = ((diag == 1) ? 1.0f : 0.0f);
             acc[2] = ((diag == 2) ? 1.0f : 0.0f);
             acc[3] = ((diag == 3) ? 1.0f : 0.0f);
-            acc[4] = ((diag == 16) ? 1.0f : 0.0f);
-            acc[5] = ((diag == 17) ? 1.0f : 0.0f);
-            acc[6] = ((diag == 18) ? 1.0f : 0.0f);
-            acc[7] = ((diag == 19) ? 1.0f : 0.0f);
-            acc[8] = ((diag + 1 == 0) ? 1.0f : 0.0f);
-            acc[9] = ((diag + 1 == 1) ? 1.0f : 0.0f);
-            acc[10] = ((diag + 1 == 2) ? 1.0f : 0.0f);
-            acc[11] = ((diag + 1 == 3) ? 1.0f : 0.0f);
-            acc[12] = ((diag + 1 == 16) ? 1.0f : 0.0f);
-            acc[13] = ((diag + 1 == 17) ? 1.0f : 0.0f);
-            acc[14] = ((diag + 1 == 18) ? 1.0f : 0.0f);
-            acc[15] = ((diag + 1 == 19) ? 1.0f : 0.0f);
-            acc[16] = ((diag + 2 == 0) ? 1.0f : 0.0f);
-            acc[17] = ((diag + 2 == 1) ? 1.0f : 0.0f);
-            acc[18] = ((diag + 2 == 2) ? 1.0f : 0.0f);
-            acc[19] = ((diag + 2 == 3) ? 1.0f : 0.0f);
-            acc[20] = ((diag + 2 == 16) ? 1.0f : 0.0f);
-            acc[21] = ((diag + 2 == 17) ? 1.0f : 0.0f);
-            acc[22] = ((diag + 2 == 18) ? 1.0f : 0.0f);
-            acc[23] = ((diag + 2 == 19) ? 1.0f : 0.0f);
-            acc[24] = ((diag + 3 == 0) ? 1.0f : 0.0f);
-            acc[25] = ((diag + 3 == 1) ? 1.0f : 0.0f);
-            acc[26] = ((diag + 3 == 2) ? 1.0f : 0.0f);
-            acc[27] = ((diag + 3 == 3) ? 1.0f : 0.0f);
-            acc[28] = ((diag + 3 == 16) ? 1.0f : 0.0f);
-            acc[29] = ((diag + 3 == 17) ? 1.0f : 0.0f);
-            acc[30] = ((diag + 3 == 18) ? 1.0f : 0.0f);
-            acc[31] = ((diag + 3 == 19) ? 1.0f : 0.0f);
+            acc[4] = ((diag + 1 == 0) ? 1.0f : 0.0f);
+            acc[5] = ((diag + 1 == 1) ? 1.0f : 0.0f);
+            acc[6] = ((diag + 1 == 2) ? 1.0f : 0.0f);
+            acc[7] = ((diag + 1 == 3) ? 1.0f : 0.0f);
+            acc[8] = ((diag + 2 == 0) ? 1.0f : 0.0f);
+            acc[9] = ((diag + 2 == 1) ? 1.0f : 0.0f);
+            acc[10] = ((diag + 2 == 2) ? 1.0f : 0.0f);
+            acc[11] = ((diag + 2 == 3) ? 1.0f : 0.0f);
+            acc[12] = ((diag + 3 == 0) ? 1.0f : 0.0f);
+            acc[13] = ((diag + 3 == 1) ? 1.0f : 0.0f);
+            acc[14] = ((diag + 3 == 2) ? 1.0f : 0.0f);
+            acc[15] = ((diag + 3 == 3) ? 1.0f : 0.0f);
+            acc[16] = ((diag + 16 == 0) ? 1.0f : 0.0f);
+            acc[17] = ((diag + 16 == 1) ? 1.0f : 0.0f);
+            acc[18] = ((diag + 16 == 2) ? 1.0f : 0.0f);
+            acc[19] = ((diag + 16 == 3) ? 1.0f : 0.0f);
+            acc[20] = ((diag + 17 == 0) ? 1.0f : 0.0f);
+            acc[21] = ((diag + 17 == 1) ? 1.0f : 0.0f);
+            acc[22] = ((diag + 17 == 2) ? 1.0f : 0.0f);
+            acc[23] = ((diag + 17 == 3) ? 1.0f : 0.0f);
+            acc[24] = ((diag + 18 == 0) ? 1.0f : 0.0f);
+            acc[25] = ((diag + 18 == 1) ? 1.0f : 0.0f);
+            acc[26] = ((diag + 18 == 2) ? 1.0f : 0.0f);
+            acc[27] = ((diag + 18 == 3) ? 1.0f : 0.0f);
+            acc[28] = ((diag + 19 == 0) ? 1.0f : 0.0f);
+            acc[29] = ((diag + 19 == 1) ? 1.0f : 0.0f);
+            acc[30] = ((diag + 19 == 2) ? 1.0f : 0.0f);
+            acc[31] = ((diag + 19 == 3) ? 1.0f : 0.0f);
         }
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 64), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 144), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 208), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 288), "r"(__float_as_uint(acc[16])), "r"(__float_as_uint(acc[17])), "r"(__float_as_uint(acc[18])), "r"(__float_as_uint(acc[19])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 352), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 432), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 496), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 144), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 288), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 432), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 2304), "r"(__float_as_uint(acc[16])), "r"(__float_as_uint(acc[17])), "r"(__float_as_uint(acc[18])), "r"(__float_as_uint(acc[19])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 2448), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 2592), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + 2736), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
         if (e_begin < e_end) {
             if (write_states != 0) {
                 long long y_first = elem_y[e_begin];
@@ -392,31 +392,31 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 16) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
                         *reinterpret_cast<float4*>(y + y_first + g_off + 128) = _v4;
                     }
                     {
-                        float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 144) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
+                        float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
                         *reinterpret_cast<float4*>(y + y_first + g_off + 256) = _v4;
                     }
                     {
-                        float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 272) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
+                        float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
                         *reinterpret_cast<float4*>(y + y_first + g_off + 384) = _v4;
                     }
                     {
+                        float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 2048) = _v4;
+                    }
+                    {
+                        float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 2176) = _v4;
+                    }
+                    {
+                        float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 2304) = _v4;
+                    }
+                    {
                         float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first + g_off + 400) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first + g_off + 2432) = _v4;
                     }
                 }
             }
@@ -429,31 +429,31 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 16) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
                     *reinterpret_cast<float4*>(y + y_last + g_off + 128) = _v4;
                 }
                 {
-                    float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 144) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
+                    float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
                     *reinterpret_cast<float4*>(y + y_last + g_off + 256) = _v4;
                 }
                 {
-                    float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 272) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
+                    float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
                     *reinterpret_cast<float4*>(y + y_last + g_off + 384) = _v4;
                 }
                 {
+                    float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 2048) = _v4;
+                }
+                {
+                    float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 2176) = _v4;
+                }
+                {
+                    float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 2304) = _v4;
+                }
+                {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last + g_off + 400) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last + g_off + 2432) = _v4;
                 }
             }
         }
@@ -565,49 +565,49 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                             cn[0 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 16);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 128);
                             cn[4 + 0] = _v4.x;
                             cn[4 + 1] = _v4.y;
                             cn[4 + 2] = _v4.z;
                             cn[4 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 128);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 256);
                             cn[8 + 0] = _v4.x;
                             cn[8 + 1] = _v4.y;
                             cn[8 + 2] = _v4.z;
                             cn[8 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 144);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 384);
                             cn[12 + 0] = _v4.x;
                             cn[12 + 1] = _v4.y;
                             cn[12 + 2] = _v4.z;
                             cn[12 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 256);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 2048);
                             cn[16 + 0] = _v4.x;
                             cn[16 + 1] = _v4.y;
                             cn[16 + 2] = _v4.z;
                             cn[16 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 272);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 2176);
                             cn[20 + 0] = _v4.x;
                             cn[20 + 1] = _v4.y;
                             cn[20 + 2] = _v4.z;
                             cn[20 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 384);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 2304);
                             cn[24 + 0] = _v4.x;
                             cn[24 + 1] = _v4.y;
                             cn[24 + 2] = _v4.z;
                             cn[24 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 400);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next + g_off + 2432);
                             cn[28 + 0] = _v4.x;
                             cn[28 + 1] = _v4.y;
                             cn[28 + 2] = _v4.z;
@@ -654,44 +654,44 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                         : "=r"(*reinterpret_cast<uint32_t*>(&mv[0])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(0) + 3]))
                         : "r"(m_rd + (unsigned int)(ch % 4 * 4608) + (unsigned int)(kk * 128)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&mv[4])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(4) + 3]))
+                        : "r"(m_rd + (unsigned int)(ch % 4 * 4608) + (unsigned int)(kk * 128) + 64));
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e + (unsigned int)(ch * 4608) + (unsigned int)(kk * 144)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
-                        : "r"(x_rd_e + (unsigned int)(ch * 4608) + (unsigned int)(kk * 144) + 64));
 #if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[0], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[0], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[0], xv[2], acc[2]);
                     acc[3] = __fmaf_rn(mv[0], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[0], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[0], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[0], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[0], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[1], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[1], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[1], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[1], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[1], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[1], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[1], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[1], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[2], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[2], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[2], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[2], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[2], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[2], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[2], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[2], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[3], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[3], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[3], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[3], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[3], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[3], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[3], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[3], xv[7], acc[31]);
+                    acc[4] = __fmaf_rn(mv[1], xv[0], acc[4]);
+                    acc[5] = __fmaf_rn(mv[1], xv[1], acc[5]);
+                    acc[6] = __fmaf_rn(mv[1], xv[2], acc[6]);
+                    acc[7] = __fmaf_rn(mv[1], xv[3], acc[7]);
+                    acc[8] = __fmaf_rn(mv[2], xv[0], acc[8]);
+                    acc[9] = __fmaf_rn(mv[2], xv[1], acc[9]);
+                    acc[10] = __fmaf_rn(mv[2], xv[2], acc[10]);
+                    acc[11] = __fmaf_rn(mv[2], xv[3], acc[11]);
+                    acc[12] = __fmaf_rn(mv[3], xv[0], acc[12]);
+                    acc[13] = __fmaf_rn(mv[3], xv[1], acc[13]);
+                    acc[14] = __fmaf_rn(mv[3], xv[2], acc[14]);
+                    acc[15] = __fmaf_rn(mv[3], xv[3], acc[15]);
+                    acc[16] = __fmaf_rn(mv[4], xv[0], acc[16]);
+                    acc[17] = __fmaf_rn(mv[4], xv[1], acc[17]);
+                    acc[18] = __fmaf_rn(mv[4], xv[2], acc[18]);
+                    acc[19] = __fmaf_rn(mv[4], xv[3], acc[19]);
+                    acc[20] = __fmaf_rn(mv[5], xv[0], acc[20]);
+                    acc[21] = __fmaf_rn(mv[5], xv[1], acc[21]);
+                    acc[22] = __fmaf_rn(mv[5], xv[2], acc[22]);
+                    acc[23] = __fmaf_rn(mv[5], xv[3], acc[23]);
+                    acc[24] = __fmaf_rn(mv[6], xv[0], acc[24]);
+                    acc[25] = __fmaf_rn(mv[6], xv[1], acc[25]);
+                    acc[26] = __fmaf_rn(mv[6], xv[2], acc[26]);
+                    acc[27] = __fmaf_rn(mv[6], xv[3], acc[27]);
+                    acc[28] = __fmaf_rn(mv[7], xv[0], acc[28]);
+                    acc[29] = __fmaf_rn(mv[7], xv[1], acc[29]);
+                    acc[30] = __fmaf_rn(mv[7], xv[2], acc[30]);
+                    acc[31] = __fmaf_rn(mv[7], xv[3], acc[31]);
 #else
                     float2 m2_0 = make_float2(mv[0], mv[0]);
                     float2 a2_0 = make_float2(acc[0], acc[1]);
@@ -702,76 +702,80 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     a2_1 = fma_f32x2_rn_ftz(m2_0, make_float2(xv[2], xv[3]), a2_1);
                     acc[2] = a2_1.x;
                     acc[3] = a2_1.y;
+                    float2 m2_1 = make_float2(mv[1], mv[1]);
                     float2 a2_2 = make_float2(acc[4], acc[5]);
-                    a2_2 = fma_f32x2_rn_ftz(m2_0, make_float2(xv[4], xv[5]), a2_2);
+                    a2_2 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[0], xv[1]), a2_2);
                     acc[4] = a2_2.x;
                     acc[5] = a2_2.y;
                     float2 a2_3 = make_float2(acc[6], acc[7]);
-                    a2_3 = fma_f32x2_rn_ftz(m2_0, make_float2(xv[6], xv[7]), a2_3);
+                    a2_3 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[2], xv[3]), a2_3);
                     acc[6] = a2_3.x;
                     acc[7] = a2_3.y;
-                    float2 m2_1 = make_float2(mv[1], mv[1]);
+                    float2 m2_2 = make_float2(mv[2], mv[2]);
                     float2 a2_4 = make_float2(acc[8], acc[9]);
-                    a2_4 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[0], xv[1]), a2_4);
+                    a2_4 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[0], xv[1]), a2_4);
                     acc[8] = a2_4.x;
                     acc[9] = a2_4.y;
                     float2 a2_5 = make_float2(acc[10], acc[11]);
-                    a2_5 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[2], xv[3]), a2_5);
+                    a2_5 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[2], xv[3]), a2_5);
                     acc[10] = a2_5.x;
                     acc[11] = a2_5.y;
+                    float2 m2_3 = make_float2(mv[3], mv[3]);
                     float2 a2_6 = make_float2(acc[12], acc[13]);
-                    a2_6 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[4], xv[5]), a2_6);
+                    a2_6 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[0], xv[1]), a2_6);
                     acc[12] = a2_6.x;
                     acc[13] = a2_6.y;
                     float2 a2_7 = make_float2(acc[14], acc[15]);
-                    a2_7 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[6], xv[7]), a2_7);
+                    a2_7 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[2], xv[3]), a2_7);
                     acc[14] = a2_7.x;
                     acc[15] = a2_7.y;
-                    float2 m2_2 = make_float2(mv[2], mv[2]);
+                    float2 m2_4 = make_float2(mv[4], mv[4]);
                     float2 a2_8 = make_float2(acc[16], acc[17]);
-                    a2_8 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[0], xv[1]), a2_8);
+                    a2_8 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[0], xv[1]), a2_8);
                     acc[16] = a2_8.x;
                     acc[17] = a2_8.y;
                     float2 a2_9 = make_float2(acc[18], acc[19]);
-                    a2_9 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[2], xv[3]), a2_9);
+                    a2_9 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[2], xv[3]), a2_9);
                     acc[18] = a2_9.x;
                     acc[19] = a2_9.y;
+                    float2 m2_5 = make_float2(mv[5], mv[5]);
                     float2 a2_10 = make_float2(acc[20], acc[21]);
-                    a2_10 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[4], xv[5]), a2_10);
+                    a2_10 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[0], xv[1]), a2_10);
                     acc[20] = a2_10.x;
                     acc[21] = a2_10.y;
                     float2 a2_11 = make_float2(acc[22], acc[23]);
-                    a2_11 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[6], xv[7]), a2_11);
+                    a2_11 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[2], xv[3]), a2_11);
                     acc[22] = a2_11.x;
                     acc[23] = a2_11.y;
-                    float2 m2_3 = make_float2(mv[3], mv[3]);
+                    float2 m2_6 = make_float2(mv[6], mv[6]);
                     float2 a2_12 = make_float2(acc[24], acc[25]);
-                    a2_12 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[0], xv[1]), a2_12);
+                    a2_12 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[0], xv[1]), a2_12);
                     acc[24] = a2_12.x;
                     acc[25] = a2_12.y;
                     float2 a2_13 = make_float2(acc[26], acc[27]);
-                    a2_13 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[2], xv[3]), a2_13);
+                    a2_13 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[2], xv[3]), a2_13);
                     acc[26] = a2_13.x;
                     acc[27] = a2_13.y;
+                    float2 m2_7 = make_float2(mv[7], mv[7]);
                     float2 a2_14 = make_float2(acc[28], acc[29]);
-                    a2_14 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[4], xv[5]), a2_14);
+                    a2_14 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[0], xv[1]), a2_14);
                     acc[28] = a2_14.x;
                     acc[29] = a2_14.y;
                     float2 a2_15 = make_float2(acc[30], acc[31]);
-                    a2_15 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[6], xv[7]), a2_15);
+                    a2_15 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[2], xv[3]), a2_15);
                     acc[30] = a2_15.x;
                     acc[31] = a2_15.y;
 #endif
                 }
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432)), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 64), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 144), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 208), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 288), "r"(__float_as_uint(acc[16])), "r"(__float_as_uint(acc[17])), "r"(__float_as_uint(acc[18])), "r"(__float_as_uint(acc[19])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 352), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 432), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 496), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 144), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 288), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 432), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 2304), "r"(__float_as_uint(acc[16])), "r"(__float_as_uint(acc[17])), "r"(__float_as_uint(acc[18])), "r"(__float_as_uint(acc[19])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 2448), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 2592), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (18432 - buf * 18432) + 2736), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
             if (y_pub >= 0) {
                 {
                     float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
@@ -779,31 +783,31 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 16) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
                     *reinterpret_cast<float4*>(y + y_pub + g_off + 128) = _v4;
                 }
                 {
-                    float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 144) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
+                    float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
                     *reinterpret_cast<float4*>(y + y_pub + g_off + 256) = _v4;
                 }
                 {
-                    float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 272) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
+                    float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
                     *reinterpret_cast<float4*>(y + y_pub + g_off + 384) = _v4;
                 }
                 {
+                    float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 2048) = _v4;
+                }
+                {
+                    float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 2176) = _v4;
+                }
+                {
+                    float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 2304) = _v4;
+                }
+                {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub + g_off + 400) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub + g_off + 2432) = _v4;
                 }
             }
             __syncthreads();
@@ -895,7 +899,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     cn[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 16);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 512);
                     cn[4 + 0] = _v4.x;
                     cn[4 + 1] = _v4.y;
                     cn[4 + 2] = _v4.z;
@@ -909,7 +913,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     cn[8 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1040);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 1536);
                     cn[12 + 0] = _v4.x;
                     cn[12 + 1] = _v4.y;
                     cn[12 + 2] = _v4.z;
@@ -923,7 +927,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     cn[16 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 2064);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 2560);
                     cn[20 + 0] = _v4.x;
                     cn[20 + 1] = _v4.y;
                     cn[20 + 2] = _v4.z;
@@ -937,7 +941,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     cn[24 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 3088);
+                    float4 _v4 = *reinterpret_cast<const float4*>(c + c_first_1 + g_off_1 + 3584);
                     cn[28 + 0] = _v4.x;
                     cn[28 + 1] = _v4.y;
                     cn[28 + 2] = _v4.z;
@@ -988,7 +992,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 acc[0 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 16);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 512);
                 acc[4 + 0] = _v4.x;
                 acc[4 + 1] = _v4.y;
                 acc[4 + 2] = _v4.z;
@@ -1002,7 +1006,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 acc[8 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1040);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 1536);
                 acc[12 + 0] = _v4.x;
                 acc[12 + 1] = _v4.y;
                 acc[12 + 2] = _v4.z;
@@ -1016,7 +1020,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 acc[16 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 2064);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 2560);
                 acc[20 + 0] = _v4.x;
                 acc[20 + 1] = _v4.y;
                 acc[20 + 2] = _v4.z;
@@ -1030,7 +1034,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 acc[24 + 3] = _v4.w;
             }
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 3088);
+                float4 _v4 = *reinterpret_cast<const float4*>(x0 + x0_off_1 + g_off_1 + 3584);
                 acc[28 + 0] = _v4.x;
                 acc[28 + 1] = _v4.y;
                 acc[28 + 2] = _v4.z;
@@ -1045,43 +1049,43 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
             acc[1] = ((diag_1 == 1) ? 1.0f : 0.0f);
             acc[2] = ((diag_1 == 2) ? 1.0f : 0.0f);
             acc[3] = ((diag_1 == 3) ? 1.0f : 0.0f);
-            acc[4] = ((diag_1 == 16) ? 1.0f : 0.0f);
-            acc[5] = ((diag_1 == 17) ? 1.0f : 0.0f);
-            acc[6] = ((diag_1 == 18) ? 1.0f : 0.0f);
-            acc[7] = ((diag_1 == 19) ? 1.0f : 0.0f);
+            acc[4] = ((diag_1 + 4 == 0) ? 1.0f : 0.0f);
+            acc[5] = ((diag_1 + 4 == 1) ? 1.0f : 0.0f);
+            acc[6] = ((diag_1 + 4 == 2) ? 1.0f : 0.0f);
+            acc[7] = ((diag_1 + 4 == 3) ? 1.0f : 0.0f);
             acc[8] = ((diag_1 + 8 == 0) ? 1.0f : 0.0f);
             acc[9] = ((diag_1 + 8 == 1) ? 1.0f : 0.0f);
             acc[10] = ((diag_1 + 8 == 2) ? 1.0f : 0.0f);
             acc[11] = ((diag_1 + 8 == 3) ? 1.0f : 0.0f);
-            acc[12] = ((diag_1 + 8 == 16) ? 1.0f : 0.0f);
-            acc[13] = ((diag_1 + 8 == 17) ? 1.0f : 0.0f);
-            acc[14] = ((diag_1 + 8 == 18) ? 1.0f : 0.0f);
-            acc[15] = ((diag_1 + 8 == 19) ? 1.0f : 0.0f);
+            acc[12] = ((diag_1 + 12 == 0) ? 1.0f : 0.0f);
+            acc[13] = ((diag_1 + 12 == 1) ? 1.0f : 0.0f);
+            acc[14] = ((diag_1 + 12 == 2) ? 1.0f : 0.0f);
+            acc[15] = ((diag_1 + 12 == 3) ? 1.0f : 0.0f);
             acc[16] = ((diag_1 + 16 == 0) ? 1.0f : 0.0f);
             acc[17] = ((diag_1 + 16 == 1) ? 1.0f : 0.0f);
             acc[18] = ((diag_1 + 16 == 2) ? 1.0f : 0.0f);
             acc[19] = ((diag_1 + 16 == 3) ? 1.0f : 0.0f);
-            acc[20] = ((diag_1 + 16 == 16) ? 1.0f : 0.0f);
-            acc[21] = ((diag_1 + 16 == 17) ? 1.0f : 0.0f);
-            acc[22] = ((diag_1 + 16 == 18) ? 1.0f : 0.0f);
-            acc[23] = ((diag_1 + 16 == 19) ? 1.0f : 0.0f);
+            acc[20] = ((diag_1 + 20 == 0) ? 1.0f : 0.0f);
+            acc[21] = ((diag_1 + 20 == 1) ? 1.0f : 0.0f);
+            acc[22] = ((diag_1 + 20 == 2) ? 1.0f : 0.0f);
+            acc[23] = ((diag_1 + 20 == 3) ? 1.0f : 0.0f);
             acc[24] = ((diag_1 + 24 == 0) ? 1.0f : 0.0f);
             acc[25] = ((diag_1 + 24 == 1) ? 1.0f : 0.0f);
             acc[26] = ((diag_1 + 24 == 2) ? 1.0f : 0.0f);
             acc[27] = ((diag_1 + 24 == 3) ? 1.0f : 0.0f);
-            acc[28] = ((diag_1 + 24 == 16) ? 1.0f : 0.0f);
-            acc[29] = ((diag_1 + 24 == 17) ? 1.0f : 0.0f);
-            acc[30] = ((diag_1 + 24 == 18) ? 1.0f : 0.0f);
-            acc[31] = ((diag_1 + 24 == 19) ? 1.0f : 0.0f);
+            acc[28] = ((diag_1 + 28 == 0) ? 1.0f : 0.0f);
+            acc[29] = ((diag_1 + 28 == 1) ? 1.0f : 0.0f);
+            acc[30] = ((diag_1 + 28 == 2) ? 1.0f : 0.0f);
+            acc[31] = ((diag_1 + 28 == 3) ? 1.0f : 0.0f);
         }
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 64), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 576), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 1152), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 1216), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 1728), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 2304), "r"(__float_as_uint(acc[16])), "r"(__float_as_uint(acc[17])), "r"(__float_as_uint(acc[18])), "r"(__float_as_uint(acc[19])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 2368), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 2880), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 3456), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 3520), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + 4032), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
         if (e_begin < e_end) {
             if (write_states != 0) {
                 long long y_first_1 = elem_y[e_begin];
@@ -1092,7 +1096,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 16) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 512) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
@@ -1100,7 +1104,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     }
                     {
                         float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1040) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 1536) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
@@ -1108,7 +1112,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     }
                     {
                         float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 2064) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 2560) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
@@ -1116,7 +1120,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                     }
                     {
                         float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 3088) = _v4;
+                        *reinterpret_cast<float4*>(y + y_first_1 + g_off_1 + 3584) = _v4;
                     }
                 }
             }
@@ -1129,7 +1133,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 16) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 512) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
@@ -1137,7 +1141,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1040) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 1536) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
@@ -1145,7 +1149,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 2064) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 2560) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
@@ -1153,7 +1157,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 3088) = _v4;
+                    *reinterpret_cast<float4*>(y + y_last_1 + g_off_1 + 3584) = _v4;
                 }
             }
         }
@@ -1265,7 +1269,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                             cn[0 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 16);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 512);
                             cn[4 + 0] = _v4.x;
                             cn[4 + 1] = _v4.y;
                             cn[4 + 2] = _v4.z;
@@ -1279,7 +1283,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                             cn[8 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1040);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 1536);
                             cn[12 + 0] = _v4.x;
                             cn[12 + 1] = _v4.y;
                             cn[12 + 2] = _v4.z;
@@ -1293,7 +1297,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                             cn[16 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 2064);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 2560);
                             cn[20 + 0] = _v4.x;
                             cn[20 + 1] = _v4.y;
                             cn[20 + 2] = _v4.z;
@@ -1307,7 +1311,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                             cn[24 + 3] = _v4.w;
                         }
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 3088);
+                            float4 _v4 = *reinterpret_cast<const float4*>(c + c_next_1 + g_off_1 + 3584);
                             cn[28 + 0] = _v4.x;
                             cn[28 + 1] = _v4.y;
                             cn[28 + 2] = _v4.z;
@@ -1355,459 +1359,475 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                         : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&mv[4])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(4) + 3]))
-                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 1152));
+                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 576));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&mv[8])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(8) + 3]))
-                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 2304));
+                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 1152));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&mv[12])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(12) + 3]))
+                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 1728));
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&mv[16])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(16) + 3]))
+                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 2304));
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&mv[20])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(20) + 3]))
+                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 2880));
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&mv[24])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(24) + 3]))
                         : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 3456));
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&mv[28])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mv[(28) + 3]))
+                        : "r"(m_rd_1 + (unsigned int)(ch_1 % 4 * 4608) + (unsigned int)(q * 16) + 4032));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
-                        : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 64));
 #if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[0], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[0], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[0], xv[2], acc[2]);
                     acc[3] = __fmaf_rn(mv[0], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[0], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[0], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[0], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[0], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[4], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[4], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[4], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[4], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[4], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[4], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[4], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[4], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[8], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[8], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[8], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[8], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[8], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[8], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[8], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[8], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[12], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[12], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[12], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[12], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[12], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[12], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[12], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[12], xv[7], acc[31]);
+                    acc[4] = __fmaf_rn(mv[4], xv[0], acc[4]);
+                    acc[5] = __fmaf_rn(mv[4], xv[1], acc[5]);
+                    acc[6] = __fmaf_rn(mv[4], xv[2], acc[6]);
+                    acc[7] = __fmaf_rn(mv[4], xv[3], acc[7]);
+                    acc[8] = __fmaf_rn(mv[8], xv[0], acc[8]);
+                    acc[9] = __fmaf_rn(mv[8], xv[1], acc[9]);
+                    acc[10] = __fmaf_rn(mv[8], xv[2], acc[10]);
+                    acc[11] = __fmaf_rn(mv[8], xv[3], acc[11]);
+                    acc[12] = __fmaf_rn(mv[12], xv[0], acc[12]);
+                    acc[13] = __fmaf_rn(mv[12], xv[1], acc[13]);
+                    acc[14] = __fmaf_rn(mv[12], xv[2], acc[14]);
+                    acc[15] = __fmaf_rn(mv[12], xv[3], acc[15]);
+                    acc[16] = __fmaf_rn(mv[16], xv[0], acc[16]);
+                    acc[17] = __fmaf_rn(mv[16], xv[1], acc[17]);
+                    acc[18] = __fmaf_rn(mv[16], xv[2], acc[18]);
+                    acc[19] = __fmaf_rn(mv[16], xv[3], acc[19]);
+                    acc[20] = __fmaf_rn(mv[20], xv[0], acc[20]);
+                    acc[21] = __fmaf_rn(mv[20], xv[1], acc[21]);
+                    acc[22] = __fmaf_rn(mv[20], xv[2], acc[22]);
+                    acc[23] = __fmaf_rn(mv[20], xv[3], acc[23]);
+                    acc[24] = __fmaf_rn(mv[24], xv[0], acc[24]);
+                    acc[25] = __fmaf_rn(mv[24], xv[1], acc[25]);
+                    acc[26] = __fmaf_rn(mv[24], xv[2], acc[26]);
+                    acc[27] = __fmaf_rn(mv[24], xv[3], acc[27]);
+                    acc[28] = __fmaf_rn(mv[28], xv[0], acc[28]);
+                    acc[29] = __fmaf_rn(mv[28], xv[1], acc[29]);
+                    acc[30] = __fmaf_rn(mv[28], xv[2], acc[30]);
+                    acc[31] = __fmaf_rn(mv[28], xv[3], acc[31]);
 #else
-                    float2 m2_4 = make_float2(mv[0], mv[0]);
+                    float2 m2_8 = make_float2(mv[0], mv[0]);
                     float2 a2_16 = make_float2(acc[0], acc[1]);
-                    a2_16 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[0], xv[1]), a2_16);
+                    a2_16 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[0], xv[1]), a2_16);
                     acc[0] = a2_16.x;
                     acc[1] = a2_16.y;
                     float2 a2_17 = make_float2(acc[2], acc[3]);
-                    a2_17 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[2], xv[3]), a2_17);
+                    a2_17 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[2], xv[3]), a2_17);
                     acc[2] = a2_17.x;
                     acc[3] = a2_17.y;
+                    float2 m2_9 = make_float2(mv[4], mv[4]);
                     float2 a2_18 = make_float2(acc[4], acc[5]);
-                    a2_18 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[4], xv[5]), a2_18);
+                    a2_18 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[0], xv[1]), a2_18);
                     acc[4] = a2_18.x;
                     acc[5] = a2_18.y;
                     float2 a2_19 = make_float2(acc[6], acc[7]);
-                    a2_19 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[6], xv[7]), a2_19);
+                    a2_19 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[2], xv[3]), a2_19);
                     acc[6] = a2_19.x;
                     acc[7] = a2_19.y;
-                    float2 m2_5 = make_float2(mv[4], mv[4]);
+                    float2 m2_10 = make_float2(mv[8], mv[8]);
                     float2 a2_20 = make_float2(acc[8], acc[9]);
-                    a2_20 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[0], xv[1]), a2_20);
+                    a2_20 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[0], xv[1]), a2_20);
                     acc[8] = a2_20.x;
                     acc[9] = a2_20.y;
                     float2 a2_21 = make_float2(acc[10], acc[11]);
-                    a2_21 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[2], xv[3]), a2_21);
+                    a2_21 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[2], xv[3]), a2_21);
                     acc[10] = a2_21.x;
                     acc[11] = a2_21.y;
+                    float2 m2_11 = make_float2(mv[12], mv[12]);
                     float2 a2_22 = make_float2(acc[12], acc[13]);
-                    a2_22 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[4], xv[5]), a2_22);
+                    a2_22 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[0], xv[1]), a2_22);
                     acc[12] = a2_22.x;
                     acc[13] = a2_22.y;
                     float2 a2_23 = make_float2(acc[14], acc[15]);
-                    a2_23 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[6], xv[7]), a2_23);
+                    a2_23 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[2], xv[3]), a2_23);
                     acc[14] = a2_23.x;
                     acc[15] = a2_23.y;
-                    float2 m2_6 = make_float2(mv[8], mv[8]);
+                    float2 m2_12 = make_float2(mv[16], mv[16]);
                     float2 a2_24 = make_float2(acc[16], acc[17]);
-                    a2_24 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[0], xv[1]), a2_24);
+                    a2_24 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[0], xv[1]), a2_24);
                     acc[16] = a2_24.x;
                     acc[17] = a2_24.y;
                     float2 a2_25 = make_float2(acc[18], acc[19]);
-                    a2_25 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[2], xv[3]), a2_25);
+                    a2_25 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[2], xv[3]), a2_25);
                     acc[18] = a2_25.x;
                     acc[19] = a2_25.y;
+                    float2 m2_13 = make_float2(mv[20], mv[20]);
                     float2 a2_26 = make_float2(acc[20], acc[21]);
-                    a2_26 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[4], xv[5]), a2_26);
+                    a2_26 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[0], xv[1]), a2_26);
                     acc[20] = a2_26.x;
                     acc[21] = a2_26.y;
                     float2 a2_27 = make_float2(acc[22], acc[23]);
-                    a2_27 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[6], xv[7]), a2_27);
+                    a2_27 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[2], xv[3]), a2_27);
                     acc[22] = a2_27.x;
                     acc[23] = a2_27.y;
-                    float2 m2_7 = make_float2(mv[12], mv[12]);
+                    float2 m2_14 = make_float2(mv[24], mv[24]);
                     float2 a2_28 = make_float2(acc[24], acc[25]);
-                    a2_28 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[0], xv[1]), a2_28);
+                    a2_28 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[0], xv[1]), a2_28);
                     acc[24] = a2_28.x;
                     acc[25] = a2_28.y;
                     float2 a2_29 = make_float2(acc[26], acc[27]);
-                    a2_29 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[2], xv[3]), a2_29);
+                    a2_29 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[2], xv[3]), a2_29);
                     acc[26] = a2_29.x;
                     acc[27] = a2_29.y;
+                    float2 m2_15 = make_float2(mv[28], mv[28]);
                     float2 a2_30 = make_float2(acc[28], acc[29]);
-                    a2_30 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[4], xv[5]), a2_30);
+                    a2_30 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[0], xv[1]), a2_30);
                     acc[28] = a2_30.x;
                     acc[29] = a2_30.y;
                     float2 a2_31 = make_float2(acc[30], acc[31]);
-                    a2_31 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[6], xv[7]), a2_31);
+                    a2_31 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[2], xv[3]), a2_31);
                     acc[30] = a2_31.x;
                     acc[31] = a2_31.y;
 #endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 144));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
-                        : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 208));
 #if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[1], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[1], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[1], xv[2], acc[2]);
                     acc[3] = __fmaf_rn(mv[1], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[1], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[1], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[1], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[1], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[5], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[5], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[5], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[5], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[5], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[5], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[5], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[5], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[9], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[9], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[9], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[9], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[9], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[9], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[9], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[9], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[13], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[13], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[13], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[13], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[13], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[13], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[13], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[13], xv[7], acc[31]);
+                    acc[4] = __fmaf_rn(mv[5], xv[0], acc[4]);
+                    acc[5] = __fmaf_rn(mv[5], xv[1], acc[5]);
+                    acc[6] = __fmaf_rn(mv[5], xv[2], acc[6]);
+                    acc[7] = __fmaf_rn(mv[5], xv[3], acc[7]);
+                    acc[8] = __fmaf_rn(mv[9], xv[0], acc[8]);
+                    acc[9] = __fmaf_rn(mv[9], xv[1], acc[9]);
+                    acc[10] = __fmaf_rn(mv[9], xv[2], acc[10]);
+                    acc[11] = __fmaf_rn(mv[9], xv[3], acc[11]);
+                    acc[12] = __fmaf_rn(mv[13], xv[0], acc[12]);
+                    acc[13] = __fmaf_rn(mv[13], xv[1], acc[13]);
+                    acc[14] = __fmaf_rn(mv[13], xv[2], acc[14]);
+                    acc[15] = __fmaf_rn(mv[13], xv[3], acc[15]);
+                    acc[16] = __fmaf_rn(mv[17], xv[0], acc[16]);
+                    acc[17] = __fmaf_rn(mv[17], xv[1], acc[17]);
+                    acc[18] = __fmaf_rn(mv[17], xv[2], acc[18]);
+                    acc[19] = __fmaf_rn(mv[17], xv[3], acc[19]);
+                    acc[20] = __fmaf_rn(mv[21], xv[0], acc[20]);
+                    acc[21] = __fmaf_rn(mv[21], xv[1], acc[21]);
+                    acc[22] = __fmaf_rn(mv[21], xv[2], acc[22]);
+                    acc[23] = __fmaf_rn(mv[21], xv[3], acc[23]);
+                    acc[24] = __fmaf_rn(mv[25], xv[0], acc[24]);
+                    acc[25] = __fmaf_rn(mv[25], xv[1], acc[25]);
+                    acc[26] = __fmaf_rn(mv[25], xv[2], acc[26]);
+                    acc[27] = __fmaf_rn(mv[25], xv[3], acc[27]);
+                    acc[28] = __fmaf_rn(mv[29], xv[0], acc[28]);
+                    acc[29] = __fmaf_rn(mv[29], xv[1], acc[29]);
+                    acc[30] = __fmaf_rn(mv[29], xv[2], acc[30]);
+                    acc[31] = __fmaf_rn(mv[29], xv[3], acc[31]);
 #else
-                    float2 m2_8 = make_float2(mv[1], mv[1]);
+                    float2 m2_16 = make_float2(mv[1], mv[1]);
                     float2 a2_32 = make_float2(acc[0], acc[1]);
-                    a2_32 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[0], xv[1]), a2_32);
+                    a2_32 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[0], xv[1]), a2_32);
                     acc[0] = a2_32.x;
                     acc[1] = a2_32.y;
                     float2 a2_33 = make_float2(acc[2], acc[3]);
-                    a2_33 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[2], xv[3]), a2_33);
+                    a2_33 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[2], xv[3]), a2_33);
                     acc[2] = a2_33.x;
                     acc[3] = a2_33.y;
+                    float2 m2_17 = make_float2(mv[5], mv[5]);
                     float2 a2_34 = make_float2(acc[4], acc[5]);
-                    a2_34 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[4], xv[5]), a2_34);
+                    a2_34 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[0], xv[1]), a2_34);
                     acc[4] = a2_34.x;
                     acc[5] = a2_34.y;
                     float2 a2_35 = make_float2(acc[6], acc[7]);
-                    a2_35 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[6], xv[7]), a2_35);
+                    a2_35 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[2], xv[3]), a2_35);
                     acc[6] = a2_35.x;
                     acc[7] = a2_35.y;
-                    float2 m2_9 = make_float2(mv[5], mv[5]);
+                    float2 m2_18 = make_float2(mv[9], mv[9]);
                     float2 a2_36 = make_float2(acc[8], acc[9]);
-                    a2_36 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[0], xv[1]), a2_36);
+                    a2_36 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[0], xv[1]), a2_36);
                     acc[8] = a2_36.x;
                     acc[9] = a2_36.y;
                     float2 a2_37 = make_float2(acc[10], acc[11]);
-                    a2_37 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[2], xv[3]), a2_37);
+                    a2_37 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[2], xv[3]), a2_37);
                     acc[10] = a2_37.x;
                     acc[11] = a2_37.y;
+                    float2 m2_19 = make_float2(mv[13], mv[13]);
                     float2 a2_38 = make_float2(acc[12], acc[13]);
-                    a2_38 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[4], xv[5]), a2_38);
+                    a2_38 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[0], xv[1]), a2_38);
                     acc[12] = a2_38.x;
                     acc[13] = a2_38.y;
                     float2 a2_39 = make_float2(acc[14], acc[15]);
-                    a2_39 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[6], xv[7]), a2_39);
+                    a2_39 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[2], xv[3]), a2_39);
                     acc[14] = a2_39.x;
                     acc[15] = a2_39.y;
-                    float2 m2_10 = make_float2(mv[9], mv[9]);
+                    float2 m2_20 = make_float2(mv[17], mv[17]);
                     float2 a2_40 = make_float2(acc[16], acc[17]);
-                    a2_40 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[0], xv[1]), a2_40);
+                    a2_40 = fma_f32x2_rn_ftz(m2_20, make_float2(xv[0], xv[1]), a2_40);
                     acc[16] = a2_40.x;
                     acc[17] = a2_40.y;
                     float2 a2_41 = make_float2(acc[18], acc[19]);
-                    a2_41 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[2], xv[3]), a2_41);
+                    a2_41 = fma_f32x2_rn_ftz(m2_20, make_float2(xv[2], xv[3]), a2_41);
                     acc[18] = a2_41.x;
                     acc[19] = a2_41.y;
+                    float2 m2_21 = make_float2(mv[21], mv[21]);
                     float2 a2_42 = make_float2(acc[20], acc[21]);
-                    a2_42 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[4], xv[5]), a2_42);
+                    a2_42 = fma_f32x2_rn_ftz(m2_21, make_float2(xv[0], xv[1]), a2_42);
                     acc[20] = a2_42.x;
                     acc[21] = a2_42.y;
                     float2 a2_43 = make_float2(acc[22], acc[23]);
-                    a2_43 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[6], xv[7]), a2_43);
+                    a2_43 = fma_f32x2_rn_ftz(m2_21, make_float2(xv[2], xv[3]), a2_43);
                     acc[22] = a2_43.x;
                     acc[23] = a2_43.y;
-                    float2 m2_11 = make_float2(mv[13], mv[13]);
+                    float2 m2_22 = make_float2(mv[25], mv[25]);
                     float2 a2_44 = make_float2(acc[24], acc[25]);
-                    a2_44 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[0], xv[1]), a2_44);
+                    a2_44 = fma_f32x2_rn_ftz(m2_22, make_float2(xv[0], xv[1]), a2_44);
                     acc[24] = a2_44.x;
                     acc[25] = a2_44.y;
                     float2 a2_45 = make_float2(acc[26], acc[27]);
-                    a2_45 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[2], xv[3]), a2_45);
+                    a2_45 = fma_f32x2_rn_ftz(m2_22, make_float2(xv[2], xv[3]), a2_45);
                     acc[26] = a2_45.x;
                     acc[27] = a2_45.y;
+                    float2 m2_23 = make_float2(mv[29], mv[29]);
                     float2 a2_46 = make_float2(acc[28], acc[29]);
-                    a2_46 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[4], xv[5]), a2_46);
+                    a2_46 = fma_f32x2_rn_ftz(m2_23, make_float2(xv[0], xv[1]), a2_46);
                     acc[28] = a2_46.x;
                     acc[29] = a2_46.y;
                     float2 a2_47 = make_float2(acc[30], acc[31]);
-                    a2_47 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[6], xv[7]), a2_47);
+                    a2_47 = fma_f32x2_rn_ftz(m2_23, make_float2(xv[2], xv[3]), a2_47);
                     acc[30] = a2_47.x;
                     acc[31] = a2_47.y;
 #endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 288));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
-                        : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 352));
 #if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[2], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[2], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[2], xv[2], acc[2]);
                     acc[3] = __fmaf_rn(mv[2], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[2], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[2], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[2], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[2], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[6], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[6], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[6], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[6], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[6], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[6], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[6], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[6], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[10], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[10], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[10], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[10], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[10], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[10], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[10], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[10], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[14], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[14], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[14], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[14], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[14], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[14], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[14], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[14], xv[7], acc[31]);
+                    acc[4] = __fmaf_rn(mv[6], xv[0], acc[4]);
+                    acc[5] = __fmaf_rn(mv[6], xv[1], acc[5]);
+                    acc[6] = __fmaf_rn(mv[6], xv[2], acc[6]);
+                    acc[7] = __fmaf_rn(mv[6], xv[3], acc[7]);
+                    acc[8] = __fmaf_rn(mv[10], xv[0], acc[8]);
+                    acc[9] = __fmaf_rn(mv[10], xv[1], acc[9]);
+                    acc[10] = __fmaf_rn(mv[10], xv[2], acc[10]);
+                    acc[11] = __fmaf_rn(mv[10], xv[3], acc[11]);
+                    acc[12] = __fmaf_rn(mv[14], xv[0], acc[12]);
+                    acc[13] = __fmaf_rn(mv[14], xv[1], acc[13]);
+                    acc[14] = __fmaf_rn(mv[14], xv[2], acc[14]);
+                    acc[15] = __fmaf_rn(mv[14], xv[3], acc[15]);
+                    acc[16] = __fmaf_rn(mv[18], xv[0], acc[16]);
+                    acc[17] = __fmaf_rn(mv[18], xv[1], acc[17]);
+                    acc[18] = __fmaf_rn(mv[18], xv[2], acc[18]);
+                    acc[19] = __fmaf_rn(mv[18], xv[3], acc[19]);
+                    acc[20] = __fmaf_rn(mv[22], xv[0], acc[20]);
+                    acc[21] = __fmaf_rn(mv[22], xv[1], acc[21]);
+                    acc[22] = __fmaf_rn(mv[22], xv[2], acc[22]);
+                    acc[23] = __fmaf_rn(mv[22], xv[3], acc[23]);
+                    acc[24] = __fmaf_rn(mv[26], xv[0], acc[24]);
+                    acc[25] = __fmaf_rn(mv[26], xv[1], acc[25]);
+                    acc[26] = __fmaf_rn(mv[26], xv[2], acc[26]);
+                    acc[27] = __fmaf_rn(mv[26], xv[3], acc[27]);
+                    acc[28] = __fmaf_rn(mv[30], xv[0], acc[28]);
+                    acc[29] = __fmaf_rn(mv[30], xv[1], acc[29]);
+                    acc[30] = __fmaf_rn(mv[30], xv[2], acc[30]);
+                    acc[31] = __fmaf_rn(mv[30], xv[3], acc[31]);
 #else
-                    float2 m2_12 = make_float2(mv[2], mv[2]);
+                    float2 m2_24 = make_float2(mv[2], mv[2]);
                     float2 a2_48 = make_float2(acc[0], acc[1]);
-                    a2_48 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[0], xv[1]), a2_48);
+                    a2_48 = fma_f32x2_rn_ftz(m2_24, make_float2(xv[0], xv[1]), a2_48);
                     acc[0] = a2_48.x;
                     acc[1] = a2_48.y;
                     float2 a2_49 = make_float2(acc[2], acc[3]);
-                    a2_49 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[2], xv[3]), a2_49);
+                    a2_49 = fma_f32x2_rn_ftz(m2_24, make_float2(xv[2], xv[3]), a2_49);
                     acc[2] = a2_49.x;
                     acc[3] = a2_49.y;
+                    float2 m2_25 = make_float2(mv[6], mv[6]);
                     float2 a2_50 = make_float2(acc[4], acc[5]);
-                    a2_50 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[4], xv[5]), a2_50);
+                    a2_50 = fma_f32x2_rn_ftz(m2_25, make_float2(xv[0], xv[1]), a2_50);
                     acc[4] = a2_50.x;
                     acc[5] = a2_50.y;
                     float2 a2_51 = make_float2(acc[6], acc[7]);
-                    a2_51 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[6], xv[7]), a2_51);
+                    a2_51 = fma_f32x2_rn_ftz(m2_25, make_float2(xv[2], xv[3]), a2_51);
                     acc[6] = a2_51.x;
                     acc[7] = a2_51.y;
-                    float2 m2_13 = make_float2(mv[6], mv[6]);
+                    float2 m2_26 = make_float2(mv[10], mv[10]);
                     float2 a2_52 = make_float2(acc[8], acc[9]);
-                    a2_52 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[0], xv[1]), a2_52);
+                    a2_52 = fma_f32x2_rn_ftz(m2_26, make_float2(xv[0], xv[1]), a2_52);
                     acc[8] = a2_52.x;
                     acc[9] = a2_52.y;
                     float2 a2_53 = make_float2(acc[10], acc[11]);
-                    a2_53 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[2], xv[3]), a2_53);
+                    a2_53 = fma_f32x2_rn_ftz(m2_26, make_float2(xv[2], xv[3]), a2_53);
                     acc[10] = a2_53.x;
                     acc[11] = a2_53.y;
+                    float2 m2_27 = make_float2(mv[14], mv[14]);
                     float2 a2_54 = make_float2(acc[12], acc[13]);
-                    a2_54 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[4], xv[5]), a2_54);
+                    a2_54 = fma_f32x2_rn_ftz(m2_27, make_float2(xv[0], xv[1]), a2_54);
                     acc[12] = a2_54.x;
                     acc[13] = a2_54.y;
                     float2 a2_55 = make_float2(acc[14], acc[15]);
-                    a2_55 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[6], xv[7]), a2_55);
+                    a2_55 = fma_f32x2_rn_ftz(m2_27, make_float2(xv[2], xv[3]), a2_55);
                     acc[14] = a2_55.x;
                     acc[15] = a2_55.y;
-                    float2 m2_14 = make_float2(mv[10], mv[10]);
+                    float2 m2_28 = make_float2(mv[18], mv[18]);
                     float2 a2_56 = make_float2(acc[16], acc[17]);
-                    a2_56 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[0], xv[1]), a2_56);
+                    a2_56 = fma_f32x2_rn_ftz(m2_28, make_float2(xv[0], xv[1]), a2_56);
                     acc[16] = a2_56.x;
                     acc[17] = a2_56.y;
                     float2 a2_57 = make_float2(acc[18], acc[19]);
-                    a2_57 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[2], xv[3]), a2_57);
+                    a2_57 = fma_f32x2_rn_ftz(m2_28, make_float2(xv[2], xv[3]), a2_57);
                     acc[18] = a2_57.x;
                     acc[19] = a2_57.y;
+                    float2 m2_29 = make_float2(mv[22], mv[22]);
                     float2 a2_58 = make_float2(acc[20], acc[21]);
-                    a2_58 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[4], xv[5]), a2_58);
+                    a2_58 = fma_f32x2_rn_ftz(m2_29, make_float2(xv[0], xv[1]), a2_58);
                     acc[20] = a2_58.x;
                     acc[21] = a2_58.y;
                     float2 a2_59 = make_float2(acc[22], acc[23]);
-                    a2_59 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[6], xv[7]), a2_59);
+                    a2_59 = fma_f32x2_rn_ftz(m2_29, make_float2(xv[2], xv[3]), a2_59);
                     acc[22] = a2_59.x;
                     acc[23] = a2_59.y;
-                    float2 m2_15 = make_float2(mv[14], mv[14]);
+                    float2 m2_30 = make_float2(mv[26], mv[26]);
                     float2 a2_60 = make_float2(acc[24], acc[25]);
-                    a2_60 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[0], xv[1]), a2_60);
+                    a2_60 = fma_f32x2_rn_ftz(m2_30, make_float2(xv[0], xv[1]), a2_60);
                     acc[24] = a2_60.x;
                     acc[25] = a2_60.y;
                     float2 a2_61 = make_float2(acc[26], acc[27]);
-                    a2_61 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[2], xv[3]), a2_61);
+                    a2_61 = fma_f32x2_rn_ftz(m2_30, make_float2(xv[2], xv[3]), a2_61);
                     acc[26] = a2_61.x;
                     acc[27] = a2_61.y;
+                    float2 m2_31 = make_float2(mv[30], mv[30]);
                     float2 a2_62 = make_float2(acc[28], acc[29]);
-                    a2_62 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[4], xv[5]), a2_62);
+                    a2_62 = fma_f32x2_rn_ftz(m2_31, make_float2(xv[0], xv[1]), a2_62);
                     acc[28] = a2_62.x;
                     acc[29] = a2_62.y;
                     float2 a2_63 = make_float2(acc[30], acc[31]);
-                    a2_63 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[6], xv[7]), a2_63);
+                    a2_63 = fma_f32x2_rn_ftz(m2_31, make_float2(xv[2], xv[3]), a2_63);
                     acc[30] = a2_63.x;
                     acc[31] = a2_63.y;
 #endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 432));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
-                        : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 4608) + (unsigned int)(q * 576) + 496));
 #if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[3], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[3], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[3], xv[2], acc[2]);
                     acc[3] = __fmaf_rn(mv[3], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[3], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[3], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[3], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[3], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[7], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[7], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[7], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[7], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[7], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[7], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[7], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[7], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[11], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[11], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[11], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[11], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[11], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[11], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[11], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[11], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[15], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[15], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[15], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[15], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[15], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[15], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[15], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[15], xv[7], acc[31]);
+                    acc[4] = __fmaf_rn(mv[7], xv[0], acc[4]);
+                    acc[5] = __fmaf_rn(mv[7], xv[1], acc[5]);
+                    acc[6] = __fmaf_rn(mv[7], xv[2], acc[6]);
+                    acc[7] = __fmaf_rn(mv[7], xv[3], acc[7]);
+                    acc[8] = __fmaf_rn(mv[11], xv[0], acc[8]);
+                    acc[9] = __fmaf_rn(mv[11], xv[1], acc[9]);
+                    acc[10] = __fmaf_rn(mv[11], xv[2], acc[10]);
+                    acc[11] = __fmaf_rn(mv[11], xv[3], acc[11]);
+                    acc[12] = __fmaf_rn(mv[15], xv[0], acc[12]);
+                    acc[13] = __fmaf_rn(mv[15], xv[1], acc[13]);
+                    acc[14] = __fmaf_rn(mv[15], xv[2], acc[14]);
+                    acc[15] = __fmaf_rn(mv[15], xv[3], acc[15]);
+                    acc[16] = __fmaf_rn(mv[19], xv[0], acc[16]);
+                    acc[17] = __fmaf_rn(mv[19], xv[1], acc[17]);
+                    acc[18] = __fmaf_rn(mv[19], xv[2], acc[18]);
+                    acc[19] = __fmaf_rn(mv[19], xv[3], acc[19]);
+                    acc[20] = __fmaf_rn(mv[23], xv[0], acc[20]);
+                    acc[21] = __fmaf_rn(mv[23], xv[1], acc[21]);
+                    acc[22] = __fmaf_rn(mv[23], xv[2], acc[22]);
+                    acc[23] = __fmaf_rn(mv[23], xv[3], acc[23]);
+                    acc[24] = __fmaf_rn(mv[27], xv[0], acc[24]);
+                    acc[25] = __fmaf_rn(mv[27], xv[1], acc[25]);
+                    acc[26] = __fmaf_rn(mv[27], xv[2], acc[26]);
+                    acc[27] = __fmaf_rn(mv[27], xv[3], acc[27]);
+                    acc[28] = __fmaf_rn(mv[31], xv[0], acc[28]);
+                    acc[29] = __fmaf_rn(mv[31], xv[1], acc[29]);
+                    acc[30] = __fmaf_rn(mv[31], xv[2], acc[30]);
+                    acc[31] = __fmaf_rn(mv[31], xv[3], acc[31]);
 #else
-                    float2 m2_16 = make_float2(mv[3], mv[3]);
+                    float2 m2_32 = make_float2(mv[3], mv[3]);
                     float2 a2_64 = make_float2(acc[0], acc[1]);
-                    a2_64 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[0], xv[1]), a2_64);
+                    a2_64 = fma_f32x2_rn_ftz(m2_32, make_float2(xv[0], xv[1]), a2_64);
                     acc[0] = a2_64.x;
                     acc[1] = a2_64.y;
                     float2 a2_65 = make_float2(acc[2], acc[3]);
-                    a2_65 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[2], xv[3]), a2_65);
+                    a2_65 = fma_f32x2_rn_ftz(m2_32, make_float2(xv[2], xv[3]), a2_65);
                     acc[2] = a2_65.x;
                     acc[3] = a2_65.y;
+                    float2 m2_33 = make_float2(mv[7], mv[7]);
                     float2 a2_66 = make_float2(acc[4], acc[5]);
-                    a2_66 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[4], xv[5]), a2_66);
+                    a2_66 = fma_f32x2_rn_ftz(m2_33, make_float2(xv[0], xv[1]), a2_66);
                     acc[4] = a2_66.x;
                     acc[5] = a2_66.y;
                     float2 a2_67 = make_float2(acc[6], acc[7]);
-                    a2_67 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[6], xv[7]), a2_67);
+                    a2_67 = fma_f32x2_rn_ftz(m2_33, make_float2(xv[2], xv[3]), a2_67);
                     acc[6] = a2_67.x;
                     acc[7] = a2_67.y;
-                    float2 m2_17 = make_float2(mv[7], mv[7]);
+                    float2 m2_34 = make_float2(mv[11], mv[11]);
                     float2 a2_68 = make_float2(acc[8], acc[9]);
-                    a2_68 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[0], xv[1]), a2_68);
+                    a2_68 = fma_f32x2_rn_ftz(m2_34, make_float2(xv[0], xv[1]), a2_68);
                     acc[8] = a2_68.x;
                     acc[9] = a2_68.y;
                     float2 a2_69 = make_float2(acc[10], acc[11]);
-                    a2_69 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[2], xv[3]), a2_69);
+                    a2_69 = fma_f32x2_rn_ftz(m2_34, make_float2(xv[2], xv[3]), a2_69);
                     acc[10] = a2_69.x;
                     acc[11] = a2_69.y;
+                    float2 m2_35 = make_float2(mv[15], mv[15]);
                     float2 a2_70 = make_float2(acc[12], acc[13]);
-                    a2_70 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[4], xv[5]), a2_70);
+                    a2_70 = fma_f32x2_rn_ftz(m2_35, make_float2(xv[0], xv[1]), a2_70);
                     acc[12] = a2_70.x;
                     acc[13] = a2_70.y;
                     float2 a2_71 = make_float2(acc[14], acc[15]);
-                    a2_71 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[6], xv[7]), a2_71);
+                    a2_71 = fma_f32x2_rn_ftz(m2_35, make_float2(xv[2], xv[3]), a2_71);
                     acc[14] = a2_71.x;
                     acc[15] = a2_71.y;
-                    float2 m2_18 = make_float2(mv[11], mv[11]);
+                    float2 m2_36 = make_float2(mv[19], mv[19]);
                     float2 a2_72 = make_float2(acc[16], acc[17]);
-                    a2_72 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[0], xv[1]), a2_72);
+                    a2_72 = fma_f32x2_rn_ftz(m2_36, make_float2(xv[0], xv[1]), a2_72);
                     acc[16] = a2_72.x;
                     acc[17] = a2_72.y;
                     float2 a2_73 = make_float2(acc[18], acc[19]);
-                    a2_73 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[2], xv[3]), a2_73);
+                    a2_73 = fma_f32x2_rn_ftz(m2_36, make_float2(xv[2], xv[3]), a2_73);
                     acc[18] = a2_73.x;
                     acc[19] = a2_73.y;
+                    float2 m2_37 = make_float2(mv[23], mv[23]);
                     float2 a2_74 = make_float2(acc[20], acc[21]);
-                    a2_74 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[4], xv[5]), a2_74);
+                    a2_74 = fma_f32x2_rn_ftz(m2_37, make_float2(xv[0], xv[1]), a2_74);
                     acc[20] = a2_74.x;
                     acc[21] = a2_74.y;
                     float2 a2_75 = make_float2(acc[22], acc[23]);
-                    a2_75 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[6], xv[7]), a2_75);
+                    a2_75 = fma_f32x2_rn_ftz(m2_37, make_float2(xv[2], xv[3]), a2_75);
                     acc[22] = a2_75.x;
                     acc[23] = a2_75.y;
-                    float2 m2_19 = make_float2(mv[15], mv[15]);
+                    float2 m2_38 = make_float2(mv[27], mv[27]);
                     float2 a2_76 = make_float2(acc[24], acc[25]);
-                    a2_76 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[0], xv[1]), a2_76);
+                    a2_76 = fma_f32x2_rn_ftz(m2_38, make_float2(xv[0], xv[1]), a2_76);
                     acc[24] = a2_76.x;
                     acc[25] = a2_76.y;
                     float2 a2_77 = make_float2(acc[26], acc[27]);
-                    a2_77 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[2], xv[3]), a2_77);
+                    a2_77 = fma_f32x2_rn_ftz(m2_38, make_float2(xv[2], xv[3]), a2_77);
                     acc[26] = a2_77.x;
                     acc[27] = a2_77.y;
+                    float2 m2_39 = make_float2(mv[31], mv[31]);
                     float2 a2_78 = make_float2(acc[28], acc[29]);
-                    a2_78 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[4], xv[5]), a2_78);
+                    a2_78 = fma_f32x2_rn_ftz(m2_39, make_float2(xv[0], xv[1]), a2_78);
                     acc[28] = a2_78.x;
                     acc[29] = a2_78.y;
                     float2 a2_79 = make_float2(acc[30], acc[31]);
-                    a2_79 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[6], xv[7]), a2_79);
+                    a2_79 = fma_f32x2_rn_ftz(m2_39, make_float2(xv[2], xv[3]), a2_79);
                     acc[30] = a2_79.x;
                     acc[31] = a2_79.y;
 #endif
                 }
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432)), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 64), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 576), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 1152), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 1216), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 1728), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 2304), "r"(__float_as_uint(acc[16])), "r"(__float_as_uint(acc[17])), "r"(__float_as_uint(acc[18])), "r"(__float_as_uint(acc[19])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 2368), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 2880), "r"(__float_as_uint(acc[20])), "r"(__float_as_uint(acc[21])), "r"(__float_as_uint(acc[22])), "r"(__float_as_uint(acc[23])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 3456), "r"(__float_as_uint(acc[24])), "r"(__float_as_uint(acc[25])), "r"(__float_as_uint(acc[26])), "r"(__float_as_uint(acc[27])) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 3520), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (18432 - buf_1 * 18432) + 4032), "r"(__float_as_uint(acc[28])), "r"(__float_as_uint(acc[29])), "r"(__float_as_uint(acc[30])), "r"(__float_as_uint(acc[31])) : "memory");
             if (y_pub_1 >= 0) {
                 {
                     float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
@@ -1815,7 +1835,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 16) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 512) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
@@ -1823,7 +1843,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1040) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 1536) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[16 + 0], acc[16 + 1], acc[16 + 2], acc[16 + 3]);
@@ -1831,7 +1851,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[20 + 0], acc[20 + 1], acc[20 + 2], acc[20 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 2064) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 2560) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(acc[24 + 0], acc[24 + 1], acc[24 + 2], acc[24 + 3]);
@@ -1839,7 +1859,7 @@ kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp(float* __restrict__ m, float*
                 }
                 {
                     float4 _v4 = make_float4(acc[28 + 0], acc[28 + 1], acc[28 + 2], acc[28 + 3]);
-                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 3088) = _v4;
+                    *reinterpret_cast<float4*>(y + y_pub_1 + g_off_1 + 3584) = _v4;
                 }
             }
             __syncthreads();
