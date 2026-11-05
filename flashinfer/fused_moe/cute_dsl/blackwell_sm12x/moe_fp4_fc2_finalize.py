@@ -23,14 +23,28 @@ from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from ....utils import ceil_div
-from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
-from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
+from ._moe_utils.heuristic import select_fp4_fc2_finalize_tile
+from ._moe_utils.moe_epilogue import (
+    EPI_CONFIGS,
+    EpiMethod,
+)
+from ._moe_utils.moe_kernel_builder import (
+    Sm12xGemmConfig,
+    dsl_targets_sm12x,
+    get_moe_worklist_grid_size,
+)
+from ._moe_utils.sm12x_blockscaled_layout import (
+    Sm120SfConfigNvfp4,
+    compute_padded_offset,
+)
 from .kernel_moe_fp4_fc2_finalize import (
     SCATTER_EPIS,
     CuteDslSm120MoeNvfp4Fc2Finalize,
+    CuteDslSm120MoeNvfp4Fc2FinalizeDecode,
+    is_swapab,
     make_args,
     make_cfg,
+    make_decode_cfg,
 )
 
 TILES = ((128, 128), (64, 128), (32, 128), (8, 128))
@@ -40,10 +54,18 @@ DEFAULT_EPI = EpiMethod.WG_SCATTER
 
 
 def resolve_stage(tile, epi: EpiMethod = DEFAULT_EPI):
+    if is_swapab(tile):
+        return 4
     stage = Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi), tuple(tile)
     )
     return 3 if tile[0] == 128 else stage
+
+
+def select_kernel(tile):
+    if is_swapab(tile):
+        return CuteDslSm120MoeNvfp4Fc2FinalizeDecode, make_decode_cfg
+    return CuteDslSm120MoeNvfp4Fc2Finalize, make_cfg
 
 
 class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
@@ -61,7 +83,8 @@ class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
         self.epi, self.enable_pdl = epi, enable_pdl
         self.ab_stage = resolve_stage(self.tile, epi)
         self.tactic = (self.tile[0], self.tile[1], epi)
-        self.cfg = make_cfg(self.tile, self.ab_stage, epi=epi, enable_pdl=enable_pdl)
+        _, cfg_factory = select_kernel(self.tile)
+        self.cfg = cfg_factory(self.tile, self.ab_stage, epi=epi, enable_pdl=enable_pdl)
 
     @classmethod
     def is_constructible(cls, tile, epi: EpiMethod = DEFAULT_EPI) -> bool:
@@ -70,8 +93,9 @@ class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
         if epi not in EPIS or not EPI_CONFIGS[epi].supports_tile(tile):
             return False
         try:
-            CuteDslSm120MoeNvfp4Fc2Finalize(
-                make_cfg(tuple(tile), resolve_stage(tuple(tile), epi), epi=epi), 1
+            kernel_type, cfg_factory = select_kernel(tuple(tile))
+            kernel_type(
+                cfg_factory(tuple(tile), resolve_stage(tuple(tile), epi), epi=epi), 1
             )
         except (AssertionError, ValueError, DSLUserCodeError):
             return False
@@ -84,14 +108,25 @@ class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
         t = tuple(tile)
         if t[:2] not in cls.TILES or t[2] != BK or epi not in EPIS:
             return False
-        if n <= 0 or k <= 0 or n % t[1] != 0 or k % t[2] != 0:
+        k_alignment = (
+            t[2]
+            if t[0] == 8
+            else Sm120SfConfigNvfp4.SF_VEC * Sm120SfConfigNvfp4.PACK_NSF
+        )
+        if n <= 0 or k <= 0 or n % t[1] != 0 or k % k_alignment != 0:
             return False
         return EPI_CONFIGS[epi].can_implement(
             t, n, cutlass.BFloat16.width
         ) and cls.is_constructible(t, epi)
 
     def build(self, grid_x: int):
-        return CuteDslSm120MoeNvfp4Fc2Finalize(self.cfg, grid_x)
+        kernel_type, _ = select_kernel(self.tile)
+        return kernel_type(self.cfg, grid_x)
+
+    def get_grid_size(self, total_rows: int, num_experts: int, num_sms: int):
+        if not is_swapab(self.tile):
+            return num_sms
+        return get_moe_worklist_grid_size(total_rows, num_experts, self.n, self.tile)
 
 
 TACTICS = tuple(
@@ -125,11 +160,27 @@ def compiled_kernel(
     return hit
 
 
-def select_tile(*, total_rows: int, n: int, num_experts: int, num_sms: int):
-    m_per_expert = total_rows // num_experts if num_experts > 0 else 0
-    if m_per_expert <= 32:
-        return (32, 128, BK)
-    return (128, 128, BK)
+def select_tile(*, total_rows: int, n: int, k: int, num_experts: int, num_sms: int):
+    return select_fp4_fc2_finalize_tile(
+        total_rows=total_rows, n=n, k=k, num_experts=num_experts, num_sms=num_sms
+    )
+
+
+def _prepare_worklist(op, inputs, out, offsets, worklist=None, workcount=None):
+    if not is_swapab(op.tile):
+        if worklist is not None or workcount is not None:
+            raise ValueError("worklist is supported only by standard-grid FC2 decode")
+        return None, None
+    from . import moe_fp4_q0_route_triton as route
+
+    return route.prepare_nvfp4_worklist(
+        offsets,
+        int(inputs[0].shape[0]),
+        op.tile[0],
+        worklist=worklist,
+        workcount=workcount,
+        tensors=(*inputs, out),
+    )
 
 
 def _validate_inputs(
@@ -185,6 +236,8 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
     enable_pdl: bool = False,
     *,
     out: torch.Tensor | None = None,
+    worklist: torch.Tensor | None = None,
+    workcount: torch.Tensor | None = None,
 ):
     n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
     assert not enable_pdl or out is not None, "PDL requires caller-owned out"
@@ -192,7 +245,7 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, alpha, num_tokens
     )
     props = torch.cuda.get_device_properties(a_q.device)
-    grid_x, sm_version = props.multi_processor_count, f"sm_{props.major}{props.minor}"
+    num_sms, sm_version = props.multi_processor_count, f"sm_{props.major}{props.minor}"
     if tile is None and tune is not False:
         chosen = None
         if MOE_AUTOTUNE_ENABLED():
@@ -221,10 +274,12 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         tile = select_tile(
             total_rows=int(a_q.shape[0]),
             n=n,
+            k=k,
             num_experts=int(b_q.shape[0]),
-            num_sms=grid_x,
+            num_sms=num_sms,
         )
     op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
+    grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
     if out is None:
         out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
     if (
@@ -234,6 +289,15 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         or not out.is_contiguous()
     ):
         raise ValueError("out does not match the FC2 output contract")
+    offsets = m_indptr.to(torch.int32)
+    worklist, workcount = _prepare_worklist(
+        op,
+        (a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, alpha),
+        out,
+        offsets,
+        worklist,
+        workcount,
+    )
     args = make_args(
         a_q,
         a_scale,
@@ -242,10 +306,12 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         out,
         src_token.to(torch.int32),
         pair_scales.to(torch.float32),
-        m_indptr.to(torch.int32),
+        offsets,
         alpha,
         op.cfg.epi,
         op.cfg.TILE,
+        worklist=worklist,
+        workcount=workcount,
     )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out
@@ -321,14 +387,15 @@ class _Fc2FinalizeRunner(TunableRunner):
         ) = inputs
         n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
         props = torch.cuda.get_device_properties(a_q.device)
-        grid_x = props.multi_processor_count
+        num_sms = props.multi_processor_count
         if tactic is None:
             tile, epi = (
                 select_tile(
                     total_rows=int(a_q.shape[0]),
                     n=n,
+                    k=k,
                     num_experts=int(b_q.shape[0]),
-                    num_sms=grid_x,
+                    num_sms=num_sms,
                 ),
                 DEFAULT_EPI,
             )
@@ -337,6 +404,9 @@ class _Fc2FinalizeRunner(TunableRunner):
         op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(
             n, k, tuple(tile), epi, self.enable_pdl
         )
+        grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
+        offsets = m_indptr.to(torch.int32)
+        worklist, workcount = _prepare_worklist(op, inputs[:8], out, offsets)
         args = make_args(
             a_q,
             a_scale,
@@ -345,10 +415,12 @@ class _Fc2FinalizeRunner(TunableRunner):
             out,
             src_token.to(torch.int32),
             pair_scales.to(torch.float32),
-            m_indptr.to(torch.int32),
+            offsets,
             alpha,
             op.cfg.epi,
             op.cfg.TILE,
+            worklist=worklist,
+            workcount=workcount,
         )
         sm_version = "sm_{}{}".format(props.major, props.minor)
         compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
