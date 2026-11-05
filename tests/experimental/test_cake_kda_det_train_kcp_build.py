@@ -462,7 +462,7 @@ def test_walk_form_rules_and_records() -> None:
     assert kcp_jit.FWDH_O_FORM_RULE == {
         "sm_100a": ((32, "split"), (None, "full")),
         "sm_103a": ((32, "split"), (None, "full")),
-        "sm_107a": "split",
+        "sm_107a": ((48, "fit"), (None, "full")),
     }
     assert set(kcp_jit.FWDH_O_FORM_RULE) == set(ARCHES)
     sms = 152
@@ -479,7 +479,9 @@ def test_walk_form_rules_and_records() -> None:
     assert kcp_jit.walk_form("kcp_fwdh_offset", [], 64, sms) == "full"
     assert kcp_jit.walk_form("kcp_fwdh_tape", [124, 124, 124], 64, sms) == "split"
     # the fused forward walk: the architecture's rule on every launch (one wave or several; on sm_100a / sm_103a the
-    # two-CTA record up to 32 heads, the full-width one above), the knob's form where given
+    # two-CTA record up to 32 heads, the full-width one above; on sm_107a the fit rule up to 48 heads, the full-width
+    # record above: the W4 list at 32 to 48 heads, 512 to 768 two-CTA CTAs on 304 slots, outlasts its longest chain),
+    # the knob's form where given
     w4 = [48, 48, 32, 32, 28, 28, 20, 20]
     by_heads = {
         1: "split",
@@ -489,15 +491,27 @@ def test_walk_form_rules_and_records() -> None:
         33: "full",
         64: "full",
     }
+    fit_by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "split",
+        48: "split",
+        49: "full",
+        64: "full",
+    }
     for arch in ARCHES:
-        for heads, form in by_heads.items():
-            if arch == "sm_107a":
-                form = "split"
-            for chains in (w4, [222, 222], [48]):
+        for chains in (w4, [222, 222], [48]):
+            for heads, form in (
+                fit_by_heads if arch == "sm_107a" else by_heads
+            ).items():
+                if arch == "sm_107a" and chains is w4 and heads in (32, 33, 48):
+                    form = "full"
                 assert (
                     kcp_jit.walk_form("kcp_fwdh_o", chains, heads, sms, arch=arch)
                     == form
-                )
+                ), (arch, chains, heads)
         assert (
             kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="full", arch=arch)
             == "full"

@@ -88,7 +88,8 @@ The tape programs' rule is ``split`` (their full-width records are test-only,
 under ``walk_form="full"``).  The fused forward walk's rule is per architecture
 (``cake_kcp_jit.FWDH_O_FORM_RULE``, from kernel A/B medians): on sm_100a and
 sm_103a the two-CTA form up to 32 value heads and the full-width form above,
-on sm_107a the two-CTA form.  The rule's inputs are static per ``(ctx, H)``, so
+on sm_107a the fit rule up to 48 value heads and the full-width form above.
+The rule's inputs are static per ``(ctx, H)``, so
 the form of each ``(program, walk list)`` is decided once per table set
 (``_Tables.walk_form``) and looked up on every later launch: the eager call
 carries no per-launch list scheduling.

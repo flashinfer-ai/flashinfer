@@ -207,15 +207,14 @@ WALK_FORMS = ("auto", "full", "split")
 #     -> the same bands: the faster record on 22 of these 26 rows (on the
 #     other four, w4 at H = 32, d4 at H = 48 and 40 and w2d at H = 40, the
 #     other record takes at most 5.5 % less time);
-#   sm_107a (an R200 board with 208 SMs; back to back; the kernel before its
-#     plain u loads), H = 64: w4 222.3 / 211.5 | z2 620.8 / 445.9 | c14 355.0
-#     / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (fewer heads not
-#     measured there; on sm_100a / sm_103a the two-CTA lead grows as the heads
-#     get fewer).
+#   sm_107a (an R200 board, 212 SMs; cold L2), the same lists at H = 64, 48,
+#     40, 32, 16, 8 and 4 -> the fit rule (:func:`walk_form`) up to 48 heads
+#     and the full-width record above: the faster record on 22 of these 26
+#     rows (on the other four the chosen record takes at most 8.8 % longer).
 FWDH_O_FORM_RULE: dict[str, Any] = {
     "sm_100a": ((32, "split"), (None, "full")),
     "sm_103a": ((32, "split"), (None, "full")),
-    "sm_107a": "split",
+    "sm_107a": ((48, "fit"), (None, "full")),
 }
 WALK_FORM_RULES: dict[str, Any] = {
     "kcp_fwdh_offset": "fit",
