@@ -1382,12 +1382,12 @@ ROUTER_RULES: dict[
     # SIMT program (router_forward_simt), timed on two nodes of each part at 1, 4, 5, 8, 9, 12, 16, 17, 32, 64, 96,
     # 97, 112, 128, 129, 160, 176 and 192 tokens: the 8 x 4 tile in the compensated form up to 8 tokens (16 on
     # sm_103a), on sm_100a the 8 x 16 tile from 9 to 16, the 16 x 32 FFMA tile from 17 to 96 and from 129 to 192 and
-    # the 16 x 64 FFMA tile from 97 to 128.  Hidden 4096 on sm_100a ends at 176 tokens: at 192 an earlier measurement
-    # was 3.1 and 3.4 % slower than the deterministic plan in CUDA graphs next to a kernel holding 32 SMs.  From 193
-    # tokens, and on 216-SM sm_107a parts, the deterministic plan (not measured under the rule)
+    # the 16 x 64 FFMA tile from 97 to 128.  Hidden 4096 on sm_100a ends at 160 tokens: at 176 one run was 3.0 % and
+    # at 192 an earlier measurement 3.1 and 3.4 % slower than the deterministic plan in CUDA graphs next to a resident
+    # kernel.  From 193 tokens, and on 216-SM sm_107a parts, the deterministic plan (not measured under the rule)
     ("sm_100a", "kk", 4096, 256): (
         (1, 8, "simt_c8_kg4_l32_e8t4"), (9, 16, "simt_c8_kg4_l32_e8t16"), (17, 96, "simt_c8_ffma_l16_e16t32"),
-        (97, 128, "simt_c8_ffma_l16_e16t64"), (129, 176, "simt_c8_ffma_l16_e16t32"),
+        (97, 128, "simt_c8_ffma_l16_e16t64"), (129, 160, "simt_c8_ffma_l16_e16t32"),
     ),
     ("sm_100a", "kk", 5120, 256): (
         (1, 8, "simt_c8_kg4_l32_e8t4"), (9, 16, "simt_c8_kg4_l32_e8t16"), (17, 96, "simt_c8_ffma_l16_e16t32"),

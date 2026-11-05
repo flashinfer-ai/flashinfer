@@ -3364,7 +3364,7 @@ _FWD_SM_103A = (
     (129, 192, "simt_c8_ffma_l16_e16t32"),
 )
 ROUTER_FWD_WINDOWS = {
-    ("sm_100a", 4096): (*_FWD_SM_100A, (129, 176, "simt_c8_ffma_l16_e16t32")),
+    ("sm_100a", 4096): (*_FWD_SM_100A, (129, 160, "simt_c8_ffma_l16_e16t32")),
     ("sm_100a", 5120): (*_FWD_SM_100A, (129, 192, "simt_c8_ffma_l16_e16t32")),
     ("sm_100a", 6144): (*_FWD_SM_100A, (129, 192, "simt_c8_ffma_l16_e16t32")),
     ("sm_103a", 4096): _FWD_SM_103A,
