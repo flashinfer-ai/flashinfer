@@ -50,8 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
-#if __CUDA_ARCH__ == 1070
-#else
 
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
@@ -65,7 +63,6 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
           "l"(*(const unsigned long long*)&c));
     return r;
 }
-#endif
 
 extern "C" {
 
@@ -1030,72 +1027,6 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
                         : "r"(x_rd_e + (unsigned int)(ch * 8704) + (unsigned int)(kk * 272) + 128));
-#if __CUDA_ARCH__ == 1070
-                    acc[0] = __fmaf_rn(mv[0], xv[0], acc[0]);
-                    acc[1] = __fmaf_rn(mv[0], xv[1], acc[1]);
-                    acc[2] = __fmaf_rn(mv[0], xv[2], acc[2]);
-                    acc[3] = __fmaf_rn(mv[0], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[0], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[0], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[0], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[0], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[1], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[1], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[1], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[1], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[1], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[1], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[1], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[1], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[2], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[2], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[2], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[2], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[2], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[2], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[2], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[2], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[3], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[3], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[3], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[3], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[3], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[3], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[3], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[3], xv[7], acc[31]);
-                    acc[32] = __fmaf_rn(mv[4], xv[0], acc[32]);
-                    acc[33] = __fmaf_rn(mv[4], xv[1], acc[33]);
-                    acc[34] = __fmaf_rn(mv[4], xv[2], acc[34]);
-                    acc[35] = __fmaf_rn(mv[4], xv[3], acc[35]);
-                    acc[36] = __fmaf_rn(mv[4], xv[4], acc[36]);
-                    acc[37] = __fmaf_rn(mv[4], xv[5], acc[37]);
-                    acc[38] = __fmaf_rn(mv[4], xv[6], acc[38]);
-                    acc[39] = __fmaf_rn(mv[4], xv[7], acc[39]);
-                    acc[40] = __fmaf_rn(mv[5], xv[0], acc[40]);
-                    acc[41] = __fmaf_rn(mv[5], xv[1], acc[41]);
-                    acc[42] = __fmaf_rn(mv[5], xv[2], acc[42]);
-                    acc[43] = __fmaf_rn(mv[5], xv[3], acc[43]);
-                    acc[44] = __fmaf_rn(mv[5], xv[4], acc[44]);
-                    acc[45] = __fmaf_rn(mv[5], xv[5], acc[45]);
-                    acc[46] = __fmaf_rn(mv[5], xv[6], acc[46]);
-                    acc[47] = __fmaf_rn(mv[5], xv[7], acc[47]);
-                    acc[48] = __fmaf_rn(mv[6], xv[0], acc[48]);
-                    acc[49] = __fmaf_rn(mv[6], xv[1], acc[49]);
-                    acc[50] = __fmaf_rn(mv[6], xv[2], acc[50]);
-                    acc[51] = __fmaf_rn(mv[6], xv[3], acc[51]);
-                    acc[52] = __fmaf_rn(mv[6], xv[4], acc[52]);
-                    acc[53] = __fmaf_rn(mv[6], xv[5], acc[53]);
-                    acc[54] = __fmaf_rn(mv[6], xv[6], acc[54]);
-                    acc[55] = __fmaf_rn(mv[6], xv[7], acc[55]);
-                    acc[56] = __fmaf_rn(mv[7], xv[0], acc[56]);
-                    acc[57] = __fmaf_rn(mv[7], xv[1], acc[57]);
-                    acc[58] = __fmaf_rn(mv[7], xv[2], acc[58]);
-                    acc[59] = __fmaf_rn(mv[7], xv[3], acc[59]);
-                    acc[60] = __fmaf_rn(mv[7], xv[4], acc[60]);
-                    acc[61] = __fmaf_rn(mv[7], xv[5], acc[61]);
-                    acc[62] = __fmaf_rn(mv[7], xv[6], acc[62]);
-                    acc[63] = __fmaf_rn(mv[7], xv[7], acc[63]);
-#else
                     float2 m2_0 = make_float2(mv[0], mv[0]);
                     float2 a2_0 = make_float2(acc[0], acc[1]);
                     a2_0 = fma_f32x2_rn_ftz(m2_0, make_float2(xv[0], xv[1]), a2_0);
@@ -1232,7 +1163,6 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     a2_31 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[6], xv[7]), a2_31);
                     acc[62] = a2_31.x;
                     acc[63] = a2_31.y;
-#endif
                 }
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (34816 - buf * 34816)), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
@@ -2259,72 +2189,6 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 128));
-#if __CUDA_ARCH__ == 1070
-                    acc[0] = __fmaf_rn(mv[0], xv[0], acc[0]);
-                    acc[1] = __fmaf_rn(mv[0], xv[1], acc[1]);
-                    acc[2] = __fmaf_rn(mv[0], xv[2], acc[2]);
-                    acc[3] = __fmaf_rn(mv[0], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[0], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[0], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[0], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[0], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[4], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[4], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[4], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[4], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[4], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[4], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[4], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[4], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[8], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[8], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[8], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[8], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[8], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[8], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[8], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[8], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[12], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[12], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[12], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[12], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[12], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[12], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[12], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[12], xv[7], acc[31]);
-                    acc[32] = __fmaf_rn(mv[16], xv[0], acc[32]);
-                    acc[33] = __fmaf_rn(mv[16], xv[1], acc[33]);
-                    acc[34] = __fmaf_rn(mv[16], xv[2], acc[34]);
-                    acc[35] = __fmaf_rn(mv[16], xv[3], acc[35]);
-                    acc[36] = __fmaf_rn(mv[16], xv[4], acc[36]);
-                    acc[37] = __fmaf_rn(mv[16], xv[5], acc[37]);
-                    acc[38] = __fmaf_rn(mv[16], xv[6], acc[38]);
-                    acc[39] = __fmaf_rn(mv[16], xv[7], acc[39]);
-                    acc[40] = __fmaf_rn(mv[20], xv[0], acc[40]);
-                    acc[41] = __fmaf_rn(mv[20], xv[1], acc[41]);
-                    acc[42] = __fmaf_rn(mv[20], xv[2], acc[42]);
-                    acc[43] = __fmaf_rn(mv[20], xv[3], acc[43]);
-                    acc[44] = __fmaf_rn(mv[20], xv[4], acc[44]);
-                    acc[45] = __fmaf_rn(mv[20], xv[5], acc[45]);
-                    acc[46] = __fmaf_rn(mv[20], xv[6], acc[46]);
-                    acc[47] = __fmaf_rn(mv[20], xv[7], acc[47]);
-                    acc[48] = __fmaf_rn(mv[24], xv[0], acc[48]);
-                    acc[49] = __fmaf_rn(mv[24], xv[1], acc[49]);
-                    acc[50] = __fmaf_rn(mv[24], xv[2], acc[50]);
-                    acc[51] = __fmaf_rn(mv[24], xv[3], acc[51]);
-                    acc[52] = __fmaf_rn(mv[24], xv[4], acc[52]);
-                    acc[53] = __fmaf_rn(mv[24], xv[5], acc[53]);
-                    acc[54] = __fmaf_rn(mv[24], xv[6], acc[54]);
-                    acc[55] = __fmaf_rn(mv[24], xv[7], acc[55]);
-                    acc[56] = __fmaf_rn(mv[28], xv[0], acc[56]);
-                    acc[57] = __fmaf_rn(mv[28], xv[1], acc[57]);
-                    acc[58] = __fmaf_rn(mv[28], xv[2], acc[58]);
-                    acc[59] = __fmaf_rn(mv[28], xv[3], acc[59]);
-                    acc[60] = __fmaf_rn(mv[28], xv[4], acc[60]);
-                    acc[61] = __fmaf_rn(mv[28], xv[5], acc[61]);
-                    acc[62] = __fmaf_rn(mv[28], xv[6], acc[62]);
-                    acc[63] = __fmaf_rn(mv[28], xv[7], acc[63]);
-#else
                     float2 m2_8 = make_float2(mv[0], mv[0]);
                     float2 a2_32 = make_float2(acc[0], acc[1]);
                     a2_32 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[0], xv[1]), a2_32);
@@ -2461,79 +2325,12 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     a2_63 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[6], xv[7]), a2_63);
                     acc[62] = a2_63.x;
                     acc[63] = a2_63.y;
-#endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 272));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 400));
-#if __CUDA_ARCH__ == 1070
-                    acc[0] = __fmaf_rn(mv[1], xv[0], acc[0]);
-                    acc[1] = __fmaf_rn(mv[1], xv[1], acc[1]);
-                    acc[2] = __fmaf_rn(mv[1], xv[2], acc[2]);
-                    acc[3] = __fmaf_rn(mv[1], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[1], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[1], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[1], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[1], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[5], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[5], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[5], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[5], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[5], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[5], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[5], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[5], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[9], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[9], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[9], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[9], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[9], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[9], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[9], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[9], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[13], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[13], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[13], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[13], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[13], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[13], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[13], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[13], xv[7], acc[31]);
-                    acc[32] = __fmaf_rn(mv[17], xv[0], acc[32]);
-                    acc[33] = __fmaf_rn(mv[17], xv[1], acc[33]);
-                    acc[34] = __fmaf_rn(mv[17], xv[2], acc[34]);
-                    acc[35] = __fmaf_rn(mv[17], xv[3], acc[35]);
-                    acc[36] = __fmaf_rn(mv[17], xv[4], acc[36]);
-                    acc[37] = __fmaf_rn(mv[17], xv[5], acc[37]);
-                    acc[38] = __fmaf_rn(mv[17], xv[6], acc[38]);
-                    acc[39] = __fmaf_rn(mv[17], xv[7], acc[39]);
-                    acc[40] = __fmaf_rn(mv[21], xv[0], acc[40]);
-                    acc[41] = __fmaf_rn(mv[21], xv[1], acc[41]);
-                    acc[42] = __fmaf_rn(mv[21], xv[2], acc[42]);
-                    acc[43] = __fmaf_rn(mv[21], xv[3], acc[43]);
-                    acc[44] = __fmaf_rn(mv[21], xv[4], acc[44]);
-                    acc[45] = __fmaf_rn(mv[21], xv[5], acc[45]);
-                    acc[46] = __fmaf_rn(mv[21], xv[6], acc[46]);
-                    acc[47] = __fmaf_rn(mv[21], xv[7], acc[47]);
-                    acc[48] = __fmaf_rn(mv[25], xv[0], acc[48]);
-                    acc[49] = __fmaf_rn(mv[25], xv[1], acc[49]);
-                    acc[50] = __fmaf_rn(mv[25], xv[2], acc[50]);
-                    acc[51] = __fmaf_rn(mv[25], xv[3], acc[51]);
-                    acc[52] = __fmaf_rn(mv[25], xv[4], acc[52]);
-                    acc[53] = __fmaf_rn(mv[25], xv[5], acc[53]);
-                    acc[54] = __fmaf_rn(mv[25], xv[6], acc[54]);
-                    acc[55] = __fmaf_rn(mv[25], xv[7], acc[55]);
-                    acc[56] = __fmaf_rn(mv[29], xv[0], acc[56]);
-                    acc[57] = __fmaf_rn(mv[29], xv[1], acc[57]);
-                    acc[58] = __fmaf_rn(mv[29], xv[2], acc[58]);
-                    acc[59] = __fmaf_rn(mv[29], xv[3], acc[59]);
-                    acc[60] = __fmaf_rn(mv[29], xv[4], acc[60]);
-                    acc[61] = __fmaf_rn(mv[29], xv[5], acc[61]);
-                    acc[62] = __fmaf_rn(mv[29], xv[6], acc[62]);
-                    acc[63] = __fmaf_rn(mv[29], xv[7], acc[63]);
-#else
                     float2 m2_16 = make_float2(mv[1], mv[1]);
                     float2 a2_64 = make_float2(acc[0], acc[1]);
                     a2_64 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[0], xv[1]), a2_64);
@@ -2670,79 +2467,12 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     a2_95 = fma_f32x2_rn_ftz(m2_23, make_float2(xv[6], xv[7]), a2_95);
                     acc[62] = a2_95.x;
                     acc[63] = a2_95.y;
-#endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 544));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 672));
-#if __CUDA_ARCH__ == 1070
-                    acc[0] = __fmaf_rn(mv[2], xv[0], acc[0]);
-                    acc[1] = __fmaf_rn(mv[2], xv[1], acc[1]);
-                    acc[2] = __fmaf_rn(mv[2], xv[2], acc[2]);
-                    acc[3] = __fmaf_rn(mv[2], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[2], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[2], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[2], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[2], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[6], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[6], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[6], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[6], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[6], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[6], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[6], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[6], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[10], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[10], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[10], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[10], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[10], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[10], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[10], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[10], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[14], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[14], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[14], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[14], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[14], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[14], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[14], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[14], xv[7], acc[31]);
-                    acc[32] = __fmaf_rn(mv[18], xv[0], acc[32]);
-                    acc[33] = __fmaf_rn(mv[18], xv[1], acc[33]);
-                    acc[34] = __fmaf_rn(mv[18], xv[2], acc[34]);
-                    acc[35] = __fmaf_rn(mv[18], xv[3], acc[35]);
-                    acc[36] = __fmaf_rn(mv[18], xv[4], acc[36]);
-                    acc[37] = __fmaf_rn(mv[18], xv[5], acc[37]);
-                    acc[38] = __fmaf_rn(mv[18], xv[6], acc[38]);
-                    acc[39] = __fmaf_rn(mv[18], xv[7], acc[39]);
-                    acc[40] = __fmaf_rn(mv[22], xv[0], acc[40]);
-                    acc[41] = __fmaf_rn(mv[22], xv[1], acc[41]);
-                    acc[42] = __fmaf_rn(mv[22], xv[2], acc[42]);
-                    acc[43] = __fmaf_rn(mv[22], xv[3], acc[43]);
-                    acc[44] = __fmaf_rn(mv[22], xv[4], acc[44]);
-                    acc[45] = __fmaf_rn(mv[22], xv[5], acc[45]);
-                    acc[46] = __fmaf_rn(mv[22], xv[6], acc[46]);
-                    acc[47] = __fmaf_rn(mv[22], xv[7], acc[47]);
-                    acc[48] = __fmaf_rn(mv[26], xv[0], acc[48]);
-                    acc[49] = __fmaf_rn(mv[26], xv[1], acc[49]);
-                    acc[50] = __fmaf_rn(mv[26], xv[2], acc[50]);
-                    acc[51] = __fmaf_rn(mv[26], xv[3], acc[51]);
-                    acc[52] = __fmaf_rn(mv[26], xv[4], acc[52]);
-                    acc[53] = __fmaf_rn(mv[26], xv[5], acc[53]);
-                    acc[54] = __fmaf_rn(mv[26], xv[6], acc[54]);
-                    acc[55] = __fmaf_rn(mv[26], xv[7], acc[55]);
-                    acc[56] = __fmaf_rn(mv[30], xv[0], acc[56]);
-                    acc[57] = __fmaf_rn(mv[30], xv[1], acc[57]);
-                    acc[58] = __fmaf_rn(mv[30], xv[2], acc[58]);
-                    acc[59] = __fmaf_rn(mv[30], xv[3], acc[59]);
-                    acc[60] = __fmaf_rn(mv[30], xv[4], acc[60]);
-                    acc[61] = __fmaf_rn(mv[30], xv[5], acc[61]);
-                    acc[62] = __fmaf_rn(mv[30], xv[6], acc[62]);
-                    acc[63] = __fmaf_rn(mv[30], xv[7], acc[63]);
-#else
                     float2 m2_24 = make_float2(mv[2], mv[2]);
                     float2 a2_96 = make_float2(acc[0], acc[1]);
                     a2_96 = fma_f32x2_rn_ftz(m2_24, make_float2(xv[0], xv[1]), a2_96);
@@ -2879,79 +2609,12 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     a2_127 = fma_f32x2_rn_ftz(m2_31, make_float2(xv[6], xv[7]), a2_127);
                     acc[62] = a2_127.x;
                     acc[63] = a2_127.y;
-#endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 816));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[4])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(4) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 8704) + (unsigned int)(q * 1088) + 944));
-#if __CUDA_ARCH__ == 1070
-                    acc[0] = __fmaf_rn(mv[3], xv[0], acc[0]);
-                    acc[1] = __fmaf_rn(mv[3], xv[1], acc[1]);
-                    acc[2] = __fmaf_rn(mv[3], xv[2], acc[2]);
-                    acc[3] = __fmaf_rn(mv[3], xv[3], acc[3]);
-                    acc[4] = __fmaf_rn(mv[3], xv[4], acc[4]);
-                    acc[5] = __fmaf_rn(mv[3], xv[5], acc[5]);
-                    acc[6] = __fmaf_rn(mv[3], xv[6], acc[6]);
-                    acc[7] = __fmaf_rn(mv[3], xv[7], acc[7]);
-                    acc[8] = __fmaf_rn(mv[7], xv[0], acc[8]);
-                    acc[9] = __fmaf_rn(mv[7], xv[1], acc[9]);
-                    acc[10] = __fmaf_rn(mv[7], xv[2], acc[10]);
-                    acc[11] = __fmaf_rn(mv[7], xv[3], acc[11]);
-                    acc[12] = __fmaf_rn(mv[7], xv[4], acc[12]);
-                    acc[13] = __fmaf_rn(mv[7], xv[5], acc[13]);
-                    acc[14] = __fmaf_rn(mv[7], xv[6], acc[14]);
-                    acc[15] = __fmaf_rn(mv[7], xv[7], acc[15]);
-                    acc[16] = __fmaf_rn(mv[11], xv[0], acc[16]);
-                    acc[17] = __fmaf_rn(mv[11], xv[1], acc[17]);
-                    acc[18] = __fmaf_rn(mv[11], xv[2], acc[18]);
-                    acc[19] = __fmaf_rn(mv[11], xv[3], acc[19]);
-                    acc[20] = __fmaf_rn(mv[11], xv[4], acc[20]);
-                    acc[21] = __fmaf_rn(mv[11], xv[5], acc[21]);
-                    acc[22] = __fmaf_rn(mv[11], xv[6], acc[22]);
-                    acc[23] = __fmaf_rn(mv[11], xv[7], acc[23]);
-                    acc[24] = __fmaf_rn(mv[15], xv[0], acc[24]);
-                    acc[25] = __fmaf_rn(mv[15], xv[1], acc[25]);
-                    acc[26] = __fmaf_rn(mv[15], xv[2], acc[26]);
-                    acc[27] = __fmaf_rn(mv[15], xv[3], acc[27]);
-                    acc[28] = __fmaf_rn(mv[15], xv[4], acc[28]);
-                    acc[29] = __fmaf_rn(mv[15], xv[5], acc[29]);
-                    acc[30] = __fmaf_rn(mv[15], xv[6], acc[30]);
-                    acc[31] = __fmaf_rn(mv[15], xv[7], acc[31]);
-                    acc[32] = __fmaf_rn(mv[19], xv[0], acc[32]);
-                    acc[33] = __fmaf_rn(mv[19], xv[1], acc[33]);
-                    acc[34] = __fmaf_rn(mv[19], xv[2], acc[34]);
-                    acc[35] = __fmaf_rn(mv[19], xv[3], acc[35]);
-                    acc[36] = __fmaf_rn(mv[19], xv[4], acc[36]);
-                    acc[37] = __fmaf_rn(mv[19], xv[5], acc[37]);
-                    acc[38] = __fmaf_rn(mv[19], xv[6], acc[38]);
-                    acc[39] = __fmaf_rn(mv[19], xv[7], acc[39]);
-                    acc[40] = __fmaf_rn(mv[23], xv[0], acc[40]);
-                    acc[41] = __fmaf_rn(mv[23], xv[1], acc[41]);
-                    acc[42] = __fmaf_rn(mv[23], xv[2], acc[42]);
-                    acc[43] = __fmaf_rn(mv[23], xv[3], acc[43]);
-                    acc[44] = __fmaf_rn(mv[23], xv[4], acc[44]);
-                    acc[45] = __fmaf_rn(mv[23], xv[5], acc[45]);
-                    acc[46] = __fmaf_rn(mv[23], xv[6], acc[46]);
-                    acc[47] = __fmaf_rn(mv[23], xv[7], acc[47]);
-                    acc[48] = __fmaf_rn(mv[27], xv[0], acc[48]);
-                    acc[49] = __fmaf_rn(mv[27], xv[1], acc[49]);
-                    acc[50] = __fmaf_rn(mv[27], xv[2], acc[50]);
-                    acc[51] = __fmaf_rn(mv[27], xv[3], acc[51]);
-                    acc[52] = __fmaf_rn(mv[27], xv[4], acc[52]);
-                    acc[53] = __fmaf_rn(mv[27], xv[5], acc[53]);
-                    acc[54] = __fmaf_rn(mv[27], xv[6], acc[54]);
-                    acc[55] = __fmaf_rn(mv[27], xv[7], acc[55]);
-                    acc[56] = __fmaf_rn(mv[31], xv[0], acc[56]);
-                    acc[57] = __fmaf_rn(mv[31], xv[1], acc[57]);
-                    acc[58] = __fmaf_rn(mv[31], xv[2], acc[58]);
-                    acc[59] = __fmaf_rn(mv[31], xv[3], acc[59]);
-                    acc[60] = __fmaf_rn(mv[31], xv[4], acc[60]);
-                    acc[61] = __fmaf_rn(mv[31], xv[5], acc[61]);
-                    acc[62] = __fmaf_rn(mv[31], xv[6], acc[62]);
-                    acc[63] = __fmaf_rn(mv[31], xv[7], acc[63]);
-#else
                     float2 m2_32 = make_float2(mv[3], mv[3]);
                     float2 a2_128 = make_float2(acc[0], acc[1]);
                     a2_128 = fma_f32x2_rn_ftz(m2_32, make_float2(xv[0], xv[1]), a2_128);
@@ -3088,7 +2751,6 @@ kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp(float* __restrict__ m, float*
                     a2_159 = fma_f32x2_rn_ftz(m2_39, make_float2(xv[6], xv[7]), a2_159);
                     acc[62] = a2_159.x;
                     acc[63] = a2_159.y;
-#endif
                 }
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (34816 - buf_1 * 34816)), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");

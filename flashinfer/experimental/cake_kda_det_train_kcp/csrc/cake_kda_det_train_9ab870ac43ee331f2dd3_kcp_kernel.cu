@@ -50,11 +50,27 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
+#if __CUDA_ARCH__ == 1070
+#else
+
+
+// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+
+__device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
+    float2 r;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b),
+          "l"(*(const unsigned long long*)&c));
+    return r;
+}
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float* __restrict__ c, float* __restrict__ x0, float* __restrict__ y, int* __restrict__ chain_start, long long* __restrict__ elem_m, long long* __restrict__ elem_c, long long* __restrict__ elem_y, long long* __restrict__ x0_index, long long* __restrict__ y_final, int ncols, int transpose_m, int write_states, int cols_per_cta)
+kernel_cake_kda_det_train_9ab870ac43ee331f2dd3_kcp(float* __restrict__ m, float* __restrict__ c, float* __restrict__ x0, float* __restrict__ y, int* __restrict__ chain_start, long long* __restrict__ elem_m, long long* __restrict__ elem_c, long long* __restrict__ elem_y, long long* __restrict__ x0_index, long long* __restrict__ y_final, int ncols, int transpose_m, int write_states, int cols_per_cta)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -416,6 +432,7 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e + (unsigned int)(ch * 1280) + (unsigned int)(kk * 80)));
+#if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[0], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[0], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[0], xv[2], acc[2]);
@@ -432,6 +449,44 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     acc[13] = __fmaf_rn(mv[3], xv[1], acc[13]);
                     acc[14] = __fmaf_rn(mv[3], xv[2], acc[14]);
                     acc[15] = __fmaf_rn(mv[3], xv[3], acc[15]);
+#else
+                    float2 m2_0 = make_float2(mv[0], mv[0]);
+                    float2 a2_0 = make_float2(acc[0], acc[1]);
+                    a2_0 = fma_f32x2_rn_ftz(m2_0, make_float2(xv[0], xv[1]), a2_0);
+                    acc[0] = a2_0.x;
+                    acc[1] = a2_0.y;
+                    float2 a2_1 = make_float2(acc[2], acc[3]);
+                    a2_1 = fma_f32x2_rn_ftz(m2_0, make_float2(xv[2], xv[3]), a2_1);
+                    acc[2] = a2_1.x;
+                    acc[3] = a2_1.y;
+                    float2 m2_1 = make_float2(mv[1], mv[1]);
+                    float2 a2_2 = make_float2(acc[4], acc[5]);
+                    a2_2 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[0], xv[1]), a2_2);
+                    acc[4] = a2_2.x;
+                    acc[5] = a2_2.y;
+                    float2 a2_3 = make_float2(acc[6], acc[7]);
+                    a2_3 = fma_f32x2_rn_ftz(m2_1, make_float2(xv[2], xv[3]), a2_3);
+                    acc[6] = a2_3.x;
+                    acc[7] = a2_3.y;
+                    float2 m2_2 = make_float2(mv[2], mv[2]);
+                    float2 a2_4 = make_float2(acc[8], acc[9]);
+                    a2_4 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[0], xv[1]), a2_4);
+                    acc[8] = a2_4.x;
+                    acc[9] = a2_4.y;
+                    float2 a2_5 = make_float2(acc[10], acc[11]);
+                    a2_5 = fma_f32x2_rn_ftz(m2_2, make_float2(xv[2], xv[3]), a2_5);
+                    acc[10] = a2_5.x;
+                    acc[11] = a2_5.y;
+                    float2 m2_3 = make_float2(mv[3], mv[3]);
+                    float2 a2_6 = make_float2(acc[12], acc[13]);
+                    a2_6 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[0], xv[1]), a2_6);
+                    acc[12] = a2_6.x;
+                    acc[13] = a2_6.y;
+                    float2 a2_7 = make_float2(acc[14], acc[15]);
+                    a2_7 = fma_f32x2_rn_ftz(m2_3, make_float2(xv[2], xv[3]), a2_7);
+                    acc[14] = a2_7.x;
+                    acc[15] = a2_7.y;
+#endif
                 }
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr + (10240 - buf * 10240)), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
@@ -791,6 +846,7 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 1280) + (unsigned int)(q * 320)));
+#if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[0], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[0], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[0], xv[2], acc[2]);
@@ -807,9 +863,48 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     acc[13] = __fmaf_rn(mv[12], xv[1], acc[13]);
                     acc[14] = __fmaf_rn(mv[12], xv[2], acc[14]);
                     acc[15] = __fmaf_rn(mv[12], xv[3], acc[15]);
+#else
+                    float2 m2_4 = make_float2(mv[0], mv[0]);
+                    float2 a2_8 = make_float2(acc[0], acc[1]);
+                    a2_8 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[0], xv[1]), a2_8);
+                    acc[0] = a2_8.x;
+                    acc[1] = a2_8.y;
+                    float2 a2_9 = make_float2(acc[2], acc[3]);
+                    a2_9 = fma_f32x2_rn_ftz(m2_4, make_float2(xv[2], xv[3]), a2_9);
+                    acc[2] = a2_9.x;
+                    acc[3] = a2_9.y;
+                    float2 m2_5 = make_float2(mv[4], mv[4]);
+                    float2 a2_10 = make_float2(acc[4], acc[5]);
+                    a2_10 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[0], xv[1]), a2_10);
+                    acc[4] = a2_10.x;
+                    acc[5] = a2_10.y;
+                    float2 a2_11 = make_float2(acc[6], acc[7]);
+                    a2_11 = fma_f32x2_rn_ftz(m2_5, make_float2(xv[2], xv[3]), a2_11);
+                    acc[6] = a2_11.x;
+                    acc[7] = a2_11.y;
+                    float2 m2_6 = make_float2(mv[8], mv[8]);
+                    float2 a2_12 = make_float2(acc[8], acc[9]);
+                    a2_12 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[0], xv[1]), a2_12);
+                    acc[8] = a2_12.x;
+                    acc[9] = a2_12.y;
+                    float2 a2_13 = make_float2(acc[10], acc[11]);
+                    a2_13 = fma_f32x2_rn_ftz(m2_6, make_float2(xv[2], xv[3]), a2_13);
+                    acc[10] = a2_13.x;
+                    acc[11] = a2_13.y;
+                    float2 m2_7 = make_float2(mv[12], mv[12]);
+                    float2 a2_14 = make_float2(acc[12], acc[13]);
+                    a2_14 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[0], xv[1]), a2_14);
+                    acc[12] = a2_14.x;
+                    acc[13] = a2_14.y;
+                    float2 a2_15 = make_float2(acc[14], acc[15]);
+                    a2_15 = fma_f32x2_rn_ftz(m2_7, make_float2(xv[2], xv[3]), a2_15);
+                    acc[14] = a2_15.x;
+                    acc[15] = a2_15.y;
+#endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 1280) + (unsigned int)(q * 320) + 80));
+#if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[1], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[1], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[1], xv[2], acc[2]);
@@ -826,9 +921,48 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     acc[13] = __fmaf_rn(mv[13], xv[1], acc[13]);
                     acc[14] = __fmaf_rn(mv[13], xv[2], acc[14]);
                     acc[15] = __fmaf_rn(mv[13], xv[3], acc[15]);
+#else
+                    float2 m2_8 = make_float2(mv[1], mv[1]);
+                    float2 a2_16 = make_float2(acc[0], acc[1]);
+                    a2_16 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[0], xv[1]), a2_16);
+                    acc[0] = a2_16.x;
+                    acc[1] = a2_16.y;
+                    float2 a2_17 = make_float2(acc[2], acc[3]);
+                    a2_17 = fma_f32x2_rn_ftz(m2_8, make_float2(xv[2], xv[3]), a2_17);
+                    acc[2] = a2_17.x;
+                    acc[3] = a2_17.y;
+                    float2 m2_9 = make_float2(mv[5], mv[5]);
+                    float2 a2_18 = make_float2(acc[4], acc[5]);
+                    a2_18 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[0], xv[1]), a2_18);
+                    acc[4] = a2_18.x;
+                    acc[5] = a2_18.y;
+                    float2 a2_19 = make_float2(acc[6], acc[7]);
+                    a2_19 = fma_f32x2_rn_ftz(m2_9, make_float2(xv[2], xv[3]), a2_19);
+                    acc[6] = a2_19.x;
+                    acc[7] = a2_19.y;
+                    float2 m2_10 = make_float2(mv[9], mv[9]);
+                    float2 a2_20 = make_float2(acc[8], acc[9]);
+                    a2_20 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[0], xv[1]), a2_20);
+                    acc[8] = a2_20.x;
+                    acc[9] = a2_20.y;
+                    float2 a2_21 = make_float2(acc[10], acc[11]);
+                    a2_21 = fma_f32x2_rn_ftz(m2_10, make_float2(xv[2], xv[3]), a2_21);
+                    acc[10] = a2_21.x;
+                    acc[11] = a2_21.y;
+                    float2 m2_11 = make_float2(mv[13], mv[13]);
+                    float2 a2_22 = make_float2(acc[12], acc[13]);
+                    a2_22 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[0], xv[1]), a2_22);
+                    acc[12] = a2_22.x;
+                    acc[13] = a2_22.y;
+                    float2 a2_23 = make_float2(acc[14], acc[15]);
+                    a2_23 = fma_f32x2_rn_ftz(m2_11, make_float2(xv[2], xv[3]), a2_23);
+                    acc[14] = a2_23.x;
+                    acc[15] = a2_23.y;
+#endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 1280) + (unsigned int)(q * 320) + 160));
+#if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[2], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[2], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[2], xv[2], acc[2]);
@@ -845,9 +979,48 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     acc[13] = __fmaf_rn(mv[14], xv[1], acc[13]);
                     acc[14] = __fmaf_rn(mv[14], xv[2], acc[14]);
                     acc[15] = __fmaf_rn(mv[14], xv[3], acc[15]);
+#else
+                    float2 m2_12 = make_float2(mv[2], mv[2]);
+                    float2 a2_24 = make_float2(acc[0], acc[1]);
+                    a2_24 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[0], xv[1]), a2_24);
+                    acc[0] = a2_24.x;
+                    acc[1] = a2_24.y;
+                    float2 a2_25 = make_float2(acc[2], acc[3]);
+                    a2_25 = fma_f32x2_rn_ftz(m2_12, make_float2(xv[2], xv[3]), a2_25);
+                    acc[2] = a2_25.x;
+                    acc[3] = a2_25.y;
+                    float2 m2_13 = make_float2(mv[6], mv[6]);
+                    float2 a2_26 = make_float2(acc[4], acc[5]);
+                    a2_26 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[0], xv[1]), a2_26);
+                    acc[4] = a2_26.x;
+                    acc[5] = a2_26.y;
+                    float2 a2_27 = make_float2(acc[6], acc[7]);
+                    a2_27 = fma_f32x2_rn_ftz(m2_13, make_float2(xv[2], xv[3]), a2_27);
+                    acc[6] = a2_27.x;
+                    acc[7] = a2_27.y;
+                    float2 m2_14 = make_float2(mv[10], mv[10]);
+                    float2 a2_28 = make_float2(acc[8], acc[9]);
+                    a2_28 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[0], xv[1]), a2_28);
+                    acc[8] = a2_28.x;
+                    acc[9] = a2_28.y;
+                    float2 a2_29 = make_float2(acc[10], acc[11]);
+                    a2_29 = fma_f32x2_rn_ftz(m2_14, make_float2(xv[2], xv[3]), a2_29);
+                    acc[10] = a2_29.x;
+                    acc[11] = a2_29.y;
+                    float2 m2_15 = make_float2(mv[14], mv[14]);
+                    float2 a2_30 = make_float2(acc[12], acc[13]);
+                    a2_30 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[0], xv[1]), a2_30);
+                    acc[12] = a2_30.x;
+                    acc[13] = a2_30.y;
+                    float2 a2_31 = make_float2(acc[14], acc[15]);
+                    a2_31 = fma_f32x2_rn_ftz(m2_15, make_float2(xv[2], xv[3]), a2_31);
+                    acc[14] = a2_31.x;
+                    acc[15] = a2_31.y;
+#endif
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                         : "r"(x_rd_e_1 + (unsigned int)(ch_1 * 1280) + (unsigned int)(q * 320) + 240));
+#if __CUDA_ARCH__ == 1070
                     acc[0] = __fmaf_rn(mv[3], xv[0], acc[0]);
                     acc[1] = __fmaf_rn(mv[3], xv[1], acc[1]);
                     acc[2] = __fmaf_rn(mv[3], xv[2], acc[2]);
@@ -864,6 +1037,44 @@ kernel_cake_kda_det_train_15e81414b27b4b831808_kcp(float* __restrict__ m, float*
                     acc[13] = __fmaf_rn(mv[15], xv[1], acc[13]);
                     acc[14] = __fmaf_rn(mv[15], xv[2], acc[14]);
                     acc[15] = __fmaf_rn(mv[15], xv[3], acc[15]);
+#else
+                    float2 m2_16 = make_float2(mv[3], mv[3]);
+                    float2 a2_32 = make_float2(acc[0], acc[1]);
+                    a2_32 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[0], xv[1]), a2_32);
+                    acc[0] = a2_32.x;
+                    acc[1] = a2_32.y;
+                    float2 a2_33 = make_float2(acc[2], acc[3]);
+                    a2_33 = fma_f32x2_rn_ftz(m2_16, make_float2(xv[2], xv[3]), a2_33);
+                    acc[2] = a2_33.x;
+                    acc[3] = a2_33.y;
+                    float2 m2_17 = make_float2(mv[7], mv[7]);
+                    float2 a2_34 = make_float2(acc[4], acc[5]);
+                    a2_34 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[0], xv[1]), a2_34);
+                    acc[4] = a2_34.x;
+                    acc[5] = a2_34.y;
+                    float2 a2_35 = make_float2(acc[6], acc[7]);
+                    a2_35 = fma_f32x2_rn_ftz(m2_17, make_float2(xv[2], xv[3]), a2_35);
+                    acc[6] = a2_35.x;
+                    acc[7] = a2_35.y;
+                    float2 m2_18 = make_float2(mv[11], mv[11]);
+                    float2 a2_36 = make_float2(acc[8], acc[9]);
+                    a2_36 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[0], xv[1]), a2_36);
+                    acc[8] = a2_36.x;
+                    acc[9] = a2_36.y;
+                    float2 a2_37 = make_float2(acc[10], acc[11]);
+                    a2_37 = fma_f32x2_rn_ftz(m2_18, make_float2(xv[2], xv[3]), a2_37);
+                    acc[10] = a2_37.x;
+                    acc[11] = a2_37.y;
+                    float2 m2_19 = make_float2(mv[15], mv[15]);
+                    float2 a2_38 = make_float2(acc[12], acc[13]);
+                    a2_38 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[0], xv[1]), a2_38);
+                    acc[12] = a2_38.x;
+                    acc[13] = a2_38.y;
+                    float2 a2_39 = make_float2(acc[14], acc[15]);
+                    a2_39 = fma_f32x2_rn_ftz(m2_19, make_float2(xv[2], xv[3]), a2_39);
+                    acc[14] = a2_39.x;
+                    acc[15] = a2_39.y;
+#endif
                 }
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(x_thr_1 + (10240 - buf_1 * 10240)), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])) : "memory");
