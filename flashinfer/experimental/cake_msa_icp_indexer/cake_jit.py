@@ -69,7 +69,9 @@ PREFIX = "cake_msa_icp_indexer"
 # rows at world size 4, else ``merge`` (4 tokens per CTA), from launch metadata only.  The fused prefill path replaces ``score`` and
 # ``select_prefill`` with ``score_topk16`` (each (CTA, item) cell's sorted
 # Top16 lists in a caller pool) and ``prefill_list_carrier`` (the lists of a
-# row merged into the same carrier rows).  The ``_dc`` roles are the same
+# row merged into the same carrier rows); with a prefill publish,
+# ``prefill_list_publish`` writes those rows into the owners' receive rows as
+# tagged words and ``merge_prefill_tagged`` merges them (no caller exchange).  The ``_dc`` roles are the same
 # selectors, publishers and merges reading the token count from the device
 # word ``token_count[0]`` instead of a launch scalar: rows of the grid past it
 # do nothing, so one captured launch serves every count up to its grid.
@@ -87,12 +89,15 @@ ROLES = (
     "merge_prefill",
     "merge_tagged",
     "prefill_list_carrier",
+    "prefill_list_publish",
+    "merge_prefill_tagged",
     "select_prefill_dc",
     "select_publish_dc",
     "topk16_publish_dc",
     "merge_dc",
     "merge_legacy_dc",
     "merge_prefill_dc",
+    "merge_prefill_tagged_dc",
 )
 # Grid rules of the records (evaluated by :func:`launch_grid`): one CTA, one
 # CTA per streaming multiprocessor (the persistent prefill scorer, whose plan
@@ -203,6 +208,7 @@ LOGICAL_SCALARS = (
     "spin_limit",
     "tagged",
     "prefill",
+    "t_base",
 )
 
 # Filled by the exporter: the host plan of every record comes from the

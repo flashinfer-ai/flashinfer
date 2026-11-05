@@ -429,6 +429,31 @@ def comm_layout(world_size: int, heads_per_rank: int, capacity: int) -> dict[str
     }
 
 
+def prefill_publish_layout(
+    world_size: int, heads_per_rank: int, capacity: int
+) -> dict[str, Any]:
+    """Layout of the caller's prefill publish storage (the prefill exchange
+    as a peer publish, :func:`prefill_score_select` with ``publish``): one
+    symmetric int64 allocation per rank of ``rows_shape = [3, W, hpr,
+    capacity, 32]`` tagged rows (``rows_bytes`` bytes), zeroed once and never
+    reset, whose peer addresses are ``recv_bases`` (int64 ``[W]``); the
+    publisher's generation counters ``generations_shape = [3, H, capacity]``
+    and the merge's ``expected_shape = [3, hpr, capacity]`` (int32, zeroed
+    with the rows on every rank).  Slot ``s`` of a layer is its decode slot
+    set: consecutive uses of one slot must be at least two sparse layers
+    apart, including across steps."""
+    _world(world_size, 0)
+    if heads_per_rank < 1 or capacity < 1:
+        raise ValueError("heads_per_rank and capacity must be positive")
+    shape = (NUM_SLOT_SETS, world_size, heads_per_rank, capacity, TAGGED_WORDS)
+    return {
+        "rows_shape": shape,
+        "rows_bytes": 8 * NUM_SLOT_SETS * world_size * heads_per_rank * capacity * TAGGED_WORDS,
+        "generations_shape": (NUM_SLOT_SETS, world_size * heads_per_rank, capacity),
+        "expected_shape": (NUM_SLOT_SETS, heads_per_rank, capacity),
+    }
+
+
 def decode_splits(
     name: str, batch: int, device_index: int, cap: int = cake_jit.MAX_DECODE_SPLITS
 ) -> int:
@@ -917,6 +942,7 @@ def prefill_score_select(
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
     enable_pdl: bool = False,
+    publish: Optional[dict[str, Any]] = None,
 ) -> None:
     """The fused prefill path of one query chunk: the list scorer keeps, per
     (CTA, plan item) cell, each query row's sorted Top16 candidate keys in
@@ -925,7 +951,15 @@ def prefill_score_select(
     :func:`index_score_sharded` into score rows of ``K`` columns followed by
     :func:`topk_select_prefill` with the layout's ``index_scale`` /
     ``index_offset``, for every ``K`` of at least the plan's columns (half,
-    rounded up, when ``compact``), without the score rows."""
+    rounded up, when ``compact``), without the score rows.
+
+    With ``publish`` (keys ``recv_bases``, ``generations``, ``slot``,
+    ``t_base``, ``capacity``; :func:`prefill_publish_layout`) the same rows
+    go to their owners' receive rows instead, as tagged words: row ``(h,
+    t)`` to rank ``h / hpr``'s rows ``[slot, rank, h % hpr, t_base + t]``;
+    ``carrier`` is then unused (``None``).  The owner's
+    :func:`merge_candidates` with ``prefill=True`` and that slot's
+    ``expected_generations`` merges them."""
     _world(tp, rank)
     _query("q", q)
     if not isinstance(plan, MSAIcpScorePlan):
@@ -949,7 +983,25 @@ def prefill_score_select(
         block_table, plan.batch, (plan.columns + blocks_per_page - 1) // blocks_per_page
     )
     _vector("num_valid_pages", num_valid_pages, torch.int32, t)
-    _carrier(carrier, h, t)
+    if publish is None:
+        _carrier(carrier, h, t)
+    else:
+        hpr = h // tp
+        pub_gens = publish["generations"]
+        if (
+            pub_gens.dtype != torch.int32
+            or not pub_gens.is_contiguous()
+            or tuple(pub_gens.shape)
+            != (NUM_SLOT_SETS, h, int(publish["capacity"]))
+        ):
+            raise ValueError("publish generations must be contiguous int32 [3, H, capacity]")
+        _vector("recv_bases", publish["recv_bases"], torch.int64, tp)
+        if publish["slot"] not in range(NUM_SLOT_SETS):
+            raise ValueError("publish slot must be 0, 1 or 2")
+        if not 0 <= publish["t_base"] <= publish["t_base"] + t <= publish["capacity"]:
+            raise ValueError("publish rows t_base + T must fit the capacity")
+        if hpr * tp != h:
+            raise ValueError("the heads must split evenly over the ranks")
     _forced(force_begin_blocks, force_end_blocks)
     num_ctas = plan.packed_work_range.numel()
     need = (
@@ -977,10 +1029,17 @@ def prefill_score_select(
         pool=pool,
         carrier=carrier,
         work_range=plan.packed_work_range,
+        **(
+            {}
+            if publish is None
+            else {"recv_bases": publish["recv_bases"], "generations": publish["generations"]}
+        ),
     )
     arch = cake_jit.device_arch(dev)
     scorer = cake_jit.route("score_topk16", rows, arch, page=page_size)
-    merger = cake_jit.route("prefill_list_carrier", None, arch)
+    merger = cake_jit.route(
+        "prefill_list_carrier" if publish is None else "prefill_list_publish", None, arch
+    )
     values = {
         # The TMA descriptors read FP8 bytes.
         "q": q.view(torch.uint8),
@@ -1013,11 +1072,20 @@ def prefill_score_select(
         "page_size": page_size,
         "compact": int(compact),
         "bt_stride": block_table.stride(0),
-        "carrier_stride_h": carrier.stride(0),
-        "carrier_stride_t": carrier.stride(1),
+        "carrier_stride_h": 0 if carrier is None else carrier.stride(0),
+        "carrier_stride_t": 0 if carrier is None else carrier.stride(1),
         "force_begin": force_begin_blocks,
         "force_end": force_end_blocks,
     }
+    if publish is not None:
+        values.update(
+            recv_bases=publish["recv_bases"],
+            generations=publish["generations"],
+            t_base=int(publish["t_base"]),
+            slot=int(publish["slot"]),
+            heads_per_rank=h // tp,
+            capacity=int(publish["capacity"]),
+        )
     cake_jit.run_module(
         scorer,
         values,
@@ -1421,12 +1489,13 @@ def merge_role(
     *, prefill: bool, tagged: bool, num_tokens: int, poll_first: bool = False
 ) -> str:
     """The merge role of one call (launch metadata only, every arch):
-    ``merge_prefill`` for a prefill merge, ``merge_tagged`` for a tagged decode
+    ``merge_prefill`` for a prefill merge (``merge_prefill_tagged`` over the
+    tagged rows of a prefill publish), ``merge_tagged`` for a tagged decode
     merge with ``poll_first`` (the facade's decode chain), ``merge_legacy`` for
     a legacy decode merge of at least ``LEGACY_MERGE_MIN_TOKENS`` tokens, else
     ``merge``."""
     if prefill:
-        return "merge_prefill"
+        return "merge_prefill_tagged" if tagged else "merge_prefill"
     if tagged and poll_first:
         return "merge_tagged"
     if not tagged and num_tokens >= LEGACY_MERGE_MIN_TOKENS:
@@ -1461,10 +1530,8 @@ def merge_candidates(
     tagged = expected_generations is not None
     dc = _token_count(token_count)
     if not _trusted:
-        if prefill and (tagged or enable_pdl):
-            raise ValueError(
-                "the prefill merge takes neither expected_generations nor enable_pdl"
-            )
+        if prefill and enable_pdl:
+            raise ValueError("the prefill merge takes no enable_pdl")
         if recv_slot.ndim != 4:
             raise ValueError("recv_slot must be [world, heads_per_rank, capacity, row]")
     world, hpr, capacity, row = recv_slot.shape
