@@ -97,3 +97,26 @@ def test_nvfp4_prefill_infinite_sink():
         assert torch.isposinf(lse[:, ::2]).all()
         assert torch.isneginf(lse[0, 1::2]).all()
         assert (f["out"].float()[0] == 0).all()
+
+
+@pytest.mark.parametrize("offset", [2, 4, 6])
+def test_nvfp4_prefill_mega_offset_query(offset):
+    """BF16-pair alignment suffices, including during graph replay."""
+    f = prefill_fixture(1, "nvfp4", heads=16, prefill_tokens=65)
+    mega, _, lse = prefill_calls(f)
+    mega()
+    expected = f["out"].float().clone(), f["scales"].clone(), lse.clone()
+    storage = torch.empty(f["q"].numel() + offset, device="cuda", dtype=torch.bfloat16)
+    query = storage[offset:].view_as(f["q"])
+    query.copy_(f["q"])
+    f["q"] = query
+    mega, _, lse = prefill_calls(f)
+    mega()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mega()
+    graph.replay()
+    for actual, reference in zip(
+        (f["out"].float(), f["scales"], lse), expected, strict=True
+    ):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)

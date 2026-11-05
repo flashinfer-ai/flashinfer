@@ -34,13 +34,27 @@ using CutePrefillQRopeLayout = decltype(cute::composition(
 
 static_assert(Dsv4Nvfp4Layout::SCALE_GROUP_SIZE == SF_VEC_SIZE);
 
-// Both Q groups and the padded P rows are 16-byte aligned.
+// Public Q views need only BF16-pair (4-byte) alignment. Preserve wide loads
+// for the usual allocation and use word loads for offset tensor views.
+__device__ __forceinline__ uint4 load_q_group8(const bf16* input) {
+  if ((reinterpret_cast<uintptr_t>(input) & 15) == 0) return *reinterpret_cast<const uint4*>(input);
+  const auto* words = reinterpret_cast<const uint32_t*>(input);
+  return make_uint4(words[0], words[1], words[2], words[3]);
+}
+
+__device__ __forceinline__ uint2 load_q_group4(const bf16* input) {
+  if ((reinterpret_cast<uintptr_t>(input) & 7) == 0) return *reinterpret_cast<const uint2*>(input);
+  const auto* words = reinterpret_cast<const uint32_t*>(input);
+  return make_uint2(words[0], words[1]);
+}
+
+// P rows are aligned; global Q may be an offset tensor view.
 __device__ __forceinline__ void cute_quantize_prefill_group16(const bf16* input, uint8_t* output,
                                                               uint8_t* scale) {
   float values[16];
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
-    uint4 packed = *reinterpret_cast<const uint4*>(input + i * 8);
+    uint4 packed = load_q_group8(input + i * 8);
     const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -77,10 +91,8 @@ __device__ __forceinline__ void cute_quantize_prefill_q_nvfp4_to_smem(
   for (int i = threadIdx.x * 4; i < HPB * KV::D_ROPE; i += MATH_THREADS * 4) {
     const int head = i / KV::D_ROPE;
     const int dim = i % KV::D_ROPE;
-    uint2 packed =
-        head < valid_hpb
-            ? *reinterpret_cast<const uint2*>(q_base + head * KV::D_QK + KV::D_NOPE + dim)
-            : make_uint2(0, 0);
+    uint2 packed = head < valid_hpb ? load_q_group4(q_base + head * KV::D_QK + KV::D_NOPE + dim)
+                                    : make_uint2(0, 0);
     bf16 result[4];
     const bf16* values = reinterpret_cast<const bf16*>(&packed);
 #pragma unroll
