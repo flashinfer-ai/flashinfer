@@ -18,6 +18,7 @@ import operator
 import subprocess
 import sys
 import types
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -1317,178 +1318,66 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
         assert route.program == ("decode_smallm", SHAPE_ROWS[row][-1][target]), row
 
 
-def _fake_context_queries(monkeypatch, state, calls):
-    """Driver queries over ``state``: the current stream's handle, its
-    context's handle, ID and SM count (``contexts`` overrides the ID and SM
-    count per context handle, ``current`` is the thread's current context --
-    which the special stream handles 0, 1 and 2 run on -- ``primary`` the
-    device's primary context, ``stream_err`` fails the stream's context query
-    and ``green`` maps a stream to its green context's context); ``calls``
-    logs each SM resource read and ``state["queries"]`` counts the driver
-    queries by name."""
+def _fake_stream_context(monkeypatch, counts):
+    """The stream-context library answering ``counts[stream]`` (``-1``, the
+    driver cannot tell, when absent) for the raw handle of the current torch
+    stream, ``state["stream"]``; ``calls`` logs each ``(stream, device)``
+    query."""
 
-    queries = state.setdefault("queries", {})
+    state, calls = {"stream": 7}, []
 
-    def query(name):
-        queries[name] = queries.get(name, 0) + 1
-
-    def context_of(context):
-        return state.get("contexts", {}).get(
-            context, (state["context_id"], state["sms"])
-        )
-
-    def stream_context(stream):
-        query("stream")
-        assert stream == state["stream"]
-        if state.get("stream_err"):
-            return state["stream_err"], 0
-        if stream in (0, 1, 2):
-            return 0, state.get("current", state["handle"])
-        return 0, state["handle"]
-
-    def current_context():
-        query("current")
-        return 0, state.get("current", state["handle"])
-
-    def context_id(context):
-        query("id")
-        return 0, context_of(context)[0]
-
-    def context_resource(context, sm_type):
-        key, sms = context_of(context)
-        calls.append(key)
-        return 0, SimpleNamespace(sm=SimpleNamespace(smCount=sms))
-
-    def primary_context(index):
-        query("primary")
-        return 0, state.get("primary", 0)
-
-    def green_context(stream):
-        query("green")
-        return state.get("green", {}).get(stream)
+    def stream_context_sm_count(stream, device):
+        calls.append((stream, device))
+        return counts.get(stream, -1)
 
     monkeypatch.setattr(
         torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
     )
-    for cache in (
-        "_CONTEXT_SM_COUNTS",
-        "_PRIMARY_CONTEXTS",
-        "_PRIMARY_SM_COUNTS",
-        "_CU_STREAMS",
-    ):
-        monkeypatch.setattr(cake_api, cache, {})
-    monkeypatch.setattr(
-        cake_api,
-        "_CONTEXT_QUERIES",
-        (
-            stream_context,
-            current_context,
-            context_id,
-            context_resource,
-            "sm",
-            lambda stream: stream,
-            primary_context,
-            green_context,
-        ),
-    )
+    monkeypatch.setattr(cake_api, "_STREAM_CONTEXT_SM_COUNT", stream_context_sm_count)
+    return state, calls
 
 
-def test_cake_fmha_smallm_partition_sm_count_follows_a_reused_stream_handle(
+def test_cake_fmha_smallm_launch_sm_count_is_bounded_by_the_streams_context(
     monkeypatch,
 ) -> None:
-    """A stream handle (and a context handle) reused by a new green context of
-    another size reads the new context's SM count: the count is cached per
-    context ID, which the driver never reuses."""
+    """A small-M launch plans on the SMs of its stream's context where that
+    holds fewer than the device (a green context's partition), else on the
+    device's, as it does when the driver cannot tell; each CUDA launch asks
+    once, with its stream's raw handle and its device index."""
 
-    state = {"stream": 7, "handle": 0x10, "context_id": 1}
-    state["sms"] = 64
-    calls = []
-    _fake_context_queries(monkeypatch, state, calls)
-    assert cake_api._stream_context_sm_count(0) == 64
-    assert cake_api._stream_context_sm_count(0) == 64
-    assert calls == [1]
-    # The 64-SM context and its stream are destroyed; a 32-SM context reuses
-    # both handles.
-    state.update(context_id=2, sms=32)
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert calls == [1, 2]
+    state, calls = _fake_stream_context(monkeypatch, {7: 32, 8: 148, 9: 152})
+    device = torch.device("cuda", 1)
+    assert cake_api._smallm_launch_sm_count(device, 148) == 32
+    state["stream"] = 8
+    assert cake_api._smallm_launch_sm_count(device, 148) == 148
+    state["stream"] = 9
+    assert cake_api._smallm_launch_sm_count(device, 148) == 148
+    state["stream"] = 10
+    assert cake_api._smallm_launch_sm_count(device, 148) == 148
+    assert calls == [(7, 1), (8, 1), (9, 1), (10, 1)]
+    assert cake_api._smallm_launch_sm_count(torch.device("cpu"), 148) == 148
+    assert len(calls) == 4
 
 
-def test_cake_fmha_smallm_partition_sm_count_is_cached_per_context_id(
+def test_cake_fmha_smallm_launch_sm_count_without_the_stream_context_library(
     monkeypatch,
 ) -> None:
-    """The SM count is cached per context ID: a launch on a stream of a known
-    context reads no SM resource, a stream of a new context reads its own, and
-    the per-thread default stream runs on the thread's current context (a
-    green context made current reads the partition)."""
+    """Where the stream-context library does not load, the module warns once
+    and plans every small-M launch on the device's SM count."""
 
-    state = {"stream": 7, "handle": 0x10, "context_id": 1, "sms": 64}
-    state["contexts"] = {0x10: (1, 64), 0x30: (2, 32), 0x50: (3, 148)}
-    calls = []
-    _fake_context_queries(monkeypatch, state, calls)
-    assert cake_api._stream_context_sm_count(0) == 64
-    assert cake_api._stream_context_sm_count(0) == 64
-    assert calls == [1]
-    state.update(stream=8, handle=0x30)
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert calls == [1, 2]
-    state.update(stream=2, current=0x50)
-    assert cake_api._stream_context_sm_count(0) == 148
-    state["current"] = 0x30
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert calls == [1, 2, 3]
+    def unavailable():
+        raise RuntimeError("no host compiler")
 
-
-def test_cake_fmha_smallm_partition_sm_count_of_an_unanswered_stream_query(
-    monkeypatch,
-) -> None:
-    """Before CUDA 13, ``cuStreamGetCtx`` does not answer for a stream of
-    ``cuGreenCtxStreamCreate``: the launch reads the partition of the stream's
-    green context (``cuStreamGetCtx_v2``), never the thread's current
-    context.  Only a stream with no green context falls back to the current
-    context; once the stream query answers, the stream's own context is
-    read."""
-
-    state = {"stream": 7, "handle": 0x10, "context_id": 1, "sms": 32}
-    state.update(current=0x20, stream_err=1, green={7: 0x40})
-    state["contexts"] = {0x20: (5, 148), 0x40: (6, 32)}
-    calls = []
-    _fake_context_queries(monkeypatch, state, calls)
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert calls == [6] and "current" not in state["queries"]
-    state["green"] = {}
-    assert cake_api._stream_context_sm_count(0) == 148
-    assert calls == [6, 5] and state["queries"]["current"] == 1
-    state["stream_err"] = 0
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert calls == [6, 5, 1]
-
-
-def test_cake_fmha_smallm_partition_sm_count_of_the_primary_context_is_one_query(
-    monkeypatch,
-) -> None:
-    """A launch on a stream of the device's primary context (retained once, so
-    its handle is never another context's) reads its SM count once and then
-    makes one driver query, the stream's context; a green context's stream
-    still reads its own count per context ID."""
-
-    state = {"stream": 7, "handle": 0x10, "context_id": 1, "sms": 152}
-    state["primary"] = 0x10
-    calls = []
-    _fake_context_queries(monkeypatch, state, calls)
-    assert cake_api._stream_context_sm_count(0) == 152
-    assert calls == [1] and state["queries"]["primary"] == 1
-    before = dict(state["queries"])
-    for _ in range(3):
-        assert cake_api._stream_context_sm_count(0) == 152
-    assert state["queries"] == {**before, "stream": before["stream"] + 3}
-    state.update(stream=8, handle=0x30, context_id=2, sms=32)
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert cake_api._stream_context_sm_count(0) == 32
-    assert calls == [1, 2]
-    assert state["queries"]["id"] == before["id"] + 2
-    assert state["queries"]["primary"] == 1 and "current" not in state["queries"]
+    monkeypatch.setattr(cake_api, "_STREAM_CONTEXT_SM_COUNT", None)
+    monkeypatch.setattr(cake_api, "load_cake_fmha_stream_context_module", unavailable)
+    monkeypatch.setattr(torch._C, "_cuda_getCurrentRawStream", lambda index: 7)
+    device = torch.device("cuda", 0)
+    with pytest.warns(RuntimeWarning, match="no host compiler"):
+        assert cake_api._smallm_launch_sm_count(device, 148) == 148
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert cake_api._smallm_launch_sm_count(device, 148) == 148
+    assert cake_api._STREAM_CONTEXT_SM_COUNT is False
 
 
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
@@ -1906,23 +1795,25 @@ def _driver_green_context(sms):
 
 
 def _without_stream_context(stream):
-    """Make ``cuStreamGetCtx`` fail for ``stream`` as it does before CUDA 13
-    for a stream of ``cuGreenCtxStreamCreate`` (``CUDA_ERROR_NOT_SUPPORTED``),
-    so the module must find the stream's partition another way."""
+    """Make the module's stream query skip ``cuStreamGetCtx`` for ``stream``,
+    which before CUDA 13 fails for a stream of ``cuGreenCtxStreamCreate``
+    (``CUDA_ERROR_NOT_SUPPORTED``), so the module must find the stream's
+    partition another way."""
 
-    from cuda.bindings import driver
+    module = cake_api.load_cake_fmha_stream_context_module()
+    query, unanswered = (
+        cake_api._stream_context_query(),
+        (module.stream_context_sm_count_unanswered),
+    )
+    raw, index = stream.cuda_stream, torch.cuda.current_device()
+    device_sms = torch.cuda.get_device_properties(index).multi_processor_count
+    if not query or not 0 < unanswered(raw, index) < device_sms:
+        raise RuntimeError("the driver gives no cuStreamGetCtx_v2 green context")
 
-    queries = cake_api._context_queries()
-    if not queries or queries[7](driver.CUstream(stream.cuda_stream)) is None:
-        raise RuntimeError("cuda.bindings gives no cuStreamGetCtx_v2 green context")
-    stream_context, raw = queries[0], stream.cuda_stream
+    def stream_context_sm_count(handle, device):
+        return (unanswered if handle == raw else query)(handle, device)
 
-    def unsupported(cu_stream):
-        if int(cu_stream) == raw:
-            return driver.CUresult.CUDA_ERROR_NOT_SUPPORTED, driver.CUcontext(0)
-        return stream_context(cu_stream)
-
-    cake_api._CONTEXT_QUERIES = (unsupported, *queries[1:])
+    cake_api._STREAM_CONTEXT_SM_COUNT = stream_context_sm_count
 
 
 def _smallm_partition_child(sms, rows, api, green=None):
@@ -2020,6 +1911,53 @@ def _smallm_partition_child(sms, rows, api, green=None):
             ),
             flush=True,
         )
+
+
+@_GPU
+def test_cake_fmha_stream_context_sm_count_reads_each_streams_context() -> None:
+    """The stream-context library reads the SM count of the context each
+    stream runs on: the device's for the legacy and per-thread default streams
+    and a torch stream; a green context's partition for its stream, also where
+    ``cuStreamGetCtx`` does not answer (as before CUDA 13); the partition for
+    the default streams while the green context is the thread's current
+    context, and the device's again once it is not."""
+
+    from cuda.bindings import driver
+
+    module = cake_api.load_cake_fmha_stream_context_module()
+    query = module.stream_context_sm_count
+    unanswered = module.stream_context_sm_count_unanswered
+    index = torch.cuda.current_device()
+    device_sms = torch.cuda.get_device_properties(index).multi_processor_count
+    side = torch.cuda.Stream()
+    for handle in (0, 1, 2, side.cuda_stream):
+        assert query(handle, index) == device_sms, handle
+        assert unanswered(handle, index) == device_sms, handle
+    try:
+        green, stream, partition = _driver_green_context(_PARTITION_SMS)
+    except Exception as error:  # noqa: BLE001 - any failure means no partition
+        pytest.skip(f"no green context: {error!r}")
+    raw = stream.cuda_stream
+    try:
+        assert _PARTITION_SMS <= partition < device_sms
+        assert query(raw, index) == partition
+        assert unanswered(raw, index) == partition
+        err, context = driver.cuCtxFromGreenCtx(green)
+        assert not int(err), err
+        (err,) = driver.cuCtxPushCurrent(context)
+        assert not int(err), err
+        try:
+            for handle in (0, 1, 2):
+                assert query(handle, index) == partition, handle
+            assert query(side.cuda_stream, index) == device_sms
+        finally:
+            driver.cuCtxPopCurrent()
+        for handle in (0, 1, 2):
+            assert query(handle, index) == device_sms, handle
+    finally:
+        del stream
+        driver.cuStreamDestroy(driver.CUstream(raw))
+        driver.cuGreenCtxDestroy(green)
 
 
 @_GPU

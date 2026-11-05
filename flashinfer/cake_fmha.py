@@ -42,6 +42,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_decode_quant_bf16q_module,
     load_cake_fmha_decode_quant_fp8_module,
     load_cake_fmha_decode_quant_nvfp4_module,
+    load_cake_fmha_stream_context_module,
 )
 from .cake_fmha_request_ordered import (
     CakeFmhaRequestOrderedDecodePlan,
@@ -1791,143 +1792,32 @@ def _smallm_sm_count(device: torch.device) -> int:
     return count
 
 
-# CUDA context unique ID (``cuCtxGetId``) -> the SM count of that context (a
-# green context's partition).  The driver never reuses a context ID in a
-# process, unlike a destroyed context's (or stream's) handle, so a new green
-# context never reads another one's count.
-_CONTEXT_SM_COUNTS: dict[int, int] = {}
-# CUDA device index -> the handle of its primary context, retained here for the
-# process (``0`` when the driver does not give it).  A retained context is never
-# destroyed, so no other context ever has its handle.
-_PRIMARY_CONTEXTS: dict[int, int] = {}
-# Primary context handle -> its SM count: a launch on a stream of the primary
-# context (every stream but a green context's) reads it with one driver call.
-_PRIMARY_SM_COUNTS: dict[int, int] = {}
-# Raw stream handle -> its ``CUstream``: a binding given a plain int builds a
-# new ``CUstream`` on every call.
-_CU_STREAMS: dict[int, Any] = {}
-# ``(cuStreamGetCtx, cuCtxGetCurrent, cuCtxGetId, cuCtxGetDevResource, SM
-# resource type, CUstream, device index -> its retained primary context,
-# CUstream -> the context of its green context or None)`` of
-# ``cuda.bindings.driver`` once resolved; ``False`` without them (then a launch
-# is planned on the device's SM count).
-_CONTEXT_QUERIES: Any = None
+# ``stream_context_sm_count(stream, device)`` of the stream-context library
+# (``csrc/cake_fmha_stream_context.cpp``) once loaded: the SM count of the CUDA
+# context a raw stream handle runs on (a green context's partition), ``-1`` when
+# the driver cannot tell; ``False`` when the library cannot be loaded (then a
+# launch is planned on the device's SM count).  One FFI call per launch: the same
+# driver queries through the Python bindings cost several microseconds of host
+# time per launch.
+_STREAM_CONTEXT_SM_COUNT: Any = None
 
 
-def _context_queries() -> Any:
-    global _CONTEXT_QUERIES
-    if _CONTEXT_QUERIES is None:
+def _stream_context_query() -> Any:
+    global _STREAM_CONTEXT_SM_COUNT
+    if _STREAM_CONTEXT_SM_COUNT is None:
         try:
-            from cuda.bindings import driver
-
-            def primary_context(index: int) -> tuple[Any, Any]:
-                err, device = driver.cuDeviceGet(index)
-                if int(err):
-                    return err, None
-                return driver.cuDevicePrimaryCtxRetain(device)
-
-            # Before CUDA 13, ``cuStreamGetCtx`` returns
-            # ``CUDA_ERROR_NOT_SUPPORTED`` for a stream of
-            # ``cuGreenCtxStreamCreate``; ``cuStreamGetCtx_v2`` (CUDA 12.5)
-            # gives its green context, whose ``cuCtxFromGreenCtx`` context holds
-            # the partition.  (Its other output is then the primary context.)
-            stream_contexts = getattr(driver, "cuStreamGetCtx_v2", None)
-            from_green = getattr(driver, "cuCtxFromGreenCtx", None)
-
-            def green_context(stream: Any) -> Any:
-                if stream_contexts is None or from_green is None:
-                    return None
-                err, _, green = stream_contexts(stream)
-                if int(err) or not int(green):
-                    return None
-                err, context = from_green(green)
-                return None if int(err) or not int(context) else context
-
-            _CONTEXT_QUERIES = (
-                driver.cuStreamGetCtx,
-                driver.cuCtxGetCurrent,
-                driver.cuCtxGetId,
-                driver.cuCtxGetDevResource,
-                driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
-                driver.CUstream,
-                primary_context,
-                green_context,
+            module = load_cake_fmha_stream_context_module()
+            _STREAM_CONTEXT_SM_COUNT = module.stream_context_sm_count
+        except Exception as error:  # noqa: BLE001
+            warnings.warn(
+                "cake_fmha: the stream-context library did not load, so small-M "
+                "decode splits are planned on the device's SM count (a launch on "
+                f"an SM partition may not complete): {error}",
+                RuntimeWarning,
+                stacklevel=2,
             )
-        except (ImportError, AttributeError):
-            _CONTEXT_QUERIES = False
-    return _CONTEXT_QUERIES
-
-
-def _context_sm_count(queries: Any, context: Any) -> int | None:
-    """The SM count of CUDA ``context``, read once per context ID."""
-
-    _, _, context_id, context_resource, sm_type = queries[:5]
-    err, key = context_id(context)
-    count = None if int(err) else _CONTEXT_SM_COUNTS.get(key)
-    if count is None:
-        err_resource, resource = context_resource(context, sm_type)
-        if int(err_resource):
-            return None
-        count = int(resource.sm.smCount)
-        if not int(err):
-            _CONTEXT_SM_COUNTS[key] = count
-    return count
-
-
-def _primary_context(queries: Any, index: int) -> int:
-    """The handle of device ``index``'s primary context (``0`` when the driver
-    does not give it), retained once."""
-
-    handle = _PRIMARY_CONTEXTS.get(index)
-    if handle is None:
-        err, context = queries[6](index)
-        handle = _PRIMARY_CONTEXTS[index] = 0 if int(err) else int(context)
-    return handle
-
-
-def _stream_context_sm_count(index: int) -> int | None:
-    """The SM count of the CUDA context of device ``index``'s current torch
-    stream (a green context's stream runs on its partition; the legacy and
-    per-thread default streams run on the thread's current context); ``None``
-    when the driver cannot tell.
-
-    Every launch resolves its stream's context (``cuStreamGetCtx``; where that
-    does not answer, the stream's green context, else the thread's current
-    context).  The device's primary context is known by its handle, so a
-    launch on one of its streams makes no other driver call; any other
-    context's count is cached per context ID (``cuCtxGetId``).  The
-    stream is not keyed by ``cuStreamGetId``: on a stream being captured into
-    a CUDA graph that query returns ``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED``
-    and invalidates the capture (driver 580, in global and relaxed capture
-    modes alike), while the context queries are legal during a capture."""
-
-    queries = _CONTEXT_QUERIES
-    if queries is None:
-        queries = _context_queries()
-    if not queries:
-        return None
-    stream = torch._C._cuda_getCurrentRawStream(index)
-    cu_stream = _CU_STREAMS.get(stream)
-    if cu_stream is None:
-        cu_stream = _CU_STREAMS[stream] = queries[5](stream)
-    err, context = queries[0](cu_stream)
-    handle = 0 if int(err) else int(context)
-    if not handle:
-        context = queries[7](cu_stream)
-        if context is None:
-            err, context = queries[1]()
-            if int(err):
-                return None
-        handle = int(context)
-        if not handle:
-            return None
-    count = _PRIMARY_SM_COUNTS.get(handle)
-    if count is not None:
-        return count
-    count = _context_sm_count(queries, context)
-    if count is not None and handle == _primary_context(queries, index):
-        _PRIMARY_SM_COUNTS[handle] = count
-    return count
+            _STREAM_CONTEXT_SM_COUNT = False
+    return _STREAM_CONTEXT_SM_COUNT
 
 
 # Whether a small-M launch plans its split count on the SMs of its stream's
@@ -1959,17 +1849,35 @@ def _smallm_launch_sm_count(
 ) -> int:
     """The SMs a small-M launch on ``device``'s current torch stream can hold
     at once: the device's (:func:`_smallm_sm_count`, or ``device_sm_count``
-    when the caller has it), bounded by the stream's CUDA context (a green
-    context's partition).  Every split of a small-M tile waits for all of them,
-    so a split count planned on more SMs than the stream's context holds never
-    completes."""
+    when the caller has it), bounded by the SMs of the stream's CUDA context (a
+    green context's partition).  Every split of a small-M tile waits for all of
+    them, so a split count planned on more SMs than the stream's context holds
+    never completes.
+
+    Every launch reads its stream's context: the legacy and per-thread default
+    streams run on the thread's current context, any other stream on its own
+    (``cuStreamGetCtx``; where that does not answer, before CUDA 13 for a stream
+    of ``cuGreenCtxStreamCreate``, its green context).  The device's primary
+    context is retained once and known by its handle, so a launch on one of its
+    streams makes one driver call; any other context's count is cached per
+    context ID (``cuCtxGetId``), which the driver never reuses, unlike a
+    destroyed context's or stream's handle.  The stream is not keyed by
+    ``cuStreamGetId``: on a stream being captured into a CUDA graph that query
+    returns ``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`` and invalidates the
+    capture (driver 580, in global and relaxed capture modes alike), while the
+    context queries are legal during a capture."""
 
     count = _smallm_sm_count(device) if device_sm_count is None else device_sm_count
     if device.type != "cuda":
         return count
+    query = _STREAM_CONTEXT_SM_COUNT
+    if query is None:
+        query = _stream_context_query()
+    if not query:
+        return count
     index = device.index if device.index is not None else torch.cuda.current_device()
-    partition = _stream_context_sm_count(index)
-    return count if partition is None or partition >= count else partition
+    partition = query(torch._C._cuda_getCurrentRawStream(index), index)
+    return count if partition < 0 or partition >= count else partition
 
 
 # On-device load-balanced split-KV decode (Cake routes ``decode_balanced_bf16_v1``
