@@ -455,6 +455,11 @@ class KdaArena:
         return base + "_lean"
 
 
+# the default arena option, for the per-call comparisons and defaults of the host path (KdaArena is frozen: one
+# shared instance equals every KdaArena() and builds none per call)
+_DEFAULT_ARENA = KdaArena()
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Host plan (pure function of the host-known scalars)
 
@@ -610,6 +615,20 @@ class Plan:
     gate: str = "g"
     l2n: str = "off"
 
+    def _memo(self, key: Any, compute: Callable[[], Any]) -> Any:
+        """``compute()``, once per plan and ``key``: a value derived from the plan's fields and the registry alone
+        (the plan is frozen and its record and grid tables are never modified, so the value holds for the plan's
+        lifetime; :func:`plan` returns the same object for a repeated problem).  Kept in the instance dict, outside
+        the dataclass fields: equality, ``repr`` and ``dataclasses.replace`` do not see it."""
+        memo = self.__dict__.get("_derived")
+        if memo is None:
+            memo = self.__dict__["_derived"] = {}
+        try:
+            return memo[key]
+        except KeyError:
+            value = memo[key] = compute()
+            return value
+
     def dispatched(self, stage: str, path: str) -> bool:
         """Whether ``path`` launches a record of ``stage``."""
         return self._records(path).get(stage) is not None
@@ -698,7 +717,10 @@ class Plan:
         """Whether a checkpoint hand-off record of this plan carries the forward's ``w`` (its backward then launches
         no ``wy``): the light set carries it (:attr:`light_saves_wu`), or the saving forward launches a WY program
         (``wy_fwd`` on the ``fwd`` path; the fused serial recurrence ``fwdh_wy_rows`` writes no ``w``)."""
-        return self.light_saves_wu or self.dispatched("wy_fwd", "fwd")
+        return self._memo(
+            "handoff_keeps_w",
+            lambda: self.light_saves_wu or self.dispatched("wy_fwd", "fwd"),
+        )
 
     @property
     def handoff_twin(self) -> str | None:
@@ -706,9 +728,22 @@ class Plan:
         forward's (:data:`cake_jit.HANDOFF_TWINS` of ``record("fwd_intra", "fwd")``: the same program that also
         writes every ``gk`` row and the internal ``beta``), ``None`` where the twin is not delivered for this
         architecture."""
+        return self._memo("handoff_twin", self._handoff_twin)
+
+    def _handoff_twin(self) -> str | None:
         twin = cake_jit.HANDOFF_TWINS.get(self.record("fwd_intra", "fwd"))
         record = None if twin is None else cake_jit.MODULES.get(twin)
         return twin if record is not None and self.arch in record["arches"] else None
+
+    def _light_prep_writes_kb(self) -> bool:
+        """Whether the prep record of the light path (:attr:`light_path`) writes ``kb`` (a hand-off tape record
+        without ``w`` needs it: its backward launches ``wy``, which reads ``kb``)."""
+
+        def writes_kb() -> bool:
+            prep = self.record("bwd_prep", self.light_path)
+            return "kb" in cake_jit.MODULES[prep]["logical"].values()
+
+        return self._memo("light_prep_writes_kb", writes_kb)
 
     @property
     def tape_wy_twin(self) -> str | None:
@@ -725,15 +760,19 @@ class Plan:
     def handoff_bytes(self, rows: bool = False) -> int:
         """Device bytes one checkpoint hand-off record of this plan adds to the light saved set
         (:func:`_handoff_bytes`); ``rows``: a row record (``kb`` too where :attr:`handoff_keeps_w` is false)."""
-        return _handoff_bytes(
-            self.NC_pad,
-            self.R,
-            self.H,
-            self.NSEG,
-            self.S,
-            fwd_w=self.dispatched("wy_fwd", "fwd") and not self.light_saves_wu,
-            rows=rows,
-            kb=rows and not self.handoff_keeps_w,
+        rows = bool(rows)
+        return self._memo(
+            ("handoff_bytes", rows),
+            lambda: _handoff_bytes(
+                self.NC_pad,
+                self.R,
+                self.H,
+                self.NSEG,
+                self.S,
+                fwd_w=self.dispatched("wy_fwd", "fwd") and not self.light_saves_wu,
+                rows=rows,
+                kb=rows and not self.handoff_keeps_w,
+            ),
         )
 
     def stages(self, path: str) -> tuple[str, ...]:
@@ -2959,6 +2998,25 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+# torch's current raw stream handle of a device, as an integer (no ``torch.cuda.Stream`` object is built); the
+# ``torch.cuda`` form on a torch build without the binding
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _current_stream_handle(index: int) -> int:
+    """``torch.cuda.current_stream(index).cuda_stream``: the handle of device ``index``'s current torch stream."""
+    if _RAW_STREAM is not None:
+        return _RAW_STREAM(index)
+    return torch.cuda.current_stream(index).cuda_stream
+
+
+def _device_arch(index: int) -> str:
+    """``cake_jit.device_arch(index)`` with the capability read once per device (:func:`_capability_arch`); a
+    device no record targets raises as ``cake_jit.device_arch`` does."""
+    arch = _capability_arch(index)
+    return cake_jit.device_arch(index) if arch is None else arch
+
+
 def _seq_order(lengths: Sequence[int]) -> tuple[int, ...]:
     """The layout table's ``seq_order`` (the documents by chain rank) from host integers: by chunk count
     ``ceil(n / 64)``, most first, ties in document order.  Every program that writes the table (``table``,
@@ -3801,7 +3859,7 @@ def _entry_acquire(
     if torch.cuda.is_current_stream_capturing():
         return build(), None
     index = _device_index(device)
-    option = KdaArena() if arena is None else arena
+    option = _DEFAULT_ARENA if arena is None else arena
     lengths = (
         tuple(int(x) for x in doc_lengths)
         if option.batched and doc_lengths is not None
@@ -3809,7 +3867,7 @@ def _entry_acquire(
     )
     key = (
         index,
-        torch.cuda.current_stream(index).cuda_stream,
+        _current_stream_handle(index),
         S,
         N,
         H,
@@ -5014,7 +5072,7 @@ def _forward(
         and save_for_backward
         and not tape
         and doc_lengths is None
-        and ws.arena_option == KdaArena()
+        and ws.arena_option == _DEFAULT_ARENA
         and _handoff_engages(p, handoff["mode"], ws.device_index)
     ):
         wants_rows = _handoff_wants_rows(p, ws.device_index, own_ws)
@@ -5211,7 +5269,7 @@ def _forward(
                 },
                 nbytes=p.handoff_bytes(rows=kind == "rows"),
                 key=_handoff_key(p, scale),
-                stream=torch.cuda.current_stream(ws.device_index).cuda_stream,
+                stream=_current_stream_handle(ws.device_index),
             )
     else:
         # the fallback's token-layout qn / kn of the whole problem are per-call tensors (a group's u / w slots are
@@ -5679,7 +5737,7 @@ def _bwd_call(
     option = (
         arena
         if arena is not None
-        else (KdaArena() if workspace is None else workspace.arena_option)
+        else (_DEFAULT_ARENA if workspace is None else workspace.arena_option)
     )
     if saved is None and option.lean:
         raise ValueError(
@@ -5701,7 +5759,7 @@ def _bwd_call(
     accepted = None
     if handoff is not None and gp is None and l2n == "off":
         index = _device_index(v.device)
-        p = plan(S, N, H, cake_jit.sm_count(index), cake_jit.device_arch(index))
+        p = plan(S, N, H, cake_jit.sm_count(index), _device_arch(index))
         accepted = _handoff_accept(
             handoff, p, saved, option, doc_lengths, scale, index=index
         )
@@ -6503,10 +6561,12 @@ def _handoff_dispatch_modes() -> bool:
 
 def _handoff_stamp(tensors: Sequence[torch.Tensor]) -> tuple:
     """Pointer, shape, stride, dtype and device of each tensor (the versions travel through the record's aliases: a
-    tensor the backward unpacks through checkpoint's hooks need not share its input's version counter)."""
+    tensor the backward unpacks through checkpoint's hooks need not share its input's version counter).  The device
+    is its CUDA index (``-1`` off CUDA): a record's inputs passed the forward's checks on one CUDA device, so the
+    index tells every other device apart; the shape and strides as torch returns them (``torch.Size`` equals the
+    tuple), so no ``torch.device`` or tuple is built per tensor."""
     return tuple(
-        (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
-        for t in tensors
+        (t.data_ptr(), t.shape, t.stride(), t.dtype, t.get_device()) for t in tensors
     )
 
 
@@ -6691,21 +6751,13 @@ def _handoff_fits(rec: _HandoffRecord, p: Plan) -> bool:
     backward then launches ``wy``), whether the light path's prep record writes the ``kb`` that ``wy`` reads; a
     row record (``gk`` set) needs the plan's intra twin, ``gk`` / ``kg`` / ``beta_int`` of the plan's shapes and
     ``kb`` exactly where it keeps no ``w``; a tape record holds none of the four."""
-
-    def shaped(t: torch.Tensor | None, shape: tuple[int, ...], dtype) -> bool:
-        return (
-            t is not None
-            and tuple(t.shape) == shape
-            and t.dtype == dtype
-            and t.is_contiguous()
-        )
-
-    prep = cake_jit.MODULES[p.record("bwd_prep", p.light_path)]["logical"]
+    shaped = _handoff_shaped
     seg = p.recur == "seg"
     rows = (p.R, p.H, D)
+    keeps_w = p.handoff_keeps_w
     if rec.gk is None:
         kind_ok = all(t is None for t in (rec.kg, rec.beta_int, rec.kb)) and (
-            rec.w is not None or "kb" in prep.values()
+            rec.w is not None or p._light_prep_writes_kb()
         )
     else:
         kind_ok = (
@@ -6713,18 +6765,23 @@ def _handoff_fits(rec: _HandoffRecord, p: Plan) -> bool:
             and shaped(rec.gk, rows, torch.float32)
             and shaped(rec.kg, rows, torch.bfloat16)
             and shaped(rec.beta_int, (p.R, p.H), torch.float32)
-            and (rec.kb is not None) == (not p.handoff_keeps_w)
+            and (rec.kb is not None) == (not keeps_w)
             and (rec.kb is None or shaped(rec.kb, rows, torch.bfloat16))
         )
     return (
         shaped(rec.h, (p.NC_pad, p.H, D, D), torch.bfloat16)
         and shaped(rec.v_new, rows, torch.bfloat16)
-        and (rec.w is not None) == p.handoff_keeps_w
+        and (rec.w is not None) == keeps_w
         and (rec.w is None or shaped(rec.w, rows, torch.bfloat16))
         and (rec.seg_m is not None) == seg
         and (rec.seg_m is None or shaped(rec.seg_m, (p.NSEG, p.H, D, D), torch.float32))
         and kind_ok
     )
+
+
+def _handoff_shaped(t: torch.Tensor | None, shape: tuple[int, ...], dtype) -> bool:
+    """Whether a record tensor is present, of ``shape`` and ``dtype``, and contiguous (:func:`_handoff_fits`)."""
+    return t is not None and t.shape == shape and t.dtype == dtype and t.is_contiguous()
 
 
 def _handoff_accept(
@@ -6751,7 +6808,7 @@ def _handoff_accept(
         path is not None
         and path == p.light_path
         and doc_lengths is None
-        and option == KdaArena()
+        and option == _DEFAULT_ARENA
         and rec.key == _handoff_key(p, scale)
         and _handoff_fits(rec, p)
     )
@@ -6811,17 +6868,25 @@ def _handoff_drop_locked(dev: _HandoffDevice, key: int) -> None:
     _handoff_outcome_locked(dev, hit=False)
 
 
+def _handoff_device_locked(index: int) -> _HandoffDevice:
+    """Device ``index``'s entry of :data:`_handoff_devices`, created when missing (under ``_handoff_lock``; an
+    existing entry costs no new :class:`_HandoffDevice`)."""
+    dev = _handoff_devices.get(index)
+    if dev is None:
+        dev = _handoff_devices[index] = _HandoffDevice()
+    return dev
+
+
 def _handoff_count(index: int, *, hit: bool) -> None:
     """Count the backward's verdict on a record it took."""
     with _handoff_lock:
-        dev = _handoff_devices.setdefault(index, _HandoffDevice())
-        _handoff_outcome_locked(dev, hit=hit)
+        _handoff_outcome_locked(_handoff_device_locked(index), hit=hit)
 
 
 def _handoff_note(index: int, counter: str) -> None:
     """Count a refusal (``unverified``, ``refused_hooks``, ``refused_blocked``, ``refused_disabled``)."""
     with _handoff_lock:
-        _handoff_devices.setdefault(index, _HandoffDevice()).stats[counter] += 1
+        _handoff_device_locked(index).stats[counter] += 1
 
 
 def _handoff_request(
@@ -6849,7 +6914,7 @@ def _handoff_request(
     task = _handoff_task()
     if task is None or task == -1:
         return None
-    index = _device_index(device)
+    index = v.get_device()  # a CUDA tensor's device index (_device_index of its device)
     dev = _handoff_devices.get(index)
     if dev is not None and dev.disabled:
         _handoff_note(index, "refused_disabled")
@@ -6876,7 +6941,7 @@ def _handoff_admit(
     device first becomes a tape record (:func:`_handoff_demote_locked`, ``demoted``), and a tape record that still
     does not fit is refused (``refused_budget``)."""
     with _handoff_lock:
-        dev = _handoff_devices.setdefault(index, _HandoffDevice())
+        dev = _handoff_device_locked(index)
         if dev.disabled:
             return None
         for key in [
@@ -6951,7 +7016,7 @@ def _handoff_publish(
         )
         rec.queued = True
     with _handoff_lock:
-        dev = _handoff_devices.setdefault(index, _HandoffDevice())
+        dev = _handoff_device_locked(index)
         key = aqk.data_ptr()
         if key in dev.records:
             _handoff_drop_locked(dev, key)
@@ -6973,7 +7038,8 @@ def _handoff_take(
     the recompute (read through the record's aliases), the inputs' pointers, shapes, strides and dtypes, the
     current stream, no capture / compile.  A mismatch drops the record (a miss); :func:`_handoff_accept` checks
     the call, the plan key and the tensors."""
-    index = _device_index(aqk.device)
+    # a CUDA tensor's device index (_device_index of its device, which refuses any other device)
+    index = aqk.get_device() if aqk.is_cuda else _device_index(aqk.device)
     dev = _handoff_devices.get(index)
     if dev is None or not dev.records:
         return None
@@ -6984,18 +7050,20 @@ def _handoff_take(
             return None
         dev.live_bytes -= rec.nbytes
     try:
+        # the same storage: both data pointers are the key, so with one dtype the storages start at the same
+        # address exactly when the storage offsets agree (no storage object is built)
         ok = (
-            rec.aqk.untyped_storage().data_ptr() == aqk.untyped_storage().data_ptr()
-            and rec.aqk.data_ptr() == key
-            and tuple(rec.aqk.shape) == tuple(aqk.shape)
-            and tuple(rec.aqk.stride()) == tuple(aqk.stride())
+            rec.aqk.data_ptr() == key
             and rec.aqk.dtype == aqk.dtype
+            and rec.aqk.storage_offset() == aqk.storage_offset()
+            and rec.aqk.shape == aqk.shape
+            and rec.aqk.stride() == aqk.stride()
             and rec.aqk._version == rec.aqk_version
             and all(
                 a._version == v for a, v in zip(rec.aliases, rec.versions, strict=True)
             )
             and rec.stamp == _handoff_stamp(inputs)
-            and rec.stream == torch.cuda.current_stream(index).cuda_stream
+            and rec.stream == _current_stream_handle(index)
             and not _handoff_blocked()
         )
     except Exception:
