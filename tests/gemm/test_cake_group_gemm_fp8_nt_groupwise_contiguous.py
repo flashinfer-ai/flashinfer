@@ -94,6 +94,8 @@ BLOCK_SCALED_ONLY_TESTS = frozenset(
         "test_block_scaled_accepts_block_rows_weight_scales",
         "test_block_scaled_launch_rebinds_token_operands_and_captures",
         "test_block_scaled_rejects_invalid_inputs",
+        "test_block_scaled_route_rule_sm107a",
+        "test_block_scaled_block_n_routes_write_the_same_bits",
         "test_block_scaled_only_arch_routes_name_registered_programs",
         "test_block_scaled_only_arch_rejects_float32_scales",
     }
@@ -1137,6 +1139,89 @@ def test_block_scaled_launch_rebinds_token_operands_and_captures():
     _assert_block_scaled(
         out3, _reference(a2, b, a_scale2, b_scale, m_indices2), m_indices2
     )
+
+
+def test_block_scaled_route_rule_sm107a():
+    """SM107a single-run layouts: 256 columns below 32 K blocks at any M-block count, 128 from 32 K blocks; other
+    architectures and run32 layouts unchanged."""
+    # Qwen3.5-35B gate_up, 4096 tokens (510 M blocks, 16 K blocks) on 216 SMs: 256 on SM107a, 128 elsewhere.
+    assert (
+        bs_route_for_shape(
+            65280,
+            1024,
+            2048,
+            alignment=128,
+            sm_count=216,
+            num_groups=256,
+            arch="sm_107a",
+        )
+        == BS_N256_ROUTE
+    )
+    assert (
+        bs_route_for_shape(
+            65280,
+            1024,
+            2048,
+            alignment=128,
+            sm_count=216,
+            num_groups=256,
+        )
+        == BS_N128_ROUTE
+    )
+    # Qwen3.5-397B gate_up, 8 / 32 tokens (512 experts, 32 K blocks) and an unknown group count: 128.
+    assert (
+        bs_route_for_shape(
+            65152,
+            512,
+            4096,
+            alignment=128,
+            sm_count=216,
+            num_groups=512,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    assert (
+        bs_route_for_shape(
+            65408,
+            512,
+            4096,
+            alignment=128,
+            sm_count=216,
+            num_groups=512,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    assert (
+        bs_route_for_shape(
+            65152,
+            512,
+            4096,
+            alignment=128,
+            sm_count=216,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    # A 256-column grid below one wave still takes 128 columns; run32 layouts keep the shared rule.
+    assert (
+        bs_route_for_shape(
+            1664,
+            256,
+            4096,
+            alignment=128,
+            sm_count=216,
+            num_groups=8,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    for sm_count in (212, 216):
+        for m in (16000, 16256):
+            kwargs = dict(alignment=32, sm_count=sm_count, num_groups=512)
+            sm107a = bs_route_for_shape(m, 512, 4096, arch="sm_107a", **kwargs)
+            assert sm107a == bs_route_for_shape(m, 512, 4096, **kwargs)
 
 
 def test_block_scaled_route_rule():
@@ -2252,6 +2337,53 @@ def test_block_scaled_rejects_invalid_inputs():
             m_indices,
             out=storage[1 : 1 + int(m_indices.numel()) * 256].view(-1, 256),
         )
+
+
+# (group_counts, N, K, alignment): 128-row aligned layouts both single-run
+# BLOCK_N routes serve.
+BLOCK_SCALED_BLOCK_N_CASES = [
+    pytest.param([128, 0, 256, 1, 130], 512, 512, 128, id="single_k512"),
+    pytest.param([100, 0, 3, 69, 128, 200, 1, 64], 1024, 2048, 128, id="single_k2048"),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment", BLOCK_SCALED_BLOCK_N_CASES)
+def test_block_scaled_block_n_routes_write_the_same_bits(
+    group_counts, n, k, alignment, monkeypatch
+):
+    """On SM107a the single-run BLOCK_N 128 and 256 routes write the same bits.
+
+    The host picks BLOCK_N by shape, so one layout can reach either single-run
+    program; both accumulate every output in the same K order.
+    """
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) != "sm_107a":
+        pytest.skip("checks the SM107a programs")
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        group_counts, n, k, alignment=alignment, seed=4790 + k, device=device
+    )
+    m = int(m_indices.numel())
+    routes = {128: BS_N128_ROUTE, 256: BS_N256_ROUTE}
+    outs = {}
+    for block_n, route in routes.items():
+        monkeypatch.setattr(host, "bs_block_n", lambda *args, _n=block_n, **kw: _n)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, out=out, alignment=alignment
+        )
+        assert prepared.route == route
+        prepared.launch()
+        outs[block_n] = out
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[128], expected, m_indices)
+    routed = m_indices >= 0
+    assert torch.equal(
+        outs[128][routed].view(torch.int16), outs[256][routed].view(torch.int16)
+    )
 
 
 def test_block_scaled_only_arch_routes_name_registered_programs():
