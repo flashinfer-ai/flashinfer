@@ -20,7 +20,11 @@ switches the plan for good to the turnover build with its own bindings.  A
 bin-mix launch whose longest task is longer than
 ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks takes the module's long-task
 bin-mix build (``_RENDERED_WORK_BIN_MIX_LONG_ROUTES``) where the loader names
-one, with the same plan words.
+one, with the same plan words.  A turnover launch whose sequences all hold
+exactly ``BF16_WORK_BIN_TURN_E128_LEN`` tokens and that takes no other build
+takes the module's 128-token turnover build
+(``_RENDERED_WORK_BIN_TURN_E128_ROUTES``) where the loader names one, with the
+same table and schedule.
 
 The device queries are stubbed (SM100a / SM103a, 148 or 152 SMs), the tensors
 live on the meta device and the loader's ``PreparedKernel`` is a recording
@@ -46,6 +50,7 @@ MAGIC = 0x58313221
 BIN_MIX = "cake_kda_prefill_000000000000000b1a11"
 SHORT_TURN = "cake_kda_prefill_00000000000000005407"
 LONG_MIX = "cake_kda_prefill_00000000000000010a11"
+E128_TURN = "cake_kda_prefill_0000000000000000e128"
 REFUSED = RuntimeError(
     f"kernel_{BIN_MIX}: cudaLaunchKernelExC failed: too many blocks in cooperative launch"
 )
@@ -360,6 +365,53 @@ def test_shipped_loader_names_the_unbounded_direct_short_task_build():
         )
 
 
+def test_e128_scope_and_program_lookup(monkeypatch):
+    # The 128-token turnover build beside a turnover build, for a launch whose
+    # sequences all hold exactly BF16_WORK_BIN_TURN_E128_LEN tokens.
+    arch = "sm_103a"
+    module, program = _turnover_pair(arch)
+    assert runtime.BF16_WORK_BIN_TURN_E128_LEN == 128
+    scope = runtime._work_bin_turn_e128_scope
+    assert scope([128]) and scope([128] * 16) and scope([128] * 320)
+    assert not scope([127] * 16) and not scope([129] * 16)
+    assert not scope([128] * 15 + [127]) and not scope([128] * 15 + [129])
+    assert not scope([64] * 16) and not scope([1, 128])
+    monkeypatch.setattr(registry, "_RENDERED_WORK_BIN_TURN_E128_ROUTES", {arch: {}})
+    lookup = runtime._work_bin_turn_e128_program
+    assert lookup(program, arch, [128] * 16) is None
+    monkeypatch.setattr(
+        registry, "_RENDERED_WORK_BIN_TURN_E128_ROUTES", {arch: {module: E128_TURN}}
+    )
+    assert lookup(program, arch, [128] * 16) == E128_TURN
+    assert lookup(program, arch, [128] * 25) == E128_TURN
+    assert lookup(program, arch, [127] * 16) is None
+    assert lookup(program, arch, [128] * 15 + [129]) is None
+    assert lookup(module, arch, [128] * 16) is None
+    assert lookup(None, arch, [128] * 16) is None
+    assert lookup(program, "sm_100a", [128] * 16) is None
+
+
+def test_shipped_loader_names_the_bounded_e128_builds():
+    # The 128-token turnover builds, on sm_103a alone: one per bounded N32
+    # direct module, beside its turnover build (which ships for both
+    # architectures and stays the route of every other turnover launch).
+    routes = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES
+    assert set(routes) == {"sm_100a", "sm_103a"} and routes["sm_100a"] == {}
+    assert len(routes["sm_103a"]) == 3
+    for module, program in routes["sm_103a"].items():
+        turnover = TURN["sm_103a"][module]
+        assert program != turnover and program not in TURN["sm_100a"].values()
+        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_103a"]
+        assert set(registry._RENDERED_MODULES[turnover]["arches"]) == {
+            "sm_100a",
+            "sm_103a",
+        }
+        lookup = runtime._work_bin_turn_e128_program
+        assert lookup(turnover, "sm_103a", [128] * 16) == program
+        assert lookup(turnover, "sm_103a", [128] * 15 + [127]) is None
+        assert lookup(TURN["sm_100a"][module], "sm_100a", [128] * 16) is None
+
+
 def test_long_task_program_lookup(monkeypatch):
     # The long-task bin-mix build beside a bin-mix build, for a bin-mix launch
     # whose longest task has more than BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS
@@ -450,12 +502,14 @@ class _Kernel:
         self.arch = arch
         short_turn = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES.get(arch, {})
         long_task = registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.get(arch, {})
+        e128 = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES.get(arch, {})
         self.work_bins = (
             name in registry._RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
             or name in registry._RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).values()
             or name in registry._RENDERED_WORK_BIN_MIX_ROUTES.get(arch, {}).values()
             or name in short_turn.values()
             or name in long_task.values()
+            or name in e128.values()
         )
         self._ready = False
         self.prepared = []
@@ -567,9 +621,17 @@ def planner(monkeypatch):
     return part
 
 
-def _prepare(lengths, heads, *, plan_cache=None):
-    """A bench_tb wrapper row on meta tensors: packed sequences, unbounded gate,
-    indexed FP32 pool, FP32 checkpoint rows every 64 tokens, strided beta."""
+def _prepare(
+    lengths,
+    heads,
+    *,
+    plan_cache=None,
+    lower_bound=None,
+    checkpoint_dtype=torch.float32,
+):
+    """A bench_tb wrapper row on meta tensors: packed sequences, unbounded gate
+    (or ``lower_bound``), indexed FP32 pool, checkpoint rows every 64 tokens
+    (FP32, or ``checkpoint_dtype``), strided beta."""
     dev = "meta"
     total = sum(lengths)
     shape = (1, total, heads, HEAD_DIM)
@@ -593,12 +655,12 @@ def _prepare(lengths, heads, *, plan_cache=None):
         out=torch.empty(shape, dtype=torch.bfloat16, device=dev),
         initial_state=pool,
         final_state=pool,
-        lower_bound=None,
+        lower_bound=lower_bound,
         cu_seqlens=torch.empty((n + 1,), dtype=torch.int64, device=dev),
         sequence_lengths=tuple(lengths),
         state_indices=torch.empty((n,), dtype=torch.int32, device=dev),
         state_checkpoints=torch.empty(
-            (rows, heads, HEAD_DIM, HEAD_DIM), dtype=torch.float32, device=dev
+            (rows, heads, HEAD_DIM, HEAD_DIM), dtype=checkpoint_dtype, device=dev
         ),
         checkpoint_cu_starts=torch.empty((n + 1,), dtype=torch.int64, device=dev),
         checkpoint_every_n_tokens=CHECKPOINT_EVERY,
@@ -820,6 +882,54 @@ def test_short_task_launch_takes_the_short_task_build(
         else:
             assert plan.module.name in TURN[arch].values(), (arch, tokens, count)
             assert SHORT_TURN not in {kernel.name for kernel in _Kernel.made}
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads", "takes"),
+    [
+        ([128] * 16, 12, True),
+        ([128] * 16, 16, True),
+        ([128] * 25, 12, True),
+        ([127] * 16, 12, False),
+        ([129] * 16, 16, False),
+        ([128] * 15 + [127], 12, False),
+    ],
+    ids=[
+        "BS16xT128-h12",
+        "BS16xT128-h16",
+        "BS25xT128-h12",
+        "BS16xT127-h12",
+        "BS16xT129-h16",
+        "BS15xT128+T127-h12",
+    ],
+)
+def test_bounded_e128_launch_takes_the_e128_build(
+    planner, monkeypatch, lengths, heads, takes
+):
+    # A bounded turnover launch on sm_103a whose sequences all hold exactly 128
+    # tokens takes the module's 128-token build (same grid, table and
+    # schedule); every other launch, and every launch on sm_100a, keeps the
+    # turnover build and builds nothing else.
+    for arch in ("sm_100a", "sm_103a"):
+        planner.configure(arch, mix=False)
+        monkeypatch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_TURN_E128_ROUTES",
+            {
+                "sm_100a": {},
+                "sm_103a": {module: E128_TURN for module in TURN["sm_103a"]},
+            },
+        )
+        plan = _launch(
+            _prepare(lengths, heads, lower_bound=-5.0, checkpoint_dtype=torch.bfloat16)
+        )
+        made = {kernel.name for kernel in _Kernel.made}
+        if takes and arch == "sm_103a":
+            assert plan.module.name == E128_TURN, (arch, lengths, heads)
+            assert plan.schedule.endswith("_turnover"), plan.schedule
+        else:
+            assert plan.module.name != E128_TURN, (arch, lengths, heads)
+            assert E128_TURN not in made, (arch, lengths, heads)
 
 
 def test_admitted_launch_keeps_the_bin_mix_build_over_the_short_task_build(

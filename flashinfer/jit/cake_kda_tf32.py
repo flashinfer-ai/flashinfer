@@ -18,7 +18,8 @@ work-bin turnover build, ``_RENDERED_WORK_BIN_POOL_ROUTES`` for the helper-pool 
 of its bin-mix build, ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` for the short-task build
 of its turnover build, ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` for the long-task build of
 its bin-mix build, ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` for the hybrid build
-of an M64 value-split module's owner/helper build).
+of an M64 value-split module's owner/helper build, ``_RENDERED_WORK_BIN_TURN_E128_ROUTES``
+for the 128-token build of a module's turnover build).
 """
 
 from functools import cache
@@ -5567,6 +5568,18 @@ _RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES: dict[str, dict[str, str]] = {
     "sm_103a": {},
 }
 
+# architecture -> shipped module -> generated 128-token build of the module's
+# work-bin turnover build (``_RENDERED_WORK_BIN_TURN_ROUTES``): the same bins
+# and bits with the compute warps loading a bin's first entering state.  The
+# runtime takes it instead of the turnover build on turnover launches whose
+# sequences all hold exactly ``BF16_WORK_BIN_TURN_E128_LEN`` tokens and that
+# take no bin-mix, helper-pool or short-task build; every other launch keeps
+# the turnover build.
+_RENDERED_WORK_BIN_TURN_E128_ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {},
+    "sm_103a": {},
+}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -6659,6 +6672,7 @@ class PreparedKernel:
             or name in _RENDERED_WORK_BIN_POOL_ROUTES.get(arch, {}).values()
             or name in _RENDERED_WORK_BIN_TURN_SHORT_ROUTES.get(arch, {}).values()
             or name in _RENDERED_WORK_BIN_MIX_LONG_ROUTES.get(arch, {}).values()
+            or name in _RENDERED_WORK_BIN_TURN_E128_ROUTES.get(arch, {}).values()
         )
         native = load(name, arch)
         entry = record["ffi_entry"]
