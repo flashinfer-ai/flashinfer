@@ -1,9 +1,15 @@
-"""SM90 (Hopper) FP4 MegaMoE: NVFP4 fused/split and MXFP4 fused.
+"""FP4 MegaMoE: SM90 (Hopper) NVFP4 fused/split and MXFP4 fused; SM120 MXFP4 fused.
 
 The fused paths perform cross-rank token dispatch, two W4A8 GEMMs, clamped
 SwiGLU and top-k reduction in one persistent kernel. NVFP4 split uses separate
-L1 and L2 launches. All paths use FP8 activations and NVLink symmetric memory.
-NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up to 32.
+L1 and L2 launches. All paths use FP8 activations and symmetric memory.
+NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up to 32
+on SM90.
+
+On SM120 (RTX PRO 6000 class, PCIe peer-to-peer, no NVLink) only MXFP4 is
+available, for one host (up to eight ranks) and decode-size batches: the kernel
+requantises the staged FP8 activations to MXFP8 (E4M3 with a UE8M0 scale per 32
+channels) and runs both GEMMs on the block-scaled FP4 x FP8 tensor-core MMA.
 
 Usage::
 
@@ -25,6 +31,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 
 from ..jit.megamoe import (
+    gen_megamoe_sm120_mxfp4_module,
     gen_megamoe_sm90_layout_module,
     gen_megamoe_sm90_mxfp4_module,
     gen_megamoe_sm90_nvfp4_module,
@@ -34,6 +41,7 @@ from ..jit.megamoe import (
 from .heuristics import (
     CANDIDATE_BLOCK_M,
     FusedPlan,
+    align,
     get_num_max_pool_tokens,
     get_num_padded_sf_pool_tokens,
     select_fused_plan,
@@ -63,6 +71,62 @@ __all__ = [
 @functools.cache
 def _get_jit_module(factory, *args):
     return factory(*args).build_and_load()
+
+
+# SM120: the kernel's per-call counter block (sm120_mxfp4_mega_moe.cuh: kCtrL1 + kMaxEl ints; error word at 3)
+_SM120_COUNTER_INTS = 8 + 256
+_SM120_ERROR_INDEX = 3
+_SM120_MAX_RANKS = 8
+_SM120_MAX_TOPK = 8
+_SM120_MAX_LOCAL_EXPERTS = 256
+_SM120_MAX_HIDDEN = 7936  # the dispatch stages one MXFP8 row (hidden + hidden / 32 bytes) in 8 KB of shared memory
+
+
+def _is_sm120() -> bool:
+    return torch.cuda.get_device_capability()[0] == 12
+
+
+def _sm120_layout(ranks, experts, capacity, topk, hidden, intermediate):
+    """Byte offsets of the SM120 symmetric buffer, in the order the binding reads them:
+    [total, x, x_sf, topk_idx, topk_weights, pool_x, pool_xs, pool_meta, recv_cnt,
+    recv_flag, comb, comb_flag, route, route_flag, inter, inter_s, ctr]. Every region
+    sits at the same offset on every rank; pool_* / recv_* / route* are written by the
+    other ranks, comb by the expert ranks, the rest only locally."""
+    epr = experts // ranks
+    rows = (
+        epr * ranks * capacity
+    )  # an expert pool slot per (local expert, source rank, token)
+    sizes = (
+        capacity * hidden,
+        capacity * (hidden // 128) * 4,
+        capacity * topk * 8,
+        capacity * topk * 4,
+        rows * hidden,
+        rows * (hidden // 128) * 4,
+        rows * 4,
+        ranks * epr * 4,
+        ranks * 4,
+        capacity * topk * hidden * 2,
+        ranks * 4,
+        ranks * (1 + capacity * topk) * 4,
+        ranks * 4,
+        rows * intermediate,
+        rows * (intermediate // 128) * 4,
+        _SM120_COUNTER_INTS * 4,
+    )
+    offsets, cursor = [], 0
+    for size in sizes:
+        offsets.append(cursor)
+        cursor = align(cursor + size, 256)
+    return [cursor, *offsets]
+
+
+def _sm120_weight_strides(hidden, intermediate):
+    """Bytes per expert of the SM120 L1 / L2 weights: packed FP4 then one UE8M0 byte per 32 values."""
+    return (
+        2 * intermediate * hidden // 2 + 2 * intermediate * hidden // 32,
+        hidden * intermediate // 2 + hidden * intermediate // 32,
+    )
 
 
 def _jit_args(factory, plan, b):
@@ -151,6 +215,20 @@ class MegaMoESymmBuffer:
     ) -> None:
         import torch.distributed._symmetric_memory as symm_mem
 
+        self.sm120 = _is_sm120()
+        if self.sm120:
+            self._init_sm120(
+                symm_mem,
+                group,
+                num_experts,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+                intermediate_hidden,
+                activation_clamp,
+                fast_math,
+            )
+            return
         # Buffer geometry is format-independent; NVFP4 checks its narrower
         # deployment constraints when selecting a fused/split plan.
         select_mxfp4_fused_plan(
@@ -221,6 +299,88 @@ class MegaMoESymmBuffer:
         self.topk_weights = self._view(
             layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
         )
+
+    def _init_sm120(
+        self,
+        symm_mem,
+        group,
+        num_experts,
+        num_max_tokens_per_rank,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
+    ) -> None:
+        ranks = group.size()
+        if not 1 <= ranks <= _SM120_MAX_RANKS:
+            raise ValueError(
+                f"SM120 MegaMoE supports 1 to {_SM120_MAX_RANKS} ranks (one host)"
+            )
+        if num_experts <= 0 or num_experts % ranks:
+            raise ValueError("num_experts must divide evenly across ranks")
+        if num_experts // ranks > _SM120_MAX_LOCAL_EXPERTS:
+            raise ValueError(
+                f"SM120 MegaMoE supports at most {_SM120_MAX_LOCAL_EXPERTS} experts per rank"
+            )
+        if not 0 < num_topk <= min(_SM120_MAX_TOPK, num_experts):
+            raise ValueError(
+                f"num_topk must be in [1, min({_SM120_MAX_TOPK}, num_experts)] on SM120"
+            )
+        if hidden <= 0 or hidden % 256 or hidden > _SM120_MAX_HIDDEN:
+            raise ValueError(
+                f"hidden must be a multiple of 256 and at most {_SM120_MAX_HIDDEN} on SM120"
+            )
+        if intermediate_hidden <= 0 or intermediate_hidden % 256:
+            raise ValueError("intermediate_hidden must be a multiple of 256 on SM120")
+        if num_max_tokens_per_rank <= 0:
+            raise ValueError("num_max_tokens_per_rank must be positive")
+        self.group = group
+        self.num_experts = num_experts
+        self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.num_topk = num_topk
+        self.hidden = hidden
+        self.intermediate_hidden = intermediate_hidden
+        self.activation_clamp = activation_clamp
+        self.fast_math = fast_math
+        self.num_sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        layout = _sm120_layout(
+            ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+        )
+        self._offsets = layout
+        self.buffer = symm_mem.empty(layout[0], dtype=torch.int8, device="cuda")
+        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer.zero_()
+        group.barrier()
+        torch.cuda.synchronize()
+        self.x = self._view(
+            layout[1], (num_max_tokens_per_rank, hidden), torch.float8_e4m3fn
+        )
+        self.x_sf = self._view(
+            layout[2], (num_max_tokens_per_rank, hidden // 128), torch.float32
+        )
+        self.topk_idx = self._view(
+            layout[3], (num_max_tokens_per_rank, num_topk), torch.int64
+        )
+        self.topk_weights = self._view(
+            layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
+        )
+
+    def error(self) -> int:
+        """SM120: the kernel's error word, 0 while every spin wait completed. A wait that times out
+        (a rank that never entered the call) records its code here and the kernel exits instead of
+        hanging. Synchronizes with the device."""
+        if not self.sm120:
+            raise ValueError("error() is available on the SM120 path only")
+        ctr = self._view(self._offsets[-1], (_SM120_COUNTER_INTS,), torch.int32)
+        return int(ctr[_SM120_ERROR_INDEX].item())
 
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
         itemsize = torch.empty((), dtype=dtype).element_size()
@@ -319,6 +479,10 @@ class MegaMoESymmBuffer:
         int
             Number of distinct modules built.
         """
+        if self.sm120:  # one shape-generic MXFP4 module
+            _get_jit_module(gen_megamoe_sm120_mxfp4_module, self.fast_math)
+            torch.distributed.barrier(group=self.group)
+            return 1
         if kernel_family not in ("auto", "fused", "split"):
             raise ValueError(
                 f"kernel_family must be 'auto', 'fused' or 'split', got {kernel_family!r}"
@@ -422,6 +586,8 @@ def nvfp4_mega_moe(
     supports four or eight ranks, which must call matching families in matching order.
     """
     b = symm_buffer
+    if getattr(b, "sm120", False):
+        raise ValueError("SM120 MegaMoE supports MXFP4 weights only (mxfp4_mega_moe)")
     m = int(num_tokens if num_tokens is not None else y.shape[0])
     _validate_call(
         y,
@@ -488,7 +654,12 @@ def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
     if not 0 < m <= b.num_max_tokens_per_rank or m > getattr(b, "num_staged_tokens", 0):
         raise ValueError("num_tokens must fit the staged input and buffer capacity")
     epr = b.num_experts // b.group.size()
-    if weight_format == "nvfp4":
+    if getattr(b, "sm120", False):
+        shapes = tuple(
+            (epr, stride)
+            for stride in _sm120_weight_strides(b.hidden, b.intermediate_hidden)
+        )
+    elif weight_format == "nvfp4":
         shapes = (
             (epr, b.intermediate_hidden * 2, b.hidden // 128 * 80),
             (epr, b.hidden, b.intermediate_hidden // 128 * 80),
@@ -577,6 +748,13 @@ def mxfp4_mega_moe(
     All tensors must be contiguous and on the buffer's CUDA device. The rank
     count must be a power of two from 1 to 32. Every rank must invoke the kernel
     in matching order; MXFP4 always uses the fused family.
+
+    On SM120 one host's ranks (1 to 8) take part over PCIe peer-to-peer; the
+    weights come from :func:`transform_mxfp4_weights_for_mega_moe` on the same
+    device. The kernel targets decode-size batches: its expert pools hold
+    ``num_max_tokens_per_rank`` rows per (local expert, source rank), so the
+    buffer grows with that capacity. A rank whose peers never enter the call
+    records an error code (:meth:`MegaMoESymmBuffer.error`) instead of hanging.
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
@@ -591,6 +769,30 @@ def mxfp4_mega_moe(
         l1_global_scales,
         l2_global_scales,
     )
+    if b.sm120:
+        module = _get_jit_module(gen_megamoe_sm120_mxfp4_module, b.fast_math)
+        module.megamoe_sm120_mxfp4_fused(
+            y,
+            b.buffer,
+            b.handle.buffer_ptrs,
+            b.group.rank(),
+            l1_weights,
+            l2_weights,
+            b._offsets,
+            [
+                b.num_experts,
+                b.num_topk,
+                b.hidden,
+                b.intermediate_hidden,
+                b.num_max_tokens_per_rank,
+            ],
+            m,
+            float(b.activation_clamp),
+            cumulative_local_expert_recv_stats,
+            l1_global_scales,
+            l2_global_scales,
+        )
+        return y
     plan = select_mxfp4_fused_plan(
         b.num_sms,
         b.group.size(),

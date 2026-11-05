@@ -1,4 +1,4 @@
-"""JIT module generation for the three SM90 FP4 MegaMoE paths.
+"""JIT module generation for the SM90 FP4 MegaMoE paths and the SM120 MXFP4 path.
 
 The kernel resolves its shared-memory layout, task schedule and dispatch
 protocol at compile time, so one module is built per (shape, plan) pair. The
@@ -12,7 +12,7 @@ from pathlib import Path
 import jinja2
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, write_if_different
+from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags, write_if_different
 
 
 def _csrc_dir() -> Path:
@@ -344,4 +344,21 @@ def gen_megamoe_sm90_mxfp4_module(
             fast_math=fast_math,
         ),
         fast_math,
+    )
+
+
+def gen_megamoe_sm120_mxfp4_module(fast_math: bool) -> JitSpec:
+    """SM120 MXFP4 fused MegaMoE. Shapes are runtime arguments: one module per fast-math policy."""
+    uri = "megamoe_sm120_mxfp4" + ("_fm" if fast_math else "")
+    csrc = _csrc_dir()
+    directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "megamoe_sm120_mxfp4.cu"
+    write_if_different(source, (csrc / "megamoe_sm120_mxfp4.cu").read_text())
+    return gen_jit_spec(
+        uri,
+        [source],
+        extra_cuda_cflags=["-std=c++17", *sm120a_nvcc_flags],
+        extra_include_paths=[csrc, jit_env.FLASHINFER_CSRC_DIR],
+        use_fast_math=fast_math,
     )

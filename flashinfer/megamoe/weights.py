@@ -1,4 +1,4 @@
-"""Offline FP4 weight preparation for SM90 MegaMoE.
+"""Offline FP4 weight preparation for SM90 and SM120 MegaMoE.
 
 Input weights are ``(packed, scales)`` in row-major ``[experts, N, K/2]``
 and ``[experts, N, K/group_size]``. Packed bytes follow Marlin order: byte b in
@@ -20,6 +20,10 @@ transforms; FlashInfer does not read checkpoint layouts:
   (for example a power of two, which keeps the weights exact) and pass it as
   ``l1_global_scales`` / ``l2_global_scales`` at run time. L1 has one global
   per expert, so gate and up must share it.
+
+On SM120 (MXFP4) the transform targets the block-scaled FP4 x FP8 tensor-core
+MMA, which applies the E8M0 scales itself: the scale range above does not apply
+there, and each expert is one row of packed FP4 followed by its scale bytes.
 """
 
 from typing import Tuple
@@ -127,6 +131,57 @@ def transform_nvfp4_weights_for_mega_moe(
     return _transform(l1_weights, l2_weights, 16, False)
 
 
+def _marlin_to_codes(packed: torch.Tensor) -> torch.Tensor:
+    """[E, N, K/2] Marlin-order bytes -> [E, N, K] E2M1 codes in K order."""
+    e, n, half_k = packed.shape
+    words = packed.reshape(e, n, half_k // 4, 4)
+    return torch.cat((words >> 4, words & 15), dim=-1).reshape(e, n, half_k * 2)
+
+
+def _sm120_fragments(codes: torch.Tensor) -> torch.Tensor:
+    """[E, N, K] codes -> the SM120 lane-fragment layout: per 16-row block and K64 step, 32 lanes x 16 bytes, lane
+    (g, c) holding rows g and g + 8 at the K offsets its m16n8k32 A fragments read (low nibble first)."""
+    e, n, k = codes.shape
+    x = codes.reshape(
+        e, n // 16, 2, 8, k // 64, 2, 2, 4, 4
+    )  # [E, blk, half, g, k64, step, pair, c, j]
+    b = x[:, :, 0] | (x[:, :, 1] << 4)
+    return b.permute(0, 1, 3, 2, 6, 4, 5, 7).reshape(
+        e, -1
+    )  # [E, blk, k64, g, c, step, pair, j]
+
+
+def _sm120_scales(sf: torch.Tensor) -> torch.Tensor:
+    """[E, N, K/32] E8M0 -> per 16-row block and K128: 16 rows x 4 bytes (one word per row)."""
+    e, n, ks = sf.shape
+    return sf.reshape(e, n // 16, 16, ks // 4, 4).permute(0, 1, 3, 2, 4).reshape(e, -1)
+
+
+def _sm120_l1_rows(intermediate: int, device) -> torch.Tensor:
+    """Kernel row -> checkpoint row of L1: per 16-row block, gate rows 8b..8b+7 then up rows 8b..8b+7, so each
+    SwiGLU pair lands in one thread (accumulator rows g and g + 8)."""
+    r = torch.arange(2 * intermediate, device=device)
+    blk, w = r // 16, r % 16
+    return torch.where(w < 8, blk * 8 + w, intermediate + blk * 8 + (w - 8))
+
+
+def _transform_one_sm120(weights, gated):
+    packed, scales = weights
+    if packed.dtype != torch.uint8 or scales.dtype != torch.uint8:
+        raise ValueError("packed weights and raw scale bytes must have dtype uint8")
+    e, n, half_k = packed.shape
+    k = half_k * 2
+    if n % 128 or k % 256 or tuple(scales.shape) != (e, n, k // 32):
+        raise ValueError(
+            "SM120 weights need N % 128 == 0, K % 256 == 0 and E8M0 scales per 32"
+        )
+    codes, sf = _marlin_to_codes(packed), scales
+    if gated:
+        rows = _sm120_l1_rows(n // 2, packed.device)
+        codes, sf = codes[:, rows], sf[:, rows]
+    return torch.cat((_sm120_fragments(codes), _sm120_scales(sf)), dim=-1).contiguous()
+
+
 def transform_mxfp4_weights_for_mega_moe(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -150,5 +205,20 @@ def transform_mxfp4_weights_for_mega_moe(
     tuple[torch.Tensor, torch.Tensor]
         Contiguous L1 and L2 weight tensors in the kernel's packed layout,
         on the input device. Weight preparation runs before graph capture.
+        On an SM120 device the layout is the SM120 kernel's: ``[E, bytes]``
+        rows of packed FP4 followed by the expert's scale bytes, with
+        ``intermediate`` a multiple of 256.
     """
+    p1 = l1_weights[0]
+    if p1.is_cuda and torch.cuda.get_device_capability(p1.device)[0] == 12:
+        p2 = l2_weights[0]
+        if p1.ndim != 3 or p2.ndim != 3 or p1.shape[0] != p2.shape[0]:
+            raise ValueError("L1 and L2 must contain the same expert count")
+        if p1.shape[1] != p2.shape[2] * 4 or p1.shape[2] * 2 != p2.shape[1]:
+            raise ValueError(
+                "expected L1 [E, 2*intermediate, hidden/2] and L2 [E, hidden, intermediate/2]"
+            )
+        return _transform_one_sm120(l1_weights, True), _transform_one_sm120(
+            l2_weights, False
+        )
     return _transform(l1_weights, l2_weights, 32, True)
