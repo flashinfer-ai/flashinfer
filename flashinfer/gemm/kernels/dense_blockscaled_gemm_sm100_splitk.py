@@ -44,7 +44,10 @@ from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_w
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
-from .dense_blockscaled_gemm_sm100 import _per_token_fragment_plan
+from .dense_blockscaled_gemm_sm100 import (
+    _check_pdl_prologue_options,
+    _per_token_fragment_plan,
+)
 from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
 
 from cutlass.cutlass_dsl import (
@@ -248,6 +251,10 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         split_k_slices: int,
         enable_pdl: bool = True,
         per_token_alpha: Optional[str] = None,
+        pdl_prologue_operand: Optional[str] = None,
+        pdl_prologue_stages: int = 0,
+        pdl_prologue_l2_prefetch: bool = False,
+        pdl_signal_at: str = "kernel_end",
     ):
         """Configure one low-M split-K tactic.
 
@@ -262,7 +269,22 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 ``"n"`` per column; the swap_ab callers of this kernel use
                 ``"n"``). The scale is applied by the owner CTA after the
                 FP32 cluster reduction, so the sum order is unchanged.
+            pdl_prologue_operand, pdl_prologue_stages,
+            pdl_prologue_l2_prefetch, pdl_signal_at: as for
+                Sm100BlockScaledPersistentDenseGemmKernel, applied to this
+                CTA's K slice of its output tile (the swap_ab callers name the
+                weights ``"a"``).
         """
+        _check_pdl_prologue_options(
+            pdl_prologue_operand,
+            pdl_prologue_stages,
+            pdl_prologue_l2_prefetch,
+            pdl_signal_at,
+        )
+        self.pdl_prologue_operand = pdl_prologue_operand
+        self.pdl_prologue_stages = pdl_prologue_stages
+        self.pdl_prologue_l2_prefetch = pdl_prologue_l2_prefetch
+        self.pdl_signal_at = pdl_signal_at
 
         self.per_token_alpha = per_token_alpha
         self.acc_dtype = cutlass.Float32
@@ -970,6 +992,44 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             )
 
         #
+        # PDL prologue, L2 only (pdl_prologue_l2_prefetch without pre-loaded
+        # stages): the TMA warp prefetches the pdl_prologue_operand K blocks of
+        # this CTA's K slice before griddepcontrol_wait. Only that operand,
+        # which no predecessor writes, is touched before the wait.
+        #
+        if cutlass.const_expr(
+            self.pdl_prologue_l2_prefetch and self.pdl_prologue_stages == 0
+        ):
+            if warp_idx == self.tma_warp_id:
+                pf_sched = _SplitKOneTileScheduler.create(
+                    cute.arch.block_idx(), cta_rank_in_cluster
+                )
+                pf_coord = pf_sched.initial_work_tile_info().tile_idx
+                pf_l = pf_coord[2]
+                pf_k0 = cutlass.Int32(0)
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    pf_l = cutlass.Int32(0)
+                    pf_k0 = cutlass.Int32(pf_coord[2]) * k_block_cnt
+                if cutlass.const_expr(self.pdl_prologue_operand == "a"):
+                    pf_m = pf_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                    pf_a = tAgA[(None, pf_m, None, pf_l)]
+                    pf_sfa = tAgSFA[(None, pf_m, None, pf_l)]
+                    for pf_k in cutlass.range(0, k_block_cnt, unroll=1):
+                        cute.prefetch(tma_atom_a, pf_a[(None, pf_k0 + pf_k)])
+                        cute.prefetch(tma_atom_sfa, pf_sfa[(None, pf_k0 + pf_k)])
+                else:
+                    pf_sn = pf_coord[1]
+                    if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                        pf_sn = pf_coord[1] // 2
+                    elif cutlass.const_expr(self.cta_tile_shape_mnk[1] < 64):
+                        pf_sn = pf_coord[1] // self.sfb_sub_tiles_per_tile
+                    pf_b = tBgB[(None, pf_coord[1], None, pf_l)]
+                    pf_sfb = tBgSFB[(None, pf_sn, None, pf_l)]
+                    for pf_k in cutlass.range(0, k_block_cnt, unroll=1):
+                        cute.prefetch(tma_atom_b, pf_b[(None, pf_k0 + pf_k)])
+                        cute.prefetch(tma_atom_sfb, pf_sfb[(None, pf_k0 + pf_k)])
+
+        #
         # Cluster wait before tensor memory alloc
         #
         if cute.size(self.cluster_shape_mnk) > 1:
@@ -982,13 +1042,103 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         # PDL bookend: griddepcontrol_wait is always emitted; the actual PDL
         # behavior is controlled by use_pdl= in .launch(). The griddepcontrol
         # instructions are effectively no-ops when PDL is not enabled at
-        # the driver level.
-        griddepcontrol_wait()
+        # the driver level. With pdl_prologue_stages every warp waits in its
+        # role branch instead, the TMA warp after its pdl_prologue_operand
+        # copies.
+        if cutlass.const_expr(self.pdl_prologue_stages == 0):
+            griddepcontrol_wait()
+            if cutlass.const_expr(self.pdl_signal_at == "after_wait"):
+                griddepcontrol_launch_dependents()
 
         #
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
+            #
+            # PDL prologue: acquire the first stages of this CTA's K slice and
+            # issue their pdl_prologue_operand copies (data and scale factors)
+            # before griddepcontrol_wait. The first acquire of a stage does not
+            # wait and arms its full barrier with the whole stage's bytes, so
+            # the stage completes only once the other operand's copies, issued
+            # after the wait, land too.
+            #
+            pro_stages = cutlass.Int32(0)
+            if cutlass.const_expr(self.pdl_prologue_stages > 0):
+                pro_coord = (
+                    _SplitKOneTileScheduler.create(
+                        cute.arch.block_idx(), cta_rank_in_cluster
+                    )
+                    .initial_work_tile_info()
+                    .tile_idx
+                )
+                pro_l = pro_coord[2]
+                pro_k0 = cutlass.Int32(0)
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    pro_l = cutlass.Int32(0)
+                    pro_k0 = cutlass.Int32(pro_coord[2]) * k_block_cnt
+                pro_stages = min(cutlass.Int32(self.num_ab_stage), k_block_cnt)
+                pro_stages = min(cutlass.Int32(self.pdl_prologue_stages), pro_stages)
+                pro_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_ab_stage
+                )
+                if cutlass.const_expr(self.pdl_prologue_operand == "a"):
+                    pro_m = pro_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                    pro_a = tAgA[(None, pro_m, None, pro_l)]
+                    pro_sfa = tAgSFA[(None, pro_m, None, pro_l)]
+                    for _pro_k in cutlass.range(0, pro_stages, 1, unroll=1):
+                        ab_pipeline.producer_acquire(pro_state)
+                        cute.copy(
+                            tma_atom_a,
+                            pro_a[(None, pro_k0 + pro_state.count)],
+                            tAsA[(None, pro_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pro_state),
+                            mcast_mask=a_full_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atom_sfa,
+                            pro_sfa[(None, pro_k0 + pro_state.count)],
+                            tAsSFA[(None, pro_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pro_state),
+                            mcast_mask=sfa_full_mcast_mask,
+                        )
+                        pro_state.advance()
+                    if cutlass.const_expr(self.pdl_prologue_l2_prefetch):
+                        for pf_k in cutlass.range(pro_stages, k_block_cnt, unroll=1):
+                            cute.prefetch(tma_atom_a, pro_a[(None, pro_k0 + pf_k)])
+                            cute.prefetch(tma_atom_sfa, pro_sfa[(None, pro_k0 + pf_k)])
+                else:
+                    pro_sn = pro_coord[1]
+                    if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                        pro_sn = pro_coord[1] // 2
+                    elif cutlass.const_expr(self.cta_tile_shape_mnk[1] < 64):
+                        pro_sn = pro_coord[1] // self.sfb_sub_tiles_per_tile
+                    pro_b = tBgB[(None, pro_coord[1], None, pro_l)]
+                    pro_sfb = tBgSFB[(None, pro_sn, None, pro_l)]
+                    for _pro_k in cutlass.range(0, pro_stages, 1, unroll=1):
+                        ab_pipeline.producer_acquire(pro_state)
+                        cute.copy(
+                            tma_atom_b,
+                            pro_b[(None, pro_k0 + pro_state.count)],
+                            tBsB[(None, pro_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pro_state),
+                            mcast_mask=b_full_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atom_sfb,
+                            pro_sfb[(None, pro_k0 + pro_state.count)],
+                            tBsSFB[(None, pro_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pro_state),
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
+                        pro_state.advance()
+                    if cutlass.const_expr(self.pdl_prologue_l2_prefetch):
+                        for pf_k in cutlass.range(pro_stages, k_block_cnt, unroll=1):
+                            cute.prefetch(tma_atom_b, pro_b[(None, pro_k0 + pf_k)])
+                            cute.prefetch(tma_atom_sfb, pro_sfb[(None, pro_k0 + pf_k)])
+                griddepcontrol_wait()
+                if cutlass.const_expr(self.pdl_signal_at == "after_wait"):
+                    griddepcontrol_launch_dependents()
+
             #
             # Persistent tile scheduling loop
             #
@@ -1039,6 +1189,60 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
+                k_block_begin = 0
+                if cutlass.const_expr(self.pdl_prologue_stages > 0):
+                    # The PDL prologue acquired these stages and issued their
+                    # pdl_prologue_operand copies; add the other operand's.
+                    for _pro_k in cutlass.range(0, pro_stages, 1, unroll=1):
+                        if cutlass.const_expr(self.pdl_prologue_operand == "a"):
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_slice[
+                                    (None, k_block_start + ab_producer_state.count)
+                                ],
+                                tBsB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_sfb,
+                                tBgSFB_slice[
+                                    (None, k_block_start + ab_producer_state.count)
+                                ],
+                                tBsSFB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
+                        else:
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA_slice[
+                                    (None, k_block_start + ab_producer_state.count)
+                                ],
+                                tAsA[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=a_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_sfa,
+                                tAgSFA_slice[
+                                    (None, k_block_start + ab_producer_state.count)
+                                ],
+                                tAsSFA[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=sfa_full_mcast_mask,
+                            )
+                        ab_producer_state.advance()
+                    k_block_begin = pro_stages
+                    pro_stages = cutlass.Int32(0)
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_block_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
@@ -1047,7 +1251,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 # Tma load loop
                 #
-                for _k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
+                for _k_block in cutlass.range(k_block_begin, k_block_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -1163,6 +1367,10 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = (
                 self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
             )
+
+            # PDL prologue: TMEM and the partitions are ready; wait here.
+            if cutlass.const_expr(self.pdl_prologue_stages > 0):
+                griddepcontrol_wait()
 
             #
             # Persistent tile scheduling loop
@@ -1358,6 +1566,9 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            if cutlass.const_expr(self.pdl_signal_at == "after_mainloop"):
+                griddepcontrol_launch_dependents()
+
             #
             # Wait for accumulator buffer empty
             #
@@ -1470,6 +1681,11 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 num_stages=self.num_c_stage,
                 producer_group=c_producer_group,
             )
+
+            # PDL prologue: TMEM is allocated and the partitions are ready;
+            # wait before the tile loop reads per-token alpha or writes C.
+            if cutlass.const_expr(self.pdl_prologue_stages > 0):
+                griddepcontrol_wait()
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1711,6 +1927,9 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            if cutlass.const_expr(self.pdl_signal_at == "after_stores"):
+                griddepcontrol_launch_dependents()
+
             #
             # Dealloc the tensor memory buffer
             #
@@ -1729,7 +1948,11 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             #
             c_pipeline.producer_tail()
 
-        griddepcontrol_launch_dependents()
+        # The first launch_dependents of any warp signals the CTA, so the other
+        # pdl_signal_at points must not be preceded by this one (the TMA warp
+        # reaches it first); a CTA that issues none signals when it exits.
+        if cutlass.const_expr(self.pdl_signal_at == "kernel_end"):
+            griddepcontrol_launch_dependents()
 
     def _compute_grid(
         self,
