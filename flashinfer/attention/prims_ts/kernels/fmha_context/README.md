@@ -91,8 +91,17 @@ or `total_q` and `total_k` for packed storage—must each be at most
 reserves 255 values for the padded tail of the largest supported 256-row query
 work tile.
 
-Q and `out`, and contiguous-path K/V, must be compact, 16-byte-aligned CUDA
-tensors on one device. Paged K/V accepts positive, non-overlapping page/head/token
+Q, K, V, and `out` must be 16-byte-aligned CUDA tensors on one device.
+Q, K, and `out` must be compact on the contiguous path. Contiguous-context V
+permits padding between token rows and batches: its head/feature strides must
+be `(Dv, 1)`, its token stride must be at least `Hkv * Dv`, and a fixed-batch
+stride must be at least `(Sk - 1) * token_stride + Hkv * Dv`. Token and batch
+strides must be multiples of 16 bytes. These strides are runtime values, so
+compact and padded V reuse the same plan and compiled kernel without a copy.
+This applies to every supported V dtype and head dimension, including MLA.
+Captured CUDA graphs retain the captured V address and strides; update its
+contents in place, or recapture to change the view.
+Paged K/V accepts positive, non-overlapping page/head/token
 strides aligned to 16 bytes and unit head-dimension stride. The strides are
 runtime TensorMap inputs, so interleaved K/V slices need no repacking.
 Cumulative offsets, sequence lengths, and variable-window metadata must
@@ -132,7 +141,8 @@ Contiguous inputs:
   V: `[total_kv, Hkv, Dv]`; O: `[total_q, Hq, Dv]`.
 - Supported contiguous `(Dqk, Dv)` pairs: `(128, 128)`, `(192, 128)`,
   `(192, 192)`, and `(256, 256)`. The 192/128 path uses separate Q, K, and V tensors
-  with compact rows; callers do not pad the head dimension.
+  with compact heads/features; callers do not pad the head dimension. V may
+  have aligned token-row/batch padding as described above.
 - Packed metadata: compact CUDA `int32[B + 1]` `qo_indptr` and `kv_indptr`.
   Both start at zero, are nondecreasing, and end at the corresponding packed
   tensor extent.

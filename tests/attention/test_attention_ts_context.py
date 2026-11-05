@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -965,6 +966,183 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
     assert context_module._ContextPlanState.__dataclass_params__.frozen is True
+
+
+def _row_strided_value(value: torch.Tensor, padding: int) -> torch.Tensor:
+    """Put V in aligned, offset storage with poisoned row/batch padding."""
+
+    row_stride = value.shape[-2] * value.shape[-1] + padding
+    strides = (row_stride, value.shape[-1], 1)
+    if value.ndim == 4:
+        strides = (value.shape[1] * row_stride + padding, *strides)
+    offset = 16 // value.element_size()
+    size = (
+        offset + sum((n - 1) * s for n, s in zip(value.shape, strides, strict=True)) + 1
+    )
+    storage = torch.full((size,), 32.0, device=value.device, dtype=value.dtype)
+    result = storage.as_strided(value.shape, strides, offset)
+    result.copy_(value)
+    return result
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, _FP8])
+def test_attention_ts_context_strided_v_layout(packed, dtype, monkeypatch):
+    """Both public validation paths accept padded V without relaxing Q/K/O."""
+
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
+    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
+    monkeypatch.setattr(
+        context_module, "_validate_indptr_tensor", lambda *_args, **_kwargs: None
+    )
+    shape = (6, 2, 128) if packed else (2, 3, 2, 128)
+    q = torch.empty(shape, dtype=dtype)
+    k = torch.empty_like(q)
+    offsets = torch.tensor([0, 3, 6], dtype=torch.int32) if packed else None
+    for padding in (0, 64, 192):
+        v = _row_strided_value(k, padding)
+        geometry = context_module._resolve_geometry(
+            q,
+            k,
+            v,
+            qo_indptr=offsets,
+            kv_indptr=offsets,
+            mask_type="dense",
+            window_left=-1,
+            out_dtype=torch.bfloat16,
+        )
+        runtime_geometry = SimpleNamespace(
+            **{**vars(geometry), "device": q.device}, store_softmax_stats=False, vc=None
+        )
+        context_module._validate_runtime_inputs(
+            q, k, v, runtime_geometry, qo_indptr=offsets, kv_indptr=offsets
+        )
+        for tensor, name in ((q, "q"), (k, "k")):
+            with pytest.raises(ValueError, match="must have compact"):
+                context_module._validate_compact(
+                    _row_strided_value(tensor, 64), name, "Q/K"
+                )
+        with pytest.raises(ValueError, match="must have compact"):
+            context_module._prepare_out(_row_strided_value(q, 64), q=q, out_dtype=dtype)
+
+
+@pytest.mark.parametrize(
+    ("shape", "strides", "match"),
+    [
+        ((3, 2, 128), (512, 129, 1), "compact head and feature"),
+        ((3, 2, 128), (512, 256, 2), "compact head and feature"),
+        ((3, 2, 128), (128, 128, 1), "token stride must not overlap"),
+        ((3, 2, 128), (0, 128, 1), "token stride must not overlap"),
+        ((3, 2, 128), (257, 128, 1), "token stride must be 16-byte"),
+        ((2, 3, 2, 128), (512, 256, 128, 1), "batch stride must not overlap"),
+        ((2, 3, 2, 128), (769, 256, 128, 1), "batch stride must be 16-byte"),
+    ],
+)
+def test_attention_ts_context_strided_v_rejects_invalid_layout(shape, strides, match):
+    v = torch.empty_strided(shape, strides, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=match):
+        context_module._validate_value_layout(v)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("dtype", [Float16, BFloat16, Float8E4M3FN])
+def test_attention_ts_context_strided_v_compile_contract(packed, dtype):
+    import cutlass.cute as cute
+
+    shape = (cute.sym_int(), 2, 128)
+    if not packed:
+        shape = (cute.sym_int(), 33, 2, 128)
+    fake = context_module._make_context_value_fake(dtype, shape)
+    assert fake.shape == shape
+    assert fake.stride[-2:] == (128, 1)
+    for stride in fake.stride[:-2]:
+        assert isinstance(stride, cute.typing.SymInt)
+        assert stride.width == 64
+        assert stride.divisibility == 128 // dtype.width
+
+
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize(
+    ("qk_dtype", "v_dtype", "head_dim"),
+    [
+        pytest.param(torch.bfloat16, torch.bfloat16, 128, id="bf16-d128"),
+        pytest.param(torch.float16, torch.float16, 128, id="fp16-d128"),
+        pytest.param(_FP8, _FP8, 128, id="fp8-d128"),
+        pytest.param(torch.bfloat16, _FP8, 128, id="mixed-d128"),
+        pytest.param(torch.bfloat16, torch.bfloat16, 192, id="bf16-mla"),
+        pytest.param(_FP8, _FP8, 192, id="fp8-mla"),
+        pytest.param(torch.bfloat16, torch.bfloat16, 256, id="bf16-d256"),
+    ],
+)
+def test_attention_ts_context_strided_v_reuse_and_graph(
+    packed, qk_dtype, v_dtype, head_dim
+):
+    """Compact/padded V reuse one kernel and replay reloads the captured view."""
+
+    case = _make_context_case(
+        q_lengths=(33, 17) if packed else (33, 33),
+        k_lengths=(257, 129) if packed else (257, 257),
+        num_qo_heads=4,
+        num_kv_heads=2,
+        qkv_dtype=qk_dtype,
+        packed_query=packed,
+        mask_type="causal",
+        head_dim=head_dim,
+        out_dtype=torch.bfloat16,
+        seed=20261105,
+    )
+    head_dim_vo = 128 if head_dim == 192 else head_dim
+    case = replace(case, v=case.v[..., :head_dim_vo].to(v_dtype).contiguous())
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=case.q.device,
+        batch_size=2,
+        max_q_len=max(case.q_lengths),
+        max_kv_len=max(case.k_lengths),
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        head_dim_vo=head_dim_vo,
+        q_dtype=qk_dtype,
+        k_dtype=qk_dtype,
+        v_dtype=v_dtype,
+        out_dtype=case.out_dtype,
+        packed_query=packed,
+        mask_type=case.mask_type,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+    )
+    compact_out = _run_wrapper(wrapper, case)
+    expected = _context_reference(case)
+    atol, rtol = (0.13, 0.05) if v_dtype == _FP8 else (0.01, 0.02)
+    torch.testing.assert_close(compact_out.float(), expected, atol=atol, rtol=rtol)
+    state = wrapper._plan_state
+    cache_before = context_module._get_compiled_context.cache_info()
+    for padding in (64, 192):
+        padded_case = replace(case, v=_row_strided_value(case.v, padding))
+        actual = _run_wrapper(wrapper, padded_case)
+        torch.testing.assert_close(actual, compact_out, atol=0, rtol=0)
+        assert wrapper._plan_state is state
+    assert context_module._get_compiled_context.cache_info() == cache_before
+    # The one-shot adapter has its own geometry validation and must accept V.
+    torch.testing.assert_close(
+        _run_one_shot(padded_case).float(), expected, atol=atol, rtol=rtol
+    )
+    graph = _capture_context_graph(
+        wrapper,
+        padded_case.q,
+        padded_case.k,
+        padded_case.v,
+        actual,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+    )
+    padded_case.v.copy_((padded_case.v.float() + 0.25).to(v_dtype))
+    expected = _context_reference(padded_case)
+    actual.zero_()
+    graph.replay()
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
 
 
 def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> None:
