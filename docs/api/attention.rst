@@ -280,6 +280,9 @@ PageAttention for MLA
     layout, not FlashMLA's GEMM-permuted layout. Query normalization, cache
     insertion, sparse selection, and learned projections remain outside.
 
+    The CuTe FP8 prefill path has unresolved async-copy racecheck reports;
+    this development route is not yet ready for production use.
+
 .. note::
 
     With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every

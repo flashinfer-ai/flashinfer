@@ -26,7 +26,7 @@
 #include "../../compute/warp_tiles.cuh"
 #include "../../pipeline/staged_pipeline.cuh"
 #include "gather.cuh"
-#include "q_stage.cuh"
+#include "prefill_q_stage.cuh"
 #include "resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
@@ -182,7 +182,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
     const bf16* q_base =
         q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)(h_start + group * HPB) * D_QK;
-    quantize_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
+    quantize_prefill_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
                              STREAMING_Q_SCALE_STRIDE>(
         sm.q_fp4(group), sm.q_sc(group), sm.q_rope(group), q_base, HPB, (Mega ? mega.cos_sin + size_t(mega.positions[token_idx]) * 64 : nullptr));
   }
@@ -234,7 +234,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
         uint32_t a0, a1, a2, a3;
-        ldmatrix_load_A_bf16(a0, a1, a2, a3, sm.q_rope(group) + ks * 16, D_ROPE, lane);
+        const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
+        const int col = ks * 16 + (lane >> 4) * 8;
+        ldmatrix_x4(a0, a1, a2, a3, sm.q_rope(group) + PrefillQRopeLayout{}(row, col));
         MmaBf16Result r = mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[group][0][0],
                                             qk[group][0][1], qk[group][0][2], qk[group][0][3]);
         qk[group][0][0] = r.d0;
@@ -407,7 +409,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       const int group = head / HPB;
       const int head_in_group = head % HPB;
       const int cand_group = task % NVFP4_VT_SCALE_GROUPS;
-      quantize_group16_to_nvfp4(
+      quantize_prefill_group16(
           sm.p_full(group) + head_in_group * STREAMING_P_STRIDE + cand_group * SF_VEC_SIZE,
           sm.p_fp4(group) + head_in_group * STREAMING_W_PACKED_STRIDE +
               cand_group * FP4_PACKED_PER_GROUP,

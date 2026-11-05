@@ -15,7 +15,7 @@ using namespace cute;
 using E4 = cute::float_e4m3_t;
 using Mma = decltype(make_tiled_mma(SM89_16x8x32_F32E4M3E4M3F32_TN{}));
 
-// Standalone experimental ABI: inline UE8M0-g32 cache, contiguous Q and indices.
+// Inline UE8M0-g32 cache parameters; contiguous Q and indices.
 struct Params {
   const bf16* q;
   const uint8_t* kv;

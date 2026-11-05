@@ -5,7 +5,7 @@
 #include <cute/atom/copy_traits_sm75.hpp>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
-// v22 geometry, with compile-time prologue/epilogue fusion.
+// 32-head x 64-candidate tile with compile-time prologue/epilogue fusion.
 // Known issue: completion-driven LDGSTS still produces unresolved racecheck reports.
 struct Params : cute_prefill::Params {
   bf16* bf16_output;
