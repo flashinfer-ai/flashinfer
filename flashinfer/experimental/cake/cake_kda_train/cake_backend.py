@@ -673,17 +673,24 @@ class Plan:
         ``wy_fwd_rows`` / ``fwdh_o_v1_rows`` too) read the saved token rows instead, so no copy is written there; the
         forward without a saved set (``"fwd_nosave"``), the other architectures' 64-column serial rows and the replay
         keep the internal-row forms and the copies."""
-        return any(
-            {"aqk_int", "akk_int"} & set(cake_jit.MODULES[name]["logical"].values())
-            for stage, name in self._records(path).items()
-            if name is not None and stage != "fwd_intra"
-        )
+        records = self._records(path)
+
+        def rows() -> bool:
+            return any(
+                {"aqk_int", "akk_int"} & set(cake_jit.MODULES[name]["logical"].values())
+                for stage, name in records.items()
+                if name is not None and stage != "fwd_intra"
+            )
+
+        return self._memo(("internal_rows", path), rows)
 
     @property
     def light_saves_qg(self) -> bool:
         """Whether the light forward saves the fold's ``qg`` (version 4): the light backward's prep record writes
         none (``bwd_prep_g8_noqg*``: no ``qg`` among its logical names) and reads the saved tensor instead."""
-        return "qg" not in self._light_prep_logical()
+        return self._memo(
+            "light_saves_qg", lambda: "qg" not in self._light_prep_logical()
+        )
 
     @property
     def light_saves_wu(self) -> bool:
@@ -691,7 +698,9 @@ class Plan:
         prep record writes no ``kb`` (``bwd_prep_g8_noqg_nokb``: the paired serial 16-head rows of ``sm_100a`` and
         the segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head) chains) and neither light
         path launches a ``wy`` program; the saved tensors feed the recurrence recompute and the adjoint."""
-        return "kb" not in self._light_prep_logical()
+        return self._memo(
+            "light_saves_wu", lambda: "kb" not in self._light_prep_logical()
+        )
 
     def _light_prep_logical(self) -> set[str]:
         name = self._records("light")["bwd_prep"]
@@ -704,7 +713,7 @@ class Plan:
         """Whether the light forward of this plan saves the segment-boundary states (``hseg``, ``seg_state``):
         the segmented route is dispatched and ``S >= SEG_SAVE_MIN_TOKENS_PER_SEG * NSEG`` (:func:`seg_states_saved`);
         otherwise the backward recomputes them."""
-        return seg_states_saved(self.S, self.NSEG)
+        return self._memo("seg_save", lambda: seg_states_saved(self.S, self.NSEG))
 
     @property
     def light_path(self) -> str:
@@ -751,6 +760,9 @@ class Plan:
         of ``record("wy", "tape")``: the same program without the ``u`` half, which nothing on the tape path reads),
         ``None`` where the tape path launches no WY program or the twin is not delivered for this architecture.
         Whether a call launches it is :func:`_tape_wy_record`'s rule."""
+        return self._memo("tape_wy_twin", self._tape_wy_twin)
+
+    def _tape_wy_twin(self) -> str | None:
         if not self.dispatched("wy", "tape"):
             return None
         twin = cake_jit.TAPE_TWINS.get(self.record("wy", "tape"))
@@ -3337,6 +3349,8 @@ class KdaWorkspace:
             self.bytes, dtype=torch.uint8, device=self.device
         )
         self._views_cache: dict[str, types.SimpleNamespace] = {}
+        # the call-independent launch values of each cached layout (:func:`_values_base`): id -> (views, values)
+        self._values_cache: dict[int, tuple[types.SimpleNamespace, dict[str, Any]]] = {}
         # the eye (eye / flags) and the carry launches' epoch counter (next_epoch): one-entry lists, shared by every
         # view of this arena (with_plan, batch_view), since the flags the epochs stamp live in the shared eye
         self._eye_box: list[torch.Tensor | None] = [None]
@@ -3634,6 +3648,7 @@ class KdaWorkspace:
         other.__dict__.update(self.__dict__)
         other.plan = plan
         other._views_cache = {}
+        other._values_cache = {}  # per plan, like the views
         other._batch_views = {}
         other._doc_cache = {}
         other._doc_graphs = set()
@@ -4414,14 +4429,30 @@ def _values(
     **extra: Any,
 ) -> dict[str, Any]:
     """The logical argument values of one call: the layout's arena buffers (and the transposed views of ``w``
-    the fused recomputes write), the tables, the plan scalars and the call's own tensors (``extra``)."""
-    p = ws.plan
-    values: dict[str, Any] = dict(vars(views))
+    the fused recomputes write), the tables, the plan scalars and the call's own tensors (``extra``).  The tables
+    and ``extra`` take precedence; no table name is an arena buffer's, a ``w`` view's or a scalar's, so the call's
+    part goes on a copy of the per-layout part (:func:`_values_base`)."""
+    values = dict(_values_base(ws, views))
     values.update(zip(TABLE_NAMES, tables, strict=False))
+    values.update(extra)
+    return values
+
+
+def _values_base(ws: KdaWorkspace, views: types.SimpleNamespace) -> dict[str, Any]:
+    """The call-independent part of :func:`_values` on ``views``: the arena buffers, the transposed views of ``w``
+    and the plan scalars.  Built once per layout of the workspace: ``views`` of :meth:`KdaWorkspace.views` (the
+    workspace keeps them, and their buffers, for its lifetime) are kept with the part; any other namespace is
+    built per call."""
+    cache = ws._values_cache
+    hit = cache.get(id(views))
+    if hit is not None and hit[0] is views:
+        return hit[1]
+    p = ws.plan
+    base: dict[str, Any] = dict(vars(views))
     if hasattr(views, "w"):
-        values["w_t"] = views.w.view(p.NC_pad, p.H, D, BT)
-        values["w_tk"] = views.w.view(p.NC_pad * D, p.H, BT)
-    values.update(
+        base["w_t"] = views.w.view(p.NC_pad, p.H, D, BT)
+        base["w_tk"] = views.w.view(p.NC_pad * D, p.H, BT)
+    base.update(
         num_seqs=p.N,
         num_chunks_pad=p.NC_pad,
         num_heads=p.H,
@@ -4433,8 +4464,9 @@ def _values(
         # the chunk pairs the persistent pair kernels walk
         num_pairs=p.R // cake_jit.PAIR_ROWS,
     )
-    values.update(extra)
-    return values
+    if any(views is ns for ns in ws._views_cache.values()):
+        cache[id(views)] = (views, base)
+    return base
 
 
 def _tables(
