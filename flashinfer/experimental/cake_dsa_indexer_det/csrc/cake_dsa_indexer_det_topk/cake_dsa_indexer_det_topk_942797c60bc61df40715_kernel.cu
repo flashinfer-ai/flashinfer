@@ -47,50 +47,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_det_topk_942797c60bc61df40715
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_ACC_OFFSET 0
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_K_PIPE_STAGES 4
-#define NUM_TMEM_PIPE_STAGES 4
-#define NUM_TMEM_LAP_PIPE_STAGES 1
-#define NUM_VERDICT_PIPE_STAGES 1
-#define NUM_TK_PIPE_STAGES 2
-#define NUM_TK_PEER_PIPE_STAGES 1
-#define NUM_PEER_PIPE_STAGES 1
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 32768
-#define SMEM_SMEM_Q_STRIDE 32768
-#define SMEM_SMEM_W_OFF 66560
-#define SMEM_SMEM_W_STAGE_BYTES 512
-#define SMEM_SMEM_W_STRIDE 512
-#define SMEM_SMEM_K_OFF 67584
-#define SMEM_SMEM_K_STAGE_BYTES 32768
-#define SMEM_SMEM_K_STRIDE 32768
-#define SMEM_S_HIST_OFF 198656
-#define SMEM_S_HIST_STAGE_BYTES 8192
-#define SMEM_S_HIST_STRIDE 8192
-#define SMEM_S_COUNT_OFF 206848
-#define SMEM_S_COUNT_STAGE_BYTES 32
-#define SMEM_S_COUNT_STRIDE 32
-#define SMEM_S_TAU_OFF 206880
-#define SMEM_S_TAU_STAGE_BYTES 64
-#define SMEM_S_TAU_STRIDE 64
-#define SMEM_S_FAIL_OFF 206944
-#define SMEM_S_FAIL_STAGE_BYTES 16
-#define SMEM_S_FAIL_STRIDE 16
-#define SMEM_S_TK_OFF 207008
-#define SMEM_S_TK_STAGE_BYTES 32
-#define SMEM_S_TK_STRIDE 32
-#define SMEM_S_PFAIL_OFF 206976
-#define SMEM_S_PFAIL_STAGE_BYTES 8
-#define SMEM_S_PFAIL_STRIDE 8
-#define SMEM_TOTAL 207104
-#if CAKE_INDEXER_TILE_UNROLL == 1
-#define TILE_UNROLL 1
-#else
-#define TILE_UNROLL 2
-#endif
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -244,7 +200,7 @@ __device__ __forceinline__ void tcgen05_commit_cg1_multicast(int mbar_addr, uint
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -252,7 +208,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, unsigned int* __restrict__ TicketWord)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, float* __restrict__ K_scale, unsigned int* __restrict__ TicketWord)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -289,7 +245,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 66560);
@@ -308,12 +264,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
     const int s_tk_addr = smem + 207008;
     int* s_pfail = reinterpret_cast<int*>(smem_raw + 206976);
     const int s_pfail_addr = smem + 206976;
+
+    // Kernel setup ops
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
-    // Mbarrier init (11 pipeline groups, 0 ordered-sequence groups, 26 barriers)
-    // Mbarriers at smem_raw[0..208)
+    // Mbarrier init (26 barriers at smem_raw[0..208))
 
     if (warp == 9) {
         uint32_t leader = elect_sync();
@@ -382,10 +339,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_acc = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (warp == 0) {
         if (elect_sync()) {
@@ -1161,7 +1118,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                             int d_pos = 0;
                             int r_pos = 0;
                             int until_check = check_period - 1;
-                            constexpr int ti_2_unroll = TILE_UNROLL;
+#if CAKE_INDEXER_TILE_UNROLL == 1
+                            constexpr int ti_2_unroll = 1;
+#else
+                            constexpr int ti_2_unroll = 2;
+#endif
                             #pragma unroll ti_2_unroll
                             for (int ti_2 = 0; ti_2 < n_tiles_5; ti_2++) {
                                 int tile_1 = d_pos;
@@ -1560,7 +1521,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 }
                                                 cum_above += lane_bins[0];
                                                 int target_lane;
-                                                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane) : "r"(is_target * lane_0));
+                                                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane) : "r"(is_target * lane_0));
                                                 int digit_sel = __shfl_sync(0xFFFFFFFF, d_sel, target_lane);
                                                 int above_cnt = __shfl_sync(0xFFFFFFFF, above_sel, target_lane);
                                                 int bucket_cnt = __shfl_sync(0xFFFFFFFF, count_sel, target_lane);
@@ -1891,7 +1852,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         }
                                         cum_above_1 += lane_bins_1[0];
                                         int target_lane_1;
-                                        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane_1) : "r"(is_target_1 * lane_0));
+                                        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane_1) : "r"(is_target_1 * lane_0));
                                         int digit_sel_1 = __shfl_sync(0xFFFFFFFF, d_sel_1, target_lane_1);
                                         int above_cnt_1 = __shfl_sync(0xFFFFFFFF, above_sel_1, target_lane_1);
                                         int bucket_cnt_1 = __shfl_sync(0xFFFFFFFF, count_sel_1, target_lane_1);
