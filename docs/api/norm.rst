@@ -170,7 +170,7 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
 * ``deterministic=False`` runs the standalone non-deterministic package
   (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
   workspace entry points take ``deterministic=False`` only): the same forward
-  kernel (up to 12 rows per SM on SM100 and SM103 and up to 10 on SM107, a
+  kernel (up to 12 rows per SM on SM100 and SM103 and up to 59 on SM107, a
   forward with 16 threads to a row, and from 976 rows per SM on SM100 and
   SM103 and from 800 on SM107,
   a forward whose CTAs each walk several row blocks: the same bits) and a
@@ -181,7 +181,9 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
   order depend on scheduling: the weight gradient can differ between calls,
-  always within the deterministic backward's error bound. Up to 256 rows
+  always within the deterministic backward's error bound (for FP32 normal
+  gates, terms and sums; with subnormal values both backwards can leave it).
+  Up to 256 rows
   the backward is one thread-block cluster of 16 CTAs that adds
   the CTAs' partial sums in a fixed order on chip: the same bits on every
   call, within the same bound, and no workspace. The workspace

@@ -126,13 +126,25 @@ per-rank partial sums (``reduce_gate_param_grads_det_kcp`` /
 ``fla`` and ``fla_cp`` run flash-linear-attention's ``chunk_kda`` with
 ``use_gate_in_kernel=True``, ``A_log``, ``dt_bias`` and the lower bound (their
 parameter gradients stay the rank's: no cross-rank sum).  This package's raw
-mode runs the deterministic raw programs in the same order, so the agreement
-step requires every result to have the deterministic arm's bit pattern:
-``out``, ``dq``, ``dk``, ``dv``, ``dbeta``, the raw gate's ``dg`` (and the
-convolution's), the per-rank ``dA_log`` / ``ddt_bias`` partials and their
-cross-rank sums.  The checkpoint hand-off never engages in this mode (with
-``nd_off`` or ``--ckpt-handoff on`` the ``ckpt`` comparison expects no
-engagement), and the workspace bytes are those of the raw mode.
+mode runs the deterministic raw programs in the same order but for the
+parameter-gradient reduce, so the agreement step requires ``out``, ``dq``,
+``dk``, ``dv``, ``dbeta`` and the raw gate's ``dg`` (and the convolution's) to
+have the deterministic arm's bit pattern.  On ``sm_107a`` the per-rank
+``dA_log`` / ``ddt_bias`` partials and their cross-rank sums must too.  On
+``sm_100a`` / ``sm_103a`` (``r1c``) each rank reduces its partials with an
+``R1c`` pair (an FP64 sum in no fixed order, rounded once), so they can differ
+from the deterministic arm's by an FP32 ulp: the step records their largest
+distance in FP32 values over the ranks (``param_max_ulp``) and does not gate on
+it (the test suite holds them to the R1c bound).  The checkpoint hand-off
+never engages in this mode (with ``nd_off`` or ``--ckpt-handoff on`` the
+``ckpt`` comparison expects no engagement), and the workspace bytes are those
+of the raw mode (with the FP64 accumulators of an ``R1c`` rank).
+
+``--build-order det-first`` (the default) runs the agreement step's ``det``
+step before its ``nd`` step, so the deterministic package allocates its
+workspace first; ``nd-first`` swaps the two.  The arena placement this decides
+moves a few kernels by microseconds; time a det / nd comparison in both orders
+(two runs) and take the mean of the two orders' medians.
 
 Example::
 
@@ -219,6 +231,10 @@ GATES = ("g", "raw")
 # mode), the per-rank parameter partials and their cross-rank sums
 PARAMS = ("A_log", "dt_bias")
 RAW_BITWISE = ("dg", "dA_log", "ddt_bias", "dA_log_sum", "ddt_bias_sum")
+# the raw results an R1c rank reduces in no fixed order (sm_100a / sm_103a): an FP32 ulp from the deterministic arm's
+R1C_PARAMS = ("dA_log", "ddt_bias", "dA_log_sum", "ddt_bias_sum")
+R1C_ARCHES = ("sm_100a", "sm_103a")
+BUILD_ORDERS = ("det-first", "nd-first")
 
 Step = tuple[Callable[[], Any], Callable[[Any], Any]]
 
@@ -696,17 +712,44 @@ def _probe_memory(step: Step, device: torch.device) -> dict[str, int]:
     return {"peak_bytes": int(t[0].item()), "held_bytes": int(t[1].item())}
 
 
+def _ulp_distance(a: torch.Tensor | None, b: torch.Tensor | None) -> int:
+    """The largest distance of two FP32 tensors in representable FP32 values (``+0`` and ``-0`` one value; -1 for a
+    missing tensor or another shape)."""
+    if a is None or b is None or a.shape != b.shape:
+        return -1
+    if a.numel() == 0:
+        return 0
+
+    def ordered(t: torch.Tensor) -> torch.Tensor:
+        i = t.detach().contiguous().view(torch.int32).to(torch.int64)
+        return torch.where(i < 0, -(i & 0x7FFFFFFF), i)
+
+    return int((ordered(a) - ordered(b)).abs().max().item())
+
+
 def _agreement(
-    problem: dict[str, Any], conv: bool, device: torch.device
+    problem: dict[str, Any],
+    conv: bool,
+    device: torch.device,
+    order: tuple[str, ...] = ("det", "nd"),
 ) -> dict[str, Any]:
-    """One ``step`` of ``det`` and of ``nd`` on the same shard: the bitwise tensors and the ``dg`` difference (in
-    the raw gate mode every result, ``dg`` and the parameter partials and sums included, with the same bit
-    pattern)."""
-    results = {arm: _results(arm, problem, conv) for arm in ("det", "nd")}
+    """One ``step`` of ``det`` and of ``nd`` on the same shard (in ``order``: the first allocates its package's
+    workspace first): the bitwise tensors and the ``dg`` difference (in the raw gate mode every result, ``dg`` and
+    the parameter partials and sums included, with the same bit pattern; on an ``R1c`` device the partials and sums
+    are measured in FP32 ulps instead, ``param_max_ulp``, and not gated)."""
+    results = {arm: _results(arm, problem, conv) for arm in order}
     torch.cuda.synchronize(device)
     det, nd = results["det"], results["nd"]
     raw = problem["gate"] == "raw"
-    names = [n for n in BITWISE + (RAW_BITWISE if raw else ()) if n in det]
+    arch = nd_kcp.cake_jit.arch_for_capability(
+        tuple(torch.cuda.get_device_capability(device))
+    )
+    r1c = raw and arch in R1C_ARCHES
+    names = [
+        n
+        for n in BITWISE + (RAW_BITWISE if raw else ())
+        if n in det and not (r1c and n in R1C_PARAMS)
+    ]
     same = _same_bits if raw else _equal
     equal = torch.tensor(
         [int(same(det[n], nd[n])) for n in names],
@@ -714,6 +757,13 @@ def _agreement(
         device=device,
     )
     dist.all_reduce(equal, op=dist.ReduceOp.MIN)
+    param_names = [n for n in R1C_PARAMS if r1c and n in det]
+    ulps = torch.tensor(
+        [_ulp_distance(det[n], nd[n]) for n in param_names] or [0],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(ulps, op=dist.ReduceOp.MAX)
     a, b = det["dg"].double(), nd["dg"].double()
     diff = b - a
     sums = torch.stack([(diff * diff).sum(), (a * a).sum()])
@@ -732,6 +782,11 @@ def _agreement(
         "dg_rel_rms": float((sums[0] / sums[1].clamp_min(1e-300)).sqrt().item()),
         "dg_max_abs": float(max_abs.item()),
         "dg_bitwise": bool(sums[0].item() == 0.0),
+        "r1c": r1c,
+        "param_max_ulp": dict(
+            zip(param_names, ulps.tolist()[: len(param_names)], strict=True)
+        ),
+        "order": list(order),
     }
 
 
@@ -1019,7 +1074,8 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     # the fla_cp arm runs on its own view of the batch (FLA's partition and context)
     problems = {arm: fla_cp_problem if arm == "fla_cp" else problem for arm in arms}
     forwards = {arm: _forward(arm, problems[arm], conv, kda.get(arm)) for arm in arms}
-    agreement = _agreement(problem, conv, device)
+    order = ("det", "nd") if args.build_order == "det-first" else ("nd", "det")
+    agreement = _agreement(problem, conv, device, order)
     agreement["fla_cp_out"] = (
         _fla_cp_agreement(problem, fla_cp_problem, forwards["fla_cp"], device)
         if "fla_cp" in forwards
@@ -1084,6 +1140,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "fla_safe_gate": problem["fla_safe_gate"],
             "ckpt_handoff": args.ckpt_handoff,
             "gate": args.gate,
+            "build_order": args.build_order,
             "lower_bound": LOWER_BOUND if raw else None,
             "layout": args.layout,
             "world_size": world,
@@ -1128,9 +1185,13 @@ def _print(report: dict[str, Any]) -> None:
     agree = report["agreement"]
     bad = [n for n, ok in agree["bitwise"].items() if not ok]
     print(
-        f"  nd vs det: bitwise {'ok' if agree['bitwise_ok'] else 'MISMATCH ' + ','.join(bad)}; "
+        f"  nd vs det ({cfg['build_order']}): bitwise {'ok' if agree['bitwise_ok'] else 'MISMATCH ' + ','.join(bad)}; "
         f"dg rel_rms={agree['dg_rel_rms']:.3e} max_abs={agree['dg_max_abs']:.3e}"
     )
+    if agree.get("r1c"):
+        print(
+            f"  R1c parameter partials / sums vs det, max FP32 ulp: {agree['param_max_ulp']}"
+        )
     for rank, rec in enumerate(report["local_records"]):
         print(f"  rank {rank} ({rec['arch']}): det {rec['det']}  nd {rec['nd']}")
     if report["fla_error"]:
@@ -1226,6 +1287,12 @@ def main() -> int:
         default="g",
         choices=GATES,
         help="the forget gate's form: g (the activated FP32 gate) or raw (use_gate_in_kernel=True, every arm)",
+    )
+    parser.add_argument(
+        "--build-order",
+        default="det-first",
+        choices=BUILD_ORDERS,
+        help="which package's workspace is allocated first (the agreement step's first arm)",
     )
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(

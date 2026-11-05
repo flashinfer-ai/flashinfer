@@ -61,9 +61,10 @@ class _StageRunner(TunableRunner):
             tactic = next(iter(self.plans))
         plan = self.plans[tactic]
         if do_preparation:
-            # Unfused plans share the grouped tensor layout. Recreate it for
-            # each stage: FC2's output aliases FC1's gathered input. This runs
-            # outside timing/capture; routing stays entirely on the device.
+            # Native layouts keep routing metadata before variable scratch,
+            # so every plan in this mode group shares its routing offsets.
+            # Recreate it: FC2's output aliases FC1's grouped input.
+            # This runs outside timing/capture, entirely on the device.
             plan["prepare_stages"](*inputs, self.state.workspace)
             return
         retain_graph_resources(self.state, inputs)
@@ -86,18 +87,71 @@ def ranked_tactics(state, inputs, tag):
         )
         ranked = []
         for stage in (1, 2):
-            runner = _StageRunner(state, tag, stage, first, second)
-            choices = tuner.rank_tactics(
-                f"{tag}-fc{stage}-{POLICY_VERSION}", [runner], config, list(inputs), k=2
-            )
             kernels = first if stage == 1 else second
-            by_tactic = {a.tactic: a for a in kernels}
-            ranked.append(
-                tuple(kernels[0] if t == -1 else by_tactic[t] for t in choices)
-            )
+            groups = (kernels,)
+            if stage == 1:
+                # GATHER borrows original token/SF rows; NONE consumes packed
+                # expert rows. Preparing one layout cannot initialize the other.
+                grouped = tuple(
+                    a for a in kernels if not getattr(a, "gathers_input", False)
+                )
+                gathered = tuple(
+                    a for a in kernels if getattr(a, "gathers_input", False)
+                )
+                if grouped and gathered:
+                    groups = (grouped, gathered)
+            if stage == 2:
+                # rank_tactics prepares only the default plan once. COMBINE
+                # needs inverse routing and weighted scores; ordinary FC2
+                # needs forward routing. Profile each layout independently,
+                # then compare its best candidate end-to-end.
+                grouped = tuple(
+                    b for b in kernels if not getattr(b, "combines_output", False)
+                )
+                combined = tuple(
+                    b for b in kernels if getattr(b, "combines_output", False)
+                )
+                if grouped and combined:
+                    groups = (grouped, combined)
+            selected = []
+            for group in groups:
+                runner = _StageRunner(
+                    state,
+                    tag,
+                    stage,
+                    group if stage == 1 else first,
+                    group if stage == 2 else second,
+                )
+                name = f"{tag}-fc{stage}-{POLICY_VERSION}"
+                if len(groups) > 1:
+                    name += (
+                        "-gather"
+                        if stage == 1 and getattr(group[0], "gathers_input", False)
+                        else (
+                            "-combine"
+                            if getattr(group[0], "combines_output", False)
+                            else "-grouped"
+                        )
+                    )
+                count = 2 // len(groups)
+                if stage == 1 and not getattr(group[0], "gathers_input", False):
+                    # Retain both old FC1 finalists when adding a new input
+                    # layout. End-to-end timing decides whether GATHER wins.
+                    count = 2
+                choices = tuner.rank_tactics(
+                    name, [runner], config, list(inputs), k=count
+                )
+                by_tactic = {a.tactic: a for a in group}
+                selected.extend(group[0] if t == -1 else by_tactic[t] for t in choices)
+            ranked.append(tuple(selected))
         first, second = ranked
     else:
-        first, second = first[:2], second[:2]
+        grouped = tuple(a for a in first if not getattr(a, "gathers_input", False))
+        gathered = tuple(a for a in first if getattr(a, "gathers_input", False))
+        first = (grouped[:1] + gathered[:1]) if grouped and gathered else first[:2]
+        second = second[:2]
     # Fusion is judged end-to-end, since its benefit includes removing the
     # intermediate quantizer. FMA remains restricted to its measured shapes.
-    return [(tag, a.tactic, b.tactic) for a, b in product(first + fused, second)]
+    compound = [(tag, a.tactic, b.tactic) for a, b in product(first + fused, second)]
+    # Expanding a stage pool must not drop independent small-token FMA plans.
+    return compound + [tactic for tactic in state.launches if tactic[0] != tag]

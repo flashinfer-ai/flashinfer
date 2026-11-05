@@ -20,6 +20,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N256_RUN32_ROUTE,
     BS_N256_S16_ROUTE,
     BS_ROUTES,
+    BS_STORE16_ARCHS,
     BS_STORE16_ROUTES,
     BS_SWAP_BM64_ROUTE,
     BS_SWAP_C1_ROUTE,
@@ -52,6 +53,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     DEEPK_CG2_RECURRENCE_ROUTE,
     DEEPK_N256_ROUTE,
     EXPERT_ALIGNED_MAX_GROUPS,
+    FP32_SCALE_ARCHS,
     K128_ROUTE,
     K384_ROUTE,
     WSEG_MAX_M,
@@ -76,24 +78,47 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
 from flashinfer.jit.gemm.cake_grouped_fp8_gemm import (
     PROGRAMS,
     ROUTES,
+    SM107A_ROUTES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
+    route_program,
 )
 
 ATOL = RTOL = 3e-2
 
+# The tests that run on an architecture outside FP32_SCALE_ARCHS (SM107a): it
+# ships the non-swapped block-scaled programs alone.
+BLOCK_SCALED_ONLY_TESTS = frozenset(
+    {
+        "test_block_scaled_packed_scales_match_reference",
+        "test_block_scaled_accepts_block_rows_weight_scales",
+        "test_block_scaled_launch_rebinds_token_operands_and_captures",
+        "test_block_scaled_rejects_invalid_inputs",
+        "test_block_scaled_route_rule_sm107a",
+        "test_block_scaled_block_n_routes_write_the_same_bits",
+        "test_block_scaled_only_arch_routes_name_registered_programs",
+        "test_block_scaled_only_arch_rejects_float32_scales",
+    }
+)
+
 
 @pytest.fixture(autouse=True)
-def _require_generated_program():
+def _require_generated_program(request):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
         pytest.skip(
-            "generated contiguous grouped FP8 GEMM programs target SM100a and SM103a"
+            "generated contiguous grouped FP8 GEMM programs target SM100a, SM103a and SM107a"
         )
     if not is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available(device):
         pytest.skip("no generated contiguous grouped FP8 GEMM program is registered")
+    arch = device_arch(torch.cuda.current_device())
+    if (
+        arch not in FP32_SCALE_ARCHS
+        and request.node.originalname not in BLOCK_SCALED_ONLY_TESTS
+    ):
+        pytest.skip(f"{arch} ships the non-swapped block-scaled programs only")
 
 
 def _make_inputs(group_counts, n, k, *, seed, device, arbitrary_scales=False):
@@ -982,6 +1007,7 @@ BLOCK_SCALED_CASES = [
     ([95, 97, 2, 193, 0, 100], 384, 128, 96),
     ([100, 0, 3, 69, 64, 129, 1, 97], 1024, 1024, 64),
     ([200, 150, 0, 97, 64, 1, 129, 300], 1024, 1024, 64),
+    ([100, 0, 3, 69, 64, 129, 1, 97], 1024, 256, 32),
 ]
 
 
@@ -1029,8 +1055,12 @@ def test_block_scaled_packed_scales_match_reference(group_counts, n, k, alignmen
                 BS_SWAP_RP32_ROUTE,
             )
         ) == (alignment % 128 != 0)
-    assert (prepared.route in BS_STORE16_ROUTES.values()) == bs_store16(
-        int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
+    arch = device_arch(torch.cuda.current_device())
+    assert (prepared.route in BS_STORE16_ROUTES.values()) == (
+        arch in BS_STORE16_ARCHS
+        and bs_store16(
+            int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
+        )
     )
     prepared.launch()
     torch.cuda.synchronize()
@@ -1109,6 +1139,89 @@ def test_block_scaled_launch_rebinds_token_operands_and_captures():
     _assert_block_scaled(
         out3, _reference(a2, b, a_scale2, b_scale, m_indices2), m_indices2
     )
+
+
+def test_block_scaled_route_rule_sm107a():
+    """SM107a single-run layouts: 256 columns below 32 K blocks at any M-block count, 128 from 32 K blocks; other
+    architectures and run32 layouts unchanged."""
+    # Qwen3.5-35B gate_up, 4096 tokens (510 M blocks, 16 K blocks) on 216 SMs: 256 on SM107a, 128 elsewhere.
+    assert (
+        bs_route_for_shape(
+            65280,
+            1024,
+            2048,
+            alignment=128,
+            sm_count=216,
+            num_groups=256,
+            arch="sm_107a",
+        )
+        == BS_N256_ROUTE
+    )
+    assert (
+        bs_route_for_shape(
+            65280,
+            1024,
+            2048,
+            alignment=128,
+            sm_count=216,
+            num_groups=256,
+        )
+        == BS_N128_ROUTE
+    )
+    # Qwen3.5-397B gate_up, 8 / 32 tokens (512 experts, 32 K blocks) and an unknown group count: 128.
+    assert (
+        bs_route_for_shape(
+            65152,
+            512,
+            4096,
+            alignment=128,
+            sm_count=216,
+            num_groups=512,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    assert (
+        bs_route_for_shape(
+            65408,
+            512,
+            4096,
+            alignment=128,
+            sm_count=216,
+            num_groups=512,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    assert (
+        bs_route_for_shape(
+            65152,
+            512,
+            4096,
+            alignment=128,
+            sm_count=216,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    # A 256-column grid below one wave still takes 128 columns; run32 layouts keep the shared rule.
+    assert (
+        bs_route_for_shape(
+            1664,
+            256,
+            4096,
+            alignment=128,
+            sm_count=216,
+            num_groups=8,
+            arch="sm_107a",
+        )
+        == BS_N128_ROUTE
+    )
+    for sm_count in (212, 216):
+        for m in (16000, 16256):
+            kwargs = dict(alignment=32, sm_count=sm_count, num_groups=512)
+            sm107a = bs_route_for_shape(m, 512, 4096, arch="sm_107a", **kwargs)
+            assert sm107a == bs_route_for_shape(m, 512, 4096, **kwargs)
 
 
 def test_block_scaled_route_rule():
@@ -1463,6 +1576,8 @@ def test_block_scaled_swap_small_block_rule_on_sm_100a():
     # The layouts of BS_SWAP_SM100_SMALL_KEEP keep the other swap-AB routes.
     for m, n, k, alignment in BS_SWAP_SM100_SMALL_KEEP:
         assert small(m, n, k, alignment=alignment, sm_count=148) is None
+    # (896, 1024, 512, 64) is not one of them: 28 * 8 = 224 one-CTA tiles.
+    assert rule(896, 1024, 512, alignment=64, sm_count=148) == BS_SWAP_C1_ROUTE
     assert rule(384, 3072, 1024, alignment=32, sm_count=148) == BS_SWAP_RP32_ROUTE
     assert rule(512, 2560, 2048, alignment=32, sm_count=148) == BS_SWAP_RUN32_ROUTE
     assert rule(512, 2048, 2048, alignment=64, sm_count=148) == BS_SWAP_RP32_ROUTE
@@ -1490,6 +1605,7 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     small = functools.partial(bs_swap_small_route, arch="sm_103a")
     rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_103a")
     assert sorted(BS_SWAP_SM103_SMALL_ADMIT) == [
+        (768, 1024, 256, 32),
         (896, 1024, 512, 64),
         (1024, 1024, 512, 32),
         (1152, 256, 1536, 32),
@@ -1504,7 +1620,8 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
                 BS_SWAP_C1_ROUTE
             )
         assert small(m, n, k, alignment=alignment, sm_count=None) is None
-        # sm_100a does not read the table: 72, 156, 224 and 256 tiles exceed 3 * 20.
+        # sm_100a does not read the table: 72, 156, 192, 224 and 256 tiles
+        # exceed 3 * 20.
         assert (
             bs_swap_small_route(
                 m, n, k, alignment=alignment, arch="sm_100a", sm_count=20
@@ -1521,6 +1638,10 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
         (1024, 512, 64),
         (896, 1024, 64),
         (896, 512, 32),
+        (640, 256, 32),
+        (896, 256, 32),
+        (768, 128, 32),
+        (768, 256, 64),
     ):
         assert rule(m, 1024, k, alignment=alignment, sm_count=152) == (
             BS_SWAP_RP32_ROUTE
@@ -1548,6 +1669,9 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
     route, grid = plan(1152, 256, 1536, alignment=32, num_groups=16, arch="sm_103a")
     assert route == BS_SWAP_C1_ROUTE and grid == (72, 1, 1)
+    # 24 * 8 = 192 tiles on 152 SMs.
+    route, grid = plan(768, 1024, 256, alignment=32, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
 
 
 def test_block_scaled_swap_bm64_admit_on_sm_103a():
@@ -1689,6 +1813,9 @@ def test_launch_plan_takes_the_small_block_routes_on_sm_100a():
     )
     # 12 * 32 = 384 one-CTA tiles on 148 CTAs.
     route, grid = plan(384, 4096, 1024, sm_count=148, alignment=32, num_groups=8)
+    assert route == BS_SWAP_C1_ROUTE and grid == (148, 1, 1)
+    # 28 * 8 = 224 one-CTA tiles on 148 CTAs.
+    route, grid = plan(896, 1024, 512, sm_count=148, alignment=64, num_groups=8)
     assert route == BS_SWAP_C1_ROUTE and grid == (148, 1, 1)
     # 20 * 8 = 160 tiles of 32 x 256 rows on 74 two-CTA clusters.
     route, grid = plan(640, 2048, 2048, sm_count=148, alignment=32, num_groups=8)
@@ -2008,6 +2135,25 @@ BLOCK_SCALED_SMALL_CASES = [
         {"sm_100a": BS_SWAP_C1_ROUTE},
         id="c1_sm100_n384_single_run",
     ),
+    # The table layouts: 896 rows at alignment 64 (not in
+    # BS_SWAP_SM100_SMALL_KEEP: 28 * 8 = 224 one-CTA tiles on 148 SMs) and
+    # 768 rows at alignment 32 (in BS_SWAP_SM103_SMALL_ADMIT: 24 * 8 = 192 tiles).
+    pytest.param(
+        [40, 77, 0, 3, 100, 1, 65, 30],
+        1024,
+        512,
+        64,
+        {"sm_100a": BS_SWAP_C1_ROUTE},
+        id="c1_sm100_m896_a64_k512",
+    ),
+    pytest.param(
+        [130, 0, 7, 61, 96, 33, 1, 100],
+        1024,
+        256,
+        32,
+        {"sm_103a": BS_SWAP_C1_ROUTE},
+        id="c1_sm103_m768_a32_k256",
+    ),
 ]
 
 
@@ -2190,6 +2336,101 @@ def test_block_scaled_rejects_invalid_inputs():
             b_packed,
             m_indices,
             out=storage[1 : 1 + int(m_indices.numel()) * 256].view(-1, 256),
+        )
+
+
+# (group_counts, N, K, alignment): 128-row aligned layouts both single-run
+# BLOCK_N routes serve.
+BLOCK_SCALED_BLOCK_N_CASES = [
+    pytest.param([128, 0, 256, 1, 130], 512, 512, 128, id="single_k512"),
+    pytest.param([100, 0, 3, 69, 128, 200, 1, 64], 1024, 2048, 128, id="single_k2048"),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment", BLOCK_SCALED_BLOCK_N_CASES)
+def test_block_scaled_block_n_routes_write_the_same_bits(
+    group_counts, n, k, alignment, monkeypatch
+):
+    """On SM107a the single-run BLOCK_N 128 and 256 routes write the same bits.
+
+    The host picks BLOCK_N by shape, so one layout can reach either single-run
+    program; both accumulate every output in the same K order.
+    """
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) != "sm_107a":
+        pytest.skip("checks the SM107a programs")
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        group_counts, n, k, alignment=alignment, seed=4790 + k, device=device
+    )
+    m = int(m_indices.numel())
+    routes = {128: BS_N128_ROUTE, 256: BS_N256_ROUTE}
+    outs = {}
+    for block_n, route in routes.items():
+        monkeypatch.setattr(host, "bs_block_n", lambda *args, _n=block_n, **kw: _n)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, out=out, alignment=alignment
+        )
+        assert prepared.route == route
+        prepared.launch()
+        outs[block_n] = out
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[128], expected, m_indices)
+    routed = m_indices >= 0
+    assert torch.equal(
+        outs[128][routed].view(torch.int16), outs[256][routed].view(torch.int16)
+    )
+
+
+def test_block_scaled_only_arch_routes_name_registered_programs():
+    """On SM107a every block-scaled launch plan names one of its four registered programs."""
+    for route in (
+        BS_N128_ROUTE,
+        BS_N256_ROUTE,
+        BS_N128_RUN32_ROUTE,
+        BS_N256_RUN32_ROUTE,
+    ):
+        assert route_program("sm_107a", route) == SM107A_ROUTES[route]
+        assert "sm_107a" in PROGRAMS[SM107A_ROUTES[route]]["arches"]
+    for route in (*BS_STORE16_ROUTES.values(), *BS_SWAP_ROUTES, K128_ROUTE):
+        with pytest.raises(NotImplementedError, match="sm_107a"):
+            route_program("sm_107a", route)
+    planned = set()
+    for m in (128, 256, 1024, 4096, 16384, 65536):
+        for n in (256, 512, 1024, 4096, 7168):
+            for k in (128, 512, 2048, 7168):
+                for alignment in (32, 64, 128):
+                    for sm_count in (148, 212, 216):
+                        route, _ = launch_plan(
+                            m,
+                            n,
+                            k,
+                            sm_count=sm_count,
+                            scalar_output=False,
+                            block_scaled=True,
+                            alignment=alignment,
+                            num_groups=8,
+                            arch="sm_107a",
+                        )
+                        planned.add(route)
+    assert planned == set(SM107A_ROUTES)
+
+
+def test_block_scaled_only_arch_rejects_float32_scales():
+    """Float32 scales have no program outside FP32_SCALE_ARCHS: preparation raises."""
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) in FP32_SCALE_ARCHS:
+        pytest.skip("the device runs the FP32-scale programs")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [128, 64], 256, 512, seed=4764, device=device
+    )
+    with pytest.raises(NotImplementedError, match="float32 scales"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_scale, b_scale, m_indices
         )
 
 

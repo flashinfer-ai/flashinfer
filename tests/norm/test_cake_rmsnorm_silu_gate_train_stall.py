@@ -18,9 +18,12 @@ non-deterministic backward (``deterministic=False``) beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs; up to 12 rows per SM
-on SM100 and SM103 (10 on SM107) the short forward launches one 256-thread CTA
+on SM100 and SM103 (59 on SM107) the short forward launches one 256-thread CTA
 per row
-block (fewer CTAs than SMs), from 976 rows per SM on SM100 and SM103 (800 on
+block (fewer CTAs than SMs on SM100 and SM103; on SM107 with 205 SMs or more,
+as with 212 or 216, at most one wave of 4 CTAs per SM on all SMs but 16, a
+bound fewer SMs do not keep at 59 rows per SM), from 976 rows per SM on SM100
+and SM103 (800 on
 SM107) the mid forward whole waves of 6 CTAs per SM that each walk at most 2
 row blocks, and from 2400 rows per SM (1740 on SM107) the long forward whole
 waves of 3 CTAs per SM that each walk at most 6.  The backward launches
@@ -81,8 +84,8 @@ SM100 and SM103, from 2400 rows per SM; 19 and 76 on SM107, from 1740) and
 the mid forward's the fewest at or above its threshold and the most below the
 long forward's (11 and 24, 1056 and 2304 rows per SM, on SM100 and SM103; 9
 and 18, 864 and 1728 rows per SM, on SM107).  The short forward at 1 row per
-SM and at its threshold (12 rows per SM on SM100 and SM103, 10 on SM107) keeps
-its speed
+SM and at its threshold (12 rows per SM on SM100 and SM103, 59 on SM107; on
+SM107 also at 10 and 30 rows per SM) keeps its speed
 beside the one-thread kernel, starts beside the all-SM kernel with the
 max-shared carveout, and beside a side kernel that holds ``k`` SMs (the item 1
 side kernels and 16 CTAs of 1024 threads with the max-shared carveout) ends no
@@ -683,11 +686,11 @@ FORWARD_EDGES = ("first", "last")
 
 def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
     """``(blocks_per_slot, T, cta_share)``: the row blocks per CTA slot of the
-    forward module of ``role`` (``fwd_long`` or ``fwd_mid``) at ``edge`` of
-    its rows, the fewest tokens ``T`` whose ``T * H`` rows give each slot that
-    many, and the share of one CTA's blocks in the call alone (blocks a CTA
-    walks over blocks a slot runs); skips where the architecture routes no such
-    module."""
+    forward module of ``role`` (``fwd_xlong``, ``fwd_long`` or ``fwd_mid``)
+    at ``edge`` of its rows, the fewest tokens ``T`` whose ``T * H`` rows give
+    each slot that many, and the share of one CTA's blocks in the call alone
+    (blocks a CTA walks over blocks a slot runs); skips where the architecture
+    routes no such module."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     routes = loader.ROUTES[arch]
@@ -701,11 +704,18 @@ def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
     # rows per SM that give each slot of the SM one more row block
     step = int(rule["ctas_per_sm"]) * rows_per_block
     blocks_per_slot = -(-loader.min_rows_per_sm(name, arch) // step)
-    if edge == "last" and role == "fwd_long":
-        blocks_per_slot *= 4
+    # the "last" edge: the most below the next tier's start where the
+    # architecture routes one (the mid forward below the long one, or on
+    # sm_107a, which routes no long forward, below the extra-long one; on
+    # sm_103a the long forward below the extra-long one), else four times
+    # "first"
+    uppers = {"fwd_mid": ("fwd_long", "fwd_xlong"), "fwd_long": ("fwd_xlong",)}
+    upper = next((u for u in uppers.get(role, ()) if u in routes), None)
+    if edge == "last" and upper is not None:
+        upper_start = loader.min_rows_per_sm(routes[upper], arch)
+        blocks_per_slot = (upper_start - 1) // step
     elif edge == "last":
-        long_start = loader.min_rows_per_sm(routes["fwd_long"], arch)
-        blocks_per_slot = (long_start - 1) // step
+        blocks_per_slot *= 4
     tokens = -(-(blocks_per_slot * slots * rows_per_block) // H)
     rows = tokens * H
     assert loader.module_for_rows(arch, "fwd", rows, sms) == name
@@ -758,19 +768,34 @@ def test_long_forward_slows_in_proportion_to_the_sms_held(
     "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
 )
 @pytest.mark.parametrize("edge", FORWARD_EDGES)
+def test_extra_long_forward_slows_in_proportion_to_the_sms_held(
+    edge: str, ctas: int, threads: int
+) -> None:
+    _forward_slows_in_proportion("fwd_xlong", edge, ctas, threads)
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("edge", FORWARD_EDGES)
 def test_mid_forward_slows_in_proportion_to_the_sms_held(
     edge: str, ctas: int, threads: int
 ) -> None:
     _forward_slows_in_proportion("fwd_mid", edge, ctas, threads)
 
 
-# The short forward: its two token counts (one row per SM and its threshold,
-# the rows per SM up to which each architecture runs it: 12 on sm_100a and
-# sm_103a, 10 on sm_107a), and the side kernels of the item 1 test beside it,
-# the issue's three with the default carveout and 16 CTAs of 1024 threads with
-# the max-shared carveout.
-SHORT_FORWARD_THRESHOLD = {"sm_100a": 12, "sm_103a": 12, "sm_107a": 10}
-SHORT_FORWARD_EDGES = ("one", "threshold")
+# The short forward: the rows per SM of its token counts on each architecture
+# (one row per SM and its threshold, the largest, up to which the architecture
+# runs it: 12 on sm_100a and sm_103a, 59 on sm_107a, where 10 and 30 are probed
+# as well), and the side kernels of the item 1 test beside it, the issue's three
+# with the default carveout and 16 CTAs of 1024 threads with the max-shared
+# carveout.
+SHORT_FORWARD_ROWS_PER_SM = {
+    "sm_100a": (1, 12),
+    "sm_103a": (1, 12),
+    "sm_107a": (1, 10, 30, 59),
+}
+SHORT_FORWARD_EDGES = tuple(sorted(set().union(*SHORT_FORWARD_ROWS_PER_SM.values())))
 SHORT_FORWARD_SIDES = ((1, 128, None), (16, 640, None), (32, 640, None)) + (
     (16, 1024, CARVEOUT_MAX_SHARED),
 )
@@ -788,29 +813,30 @@ SHORT_MAX_ALONE_SPREAD = 1.7
 SHORT_EXTRA_ATTEMPTS = 2
 
 
-def _short_forward_tokens(edge: str) -> int:
+def _short_forward_tokens(rows_per_sm: int) -> int:
     """The most tokens ``T`` (at least one) whose ``T * H`` rows stay within
-    one row per SM (``edge`` "one") or the architecture's threshold
-    (``edge`` "threshold", ``SHORT_FORWARD_THRESHOLD``), where the
+    ``rows_per_sm`` rows per SM, one of the architecture's
+    ``SHORT_FORWARD_ROWS_PER_SM`` (the largest its threshold), where the
     architecture routes the short forward (skips elsewhere)."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     name = loader.ROUTES[arch].get("fwd_short")
     if name is None:
         pytest.skip(f"{arch} routes no fwd_short module")
+    if rows_per_sm not in SHORT_FORWARD_ROWS_PER_SM[arch]:
+        pytest.skip(f"{arch} does not probe {rows_per_sm} rows per SM")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    assert loader.max_rows_per_sm(name, arch) == SHORT_FORWARD_THRESHOLD[arch]
-    rows_per_sm = 1 if edge == "one" else SHORT_FORWARD_THRESHOLD[arch]
+    assert loader.max_rows_per_sm(name, arch) == max(SHORT_FORWARD_ROWS_PER_SM[arch])
     tokens = max(1, rows_per_sm * sms // H)
     assert loader.module_for_rows(arch, "fwd", tokens * H, sms) == name
     return tokens
 
 
-@pytest.mark.parametrize("edge", SHORT_FORWARD_EDGES)
+@pytest.mark.parametrize("rows_per_sm", SHORT_FORWARD_EDGES)
 def test_short_forward_keeps_its_speed_beside_a_resident_kernel(
-    edge: str,
+    rows_per_sm: int,
 ) -> None:
-    tokens = _short_forward_tokens(edge)
+    tokens = _short_forward_tokens(rows_per_sm)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
 
@@ -838,11 +864,11 @@ def test_short_forward_keeps_its_speed_beside_a_resident_kernel(
     )
 
 
-@pytest.mark.parametrize("edge", SHORT_FORWARD_EDGES)
+@pytest.mark.parametrize("rows_per_sm", SHORT_FORWARD_EDGES)
 def test_short_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
-    edge: str,
+    rows_per_sm: int,
 ) -> None:
-    tokens = _short_forward_tokens(edge)
+    tokens = _short_forward_tokens(rows_per_sm)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
 
@@ -870,11 +896,11 @@ def test_short_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveo
     SHORT_FORWARD_SIDES,
     ids=["1x128", "16x640", "32x640", "16x1024-max_shared"],
 )
-@pytest.mark.parametrize("edge", SHORT_FORWARD_EDGES)
+@pytest.mark.parametrize("rows_per_sm", SHORT_FORWARD_EDGES)
 def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
-    edge: str, ctas: int, threads: int, carveout: int | None
+    rows_per_sm: int, ctas: int, threads: int, carveout: int | None
 ) -> None:
-    tokens = _short_forward_tokens(edge)
+    tokens = _short_forward_tokens(rows_per_sm)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
     y_det = torch.empty_like(x)

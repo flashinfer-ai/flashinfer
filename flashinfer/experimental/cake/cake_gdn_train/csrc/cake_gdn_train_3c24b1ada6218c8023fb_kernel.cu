@@ -47,46 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_S_W_OFF 0
-#define SMEM_S_W_STAGE_BYTES 16384
-#define SMEM_S_W_STRIDE 40960
-#define SMEM_S_KN_OFF 16384
-#define SMEM_S_KN_STAGE_BYTES 16384
-#define SMEM_S_KN_STRIDE 40960
-#define SMEM_S_U_OFF 32768
-#define SMEM_S_U_STAGE_BYTES 8192
-#define SMEM_S_U_STRIDE 40960
-#define SMEM_S_G_OFF 81920
-#define SMEM_S_G_STAGE_BYTES 512
-#define SMEM_S_G_STRIDE 512
-#define SMEM_S_STAGE_OFF 82432
-#define SMEM_S_STAGE_STAGE_BYTES 16384
-#define SMEM_S_STAGE_STRIDE 16384
-#define SMEM_S_RED_OFF 98816
-#define SMEM_S_RED_STAGE_BYTES 16
-#define SMEM_S_RED_STRIDE 16
-#define SMEM_S_X32_OFF 0
-#define SMEM_S_X32_STAGE_BYTES 32768
-#define SMEM_S_X32_STRIDE 32768
-#define SMEM_S_XHI_OFF 32768
-#define SMEM_S_XHI_STAGE_BYTES 16384
-#define SMEM_S_XHI_STRIDE 16384
-#define SMEM_S_XLO_OFF 49152
-#define SMEM_S_XLO_STAGE_BYTES 16384
-#define SMEM_S_XLO_STRIDE 16384
-#define SMEM_S_MHI_OFF 65536
-#define SMEM_S_MHI_STAGE_BYTES 8192
-#define SMEM_S_MHI_STRIDE 8192
-#define SMEM_S_MLO_OFF 73728
-#define SMEM_S_MLO_STAGE_BYTES 8192
-#define SMEM_S_MLO_STRIDE 8192
-#define SMEM_S_M32_OFF 82432
-#define SMEM_S_M32_STAGE_BYTES 16384
-#define SMEM_S_M32_STRIDE 16384
-#define SMEM_TOTAL 98944
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float approx_exp2(float x) {
@@ -127,7 +87,7 @@ kernel_cake_gdn_train_3c24b1ada6218c8023fb(__nv_bfloat16* __restrict__ kn, __nv_
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_w = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_w_addr = smem + 0;
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -3541,8 +3501,8 @@ kernel_cake_gdn_train_3c24b1ada6218c8023fb(__nv_bfloat16* __restrict__ kn, __nv_
                     : "=f"((acc_v + nb3 * 8)[0]), "=f"((acc_v + nb3 * 8)[1]), "=f"((acc_v + nb3 * 8)[2]), "=f"((acc_v + nb3 * 8)[3])
                     : "r"((hpk + ks * 4)[0]), "r"((hpk + ks * 4)[1]), "r"((hpk + ks * 4)[2]), "r"((hpk + ks * 4)[3]), "r"(b_frag_k[0]), "r"(b_frag_k[1]), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8)[0])), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8)[1])), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8)[2])), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8)[3])));
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-                    : "=f"((acc_v + nb3 * 8 + 4)[0]), "=f"((acc_v + nb3 * 8 + 4)[1]), "=f"((acc_v + nb3 * 8 + 4)[2]), "=f"((acc_v + nb3 * 8 + 4)[3])
-                    : "r"((hpk + ks * 4)[0]), "r"((hpk + ks * 4)[1]), "r"((hpk + ks * 4)[2]), "r"((hpk + ks * 4)[3]), "r"(b_frag_k[2]), "r"(b_frag_k[(2) + 1]), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8 + 4)[0])), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8 + 4)[1])), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8 + 4)[2])), "f"(((ks == 0) ? 0.0f : (acc_v + nb3 * 8 + 4)[3])));
+                    : "=f"((acc_v + (nb3 * 8 + 4))[0]), "=f"((acc_v + (nb3 * 8 + 4))[1]), "=f"((acc_v + (nb3 * 8 + 4))[2]), "=f"((acc_v + (nb3 * 8 + 4))[3])
+                    : "r"((hpk + ks * 4)[0]), "r"((hpk + ks * 4)[1]), "r"((hpk + ks * 4)[2]), "r"((hpk + ks * 4)[3]), "r"(b_frag_k[2]), "r"(b_frag_k[(2) + 1]), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[0])), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[1])), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[2])), "f"(((ks == 0) ? 0.0f : (acc_v + (nb3 * 8 + 4))[3])));
             }
         }
         long long tape_base = ((long long)chunk * nvh + hv64) * 16384 + (long long)(v0 + vwarp * 16) * 128 + (long long)kbase;
@@ -3761,7 +3721,7 @@ kernel_cake_gdn_train_3c24b1ada6218c8023fb(__nv_bfloat16* __restrict__ kn, __nv_
                     : "+f"((acc_h + nb5 * 8)[0]), "+f"((acc_h + nb5 * 8)[1]), "+f"((acc_h + nb5 * 8)[2]), "+f"((acc_h + nb5 * 8)[3])
                     : "r"((vpk + ks2 * 4)[0]), "r"((vpk + ks2 * 4)[1]), "r"((vpk + ks2 * 4)[2]), "r"((vpk + ks2 * 4)[3]), "r"(b_frag_mn[0]), "r"(b_frag_mn[1]));
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                    : "+f"((acc_h + nb5 * 8 + 4)[0]), "+f"((acc_h + nb5 * 8 + 4)[1]), "+f"((acc_h + nb5 * 8 + 4)[2]), "+f"((acc_h + nb5 * 8 + 4)[3])
+                    : "+f"((acc_h + (nb5 * 8 + 4))[0]), "+f"((acc_h + (nb5 * 8 + 4))[1]), "+f"((acc_h + (nb5 * 8 + 4))[2]), "+f"((acc_h + (nb5 * 8 + 4))[3])
                     : "r"((vpk + ks2 * 4)[0]), "r"((vpk + ks2 * 4)[1]), "r"((vpk + ks2 * 4)[2]), "r"((vpk + ks2 * 4)[3]), "r"(b_frag_mn[2]), "r"(b_frag_mn[(2) + 1]));
             }
         }

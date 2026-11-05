@@ -1213,6 +1213,15 @@ def get_shuffle_block_size(epilogue_tile_m: int) -> int:
     return shuffle_block_size
 
 
+def _unaligned_rows_message(M: int, alignment: int) -> str:
+    return (
+        f"input_tensor.shape[0]={M} must be a multiple of {alignment}. For the trtllm "
+        "block-scale MoE ops (FP8, FP4, MXINT4), zero-pad the unaligned dimension "
+        "(intermediate_size for FC1, hidden_size for FC2) to a multiple of 128 and "
+        "pass valid_intermediate_size / valid_hidden_size."
+    )
+
+
 def get_shuffle_matrix_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int
 ) -> torch.Tensor:
@@ -1232,9 +1241,7 @@ def get_shuffle_matrix_a_row_indices(
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
     row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
 
-    assert M % shuffle_block_size == 0, (
-        f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
-    )
+    assert M % shuffle_block_size == 0, _unaligned_rows_message(M, shuffle_block_size)
 
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
@@ -1263,7 +1270,7 @@ def get_shuffle_matrix_sf_a_row_indices(
 
     # M, K from the input
     M, K = input_tensor.shape
-    assert M % 128 == 0
+    assert M % 128 == 0, _unaligned_rows_message(M, 128)
     # K % 4 alignment is not required here, downstream block_scale_interleave kernel pads K to a multiple of 4 internally
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 

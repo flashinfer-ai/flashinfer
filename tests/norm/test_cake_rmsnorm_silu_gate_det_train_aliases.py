@@ -172,6 +172,7 @@ def test_old_package_is_self_contained() -> None:
     roles = {record["role"] for record in loader.MODULES.values()}
     assert roles == (
         set(loader.ROLES)
+        | set(loader.XLONG_ROLES)
         | set(loader.LONG_ROLES)
         | set(loader.MID_ROLES)
         | set(loader.SHORT_ROLES)

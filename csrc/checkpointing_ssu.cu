@@ -291,14 +291,23 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(ring_start.size(0) == state_cache_size,
                    "ring_start.size(0)=", ring_start.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  CHECK_CONTIGUOUS(ring_start);
+  // Strided 1-D views are allowed (e.g. a per-slot field inside a larger cache
+  // page); stride 0 would alias every slot.
+  FLASHINFER_CHECK(
+      ring_start.size(0) <= 1 || (ring_start.stride(0) >= 1 && ring_start.stride(0) <= INT32_MAX),
+      "ring_start.stride(0)=", ring_start.stride(0), " must be in [1, 2^31)");
 
   CHECK_CUDA(prev_num_accepted);
   CHECK_DIM(1, prev_num_accepted);
   FLASHINFER_CHECK(prev_num_accepted.size(0) == state_cache_size,
                    "prev_num_accepted.size(0)=", prev_num_accepted.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  CHECK_CONTIGUOUS(prev_num_accepted);
+  // Strided 1-D views are allowed (e.g. a per-slot field inside a larger cache
+  // page); stride 0 would alias every slot.
+  FLASHINFER_CHECK(
+      prev_num_accepted.size(0) <= 1 ||
+          (prev_num_accepted.stride(0) >= 1 && prev_num_accepted.stride(0) <= INT32_MAX),
+      "prev_num_accepted.stride(0)=", prev_num_accepted.stride(0), " must be in [1, 2^31)");
 
   // ── Validate optional D ──
   if (D.has_value()) {
@@ -494,8 +503,10 @@ void checkpointing_ssu(
   p.B_cache = B_cache.data_ptr();
   p.dt_cache = dt_cache.data_ptr();
   p.ring_start = const_cast<void*>(ring_start.data_ptr());
+  p.ring_start_stride = ring_start.stride(0);
   p.ring_buffer_len = static_cast<int32_t>(ring_buffer_len);
   p.prev_num_accepted = const_cast<void*>(prev_num_accepted.data_ptr());
+  p.prev_num_accepted_stride = prev_num_accepted.stride(0);
 
   if (D.has_value()) p.D = const_cast<void*>(D.value().data_ptr());
   if (z.has_value()) {

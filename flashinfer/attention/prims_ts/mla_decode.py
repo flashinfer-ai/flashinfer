@@ -30,6 +30,7 @@ from ._hardware import get_max_active_clusters
 
 from .kernels.mla_decode.helpers.nvfp4_kv import (
     cache_record_size,
+    is_sm107_target,
     validate_nvfp4_kv_formats,
 )
 
@@ -2435,6 +2436,11 @@ def _resolve_sparse_mla_plan(
     if max_rows * num_qo_heads >= 2**31 or capacity >= 2**31 - 32768:
         raise ValueError("query/route extent exceeds the int32 kernel domain")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    compute_capability = torch.cuda.get_device_capability(device)
+    if compute_capability == (10, 7) and not is_sm107_target():
+        # SM107 schedules assume the SM107 kernel resources gated on the
+        # compile target; an sm_100f build keeps the generic schedule.
+        compute_capability = None
     profile = select_sparse_mla_profile(
         rows=max_rows,
         heads=num_qo_heads,
@@ -2444,7 +2450,15 @@ def _resolve_sparse_mla_plan(
         sm_count=sm_count,
         rope_dim=qk_rope_head_dim,
         kv_cache_format=kv_cache_format,
+        compute_capability=compute_capability,
     )
+    if (
+        output_quant is not None
+        and profile.family == "2cta"
+        and q_dtype != torch.bfloat16
+    ):
+        # The staged quantized-output tile takes the SMEM of a third V stage.
+        profile = replace(profile, kv_pipeline_stages=0)
     # Reloading V from L2 shortens native FP8 decode's producer lifetime.
     # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
     # caches and two-source/sink plans retain their format-specific schedules.
