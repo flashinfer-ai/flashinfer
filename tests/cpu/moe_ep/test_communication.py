@@ -697,11 +697,11 @@ def _fake_sentinel(monkeypatch, module) -> list:
         extended.append(max_tokens)
         metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] += 1 << 12
 
-    module.moe_a2a_lamport_extend_workspace_layout = extend
+    module.moe_a2a_sentinel_extend_workspace_layout = extend
     monkeypatch.setattr(
         one_sided,
         "layout_constants",
-        lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT, LAMPORT_FORMAT_BF16=0),
+        lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT, SENTINEL_FORMAT_BF16=0),
     )
     monkeypatch.setattr(one_sided, "_sentinel_unsupported_reason", lambda *a: None)
     row = one_sided._SentinelRow(16, 0, 1, 64)

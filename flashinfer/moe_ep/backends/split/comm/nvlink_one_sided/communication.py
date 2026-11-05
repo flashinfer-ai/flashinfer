@@ -5,13 +5,13 @@ ranks that own its experts; the combine kernel reads the expert outputs back
 from those ranks and reduces them locally. A step synchronizes by one of two
 protocols (``NVLinkOneSidedConfig.sync_protocol``): the fence protocol publishes
 per-peer completion flags behind a system-scope fence; under the sentinel
-protocol (``include/flashinfer/comm/moe_alltoall_lamport.cuh``) every pushed
+protocol (``include/flashinfer/comm/moe_alltoall_sentinel.cuh``) every pushed
 vector carries its own arrival, so neither direction waits for flags.
 
 One symmetric workspace, laid out by ``moe_a2a_get_workspace_layout``, holds
 the round state, the dispatch receive buffers and the combine buffers of a
 rank. Its size grows with ``ep_size * max_tokens_per_rank``; the sentinel
-regions, appended by ``moe_a2a_lamport_extend_workspace_layout``, grow with
+regions, appended by ``moe_a2a_sentinel_extend_workspace_layout``, grow with
 ``ep_size * sentinel_max_tokens``. Instances with the same layout share one
 workspace.
 """
@@ -76,8 +76,8 @@ def _sentinel_row(
     return _SentinelRow(
         *map(
             int,
-            module.moe_a2a_lamport_row_bytes(
-                getattr(index, f"LAMPORT_FORMAT_{sentinel_format}"),
+            module.moe_a2a_sentinel_row_bytes(
+                getattr(index, f"SENTINEL_FORMAT_{sentinel_format}"),
                 params.hidden_size,
                 params.top_k,
             ),
@@ -94,17 +94,17 @@ def _probe_sentinel_support(
 ) -> Optional[str]:
     import torch
 
-    if not module.moe_a2a_lamport_available():
+    if not module.moe_a2a_sentinel_available():
         return "the kernel module has no sentinel kernels for this GPU"
-    if ep_size > index.LAMPORT_MAX_RANKS:
-        return f"it supports at most {index.LAMPORT_MAX_RANKS} EP ranks"
-    if params.top_k > index.LAMPORT_MAX_TOP_K:
-        return f"it supports top_k <= {index.LAMPORT_MAX_TOP_K}"
+    if ep_size > index.SENTINEL_MAX_RANKS:
+        return f"it supports at most {index.SENTINEL_MAX_RANKS} EP ranks"
+    if params.top_k > index.SENTINEL_MAX_TOP_K:
+        return f"it supports top_k <= {index.SENTINEL_MAX_TOP_K}"
     if params.token_dtype != torch.bfloat16:
         return "it combines BF16 expert outputs only"
     if config.use_low_precision_combine:
         return "it has no FP8 combine"
-    if ((params.invalid_expert_id - index.LAMPORT_IDS_SENTINEL) & 0xFFFFFFFF) == 0:
+    if ((params.invalid_expert_id - index.SENTINEL_IDS_SENTINEL) & 0xFFFFFFFF) == 0:
         return "invalid_expert_id equals its expert-id sentinel as an int32"
     name = getattr(params.dispatch_format, "name", None)
     if name not in _SENTINEL_FORMATS:
@@ -283,10 +283,10 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             ]
             row = _sentinel_row(self._module, index, sentinel_format, params)
             size_before = int(metainfo[index.WORKSPACE_SIZE_INDEX])
-            self._module.moe_a2a_lamport_extend_workspace_layout(
+            self._module.moe_a2a_sentinel_extend_workspace_layout(
                 metainfo,
                 max_tokens,
-                getattr(index, f"LAMPORT_FORMAT_{sentinel_format}"),
+                getattr(index, f"SENTINEL_FORMAT_{sentinel_format}"),
                 params.hidden_size,
             )
             self.sentinel_max_tokens = max_tokens
