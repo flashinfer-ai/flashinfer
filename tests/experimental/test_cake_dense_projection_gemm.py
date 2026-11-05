@@ -1715,18 +1715,18 @@ K1_148_EXCLUDED_TOKENS = {
     ("sm_100a", 5120, 64, "f32"): ((512, 1024), (8192, 8192)),
     ("sm_103a", 4096, 32, "bf16"): ((65536, None),),
     ("sm_103a", 4096, 32, "f32"): ((65536, None),),
-    ("sm_103a", 5120, 48, "bf16"): ((512, 2048),),
+    ("sm_103a", 5120, 48, "bf16"): ((512, 2048), (40961, 49151)),
     ("sm_103a", 5120, 48, "f32"): ((512, 2048),),
-    ("sm_103a", 5120, 64, "bf16"): ((512, 1024),),
+    ("sm_103a", 5120, 64, "bf16"): ((512, 1024), (47105, 49152)),
     ("sm_103a", 5120, 64, "f32"): ((512, 1024),),
     ("sm_103a", 5120, 128, "bf16"): ((512, 4096), (32768, 65536)),
     ("sm_103a", 5120, 128, "f32"): ((512, 4096), (32768, 65536)),
     ("sm_103a", 6144, 128, "bf16"): ((512, 8192),),
     ("sm_103a", 6144, 128, "f32"): ((512, 8192),),
 }
-#: The measured token counts of the 148-SM audit (49153: a point of the FP64 error grid of sm_100a ``5120 -> 32`` BF16,
-#: 10 seeds at 32769 to 65025 tokens).
-K1_148_MEASURED_TOKENS = (512, 1024, 2048, 4096, 8192, 16231, 32768, 49153, 65536)
+#: The measured token counts of the 148-SM audit (40961, 47105, 49152 and 49153: points of the 10-seed FP64 error grids
+#: of sm_100a ``5120 -> 32`` and sm_103a ``5120 -> 48`` / ``5120 -> 64`` BF16).
+K1_148_MEASURED_TOKENS = (512, 1024, 2048, 4096, 8192, 16231, 32768, 40961, 47105, 49152, 49153, 65536)
 
 
 def test_k1_exact_sm_count_exclusions(monkeypatch):
@@ -1734,8 +1734,8 @@ def test_k1_exact_sm_count_exclusions(monkeypatch):
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` on a part of exactly that SM count (148-SM sm_100a / sm_103a parts),
     and every part of any other SM count (147, 149, 152, 160, 208, 212, 216, 220) plans every row and token count as
     without the table.  Every entry belongs to a row of :data:`K1_SPLIT_RULES` with a program on that part; its ranges
-    are closed, disjoint and not adjacent, start at a measured token count and end at one or have no upper bound; one
-    token outside a range the row keeps the plan it has without the table."""
+    are closed, disjoint and not adjacent, start at a measured token count and end at one, one token below one, or
+    have no upper bound; one token outside a range the row keeps the plan it has without the table."""
     table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM
     got_rows = {
         (arch, k[2], k[3], k[4]): tuple(v)
@@ -1794,7 +1794,7 @@ def test_k1_exact_sm_count_exclusions(monkeypatch):
                 assert any(b < T < c for T in K1_148_MEASURED_TOKENS), key
             for lo, hi in spans:
                 assert lo in K1_148_MEASURED_TOKENS, key
-                assert hi is None or hi in K1_148_MEASURED_TOKENS, key
+                assert hi is None or {hi, hi + 1} & set(K1_148_MEASURED_TOKENS), key
                 assert without[(key, 148, lo)] is not None, key
                 assert with_table[(key, 148, lo)] is None, key
 
