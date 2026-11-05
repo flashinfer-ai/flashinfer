@@ -172,7 +172,7 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     return y, S_after_history, us, khat, gam
 
 
-def _make_case(B, T, hist_lens, seed, bases=None, poison=True):
+def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
     io = torch.bfloat16
     g = torch.Generator(device=DEV).manual_seed(seed)
 
@@ -189,7 +189,7 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True):
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(torch.float16)
     fill = float("nan") if poison else 0.0
     kc = torch.full((B, H, RING, K), fill, dtype=io, device=DEV)
-    uc = torch.full((B, HV, RING, V), fill, dtype=io, device=DEV)
+    uc = torch.full((B, HV, RING, V), fill, dtype=u_dtype or io, device=DEV)
     gc = torch.full((B, HV, RING), fill, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     bases = bases or [0] * B
@@ -203,7 +203,9 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True):
         )
         kh = torch.randn(H, P, K, generator=g, device=DEV)
         kc[r, :, rows] = F.normalize(kh, dim=-1).to(io)
-        uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(io)
+        uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(
+            u_dtype or io
+        )
         la = -(torch.rand(HV, P, generator=g, device=DEV) * 0.3 + 0.003)
         gc[r, :, rows] = torch.cumsum(la, dim=-1)
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
@@ -256,7 +258,15 @@ def _run(fn, case, flush_min, row_order=None, restart=False, window_rows=None):
 
 
 def _check_case(
-    T, hist, bases, flush_min, seed, row_order=None, check_rings=True, hpc=None
+    T,
+    hist,
+    bases,
+    flush_min,
+    seed,
+    row_order=None,
+    check_rings=True,
+    hpc=None,
+    u_dtype=None,
 ):
     fn = _umma()
     if hpc is not None:
@@ -264,7 +274,7 @@ def _check_case(
 
         fn = functools.partial(fn, heads_per_cta=hpc)
     B = len(hist)
-    case = _make_case(B, T, hist, seed, bases)
+    case = _make_case(B, T, hist, seed, bases, u_dtype=u_dtype)
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
     ro = None
@@ -339,6 +349,18 @@ def test_matches_fp32_reference_any_T(T, bases):
     hist = [0, fm - 1, fm, _p_max(T), 1, fm - 1, _p_max(T), 3]
     b = [0] * 8 if bases == "base0" else _B8W
     _check_case(T, hist, b, fm, seed=100 + T)
+
+
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("bases", ["base0", "wrap"])
+def test_u_ring_fp16_matches_fp32_reference(T, bases):
+    """fp16 u ring (vLLM's u-cache dtype) next to the bf16 k ring: a separate kernel build whose u reads and
+    appends convert from / to fp16; outputs, ring appends and the folded state against the oracle."""
+    _skip_if_not_sm100()
+    fm = _fm_max(T)
+    hist = [0, fm - 1, fm, _p_max(T), 1, fm - 1, _p_max(T), 3]
+    b = [0] * 8 if bases == "base0" else _B8W
+    _check_case(T, hist, b, fm, seed=400 + T, u_dtype=torch.float16)
 
 
 @pytest.mark.parametrize("T", [4, 8])
@@ -1714,14 +1736,63 @@ def test_public_backend_umma_ring64_needs_64_slot_rings():
         _public_call(case, backend="umma_ring64")
 
 
-def test_public_backend_umma_ring64_rejects_an_fp16_u_ring():
-    """The fp16 u ring (vLLM's u-cache dtype) is served by backend='umma' only."""
+@pytest.mark.parametrize("T", [1, 4, 8])
+def test_public_backend_umma_ring64_takes_an_fp16_u_ring(T):
+    """The fp16 u ring (vLLM's u-cache dtype) next to the bf16 k ring is served: bit-identical to the direct call."""
+    _skip_if_not_sm100()
+    hist = list(range(0, _default_fm(T) + 1))
+    B = len(hist)
+    case_a = _make_case(B, T, hist, 60 + T, [3] * B, u_dtype=torch.float16)
+    case_b = tuple(x.clone() for x in case_a)
+    y_a = _public_call(case_a, backend="umma_ring64")
+    y_b = _run(_umma(), case_b, None)
+    torch.cuda.synchronize()
+    assert case_a[9].dtype == torch.float16
+    for x, y_ in (
+        (y_a, y_b),
+        (case_a[7], case_b[7]),
+        (case_a[8], case_b[8]),
+        (case_a[9], case_b[9]),
+        (case_a[10], case_b[10]),
+    ):
+        assert torch.equal(_bits(x), _bits(y_))
+
+
+def test_public_backend_umma_ring64_rejects_an_fp16_k_ring():
+    """The Gram runs bf16 mma.sync on the raw k ring: only the u ring may be fp16."""
     _skip_if_not_sm100()
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
         2, 4, [0, 1], 5, [0, 0]
     )
-    case = (q, k, v, a, b, A_log, dt_bias, pool, kc, uc.half(), gc, hl, cb, idx)
-    with pytest.raises(ValueError, match="bf16 k and u rings"):
+    case = (q, k, v, a, b, A_log, dt_bias, pool, kc.half(), uc, gc, hl, cb, idx)
+    with pytest.raises(ValueError, match="bf16 k ring"):
+        _public_call(case, backend="umma_ring64")
+
+
+def test_public_backend_umma_ring64_needs_4_value_heads_per_key_head():
+    """The kernel is specialised for HV / H = 4 (backend='umma' also serves 1 to 3)."""
+    _skip_if_not_sm100()
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
+        2, 4, [0, 1], 5, [0, 0]
+    )
+    hv = 32  # HV / H = 2
+    case = (
+        q,
+        k,
+        v[:, :, :hv].contiguous(),
+        a[:, :, :hv].contiguous(),
+        b[:, :, :hv].contiguous(),
+        A_log[:hv].contiguous(),
+        dt_bias[:hv].contiguous(),
+        pool[:, :hv].contiguous(),
+        kc,
+        uc[:, :hv].contiguous(),
+        gc[:, :hv].contiguous(),
+        hl,
+        cb,
+        idx,
+    )
+    with pytest.raises(ValueError, match="4 value heads per key head"):
         _public_call(case, backend="umma_ring64")
 
 

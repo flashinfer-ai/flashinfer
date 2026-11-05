@@ -3363,7 +3363,7 @@ def gated_delta_rule_mtp_ucache_flush(
     (k [pool, H, 64, K], u [pool, HV, 64, V], g [pool, HV, 64]; +0.63 MiB per
     request and layer) and gets a 32-row window; ``flush_min`` defaults to
     nu - T + 1 (T = 4: 29, T = 8: 25; 16 at T = 1), legal ``hist_len`` is
-    [0, flush_min - 1 + T], ``cache_base`` [0, 64). It takes bf16 rings only.
+    [0, flush_min - 1 + T], ``cache_base`` [0, 64). It takes a bf16 k ring and a bf16 or fp16 u ring (vLLM's u-cache dtype), and 4 value heads per key head.
     The 32-slot ring contents are not interchangeable with it.
     ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
     ``rand_seed`` and ``philox_rounds``; off unless set) rounds the fp16
@@ -3494,9 +3494,12 @@ def gated_delta_rule_mtp_ucache_flush(
             else _umma_unavailable_reason(device, T, H, HK, HV, _pc, pdl_trigger)
         )
         if _why is None and (
-            k_cache.dtype != torch.bfloat16 or u_cache.dtype != torch.bfloat16
+            k_cache.dtype != torch.bfloat16
+            or u_cache.dtype not in (torch.bfloat16, torch.float16)
         ):
-            _why = "needs bf16 k and u rings (an fp16 u ring is served by backend='umma' only)"
+            _why = "needs a bf16 k ring and a bf16 or fp16 u ring"
+        if _why is None and HV // H != 4:
+            _why = f"needs 4 value heads per key head (got HV / H = {HV}/{H})"
         if _why is None and tuple(k_cache.shape)[2:3] != (_UMMA_RING64_SLOTS,):
             _why = (
                 f"needs {_UMMA_RING64_SLOTS}-slot rings (k_cache [pool, H, "

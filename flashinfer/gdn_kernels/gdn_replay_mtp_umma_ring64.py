@@ -2,7 +2,7 @@
 """GDN ReplaySSM MTP decode step (1 <= T <= 8) on the UMMA / TMEM design (Blackwell).
 
 Opt-in sibling of ``gdn_replay_mtp_umma`` (``backend="umma_ring64"`` of ``gated_delta_rule_mtp_ucache_flush``):
-the same fp16-state arm (bf16 q/k/v/a/b/out, fp16 state pool, bf16 k/u rings, fp32 g ring), but a 64-slot ring
+the same fp16-state arm (bf16 q/k/v/a/b/out, fp16 state pool, bf16 k ring, bf16 or fp16 u ring, fp32 g ring), but a 64-slot ring
 with a 32-row window (RING_SLOTS = 64, W_RING = 32) instead of the 32-slot ring with a 16-row window. The caller
 allocates 64-slot rings (+0.63 MiB per request and layer); the default ``flush_min`` is nu - T + 1 (T = 4: 29,
 T = 8: 25) and 16 at T = 1. The ring contents are not interchangeable with the 32-slot kernel's.
@@ -225,7 +225,7 @@ class GdnReplayMtpUmma:
         T: int,
         h: int,
         hv: int,
-        ring_bf16: bool = True,
+        u_bf16: bool = True,
         use_row_order: bool = False,
         prof: bool = False,
         vf: bool = False,
@@ -247,7 +247,7 @@ class GdnReplayMtpUmma:
         self.T = T
         self.h = h
         self.hv = hv
-        self.ring_bf16 = ring_bf16
+        self.u_bf16 = u_bf16
         self.use_row_order = use_row_order
         self.prof = prof
         self.vf = vf
@@ -664,7 +664,7 @@ class GdnReplayMtpUmma:
         HPC = self.hpc
         T = self.T
         T2 = 2 * T
-        RB = self.ring_bf16
+        RB = self.u_bf16
         _ring_t = BFloat16 if RB else Float16
         HPC = self.hpc
         s_state = S["s_state"]
@@ -2218,12 +2218,12 @@ class GdnReplayMtpUmma:
                     hi = Float32(0.0)
                     if cutlass.const_expr(2 * c < nrow):
                         lo = (
-                            U.u16_as_f32(uvc[2 * c], self.ring_bf16)
+                            U.u16_as_f32(uvc[2 * c], self.u_bf16)
                             * s_coef[cb + _CO_W + j0]
                         )
                     if cutlass.const_expr(2 * c + 1 < nrow):
                         hi = (
-                            U.u16_as_f32(uvc[2 * c + 1], self.ring_bf16)
+                            U.u16_as_f32(uvc[2 * c + 1], self.u_bf16)
                             * s_coef[cb + _CO_W + j0 + 1]
                         )
                     words.append(U.pack_f16x2(lo, hi))
@@ -2272,9 +2272,9 @@ class GdnReplayMtpUmma:
         self._u_release(hh, ctx, uv)
         words = []
         for c in range(W_CHUNK // 2):
-            lo = U.u16_as_f32(uv[2 * c], self.ring_bf16) * s_coef[cb + _CO_W + 2 * c]
+            lo = U.u16_as_f32(uv[2 * c], self.u_bf16) * s_coef[cb + _CO_W + 2 * c]
             hi = (
-                U.u16_as_f32(uv[2 * c + 1], self.ring_bf16)
+                U.u16_as_f32(uv[2 * c + 1], self.u_bf16)
                 * s_coef[cb + _CO_W + 2 * c + 1]
             )
             words.append(U.pack_f16x2(lo, hi))
@@ -2290,7 +2290,7 @@ class GdnReplayMtpUmma:
         """Outputs and u appends of head hh from the readout R (cols rcol..) and history Y
         (cols rcol + 16..) TMEM columns; arrives epi_done[hh] once its TMEM reads are done."""
         T = self.T
-        ring_t = BFloat16 if self.ring_bf16 else Float16
+        ring_t = BFloat16 if self.u_bf16 else Float16
         sidx, base, P, brow, hv0 = (
             ctx["sidx"],
             ctx["base"],
@@ -2358,9 +2358,7 @@ class GdnReplayMtpUmma:
                 u_cache[sidx, hv, (base + P + t) & RING_MASK, row] = ring_t(uu[t])
             else:
                 ua = _sel(s0 + t < RING_SLOTS, u_a, u_b, Int64)
-                U.stg_u16(
-                    ua + Int64(t * V_DIM * 2), U.f32_to_u16(uu[t], self.ring_bf16)
-                )
+                U.stg_u16(ua + Int64(t * V_DIM * 2), U.f32_to_u16(uu[t], self.u_bf16))
             if self.vf and not early_release:  # flush rows (verify: warp 0 bulk copies)
                 ctx["v_cache"][sidx, hv, (base + P + t) & RING_MASK, row] = vv[t]
         self._stamp(ctx, PF_EPI + hh)
@@ -2601,7 +2599,7 @@ class GdnReplayMtpUmma:
         T: int,
         h: int,
         hv: int,
-        ring_bf16: bool,
+        u_bf16: bool,
         use_row_order: bool,
         prof: bool = False,
         vf: bool = False,
@@ -2616,7 +2614,7 @@ class GdnReplayMtpUmma:
         batch = cute.sym_int()
         pool = cute.sym_int()
         ft = U.make_fake_tensor_lead_dyn
-        ring = BFloat16 if ring_bf16 else Float16
+        uring = BFloat16 if u_bf16 else Float16  # u ring element type
         args = [
             ft(BFloat16, (batch, T, h, K_DIM), 8),  # q
             ft(BFloat16, (batch, T, h, K_DIM), 8),  # k
@@ -2627,10 +2625,11 @@ class GdnReplayMtpUmma:
             ft(Float32, (hv,), 1),  # dt_bias (fp32)
             ft(Float16, (pool, hv, V_DIM, K_DIM), 8),  # state
             ft(Int32, (batch,), 1),  # state indices
-            ft(ring, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring
-            ft(ring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring
+            ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring (bf16)
+            ft(uring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring (bf16 / fp16)
             ft(Float32, (pool, hv, RING_SLOTS), 1),  # g ring
-            ft(BFloat16, (pool, hv, RING_SLOTS, V_DIM), 8),  # v ring (unf_vf)
+            # v ring (unf_vf); an unread placeholder (the u ring itself) otherwise, so it has the u ring's dtype
+            ft(BFloat16 if vf else uring, (pool, hv, RING_SLOTS, V_DIM), 8),
             ft(Float32, (pool, hv, RING_SLOTS), 1),  # beta ring (unf_vf)
             ft(Int32, (batch,), 1),  # hist_len
             ft(Int32, (batch,), 1),  # cache_base
@@ -2646,7 +2645,7 @@ class GdnReplayMtpUmma:
                 T,
                 h,
                 hv,
-                ring_bf16,
+                u_bf16,
                 use_row_order,
                 prof,
                 vf,
@@ -2831,8 +2830,12 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         and g_cache is not None
         and hist_len is not None
     )
-    # the per-CTA Gram runs bf16 mma.sync on raw ring keys and q/k: bf16 rings only
-    assert k_cache.dtype == u_cache.dtype == torch.bfloat16, "bf16 k/u rings required"
+    # the per-CTA Gram runs bf16 mma.sync on raw ring keys: a bf16 k ring; the u ring is read and appended through
+    # dtype-aware conversions, so it may be bf16 or fp16 (vLLM's u-cache dtype)
+    assert k_cache.dtype == torch.bfloat16, "bf16 k ring required"
+    assert u_cache.dtype in (torch.bfloat16, torch.float16), (
+        "bf16 or fp16 u ring required"
+    )
     pool = h0.shape[0]
     assert tuple(k_cache.shape) == (pool, H, RING_SLOTS, K_DIM)
     assert tuple(u_cache.shape) == (pool, HV, RING_SLOTS, V_DIM)
@@ -3003,7 +3006,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         T,
         H,
         HV,
-        k_cache.dtype == torch.bfloat16,
+        u_cache.dtype == torch.bfloat16,
         use_ro,
         prof,
         vf,

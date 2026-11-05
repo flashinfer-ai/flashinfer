@@ -93,6 +93,15 @@ ARMS = {
     # ... the opt-in ring-64 variant: 64-slot rings, 32-row window, its own default flush_min
     # (flashinfer/gdn_kernels/gdn_replay_mtp_umma_ring64.py, backend="umma_ring64")
     "umma_ring64": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    # ... and with an fp16 u ring (vLLM's u-cache dtype; the k ring stays bf16)
+    "umma_ring64_u16": (
+        None,
+        "fp16",
+        None,
+        torch.bfloat16,
+        torch.float16,
+        torch.bfloat16,
+    ),
     # ... with an fp16 u ring (vLLM's u-cache dtype; the k ring stays bf16)
     "umma_u16": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
     # ... with stochastic rounding of the flushed state (fixed seed; the bits do not
@@ -104,6 +113,7 @@ ARMS = {
 _UMMA_SR = {
     "umma": {},
     "umma_ring64": {},
+    "umma_ring64_u16": {},
     "umma_u16": {},
     "umma_ph5": dict(stochastic_rounding="philox", philox_rounds=5),
     "umma_ph10": dict(stochastic_rounding="philox", philox_rounds=10),
@@ -149,7 +159,7 @@ _FLUSH_PATH = str(
 def load_flush(arm):
     io_env, state_env, ring_env, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     if arm in _UMMA_SR:
-        if arm == "umma_ring64":
+        if arm in ("umma_ring64", "umma_ring64_u16"):
             from flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 import (
                 gated_delta_rule_mtp_ucache_flush_umma_ring64 as fn,
             )
@@ -397,7 +407,7 @@ def main():
         choices=list(ARMS),
         default="bf16",
         help="dtype config: bf16 | fp16_state | fp16_io | ring_fp16 | fp16_state_cache | umma (UMMA kernel, "
-        "fp16 state) | umma_u16 (UMMA, fp16 u ring) | umma_ring64 (opt-in ring-64 UMMA, 64-slot rings) | umma_ph5 / "
+        "fp16 state) | umma_u16 (UMMA, fp16 u ring) | umma_ring64 / umma_ring64_u16 (opt-in ring-64 UMMA, 64-slot rings; bf16 / fp16 u ring) | umma_ph5 / "
         "umma_ph10 / umma_lcg (UMMA with stochastic rounding)",
     )
     ap.add_argument(
@@ -436,7 +446,7 @@ def main():
     ROW_ORDER = args.row_order
     T = args.T
     HV = args.hv
-    if args.arm == "umma_ring64":
+    if args.arm in ("umma_ring64", "umma_ring64_u16"):
         # the ring-64 kernel's own window / ring size and its default flush_min (nu - T + 1; 16 at T = 1)
         from flashinfer.gdn_kernels import gdn_replay_mtp_umma_ring64 as _r64
 
@@ -480,7 +490,9 @@ def main():
                 base=args.base,
                 no_commit=args.no_commit,
                 l2=args.l2,
-                u_dtype=torch.float16 if args.arm == "umma_u16" else None,
+                u_dtype=torch.float16
+                if args.arm in ("umma_u16", "umma_ring64_u16")
+                else None,
             )
             for r in args.rates
         ]
