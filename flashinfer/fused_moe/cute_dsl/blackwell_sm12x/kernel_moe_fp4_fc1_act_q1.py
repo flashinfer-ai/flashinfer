@@ -26,6 +26,7 @@ from ....tllm_enums import DEFAULT_SITU_BETA as SITU_BETA
 from ....tllm_enums import DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA
 from ....tllm_enums import ActivationType
 from ....utils import ceil_div
+from ....utils import round_up as align
 from ._moe_utils import moe_activation, moe_epilogue, moe_scheduler
 from ._moe_utils.moe_epilogue import (
     EPI_CONFIGS,
@@ -534,8 +535,7 @@ def mma(
     ab_stages,
     stage,
     phase,
-    up_scale,
-    gate_scale,
+    scale,
     gated: cutlass.Constexpr = True,
 ):
     bm, bn = tile_mn
@@ -547,7 +547,7 @@ def mma(
     shape_c = tiledmma.partition_shape_C((bm, bn))
     acc = cute.make_rmem_tensor(shape_c, acc_dtype)
     if cutlass.const_expr(gated):
-        acc_g = cute.make_rmem_tensor(shape_c, acc_dtype)
+        acc_up = cute.make_rmem_tensor(shape_c, acc_dtype)
     s2r_a = mma_cfg.make_s2r_a(tiledmma, a_dtype, a_is_m_major)
     s2r_b = mma_cfg.make_s2r_b(tiledmma, b_dtype, b_is_n_major, unpack_bits)
     thr_a, thr_b = s2r_a.get_slice(tidx), s2r_b.get_slice(tidx)
@@ -580,7 +580,7 @@ def mma(
     sf_blocks = cute.size(tCrSFA_v, mode=[2])
     acc.fill(0.0)
     if cutlass.const_expr(gated):
-        acc_g.fill(0.0)
+        acc_up.fill(0.0)
     for _ in cutlass.range(0, k_tile_count):
         cute.arch.mbarrier_wait(a_full + stage, phase)
         cute.arch.mbarrier_wait(b_full + stage, phase)
@@ -604,20 +604,23 @@ def mma(
                 cute.copy(s2r_sfb, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
         cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
         if cutlass.const_expr(gated):
-            cute.gemm(tiledmma, acc_g, [tCrA, tCrSFA_frg], [tCrG, tCrSFG_frg], acc_g)
+            cute.gemm(tiledmma, acc_up, [tCrA, tCrSFA_frg], [tCrG, tCrSFG_frg], acc_up)
         cute.arch.mbarrier_arrive(a_empty + stage)
         cute.arch.mbarrier_arrive(b_empty + stage)
         stage += 1
         if stage == ab_stages:
             stage = cutlass.Int32(0)
             phase ^= 1
-    acc.store(acc.load() * up_scale)
+    acc.store(acc.load() * scale)
     if cutlass.const_expr(gated):
-        acc_g.store(acc_g.load() * gate_scale)
-        activation(acc, acc_g)
+        acc_up.store(acc_up.load() * scale)
+        activation(acc_up, acc)
     else:
         activation(acc)
-    return acc, stage, phase
+    if cutlass.const_expr(gated):
+        return acc_up, stage, phase
+    else:
+        return acc, stage, phase
 
 
 class CuteDslSm120MoeNvfp4Fc1ActQ1:
@@ -645,8 +648,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
         gQ_u8: cute.Tensor,
         gSFQ_u8: cute.Tensor,
         offsets: cute.Tensor,
-        up_scale: cute.Tensor,
-        gate_scale: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         global_scale: cute.Tensor,
         stream,
         token_map=None,
@@ -812,8 +815,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
             gQ,
             gSFQ,
             offsets,
-            up_scale,
-            gate_scale,
+            weight_global_scale,
+            input_global_scale,
             global_scale,
             sfq_cols,
             a_smem,
@@ -851,8 +854,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
         gQ: cute.Tensor,
         gSFQ: cute.Tensor,
         offsets: cute.Tensor,
-        up_scale: cute.Tensor,
-        gate_scale: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         global_scale: cute.Tensor,
         sfq_cols,
         a_smem,
@@ -1168,9 +1171,6 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                     )
                 else:
                     sSFB_tile = sSFB
-                gate_mul = cutlass.Float32(0)
-                if cutlass.const_expr(cfg.gated):
-                    gate_mul = gate_scale[tile.group].to(cutlass.Float32)
                 acc, rstage, rphase = mma(
                     tiledmma,
                     self.mma,
@@ -1198,8 +1198,9 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                     cfg.ab_stage,
                     rstage,
                     rphase,
-                    up_scale[tile.group].to(cutlass.Float32),
-                    gate_mul,
+                    (weight_global_scale[tile.group] / input_global_scale[0]).to(
+                        cutlass.Float32
+                    ),
                     gated=cfg.gated,
                 )
                 if cutlass.const_expr(cfg.enable_pdl):
@@ -1490,8 +1491,7 @@ def mma_multistage(
     tile,
     tidx,
     k_tile_count,
-    up_scale,
-    gate_scale,
+    scale,
     gather: cutlass.Constexpr,
 ):
     thr = tiledmma.get_slice(tidx)
@@ -1503,12 +1503,12 @@ def mma_multistage(
     acc = cute.make_rmem_tensor(
         tiledmma.partition_shape_C(cfg.TILE[:2]), cutlass.Float32
     )
-    acc_g = None
+    acc_up = None
     if cutlass.const_expr(cfg.gated):
-        acc_g = cute.make_rmem_tensor(
+        acc_up = cute.make_rmem_tensor(
             tiledmma.partition_shape_C(cfg.TILE[:2]), cutlass.Float32
         )
-        acc_g.fill(0.0)
+        acc_up.fill(0.0)
     s2r_a = cfg.mma.make_s2r_a(tiledmma, cfg.load_ab.a_smem_dtype, False)
     s2r_b = cfg.mma.make_s2r_b(tiledmma, cfg.load_ab.b_smem_dtype, False)
     thr_a, thr_b = s2r_a.get_slice(tidx), s2r_b.get_slice(tidx)
@@ -1617,16 +1617,19 @@ def mma_multistage(
         cute.arch.cp_async_commit_group()
         cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
         if cutlass.const_expr(cfg.gated):
-            cute.gemm(tiledmma, acc_g, [tCrG, tCrSFG_frg], [tCrB, tCrSFB_frg], acc_g)
+            cute.gemm(tiledmma, acc_up, [tCrG, tCrSFG_frg], [tCrB, tCrSFB_frg], acc_up)
     cute.arch.cp_async_wait_group(0)
     cute.arch.sync_threads()
-    acc.store(acc.load() * up_scale)
+    acc.store(acc.load() * scale)
     if cutlass.const_expr(cfg.gated):
-        acc_g.store(acc_g.load() * gate_scale)
-        activation(acc, acc_g)
+        acc_up.store(acc_up.load() * scale)
+        activation(acc_up, acc)
     else:
         activation(acc)
-    return acc
+    if cutlass.const_expr(cfg.gated):
+        return acc_up
+    else:
+        return acc
 
 
 def _gmem_ptr(tensor, dtype, byte_offset, alignment=16):
@@ -1768,8 +1771,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
         gQ_u8: cute.Tensor,
         gSF_u8: cute.Tensor,
         offsets: cute.Tensor,
-        up_scale: cute.Tensor,
-        gate_scale: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         global_scale: cute.Tensor,
         stream,
         token_map=None,
@@ -1789,8 +1792,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
                 gQ_u8,
                 gSF_u8,
                 offsets,
-                up_scale,
-                gate_scale,
+                weight_global_scale,
+                input_global_scale,
                 global_scale,
                 token_map,
                 worklist,
@@ -1811,8 +1814,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
                 gQ_u8,
                 gSF_u8,
                 offsets,
-                up_scale,
-                gate_scale,
+                weight_global_scale,
+                input_global_scale,
                 global_scale,
                 stream,
                 token_map,
@@ -1830,8 +1833,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
         gQ_u8: cute.Tensor,
         gSF_u8: cute.Tensor,
         offsets: cute.Tensor,
-        up_scale: cute.Tensor,
-        gate_scale: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         global_scale: cute.Tensor,
         stream,
         token_map=None,
@@ -1934,8 +1937,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
             gQ,
             gSF,
             offsets,
-            up_scale,
-            gate_scale,
+            weight_global_scale,
+            input_global_scale,
             global_scale,
             cute.size(gSF_u8, mode=[1]),
             token_map,
@@ -1971,8 +1974,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
         gQ: cute.Tensor,
         gSF: cute.Tensor,
         offsets: cute.Tensor,
-        up_scale: cute.Tensor,
-        gate_scale: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         global_scale: cute.Tensor,
         sf_cols,
         token_map,
@@ -2036,12 +2039,10 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
                 storage.sSFB.get_tensor(sfb_smem),
             )
             sG, sSFG, tGsG = None, None, None
-            gate_mul = cutlass.Float32(0)
             if cutlass.const_expr(cfg.gated):
                 sG = storage.sG.get_tensor(a_smem.outer, swizzle=a_smem.inner)
                 sSFG = storage.sSFG.get_tensor(sfa_smem)
                 tGsG = tiled.get_slice(tidx & (cfg.WARP_SIZE - 1)).partition_D(sG)
-                gate_mul = gate_scale[group].to(cutlass.Float32)
             subtile = cutlass.Int32(0)
             if cutlass.const_expr(not self.gather):
                 subtile = tile.n_block & (sfb_subtiles - 1)
@@ -2074,8 +2075,9 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
                 tile,
                 tidx,
                 ceil_div(cute.size(gA_u8, mode=[1]), bk >> 1),
-                up_scale[group].to(cutlass.Float32),
-                gate_mul,
+                (weight_global_scale[group] / input_global_scale[0]).to(
+                    cutlass.Float32
+                ),
                 self.gather,
             )
             sC = storage.sC.get_tensor(epi_smem.outer, swizzle=epi_smem.inner)[
@@ -2113,8 +2115,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
         gQ_u8: cute.Tensor,
         gSF_u8: cute.Tensor,
         offsets: cute.Tensor,
-        up_scale: cute.Tensor,
-        gate_scale: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         global_scale: cute.Tensor,
         token_map,
         worklist,
@@ -2462,8 +2464,12 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
             gate = cute.make_rmem_tensor(acc.layout, f32)
             for i in cutlass.range_constexpr(cute.size(acc)):
                 if (idt[i][0] < i32(bm // 2)) & (idt[i][1] < rows):
-                    up[i] = sC[idt[i][1], idt[i][0]] * up_scale[expert]
-                    gate[i] = sC[idt[i][1], idt[i][0] + bm // 2] * gate_scale[expert]
+                    up[i] = sC[idt[i][1], idt[i][0] + bm // 2] * (
+                        weight_global_scale[expert] / input_global_scale[0]
+                    )
+                    gate[i] = sC[idt[i][1], idt[i][0]] * (
+                        weight_global_scale[expert] / input_global_scale[0]
+                    )
             cute.arch.sync_threads()
             act_up = cute.make_rmem_tensor(cute.make_layout(1), f32)
             act_gate = cute.make_rmem_tensor(cute.make_layout(1), f32)
@@ -2510,8 +2516,8 @@ def make_args(
     out_q,
     out_sf,
     m_indptr,
-    up_scale,
-    gate_scale,
+    weight_global_scale,
+    input_global_scale,
     global_scale,
     epi_cfg,
     tile,
@@ -2521,6 +2527,10 @@ def make_args(
     workcount=None,
 ):
     assert (worklist is None) == (workcount is None)
+    b_scale = b_scale.view(torch.uint8).view(
+        int(b_q.shape[0]) * align(int(b_q.shape[1]), 128),
+        ceil_div(int(b_q.shape[2]) * 2, 16),
+    )
     sf = lambda tensor: from_dlpack(
         tensor.contiguous(), assumed_align=16
     ).mark_layout_dynamic()
@@ -2542,8 +2552,8 @@ def make_args(
         out_arg,
         sf(out_sf),
         from_dlpack(m_indptr).mark_layout_dynamic(),
-        from_dlpack(up_scale).mark_layout_dynamic(),
-        from_dlpack(gate_scale).mark_layout_dynamic(),
+        from_dlpack(weight_global_scale).mark_layout_dynamic(),
+        from_dlpack(input_global_scale).mark_layout_dynamic(),
         from_dlpack(global_scale).mark_layout_dynamic(),
         _stream(),
         (
