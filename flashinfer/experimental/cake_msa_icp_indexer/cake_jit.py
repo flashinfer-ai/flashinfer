@@ -79,6 +79,7 @@ ROLES = (
     "plan",
     "score",
     "score_topk16",
+    "score_topk16_n256",
     "decode_plane",
     "decode_topk",
     "select_prefill",

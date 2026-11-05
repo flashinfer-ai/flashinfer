@@ -88,6 +88,10 @@ _PLAN_FIELD_MAX = (1 << 16) - 1
 # The fused prefill path's list pool: one piece per (scorer CTA, plan item)
 # cell, each piece one sorted 16-key uint64 list per (item query row, head).
 PREFILL_PIECE_WORDS = PLAN_ITEM_TOKENS * NUM_INDEX_HEADS * TOPK
+# Prefill windows of at least this many tokens at TP2 P256 run the list build
+# with two pages per MMA (``score_topk16_n256``) where it ships; shorter ones
+# keep ``score_topk16``.
+N256_MIN_TOKENS = 4096
 _FP8 = torch.float8_e4m3fn
 
 
@@ -1065,7 +1069,17 @@ def prefill_score_select(
         **({} if publish is None else {"generations": publish["generations"]}),
     )
     arch = cake_jit.device_arch(dev)
-    scorer = cake_jit.route("score_topk16", rows, arch, page=page_size)
+    # Long TP2 P256 windows take the list build with two pages per MMA (the
+    # same lists in the same pool) where it ships.
+    n256 = (
+        tp == 2
+        and page_size == 256
+        and t >= N256_MIN_TOKENS
+        and cake_jit.has_role("score_topk16_n256", arch)
+    )
+    scorer = cake_jit.route(
+        "score_topk16_n256" if n256 else "score_topk16", rows, arch, page=page_size
+    )
     merger = cake_jit.route(
         "prefill_list_carrier" if publish is None else "prefill_list_publish",
         None,

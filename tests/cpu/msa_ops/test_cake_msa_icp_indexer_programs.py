@@ -60,7 +60,13 @@ PACKAGE = "flashinfer.experimental.cake_msa_icp_indexer"
 LAYOUTS = tuple((p, w) for p in (128, 256) for w in (2, 4))
 LAYOUT_ROWS = tuple(sorted({p // w for p, w in LAYOUTS}))
 # Roles whose program depends on the local K rows per page (tensor-core scorers).
-LAYOUT_ROLES = ("score", "score_topk16", "decode_plane", "decode_topk")
+LAYOUT_ROLES = (
+    "score",
+    "score_topk16",
+    "score_topk16_n256",
+    "decode_plane",
+    "decode_topk",
+)
 REQUIRED_ROLES = (
     "plan",
     "score",
@@ -566,6 +572,7 @@ def test_records_are_well_formed() -> None:
     grid_kind = {
         "score": ("per_sm",),
         "score_topk16": ("per_sm",),
+        "score_topk16_n256": ("per_sm",),
         "decode_plane": ("request_splits",),
         "decode_topk": ("request_splits",),
         "select_prefill": ("tokens_per_cta_by_head",),
@@ -804,6 +811,15 @@ def _drive_every_role(arch: str) -> None:
                 **{**fused_prefill_args(page, tp), "carrier": None},
                 publish=publish_rows(tp),
             )
+        if (page, tp) == (256, 2) and cake_jit.has_role("score_topk16_n256", arch):
+            # a long TP2 P256 window takes the two-pages-per-MMA list build
+            saved, cb.N256_MIN_TOKENS = cb.N256_MIN_TOKENS, 1
+            try:
+                _call(
+                    msa_ops.msa_icp_prefill_score_select, fused_prefill_args(page, tp)
+                )
+            finally:
+                cb.N256_MIN_TOKENS = saved
         if cake_jit.has_role("decode_topk", arch):
             for tagged in (False, True):
                 _call(
