@@ -116,6 +116,38 @@ def _store_shared_remote_v4(
     )
 
 
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: "cute.Pointer",
+    phase: "Int32",
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class _SplitKOneTileScheduler:
     """One-work-item scheduler for a physical K-cluster.
 
@@ -1614,7 +1646,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
                                     * 4,
                                 )
-                        cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
+                        _mbarrier_wait_acquire_cluster(reduce_mbar_ptr, Int32(0))
 
                         local_thread_base = (
                             subtile_mailbox_base + epi_tidx * values_per_thread
