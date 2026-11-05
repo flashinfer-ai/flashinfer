@@ -175,3 +175,19 @@ Names: ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<name>`` ->
 non-deterministic package's nodes). The legacy module
 ``flashinfer.cake_mhc_train`` keeps the same ``cake_mhc_train_*`` names as
 aliases of the deterministic objects, without a ``deterministic`` keyword.
+
+.. currentmodule:: flashinfer.cake_mhc_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_mhc_train_forward_prepare
+    cake_mhc_train_forward_stats
+    cake_mhc_train_forward_finish
+    cake_mhc_train_backward_prepare
+    cake_mhc_train_backward_finish
+    cake_mhc_train_prepare
+    cake_mhc_train_finish
+    cake_mhc_train_head_forward
+    cake_mhc_train_head_backward
+    cake_mhc_train_head

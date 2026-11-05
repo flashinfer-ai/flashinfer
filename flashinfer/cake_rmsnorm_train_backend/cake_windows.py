@@ -1543,7 +1543,7 @@ moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
 and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
-max(|dx|, rms(dx)) of the deterministic backward's ``dx``, not always bitwise equal to
+``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
 scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a fixed
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
@@ -1634,7 +1634,7 @@ moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
 and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
-max(|dx|, rms(dx)) of the deterministic backward's ``dx``, not always bitwise equal to
+``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
 scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a fixed
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
@@ -1811,7 +1811,7 @@ moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
 and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
-max(|dx|, rms(dx)) of the deterministic backward's ``dx``, not always bitwise equal to
+``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
 scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a fixed
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of

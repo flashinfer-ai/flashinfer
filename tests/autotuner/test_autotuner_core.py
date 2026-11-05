@@ -1,9 +1,13 @@
 import gc
 import json
+import os
 import random
+import subprocess
+import sys
 import tracemalloc
 import weakref
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -511,6 +515,144 @@ def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, p
     assert tactic == -1
     profile.assert_not_called()
     empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("grouped", (False, True))
+@pytest.mark.parametrize("entry", ("choose_one", "rank_tactics", "nested"))
+def test_tuning_stops_after_a_tactic_loses_the_cuda_context(
+    monkeypatch, entry, grouped
+):
+    """A failed tactic after which the CUDA context is unusable stops tuning with
+    an error naming it, before another runner fails on the dead context. A
+    tuning-group member cannot rejoin the per-tactic reduces, so it stops too,
+    also when the ranking runs inside a runner's get_valid_tactics (MoE)."""
+    module = "flashinfer.autotuner.autotuner"
+    failure = RuntimeError("tactic failed")
+    lost = RuntimeError(
+        "CUDA error: an illegal memory access was encountered\n"
+        "CUDA kernel errors might be asynchronously reported"
+    )
+    profiled = []
+
+    class PoisoningRunner(DummyRunner):
+        pass
+
+    class RankingRunner(DummyRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return tuner.rank_tactics(
+                "lost_context", [PoisoningRunner((0, 1))], TuningConfig(), inputs, k=2
+            )
+
+    def profile(self, runner, inputs, tactic, *args, **kwargs):
+        profiled.append((type(runner).__name__, tactic))
+        if isinstance(runner, PoisoningRunner):
+            raise failure
+        return 1.0
+
+    tuner = reset_autotuner()
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(f"{module}._sticky_cuda_error", lambda: lost)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    if grouped:
+        monkeypatch.setattr(f"{module}._tune_process_group", object())
+        monkeypatch.setattr(f"{module}._check_tuning_group_phase", lambda *a, **k: None)
+        monkeypatch.setattr(f"{module}._all_ranks_hit_cache", lambda hit, *a: hit)
+        monkeypatch.setattr(
+            f"{module}._sync_oom_across_tune_group", lambda oom, **k: oom
+        )
+    runners = [PoisoningRunner(valid_tactics=(0, 1)), DummyRunner(valid_tactics=(0,))]
+    inputs = [torch.empty((16, 32))]
+
+    with (
+        autotune(True),
+        pytest.raises(
+            RuntimeError,
+            match="PoisoningRunner tactic 0 failed while tuning lost_context",
+        ) as exc,
+    ):
+        if entry == "choose_one":
+            tuner.choose_one("lost_context", runners, TuningConfig(), inputs)
+        elif entry == "rank_tactics":
+            tuner.rank_tactics("lost_context", runners[:1], TuningConfig(), inputs, k=2)
+        else:
+            tuner.choose_one("moe", [RankingRunner()], TuningConfig(), inputs)
+    assert exc.value.__cause__ is failure
+    assert "(CUDA error: an illegal memory access was encountered)" in str(exc.value)
+    assert "asynchronously" not in str(exc.value)
+    assert profiled == [("PoisoningRunner", 0)]
+    if entry == "choose_one":
+        failed = tuner.stats.failed_tactics["lost_context::PoisoningRunner"]
+        assert failed == {0}
+
+
+def _lost_cuda_context_worker():
+    """Subprocess body of test_choose_one_stops_on_a_device_side_assert."""
+    prepared = []
+
+    class Runner(DummyRunner):
+        def __init__(self, name, failure=None):
+            super().__init__(valid_tactics=(0, 1))
+            self.name, self.failure = name, failure
+
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            x = inputs[0]
+            if do_preparation:
+                prepared.append(self.name)
+            elif tactic == 1 and self.failure == "error":
+                raise ValueError("unsupported tactic")
+            elif tactic == 1 and self.failure == "device_assert":
+                # An out-of-range index trips a device-side assert, a sticky error.
+                torch.index_select(x, 0, torch.full((1,), 1 << 20, device=x.device))
+            return x
+
+    tuner = reset_autotuner()
+    tuner.stream_delay_micro_secs = 0
+    inputs = [torch.zeros(64, device="cuda")]
+    result = {}
+    with autotune(True):
+        _, result["ordinary_tactic"] = tuner.choose_one(
+            "ordinary_failure", [Runner("skips", "error")], TuningConfig(), inputs
+        )
+        try:
+            tuner.choose_one(
+                "lost_context",
+                [Runner("poisons", "device_assert"), Runner("next")],
+                TuningConfig(),
+                inputs,
+            )
+        except RuntimeError as error:
+            result["error"] = str(error)
+    result["prepared"] = prepared
+    print(json.dumps(result), flush=True)
+    os._exit(0)  # the CUDA context is unusable, so skip its teardown
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_choose_one_stops_on_a_device_side_assert():
+    """A real sticky error (a device-side assert) stops tuning at the tactic that
+    raised it, while an ordinary tactic failure is still skipped. The assert
+    leaves the CUDA context unusable, so this runs in a subprocess."""
+    script = (
+        "from tests.autotuner.test_autotuner_core import _lost_cuda_context_worker; "
+        "_lost_cuda_context_worker()"
+    )
+    env = {**os.environ, "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE": "0"}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=300,
+    )
+    log = result.stdout + result.stderr
+    assert result.returncode == 0, log
+    worker = json.loads(result.stdout.splitlines()[-1])
+    assert worker["ordinary_tactic"] == 0, log
+    error = worker.get("error", "")
+    assert "Runner tactic 1 failed while tuning lost_context" in error, log
+    assert "CUDA context is unusable (CUDA error: device-side assert" in error, log
+    assert worker["prepared"] == ["skips", "poisons"], log
 
 
 @pytest.mark.parametrize("failure_phase", ("input_batches", "runner"))
@@ -2521,6 +2663,24 @@ def test_skip_ops_prevents_profiling(monkeypatch):
     assert chosen_runner is runner
     assert tactic == -1
     assert len(profile_calls) == 0
+
+
+def test_sticky_cuda_error_does_not_synchronize_during_capture(monkeypatch):
+    """A device synchronize during capture invalidates the graph rather than
+    just failing, and the first one here is exception-suppressed, so the check
+    has to come before it. rank_tactics reaches this helper with no capture
+    pre-check of its own."""
+    from flashinfer.autotuner.autotuner import _sticky_cuda_error
+
+    synchronized = []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda *a, **k: synchronized.append(True)
+    )
+
+    assert _sticky_cuda_error() is None
+    assert synchronized == []
 
 
 def test_active_capture_allows_warm_tuning_cache_hits(monkeypatch):

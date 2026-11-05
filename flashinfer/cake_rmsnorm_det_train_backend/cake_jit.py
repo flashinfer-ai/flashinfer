@@ -16970,7 +16970,7 @@ def supported_hidden_sizes(arch: str) -> tuple[int, ...]:
 
 
 def weight_dtypes(arch: str, hidden: int, kind: str, residual: bool) -> tuple[str, ...]:
-    """The weight dtypes (tokens of ``WEIGHT_DTYPES``) the route ships for on ``arch``."""
+    """The weight dtypes (tokens of ``WEIGHT_DTYPES``) the route ships on ``arch``."""
 
     routes = ROUTES.get(arch, {})
     return tuple(
