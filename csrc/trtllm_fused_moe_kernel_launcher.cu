@@ -1159,14 +1159,15 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
  * Reports a tile_N fallback once per (device, tile) pair on stderr; token-by-token inference
  * would otherwise print the same line on every launch.
  *
+ * @param device The device of the launch's tensors. It keys the report: the caller reports
+ *        after the launcher's device guard has unwound, so the current device would be the
+ *        caller's, not the one whose kernels failed to load.
  * @param tile_N The tile the heuristic chose, which has no kernel that loads on this driver.
  * @param chosen The next tile tried instead.
  */
-inline void reportTileFallbackOnce(int64_t tile_N, int64_t chosen) {
+inline void reportTileFallbackOnce(int device, int64_t tile_N, int64_t chosen) {
   static std::mutex reported_mutex;
   static std::set<std::pair<int, int64_t>> reported;
-  int device = -1;
-  cudaGetDevice(&device);
   {
     std::lock_guard<std::mutex> lock(reported_mutex);
     if (!reported.insert({device, tile_N}).second) {
@@ -6519,7 +6520,8 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
       if (attempt + 1 == tile_order.size()) {
         throw;
       }
-      reportTileFallbackOnce(resolved_tile_N, tile_order[attempt + 1]);
+      reportTileFallbackOnce(hidden_states.device().device_id, resolved_tile_N,
+                             tile_order[attempt + 1]);
     }
   }
   // Unreachable: the loop returns or rethrows. Added to suppress compiler warning.
