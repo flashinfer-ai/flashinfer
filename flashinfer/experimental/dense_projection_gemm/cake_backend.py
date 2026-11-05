@@ -915,8 +915,8 @@ def k1_plan(
         if in_window:
             overrides = K1_SPLIT_OVERRIDES_BY_SM.get((arch, int(sm_count)), {})
             choice = overrides.get(key, choice)
-        two = K1_TWO_SPLIT_RANGES_BY_SM.get((arch, int(sm_count)), {})
-        own = [v for lo, hi, v in two.get(key, ()) if lo <= int(K) <= hi]
+        two_part = K1_TWO_SPLIT_RANGES_BY_SM.get((arch, int(sm_count)), {})
+        own = [v for lo, hi, v in two_part.get(key, ()) if lo <= int(K) <= hi]
         if own:
             choice = own[0]
     else:

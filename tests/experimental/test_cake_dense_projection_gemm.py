@@ -1728,7 +1728,20 @@ K1_148_EXCLUDED_TOKENS = {
 }
 #: The measured token counts of the 148-SM audit (40961, 47105, 49152 and 49153: points of the 10-seed FP64 error grids
 #: of sm_100a ``5120 -> 32`` and sm_103a ``5120 -> 48`` / ``5120 -> 64`` BF16).
-K1_148_MEASURED_TOKENS = (512, 1024, 2048, 4096, 8192, 16231, 32768, 40961, 47105, 49152, 49153, 65536)
+K1_148_MEASURED_TOKENS = (
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16231,
+    32768,
+    40961,
+    47105,
+    49152,
+    49153,
+    65536,
+)
 
 
 def test_k1_exact_sm_count_exclusions(monkeypatch):
