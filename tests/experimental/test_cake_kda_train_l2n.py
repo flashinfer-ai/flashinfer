@@ -323,6 +323,50 @@ def test_saved_set_fields_and_their_checks_read_either_package() -> None:
     )
 
 
+def test_check_saved_l2n_agrees_in_both_directions() -> None:
+    """Each package's ``_check_saved_l2n`` on the other package's saved sets and on its own: over both set types, every
+    mode and every ``qk_rstd`` / ``qk_l2norm`` state, the two checks accept the same sets and refuse the others with
+    the same message (a set written by either package's forward is read by either backward)."""
+    S, H = 3, 2
+    rstd = torch.zeros(2, S, H, dtype=torch.float32)
+    states = {
+        "on": {"qk_rstd": rstd, "qk_l2norm": True},
+        "off": {},
+        "flag without rstd": {"qk_l2norm": True},
+        "rstd without flag": {"qk_rstd": rstd},
+        "short rstd": {"qk_rstd": torch.zeros(2, S + 1, H), "qk_l2norm": True},
+        "fp64 rstd": {
+            "qk_rstd": torch.zeros(2, S, H, dtype=torch.float64),
+            "qk_l2norm": True,
+        },
+        "strided rstd": {
+            "qk_rstd": torch.zeros(2, H, S).transpose(1, 2),
+            "qk_l2norm": True,
+        },
+    }
+
+    def outcome(check, saved, mode: str) -> str | None:
+        try:
+            check(saved, mode, S, H, CPU)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    compared = accepted = 0
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+        for state, fields in states.items():
+            saved = _saved(saved_type, S, H, **fields)
+            for mode in ("off", *L2N_ON):
+                nd = outcome(cake_backend._check_saved_l2n, saved, mode)
+                det = outcome(det_backend._check_saved_l2n, saved, mode)
+                assert nd == det, (saved_type.__name__, state, mode, nd, det)
+                compared += 1
+                accepted += nd is None
+    assert compared == 2 * len(states) * (1 + len(L2N_ON)) > 0
+    # per set type: the "on" set in both l2n modes, the "off" set in the flag-off mode
+    assert accepted == 2 * (len(L2N_ON) + 1)
+
+
 def test_saved_and_output_bytes_are_the_deterministic_packages() -> None:
     S, H = 1000, 8
     # (the tape set's bytes need the document count)
