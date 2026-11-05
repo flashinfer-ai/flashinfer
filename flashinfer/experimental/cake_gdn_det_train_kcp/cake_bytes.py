@@ -18,28 +18,27 @@ pair; keyword-only beyond ``ctx``).  ``s = HV * 128 * 128 * 4`` is one FP32
 state of all value heads (3 MiB at ``HV = 48``); ``n_in`` / ``n_out`` are this
 rank's crossing-in / crossing-out fragments (a fragment with a predecessor /
 with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
-``Hg = ceil(HV / W)`` the heads per owner.
+``n_io`` / ``N_io`` the fragments with both (``hp.n_io_by_rank``: the maps that
+travel on b1), ``Hg = ceil(HV / W)`` the heads per owner.
 
 * ``gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C)``: bytes this rank moves per
   collective and per boundary.  Per crossing-out fragment c1 sends ``2 s``
   (``[B_f | M_f^T]`` pair tiles) and b2 receives ``s`` (``dS_out``); per
   crossing-in fragment c2 receives ``s`` (``S_in``) and b1 sends ``s`` (``d_f``);
-  per crossing-out fragment b1 also sends ``s`` (the re-sent ``M_f^T``) when the
-  maps are not kept on the owner (``boundary_mode="saved"`` without
-  ``save_transfer``), i.e. ``b1_send = s n_in + s n_out [not save_transfer]``
-  (the per-rank lower-bound form; reported as ``b1_design``).  Owner side: c1 receives ``2 s_owner`` per crossing-out
+  per fragment crossing in and out b1 also sends ``s`` (the re-sent ``M_f^T``,
+  which the owner's adjoint chain reads; a document's last fragment has none)
+  when the maps are not kept on the owner (``boundary_mode="saved"`` without
+  ``save_transfer``), i.e. ``b1_send = s n_in + s n_io [not save_transfer]``
+  (reported as ``b1_design``).  Owner side: c1 receives ``2 s_owner`` per crossing-out
   fragment of the group; b1 receives ``s_owner`` per crossing-in fragment (the
-  ``d`` half, ``b1_d``) plus ``s_owner`` per crossing-out fragment when the maps
-  are re-sent (the ``m`` half, ``b1_m``); c2 / b2 send ``s_owner`` per
+  ``d`` plane, ``b1_d``) plus ``s_owner`` per fragment crossing in and out when the
+  maps are re-sent (the ``m`` plane, ``b1_m``); c2 / b2 send ``s_owner`` per
   crossing-in / crossing-out fragment of the group, with
   ``s_owner = Hg_r * 128 * 128 * 4``.  ``b1`` reports the bytes of the plan's
   b1 split tables (``hp.b1_splits``: what the host allocates and the collective
-  moves): their map half is paired with the crossing-IN slots
-  (``2 s`` per crossing-in fragment).  ``b1_design`` is the design form above
-  (a per-rank lower bound): equal to ``b1`` in the d-only form, different per
-  rank when the maps are re-sent on a rank with ``n_in != n_out`` (the sums over
-  the ranks agree).  Halo: ``rows * C * 2`` forward (BF16 ``x``
-  history rows), ``rows * C * 4`` backward (FP32 ``dpre`` rows).  ``B1`` =
+  moves): ``d_f`` plane + map plane; ``b1_design`` is the same total built
+  from the fragment counts (the padded owner slots included, so ``b1`` ==
+  ``b1_design``).  Halo: ``rows * C * 2`` forward (BF16 ``x`` history rows), ``rows * C * 4`` backward (FP32 ``dpre`` rows).  ``B1`` =
   forward (c1 + c2 + halo_fwd), ``B2`` = backward from the saved context
   (b1 + b2 + halo_bwd), ``B3`` = the replayed forward + the backward with b1 in
   its offsets-only form.  ``H_qk`` enters the exchange terms only through the
@@ -52,15 +51,17 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   saved set of one layer on this rank (design table 4.1): ``S_in`` (``n_in s``;
   the padded receive buffer), the owner's c1 receive tensor with
   ``save_transfer`` (``2 N_out s_owner``), ``M_seg`` at ``P > 1``
-  (``(P - 1) n_frag s``) and the conv history rows (``n_hist_rows * C * 2``);
+  (``P n_frag s``, the whole ``M_seg^T`` plane; see below) and the conv history rows
+  (``n_hist_rows * C * 2``);
   ``save_mode="light"`` keeps no tape (its backward re-runs #1 and the #2 tape
   walk); ``save_mode="full"`` adds every forward tape: the ``h`` tape
   ``[NC_pad, HV, 128, 128]``, ``v_new`` / ``w`` / ``u`` ``[R, HV, 128]``, ``Aqk`` and
   ``Akk`` ``[R, HV, 64]`` (BF16), ``gamma [NC_pad, HV]`` and the FP32 row factors
   ``gcum`` / ``rowscale`` / ``qscale`` ``[R, HV]`` (the host skips #1 and the walk
   entirely).  ``M_seg`` is retained with
-  ``save_transfer`` only (the ``save_transfer=False`` form re-runs the transfer
-  walks, KDA semantics).  ``boundary_mode="replay"`` keeps no ``S_in`` /
+  ``save_transfer`` and with ``save_mode="full"`` (whose backward runs no transfer
+  walk); the light ``save_transfer=False`` form re-runs the transfer walks
+  (KDA semantics).  ``boundary_mode="replay"`` keeps no ``S_in`` /
   c1 tensor / ``M_seg`` (the backward re-runs the offset and transfer walks, the
   exchange and the merge).  Inputs are references (0 extra bytes); the int32
   tables live on the context (not per layer).
@@ -220,14 +221,15 @@ def gdn_det_comm_bytes_kcp(
         "send": ctx.n_in * s_pad,
         "recv": ctx.N_in * s_owner,
     }  # d_f of every crossing-in fragment
-    b1_m = {  # M_f^T re-sent by every crossing-out fragment unless the owner kept the c1 pairs
-        "send": ctx.n_out * s_pad if with_maps else 0,
-        "recv": ctx.N_out * s_owner if with_maps else 0,
+    n_io, N_io = hp.n_io_by_rank[ctx.rank], sum(hp.n_io_by_rank)
+    b1_m = {  # M_f^T re-sent by every fragment crossing in and out unless the owner kept the c1 pairs
+        "send": n_io * s_pad if with_maps else 0,
+        "recv": N_io * s_owner if with_maps else 0,
     }
     b1_buf_send, b1_buf_recv = hp.b1_splits(
         with_maps
     )  # the plan's split tables (allocated buffers)
-    b1_design = {  # per-rank lower bound of the b1 traffic (d halves + re-sent maps)
+    b1_design = {  # d_f plane + re-sent maps from the counts, padding included (= b1)
         "send": b1_d["send"] + b1_m["send"],
         "recv": b1_d["recv"] + b1_m["recv"],
     }
@@ -267,8 +269,8 @@ def gdn_det_comm_bytes_kcp(
     pad_self = (
         hp.Hg_pad_by_rank[ctx.rank] - hp.Hg_r
     ) * STATE_TILE_BYTES  # this owner's padding per slot
-    n_b1_send = ctx.n_in + (ctx.n_out if with_maps else 0)
-    n_b1_recv = ctx.N_in + (ctx.N_out if with_maps else 0)
+    n_b1_send = ctx.n_in + (n_io if with_maps else 0)
+    n_b1_recv = ctx.N_in + (N_io if with_maps else 0)
     padding = {
         "c1": {"send": pn["c1_send"] * 4, "recv": pn["c1_recv"] * 4},
         "c2": {"send": pn["c2_send"] * 4, "recv": pn["c2_recv"] * 4},
@@ -339,8 +341,8 @@ def gdn_det_saved_layout_kcp(
         "c1_recv": (ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES)
         if (saved and save_transfer)
         else 0,
-        "M_seg": ((P - 1) * ctx.n_frag * s)
-        if (saved and save_transfer and P > 1)
+        "M_seg": (P * ctx.n_frag * s)
+        if (saved and (save_transfer or save_mode == "full") and P > 1)
         else 0,
         "hist": ctx.halo.n_hist_rows * C * 2 if with_conv else 0,
     }
@@ -464,10 +466,13 @@ def gdn_det_workspace_layout_kcp(
     full = save_mode == "full"
     kept = kept_form and not full  # the kept-tape backward is the light form's
     # staging planes at P > 1: stage_b always; stage_m only when the call does not bind the saved M_seg^T for it
-    # (save_transfer under boundary_mode="saved" saves M_seg: the pool of that name is not sized, cake_kcp
-    # SAVE_TRANSFER_FRESH_POOLS); the ring pools are sized only under exchange="ring" and are not workspace here
+    # (save_transfer or save_mode="full" under boundary_mode="saved" saves M_seg: the pool of that name is not sized,
+    # cake_kcp SAVE_TRANSFER_FRESH_POOLS / _FULL_FRESH_POOLS); the ring pools are sized only under exchange="ring" and
+    # are not workspace here
     plane = (hp.NSEG * HV * STATE_TILE_BYTES) if P > 1 else 0
-    staging = plane + (0 if (boundary_mode == "saved" and save_transfer) else plane)
+    staging = plane + (
+        0 if (boundary_mode == "saved" and (save_transfer or full)) else plane
+    )
     carry = (ctx.n_frag * (P - 1) * s) if P > 1 else 0
     # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
     # in the backward; in "full" they are saved-set bytes (gdn_det_saved_layout_kcp), not workspace
@@ -507,8 +512,8 @@ def gdn_det_workspace_layout_kcp(
         {"qn": T_r * H_qk * QK_ROW_BF16, "kn": T_r * H_qk * QK_ROW_BF16} if l2n else {}
     )
     fwd = {**fwd_pools, **fwd_tapes, **qk_rows}
-    # the b1 buffers are the plan's split tables (their map half pairs with the crossing-in slots; the design's
-    # per-rank b1 QUERY is in gdn_det_comm_bytes_kcp -- the workspace counts what the host allocates)
+    # the b1 buffers are the plan's split tables (the d_f plane + the map plane of the fragments crossing in and
+    # out; the per-rank b1 QUERY is in gdn_det_comm_bytes_kcp -- the workspace counts what the host allocates)
     b1_send, b1_recv = hp.b1_splits(saved and not save_transfer)
     bwd_pools = {
         "b1_send": sum(b1_send) * 4,

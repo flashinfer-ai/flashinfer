@@ -225,7 +225,7 @@ kernel_cake_gdn_train_3e6562c2f739184a3765(const __grid_constant__ CUtensorMap q
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v0_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -319,8 +319,7 @@ kernel_cake_gdn_train_3e6562c2f739184a3765(const __grid_constant__ CUtensorMap q
     unsigned int* tk_s = reinterpret_cast<unsigned int*>(smem_raw + 209984);
     const int tk_s_addr = smem + 209984;
 
-    // Mbarrier init (27 pipeline groups, 0 ordered-sequence groups, 29 barriers)
-    // Mbarriers at smem_raw[0..232)
+    // Mbarrier init (29 barriers at smem_raw[0..232))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -402,23 +401,23 @@ kernel_cake_gdn_train_3e6562c2f739184a3765(const __grid_constant__ CUtensorMap q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dqs = taddr;
+    const unsigned int tmem_acc_dks = taddr + 64;
+    const unsigned int tmem_acc_dq = taddr + 128;
+    const unsigned int tmem_acc_dk = taddr + 192;
+    const unsigned int tmem_acc_dw = taddr + 256;
+    const unsigned int tmem_acc_da = taddr + 320;
+    const unsigned int tmem_acc_daq = taddr + 384;
+    const unsigned int tmem_acc_dvb = taddr + 384;
+    const unsigned int tmem_acc_dkgb = taddr + 256;
+    const unsigned int tmem_acc_da1 = taddr + 256;
+    const unsigned int tmem_acc_da2 = taddr + 320;
+    const unsigned int tmem_acc_dksrc = taddr + 256;
+    const unsigned int tmem_acc_x = taddr + 384;
+    const unsigned int tmem_acc_gp = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_acc_dqs = taddr;
-    const int tmem_acc_dks = taddr + 64;
-    const int tmem_acc_dq = taddr + 128;
-    const int tmem_acc_dk = taddr + 192;
-    const int tmem_acc_dw = taddr + 256;
-    const int tmem_acc_da = taddr + 320;
-    const int tmem_acc_daq = taddr + 384;
-    const int tmem_acc_dvb = taddr + 384;
-    const int tmem_acc_dkgb = taddr + 256;
-    const int tmem_acc_da1 = taddr + 256;
-    const int tmem_acc_da2 = taddr + 320;
-    const int tmem_acc_dksrc = taddr + 256;
-    const int tmem_acc_x = taddr + 384;
-    const int tmem_acc_gp = taddr + 448;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     }

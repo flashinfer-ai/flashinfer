@@ -38,16 +38,30 @@ FP64 (a CTA of a few blocks adds its runs across its warps in FP32 and
 converts once: at most 16 FP32 roundings a term either way), and adds each
 CTA's FP64 column sums into
 FP64 accumulators of the workspace with atomics; the CTA that arrives last
-rounds the sum once into ``dw`` and zeroes the workspace.  The claimed blocks,
-and so the FP32 runs, and the order of the FP64 additions depend on
-scheduling: ``dw`` can move from call to call, always within the deterministic
-backward's error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.  On
-every architecture up to 256 rows the backward is one thread-block cluster of
-16 CTAs with the same row arithmetic (the same ``dx`` and ``dz`` bits): each
+rounds the sum into ``dw`` (FP64 -> FP32, and FP32 -> BF16 for a BF16
+``dw``) and zeroes the workspace.  The claimed blocks, and so the FP32 runs,
+and the order of the FP64 additions depend on scheduling: ``dw`` can move
+from call to call, always within the deterministic backward's error bound
+``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column (``dw64`` the exact sum of
+the ``terms``) when the gate ``silu(z)``, the terms and the column sums are
+FP32 normal numbers or zero.  FP32 underflows gradually: a subnormal gate,
+term or sum is rounded to a multiple of ``2^-149``, an error that a later
+product scales (by ``|dy|`` for the gate, by ``|x * rstd| <= sqrt(128)`` for
+``dy * silu(z)``), so with subnormal values the weight gradient of either
+package can lie outside that bound (by up to about
+``(1 + |x * rstd|) * 2^-150`` per row when only ``dy * silu(z)`` and the
+terms underflow), and a weight gradient below the smallest normal number of
+its dtype is rounded to a multiple of the dtype's smallest subnormal
+(``2^-133`` for BF16, ``2^-149`` for FP32).  An infinite ``grad_out`` makes
+its columns' weight gradient infinite or ``NaN``: ``NaN`` where the infinite
+term is in the last row and the last row block is partial (its padding rows
+reread that row and multiply it by zero), as in the deterministic backward.
+On every architecture up to 256 rows the backward is one thread-block cluster
+of 16 CTAs with the same row arithmetic (the same ``dx`` and ``dz`` bits): each
 CTA sums its rows' terms in FP32 (at most 16 FP32 roundings a term), and CTA
 ``r`` adds every CTA's FP32 partial of its eight columns in rank order in FP64
-and rounds once into ``dw``, so ``dw`` is the same bits on every call and
-within the same bound.
+and rounds the sum into ``dw`` the same way, so ``dw`` is the same bits on
+every call and within the same bound.
 
 Numerical-mode keyword: every compute and workspace entry point (and the
 forward of :class:`CakeRMSNormSiLUGateFunction`) takes
@@ -117,8 +131,15 @@ Host design (the input layout rules are the deterministic package's):
   blocks: from 976 rows per SM on sm_100a and sm_103a (800 on sm_107a) the
   mid forward (6 CTAs per SM, at most 2 blocks of 16 rows each), from 2400
   (1740 on sm_107a) the long forward (3 CTAs per SM, at most 6 blocks of 32
-  rows each).  The backward
-  launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
+  rows each).  The mid forward's thread 0 also warms in L2, with one bulk
+  prefetch a tensor where x and z hold their rows packed (head stride 128 and
+  token stride ``H * 128``, which a ``[T, 1, 128]`` or ``[T, 128]`` input
+  whose rows follow one another meets: see ``_kernel_view``), the CTA's next block
+  and the first block of the CTA one wave later; from 3000 rows per SM on
+  sm_103a and from 1740 on sm_107a (its whole range there) the long
+  forward's thread 0 also warms the CTA's next block the same way.  The
+  backward launches
+  ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
   ctas_per_sm * SMs)``: 256-thread CTAs of 16-row blocks with
   ``ctas_per_sm = 4`` (one wave); on sm_100a and sm_103a from 1280 rows per
   SM the same CTAs, whose thread 0 warms the next block of packed rows in L2
@@ -300,7 +321,11 @@ def _kernel_view(
     The tensor is viewed as ``[T, H, 128]``; it is read in place when its last
     stride is 1, its storage offset and both strides are multiples of 16
     elements (32 bytes) and its storage is 32-byte aligned, else copied once.
-    A stride of a size-1 dimension is never dereferenced and is passed as 0.
+    A stride of a size-1 dimension is never dereferenced: a single token's
+    stride is passed as 0 and a single head's as 128, the stride of rows that
+    follow one another, so a ``[T, 1, 128]`` or ``[T, 128]`` input whose token
+    stride is 128 passes the kernels' packed-rows test (head stride 128 and
+    token stride ``H * 128``) as a ``[T, H, 128]`` input with packed rows does.
     """
 
     if not isinstance(tensor, torch.Tensor):
@@ -321,7 +346,7 @@ def _kernel_view(
         view = None
     if view is not None:
         tok = int(view.stride(0)) if tokens > 1 else 0
-        head = int(view.stride(1)) if heads > 1 else 0
+        head = int(view.stride(1)) if heads > 1 else HEAD_DIM
         if (
             view.stride(2) == 1
             and _aligned(tok)
@@ -335,7 +360,7 @@ def _kernel_view(
     return (
         copy,
         heads * HEAD_DIM if tokens > 1 else 0,
-        HEAD_DIM if heads > 1 else 0,
+        HEAD_DIM,
     )
 
 
@@ -852,8 +877,9 @@ def cake_rmsnorm_silu_gate_train_backward(
     chunks from the workspace's claim counter): ``dx`` and ``dz`` are
     the deterministic backward's bits, and each CTA adds its FP64 column sums
     into the FP64 accumulators of the workspace with atomics; the CTA that
-    arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s value
-    first when accumulating) and zeroes the workspace.  Every call with rows
+    arrives last rounds the FP64 sum into ``dw`` (adding ``grad_weight``'s value
+    first when accumulating; FP64 -> FP32, and FP32 -> BF16 for a BF16 ``dw``)
+    and zeroes the workspace.  Every call with rows
     uses a workspace, also with ``compute_grad_weight=False``, but up to 256
     rows: there one cluster of 16 CTAs sums the weight
     gradient on chip in a fixed order (the same ``dw`` bits on every call) and

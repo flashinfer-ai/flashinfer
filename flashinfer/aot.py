@@ -1093,7 +1093,7 @@ def gen_all_modules(
 
         jit_specs.append(gen_nvlink_two_sided_alltoall_module())
         if has_sm89 or has_sm120:
-            # One fat binary covers SM89 and SM120; register it only once.
+            # One module emits the requested SM89/SM120 targets; register it once.
             jit_specs.append(gen_ulysses_lowp_module())
         if has_sm90:
             # The SM90 grid (16/128) lives in its own translation unit pinned to
@@ -1536,7 +1536,7 @@ def detect_sm_capabilities():
             for major, _ in compilation_context.TARGET_CUDA_ARCHS
         ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
-        # The Lowp SM89/SM120 fat binary also emits sm_120a (CUDA >= 12.8).
+        # Keep the existing CUDA >= 12.8 floor for Lowp AOT builds.
         "sm89": has_sm("compute_89", "12.8"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),

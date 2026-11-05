@@ -30,6 +30,7 @@ limitations under the License.
 # warning contract are covered by ``test_cake_dsa_indexer_api.py``.
 
 import itertools
+import json
 import os
 import re
 from types import SimpleNamespace
@@ -72,6 +73,8 @@ DispatchPolicy = cake_policy.DispatchPolicy
 finalize_grid = cake_policy.finalize_grid
 finalize_key = cake_policy.finalize_key
 scan_key = cake_policy.scan_key
+scan_key_fields = cake_policy.scan_key_fields
+scan_key_form = cake_policy.scan_key_form
 select_program = cake_policy.select_program
 stage_slug = cake_policy.stage_slug
 
@@ -108,6 +111,7 @@ _COMMON = dict(
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
     split_wave_scope=None,
+    split_fit_rule=None,
     l6_solo_rule=None,
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
@@ -125,6 +129,7 @@ _COMMON = dict(
     sample_shift_rule=None,
     sample_class_rule=None,
     lsf_programs=False,
+    static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
@@ -300,6 +305,7 @@ def test_registry_records_are_well_formed():
                 "raw_pointer",
                 "nullable_raw_pointer",
                 "parameter",
+                "zero",
                 "grid",
             ), (role, kind, arg)
             if kind != "grid":
@@ -338,6 +344,16 @@ def test_registry_records_are_well_formed():
         assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
             MERGE_KEY
         }, arch
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
+        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
+        # record of its own, ``policy_for(arch, "fp8")``)
+        for key in scan_keys:
+            fields = scan_key_fields(key)
+            assert fields is not None, (arch, key)
+            assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
+            if fields.form == cake_policy.FP8:
+                assert not fields.snake and fields.sample_fit, (arch, key)
+        scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
             policy.rank_finalize and policy.rank_rule is not None
@@ -756,6 +772,11 @@ def test_policy_record_round_trip_and_validation():
         # the wide CTA pair on the snake walk only (sampled calls): a bool
         dict(wide_pair_snake_only=1),
         dict(wide_pair_snake_only=None),
+        # the static scan kinds: an ascending list of physical scan kinds
+        dict(static_scan_kinds="l6"),
+        dict(static_scan_kinds=["split"]),
+        dict(static_scan_kinds=["pair_l6", "l6"]),
+        dict(static_scan_kinds=["l6", "l6"]),
         # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
         dict(pair_units="l6"),
         dict(pair_units=["pair_l6"]),
@@ -1841,6 +1862,32 @@ def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
         assert moved, arch
 
 
+def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
+    """sm_100a / sm_103a ``split_fit_rule`` [4096]: a split call whose mean unit keys fit ceil(keys / top_k) <= split_max
+    splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the floor rule,
+    and so does a call the floor rule does not split.  sm_107a has no fit rule."""
+    for arch in ("sm_100a", "sm_103a"):
+        p = policy_for(arch)
+        assert p.split_fit_rule == [4096], arch
+        # 4 queries x 22018 keys: floor rule 5, fit ceil(22016 / 2048) = 11 -> 12 (two splits per chunk)
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True) == 5
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 2048) == 12
+        assert p.split_rule_for(4, 30466, 1, 1, 152, p.block_q_l6, False, 2048) == 16
+        # 41986 keys need 21 splits > split_max: the floor rule's 10
+        assert p.split_rule_for(4, 41986, 1, 1, 152, p.block_q_l6, True, 2048) == 10
+        # top_k 4096: one split per chunk, ceil(22016 / 4096) = 6
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 4096) == 6
+        # the floor rule does not split 8192 keys: no fit split either
+        assert p.split_rule_for(1, 8192, 1, 1, 152, p.block_q_l6, True, 2048) == 1
+    assert policy_for("sm_107a").split_fit_rule is None
+    assert (
+        policy_for("sm_107a").split_rule_for(
+            4, 22018, 1, 1, 212, policy_for("sm_107a").block_q_l6, True, 2048
+        )
+        == 5
+    )
+
+
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
     """sm_107a's ``split_wave_scope`` [["narrow"], 1, True]: the two-way wave split of ``split_wave_rule`` stays on sampled
     single-segment calls of the narrow unit only (never with the sampled first threshold off, and never for the
@@ -2041,12 +2088,13 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
         )
         assert policy_for(arch).sample_fit_kinds == registered, arch
     # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    # (12 splits: split_fit_rule gives each split at most top_k keys)
     p = policy_for("sm_103a")
     geometry = dict(
         num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
     )
     c = select_program(p, candidate_multiplier=16, **geometry)
-    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 5, 32768)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 12, 32768)
     assert c.physical_kind == "split_l6" and not c.sample_fit
     assert (
         select_program(p, **geometry).cand_cap == 32768
@@ -3336,13 +3384,17 @@ _TICKET_WORD_BYTES = 8 * 16
 
 def _assert_ticket_tail_zero(runner) -> None:
     """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
-    backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
-    on the architectures without a tail.  The segment order behind it is not checked: an :lsf launch
+    backend-owned tail is zeroed once at prepare, a caller-owned one by the scan binding before every scan launch); None
+    for a program without a tail (``static_scan_kinds``).  The segment order behind it is not checked: an :lsf launch
     leaves it written.  A static call (``runner._tail_static``, ``cake_policy.ticket_static_path``) never touches the word,
-    which then holds whatever the buffer held: nothing to check."""
+    which then holds whatever the buffer held: nothing to check.  A runner whose scan program reads its ``TicketWord``
+    argument has no tail: its ticket block's word reads 0 instead."""
     if runner.ticket_tail is not None and not runner._tail_static:
         words = runner.ticket_tail[:_TICKET_WORD_BYTES]
         assert not words.any(), words[:8].tolist()
+    if runner.ticket_block is not None:
+        word = runner.ticket_block[: cake_backend.TICKET_WORD_ZERO_BYTES]
+        assert not word.any(), word.tolist()
 
 
 def _prepare(inputs: ref.IndexerInputs, **extra):
@@ -3370,9 +3422,11 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail on this architecture")
+        pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
+    # the scan binding zeroes nothing: the device's one empty region, no per-call view
+    assert _scan_zero_region(runner) is cake_backend._empty_region(runner.device_index)
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
     expected = runner()
@@ -3410,12 +3464,29 @@ def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
     )
 
 
+def _scan_zero_region(runner) -> torch.Tensor:
+    """The ``zero_region`` argument the runner's scan launch passes its binding."""
+    (scan,) = [launch for launch in runner.launches if launch.role == "scan"]
+    plan = cake_backend.ARG_PLANS["scan"]
+    (index,) = [i for i, (kind, _name) in enumerate(plan) if kind == "zero"]
+    return scan.arguments[index]
+
+
 def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
-    """A runner on the caller-owned ``workspace`` (skips where the architecture has no ticket tail)."""
+    """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail on this architecture")
+        pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert runner._tail_shared
+    # the scan binding zeroes the tail right before every scan launch; nothing on a static call
+    zero_region = _scan_zero_region(runner)
+    if runner._tail_static:
+        assert zero_region is cake_backend._empty_region(runner.device_index)
+    else:
+        assert (zero_region.data_ptr(), zero_region.numel()) == (
+            runner.ticket_tail.data_ptr(),
+            cake_policy.TICKET_TAIL_BYTES,
+        )
     return runner
 
 
@@ -3461,7 +3532,8 @@ def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact()
 
 def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the_next_run():
     """The direct hazard: on a caller-owned workspace another kernel writes the ticket word between two
-    runs of a cached runner; the next run zeroes it first and stays bit-exact, and the tail reads 0 after."""
+    runs of a cached runner; the next run's scan binding zeroes it first and the run stays bit-exact, and the tail
+    reads 0 after."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = ref.make_random_inputs(
@@ -3470,17 +3542,17 @@ def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the
     workspace = torch.empty(
         _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
     )
+    # whatever the buffer held: prepare zeroes nothing, the scan binding does
+    workspace.fill_(0xFF)
     runner = _caller_owned_runner(inputs, workspace)
     assert not runner._tail_static  # the call draws tickets
-    torch.cuda.synchronize()
-    _assert_ticket_tail_zero(runner)  # zeroed at prepare as well
     expected = _cloned(runner())
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)
     _judge_ok(expected, ref.select_reference(inputs))
     for fill in (7, 0xFF, 1):
         # what another kernel could leave in a shared buffer; not a failed launch,
-        # so the shared flag alone drives the memset
+        # so the scan binding's zero_region alone restores it
         runner.ticket_tail.fill_(fill)
         assert not runner._tail_dirty
         out = runner()
@@ -3490,9 +3562,10 @@ def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the
 
 
 def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
-    """The eager entry with a caller-owned workspace: ``prepare`` zeroes the ticket tail on the current stream and the run
-    that follows does not repeat the memset; a tail another kernel left non-zero before the call is still restored, so
-    every call stays bit-exact and leaves the word 0.  A prepared runner on the same buffer still zeroes it every run."""
+    """The eager entry with a caller-owned workspace: the scan binding zeroes the ticket tail right before the scan
+    launch and no host-side memset runs (neither in ``prepare`` nor in the run); a tail another kernel left non-zero
+    before the call is restored, so every call stays bit-exact and leaves the word 0.  A prepared runner on the same
+    buffer restores it on every run the same way."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = ref.make_random_inputs(
@@ -3502,19 +3575,20 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
     )
     expected = _cloned(_run(inputs))
-    runners, run_memsets = [], []
-    prepare = cake_backend.prepare_dsa_indexer_det_topk
+    runners, host_memsets = [], []
+    prepare = cake_backend._prepare_runner
 
     def counting_prepare(*args, **kwargs):
+        assert kwargs.get("one_shot") is True  # the eager entry's runner runs once
         runner = prepare(*args, **kwargs)
         if runner.ticket_tail is not None:
             tail = runner.ticket_tail
             zero = tail.zero_
-            tail.zero_ = lambda: (run_memsets.append(1), zero())[1]
+            tail.zero_ = lambda: (host_memsets.append(1), zero())[1]
         runners.append(runner)
         return runner
 
-    monkeypatch.setattr(cake_backend, "prepare_dsa_indexer_det_topk", counting_prepare)
+    monkeypatch.setattr(cake_backend, "_prepare_runner", counting_prepare)
     for fill in (7, 0xFF):
         workspace.fill_(
             fill
@@ -3531,21 +3605,34 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         torch.cuda.synchronize()
         assert ref.same_bits(out, expected), fill
         _assert_ticket_tail_zero(runners[-1])
+    if runners[-1].ticket_block is not None:
+        # a program that reads its TicketWord: the one launch draws from the tail's first bytes, its scan binding
+        # zeroes the 8-byte word (not the whole tail), and no host-side memset runs
+        runner = runners[-1]
+        block_at = runner.workspace_bytes - cake_policy.TICKET_TAIL_BYTES
+        assert runner.ticket_block.data_ptr() == workspace.data_ptr() + block_at
+        zero_region = _scan_zero_region(runner)
+        assert (zero_region.data_ptr(), zero_region.numel()) == (
+            runner.ticket_block.data_ptr(),
+            cake_backend.TICKET_WORD_ZERO_BYTES,
+        )
+        assert not host_memsets and runner._ticket_restore is None
+        return
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail on this architecture")
-    assert runners[-1]._tail_shared and not run_memsets  # zeroed by prepare only
+        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+    assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
     runner.ticket_tail.fill_(7)
-    out = runner()  # the prepared runner's own run restores a shared tail
+    out = runner()  # the prepared runner's scan binding restores a shared tail
     torch.cuda.synchronize()
-    assert ref.same_bits(out, expected) and run_memsets == [1]
+    assert ref.same_bits(out, expected) and not host_memsets
     _assert_ticket_tail_zero(runner)
 
 
 def test_caller_owned_workspace_graph_replay_restores_the_tail():
-    """A graph capturing a caller-owned runner carries the tail memset node: corrupting the tail between
-    replays leaves every replay bit-exact and the tail 0 afterwards."""
+    """A graph capturing a caller-owned runner carries the scan binding's tail memset node: corrupting the tail
+    between replays leaves every replay bit-exact and the tail 0 afterwards."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = ref.make_random_inputs(
@@ -3586,6 +3673,67 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)
     _judge_ok(_cloned(captured), ref.select_reference(inputs))
+
+
+def test_static_scan_kind_runner_has_no_ticket_tail_and_stays_exact_on_a_poisoned_workspace():
+    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
+    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
+    at prepare or run) and its rows stay bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on
+    the same architecture keeps its tail."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    arch = arch_for(device)
+    static_kinds = policy_for(arch).static_scan_kinds
+    if not static_kinds:
+        pytest.skip("every scan program of this architecture draws tickets")
+    found = {}
+    for (T, Tkv, S), sample in itertools.product(
+        (
+            (8192, 32768, 1),
+            (8192, 131072, 4),
+            (4096, 16384, 2),
+            (2048, 65536, 1),
+            (32768, 32768, 1),
+            (16384, 131072, 1),
+            (65536, 65536, 8),
+        ),
+        (None, 0),
+    ):
+        choice = cake_backend.plan_dsa_indexer_det_topk(
+            T, Tkv, S, top_k=2048, sample_tiles_max=sample
+        )
+        if cake_policy.ticket_static_path(choice):
+            continue  # one unit per CTA at most: no draw either way
+        static = choice.physical_kind in static_kinds
+        found.setdefault(static, (T, Tkv, S, sample))
+    assert True in found, (
+        "no geometry runs a static scan kind with more units than CTAs"
+    )
+    assert False in found, (
+        "no geometry runs a drawing scan program with more units than CTAs"
+    )
+    for static, (T, Tkv, S, sample) in sorted(found.items()):
+        inputs = ref.make_random_inputs(
+            [T // S] * S, [Tkv // S] * S, top_k=2048, seed=78, device="cuda"
+        )
+        extra = {} if sample is None else {"sample_tiles_max": sample}
+        expected = _cloned(_run(inputs, **extra))
+        shared = torch.empty(
+            _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+        )
+        shared.fill_(7)
+        runner = _prepare(inputs, workspace_buffer=shared, **extra)
+        assert (runner.choice.physical_kind in static_kinds) == static
+        # a drawing program keeps a ticket word of its own: the workspace's tail, or its ticket block where it reads
+        # its TicketWord argument
+        assert (runner.ticket_tail is None and runner.ticket_block is None) == static, (
+            runner.choice.scan_key
+        )
+        for _ in range(2):
+            out = runner()
+            torch.cuda.synchronize()
+            assert ref.same_bits(out, expected), runner.choice.scan_key
+        _assert_ticket_tail_zero(runner)
 
 
 def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
@@ -3641,7 +3789,7 @@ def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
     out = drawing()
     torch.cuda.synchronize()
     assert ref.same_bits(out, expected_d)
-    _assert_ticket_tail_zero(drawing)  # zeroed before its run, left 0 by its scan
+    _assert_ticket_tail_zero(drawing)  # zeroed by its scan binding, left 0 by its scan
     out = runner()  # the static runner after the drawing one wrote the buffer
     torch.cuda.synchronize()
     assert ref.same_bits(out, expected_s) and not memsets
@@ -3659,6 +3807,314 @@ def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
     torch.cuda.synchronize()
     assert memsets == [1] and not runner._tail_dirty and not word.any()
     assert ref.same_bits(out, expected_s)
+
+
+# ---------------------------------------------------------------------------
+# TicketWord: a scan program that reads its ticket block (registry ``ticket_arg_arches``)
+# ---------------------------------------------------------------------------
+
+_TICKET_GEOMETRIES = (
+    ([600, 400], [600, 12000], 1024),
+    ([2048, 2048], [2048, 16384], 1024),
+    ([8192], [32768], 2048),
+)
+
+
+def _scan_ticket_word(runner):
+    """The ``TicketWord`` argument the runner's scan launch passes its binding."""
+    (scan,) = [launch for launch in runner.launches if launch.role == "scan"]
+    plan = cake_backend.ARG_PLANS["scan"]
+    (index,) = [i for i, (_kind, name) in enumerate(plan) if name == "TicketWord"]
+    return scan.arguments[index]
+
+
+def _ticket_word_inputs(seed: int):
+    """Inputs whose prepared runner draws from its own ticket block on this device (skips where no scan program of the
+    architecture reads its TicketWord, or none of the geometries dispatches one that draws)."""
+    _require_program()
+    arch = arch_for(torch.device("cuda"))
+    if not any(
+        arch in r.get("ticket_arg_arches", ()) for r in cake_jit.PROGRAMS.values()
+    ):
+        pytest.skip(
+            f"no scan program reads its TicketWord on {arch}: they draw from the workspace's tail"
+        )
+    for seg_q, seg_k, top_k in _TICKET_GEOMETRIES:
+        inputs = ref.make_random_inputs(
+            seg_q, seg_k, top_k=top_k, seed=seed, device="cuda"
+        )
+        runner = _prepare(inputs)
+        if runner.ticket_block is not None:
+            return inputs
+    pytest.skip("no geometry dispatches a TicketWord program that draws")
+
+
+def test_ticket_word_runner_owns_its_block_and_ignores_a_poisoned_caller_workspace():
+    """A prepared runner whose scan program reads its TicketWord gets a 16-byte block of its own, zeroed once at
+    prepare, never the shared placeholder and never the workspace's tail: poisoning the whole caller-owned workspace
+    (the tail's ticket word included) between runs leaves every run bit-equal to a backend-owned runner, no run issues
+    a memset, and the block's word reads 0 after every run."""
+    inputs = _ticket_word_inputs(80)
+    device = torch.device("cuda", torch.cuda.current_device())
+    own = _prepare(inputs)
+    expected = _cloned(own())
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(own)
+    _judge_ok(expected, ref.select_reference(inputs))
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    workspace.fill_(0xFF)
+    runner = _prepare(inputs, workspace_buffer=workspace)
+    assert runner.ticket_tail is None and runner.ticket_block is not None
+    assert cake_backend.reads_ticket_word(runner.programs["scan"], runner.arch)
+    word = _scan_ticket_word(runner)
+    assert word is not cake_backend._ticket_placeholder(runner.device_index)
+    assert (
+        word.dtype == torch.uint32 and word.data_ptr() == runner.ticket_block.data_ptr()
+    )
+    assert runner.ticket_block.numel() == cake_backend.TICKET_BLOCK_BYTES
+    assert not (
+        workspace.data_ptr()
+        <= runner.ticket_block.data_ptr()
+        < workspace.data_ptr() + workspace.numel()
+    )
+    # the scan binding zeroes nothing on a run: the device's empty region
+    assert _scan_zero_region(runner) is cake_backend._empty_region(runner.device_index)
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
+    generator = torch.Generator(device=device).manual_seed(81)
+    tail_at = runner.workspace_bytes - cake_policy.TICKET_TAIL_BYTES
+    for step in range(6):
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), step
+        _assert_ticket_tail_zero(runner)
+        # what another kernel could leave in the shared buffer: random bytes, a random tail word
+        workspace.copy_(
+            torch.randint(
+                0,
+                256,
+                workspace.shape,
+                generator=generator,
+                device=device,
+                dtype=torch.uint8,
+            )
+        )
+        workspace[tail_at : tail_at + 4] = torch.tensor(
+            [1 + step, 2, 3, 4], dtype=torch.uint8, device=device
+        )
+
+
+def test_ticket_word_runner_restores_its_word_after_a_failed_launch():
+    """A run that raised while launching may leave the block's word non-zero: the next run launches the scan through
+    the binding call whose ``zero_region`` is the block's 8-byte word, on the run's stream, once; later runs pass the
+    empty region again."""
+    inputs = _ticket_word_inputs(82)
+    runner = _prepare(inputs)
+    expected = _cloned(runner())
+    torch.cuda.synchronize()
+    restore = runner._ticket_restore
+    assert (
+        restore is not None
+        and restore.role == "scan"
+        and runner.launches[0].role == "scan"
+    )
+    plan = cake_backend.ARG_PLANS["scan"]
+    (zero_at,) = [i for i, (kind, _name) in enumerate(plan) if kind == "zero"]
+    region = restore.arguments[zero_at]
+    assert (region.data_ptr(), region.numel()) == (
+        runner.ticket_block.data_ptr(),
+        cake_backend.TICKET_WORD_ZERO_BYTES,
+    )
+    launches = runner.launches
+
+    def failing() -> None:
+        raise RuntimeError("boom")
+
+    runner.launches = (failing, *launches[1:])
+    with pytest.raises(RuntimeError, match="boom"):
+        runner()
+    assert runner._tail_dirty
+    runner.launches = launches
+    runner.ticket_block[:4].fill_(7)  # what an aborted launch could leave behind
+    used = []
+    restore_entry = restore.entry
+    object.__setattr__(
+        restore, "entry", lambda *args: (used.append(1), restore_entry(*args))[1]
+    )
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        out = runner()  # the restoring launch zeroes the word on this stream
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    assert used == [1] and not runner._tail_dirty
+    assert ref.same_bits(out, expected)
+    _assert_ticket_tail_zero(runner)
+    out = runner()
+    torch.cuda.synchronize()
+    assert used == [1] and ref.same_bits(out, expected)
+
+
+def test_ticket_word_runners_sharing_a_workspace_keep_their_own_blocks():
+    """Two TicketWord runners of different geometries on one caller-owned buffer, run in turn: each draws from its own
+    block, so every run is bit-equal to the same geometry's backend-owned run."""
+    inputs_a = _ticket_word_inputs(83)
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs_b = ref.make_random_inputs(
+        [900, 300], [900, 7000], top_k=4096, seed=84, device="cuda"
+    )
+    expected_a = _cloned(_prepare(inputs_a)())
+    expected_b = _cloned(_prepare(inputs_b)())
+    shared = torch.empty(
+        max(_workspace_bytes(inputs_a, device), _workspace_bytes(inputs_b, device)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    shared.fill_(7)
+    runner_a = _prepare(inputs_a, workspace_buffer=shared)
+    runner_b = _prepare(inputs_b, workspace_buffer=shared)
+    assert runner_a.ticket_block is not None
+    if runner_b.ticket_block is not None:
+        assert runner_a.ticket_block.data_ptr() != runner_b.ticket_block.data_ptr()
+    for step, (runner, expected) in enumerate(
+        [(runner_a, expected_a), (runner_b, expected_b)] * 2
+    ):
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), step
+        _assert_ticket_tail_zero(runner)
+
+
+def test_ticket_word_runner_prepared_on_one_stream_runs_on_another():
+    """The block is zeroed at prepare on the preparing stream; after the caller synchronizes, a run on another stream
+    draws from a zero word."""
+    inputs = _ticket_word_inputs(85)
+    expected = _cloned(_prepare(inputs)())
+    stream_a, stream_b = torch.cuda.Stream(), torch.cuda.Stream()
+    stream_a.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream_a):
+        runner = _prepare(inputs)
+    torch.cuda.synchronize()
+    stream_b.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream_b):
+        out = runner()
+        again = _cloned(runner())
+    torch.cuda.current_stream().wait_stream(stream_b)
+    torch.cuda.synchronize()
+    assert ref.same_bits(out, expected) and ref.same_bits(again, expected)
+    _assert_ticket_tail_zero(runner)
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_ticket_word_runner_graph_capture_before_and_after_first_use(warm):
+    """A TicketWord runner captured before its first run and after it: the graph carries no memset node, and replays
+    stay bit-exact with the caller-owned workspace poisoned between them."""
+    inputs = _ticket_word_inputs(86)
+    device = torch.device("cuda", torch.cuda.current_device())
+    expected = _cloned(_prepare(inputs)())
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    workspace.fill_(0xFF)
+    runner = _prepare(inputs, workspace_buffer=workspace)
+    if warm:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                runner()
+        torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner()
+    for fill in (7, 0xFF, 0):
+        workspace.fill_(fill)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert ref.same_bits(captured, expected), fill
+        _assert_ticket_tail_zero(runner)
+
+
+def test_ticket_word_eager_entry_draws_from_the_tail_word_it_zeroes():
+    """The eager entry on either workspace: its one scan launch draws from the tail's first bytes, which its binding
+    zeroes (8 bytes) right before the launch; a poisoned caller-owned buffer leaves every call bit-exact."""
+    inputs = _ticket_word_inputs(87)
+    device = torch.device("cuda", torch.cuda.current_device())
+    expected = _cloned(_prepare(inputs)())
+    assert ref.same_bits(_cloned(_run(inputs)), expected)  # backend-owned workspace
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    for fill in (0xFF, 7, 1):
+        workspace.fill_(fill)
+        out = _run(inputs, workspace_buffer=workspace)
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), fill
+        tail_at = _workspace_bytes(inputs, device) - cake_policy.TICKET_TAIL_BYTES
+        assert not workspace[
+            tail_at : tail_at + cake_backend.TICKET_WORD_ZERO_BYTES
+        ].any(), fill
+
+
+def test_static_ticket_word_calls_get_the_placeholder_and_shape_alone_decides():
+    """A call that never draws (``ticket_static_path``, or a ``static_scan_kinds`` program) passes the device's zeroed
+    placeholder as its TicketWord and gets no block; the decision is the shape's alone, so the same shapes with other
+    segment contents decide the same way."""
+    _require_program()
+    inputs = ref.make_random_inputs([4], [22018], top_k=2048, seed=88, device="cuda")
+    runner = _prepare(inputs)
+    assert cake_policy.ticket_static_path(runner.choice)
+    assert runner.ticket_block is None and runner._ticket_restore is None
+    assert _scan_ticket_word(runner) is cake_backend._ticket_placeholder(
+        runner.device_index
+    )
+    expected = _cloned(runner())
+    torch.cuda.synchronize()
+    placeholder = torch.from_dlpack(
+        cake_backend._ticket_placeholder(runner.device_index)
+    )
+    assert (
+        placeholder.numel() * placeholder.element_size()
+        == cake_backend.TICKET_BLOCK_BYTES
+    )
+    a = _prepare(
+        ref.make_random_inputs(
+            [2048, 2048], [2048, 16384], top_k=1024, seed=89, device="cuda"
+        )
+    )
+    # the same T, Tkv and S with other segment lengths and values
+    b = _prepare(
+        ref.make_random_inputs(
+            [3000, 1096], [9000, 9384], top_k=1024, seed=90, device="cuda"
+        )
+    )
+    if (a.choice.scan_key, a.choice.grid_ctas) == (
+        b.choice.scan_key,
+        b.choice.grid_ctas,
+    ):
+        assert (a._tail_static, a.ticket_block is None) == (
+            b._tail_static,
+            b.ticket_block is None,
+        )
+    for r in (a, b):
+        static = (
+            r._tail_static
+            or r.choice.physical_kind in policy_for(r.arch, r.form).static_scan_kinds
+        )
+        assert (r.ticket_block is not None) == (
+            not static and cake_backend.reads_ticket_word(r.programs["scan"], r.arch)
+        )
+        if r.ticket_block is None:
+            assert _scan_ticket_word(r) is cake_backend._ticket_placeholder(
+                r.device_index
+            )
+    assert ref.same_bits(runner(), expected)
+    torch.cuda.synchronize()
+    assert not placeholder.view(torch.uint8).any()  # no launch writes it
 
 
 def test_workspace_bound_is_respected():
@@ -3908,21 +4364,20 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
 
 
 def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
-    """Lever LSF (#7549): the ticket architectures ship the longest-first segment order copy of every scan program
-    (key suffix ``:lsf``, a program of its own); the host runs it on packed calls whose key segments are not all equal
-    and the program without it on one-segment calls and on packed calls of equal key segments
-    (``num_keys == S x max_seqlen_k``)."""
+    """Lever LSF (#7549): an architecture whose policy sets ``lsf_programs`` (a ticket architecture) ships the
+    longest-first segment order copy of every scan program (key suffix ``:lsf``, a program of its own); the host runs it
+    on packed calls whose key segments are not all equal and the program without it on one-segment calls and on packed
+    calls of equal key segments (``num_keys == S x max_seqlen_k``)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
         scan = {k for k in keys if k.startswith("scan:")}
         copies = {k for k in scan if k.endswith(":lsf")}
-        ticket = arch in cake_jit.TICKET_TAIL_ARCHES
-        assert copies == ({k + ":lsf" for k in scan - copies} if ticket else set()), (
-            arch
-        )
+        lsf = policy_for(arch).lsf_programs
+        assert copies == ({k + ":lsf" for k in scan - copies} if lsf else set()), arch
         assert all(keys[k] != keys[k[: -len(":lsf")]] for k in copies), arch
-        assert policy_for(arch).lsf_programs == ticket, arch
+        # the copy reorders the ticket draws, so only a ticket architecture can ship it
+        assert not lsf or arch in cake_jit.TICKET_TAIL_ARCHES, arch
     p = policy_for("sm_100a")
     one = _select(p, 65536, 65536)
     assert not one.lsf and not one.scan_key.endswith(":lsf")
@@ -3942,3 +4397,267 @@ def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
     assert _select(p, 8 * 32768, 8 * 32768, S=8).lsf  # no bound: the host cannot tell
     off = DispatchPolicy.from_record(dict(p.record(), lsf_programs=False))
     assert not _select(off, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536).lsf
+
+
+def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectures():
+    """``ticket_arg_arches`` (written by the exporter from each program's source build) lists, per scan program, the
+    architectures on which it draws from its TicketWord: on sm_107a every drawing scan program, on sm_100a / sm_103a
+    none (they draw from the workspace's tail).  Both ways: no program of a ``static_scan_kinds`` kind or an ``:lsf``
+    copy reads it, and every other scan program of an architecture that has a reader reads it -- so the host, which
+    decides by the record alone (``reads_ticket_word``), never hands a drawing program the placeholder."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for name, record in cake_jit.PROGRAMS.items():
+        reads = record.get("ticket_arg_arches")
+        if reads is not None:
+            assert record["role"] == "scan" and reads, name
+            assert list(reads) == [a for a in record["arches"] if a in reads], name
+    readers = {}
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        for key, name in keys.items():
+            if not key.startswith("scan:"):
+                continue
+            # the static kinds of the key's form (on sm_107a every FP8 kind is static)
+            static = set(policy_for(arch, scan_key_form(key)).static_scan_kinds)
+            parts = key.split(":")
+            reads = cake_backend.reads_ticket_word(name, arch)
+            assert reads == (
+                arch in cake_jit.PROGRAMS[name].get("ticket_arg_arches", ())
+            ), (arch, key)
+            if reads:
+                assert parts[1] not in static and parts[-1] != "lsf", (arch, key)
+            readers.setdefault(arch, []).append((reads, parts[1] in static))
+    assert {arch: any(r for r, _ in rows) for arch, rows in readers.items()} == {
+        "sm_100a": False,
+        "sm_103a": False,
+        "sm_107a": True,
+    }
+    for arch, rows in readers.items():
+        if any(r for r, _ in rows):
+            assert all(r != s for r, s in rows), (
+                arch
+            )  # every drawing program reads it, no static one does
+    assert cake_jit.ARG_PLANS["scan"][-5] == ["buffer", "TicketWord"]
+    assert cake_jit.ARG_PLANS["scan"][-6] == ["buffer", "K_scale"]
+    assert all(
+        ["buffer", "TicketWord"] not in plan and ["buffer", "K_scale"] not in plan
+        for role, plan in cake_jit.ARG_PLANS.items()
+        if role != "scan"
+    )
+
+
+def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
+    """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
+    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
+    architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
+    assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
+    assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
+        "sm_100a": [],
+        "sm_103a": [],
+        "sm_107a": ["l6", "pair_l6"],
+    }
+    # prepare decides a call's tail from this per-architecture set (made once per process)
+    for arch in cake_jit.POLICY:
+        assert cake_backend.ticket_tail_skips(arch) == frozenset(
+            policy_for(arch).static_scan_kinds
+        )
+    assert cake_backend.ticket_tail_skips("sm_90a") is None
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        scan = [k.split(":") for k in keys if k.startswith("scan:")]
+        kinds = {parts[1] for parts in scan}
+        lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
+        for kind in policy_for(arch).static_scan_kinds:
+            assert kind in kinds and kind not in lsf_kinds, (arch, kind)
+        # the FP8 form decides its tail by its own record (``POLICY_FP8``): every static kind is an FP8 kind
+        # the architecture registers without an :lsf copy
+        if not cake_backend.fp8_programs_for(arch):
+            continue
+        fp8 = [
+            scan_key_fields(k)
+            for k in keys
+            if k.startswith("scan:") and scan_key_form(k) == cake_policy.FP8
+        ]
+        fp8_static = policy_for(arch, cake_policy.FP8).static_scan_kinds
+        assert cake_backend.ticket_tail_skips(arch, cake_policy.FP8) == frozenset(
+            fp8_static
+        )
+        for kind in fp8_static:
+            assert kind in {f.physical for f in fp8}, (arch, kind)
+            assert kind not in {f.physical for f in fp8 if f.lsf}, (arch, kind)
+
+
+# ---------------------------------------------------------------------------
+# Eager entry: nothing launched before the scan
+# ---------------------------------------------------------------------------
+
+# a static call on every architecture (4 queries, split plan) and a call that draws tickets from a caller-owned buffer
+_EAGER_GEOMETRIES = (([4], [22018], 2048), ([600, 400], [600, 12000], 1024))
+
+
+def _device_ops(fn, tmp_path, name: str) -> list[str]:
+    """The categories (``kernel`` / ``gpu_memset`` / ``gpu_memcpy``) of the device activities ``fn`` issues, in start
+    order, from a profiler trace of one call (the stream is synchronized inside the trace)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    path = tmp_path / f"{name}.json"
+    prof.export_chrome_trace(str(path))
+    events = json.loads(path.read_text())["traceEvents"]
+    ops = sorted(
+        (
+            e
+            for e in events
+            if e.get("ph") == "X"
+            and e.get("cat") in ("kernel", "gpu_memset", "gpu_memcpy")
+        ),
+        key=lambda e: e["ts"],
+    )
+    assert ops, "the profiler recorded no device activity"
+    return [e["cat"] for e in ops]
+
+
+def _expected_ops(runner) -> list[str]:
+    """The device activities of one run: the scan binding's ``zero_region`` memset where it zeroes bytes, then one
+    kernel per launch."""
+    # a torch view, or the device's empty tvm_ffi region
+    region = _scan_zero_region(runner)
+    memset = ["gpu_memset"] if torch.Size(tuple(region.shape)).numel() else []
+    return memset + ["kernel"] * len(runner.launches)
+
+
+class _EagerCall:
+    """One eager call with a caller-owned workspace and outputs; records the runner of every call."""
+
+    def __init__(self, monkeypatch, inputs, device):
+        self.inputs = inputs
+        self.workspace = torch.empty(
+            _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+        )
+        self.indices = torch.empty(
+            (inputs.num_queries, inputs.top_k), dtype=torch.int32, device=device
+        )
+        self.scores = torch.empty(
+            (inputs.num_queries, inputs.top_k), dtype=torch.float32, device=device
+        )
+        self.runners = []
+        prepare = cake_backend._prepare_runner
+
+        def recording(*args, **kwargs):
+            runner = prepare(*args, **kwargs)
+            self.runners.append(runner)
+            return runner
+
+        monkeypatch.setattr(cake_backend, "_prepare_runner", recording)
+
+    def __call__(self):
+        i = self.inputs
+        return cake_backend.dsa_indexer_det_topk(
+            i.q,
+            i.k,
+            i.w,
+            i.cu_seqlens_q,
+            i.cu_seqlens_k,
+            **i.kwargs(),
+            workspace_buffer=self.workspace,
+            indices=self.indices,
+            scores=self.scores,
+        )
+
+
+def test_offsets_placeholder_is_one_never_written_tensor_per_device():
+    """A call without ``q_causal_offsets`` passes the device's offsets placeholder (one int64 element, ``has_offsets``
+    = 0), and every call the device's ``K_scale`` placeholder (one float32 element, read by no BF16 program): the
+    same tensors for every runner and eager call of the device, never written by any launch."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    holder = cake_backend._offsets_placeholder(device.index)
+    assert holder is cake_backend._offsets_placeholder(device.index)
+    assert holder.dtype == torch.int64 and holder.numel() == 1
+    assert holder.device == device
+    scales = cake_backend._unread_placeholder(device.index, torch.float32)
+    assert scales.dtype == torch.float32 and scales.numel() == 1
+    before = holder.clone()
+    for n, (seg_q, seg_k, top_k) in enumerate(_EAGER_GEOMETRIES):
+        inputs = ref.make_random_inputs(
+            seg_q, seg_k, top_k=top_k, seed=93 + n, device="cuda"
+        )
+        assert inputs.q_causal_offsets is None
+        runner = _prepare(inputs)
+        assert runner.tensors["q_offsets"] is holder
+        assert runner.tensors["K_scale"] is scales
+        expected = _cloned(runner())
+        for _ in range(2):
+            assert ref.same_bits(runner(), expected)
+            assert ref.same_bits(_run(inputs), expected)
+        torch.cuda.synchronize()
+        _judge_ok(expected, ref.select_reference(inputs))
+    assert torch.equal(holder, before)
+
+
+@pytest.mark.parametrize("geometry", range(len(_EAGER_GEOMETRIES)))
+def test_eager_entry_launches_nothing_before_its_scan(monkeypatch, tmp_path, geometry):
+    """One eager call issues exactly its runner's launches, the scan first (after its binding's ``zero_region``
+    memset where that zeroes bytes): no fill or copy of its own before them."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    seg_q, seg_k, top_k = _EAGER_GEOMETRIES[geometry]
+    inputs = ref.make_random_inputs(
+        seg_q, seg_k, top_k=top_k, seed=95 + geometry, device="cuda"
+    )
+    call = _EagerCall(monkeypatch, inputs, device)
+    expected = _cloned(call())  # loads the programs and makes the device's placeholders
+    ops = _device_ops(call, tmp_path, f"eager{geometry}")
+    runner = call.runners[-1]
+    assert ops == _expected_ops(runner), (ops, runner.stages)
+    assert runner.tensors["q_offsets"] is cake_backend._offsets_placeholder(
+        device.index
+    )
+    assert ref.same_bits((call.indices, call.scores), expected)
+
+
+@pytest.mark.parametrize("first_use", ["before_capture", "in_capture"])
+def test_eager_entry_graph_capture_holds_only_the_runner_launches(
+    monkeypatch, tmp_path, first_use
+):
+    """A CUDA graph capturing one eager call holds exactly the runner's launches, whether the device's offsets
+    placeholder was made before the capture or first needed inside it (then the capture's own tensor, not kept);
+    replays and later eager calls stay bit-exact, also after new values are copied into the bound inputs."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    seg_q, seg_k, top_k = _EAGER_GEOMETRIES[0]
+    inputs = ref.make_random_inputs(seg_q, seg_k, top_k=top_k, seed=97, device="cuda")
+    call = _EagerCall(monkeypatch, inputs, device)
+    expected = _cloned(call())  # loads the programs and makes the device's placeholders
+    kept = cake_backend._offsets_placeholder(device.index)
+    if first_use == "in_capture":
+        monkeypatch.setattr(cake_backend, "_UNREAD_PLACEHOLDERS", {})
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    runner = call.runners[-1]
+    if first_use == "in_capture":
+        assert runner.tensors["q_offsets"] is not kept
+        # made during the capture: not kept
+        assert cake_backend._UNREAD_PLACEHOLDERS == {}
+    else:
+        assert runner.tensors["q_offsets"] is kept
+    ops = _device_ops(graph.replay, tmp_path, f"graph_{first_use}")
+    assert ops == _expected_ops(runner), (ops, runner.stages)
+    assert ref.same_bits(captured, expected)
+    fresh = ref.make_random_inputs(seg_q, seg_k, top_k=top_k, seed=98, device="cuda")
+    inputs.q.copy_(fresh.q)
+    inputs.k.copy_(fresh.k)
+    inputs.w.copy_(fresh.w)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = _cloned(captured)
+    assert ref.same_bits(replayed, _run(fresh))
+    assert ref.same_bits(call(), replayed)
+    torch.cuda.synchronize()
+    _judge_ok(replayed, ref.select_reference(inputs))
