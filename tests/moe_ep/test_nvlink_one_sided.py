@@ -1,6 +1,7 @@
 """NVLink one-sided dispatch/combine: model-shaped round trips, round sequences
-with changing token counts and rank skew, and the workspace layout. A subset of
-the cases also runs on the Cake backend, which implements the same protocol.
+with changing token counts and rank skew, the workspace layout and the CFT
+logical endpoints over the workspace. A subset of the cases also runs on the
+Cake backend, which implements the same protocol.
 
 Each multi-rank case spawns one process per EP rank from this pytest process,
 so a single ``pytest`` run covers every EP size the machine has GPUs for:
@@ -25,10 +26,6 @@ import torch
 
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
-# Bytes one fabric.try_put moves; payload rows that are not a multiple of it
-# take the fence path even when CFT is requested.
-CFT_ALIGNMENT_BYTES = 16
-CFT_MAX_TOKENS = 128
 
 
 @dataclass(frozen=True)
@@ -126,18 +123,20 @@ class Case:
     synchronization between rounds.
 
     ``backend`` names the moe_ep communication backend. ``mode`` maps to
-    ``NVLinkOneSidedConfig.cft``: auto (None), fence (False) or cft (True),
-    each with ``lamport=False``; ``lamport`` is ``lamport=True, cft=False``
-    (Lamport steps up to its default token limit, fence steps above it).
-    Cake has no CFT transport and only runs ``auto``. ``payload_in_workspace`` writes the expert output into the
-    combine input region before combine. ``fp8_combine`` sends combine payloads
-    as FP8. ``graph`` captures the whole round sequence in one CUDA graph and
-    replays it.
+    ``NVLinkOneSidedConfig.lamport``: auto (None) and lamport (True) take the
+    Lamport transport for the steps it carries (up to its default token limit)
+    and the fence transport for the others, fence (False) the fence transport
+    only. A lamport case skips where the Lamport transport is unavailable; an
+    auto case then runs every step on the fence transport. Cake has no
+    transport to select and only runs ``auto``. ``payload_in_workspace`` writes
+    the expert output into the combine input region before combine.
+    ``fp8_combine`` sends combine payloads as FP8. ``graph`` captures the whole
+    round sequence in one CUDA graph and replays it.
     """
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "cft", "lamport"] = "auto"
+    mode: Literal["auto", "fence", "lamport"] = "auto"
     payload_in_workspace: bool = False
     fp8_combine: bool = False
     graph: bool = False
@@ -288,8 +287,8 @@ def _cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 # ----------------------------------------------------------------------------
 
 
-def _transport(cft, lamport) -> str:
-    return "lamport" if lamport else "cft" if cft else "fence"
+def _transport(lamport) -> str:
+    return "lamport" if lamport else "fence"
 
 
 class _RecordingModule:
@@ -303,11 +302,13 @@ class _RecordingModule:
         return getattr(self._module, name)
 
     def moe_a2a_dispatch(self, *args):
-        self._launches.append(("dispatch", _transport(args[10], args[13])))
+        assert args[10] is False, "CFT counted writes requested"
+        self._launches.append(("dispatch", _transport(args[13])))
         return self._module.moe_a2a_dispatch(*args)
 
     def moe_a2a_combine(self, *args):
-        self._launches.append(("combine", _transport(args[11], args[17])))
+        assert args[11] is False, "CFT counted writes requested"
+        self._launches.append(("combine", _transport(args[17])))
         return self._module.moe_a2a_combine(*args)
 
 
@@ -355,24 +356,17 @@ def _run_case(case: Case, rank: int) -> dict:
     )
     if one_sided:
         config = NVLinkOneSidedConfig(
-            cft={"auto": None, "fence": False, "cft": True, "lamport": False}[
-                case.mode
-            ],
-            # Lamport against the fence transport: test_nvlink_one_sided_lamport.py.
-            lamport=case.mode == "lamport",
+            lamport={"auto": None, "fence": False, "lamport": True}[case.mode],
             timeout_sec=30,
             **options,
         )
     else:
-        assert case.mode == "auto", "Cake has no CFT transport to select"
+        assert case.mode == "auto", "Cake has no transport to select"
         config = CakeAlltoAllConfig(**options)
     comm = create_communication(
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        cft_enabled = one_sided and comm._cft_enabled
-        if case.mode == "cft" and not cft_enabled:
-            return {"skip": "CFT counted writes are unavailable on this platform"}
         if case.mode == "lamport" and not comm.lamport_enabled:
             return {"skip": "the Lamport transport is unavailable here"}
         launches: list = []
@@ -460,7 +454,6 @@ def _run_case(case: Case, rank: int) -> dict:
                 for o in outputs
             ],
             "launches": launches,
-            "cft_enabled": cft_enabled,
             "lamport_max_tokens": comm.lamport_max_tokens if one_sided else 0,
         }
         dist.barrier()
@@ -602,39 +595,17 @@ def _assert_results(case: Case, results: list[dict]) -> None:
         assert len(result["outputs"]) == len(case.rounds)
         expected_launches = []
         for i, spec in enumerate(case.rounds):
-            payload, sf, slots, weights = result["inputs"][i]
             lamport = (
-                case.mode == "lamport"
+                case.mode in ("auto", "lamport")
                 and not case.eplb
                 and max(spec.tokens) <= result["lamport_max_tokens"]
             )
             _verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
                 _verify_dispatch(case, results, rank, i, lamport)
-            requested = (
-                result["cft_enabled"]
-                and case.mode != "fence"
-                and (case.mode == "cft" or max(spec.tokens) <= CFT_MAX_TOKENS)
-            )
-            # Wire eligibility, computed independently of the backend.
-            rows = (
-                (payload, slots, weights)
-                if sf is None
-                else (payload, sf, slots, weights)
-            )
-            dispatch_cft = requested and all(
-                t.shape[1] * t.element_size() % CFT_ALIGNMENT_BYTES == 0 for t in rows
-            )
-            combine_cft = (
-                requested
-                and case.model.hidden_size
-                * (1 if case.fp8_combine else 2)
-                % CFT_ALIGNMENT_BYTES
-                == 0
-            )
             expected_launches += [
-                ("dispatch", _transport(dispatch_cft, lamport)),
-                ("combine", _transport(combine_cft, lamport)),
+                ("dispatch", _transport(lamport)),
+                ("combine", _transport(lamport)),
             ]
             if case.eplb:
                 expected = torch.stack(
@@ -656,8 +627,7 @@ def _assert_results(case: Case, results: list[dict]) -> None:
 # ----------------------------------------------------------------------------
 
 # A four-rank communicator reused across changing token counts and peer
-# dependencies, including zero-token and delayed ranks. 128/129 tokens straddle
-# the automatic CFT threshold.
+# dependencies, including zero-token and delayed ranks.
 _ROUND_SEQUENCE = (
     Round((3, 0, 2, 1), Routing.LOCAL, 0),
     Round((1, 129, 0, 5), Routing.SPREAD, 1),
@@ -746,7 +716,6 @@ CASES = [
             ("auto", False, True),
             ("auto", False, False),
             ("auto", True, True),
-            ("cft", True, True),
             ("fence", True, True),
             ("lamport", False, True),
             ("lamport", False, False),
@@ -888,3 +857,81 @@ def test_workspace_layout(cft: bool) -> None:
     else:
         assert field("COMBINE_RECV_SIZE_INDEX") == 0
         assert combine_end <= total
+
+
+def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:
+    """Bind, query, release, rebind and destroy the CFT logical endpoints of a
+    workspace; writes the result of this rank."""
+    import torch.distributed as dist
+
+    from flashinfer.comm.comm_backend import TorchDistBackend
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEEpCommParams,
+        NVLinkOneSidedConfig,
+        create_communication,
+    )
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.cft import (
+        CftEndpoints,
+    )
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl",
+        init_method=f"file://{os.path.join(out_dir, 'rendezvous')}",
+        rank=rank,
+        world_size=world,
+        device_id=torch.device("cuda", rank),
+    )
+    try:
+        comm_backend = TorchDistBackend()
+        a2a = create_communication(
+            BootstrapConfig(world_size=world, rank=rank),
+            MoEEpCommParams(
+                num_experts=8 * world,
+                top_k=8,
+                max_tokens_per_rank=16,
+                hidden_size=1024,
+                dtype=torch.bfloat16,
+            ),
+            NVLinkOneSidedConfig(lamport=False),
+        )
+        try:
+            endpoints = CftEndpoints.bind(a2a, comm_backend)
+            if endpoints is None:
+                result = {"skip": "CFT logical endpoints are not available"}
+            else:
+                ids = endpoints.ids()
+                gathered = [None] * world
+                dist.all_gather_object(gathered, ids.tolist())
+                endpoints.release()
+                endpoints.rebind(comm_backend, ids)
+                endpoints.destroy()
+                result = {"ids": ids.tolist(), "gathered": gathered}
+        finally:
+            a2a.destroy()
+        torch.save(result, os.path.join(out_dir, f"rank{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_cft_endpoints() -> None:
+    """Every rank sees the same logical-endpoint ID per rank, and a rebind after
+    a release keeps the IDs."""
+    import torch.multiprocessing as mp
+
+    world = 2
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"requires {world} GPUs")
+    with tempfile.TemporaryDirectory() as out_dir:
+        mp.spawn(_cft_endpoints_worker, args=(world, out_dir), nprocs=world, join=True)
+        results = [
+            torch.load(os.path.join(out_dir, f"rank{r}.pt"), weights_only=False)
+            for r in range(world)
+        ]
+    if "skip" in results[0]:
+        assert all("skip" in r for r in results), "inconsistent support across ranks"
+        pytest.skip(results[0]["skip"])
+    assert all(r["gathered"] == results[0]["gathered"] for r in results)
+    assert all(r["ids"] == results[0]["ids"] for r in results)
+    assert len(set(results[0]["ids"])) == world

@@ -50,9 +50,9 @@ their fallback tactics; ``--autotune_cache`` reuses the profiles across runs).
 Launch on one node, for example:
 
     # DeepSeek-V4-Pro experts (MXFP4 weights, MXFP8 activations) behind the
-    # one-sided all-to-all on its fence transport, local batches 1..1024.
+    # one-sided all-to-all, local batches 1..1024.
     torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/bench_moe_ep.py \\
-        --comm nvlink_one_sided --cft off --compute trtllm \\
+        --comm nvlink_one_sided --compute trtllm \\
         --profile deepseek_v4_pro --perfect_router -b 1 -e 1024 -f 2 \\
         --kernel_breakdown --output_file out.json
 """
@@ -102,8 +102,6 @@ QUANT_FORMATS = {
 ACTIVATION_FORMATS = ("bf16", "fp8_block_scale", "mxfp8", "nvfp4")
 COMM_BACKENDS = ("nvlink_one_sided", "cake", "nvlink_two_sided")
 COMPUTE_BACKENDS = ("trtllm", "cutedsl", "prims_ts")
-# NVLinkOneSidedConfig.cft for each --cft choice.
-_CFT_MODES = {"auto": None, "on": True, "off": False}
 TIMING_SCOPES = ("dispatch_compute_combine", "forward")
 # The stage a fused dispatch-experts-combine kernel starts at.
 _DISPATCH_STAGE = "dispatch"
@@ -118,9 +116,7 @@ def _comm_config(args: argparse.Namespace):
 
     low_precision = bool(args.use_low_precision_combine)
     if args.comm == "nvlink_one_sided":
-        return NVLinkOneSidedConfig(
-            use_low_precision_combine=low_precision, cft=_CFT_MODES[args.cft]
-        )
+        return NVLinkOneSidedConfig(use_low_precision_combine=low_precision)
     if args.comm == "cake":
         return CakeAlltoAllConfig(use_low_precision_combine=low_precision)
     return NVLinkTwoSidedConfig()
@@ -594,13 +590,6 @@ def parse_args() -> argparse.Namespace:
         help="Send combine payloads as FP8 (nvlink_one_sided and cake).",
     )
     parser.add_argument(
-        "--cft",
-        choices=sorted(_CFT_MODES),
-        default="auto",
-        help="CFT counted writes of nvlink_one_sided: auto (where supported, up "
-        "to its token-count limits), on (every supported step) or off.",
-    )
-    parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
         help="Run eagerly instead of replaying one CUDA graph.",
@@ -683,7 +672,6 @@ def main() -> None:
         "max_num_tokens_per_rank": max_num_tokens_per_rank,
         "perfect_router": bool(args.perfect_router),
         "use_low_precision_combine": bool(args.use_low_precision_combine),
-        "cft": args.cft,
         "random_seed": int(args.random_seed),
         "device": torch.cuda.get_device_name(device),
         "cuda_graph": not args.no_cuda_graph,

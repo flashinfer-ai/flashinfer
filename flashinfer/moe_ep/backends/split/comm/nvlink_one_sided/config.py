@@ -25,18 +25,10 @@ class NVLinkOneSidedConfig:
     sends combine payloads as FP8. ``comm_backend`` exchanges the MNNVL memory
     handles and defaults to torch.distributed over the bootstrap process group.
 
-    ``cft`` selects CFT counted writes, which push payloads over the NVLink
-    fabric with ``fabric.try_put.counted`` and let the receiver wait on
-    hardware byte counters. They need compute capability 10.0 or newer, a
-    FlashInfer build against CUDA 13.4+ and a driver of the 615 branch or newer
-    that exports the CUDA logical-endpoint API; payload rows must be multiples
-    of 16 bytes. ``None`` (default) uses them where every rank supports them,
-    for steps whose busiest rank sends at most ``cft_max_tokens_for_dispatch``
-    (dispatch) or ``cft_max_tokens_for_combine`` (combine) tokens; ``True``
-    uses them for every step where supported; ``False`` never uses them. Steps
-    the Lamport transport takes (see ``lamport``) do not use them. Only one
-    workspace per process can bind CFT endpoints; further workspaces use the
-    fence path.
+    ``cft``, ``cft_max_tokens_for_dispatch`` and ``cft_max_tokens_for_combine``
+    select no transport: steps do not use CFT counted writes. ``cft=True``
+    turns the Lamport transport off unless ``lamport`` is set, which leaves
+    every step to the fence path; the token limits have no effect.
 
     ``lamport`` selects the Lamport transport for small steps: one dispatch and
     one combine kernel in which every pushed vector carries its own arrival, so
@@ -44,14 +36,14 @@ class NVLinkOneSidedConfig:
     10.0, 10.3 or 10.7, at most 64 EP ranks, a BF16 combine and a BF16, ``MXFP8``,
     ``DeepSeekFp8`` or ``NVFP4`` dispatch format. Where every rank supports it,
     it takes every step without ``eplb_local_stats`` whose busiest rank sends
-    at most ``lamport_max_tokens`` tokens, ahead of CFT. A step's busiest-rank
+    at most ``lamport_max_tokens`` tokens. A step's busiest-rank
     count is the ``runtime_max_tokens_per_rank`` passed to dispatch (the same
     on every rank, fixed in a captured CUDA graph), which ``MoEEpSplitLayer``
     passes from ``MoEEpTensors.runtime_max_tokens_per_rank``; a step that
     passes none is compared at the capacity, ``max_tokens_per_rank``. ``None``
     (default) turns it on unless ``cft=True``; ``True`` turns it on and cannot
-    be combined with ``cft=True``; ``False`` leaves those steps to CFT or the
-    fence path. A rank where it is off turns it off on every rank.
+    be combined with ``cft=True``; ``False`` leaves those steps to the fence
+    path. A rank where it is off turns it off on every rank.
     ``lamport_max_tokens`` must be the same on every rank; it defaults to the
     largest step whose dispatch grid stays below one wave of resident blocks
     and whose Lamport regions stay within 64 MiB per rank (a speed bound, not
