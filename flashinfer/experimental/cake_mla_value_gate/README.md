@@ -8,8 +8,7 @@ Both the API and the backend are experimental (see
 [`../README.md`](../README.md)).  Calling
 `flashinfer.cake_mla_value_gate.prepare_mla_value_gate` is the opt-in; no
 environment variable is involved and the backend takes part in no automatic
-routing (dispatch, autotuning or trace-apply).  Tracking issue:
-flashinfer-ai/flashinfer#8795.
+routing (dispatch, autotuning or trace-apply).
 
 ## Operation
 
@@ -126,6 +125,16 @@ Program names are `cake_mla_value_gate_<20 hex>`.  Tests:
 `pytest tests/experimental/test_cake_mla_value_gate.py`; example:
 `python examples/cake_mla_value_gate.py`; benchmark:
 `python benchmarks/bench_cake_mla_value_gate.py`.
+
+## Ownership and graduation
+
+- Owner: @yyihuang.
+- Tracking issue: flashinfer-ai/flashinfer#8795.
+- Graduation plan: the feature leaves the experimental track when (a) an
+  adapter in a real engine consumer is qualified on its target GPU, and (b) the
+  maintainers agree on the API name and on how its shape is generalized (head
+  count, decode widths, sigmoid modes).  Until then it is reviewed on the
+  experimental policy's cadence and may change or be removed.
 
 ## Attribution
 
