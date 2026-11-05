@@ -92,11 +92,8 @@ namespace moe_alltoall_lamport {
 constexpr int kMaxRanks = 64;  // the active-rank mask is one 64-bit word
 constexpr int kMaxTopK = 22;   // the NVLink one-sided kernels' bound
 constexpr int kNumThreads = 128;
-// Resident dispatch blocks per SM (a register bound); the default token limit keeps the dispatch
-// grid within one wave of them.
+// Resident dispatch blocks per SM (a register bound).
 constexpr int kDispatchBlocksPerSM = 6;
-// Landing rows per source rank of a workspace, at most (bounds memory, not code).
-constexpr int kMaxTokensPerRank = 512;
 
 // 16-byte vectors of an ids or weights row (top_k 4-byte words, padded).
 __host__ __device__ constexpr int topk_row_vectors(int top_k) { return (top_k + 3) / 4; }
