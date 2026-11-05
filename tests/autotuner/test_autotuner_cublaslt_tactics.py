@@ -79,16 +79,28 @@ def test_non_descriptor_tactics_rejected(tactic):
     assert not _is_cublaslt_algo_tactic(tactic)
 
 
-def test_default_tactic_is_not_a_rejected_descriptor():
+def test_default_tactic_is_not_a_rejected_descriptor(monkeypatch):
     """The autotuner times ``-1`` as a candidate (it races the tuned tactics
     under ``autotune_v2``); the heuristic default it runs must not be
-    disqualified as a descriptor that does not apply."""
+    disqualified as a descriptor that does not apply. Outside profiling a
+    rejected descriptor is counted and warned about once."""
+    rematerialized = Counter()
+    monkeypatch.setattr(gemm_base, "_CUBLASLT_TACTIC_REMATERIALIZED", rematerialized)
+    monkeypatch.setattr(gemm_base, "_CUBLASLT_REMATERIALIZE_WARNED", set())
     with _profile_measurement_scope():
         _check_cublaslt_descriptor_ran(0, -1)
         _check_cublaslt_descriptor_ran(1, _DESCRIPTORS[0])
         with pytest.raises(RuntimeError, match="does not apply"):
             _check_cublaslt_descriptor_ran(0, _DESCRIPTORS[0])
-    _check_cublaslt_descriptor_ran(0, _DESCRIPTORS[0])
+    assert not rematerialized
+    _check_cublaslt_descriptor_ran(0, -1)
+    _check_cublaslt_descriptor_ran(1, _DESCRIPTORS[0])
+    with pytest.warns(UserWarning, match="rejected the tuned algorithm"):
+        _check_cublaslt_descriptor_ran(0, _DESCRIPTORS[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _check_cublaslt_descriptor_ran(0, _DESCRIPTORS[0])
+    assert rematerialized == {_DESCRIPTORS[0]: 2}
 
 
 _OP = "test::cublaslt_descriptor_persistence"
