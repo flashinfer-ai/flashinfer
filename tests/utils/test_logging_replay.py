@@ -402,9 +402,9 @@ def test_trtllm_mla_prefill_logging_attribution_in_fresh_process(
             return torch.tensor([len(calls)], dtype=torch.int32)
 
         assert not hasattr(
-            core._trtllm_batch_decode_with_kv_cache_mla_impl, "__wrapped__"
+            core._mla_with_kv_cache_impl, "__wrapped__"
         )
-        core._trtllm_batch_decode_with_kv_cache_mla_impl = shared_impl
+        core._mla_with_kv_cache_impl = shared_impl
         required = (
             torch.empty(1),
             torch.empty(1),

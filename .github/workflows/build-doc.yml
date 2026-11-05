@@ -98,7 +98,11 @@ jobs:
   deploy:
     name: Deploy Docs
     needs: test_linux
-    if: inputs.release_tag != ''
+    # Release tags only, and never a release candidate: docs.flashinfer.ai is the
+    # stable documentation site, so publishing an rc there would advertise an
+    # unreleased API to every reader. An rc still builds the docs above, which is
+    # what catches a broken doc build before the final tag.
+    if: inputs.release_tag != '' && !contains(inputs.release_tag, 'rc')
     runs-on: ubuntu-latest
     permissions:
       pages: write

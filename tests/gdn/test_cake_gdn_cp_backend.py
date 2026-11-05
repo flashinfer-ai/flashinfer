@@ -15,8 +15,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-import hashlib
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +26,7 @@ import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
 from flashinfer.jit import cake_gdn_cp_backend as gdn_cp_jit
 from flashinfer.utils import is_sm100a_supported
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 from .reference_delta_rule import blockwise_delta_rule, delta_rule
 
@@ -49,90 +48,69 @@ def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2, equal_nan=True)
 
 
-def test_generated_source_inventory_and_hashes() -> None:
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_registry_maps_every_logical_kernel_to_a_program_for_the_arch(
+    arch: str,
+) -> None:
+    csrc = _source_root().parents[1]
+    table = gdn_cp_jit.KERNELS[arch]
+    assert table, "the generated registry lists the kernels the host dispatches on"
+    for name in table:
+        program = gdn_cp_jit.program_for(name, arch)
+        assert program.startswith("cake_gdn_cp_")
+        record = gdn_cp_jit.MODULES[program]
+        assert arch in record["arches"]
+        assert record["sources"], program
+        for relative in record["sources"]:
+            assert Path(relative).name.startswith("cake_gdn_cp_"), relative
+            assert (csrc / relative).is_file(), relative
+        assert record["ffi_entry"]
+        assert record["arg_plan"], program
+    with pytest.raises(ValueError):
+        gdn_cp_jit.program_for("not_a_gdn_cp_kernel", arch)
+
+
+def test_generated_sources_carry_no_manifest_and_every_kernel_is_registered() -> None:
     root = _source_root()
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
-    legacy_inventory = {"README.md", "manifest.json"}
-    legacy_inventory.update(header["path"] for header in manifest["cuda_headers"])
-    for kernel in manifest["kernels"]:
-        legacy_inventory.add(kernel["host_binding"]["path"])
-        legacy_inventory.update(output["path"] for output in kernel["outputs"])
-    assert len(legacy_inventory) == 72
-    assert all((root / path).is_file() for path in legacy_inventory)
-    implementation_paths = [record["path"] for record in manifest["cuda_headers"]]
-    for kernel in manifest["kernels"]:
-        implementation_paths.append(kernel["host_binding"]["path"])
-        implementation_paths.extend(record["path"] for record in kernel["outputs"])
-    assert len(implementation_paths) == 70
-    assert all(
-        Path(path).name.startswith("cake_gdn_cp_") for path in implementation_paths
-    )
-    assert len(manifest["cuda_headers"]) == 1
-    assert manifest["cuda_headers"][0]["path"] == "cuda/cake_gdn_cp_common.cuh"
-    assert manifest["cuda_headers"][0]["sha256"] == (
-        "58977b0805adba62e0f07df9e3e90d4b46754fc672f02deef6c27f0b55952777"
-    )
-    assert [record["name"] for record in manifest["kernels"]] == [
-        "qk_norm",
-        "qk_norm_bf16",
-        "t_precompute",
-        "t_precompute_bf16",
-        "t_precompute_gb300_hv48_min6",
-        "mn_precompute",
-        "mn_precompute_bf16",
-        "state_fixup_simt_row4",
-        "normalized_final_state",
-        "normalized_final_state_bf16",
-        "state_gather_fp32",
-        "state_gather_fp16",
-        "state_gather_bf16",
-        "state_gather_fp32_int64",
-        "state_gather_fp16_int64",
-        "state_gather_bf16_int64",
-        "state_scatter_fp32",
-        "state_scatter_fp16",
-        "state_scatter_bf16",
-        "state_scatter_fp32_int64",
-        "state_scatter_fp16_int64",
-        "state_scatter_bf16_int64",
-        "state_fixup_utcmma64",
-        "state_fixup_utcmma128",
-        "cp_prefill",
-        "cp_prefill_checkpoint",
-        "cp_prefill_equal_head",
-        "cp_prefill_equal_head_checkpoint",
-        "cp_prefill_equal_head_h32",
-        "cp_prefill_bf16",
-        "cp_prefill_generic",
-        "cp_prefill_generic_checkpoint",
-        "cp_prefill_generic_bf16",
-    ]
-    assert len(manifest["kernels"]) == 33
-    for record in manifest["kernels"]:
-        host = record["host_binding"]
-        host_path = root / host["path"]
-        assert hashlib.sha256(host_path.read_bytes()).hexdigest() == host["sha256"]
-        for output in record["outputs"]:
-            source = root / output["path"]
-            assert hashlib.sha256(source.read_bytes()).hexdigest() == output["sha256"]
-    common_header = root / manifest["cuda_headers"][0]["path"]
-    assert (
-        hashlib.sha256(common_header.read_bytes()).hexdigest()
-        == (manifest["cuda_headers"][0]["sha256"])
-    )
+    assert not (root / "manifest.json").exists()
+    referenced = {
+        Path(relative).name
+        for record in gdn_cp_jit.MODULES.values()
+        for relative in record["sources"]
+    }
+    delivered = {path.name for path in root.iterdir() if path.suffix == ".cu"}
+    assert delivered, "generated CUDA sources are delivered next to the README"
+    assert delivered <= referenced, sorted(delivered - referenced)
+    present = {path.name for path in root.iterdir()}
+    assert referenced <= present, sorted(referenced - present)
 
 
-def test_jit_loader_accepts_checked_in_manifest() -> None:
-    gdn_cp_jit._manifest.cache_clear()
-    assert gdn_cp_jit._manifest()["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
+def test_programs_shared_across_arches_serve_the_same_logical_kernels() -> None:
+    """A program listed for several architectures answers the same names on each.
+
+    One logical kernel must resolve to one program wherever that program is
+    listed; a table naming it on one architecture only would re-split the
+    generations silently.
+    """
+
+    for program, record in gdn_cp_jit.MODULES.items():
+        if len(record["arches"]) < 2:
+            continue
+        per_arch = []
+        for arch in record["arches"]:
+            table = gdn_cp_jit.KERNELS[arch]
+            per_arch.append({name for name in table if table[name] == program})
+            for name in per_arch[-1]:
+                assert gdn_cp_jit.program_for(name, arch) == program
+        assert per_arch[0], program
+        assert all(names == per_arch[0] for names in per_arch), (program, per_arch)
 
 
 @pytest.mark.parametrize(
     ("arch", "hq", "hv", "expected_t", "expected_chunk", "expected_source"),
     [
         ("sm_100a", 16, 48, "t_precompute", None, None),
-        ("sm_103a", 16, 48, "t_precompute_gb300_hv48_min6", None, None),
+        ("sm_103a", 16, 48, "t_precompute", None, None),
         ("sm_103a", 16, 64, "t_precompute", 4096, 32768),
         ("sm_103a", 32, 32, "t_precompute", None, None),
     ],
@@ -168,30 +146,13 @@ def test_long_row_dispatch_is_exact(
 @pytest.mark.parametrize(
     ("arch", "seq_lens", "dtype", "heads", "expected_prefill"),
     [
-        (
-            "sm_100a",
-            (128,),
-            torch.float16,
-            (1, 1, 1),
-            "cp_prefill_equal_head_checkpoint",
-        ),
-        (
-            "sm_100a",
-            (128,),
-            torch.float16,
-            (32, 32, 32),
-            "cp_prefill_equal_head_checkpoint",
-        ),
+        ("sm_100a", (128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
+        ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
+        ("sm_107a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
-        (
-            "sm_100a",
-            (128, 129),
-            torch.float16,
-            (4, 2, 2),
-            "cp_prefill_generic_checkpoint",
-        ),
+        ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
     ],
 )
 def test_generic_plan_selects_head_dtype_and_tail_routes(
@@ -230,10 +191,12 @@ def test_generic_plan_selects_head_dtype_and_tail_routes(
     assert plan.num_sab_heads == max(hq, hv)
 
 
+@pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
 def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
     monkeypatch: pytest.MonkeyPatch,
     metadata_dtype: torch.dtype,
+    cu_dtype: torch.dtype,
 ) -> None:
     monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_103a")
     monkeypatch.setattr(
@@ -259,23 +222,21 @@ def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
 
     assert plan.cp_chunk_len == 128
     assert plan.checkpoint_count == 5
-    assert gdn_cp._checkpoint_fixed_state_indices(
-        torch.tensor([0, 256, 640], dtype=torch.int64),
+    # The indices read the caller's prefix sums directly (int32 or int64).
+    indices = gdn_cp._checkpoint_fixed_state_indices(
+        torch.tensor([0, 256, 640], dtype=cu_dtype),
         torch.tensor([0, 2, 5], dtype=metadata_dtype),
         checkpoint_count=5,
         cp_chunk_len=plan.cp_chunk_len,
-    ).tolist() == [
-        0,
-        1,
-        2,
-        3,
-        4,
-    ]
+    )
+    assert indices.dtype == torch.int64
+    assert indices.tolist() == [0, 1, 2, 3, 4]
 
 
-def test_checkpoint_indices_skip_zero_length_sequences() -> None:
+@pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64])
+def test_checkpoint_indices_skip_zero_length_sequences(cu_dtype: torch.dtype) -> None:
     indices = gdn_cp._checkpoint_fixed_state_indices(
-        torch.tensor([0, 0, 256, 256, 640], dtype=torch.int64),
+        torch.tensor([0, 0, 256, 256, 640], dtype=cu_dtype),
         torch.tensor([0, 0, 2, 2, 5], dtype=torch.int32),
         checkpoint_count=5,
         cp_chunk_len=128,
@@ -501,10 +462,253 @@ def test_zero_length_plans_keep_semantic_fixup_and_skip_empty_grids(
     assert empty.cp_grid[0] == 0
 
 
+def _sm107_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    num_sms: int,
+    cp_chunk_len: int | None = None,
+) -> gdn_cp.GDNCPPrefillPlan:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_107a")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=num_sms),
+    )
+    total = sum(seq_lens)
+    device = SimpleNamespace()
+    q = SimpleNamespace(shape=(total, heads, 128), device=device, dtype=torch.float16)
+    k = SimpleNamespace(shape=(total, heads, 128))
+    v = SimpleNamespace(shape=(total, heads, 128))
+    return gdn_cp._build_plan(
+        q,
+        k,
+        v,
+        num_seqs=len(seq_lens),
+        max_seqlen=max(seq_lens, default=0),
+        cp_chunk_len=cp_chunk_len,
+    )
+
+
+_ROW_SPLIT_CTAS = {
+    "state_fixup_simt_row3_sb2": 43,
+    "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row7_sb2_mb3": 19,
+    "state_fixup_simt_row8_sb2_mb3": 16,
+    "state_fixup_simt_row8_mb3": 16,
+    "state_fixup_simt_row10_sb2": 13,
+    "state_fixup_simt_row10_mb3": 13,
+}
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "num_sms", "expected"),
+    [
+        # More than 2 CTAs per SM over sequences of one length: 3 CTAs per SM.
+        ((1024,) * 8, 8, 212, "state_fixup_simt_row4_mb3"),
+        ((16384,), 15, 216, "state_fixup_simt_row4_mb3"),
+        # 16, 26 and 48 states whose row split does not fit its CTAs per SM.
+        ((16384,), 16, 200, "state_fixup_simt_row4_mb3"),
+        ((16384,), 26, 200, "state_fixup_simt_row4_mb3"),
+        ((16384,), 48, 200, "state_fixup_simt_row4_mb3"),
+        # Sequences of one length with 4, 8, 14, 16, 22, 24, 26, 32, 36 or 48
+        # states: the row-split builds (4 states from 6 CP chunks per sequence
+        # on).
+        ((16384,), 4, 212, "state_fixup_simt_row3_sb2"),
+        ((4096,), 4, 212, "state_fixup_simt_row3_sb2"),
+        ((16384,), 8, 212, "state_fixup_simt_row3_sb2"),
+        ((8192, 8192), 4, 212, "state_fixup_simt_row3_sb2"),
+        ((16384,), 16, 212, "state_fixup_simt_row5_mb3"),
+        ((16384,), 16, 216, "state_fixup_simt_row5_mb3"),
+        ((8192, 8192), 16, 212, "state_fixup_simt_row10_sb2"),
+        ((2048,) * 4, 8, 212, "state_fixup_simt_row10_sb2"),
+        ((16384,), 14, 216, "state_fixup_simt_row5_mb3"),
+        ((16384,), 14, 224, "state_fixup_simt_row5_mb3"),
+        ((8192, 8192), 7, 212, "state_fixup_simt_row5_mb3"),
+        ((16384,), 22, 212, "state_fixup_simt_row7_sb2_mb3"),
+        ((8192, 8192), 11, 216, "state_fixup_simt_row7_sb2_mb3"),
+        ((16384,), 24, 212, "state_fixup_simt_row8_sb2_mb3"),
+        ((8192,) * 3, 8, 212, "state_fixup_simt_row8_sb2_mb3"),
+        ((16384,), 26, 212, "state_fixup_simt_row8_mb3"),
+        ((8192, 8192), 13, 216, "state_fixup_simt_row8_mb3"),
+        ((8192,) * 3, 12, 212, "state_fixup_simt_row8_sb2_mb3"),
+        ((16384,), 36, 216, "state_fixup_simt_row8_sb2_mb3"),
+        ((16384,), 48, 212, "state_fixup_simt_row10_mb3"),
+        ((65536,), 48, 216, "state_fixup_simt_row10_mb3"),
+        # At most 2 CTAs per SM: the default build.
+        ((16384,), 6, 212, "state_fixup_simt_row4"),
+        ((16384,), 8, 160, "state_fixup_simt_row4"),
+        ((16384,), 12, 224, "state_fixup_simt_row4"),
+        ((4096,), 13, 208, "state_fixup_simt_row4"),
+        # Unequal sequences keep the default build at any grid: 8 heads over
+        # 6144 + 2048 tokens is 512 CTAs, where the 3-CTA build is slower.
+        ((6144, 2048), 8, 212, "state_fixup_simt_row4"),
+        ((2048, 6144), 16, 212, "state_fixup_simt_row4"),
+        ((6144, 2048), 11, 212, "state_fixup_simt_row4"),
+        ((6144, 2048), 24, 212, "state_fixup_simt_row4"),
+        ((0, 64, 0), 64, 148, "state_fixup_simt_row4"),
+    ],
+)
+def test_sm107_fixup_takes_three_ctas_per_sm_past_two_over_equal_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    num_sms: int,
+    expected: str,
+) -> None:
+    plan = _sm107_plan(monkeypatch, seq_lens, heads, num_sms)
+    assert plan.fixup_kernel == expected
+    row_ctas = _ROW_SPLIT_CTAS.get(expected, 32)
+    assert plan.fixup_grid == (len(seq_lens) * heads * row_ctas, 1, 1)
+    assert gdn_cp_jit.has_gdn_cp_kernel(expected, "sm_107a")
+
+
+def test_sm107_fixup_gate_needs_the_shipped_three_cta_program(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert gdn_cp_jit.has_gdn_cp_kernel("state_fixup_simt_row4_mb3", "sm_107a")
+    for arch in ("sm_100a", "sm_103a"):
+        assert not gdn_cp_jit.has_gdn_cp_kernel("state_fixup_simt_row4_mb3", arch)
+    shipped = gdn_cp_jit.program_for("state_fixup_simt_row4", "sm_107a")
+    mb3 = gdn_cp_jit.program_for("state_fixup_simt_row4_mb3", "sm_107a")
+    assert mb3 != shipped
+    records = gdn_cp_jit.MODULES
+    assert records[mb3]["arg_plan"] == records[shipped]["arg_plan"]
+    assert records[mb3]["arches"] == ["sm_107a"]
+    monkeypatch.setattr(gdn_cp, "has_gdn_cp_kernel", lambda _name, _arch: False)
+    plan = _sm107_plan(monkeypatch, (16384,), 16, 212)
+    assert plan.fixup_kernel == "state_fixup_simt_row4"
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "expected"),
+    [
+        ((2560,), 4, "state_fixup_simt_row4"),
+        ((3072,), 4, "state_fixup_simt_row3_sb2"),
+        ((1024, 1024), 2, "state_fixup_simt_row4"),
+        ((3072, 3072), 2, "state_fixup_simt_row3_sb2"),
+        ((1024,), 8, "state_fixup_simt_row3_sb2"),
+    ],
+)
+def test_sm107_four_state_row_split_needs_six_cp_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    expected: str,
+) -> None:
+    plan = _sm107_plan(monkeypatch, seq_lens, heads, 212, cp_chunk_len=512)
+    assert plan.cp_chunk_len == 512
+    assert plan.fixup_kernel == expected
+
+
+def test_sm107_row_split_fixups_share_the_shipped_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shipped = gdn_cp_jit.program_for("state_fixup_simt_row4", "sm_107a")
+    records = gdn_cp_jit.MODULES
+    for name in _ROW_SPLIT_CTAS:
+        program = gdn_cp_jit.program_for(name, "sm_107a")
+        assert program != shipped
+        assert records[program]["arg_plan"] == records[shipped]["arg_plan"]
+        assert records[program]["arches"] == ["sm_107a"]
+        for arch in ("sm_100a", "sm_103a"):
+            assert not gdn_cp_jit.has_gdn_cp_kernel(name, arch)
+    # Without a row-split program the gate keeps the 4-row builds.
+    monkeypatch.setattr(
+        gdn_cp,
+        "has_gdn_cp_kernel",
+        lambda name, _arch: name not in _ROW_SPLIT_CTAS,
+    )
+    assert (
+        _sm107_plan(monkeypatch, (16384,), 16, 212).fixup_kernel
+        == "state_fixup_simt_row4_mb3"
+    )
+    assert (
+        _sm107_plan(monkeypatch, (16384,), 8, 212).fixup_kernel
+        == "state_fixup_simt_row4"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="requires an SM107a GPU",
+)
+@pytest.mark.parametrize(
+    ("name", "heads", "seq_lens", "chunk_len"),
+    [
+        ("state_fixup_simt_row3_sb2", 4, (4096,), 512),
+        ("state_fixup_simt_row3_sb2", 3, (1000, 1, 2000, 0, 640), 256),
+        ("state_fixup_simt_row5_mb3", 16, (4096, 4096), 1024),
+        ("state_fixup_simt_row5_mb3", 16, (6144, 2048), 1024),
+        ("state_fixup_simt_row10_sb2", 32, (8192,), 1024),
+        ("state_fixup_simt_row10_sb2", 2, (128, 128, 129), 128),
+        # Odd and even chunk counts: a two-buffer build's final state is in
+        # buffer num_chunks & 1, also when its rows divide 128 (8 rows).
+        ("state_fixup_simt_row7_sb2_mb3", 22, (3072,), 1024),
+        ("state_fixup_simt_row7_sb2_mb3", 11, (4096, 4096), 1024),
+        ("state_fixup_simt_row8_sb2_mb3", 24, (3072,), 1024),
+        ("state_fixup_simt_row8_sb2_mb3", 12, (4096, 4096), 1024),
+        ("state_fixup_simt_row8_sb2_mb3", 3, (1000, 1, 2000, 0, 640), 256),
+        ("state_fixup_simt_row8_mb3", 26, (3072,), 1024),
+        ("state_fixup_simt_row8_mb3", 13, (6144, 2048), 1024),
+        ("state_fixup_simt_row10_mb3", 48, (8192,), 1024),
+        ("state_fixup_simt_row10_mb3", 2, (128, 128, 129), 128),
+    ],
+)
+def test_sm107_row_split_fixups_match_the_four_row_build_bitwise(
+    name: str, heads: int, seq_lens: tuple[int, ...], chunk_len: int
+) -> None:
+    num_seqs, total = len(seq_lens), sum(seq_lens)
+    bounded = min(num_seqs, total)
+    total_cp_chunks = bounded + (total - bounded) // chunk_len
+    gen = torch.Generator(device="cuda").manual_seed(8457)
+    chunks = (total_cp_chunks, heads, 128, 128)
+    transfer = (torch.rand(chunks, generator=gen, device="cuda") - 0.5) / 8
+    local = torch.rand(chunks, generator=gen, device="cuda") * 2 - 1
+    initial = (
+        torch.rand((num_seqs, heads, 128, 128), generator=gen, device="cuda") * 2 - 1
+    )
+    cu = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    results = []
+    for kind, row_ctas in (
+        ("state_fixup_simt_row4", 32),
+        (name, _ROW_SPLIT_CTAS[name]),
+    ):
+        workspace = torch.full_like(initial, float("nan"))
+        fixed = torch.full_like(local, float("nan"))
+        output = torch.full_like(initial, float("nan"))
+        gdn_cp_jit.load_gdn_cp_kernel(kind, "sm_107a")(
+            transfer,
+            local,
+            initial,
+            workspace,
+            fixed,
+            output,
+            cu,
+            chunk_len,
+            total_cp_chunks,
+            num_seqs,
+            heads,
+            num_seqs * heads * row_ctas,
+            1,
+            1,
+        )
+        torch.cuda.synchronize()
+        results.append((workspace, fixed, output))
+    for base, split in zip(results[0], results[1], strict=True):
+        assert torch.equal(base.view(torch.int32), split.view(torch.int32))
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
 @pytest.mark.parametrize("output_final_state", [False, True])
 def test_alpha_absent_requires_output_and_requested_final_state_recurrences(
+    arch: str,
     io_dtype: torch.dtype,
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
@@ -515,6 +719,7 @@ def test_alpha_absent_requires_output_and_requested_final_state_recurrences(
             alpha_was_none=True,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             output_final_state=output_final_state,
+            arch=arch,
         )
     )
 
@@ -524,10 +729,12 @@ def test_alpha_absent_requires_output_and_requested_final_state_recurrences(
     assert use_block64 == 0
 
 
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
 @pytest.mark.parametrize("output_final_state", [False, True])
-def test_explicit_alpha_recomputes_requested_bf16_final_state(
+def test_explicit_alpha_runs_no_bf16_repair_on_the_native_arches(
+    arch: str,
     io_dtype: torch.dtype,
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
@@ -538,17 +745,21 @@ def test_explicit_alpha_recomputes_requested_bf16_final_state(
             alpha_was_none=False,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             output_final_state=output_final_state,
+            arch=arch,
         )
     )
 
+    # Native BF16 on sm_100a/sm_103a/sm_107a: the I/O dtype selects no
+    # recurrence on any shipped architecture.
+    assert gdn_cp._NATIVE_BF16_ARCHES == ("sm_100a", "sm_103a", "sm_107a")
+    repair = io_dtype == torch.bfloat16 and arch not in gdn_cp._NATIVE_BF16_ARCHES
+    assert repair is False
     assert needs_final_state is (
-        output_final_state and (use_qk_l2norm_in_kernel or io_dtype == torch.bfloat16)
+        output_final_state and (use_qk_l2norm_in_kernel or repair)
     )
-    assert needs_output is (io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel)
+    assert needs_output is (repair and not use_qk_l2norm_in_kernel)
     assert normalize_qk == int(use_qk_l2norm_in_kernel)
-    assert use_block64 == int(
-        io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
-    )
+    assert use_block64 == int(repair and not use_qk_l2norm_in_kernel)
 
 
 def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
@@ -565,6 +776,8 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
         checkpoint_count=0,
         cp_chunk_len=64,
         source_cp_chunk_len=64,
+        cu_seqlens_dtype=torch.int64,
+        host_stages_cu_seqlens=False,
         t_grid=(1, 1, 1),
         cp_grid=(1, 1, 1),
         fixup_grid=(1, 1, 1),
@@ -602,6 +815,7 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
     prepared._mn = lambda *_args: None
     prepared._fixup = lambda *_args: None
     prepared._prefill = lambda *_args: None
+    prepared._prefill_divisors = ()
     recurrence_calls: dict[str, tuple[object, ...]] = {}
     prepared._final_state_recurrence = lambda *args: recurrence_calls.__setitem__(
         "final", args
@@ -619,6 +833,443 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
     assert output[10:14] == (0, 1, 0, 0)
     assert final[14:18] == output[14:18] == (32, 16, 32, 32)
     assert final[18:] == output[18:] == (32, 2, 1)
+
+
+def _cu32_arches_only(name: str, arch: str) -> bool:
+    """Registry stand-in: the FP16 and BF16 cu32 Stage-1 programs ship for
+    sm_100a, sm_103a and sm_107a."""
+
+    return name.endswith("_cu32") and arch in ("sm_100a", "sm_103a", "sm_107a")
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("name", ["t_precompute_cu32", "t_precompute_bf16_cu32"])
+def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
+    assert _cu32_arches_only(name, arch) is gdn_cp_jit.has_gdn_cp_kernel(name, arch)
+
+
+@pytest.mark.parametrize(
+    (
+        "arch",
+        "io_dtype",
+        "heads",
+        "seq_lens",
+        "max_seqlen",
+        "cu_dtype",
+        "expected_t",
+        "host_stages",
+    ),
+    [
+        # GB300 fp16 Hk16 class: int32 prefix sums select the cu32 program ...
+        (
+            "sm_103a",
+            torch.float16,
+            (16, 16, 64),
+            (1536, 257),
+            1536,
+            torch.int32,
+            "t_precompute_cu32",
+            False,
+        ),
+        # ... and int64 keeps the plain Stage-1 program.
+        (
+            "sm_103a",
+            torch.float16,
+            (16, 16, 64),
+            (1536, 257),
+            1536,
+            torch.int64,
+            "t_precompute",
+            False,
+        ),
+        (
+            "sm_100a",
+            torch.bfloat16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int32,
+            "t_precompute_bf16_cu32",
+            False,
+        ),
+        (
+            "sm_100a",
+            torch.bfloat16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int64,
+            "t_precompute_bf16",
+            False,
+        ),
+        # sm_107a ships the BF16 and the FP16 cu32 programs.
+        (
+            "sm_107a",
+            torch.bfloat16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int32,
+            "t_precompute_bf16_cu32",
+            False,
+        ),
+        (
+            "sm_107a",
+            torch.float16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int32,
+            "t_precompute_cu32",
+            False,
+        ),
+        # Stage 1 does not run for an all-empty batch: the host casts once per launch.
+        (
+            "sm_100a",
+            torch.float16,
+            (1, 1, 1),
+            (0, 0, 0),
+            0,
+            torch.int32,
+            "t_precompute",
+            True,
+        ),
+        (
+            "sm_100a",
+            torch.float16,
+            (1, 1, 1),
+            (0, 0, 0),
+            0,
+            torch.int64,
+            "t_precompute",
+            False,
+        ),
+    ],
+)
+def test_build_plan_selects_cu32_only_for_int32_where_shipped(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: str,
+    io_dtype: torch.dtype,
+    heads: tuple[int, int, int],
+    seq_lens: tuple[int, ...],
+    max_seqlen: int,
+    cu_dtype: torch.dtype,
+    expected_t: str,
+    host_stages: bool,
+) -> None:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: arch)
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=148),
+    )
+    monkeypatch.setattr(gdn_cp, "has_gdn_cp_kernel", _cu32_arches_only)
+    hq, hk, hv = heads
+    total = sum(seq_lens)
+    q = SimpleNamespace(
+        shape=(total, hq, 128), device=SimpleNamespace(), dtype=io_dtype
+    )
+    k = SimpleNamespace(shape=(total, hk, 128))
+    v = SimpleNamespace(shape=(total, hv, 128))
+    plan = gdn_cp._build_plan(
+        q,
+        k,
+        v,
+        num_seqs=len(seq_lens),
+        max_seqlen=max_seqlen,
+        cu_seqlens_dtype=cu_dtype,
+    )
+    assert plan.t_kernel == expected_t
+    assert plan.cu_seqlens_dtype == cu_dtype
+    assert plan.host_stages_cu_seqlens is host_stages
+    # The default keeps today's int64 plan.
+    default = gdn_cp._build_plan(q, k, v, num_seqs=len(seq_lens), max_seqlen=max_seqlen)
+    assert default.cu_seqlens_dtype == torch.int64
+    assert default.host_stages_cu_seqlens is False
+    with pytest.raises(TypeError):
+        gdn_cp._build_plan(
+            q,
+            k,
+            v,
+            num_seqs=len(seq_lens),
+            max_seqlen=max_seqlen,
+            cu_seqlens_dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("arch", "name"),
+    [
+        ("sm_100a", "t_precompute_cu32"),
+        ("sm_100a", "t_precompute_bf16_cu32"),
+        ("sm_103a", "t_precompute_cu32"),
+        ("sm_103a", "t_precompute_bf16_cu32"),
+        ("sm_107a", "t_precompute_cu32"),
+        ("sm_107a", "t_precompute_bf16_cu32"),
+    ],
+)
+def test_cu32_stage1_registry_arg_plan_matches_the_host_call(
+    arch: str, name: str
+) -> None:
+    if not gdn_cp_jit.has_gdn_cp_kernel(name, arch):
+        pytest.skip(
+            f"{name} for {arch} is integrated into the registry by the Cake export"
+        )
+    record = gdn_cp_jit.MODULES[gdn_cp_jit.program_for(name, arch)]
+    assert [list(entry) for entry in record["arg_plan"]] == [
+        ["tma_buffer", "K"],
+        ["buffer", "beta"],
+        ["buffer", "t"],
+        ["buffer", "cu_seqlens"],
+        ["buffer", "cu_seqlens_i64"],
+        ["parameter", "num_k_heads"],
+        ["parameter", "num_sab_heads"],
+        ["parameter", "total_t_blocks"],
+        ["parameter", "num_seqs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ]
+
+
+class _CopyRecorder:
+    """Stands in for a prefix-sum tensor and records host ``copy_`` calls."""
+
+    def __init__(self) -> None:
+        self.copies: list[object] = []
+
+    def copy_(self, source: object) -> "_CopyRecorder":
+        self.copies.append(source)
+        return self
+
+
+def _fake_prepared(
+    *,
+    cu_seqlens_dtype: torch.dtype,
+    host_stages_cu_seqlens: bool,
+    total_tokens: int,
+    cu_seqlens_input: object,
+    cu_seqlens: object,
+    checkpoint_count: int = 0,
+    checkpoint_cu_starts: torch.Tensor | None = None,
+) -> tuple[gdn_cp.GDNCPPrefill, list[tuple[object, ...]]]:
+    prepared = object.__new__(gdn_cp.GDNCPPrefill)
+    prepared.plan = SimpleNamespace(
+        total_tokens=total_tokens,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=16,
+        num_sab_heads=16,
+        total_t_blocks=10,
+        total_cp_chunks=5,
+        num_seqs=2,
+        checkpoint_count=checkpoint_count,
+        cp_chunk_len=128,
+        source_cp_chunk_len=128,
+        cu_seqlens_dtype=cu_seqlens_dtype,
+        host_stages_cu_seqlens=host_stages_cu_seqlens,
+        t_grid=(80, 2, 1),
+        cp_grid=(1, 1, 1),
+        fixup_grid=(1, 1, 1),
+    )
+    for name in (
+        "q",
+        "k",
+        "v",
+        "alpha",
+        "beta",
+        "initial_state",
+        "output_state_workspace",
+        "output",
+        "q_normalized",
+        "k_normalized",
+        "t",
+        "local_transfer",
+        "local_state",
+        "fixed_state",
+        "initial_state_workspace",
+        "tensormap_workspace",
+    ):
+        setattr(prepared, name, object())
+    prepared.cu_seqlens_input = cu_seqlens_input
+    prepared.cu_seqlens = cu_seqlens
+    prepared.checkpoint_cu_starts = checkpoint_cu_starts
+    prepared.checkpoint_indices = None
+    prepared.scale = 0.125
+    prepared._qk_norm = None
+    prepared._gather = None
+    prepared._checkpoint = None
+    prepared._scatter = None
+    prepared._final_state_recurrence = None
+    prepared._output_recurrence = None
+    t_calls: list[tuple[object, ...]] = []
+    prepared._t = lambda *args: t_calls.append(args)
+    prepared._mn = lambda *_args: None
+    prepared._fixup = lambda *_args: None
+    prepared._prefill = lambda *_args: None
+    prepared._prefill_divisors = ()
+    return prepared, t_calls
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_prefill_divisors_are_the_sm107a_bf16_stage4_programs(arch: str) -> None:
+    names = sorted(k for k in gdn_cp_jit.KERNELS[arch] if k.startswith("cp_prefill"))
+    assert {"cp_prefill", "cp_prefill_bf16", "cp_prefill_generic_bf16"} <= set(names)
+    for name in names:
+        expected = (
+            ("cp_chunk_len_fdd", "num_sab_heads_fdd")
+            if arch == "sm_107a"
+            and name in ("cp_prefill_bf16", "cp_prefill_generic_bf16")
+            else ()
+        )
+        assert gdn_cp._prefill_divisors(name, arch) == expected, (arch, name)
+
+
+@pytest.mark.parametrize("divisors", [(), ("cp_chunk_len_fdd", "num_sab_heads_fdd")])
+def test_direct_launch_passes_the_stage4_fast_divisors(
+    divisors: tuple[str, ...],
+) -> None:
+    prepared, _ = _fake_prepared(
+        cu_seqlens_dtype=torch.int64,
+        host_stages_cu_seqlens=False,
+        total_tokens=1024,
+        cu_seqlens_input=_CopyRecorder(),
+        cu_seqlens=_CopyRecorder(),
+    )
+    prefill_calls: list[tuple[object, ...]] = []
+    prepared._prefill = lambda *args: prefill_calls.append(args)
+    prepared._prefill_divisors = divisors
+
+    prepared._launch_direct()
+
+    (args,) = prefill_calls
+    # cp_chunk_len, source_cp_chunk_len, Hq, Hk, Hv, Hsab, the divisors' values,
+    # scale, grid.
+    values = (128, 16)[: len(divisors)]
+    assert args[10:16] == (128, 128, 2, 2, 16, 16)
+    assert args[16:-4] == values
+    assert args[-4:] == (0.125, 1, 1, 1)
+
+
+def test_direct_launch_int32_lets_stage1_publish_the_int64_prefix() -> None:
+    cu_input = _CopyRecorder()
+    owned = _CopyRecorder()
+    prepared, t_calls = _fake_prepared(
+        cu_seqlens_dtype=torch.int32,
+        host_stages_cu_seqlens=False,
+        total_tokens=1024,
+        cu_seqlens_input=cu_input,
+        cu_seqlens=owned,
+    )
+
+    prepared._launch_direct()
+
+    assert owned.copies == [] and cu_input.copies == []
+    assert len(t_calls) == 1
+    (call,) = t_calls
+    assert len(call) == 12
+    assert call[3] is cu_input
+    assert call[4] is owned
+    assert call[5:9] == (2, 16, 10, 2)
+    assert call[9:] == (80, 2, 1)
+
+
+def test_direct_launch_int32_without_stage1_casts_on_the_host() -> None:
+    cu_input = _CopyRecorder()
+    owned = _CopyRecorder()
+    prepared, t_calls = _fake_prepared(
+        cu_seqlens_dtype=torch.int32,
+        host_stages_cu_seqlens=True,
+        total_tokens=0,
+        cu_seqlens_input=cu_input,
+        cu_seqlens=owned,
+    )
+
+    prepared._launch_direct()
+
+    assert owned.copies == [cu_input]
+    assert t_calls == []
+
+
+def test_direct_launch_int64_binds_the_caller_prefix_without_a_copy() -> None:
+    cu_input = _CopyRecorder()
+    prepared, t_calls = _fake_prepared(
+        cu_seqlens_dtype=torch.int64,
+        host_stages_cu_seqlens=False,
+        total_tokens=1024,
+        cu_seqlens_input=cu_input,
+        cu_seqlens=cu_input,
+    )
+
+    prepared._launch_direct()
+
+    assert cu_input.copies == []
+    assert prepared.cu_seqlens is cu_input
+    assert len(t_calls) == 1
+    (call,) = t_calls
+    assert len(call) == 11
+    assert call[3] is cu_input
+    assert call[4:8] == (2, 16, 10, 2)
+
+
+def test_direct_launch_checkpoint_indices_read_the_caller_prefix() -> None:
+    starts = torch.tensor([0, 2, 5], dtype=torch.int32)
+    results = {}
+    for cu_dtype in (torch.int32, torch.int64):
+        cu_input = torch.tensor([0, 256, 640], dtype=cu_dtype)
+        owned = _CopyRecorder()
+        prepared, t_calls = _fake_prepared(
+            cu_seqlens_dtype=cu_dtype,
+            host_stages_cu_seqlens=False,
+            total_tokens=640,
+            cu_seqlens_input=cu_input,
+            cu_seqlens=owned if cu_dtype == torch.int32 else cu_input,
+            checkpoint_count=5,
+            checkpoint_cu_starts=starts,
+        )
+        prepared._launch_direct()
+        assert owned.copies == []
+        assert prepared.checkpoint_indices.dtype == torch.int64
+        results[cu_dtype] = prepared.checkpoint_indices.tolist()
+        assert len(t_calls) == 1
+        assert len(t_calls[0]) == (12 if cu_dtype == torch.int32 else 11)
+        assert t_calls[0][3] is cu_input
+    assert results[torch.int32] == results[torch.int64] == [0, 1, 2, 3, 4]
+
+
+def test_launch_with_bindings_validates_cu_seqlens_before_any_launch() -> None:
+    prepared = object.__new__(gdn_cp.GDNCPPrefill)
+    prepared.plan = SimpleNamespace(cu_seqlens_dtype=torch.int32, num_seqs=2)
+    prepared._graph = None
+    launches: list[str] = []
+    prepared._launch_direct = lambda: launches.append("direct")
+    q = torch.zeros((1,))
+
+    def launch(cu_seqlens: torch.Tensor) -> None:
+        prepared.launch_with_bindings(
+            q=q,
+            k=q,
+            v=q,
+            alpha=None,
+            beta=None,
+            initial_state=None,
+            output=q,
+            output_state=None,
+            state_checkpoints=None,
+            cu_seqlens=cu_seqlens,
+            state_indices=None,
+            checkpoint_cu_starts=None,
+        )
+
+    with pytest.raises(TypeError, match="prepared dtype"):
+        launch(torch.tensor([0, 1, 2], dtype=torch.int64))
+    with pytest.raises(ValueError, match="shape"):
+        launch(torch.tensor([0, 1, 2, 3], dtype=torch.int32))
+    with pytest.raises(ValueError, match="contiguous"):
+        launch(torch.arange(6, dtype=torch.int32)[::2])
+    with pytest.raises(ValueError, match="device"):
+        launch(torch.empty((3,), dtype=torch.int32, device="meta"))
+    assert launches == []
 
 
 def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
@@ -719,6 +1370,7 @@ def test_direct_binding_refreshes_unnormalized_qk_aliases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prepared = object.__new__(gdn_cp.GDNCPPrefill)
+    prepared.plan = SimpleNamespace(cu_seqlens_dtype=torch.int64, num_seqs=1)
     prepared._graph = None
     prepared._stream = SimpleNamespace(cuda_stream=7)
     prepared._qk_norm = None
@@ -1228,8 +1880,10 @@ def test_explicit_cake_backend_uses_cp_only_when_requested(
     ("capability", "backend"),
     [((10, 0), "cake_gdn"), ((10, 0), "flashinfer"), ((12, 0), "flashinfer")],
 )
-@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 5), (11, 11)])
-def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
+# Without a hint CP falls back to the packed length, the only bound that
+# holds for every batch.
+@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 17), (11, 11)])
+def test_public_dispatch_forwards_max_seqlen_or_packed_length_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capability: tuple[int, int],
     backend: str,
@@ -1478,7 +2132,8 @@ def test_explicit_cake_cp_rejects_unsupported_domain_without_fallback(
     unsupported: str,
 ) -> None:
     calls: list[str] = []
-    capability = (10, 7) if unsupported == "architecture" else (10, 3)
+    # Compute capability 10.7 joined the Cake CP domain; 12.0 stays outside it.
+    capability = (12, 0) if unsupported == "architecture" else (10, 3)
     monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 152)
     monkeypatch.setattr(
         gdn_prefill, "get_compute_capability", lambda _device: capability
@@ -1604,19 +2259,22 @@ def test_public_dispatch_rejects_impossible_max_seqlen_without_cuda_reads(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="requires the generated SM103a route",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 3), (10, 7)),
+    reason="requires the generated SM103a or SM107a route",
 )
+@pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_seqs", [1, 8])
 def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
-    dtype: torch.dtype, num_seqs: int
+    dtype: torch.dtype, num_seqs: int, cu_dtype: torch.dtype
 ) -> None:
     # Sixteen parallel states exercise UTCMMA64; 128 exercise UTCMMA128.
     # Preparing a second graph must not replace the first graph's descriptors.
     total, hq, hv, dim = num_seqs * 512, 2, 16, 128
     prepared_graphs = []
     expected = []
+    prefixes = []
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     for seed, stream in enumerate(streams, start=4539):
         with torch.cuda.stream(stream):
@@ -1628,9 +2286,8 @@ def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
             v = torch.randn((total, hv, dim), dtype=dtype, device="cuda")
             alpha = 1.0 - torch.rand((total, hv), device="cuda") / total
             beta = torch.rand((total, hv), device="cuda").sigmoid()
-            cu_seqlens = torch.arange(
-                0, total + 1, 512, dtype=torch.int64, device="cuda"
-            )
+            cu_seqlens = torch.arange(0, total + 1, 512, dtype=cu_dtype, device="cuda")
+            prefixes.append(cu_seqlens)
             state = torch.randn((num_seqs, hv, dim, dim), device="cuda")
             prepared = gdn_cp.prepare_gdn_cp_prefill(
                 q, k, v, alpha, beta, cu_seqlens, state, max_seqlen=512
@@ -1649,13 +2306,22 @@ def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
     for prepared, (output, state) in zip(prepared_graphs, expected, strict=True):
         _assert_oracle_close(prepared.output, output)
         _assert_oracle_close(prepared.final_state, state)
+    for prepared, cu_seqlens in zip(prepared_graphs, prefixes, strict=True):
+        # int64 is bound by address; int32 is published into the owned int64 buffer.
+        assert torch.equal(prepared.cu_seqlens, cu_seqlens.to(torch.int64))
+        assert prepared.cu_seqlens.dtype == torch.int64
+        if cu_dtype == torch.int64:
+            assert prepared.cu_seqlens is cu_seqlens
+        else:
+            assert prepared.cu_seqlens is not cu_seqlens
+            assert cu_seqlens.dtype == torch.int32
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an exact SM100a or SM103a GPU",
+    reason="requires an exact SM100a, SM103a or SM107a GPU",
 )
 @pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
 def test_public_cuda_graph_reads_updated_sequence_boundaries(
@@ -1740,9 +2406,9 @@ def test_public_cuda_graph_reads_updated_sequence_boundaries(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an exact SM100a or SM103a GPU",
+    reason="requires an exact SM100a, SM103a or SM107a GPU",
 )
 @pytest.mark.parametrize(
     ("total", "hq", "hv"),
@@ -1753,10 +2419,12 @@ def test_public_cuda_graph_reads_updated_sequence_boundaries(
         (65536, 32, 32),
     ],
 )
+@pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64])
 def test_frozen_graph_matches_reference_and_preserves_inputs(
     total: int,
     hq: int,
     hv: int,
+    cu_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(4078 + hq * 100 + hv)
     device = torch.device("cuda")
@@ -1771,7 +2439,8 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
     v = torch.randn((total, hv, dim), dtype=torch.float16, device=device)
     alpha = 1.0 - torch.rand((total, hv), dtype=torch.float32, device=device) / total
     beta = torch.rand((total, hv), dtype=torch.float32, device=device).sigmoid()
-    cu_seqlens = torch.tensor([0, total], dtype=torch.int64, device=device)
+    cu_seqlens = torch.tensor([0, total], dtype=cu_dtype, device=device)
+    reference_cu_seqlens = cu_seqlens.to(torch.int64)
     initial_state = torch.randn((1, hv, dim, dim), dtype=torch.float32, device=device)
     output_state = torch.empty_like(initial_state)
     snapshots = tuple(
@@ -1793,7 +2462,7 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
             v,
             alpha,
             beta,
-            cu_seqlens,
+            reference_cu_seqlens,
             1.0 / dim**0.5,
             initial_state=initial_state,
             max_seqlen=total,
@@ -1841,17 +2510,144 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
         (q, k, v, alpha, beta, cu_seqlens, initial_state), snapshots, strict=True
     ):
         assert torch.equal(observed, before)
+    assert torch.equal(prepared.cu_seqlens, reference_cu_seqlens)
+    assert (prepared.cu_seqlens is cu_seqlens) == (cu_dtype == torch.int64)
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an exact SM100a or SM103a GPU",
+    reason="requires an exact SM100a, SM103a or SM107a GPU",
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
+    dtype: torch.dtype,
+) -> None:
+    """int32 and int64 prefix sums both run T, MN, fixup, prefill and no cast kernel
+    where the architecture ships the cu32 Stage-1 program; without it (FP16 on
+    sm_107a) the int32 prefix sums add the host's one cast kernel."""
+
+    torch.manual_seed(4545)
+    num_seqs, hq, hv, dim = 2, 2, 16, 128
+    total = num_seqs * 512
+    q = torch.randn((total, hq, dim), dtype=dtype, device="cuda")
+    k = torch.nn.functional.normalize(
+        torch.randn((total, hq, dim), device="cuda"), dim=-1
+    ).to(dtype)
+    v = torch.randn((total, hv, dim), dtype=dtype, device="cuda")
+    alpha = 1.0 - torch.rand((total, hv), device="cuda") / total
+    beta = torch.rand((total, hv), device="cuda").sigmoid()
+    state = torch.randn((num_seqs, hv, dim, dim), device="cuda")
+    prefix = torch.arange(0, total + 1, 512, dtype=torch.int64, device="cuda")
+    outputs = {}
+    for cu_dtype in (torch.int32, torch.int64):
+        cu_seqlens = prefix.to(cu_dtype)
+        prepared = gdn_cp.prepare_gdn_cp_prefill(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens,
+            state,
+            max_seqlen=512,
+            _capture_graph=False,
+        )
+        torch.cuda.synchronize()
+        replays = []
+        # every CUDA record of one replay (copies included: the assertion below wants none); the helper retries a
+        # profiler session that lost its device records, so the outputs are the last replay's
+        kernels = cuda_kernel_names(
+            lambda: replays.append(prepared.replay()), exclude=()
+        )
+        output, final_state = replays[-1]
+        expected_t = f"t_precompute{'_bf16' if dtype == torch.bfloat16 else ''}"
+        ships_cu32 = gdn_cp_jit.has_gdn_cp_kernel(
+            f"{expected_t}_cu32", prepared.plan.arch
+        )
+        host_cast = cu_dtype == torch.int32 and not ships_cu32
+        copies = [name for name in kernels if "copy" in name.lower()]
+        assert len(kernels) == 4 + len(copies), kernels
+        assert len(copies) == int(host_cast), kernels
+        if cu_dtype == torch.int32 and ships_cu32:
+            assert prepared.plan.t_kernel == f"{expected_t}_cu32"
+            assert prepared.plan.host_stages_cu_seqlens is False
+        elif cu_dtype == torch.int32:
+            assert prepared.plan.t_kernel == expected_t
+            assert prepared.plan.host_stages_cu_seqlens is True
+        else:
+            assert prepared.plan.t_kernel == expected_t
+            assert prepared.cu_seqlens is cu_seqlens
+        assert torch.equal(prepared.cu_seqlens, prefix)
+        assert torch.equal(cu_seqlens, prefix.to(cu_dtype))
+        outputs[cu_dtype] = (output.clone(), final_state.clone())
+    assert torch.equal(outputs[torch.int32][0], outputs[torch.int64][0])
+    assert torch.equal(outputs[torch.int32][1], outputs[torch.int64][1])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
+    or not is_sm100a_supported(torch.device("cuda")),
+    reason="requires an exact SM100a, SM103a or SM107a GPU",
+)
+def test_checkpoint_row_launches_no_extra_cast_kernel_for_int32_prefix() -> None:
+    torch.manual_seed(4546)
+    seq_lens = (128, 256)
+    interval = 128
+    total = sum(seq_lens)
+    hq, hk, hv = 4, 1, 1
+    # Gates, output and state carry max(hq, hv) heads (the host's gate_shape).
+    state_heads = max(hq, hv)
+    q = torch.randn((total, hq, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.nn.functional.normalize(
+        torch.randn((total, hk, 128), device="cuda"), dim=-1
+    ).to(torch.bfloat16)
+    v = torch.randn((total, hv, 128), dtype=torch.bfloat16, device="cuda")
+    alpha = torch.rand((total, state_heads), device="cuda")
+    beta = torch.rand((total, state_heads), device="cuda")
+    checkpoint_cu_starts = torch.tensor([0, 1, 3], dtype=torch.int64, device="cuda")
+    counts = {}
+    for cu_dtype in (torch.int32, torch.int64):
+        cu_seqlens = torch.tensor([0, 128, total], dtype=cu_dtype, device="cuda")
+        checkpoints = torch.empty(
+            (3, state_heads, 128, 128), dtype=torch.float32, device="cuda"
+        )
+        prepared = gdn_cp.prepare_gdn_cp_prefill(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens,
+            None,
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=interval,
+            cp_chunk_len=interval,
+            max_seqlen=max(seq_lens),
+            _capture_graph=False,
+        )
+        torch.cuda.synchronize()
+        kernels = cuda_kernel_names(prepared.replay, exclude=())
+        assert not any("copy" in name.lower() for name in kernels), kernels
+        counts[cu_dtype] = len(kernels)
+        assert prepared.plan.checkpoint_count == 3
+    assert counts[torch.int32] == counts[torch.int64], counts
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
+    or not is_sm100a_supported(torch.device("cuda")),
+    reason="requires an exact SM100a, SM103a or SM107a GPU",
+)
+@pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
 def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph(
     metadata_dtype: torch.dtype,
+    cu_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(4436)
     seq_lens = (128, 256)
@@ -1868,7 +2664,7 @@ def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph(
     v = torch.randn((total, hv, 128), dtype=torch.bfloat16, device="cuda")
     alpha = torch.rand((total, state_heads), dtype=torch.float32, device="cuda")
     beta = torch.rand((total, state_heads), dtype=torch.float32, device="cuda")
-    cu_seqlens = torch.tensor([0, 128, total], dtype=torch.int64, device="cuda")
+    cu_seqlens = torch.tensor([0, 128, total], dtype=cu_dtype, device="cuda")
     checkpoint_cu_starts = torch.tensor([0, 1, 3], dtype=metadata_dtype, device="cuda")
     output = torch.empty((total, state_heads, 128), dtype=q.dtype, device="cuda")
     output_state = torch.empty(
@@ -2004,10 +2800,10 @@ def _allocate_state_pool(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda"))
     or _cuda_major() < 13,
-    reason="requires an exact SM100a or SM103a GPU with CUDA 13",
+    reason="requires an exact SM100a, SM103a or SM107a GPU with CUDA 13",
 )
 @pytest.mark.parametrize(
     "case",
@@ -2259,15 +3055,16 @@ def test_structurally_supported_public_route_uses_generated_state_and_lifecycle(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda"))
     or _cuda_major() < 13,
-    reason="requires an exact SM100a or SM103a GPU with CUDA 13",
+    reason="requires an exact SM100a, SM103a or SM107a GPU with CUDA 13",
 )
 @pytest.mark.parametrize(
     ("seq_lens", "cu_dtype"),
     [
         ((0, 0, 0), torch.int64),
+        ((0, 0, 0), torch.int32),
         ((0, 64, 0), torch.int32),
     ],
 )
@@ -2391,10 +3188,10 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda"))
     or _cuda_major() < 13,
-    reason="requires an exact SM100a or SM103a GPU with CUDA 13",
+    reason="requires an exact SM100a, SM103a or SM107a GPU with CUDA 13",
 )
 def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
@@ -2516,3 +3313,464 @@ def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
     for row in range(candidate_state.shape[0]):
         if row not in selected:
             assert torch.equal(candidate_state[row], state_before[row])
+
+
+@pytest.mark.parametrize(
+    ("heads", "max_seqlen", "expected_chunk"),
+    [
+        (32, 65536, 11264),
+        (32, 32768, 5120),
+        (32, 16384, 2560),
+        (32, 8192, 1536),
+        (48, 65536, 16384),
+        (48, 32768, 8192),
+        (48, 16384, 4096),
+        (48, 8192, 2048),
+        (16, 65536, 5120),
+        (8, 65536, 2560),
+    ],
+)
+def test_sm107_physical_plan_avoids_a_long_second_wave(
+    monkeypatch: pytest.MonkeyPatch, heads: int, max_seqlen: int, expected_chunk: int
+) -> None:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_107a")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=212),
+    )
+    q = SimpleNamespace(
+        shape=(max_seqlen, heads, 128), device=SimpleNamespace(), dtype=torch.float16
+    )
+    k = SimpleNamespace(shape=(max_seqlen, heads, 128))
+    v = SimpleNamespace(shape=(max_seqlen, heads, 128))
+    plan = gdn_cp._build_plan(q, k, v, num_seqs=1, max_seqlen=max_seqlen)
+    assert plan.cp_chunk_len == expected_chunk
+    chunks = gdn_cp._ceil_div(max_seqlen, plan.cp_chunk_len)
+    tail = max_seqlen - (chunks - 1) * plan.cp_chunk_len
+    # Either the grid fits one wave or the second wave is at most a chunk long.
+    assert heads * chunks <= 212 or 2 * tail <= plan.cp_chunk_len
+
+
+def _physical_chunk_len(num_heads: int, max_seqlen: int, *, num_sms: int) -> int:
+    return gdn_cp._default_physical_chunk_len(
+        source_chunk_len=512,
+        max_seqlen=max_seqlen,
+        total_tokens=max_seqlen,
+        num_seqs=1,
+        num_heads=num_heads,
+        num_sms=num_sms,
+    )
+
+
+def _chunk_ctas(num_heads: int, max_seqlen: int, chunk_len: int) -> int:
+    return num_heads * gdn_cp._bounded_chunks(
+        chunk_len, max_seqlen=max_seqlen, total_tokens=max_seqlen, num_seqs=1
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_sms", "num_heads", "max_seqlen", "expected"),
+    [
+        (148, 32, 16384, 4096),  # 5 x 3584 = 160 CTAs > 148 -> one wave of 4 x 4096
+        (148, 32, 65536, 16384),
+        (148, 64, 65536, 32768),
+        (148, 16, 65536, 7680),  # 10 x 6656 = 160 CTAs -> 9 x 7680 = 144 CTAs
+        (160, 48, 16384, 5632),
+        (212, 32, 65536, 11264),  # the original R200 rule, unchanged
+    ],
+)
+def test_overflowing_ceil_target_falls_back_to_one_wave(
+    num_sms: int, num_heads: int, max_seqlen: int, expected: int
+) -> None:
+    # One-wave overflow rule: it applies on every SM count without
+    # a dedicated wave budget (the 152-SM GB300 keeps its own).
+    chunk_len = _physical_chunk_len(num_heads, max_seqlen, num_sms=num_sms)
+    assert chunk_len == expected
+    assert _chunk_ctas(num_heads, max_seqlen, chunk_len) <= num_sms
+
+
+@pytest.mark.parametrize(
+    ("num_sms", "num_heads", "max_seqlen"),
+    [(148, 16, 16384), (148, 8, 16384), (148, 4, 16384)],
+)
+def test_fitting_ceil_target_is_kept(
+    num_sms: int, num_heads: int, max_seqlen: int
+) -> None:
+    chunk_len = _physical_chunk_len(num_heads, max_seqlen, num_sms=num_sms)
+    assert _chunk_ctas(num_heads, max_seqlen, chunk_len) <= num_sms
+    # The rounded-up target already fits in one wave: the floor fallback must
+    # not fire, so the chunk is the smallest one-wave chunk at the planner's
+    # granularity.
+    smaller = chunk_len - gdn_cp._CHUNK_GRANULARITY
+    assert smaller <= 0 or _chunk_ctas(num_heads, max_seqlen, smaller) > num_sms
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "heads", "max_seqlen", "total_tokens", "expected"),
+    [
+        (1, 8, 4096, 4096, True),
+        (1, 8, 2048, 2048, False),
+        (4, 8, 2048, 8192, False),
+        (2, 8, 4096, 8192, True),
+        (1, 16, 4096, 4096, True),
+        (2, 16, 4096, 8192, False),
+        (2, 16, 6144, 8192, True),
+        (1, 32, 4096, 4096, False),
+        (1, 32, 8192, 8192, True),
+        (1, 32, 65536, 65536, True),
+        (1, 48, 4096, 4096, False),
+        (1, 48, 8192, 8192, False),
+        (1, 48, 16384, 16384, True),
+        (1, 48, 65536, 65536, True),
+    ],
+)
+def test_sm107_auto_band_follows_the_measured_plan(
+    num_seqs: int, heads: int, max_seqlen: int, total_tokens: int, expected: bool
+) -> None:
+    assert (
+        gdn_prefill._cake_gdn_cp_sm107a_plan_pays(
+            num_seqs=num_seqs,
+            num_sab_heads=heads,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+            num_sms=212,
+        )
+        is expected
+    )
+
+
+# R200 rows of the BF16-I/O FP32-state records: (num_seqs, state heads, longest
+# sequence) and whether the non-CP Cake kernel loses to the default route.
+@pytest.mark.parametrize(
+    ("num_seqs", "heads", "max_seqlen", "expected"),
+    [
+        (1, 4, 16384, True),
+        (1, 32, 16384, True),
+        (2, 16, 8192, True),
+        (2, 32, 8192, False),
+        (1, 8, 4096, True),
+        (1, 4, 4096, True),
+        (1, 16, 4096, False),
+        (1, 32, 4096, False),
+        (4, 4, 2048, False),
+        (8, 4, 1024, False),
+        (16, 4, 8192, False),
+        (1, 4, 2048, False),
+    ],
+)
+def test_sm107_fp32_state_fail_closed_band_follows_the_measured_rows(
+    num_seqs: int, heads: int, max_seqlen: int, expected: bool
+) -> None:
+    assert (
+        gdn_prefill._cake_gdn_sm107a_fp32_state_fails_closed(
+            num_seqs=num_seqs, num_sab_heads=heads, max_seqlen=max_seqlen
+        )
+        is expected
+    )
+
+
+def _sm107_fp32_state_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dtype: torch.dtype,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    use_cp: str | bool = "auto",
+    gates: bool = True,
+    use_qk_l2norm_in_kernel: bool = False,
+    head_geometry: tuple[int, int, int] | None = None,
+    cu_seqlens_dtype: torch.dtype = torch.int32,
+    calls: list[str] | None = None,
+) -> list[str]:
+    """Dispatch on a stubbed SM107; ``heads`` are the state heads, and the
+    default geometry is ``(heads // 2, heads // 2, heads)`` (Hq, Hk, Hv).
+    ``calls`` (when given) records the routes taken even if the call raises."""
+
+    calls = [] if calls is None else calls
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 212)
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 7))
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "test GPU")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *_args, **_kwargs: calls.append("gdn_cp"),
+    )
+
+    def cake_non_cp(**kwargs):
+        calls.append("cake_non_cp")
+        return kwargs["output"], kwargs["output_state"]
+
+    monkeypatch.setattr(gdn_prefill, "_run_cake_gdn_prefill", cake_non_cp)
+    tokens = sum(seq_lens)
+    hq, hk, hv = head_geometry or (heads // 2, heads // 2, heads)
+    assert max(hq, hv) == heads
+    q = torch.zeros((tokens, hq, 128), dtype=dtype)
+    k = torch.zeros((tokens, hk, 128), dtype=dtype)
+    v = torch.zeros((tokens, hv, 128), dtype=dtype)
+    gate_values = torch.zeros((tokens, heads), dtype=torch.float32)
+    starts = [0]
+    for length in seq_lens:
+        starts.append(starts[-1] + length)
+    gdn_prefill.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g=gate_values if gates else None,
+        beta=gate_values if gates else None,
+        initial_state=torch.zeros((len(seq_lens), heads, 128, 128)),
+        output_final_state=True,
+        cu_seqlens=torch.tensor(starts, dtype=cu_seqlens_dtype),
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_cp=use_cp,
+        backend="cake_gdn",
+    )
+    return calls
+
+
+def test_sm107_auto_band_keeps_fp16_and_skips_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 1 x 4096 at 16 state heads is in the measured FP16 CP plan; the BF16
+    # single-sequence CP band starts at 8192 tokens for 16 state heads, so BF16
+    # keeps the non-CP Cake kernel there.
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch, dtype=torch.float16, seq_lens=(4096,), heads=16
+    ) == ["gdn_cp"]
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch, dtype=torch.bfloat16, seq_lens=(4096,), heads=16
+    ) == ["cake_non_cp"]
+
+
+# Rows of the BF16-I/O FP32-state single-sequence CP band: head geometry
+# (Hq, Hk, Hv), sequence length and whether the native BF16 Cake CP program
+# serves the call.  The band holds the six measured head geometries up to
+# 65536 tokens, a multiple of 128, with int32 ``cu_seqlens``, inside the
+# fail-closed band.
+@pytest.mark.parametrize(
+    ("geometry", "seqlen", "expected"),
+    [
+        ((2, 2, 4), 4096, True),
+        ((4, 4, 8), 4096, True),
+        ((2, 2, 8), 4096, True),
+        ((4, 4, 8), 4224, True),
+        ((4, 4, 8), 65536, True),
+        ((8, 8, 16), 8192, True),
+        ((4, 4, 16), 8192, True),
+        ((8, 8, 32), 16384, True),
+        ((8, 8, 32), 65536, True),
+        ((2, 2, 4), 4095, False),
+        ((4, 4, 8), 2048, False),
+        ((8, 8, 16), 4096, False),
+        ((8, 8, 16), 8191, False),
+        ((16, 16, 48), 16384, False),
+        # Inside the fail-closed band, but not a measured geometry or length.
+        ((4, 4, 8), 4097, False),
+        ((8, 8, 16), 8193, False),
+        ((8, 8, 32), 65535, False),
+        ((2, 2, 4), 65537, False),
+        ((8, 8, 32), 131072, False),
+        ((16, 16, 32), 16384, False),
+        ((1, 1, 4), 4096, False),
+        ((8, 8, 8), 8192, False),
+        ((8, 2, 2), 8192, False),
+        ((8, 8, 24), 8192, False),
+        ((1, 1, 2), 8192, False),
+        ((1, 1, 1), 8192, False),
+        ((4, 2, 8), 4096, False),
+    ],
+)
+def test_sm107_bf16_single_sequence_cp_band_is_the_measured_geometries(
+    geometry: tuple[int, int, int], seqlen: int, expected: bool
+) -> None:
+    hq, hk, hv = geometry
+    heads = max(hq, hv)
+    state = torch.zeros((1, heads, 128, 128))
+    gates = torch.zeros((seqlen, heads))
+    kwargs = dict(
+        device_capability=(10, 7),
+        io_dtype=torch.bfloat16,
+        cu_seqlens_dtype=torch.int32,
+        num_seqs=1,
+        num_q_heads=hq,
+        num_k_heads=hk,
+        num_v_heads=hv,
+        max_seqlen=seqlen,
+        initial_state=state,
+        output_state=None,
+        output_final_state=True,
+        g=gates,
+        beta=gates,
+        use_qk_l2norm_in_kernel=False,
+        checkpoint_every_n_tokens=0,
+        state_indices=None,
+    )
+    band = gdn_prefill._cake_gdn_cp_sm107a_bf16_single_sequence_band
+    assert band(**kwargs) is expected
+    if not expected:
+        return
+    # The band lies inside the fail-closed band.
+    assert gdn_prefill._cake_gdn_sm107a_fp32_state_fails_closed(
+        num_seqs=1, num_sab_heads=heads, max_seqlen=seqlen
+    )
+    # Every other input of the band's contract leaves it.
+    for change in (
+        {"device_capability": (10, 0)},
+        {"device_capability": (10, 3)},
+        {"io_dtype": torch.float16},
+        {"cu_seqlens_dtype": torch.int64},
+        {"num_seqs": 2},
+        {"initial_state": None},
+        {"initial_state": state.to(torch.bfloat16)},
+        {"output_state": state.to(torch.bfloat16)},
+        {"output_final_state": False},
+        {"g": None},
+        {"beta": None},
+        {"use_qk_l2norm_in_kernel": True},
+        {"checkpoint_every_n_tokens": 64},
+        {"state_indices": torch.zeros((1,), dtype=torch.int32)},
+    ):
+        assert band(**{**kwargs, **change}) is False, change
+    assert band(**{**kwargs, "output_state": state}) is True
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "geometry"),
+    [
+        ((4096,), (4, 4, 8)),
+        ((4224,), (2, 2, 4)),
+        ((6144,), (2, 2, 8)),
+        ((8192,), (8, 8, 16)),
+        ((12288,), (4, 4, 16)),
+        ((16384,), (8, 8, 32)),
+        ((65536,), (8, 8, 16)),
+    ],
+)
+def test_sm107_bf16_fp32_state_single_sequence_enters_cake_cp(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    geometry: tuple[int, int, int],
+) -> None:
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch,
+        dtype=torch.bfloat16,
+        seq_lens=seq_lens,
+        heads=max(geometry[0], geometry[2]),
+        head_geometry=geometry,
+    ) == ["gdn_cp"]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "geometry"),
+    [
+        ((4096,), (4, 4, 8)),
+        ((4224,), (2, 2, 4)),
+        ((6144,), (2, 2, 8)),
+        ((8192,), (8, 8, 16)),
+        ((12288,), (4, 4, 16)),
+        ((16384,), (8, 8, 32)),
+        ((65536,), (8, 8, 16)),
+    ],
+)
+def test_sm107_bf16_fp32_state_int64_cu_seqlens_keeps_failing_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    geometry: tuple[int, int, int],
+) -> None:
+    # A row the band admits with int32 ``cu_seqlens`` but int64 ``cu_seqlens``:
+    # the band holds the measured (int32) rows only, so ``use_cp="auto"`` never
+    # reaches Cake CP and fails closed as before the band; an explicit
+    # ``use_cp=True`` request still runs Cake CP.
+    heads = max(geometry[0], geometry[2])
+    calls: list[str] = []
+    with pytest.raises(gdn_prefill._cake_gdn.CakeGDNUnsupportedError):
+        _sm107_fp32_state_dispatch(
+            monkeypatch,
+            dtype=torch.bfloat16,
+            seq_lens=seq_lens,
+            heads=heads,
+            head_geometry=geometry,
+            cu_seqlens_dtype=torch.int64,
+            calls=calls,
+        )
+    assert calls == []
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch,
+        dtype=torch.bfloat16,
+        seq_lens=seq_lens,
+        heads=heads,
+        head_geometry=geometry,
+        cu_seqlens_dtype=torch.int64,
+        use_cp=True,
+    ) == ["gdn_cp"]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "gates", "use_qk_l2norm_in_kernel", "geometry"),
+    [
+        ((8192, 8192), 16, True, False, None),
+        ((8192, 8192), 8, True, False, None),
+        ((4096, 4096), 4, True, False, None),
+        ((16384, 16), 16, True, False, None),
+        # One sequence without gates (outside the measured contract) keeps
+        # failing closed; caller-normalized Q/K is held by the band test above.
+        ((4096,), 8, False, False, None),
+        # One sequence longer than the measured rows or of an unmeasured head
+        # geometry keeps failing closed.
+        ((65537,), 16, True, False, None),
+        ((4097,), 8, True, False, None),
+        ((8193,), 16, True, False, None),
+        ((65535,), 32, True, False, (8, 8, 32)),
+        ((16384,), 32, True, False, (16, 16, 32)),
+        ((8192,), 8, True, False, (8, 8, 8)),
+        ((8192,), 8, True, False, (8, 2, 2)),
+        ((8192,), 24, True, False, (8, 8, 24)),
+        ((8192,), 2, True, False, (1, 1, 2)),
+        ((4096,), 4, True, False, (1, 1, 4)),
+    ],
+)
+def test_sm107_bf16_fp32_state_fails_closed_in_the_losing_band(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    gates: bool,
+    use_qk_l2norm_in_kernel: bool,
+    geometry: tuple[int, int, int] | None,
+) -> None:
+    with pytest.raises(gdn_prefill._cake_gdn.CakeGDNUnsupportedError):
+        _sm107_fp32_state_dispatch(
+            monkeypatch,
+            dtype=torch.bfloat16,
+            seq_lens=seq_lens,
+            heads=heads,
+            gates=gates,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            head_geometry=geometry,
+        )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "use_cp"),
+    [
+        ((2048,) * 4, 4, "auto"),
+        ((1024,) * 8, 4, "auto"),
+        ((8192, 8192), 32, "auto"),
+        ((4096,), 8, False),
+        ((4096,), 16, "auto"),
+        ((2048,), 4, "auto"),
+    ],
+)
+def test_sm107_bf16_fp32_state_keeps_cake_outside_the_losing_band(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    use_cp: str | bool,
+) -> None:
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch,
+        dtype=torch.bfloat16,
+        seq_lens=seq_lens,
+        heads=heads,
+        use_cp=use_cp,
+    ) == ["cake_non_cp"]

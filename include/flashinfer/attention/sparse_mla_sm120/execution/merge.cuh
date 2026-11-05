@@ -3,6 +3,7 @@
 #pragma once
 
 #include "../arch/common.cuh"
+#include "../common/lse.cuh"
 
 namespace flashinfer::sparse_mla_sm120 {
 
@@ -13,7 +14,7 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
                                         bf16* __restrict__ output, float* __restrict__ out_lse,
                                         const float* __restrict__ attn_sink, int num_tokens,
                                         int num_splits, int num_heads, int mid_heads,
-                                        size_t stride_out_lse) {
+                                        size_t stride_out_lse, float lse_scale) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
   static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
@@ -114,7 +115,7 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
     *reinterpret_cast<uint4*>(out_ptr + dim_base + v * 8) = packed;
   }
   if (out_lse != nullptr && tid == 0) {
-    out_lse[(size_t)t_idx * stride_out_lse + h] = sm_glse;
+    out_lse[(size_t)t_idx * stride_out_lse + h] = scale_output_lse(sm_glse, lse_scale);
   }
 }
 

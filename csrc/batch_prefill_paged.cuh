@@ -15,6 +15,11 @@
  */
 #pragma once
 
+static_assert(PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_RUNTIME ||
+                  PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_EQUAL ||
+                  PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_INDEPENDENT,
+              "Unsupported PAGED_KV_STRIDE_MODE");
+
 void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
                                      TensorView q, TensorView paged_k_cache,
@@ -128,51 +133,49 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
           tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
-          if (plan_info.enable_cuda_graph) {
-            params.block_valid_mask =
-                GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
-          }
         }
         params.padded_batch_size = plan_info.padded_batch_size;
         params.max_total_num_rows = plan_info.total_num_rows;
         if (plan_info.enable_cuda_graph) {
+          params.block_valid_mask =
+              GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
           params.total_num_rows =
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
         }
 
         cudaError_t status = cudaSuccess;
 
-#if PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_RUNTIME
-        DISPATCH_BOOL(kv_strides_are_identical, SAME_KV_STRIDES, [&] {
+        // Preprocessor directives inside macro arguments are not portable to nvcc/MSVC.
+        if constexpr (PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_RUNTIME) {
+          DISPATCH_BOOL(kv_strides_are_identical, SAME_KV_STRIDES, [&] {
+            DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+              status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+                  /*SAME_KV_STRIDES=*/SAME_KV_STRIDES, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
+                  POS_ENCODING_MODE, /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE,
+                  USE_TOKEN_HEAD_SF, AttentionVariant, PagedParams>(params, tmp_v, tmp_s,
+                                                                    enable_pdl, stream);
+            });
+            return true;
+          });
+        } else if constexpr (PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_EQUAL) {
+          TVM_FFI_ICHECK(kv_strides_are_identical)
+              << "The equal-stride FA2 batch-prefill primary requires paged K/V cache data "
+                 "tensors to have identical strides in every dimension; route unequal layouts "
+                 "through the independent paged module.";
           DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
             status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-                /*SAME_KV_STRIDES=*/SAME_KV_STRIDES, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
-                POS_ENCODING_MODE, /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE,
+                /*SAME_KV_STRIDES=*/true, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_TOKEN_HEAD_SF,
                 AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
           });
-          return true;
-        });
-#elif PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_EQUAL
-        TVM_FFI_ICHECK(kv_strides_are_identical)
-            << "The equal-stride FA2 batch-prefill primary requires paged K/V cache data "
-               "tensors to have identical strides in every dimension; route unequal layouts "
-               "through the independent paged module.";
-        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-          status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-              /*SAME_KV_STRIDES=*/true, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
-        });
-#elif PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_INDEPENDENT
-        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-          status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-              /*SAME_KV_STRIDES=*/false, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
-        });
-#else
-#error "Unsupported PAGED_KV_STRIDE_MODE"
-#endif
+        } else if constexpr (PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_INDEPENDENT) {
+          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+            status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+                /*SAME_KV_STRIDES=*/false, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_TOKEN_HEAD_SF,
+                AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          });
+        }
 
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "BatchPrefillWithPagedKVCache failed with error " << cudaGetErrorString(status);

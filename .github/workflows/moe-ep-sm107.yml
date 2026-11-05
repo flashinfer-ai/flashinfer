@@ -1,0 +1,48 @@
+name: SM107 MegaMoE qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'JSON array of labels for an existing Rubin runner'
+        required: true
+        type: string
+      python:
+        description: 'Python executable in the provisioned Rubin environment'
+        default: python3
+        required: true
+        type: string
+      world_size:
+        description: 'Number of GPUs in one NVLink domain'
+        type: choice
+        options: ['2', '4', '8']
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 240
+    env:
+      QUALIFY_PYTHON: ${{ inputs.python }}
+      EP_WORLD_SIZE: ${{ inputs.world_size }}
+      CUTE_DSL_ARCH: sm_107a
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Qualify all three quantization formats
+        run: >-
+          "$QUALIFY_PYTHON" tests/moe_ep/qualify_sm107.py
+          --suite all --world-size "$EP_WORLD_SIZE"
+          --output-dir "$RUNNER_TEMP/sm107-qualification"
+      - name: Preserve qualification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm107-ep${{ inputs.world_size }}
+          path: ${{ runner.temp }}/sm107-qualification
+          if-no-files-found: error

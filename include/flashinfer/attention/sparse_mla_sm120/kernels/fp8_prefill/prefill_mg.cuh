@@ -5,6 +5,7 @@
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
 #include "../../common/d2_load_b.cuh"
+#include "../../common/lse.cuh"
 #include "../../compute/online_softmax.cuh"
 #include "../../compute/q_rope.cuh"
 #include "../../compute/q_stage.cuh"
@@ -21,6 +22,7 @@ using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8_pair;
 using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
 using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
+using flashinfer::sparse_mla_sm120::scale_output_lse;
 using flashinfer::sparse_mla_sm120::pipeline::BulkReady;
 using flashinfer::sparse_mla_sm120::pipeline::RoleSync;
 using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
@@ -842,7 +844,7 @@ __device__ __forceinline__ void prefill_mg_impl(
           lse = -INFINITY;
         }
         size_t lse_idx = (size_t)s_i * cold.out_lse_stride_elems + (h_start + g * HPB + h);
-        out_lse[lse_idx] = lse;
+        out_lse[lse_idx] = scale_output_lse(lse, cold.lse_scale);
       }
 
       if (g < MG_N_HG - 1) bar_sync_t<Fp8PrefillSync::MATH, MATH_THREADS>();

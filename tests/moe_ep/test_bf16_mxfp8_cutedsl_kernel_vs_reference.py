@@ -51,7 +51,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8ScaleDtype,
         autotune_bf16_mxfp8_mega_moe,
         compute_megamoe_reference_bf16_mxfp8,
@@ -131,7 +131,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
             fc2_weight=transformed_l2[0].unsqueeze(0),
             fc2_weight_sf=transformed_l2[1].view(Mxfp8ScaleDtype).unsqueeze(0),
             ref_compute_graph="deepgemm",
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
         y_ref = combine_ref[0].to(torch.float32).sum(dim=1)
         y_kernel = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
@@ -160,7 +160,7 @@ def test_bf16_mxfp8_preprocesses_canonical_prequantized_weights():
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8ScaleDtype,
         mxfp8_quantize_per_block_32,
     )

@@ -132,6 +132,18 @@ except ImportError:  # tests and benchmarks load this file by path, outside the 
         gdn_device_target,
     )
 
+# UMMA (tcgen05 / TMEM) backend of gated_delta_rule_mtp_ucache_flush for SM100: same
+# tensors, ring and flush contract, served for the fp16-state arm (bf16 IO and rings).
+try:
+    from .gdn_replay_mtp_umma import gated_delta_rule_mtp_ucache_flush_umma as _UMMA
+except ImportError:
+    try:
+        from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
+            gated_delta_rule_mtp_ucache_flush_umma as _UMMA,
+        )
+    except ImportError:  # keep the HMMA kernel usable without the UMMA module
+        _UMMA = None
+
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).
 T = 16
@@ -3223,6 +3235,35 @@ def _cached_bf16(t):
     return c
 
 
+def _umma_unavailable_reason(
+    device, T, H, HK, HV, pools_contig, pdl_trigger
+) -> Optional[str]:
+    """None when the UMMA backend can serve this call, else why not (``backend="umma"``
+    raises with it; ``"auto"`` falls back to the HMMA kernel)."""
+    if _UMMA is None:
+        return "flashinfer.gdn_kernels.gdn_replay_mtp_umma could not be imported"
+    if gdn_device_target(device).major != 10:
+        return "needs an SM100-class GPU (tcgen05 / TMEM)"
+    if (
+        torch.bfloat16,
+        torch.float16,
+        torch.bfloat16,
+    ) != (IO_TORCH, ST_TORCH, RING_TORCH):
+        return (
+            "needs the fp16-state arm: bf16 IO and rings with an fp16 state pool "
+            "(GDN_UCACHE_STATE_DTYPE=fp16)"
+        )
+    if not 1 <= T <= 8:
+        return f"T={T} (the UMMA kernel takes 1 <= T <= 8)"
+    if HK != H or HV % H != 0 or not 1 <= HV // H <= 4:
+        return "needs q/k with the same head count and 1 to 4 value heads per key head"
+    if not pools_contig:
+        return "needs contiguous state and ring pools (TMA descriptors)"
+    if pdl_trigger:
+        return "pdl_trigger is not supported"
+    return None
+
+
 def gated_delta_rule_mtp_ucache_flush(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -3253,6 +3294,10 @@ def gated_delta_rule_mtp_ucache_flush(
     flush_min: Optional[int] = None,
     restart_hist_on_flush: bool = True,
     pdl_trigger: bool = False,
+    backend: str = "auto",
+    stochastic_rounding: Optional[str] = None,
+    rand_seed: Optional[torch.Tensor] = None,
+    philox_rounds: int = 10,
 ) -> torch.Tensor:
     """GDN decode output + u-cache append + PER-REQUEST state flush.
 
@@ -3281,6 +3326,24 @@ def gated_delta_rule_mtp_ucache_flush(
     (bf16 default; fp16 when the module was imported with
     ``GDN_UCACHE_IO_DTYPE=fp16`` — q/k/v/a/b, the state pool, and the
     k/u rings must all be that dtype; g_cache stays fp32).
+
+    BACKENDS. ``backend="auto"`` (default) runs the UMMA (tcgen05 / TMEM)
+    kernel ``gated_delta_rule_mtp_ucache_flush_umma`` when it can serve the
+    call — an SM100-class GPU, the fp16-state arm (bf16 IO and rings,
+    ``GDN_UCACHE_STATE_DTYPE=fp16``), 1 <= T <= 8, HV / H in 1..4, contiguous
+    pools, no ``pdl_trigger`` — and the HMMA kernel otherwise (any SM90+,
+    T in {4, 8}). With bf16 rings the UMMA backend also takes an fp16
+    ``u_cache`` (vLLM's u-cache dtype) next to the bf16 ``k_cache``; the HMMA
+    kernel does not, so such a call raises ``ValueError`` when the UMMA
+    backend cannot serve it. ``"umma"`` / ``"hmma"`` force one of them
+    (``"umma"`` raises ``ValueError`` when unavailable). Both implement the
+    same contract; they
+    differ in rounding only (fp32 accumulation in both, different summation
+    orders). ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
+    ``rand_seed`` and ``philox_rounds``; off unless set) rounds the fp16
+    state written by flush rows stochastically and is implemented by the
+    UMMA backend only (see that function's docstring). ``rand_seed`` is
+    read only with one of those modes.
     """
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
@@ -3361,7 +3424,9 @@ def gated_delta_rule_mtp_ucache_flush(
 
     # A_log / dt_bias are read as bf16 by the kernel. They are per-layer constants, so
     # cache the bf16 cast by storage identity (one-time at warm-up; absent from the
-    # captured graph). Falls back to a plain cast if already bf16-contiguous.
+    # captured graph). Falls back to a plain cast if already bf16-contiguous. The UMMA
+    # backend reads them in fp32, so it gets the caller's tensors.
+    A_log_in, dt_bias_in = A_log, dt_bias
     A_log = _cached_bf16(A_log)
     dt_bias = _cached_bf16(dt_bias)
 
@@ -3398,10 +3463,15 @@ def gated_delta_rule_mtp_ucache_flush(
         f"k_cache must be [pool={_pool}, H={HK}, {RING_SLOTS}, K={K_dim}]; "
         f"got {tuple(k_cache.shape)}"
     )
-    assert u_cache.dtype == RING_TORCH, (
+    # an fp16 u ring next to bf16 rings is the UMMA backend's mixed arm (vLLM's u-cache
+    # dtype); the HMMA kernel reads both rings in the module RING dtype
+    _u_mixed = u_cache.dtype != RING_TORCH
+    assert not _u_mixed or (
+        u_cache.dtype == torch.float16 and RING_TORCH is torch.bfloat16
+    ), (
         f"u_cache must be {RING_TORCH} (module RING dtype, see "
-        f"GDN_UCACHE_RING_DTYPE; f32 rings remain a documented extension "
-        f"point); got {u_cache.dtype}."
+        f"GDN_UCACHE_RING_DTYPE) or, with bf16 rings, fp16 (UMMA backend only); "
+        f"got {u_cache.dtype}."
     )
     _pools_contig &= _inner_dense(u_cache, "u_cache")
     assert tuple(u_cache.shape) == (_pool, HV, RING_SLOTS, V_dim)
@@ -3455,6 +3525,61 @@ def gated_delta_rule_mtp_ucache_flush(
         cache_base = torch.zeros_like(hist_len)
     assert cache_base.dtype == torch.int32 and cache_base.shape[0] == B
     cache_base = cache_base.contiguous()
+
+    # --- backend ---------------------------------------------------------------
+    if backend not in ("auto", "umma", "hmma"):
+        raise ValueError(
+            f"gated_delta_rule_mtp_ucache_flush: backend={backend!r}; use 'auto', "
+            "'umma' or 'hmma'."
+        )
+    _why = "backend='hmma' was requested"
+    if backend != "hmma":
+        _why = _umma_unavailable_reason(
+            device, T, H, HK, HV, _pools_contig, pdl_trigger
+        )
+        if _why is None:
+            return _UMMA(
+                A_log_in,
+                a,
+                dt_bias_in,
+                softplus_beta,
+                softplus_threshold,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=h0,
+                initial_state_indices=initial_state_indices,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                scale=scale,
+                output=output,
+                k_cache=k_cache,
+                u_cache=u_cache,
+                g_cache=g_cache,
+                hist_len=hist_len,
+                cache_base=cache_base,
+                flush_min=flush_min,
+                restart_hist_on_flush=restart_hist_on_flush,
+                stochastic_rounding=stochastic_rounding,
+                rand_seed=rand_seed,
+                philox_rounds=philox_rounds,
+            )
+        if backend == "umma":
+            raise ValueError(
+                f"gated_delta_rule_mtp_ucache_flush: backend='umma' unavailable: {_why}."
+            )
+    if _u_mixed:
+        raise ValueError(
+            "gated_delta_rule_mtp_ucache_flush: an fp16 u_cache with bf16 k_cache is "
+            f"served by the UMMA backend only ({_why}); the HMMA kernel needs both "
+            f"rings in {RING_TORCH}."
+        )
+    if stochastic_rounding not in (None, "none"):
+        raise NotImplementedError(
+            "gated_delta_rule_mtp_ucache_flush: stochastic rounding of the flushed state "
+            "is implemented by the UMMA backend only (SM100, bf16 IO and rings, fp16 "
+            "state); the HMMA kernel rounds to nearest."
+        )
     if T not in (4, 8):
         raise NotImplementedError(
             f"gated_delta_rule_mtp_ucache_flush: T={T} unsupported — native T in "

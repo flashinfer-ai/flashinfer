@@ -140,6 +140,36 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: Tensor) -> None",
                 "def api(value: Tensor | None = None) -> None",
             ),
+            (
+                "Literal gains a member",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b', 'c'] = 'a') -> None",
+            ),
+            (
+                "Literal gains a member, reordered and qualified",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: typing.Literal['c', 'b', 'a'] = 'a') -> None",
+            ),
+            (
+                "single-member Literal widens",
+                "def api(backend: Literal['a'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+            ),
+            (
+                "general union widening",
+                "def api(value: int) -> None",
+                "def api(value: int | str) -> None",
+            ),
+            (
+                "keyword-only insertion after varargs",
+                "def api(value: int, *args: object, last: int = 2) -> None",
+                "def api(value: int, *args: object, added: str = 'x', last: int = 2) -> None",
+            ),
+            (
+                "variadic tuple input widens",
+                "def api(value: tuple[int, ...]) -> None",
+                "def api(value: tuple[int | str, ...]) -> None",
+            ),
         )
 
         for name, before, after in cases:
@@ -174,6 +204,26 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(second: str, first: int) -> None",
             ),
             (
+                "Literal loses a member",
+                "def api(backend: Literal['a', 'b', 'c'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+            ),
+            (
+                "Literal member replaced",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'c'] = 'a') -> None",
+            ),
+            (
+                "Literal default changes",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b', 'c'] = 'c') -> None",
+            ),
+            (
+                "Literal replaced by str",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: str = 'a') -> None",
+            ),
+            (
                 "positional parameter inserted",
                 "def api(first: int, second: str) -> None",
                 "def api(first: int, inserted: bool = False, second: str = 'x') -> None",
@@ -187,11 +237,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "annotation narrowed",
                 "def api(value: Optional[int] = None) -> None",
                 "def api(value: int = 0) -> None",
-            ),
-            (
-                "general union widening",
-                "def api(value: int) -> None",
-                "def api(value: int | str) -> None",
             ),
             (
                 "unrelated Optional attribute",
@@ -214,9 +259,39 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int, added: str = 'x', **kwargs: object) -> None",
             ),
             (
+                "new keyword-only parameter before kwargs",
+                "def api(value: int, **kwargs: object) -> None",
+                "def api(value: int, *, added: str = 'x', **kwargs: object) -> None",
+            ),
+            (
                 "return annotation changed",
                 "def api(value: int) -> int",
                 "def api(value: int) -> str",
+            ),
+            (
+                "return union narrowed",
+                "def api(value: int) -> int | str",
+                "def api(value: int) -> int",
+            ),
+            (
+                "return union widened without an opt-in input",
+                "def api(value: int) -> int",
+                "def api(value: int) -> int | str",
+            ),
+            (
+                "return union widened with an opt-in input",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
+            ),
+            (
+                "return tuple member widens",
+                "def api(value: int) -> tuple[int, str]",
+                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
+            ),
+            (
+                "fixed return tuple widens to variadic",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
             ),
             (
                 "function became async",
@@ -233,6 +308,88 @@ class SignatureCompatibilityTest(unittest.TestCase):
                         api_function(after),
                     )
                 )
+
+
+class TypeAliasCompatibilityTest(unittest.TestCase):
+    def test_module_local_alias_can_preserve_or_widen_an_annotation(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(
+                    backend: Literal["first", "second"] = "first",
+                ) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Backend = Literal["first", "second", "third"]
+
+                @flashinfer_api
+                def api(backend: Backend = "first") -> OldPlan:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_module_local_alias_cannot_hide_narrowing(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(backend: Literal["first", "second"] = "first") -> None:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Backend = Literal["first"]
+
+                @flashinfer_api
+                def api(backend: Backend = "first") -> None:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
+
+    def test_module_local_alias_cannot_hide_return_widening(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(value: int) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Plan = Union[OldPlan, NewPlan]
+
+                @flashinfer_api
+                def api(value: int, fallback: bool = False) -> Plan:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
 
 
 class ClassReexportIntegrationTest(unittest.TestCase):

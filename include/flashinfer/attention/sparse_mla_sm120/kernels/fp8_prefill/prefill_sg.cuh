@@ -31,6 +31,7 @@
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
 #include "../../common/d2_load_b.cuh"
+#include "../../common/lse.cuh"
 #include "../../compute/online_softmax.cuh"
 #include "../../compute/q_rope.cuh"
 #include "../../compute/q_stage.cuh"
@@ -49,6 +50,7 @@ using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8_pair;
 using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
 using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
+using flashinfer::sparse_mla_sm120::scale_output_lse;
 using flashinfer::sparse_mla_sm120::pipeline::BulkReady;
 using flashinfer::sparse_mla_sm120::pipeline::RoleSync;
 using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
@@ -220,13 +222,11 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
       if constexpr (QkMode == QkComputeMode::BF16) {
 #pragma unroll
         for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
-          float scale_f;
-          if constexpr (KV::SCALE_IN_KV_SMEM) {
-            scale_f = reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk];
-          } else {
-            scale_f = fp32_from_exponent_byte(
-                sm.kv_scale_buf(buf)[(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
-          }
+          const float scale_f = kv_scale_fp32<KV>(
+              KV::SCALE_IN_KV_SMEM
+                  ? kv_gid_base + KV::D_NOPE
+                  : sm.kv_scale_buf(buf) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN,
+              blk);
 #pragma unroll
           for (int ks = 0; ks < KV::QUANT_TILE / 16; ks++) {
             int ko = blk * KV::QUANT_TILE + ks * 16;
@@ -320,15 +320,14 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
       float vsc_cache[CT::N_V_CHUNKS][2];
 #pragma unroll
       for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-        if constexpr (KV::SCALE_IN_KV_SMEM) {
-          vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
-          vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
-        } else {
-          vsc_cache[vc][0] =
-              fp32_from_exponent_byte(sm.kv_scale_buf(buf)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-          vsc_cache[vc][1] =
-              fp32_from_exponent_byte(sm.kv_scale_buf(buf)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-        }
+        vsc_cache[vc][0] = kv_scale_fp32<KV>(
+            KV::SCALE_IN_KV_SMEM ? e0_base + KV::D_NOPE
+                                 : sm.kv_scale_buf(buf) + e0i * KV::SCALE_BYTES_PER_TOKEN,
+            vc);
+        vsc_cache[vc][1] = kv_scale_fp32<KV>(
+            KV::SCALE_IN_KV_SMEM ? e1_base + KV::D_NOPE
+                                 : sm.kv_scale_buf(buf) + e1i * KV::SCALE_BYTES_PER_TOKEN,
+            vc);
         float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
         float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
         atomicMax(reinterpret_cast<int*>(&wsc_buf[vc * HPB + gid]),
@@ -398,7 +397,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
         lse = -INFINITY;
       }
       size_t lse_idx = (size_t)s_i * cold.out_lse_stride_elems + h_start + h;
-      out_lse[lse_idx] = lse;
+      out_lse[lse_idx] = scale_output_lse(lse, cold.lse_scale);
     }
     // Publish l_smem/m_smem to the consumer group for the output normalizer.
     bar_sync_t<Fp8PrefillSync::NORMALIZER, Cfg::MATH_THREADS>();
@@ -517,7 +516,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 }
 
 template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE,
-          typename GatherSchedule = Dsv41PrefillGatherSchedule>
+          typename GatherSchedule = Dsv41PrefillGatherSchedule<ModelType::DSV4_1>>
 __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS),
                                   1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -610,7 +609,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const int32_t* idx_base = indices + (size_t)s_i * topk;
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-    if constexpr (MT == ModelType::DSV4_1 && !GatherSchedule::RAW_PIPELINE) {
+    if constexpr (is_dsv41(MT) && !GatherSchedule::RAW_PIPELINE) {
       {
         auto issue_dual_tile = [&](int t) {
           const auto sec = prefill_section<Cfg::BI, PAGE_BLOCK_SIZE>(cold, KV_cache, indices, s_i,
@@ -866,15 +865,14 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
 #pragma unroll
         for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-          if constexpr (KV::SCALE_IN_KV_SMEM) {
-            vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
-            vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
-          } else {
-            vsc_cache[vc][0] = fp32_from_exponent_byte(
-                sm.kv_scale_buf(ti & 1)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-            vsc_cache[vc][1] = fp32_from_exponent_byte(
-                sm.kv_scale_buf(ti & 1)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-          }
+          vsc_cache[vc][0] = kv_scale_fp32<KV>(
+              KV::SCALE_IN_KV_SMEM ? e0_base + KV::D_NOPE
+                                   : sm.kv_scale_buf(ti & 1) + e0i * KV::SCALE_BYTES_PER_TOKEN,
+              vc);
+          vsc_cache[vc][1] = kv_scale_fp32<KV>(
+              KV::SCALE_IN_KV_SMEM ? e1_base + KV::D_NOPE
+                                   : sm.kv_scale_buf(ti & 1) + e1i * KV::SCALE_BYTES_PER_TOKEN,
+              vc);
           float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
           float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
@@ -1118,7 +1116,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         lse = -INFINITY;
       }
       size_t lse_idx = (size_t)s_i * cold.out_lse_stride_elems + h_start + h;
-      out_lse[lse_idx] = lse;
+      out_lse[lse_idx] = scale_output_lse(lse, cold.lse_scale);
     }
   }
 }

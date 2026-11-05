@@ -1339,6 +1339,7 @@ class BlockwiseContiguousGroupedGemmKernel:
                     scale_producer_state.reset_count()
                     _m0 = tile_info[0] * self.cta_tile_shape_mnk[0]
                     _sfb_off = tile_info[1] * _sfb_n_st + tile_info[2] * _sfb_l_st
+                    _sfa_m_last = mSFA_mkl.shape[0][1] - 1
                     for _kg in cutlass.range(0, k_tile_cnt // _KG, 1, unroll=1):
                         scale_pipeline.producer_acquire(scale_producer_state)
                         _st = scale_producer_state.index
@@ -1346,12 +1347,15 @@ class BlockwiseContiguousGroupedGemmKernel:
                             self.cta_tile_shape_mnk[0] // 32
                         ):
                             _r = _i * 32 + lane_idx
+                            _sfa_row = _m0 + _r
+                            if cutlass.const_expr(not self.scale_always_inbounds):
+                                _sfa_row = cutlass.min(_sfa_row, _sfa_m_last)
                             cute.copy(
                                 atom_sf_kg,
                                 cute.make_tensor(
                                     (
                                         mSFA_mkl.iterator
-                                        + (_m0 + _r) * _sfa_m_st
+                                        + _sfa_row * _sfa_m_st
                                         + _kg * _KG * _sfa_k_st
                                     ).align(4 * _KG),
                                     cute.make_layout((_KG,), stride=(_sfa_k_st,)),

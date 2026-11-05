@@ -2,7 +2,6 @@ ARG CUDA_IMAGE=nvidia/cuda:12.9.0-devel-ubuntu24.04
 FROM ${CUDA_IMAGE} AS base
 
 ARG PYTORCH_INDEX=cu129
-ARG CUDNN_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV FLASHINFER_PYTHON_ENV=flashinfer
@@ -10,6 +9,7 @@ ENV FLASHINFER_PYTHON_ENV=flashinfer
 RUN apt-get update && apt-get install -y \
     curl \
     git \
+    jq \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,14 +27,24 @@ ENV PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
 # does not exist for a particular CUDA major is harmless.
 ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cu13/lib:/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+ENV TRITON_PTXAS_BLACKWELL_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
-ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 
+# One layer per stage, most stable first (see install_python_packages.sh), so a
+# cuDNN or requirements bump does not invalidate and re-pull the multi-GB torch
+# layer. The torch stage therefore runs before CUDNN_VERSION and the files that
+# change with it (requirements.txt, build_utils.py, cuda-versions.json) enter
+# the build.
+COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "" torch
+
+ARG CUDNN_VERSION
+ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 COPY requirements.txt /install/requirements.txt
 COPY build_utils.py /install/build_utils.py
 COPY ci/cuda-versions.json /install/ci/cuda-versions.json
-COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" deps
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" cudnn
 
 RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
 
@@ -59,6 +69,18 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install pre-commit
+
+# sccache for the JIT/AOT compiles; a devcontainer activates it by exporting
+# FLASHINFER_{CXX,NVCC}_LAUNCHER. Sourcing the CI helper keeps the pinned
+# version shared with the jit-cache wheel builds.
+COPY scripts/jit_cache_build_common.sh /install/jit_cache_build_common.sh
+RUN bash -c 'source /install/jit_cache_build_common.sh \
+    && install_sccache "${SCCACHE_VERSION}" "$(uname -m)"'
+
+# Docker creates missing mount parents as root, so a volume on
+# ~/.cache/sccache would leave ~/.cache unwritable and break the JIT cache.
+RUN mkdir -p "/home/${USERNAME}/.cache/sccache" \
+    && chown -R "${USER_UID}:${USER_GID}" "/home/${USERNAME}/.cache"
 
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}

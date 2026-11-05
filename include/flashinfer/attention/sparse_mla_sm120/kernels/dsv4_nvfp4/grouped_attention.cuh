@@ -20,6 +20,7 @@
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
 #include "../../arch/mma_sm120_nvfp4.cuh"
+#include "../../common/lse.cuh"
 #include "../../common/zero_row.cuh"
 #include "../../compute/nvfp4_vt.cuh"
 #include "../../compute/warp_tiles.cuh"
@@ -40,8 +41,12 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const uint8_t* __restrict__ extra_kv_cache, const int32_t* __restrict__ extra_indices,
         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
         size_t extra_page_stride_bytes, int num_tokens, int scratch_split_stride,
-        int chunks_per_block, float sm_scale, size_t page_stride_bytes, bool write_direct) {
+        int chunks_per_block, float sm_scale, int page_block_size, size_t page_stride_bytes,
+        bool write_direct, float lse_scale) {
   static_assert(NUM_HEADS <= STREAMING_HEADS_PER_CTA || NUM_HEADS % STREAMING_HEADS_PER_CTA == 0);
+  static_assert(NUM_HEADS % HPB == 0,
+                "streaming kernel processes full HPB head groups; thinner heads use the decode "
+                "kernel");
   constexpr int VALID_HEAD_GROUPS =
       NUM_HEADS < STREAMING_HEADS_PER_CTA ? (NUM_HEADS + HPB - 1) / HPB : STREAMING_HEAD_GROUPS;
   constexpr int HEADS_PER_CTA = VALID_HEAD_GROUPS * HPB;
@@ -112,7 +117,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const int h = h_start + threadIdx.x;
         if (write_direct) {
           out_lse[(size_t)token_idx * NUM_HEADS + h] =
-              attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY;
+              scale_output_lse(attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY, lse_scale);
         } else {
           mid_lse[((size_t)token_idx * NUM_HEADS + h) * scratch_split_stride + split_idx] = -1e30f;
         }
@@ -123,7 +128,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 
   auto issue_gather = [&](int chunk, int buf) {
     gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE, STREAMING_GATHER_WARPS * 32>(
-        kv_cache, idx_base, chunk, topk_len, false, PAGE_BLOCK_SIZE, page_stride_bytes,
+        kv_cache, idx_base, chunk, topk_len, false, page_block_size, page_stride_bytes,
         (warp_id - STREAMING_N_WARPS) * 32 + lane, sm.kv_fp4(buf), sm.kv_rope(buf), sm.kv_sc(buf),
         sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
         DUAL_CACHE ? extra_indices + size_t(token_idx) * extra_topk : nullptr,
@@ -492,8 +497,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       final_output_scale[group * HPB + gid] = output_scale0;
       final_output_scale[group * HPB + gid + 8] = output_scale1;
       if (write_direct) {
-        out_lse[(size_t)token_idx * NUM_HEADS + h0] = lse0;
-        out_lse[(size_t)token_idx * NUM_HEADS + h0 + 8] = lse1;
+        out_lse[(size_t)token_idx * NUM_HEADS + h0] = scale_output_lse(lse0, lse_scale);
+        out_lse[(size_t)token_idx * NUM_HEADS + h0 + 8] = scale_output_lse(lse1, lse_scale);
       } else {
         const size_t lse_base = (size_t)token_idx * NUM_HEADS * scratch_split_stride;
         mid_lse[lse_base + (size_t)h0 * scratch_split_stride + split_idx] = lse0;

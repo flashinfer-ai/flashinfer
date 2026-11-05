@@ -13,110 +13,73 @@
 # limitations under the License.
 
 
-"""JIT loader for generated SM120 Sage block-sparse attention kernels."""
+"""JIT loader facade of the Cake Sage block-sparse attention package.
+
+The kernels ship in :mod:`flashinfer.cake_sage_block_sparse_attention_backend`:
+``build.json`` names every library (sources, flags, digests), ``cake_build.py``
+builds or loads it and the ``cake_jit`` registry records what each module
+launches.  This module keeps the names the rest of FlashInfer and its tests
+import, each a thin call into that package:
+
+* ``SM120_MODULES`` -- specialization key ``(HAS_BLOCK_NUMS, BLOCK_SIZES_MODE,
+  FULL_K64_TILES, UNIFORM_NONEMPTY, CONTIGUOUS_BLOCK_INDICES)`` -> the library
+  (JIT module) name of the SM120 (RTX PRO 6000 / RTX 5090) ``mma.sync`` kernel,
+  read off the registry's ``select_rule`` records.  Every specialization is one
+  shared kernel source and one shared launcher compiled under its own compile
+  definitions (``sm120_compile_definitions``, the ``-D`` flags of its manifest
+  entry): ``CAKE_SAGE_SM120_KERNEL`` names its kernel symbol and the five
+  ``CAKE_SAGE_*`` flag macros select its text.
+* ``SM100_ARCHES`` / ``SM100_STAGES`` and ``gen_cake_sage_sm100_module`` /
+  ``load_cake_sage_sm100_module`` -- the SM100-family (B200 / B300) ``tcgen05``
+  attention and the two fused Sage-FP8 quantizers, compiled for ``sm_100a`` and
+  ``sm_103a``.
+"""
 
 from __future__ import annotations
 
 import functools
-import hashlib
-import json
-from pathlib import Path
 from typing import Any
 
-from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm120a_nvcc_flags
+from flashinfer.cake_sage_block_sparse_attention_backend import cake_build, cake_jit
 
-_GENERATED_ROOT = "csrc/cake_sage_block_sparse_attention"
-_MANIFEST_NAME = "cake_sage_block_sparse_attention_manifest.json"
-_SPECIALIZATION_NAMES = (
-    "HAS_BLOCK_NUMS",
-    "BLOCK_SIZES_MODE",
-    "FULL_K64_TILES",
-    "UNIFORM_NONEMPTY",
-    "CONTIGUOUS_BLOCK_INDICES",
-)
+SM100_ARCHES = tuple(cake_jit.SM100_ARCHES)
+# stage -> the registry record (and build.json library stem) of the SM100 family.
+SM100_STAGES = ("attention", "quantize_qk_vamax", "quantize_v")
+SM120_KERNEL_MACRO = "CAKE_SAGE_SM120_KERNEL"
+
+Sm120Key = tuple[int, int, int, int, int]
 
 
-def _get_csrc_dir() -> Path:
-    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_sage_block_sparse_attention"
-    if (installed / _MANIFEST_NAME).is_file():
-        return installed
-    checkout = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "cake_sage_block_sparse_attention"
-    )
-    if (checkout / _MANIFEST_NAME).is_file():
-        return checkout
-    raise FileNotFoundError("Cake Sage block-sparse attention sources were not found")
+def _sm120_key(*flags: Any) -> Sm120Key:
+    values = tuple(int(flag) for flag in flags)
+    if len(values) != 5:
+        raise RuntimeError(f"an SM120 specialization key has five flags, got {values}")
+    return values  # type: ignore[return-value]
 
 
-def _get_include_dir() -> Path:
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError("FlashInfer headers were not found")
+# (HAS_BLOCK_NUMS, BLOCK_SIZES_MODE, FULL_K64_TILES, UNIFORM_NONEMPTY,
+#  CONTIGUOUS_BLOCK_INDICES) -> SM120 library name, one row per registry record
+# of role ``attention_sm120``.  CONTIGUOUS_BLOCK_INDICES is set only together
+# with UNIFORM_NONEMPTY: with no block to load, the contiguous specialization
+# writes the same zeros as its (..., 0, 0) sibling, so the dispatch rule
+# (``cake_jit.sm120_module_key``) clears the flag instead.
+SM120_MODULES: dict[Sm120Key, str] = {
+    key: cake_jit.MODULES[record]["library"]
+    for key, record in sorted(cake_jit.SM120_RECORDS.items())
+}
 
 
-@functools.cache
-def _manifest() -> dict[str, Any]:
-    path = _get_csrc_dir() / _MANIFEST_NAME
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        value.get("schema") != "cake.library_export.v4"
-        or value.get("producer") != "cake"
-        or value.get("library") != "flashinfer"
-        or value.get("name") != "cake_sage_block_sparse_attention"
-    ):
-        raise RuntimeError("invalid Cake Sage block-sparse attention manifest")
-    modules = value.get("modules")
-    if not isinstance(modules, list) or not modules:
-        raise RuntimeError("empty Cake Sage block-sparse attention module inventory")
-    return value
+def sm120_compile_definitions(key: Sm120Key) -> list[str]:
+    """Per-module compile definitions of one SM120 specialization.
 
-
-def _key(values: dict[str, Any]) -> tuple[int, ...]:
-    if set(values) != set(_SPECIALIZATION_NAMES):
-        raise RuntimeError("invalid Sage block-sparse specialization receipt")
-    return tuple(int(values[name]) for name in _SPECIALIZATION_NAMES)
-
-
-def _record(key: tuple[int, ...]) -> dict[str, Any]:
-    matches = [
-        item
-        for item in _manifest()["modules"]
-        if item.get("arch") == "sm_120a"
-        and _key(dict(item.get("specializations", {}))) == key
-    ]
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"expected one generated Sage module for specialization {key}, got {len(matches)}"
-        )
-    return matches[0]
-
-
-def _source_path(relative_path: str) -> Path:
-    relative = Path(relative_path)
-    prefix = Path(_GENERATED_ROOT)
-    try:
-        suffix = relative.relative_to(prefix)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"generated source escaped {_GENERATED_ROOT}: {relative_path}"
-        ) from exc
-    path = _get_csrc_dir() / suffix
-    inventory = {item["path"]: item for item in _manifest()["files"]}
-    receipt = inventory.get(relative.as_posix())
-    if not isinstance(receipt, dict) or not path.is_file():
-        raise FileNotFoundError(
-            f"generated source is absent from the manifest: {relative_path}"
-        )
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != receipt.get("sha256"):
-        raise RuntimeError(f"generated source hash mismatch: {relative_path}")
-    return path
+    The ``-D`` flags of the specialization's ``build.json`` entry: the first
+    names the module's kernel symbol (``-DCAKE_SAGE_SM120_KERNEL=kernel_<name>``),
+    the next five set the flag macros of the shared kernel source to the key's
+    values, in key order.
+    """
+    library = f"{SM120_MODULES[_sm120_key(*key)]}_{cake_jit.SM120_ARCH}"
+    entry = cake_build.libraries_by_name()[library]
+    return [flag for flag in entry["nvcc_flags"] if flag.startswith("-D")]
 
 
 @functools.cache
@@ -126,25 +89,21 @@ def gen_cake_sage_block_sparse_attention_module(
     full_k64_tiles: int,
     uniform_nonempty: int,
     contiguous_block_indices: int,
-) -> JitSpec:
-    key = (
-        int(has_block_nums),
-        int(block_sizes_mode),
-        int(full_k64_tiles),
-        int(uniform_nonempty),
-        int(contiguous_block_indices),
+) -> Any:
+    """The JIT spec of one SM120 specialization (``cake_build.jit_spec``)."""
+    key = _sm120_key(
+        has_block_nums,
+        block_sizes_mode,
+        full_k64_tiles,
+        uniform_nonempty,
+        contiguous_block_indices,
     )
-    record = _record(key)
-    units = record["translation_units"]
-    spec = gen_jit_spec(
-        name=str(record["name"]),
-        sources=[_source_path(units["device"]), _source_path(units["binding"])],
-        extra_cuda_cflags=[*sm120a_nvcc_flags, *record["compile_flags"]],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
-    )
-    logger.info("Generated Cake Sage block-sparse attention JIT spec: %s", spec.name)
-    return spec
+    name = SM120_MODULES.get(key)
+    if name is None:
+        raise RuntimeError(
+            f"no generated SM120 Sage block-sparse attention module for specialization {key}"
+        )
+    return cake_build.jit_spec(f"{name}_{cake_jit.SM120_ARCH}")
 
 
 @functools.cache
@@ -155,33 +114,50 @@ def load_cake_sage_block_sparse_attention_module(
     uniform_nonempty: int,
     contiguous_block_indices: int,
 ):
-    key = (
-        int(has_block_nums),
-        int(block_sizes_mode),
-        int(full_k64_tiles),
-        int(uniform_nonempty),
-        int(contiguous_block_indices),
+    """Build (or load the prebuilt) and return the SM120 module of one specialization."""
+    record = cake_jit.select_sm120(
+        has_block_nums=has_block_nums,
+        block_sizes_mode=block_sizes_mode,
+        full_k64_tiles=full_k64_tiles,
+        uniform_nonempty=uniform_nonempty,
+        contiguous_block_indices=contiguous_block_indices,
     )
-    spec = gen_cake_sage_block_sparse_attention_module(*key)
-    module = spec.build_and_load()
-    return module, _record(key)
+    return cake_jit.load(record, cake_jit.SM120_ARCH)
 
 
-def build_all_cake_sage_block_sparse_attention_modules() -> dict[str, str]:
-    result = {}
-    for record in _manifest()["modules"]:
-        key = _key(dict(record["specializations"]))
-        spec = gen_cake_sage_block_sparse_attention_module(*key)
-        module = spec.build_and_load()
-        if not hasattr(module, str(record["ffi_entry"])):
-            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
-        path = spec.get_library_path().resolve(strict=True)
-        result[str(record["name"])] = str(path)
-    return result
+def _sm100_record(arch: str, stage: str) -> str:
+    if arch not in SM100_ARCHES:
+        raise RuntimeError(
+            f"Cake SM100 Sage block-sparse attention supports {list(SM100_ARCHES)}, got {arch!r}"
+        )
+    if stage not in SM100_STAGES:
+        raise RuntimeError(
+            f"unknown Cake SM100 Sage stage {stage!r}; expected one of {SM100_STAGES}"
+        )
+    return stage
+
+
+@functools.cache
+def gen_cake_sage_sm100_module(arch: str, stage: str) -> Any:
+    """The JIT spec of the (``arch``, ``stage``) SM100-family module."""
+    record = _sm100_record(arch, stage)
+    return cake_build.jit_spec(cake_jit.library_name(record, arch))
+
+
+@functools.cache
+def load_cake_sage_sm100_module(arch: str, stage: str):
+    """Build (or load the prebuilt) and return the (``arch``, ``stage``) SM100-family module."""
+    return cake_jit.load(_sm100_record(arch, stage), arch)
 
 
 __all__ = [
-    "build_all_cake_sage_block_sparse_attention_modules",
+    "SM100_ARCHES",
+    "SM100_STAGES",
+    "SM120_KERNEL_MACRO",
+    "SM120_MODULES",
     "gen_cake_sage_block_sparse_attention_module",
+    "gen_cake_sage_sm100_module",
     "load_cake_sage_block_sparse_attention_module",
+    "load_cake_sage_sm100_module",
+    "sm120_compile_definitions",
 ]

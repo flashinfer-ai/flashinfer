@@ -25,6 +25,10 @@ from tests.test_helpers.jit_utils import (
 
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 
 @pytest.fixture(
@@ -64,10 +68,15 @@ def attention_logits_soft_cap_torch(q, k, v, soft_cap):
     return torch.einsum("ovh,vhd->ohd", attn, v.float()).to(q)
 
 
-@pytest.mark.parametrize("seq_len", [1, 9, 81, 729, 33001])
-@pytest.mark.parametrize("num_heads", [4, 8, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("soft_cap", [1.0, 30.0, 50.0])
+@parametrize_product(
+    {
+        "seq_len": [1, 9, 81, 729, 33001],
+        "num_heads": [4, 8, 32],
+        "head_dim": [128, 256],
+    },
+    regular=pairwise_product_cases,
+)
 def test_single_decode_logits_soft_cap(
     seq_len,
     num_heads,
@@ -83,11 +92,16 @@ def test_single_decode_logits_soft_cap(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("q_len", [1, 17, 81, 987])
-@pytest.mark.parametrize("kv_len", [1, 17, 81, 987, 31111])
-@pytest.mark.parametrize("num_heads", [4, 8, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("soft_cap", [1.0, 30.0, 50.0])
+@parametrize_product(
+    {
+        "q_len": [1, 17, 81, 987],
+        "kv_len": [1, 17, 81, 987, 31111],
+        "num_heads": [4, 8, 32],
+        "head_dim": [128, 256],
+    },
+    regular=pairwise_product_cases,
+)
 def test_single_prefill_logits_soft_cap(
     q_len,
     kv_len,

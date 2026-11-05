@@ -20,7 +20,7 @@ def mxfp8_data_dtype(kind: str) -> "torch.dtype":
 
 
 def swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    from ......kernel_src.cutedsl_megamoe import to_blocked
+    from ......kernel_src.sm100.cutedsl_megamoe import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -61,7 +61,7 @@ def quantize_mxfp8_weight_k_major(
 ) -> Tuple["torch.Tensor", "torch.Tensor"]:
     import torch
 
-    from ......kernel_src.cutedsl_megamoe import mxfp8_quantize_per_block_32
+    from ......kernel_src.sm100.cutedsl_megamoe import mxfp8_quantize_per_block_32
 
     return mxfp8_quantize_per_block_32(
         weight_k_major.to(torch.float32), mxfp8_data_dtype(kind)
@@ -71,7 +71,7 @@ def quantize_mxfp8_weight_k_major(
 def as_mxfp8_scale(scale: "torch.Tensor") -> "torch.Tensor":
     import torch
 
-    from ......kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype
+    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8ScaleDtype
 
     if scale.dtype == Mxfp8ScaleDtype:
         return scale
@@ -86,6 +86,6 @@ def as_mxfp8_scale(scale: "torch.Tensor") -> "torch.Tensor":
 def mxfp8_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
-    from ......kernel_src.cutedsl_megamoe import Mxfp8ScaleDtype, to_blocked
+    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8ScaleDtype, to_blocked
 
     return to_blocked(torch.zeros(rows, cols, dtype=Mxfp8ScaleDtype)).numel()

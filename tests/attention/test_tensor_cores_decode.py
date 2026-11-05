@@ -451,6 +451,9 @@ def test_batch_decode_tensor_cores_with_fast_plan(
         q, kv_data, return_lse=True
     )
 
+    # Finish the async schedule copy before reusing its pinned host staging
+    # buffer. This test checks batch invariance, not overlapping CPU replans.
+    torch.cuda.current_stream().synchronize()
     kv_indptr_invariant = kv_indptr[: invariant_bs + 1]
     kv_last_page_len_invariant = kv_last_page_len[:invariant_bs]
     global_override_indptr_cpu = global_override_indptr_cpu[: invariant_bs + 1]
@@ -649,6 +652,43 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
 
     torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 17])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("seq_lens_dtype", [None, torch.int32, torch.uint32])
+def test_batch_decode_tensor_cores_plan_max_kv_len(
+    batch_size, page_size, seq_lens_dtype
+):
+    """plan() derives the longest KV length from the page table or from
+    seq_lens, which may be int32 or uint32. A single request is the
+    one-element case of the reduction."""
+    torch.manual_seed(batch_size * 31 + page_size)
+    kv_lens = torch.randint(1, 513, (batch_size,), dtype=torch.int32)
+    num_pages = (kv_lens + page_size - 1) // page_size
+    kv_indptr = torch.nn.functional.pad(
+        torch.cumsum(num_pages, 0, dtype=torch.int32), (1, 0)
+    )
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        use_tensor_cores=True,
+    )
+    wrapper.plan(
+        kv_indptr.cuda(),
+        torch.arange(int(kv_indptr[-1]), dtype=torch.int32, device="cuda"),
+        (kv_lens - (num_pages - 1) * page_size).cuda(),
+        8,
+        8,
+        128,
+        page_size,
+        q_data_type=torch.float16,
+        seq_lens=None if seq_lens_dtype is None else kv_lens.to(seq_lens_dtype).cuda(),
+    )
+
+    assert type(wrapper._max_kv_len) is int
+    assert wrapper._max_kv_len == int(kv_lens.max())
 
 
 if __name__ == "__main__":

@@ -118,6 +118,8 @@ def _ref_expanded_gemm(intermediate, w2, maps, row_valid, tile_m):
         (2048, 96, (128, 64), (1, 1), False),  # tp=8, partial last K tile (32 of 64)
         (2048, 176, (128, 128), (1, 1), False),  # I%32!=0: K tail 48 of 64
         (2048, 352, (128, 128), (1, 2), False),  # K tail with A multicast
+        (1032, 768, (128, 128), (1, 1), False),  # partial last N tile (8 of 128)
+        (1160, 768, (128, 128), (1, 2), False),  # N tail 8 of 128, 10 N tiles paired
     ],
 )
 @pytest.mark.parametrize("num_tokens", [3, 777])
@@ -183,6 +185,7 @@ def test_cute_dsl_grouped_gemm_finalize_fused(
     [
         (2048, 768, (128, 128)),
         (2048, 96, (128, 64)),  # partial last K tile
+        (2072, 768, (128, 128)),  # partial last N tile (24 of 128)
     ],
 )
 @pytest.mark.parametrize("num_tokens", [3, 777])
@@ -230,6 +233,35 @@ def test_cute_dsl_grouped_gemm_finalize_deterministic(
     perm_rows = expanded_to_perm.flatten().long()
     ref = ref_rows[perm_rows]
     torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=3e-2)
+
+
+@cute_dsl_available
+def test_cute_dsl_grouped_gemm_finalize_n_rules():
+    """Output rows must be a multiple of 16 B in the output dtype (a partial
+    last N tile is allowed), and a (1, 2) cluster needs an even number of N
+    tiles counted with a ceiling division."""
+    import cutlass
+    from flashinfer.fused_moe.cute_dsl.hopper.contiguous_grouped_gemm_finalize_fusion import (
+        Sm90ContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    def ok(n, c_dtype=cutlass.BFloat16, cluster=(1, 1)):
+        return Sm90ContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+            cutlass.BFloat16,
+            cutlass.BFloat16,
+            c_dtype,
+            (128, 128),
+            cluster,
+            256,
+            n,
+            768,
+            8,
+        )
+
+    assert ok(1032) and not ok(1028)  # bf16: 8 elements per 16 B
+    assert ok(1028, cutlass.Float32) and not ok(1030, cutlass.Float32)  # fp32: 4
+    assert not ok(1032, cluster=(1, 2))  # 9 N tiles of 128
+    assert ok(1160, cluster=(1, 2))  # 10 N tiles of 128
 
 
 @cute_dsl_available

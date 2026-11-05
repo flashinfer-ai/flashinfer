@@ -24,6 +24,7 @@ from tests.test_helpers.jit_utils import (
 import flashinfer
 from flashinfer.jit.attention import gen_pod_module
 from flashinfer.utils import has_flashinfer_jit_cache
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 
 @pytest.fixture(
@@ -72,20 +73,25 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("kv_len_p", [127, 12288])
-@pytest.mark.parametrize("qo_len_p", [127, 12288])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("batch_size_d", [1, 17, 127])
-@pytest.mark.parametrize("kv_len_d", [127, 12288])
-@pytest.mark.parametrize("page_size_d", [1, 16])
-@pytest.mark.parametrize("kv_layout_d", ["NHD"])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("num_qo_heads", [8, 32])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-@pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize("kv_dtype", [torch.float16])
-@pytest.mark.parametrize("contiguous_kv", [True])
+@parametrize_product(
+    {
+        "kv_len_p": [127, 12288],
+        "qo_len_p": [127, 12288],
+        "causal": [False, True],
+        "batch_size_d": [1, 17, 127],
+        "kv_len_d": [127, 12288],
+        "page_size_d": [1, 16],
+        "kv_layout_d": ["NHD"],
+        "num_kv_heads": [8],
+        "num_qo_heads": [8, 32],
+        "head_dim": [128],
+        "pos_encoding_mode": ["NONE"],
+        "q_dtype": [torch.float16],
+        "kv_dtype": [torch.float16],
+        "contiguous_kv": [True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_pod_with_paged_kv_cache(
     # Prefill params
     kv_len_p,

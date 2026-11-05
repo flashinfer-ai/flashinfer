@@ -552,14 +552,15 @@ def test_nvfp4_sparse_mla_rejects_strided_optional_tensors(
     "topk,chunks_per_block,topk_len", [(128, 2, 111), (512, 6, 389)]
 )
 @pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("page_size", [64, 32, 48])
 def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
-    topk: int, chunks_per_block: int, topk_len: int, with_sink: bool
+    topk: int, chunks_per_block: int, topk_len: int, with_sink: bool, page_size: int
 ) -> None:
     """Cover the direct and two-split epilogues with online quantization."""
     _require_sm120()
-    torch.manual_seed(20260902 + topk + int(with_sink))
+    torch.manual_seed(20260902 + topk + int(with_sink) + page_size)
     num_tokens, num_heads = 2, 128
-    num_pages, page_size = 16, 64
+    num_pages = 16 * 64 // page_size
     kv_bf16 = (
         torch.randn(
             num_pages,
@@ -735,16 +736,17 @@ def test_nvfp4_sparse_mla_shared_wrapper_normalizes_singleton_indices(
     torch.testing.assert_close(lse_3d, lse_2d, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512)])
+@pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512), (32, 512)])
 @pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("main_page_size", [64, 32])
 def test_nvfp4_sparse_mla_decode_dual_cache_matches_reference(
-    extra_page_size: int, extra_topk: int, with_sink: bool
+    extra_page_size: int, extra_topk: int, with_sink: bool, main_page_size: int
 ) -> None:
     """Main and C4A/C128A cache sections share one online softmax."""
     _require_sm120()
-    torch.manual_seed(20260904 + extra_page_size + int(with_sink))
+    torch.manual_seed(20260904 + extra_page_size + int(with_sink) + main_page_size)
     num_tokens, num_heads, main_topk = 2, 128, 128
-    main_pages, main_page_size = 8, 64
+    main_pages = 8 * 64 // main_page_size
     extra_pages = max(16, (extra_topk + extra_page_size - 1) // extra_page_size)
     main_bf16 = (
         torch.randn(
@@ -871,12 +873,15 @@ def test_nvfp4_sparse_mla_decode_dual_cache_matches_reference(
     torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_heads", [16, 32, 64])
-def test_nvfp4_sparse_mla_supported_head_counts(num_heads: int) -> None:
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64])
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_nvfp4_sparse_mla_supported_head_counts(
+    num_heads: int, num_tokens: int
+) -> None:
     """Decode and prefill share the vLLM padded-head dispatch set."""
     _require_sm120()
-    torch.manual_seed(20260905 + num_heads)
-    num_tokens, topk = 1, 128
+    torch.manual_seed(20260905 + num_heads + num_tokens)
+    topk = 128
     kv_bf16 = (
         torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
     ).clamp(-1, 1)
@@ -1315,3 +1320,292 @@ def test_nvfp4_sparse_mla_empty_store_families(heads, topk, cpbs, dual, sink_val
         assert torch.count_nonzero(output[:2]) == 0
         torch.testing.assert_close(output, reference, atol=0.05, rtol=0.05)
         torch.testing.assert_close(lse, reference_lse, atol=0.02, rtol=0.02)
+
+
+def _nvfp4_lse_case(num_tokens, num_heads, topk, with_sink):
+    """Quantized reference inputs with one empty row and varying valid lengths."""
+    torch.manual_seed(4650 + topk + num_heads)
+    kv = (torch.randn(16, 64, 512, device="cuda", dtype=torch.bfloat16) / 10).clamp(
+        -1, 1
+    )
+    q = (
+        torch.randn(num_tokens, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+        / 10
+    ).clamp(-1, 1)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.randint(
+        0, 1024, (num_tokens, topk), device="cuda", dtype=torch.int32
+    )
+    indices[:, -3:] = -1
+    indices[1] = -1  # fully masked despite a nonzero topk_length
+    lengths = torch.full((num_tokens,), topk, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    lengths[-1] = topk - 19
+    sink = (
+        torch.linspace(-1, 1, num_heads, device="cuda", dtype=torch.float32)
+        if with_sink
+        else None
+    )
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+        topk_length=lengths,
+        attn_sink=sink,
+    )
+    return q, cache, indices, lengths, sink, reference, reference_lse
+
+
+_NVFP4_LSE_PATHS = [
+    pytest.param("decode", 3, 16, 128, 2, id="ungrouped-direct"),
+    # H128 has two 64-head groups; T8 satisfies the grouped-grid threshold.
+    pytest.param("decode", 8, 128, 512, 8, id="grouped-direct"),
+    pytest.param("decode", 3, 16, 512, 4, id="merge2"),
+    pytest.param("decode", 3, 16, 512, 2, id="generic-merge4"),
+    pytest.param("prefill", 65, 16, 128, None, id="streaming-prefill"),
+]
+
+
+@pytest.mark.parametrize("phase,num_tokens,num_heads,topk,cpb", _NVFP4_LSE_PATHS)
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_lse_scale_final_stores(
+    phase, num_tokens, num_heads, topk, cpb, with_sink
+):
+    """Every final store converts base-2 once, after sink merging, preserving sentinels."""
+    _require_sm120()
+    q, cache, indices, lengths, sink, reference, reference_lse = _nvfp4_lse_case(
+        num_tokens, num_heads, topk, with_sink
+    )
+    attention = (
+        _nvfp4_sparse_mla_decode if phase == "decode" else _nvfp4_sparse_mla_prefill
+    )
+    kwargs = dict(topk_length=lengths, attn_sink=sink)
+    if phase == "decode":
+        kwargs["chunks_per_block_override"] = cpb
+    results = []
+    for scale in (None, 1.0, math.log(2)):
+        scale_kwargs = {} if scale is None else {"lse_scale": scale}
+        output, lse = attention(q, cache, indices, 512**-0.5, **kwargs, **scale_kwargs)
+        expected_lse = reference_lse * (1.0 if scale is None else scale)
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+        if not with_sink:
+            assert torch.equal(lse[0], torch.full_like(lse[0], -float("inf")))
+        results.append((output, lse))
+    assert torch.equal(results[0][1], results[1][1])
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][0], results[2][0])
+    finite_rows = torch.isfinite(reference_lse)
+    torch.testing.assert_close(
+        results[2][1][finite_rows],
+        results[1][1][finite_rows] * math.log(2),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_heads,topk,cpb",
+    [
+        pytest.param(3, 16, 512, 2, id="ungrouped"),
+        pytest.param(8, 128, 512, 3, id="grouped"),
+    ],
+)
+def test_nvfp4_sparse_mla_lse_scale_keeps_partials_base2(
+    num_tokens, num_heads, topk, cpb
+):
+    """Stage-one scratch stays base-2, independently checked by merging its LSE."""
+    _require_sm120()
+    from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
+        get_sparse_mla_nvfp4_sm120_module,
+    )
+
+    q, cache, indices, lengths, _, _, reference_lse = _nvfp4_lse_case(
+        num_tokens, num_heads, topk, False
+    )
+    num_splits = (topk + 63) // 64
+    active_splits = (num_splits + cpb - 1) // cpb
+    module = get_sparse_mla_nvfp4_sm120_module()
+    partials = []
+    for scale in (1.0, math.log(2)):
+        mid_out = torch.full(
+            (num_tokens, num_heads, num_splits, 512),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        mid_lse = torch.full(
+            (num_tokens, num_heads, num_splits),
+            float("nan"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = torch.empty_like(q)
+        out_lse = torch.full((num_tokens, num_heads), float("nan"), device=q.device)
+        module.sparse_mla_sm120_nvfp4_decode(
+            q,
+            cache,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            out_lse,
+            num_splits,
+            512**-0.5,
+            lengths,
+            None,
+            None,
+            None,
+            None,
+            cpb,
+            True,
+            scale,
+        )
+        # The launcher packs active splits at the front of the allocated scratch.
+        partial = mid_lse.flatten()[: num_tokens * num_heads * active_splits].reshape(
+            num_tokens, num_heads, active_splits
+        )
+        assert torch.isfinite(partial).all()
+        assert torch.isnan(out_lse).all(), "stage1_only must not write final LSE"
+        merged_base_e = torch.logsumexp(
+            torch.where(partial == -1e30, -torch.inf, partial * math.log(2)), dim=-1
+        )
+        torch.testing.assert_close(
+            merged_base_e / math.log(2), reference_lse, atol=2e-2, rtol=2e-2
+        )
+        partials.append(partial.clone())
+    assert torch.equal(partials[0], partials[1])
+
+
+@pytest.mark.parametrize("use_prefill", [False, True])
+@pytest.mark.parametrize("surface", ["wrapper", "facade"])
+def test_nvfp4_sparse_mla_lse_scale_wrapper_buffer(monkeypatch, use_prefill, surface):
+    """The shared wrapper forwards scale to native stores in the caller's LSE buffer."""
+    _require_sm120()
+    from flashinfer.mla import _core
+    from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _prepared
+
+    # Each forced dispatch needs a fresh plan, independent of earlier tests.
+    monkeypatch.setattr(_prepared, "_functional_plans", {})
+    num_tokens = 65 if use_prefill else 3
+    q, cache, indices, lengths, sink, reference, reference_lse = _nvfp4_lse_case(
+        num_tokens, 16, 128, True
+    )
+    variant = (
+        plan_mod.NVFP4KernelVariant.PREFILL_STREAMING
+        if use_prefill
+        else plan_mod.NVFP4KernelVariant.DECODE_SPLITK
+    )
+    # Pin only the planner decision so cached calibration cannot skip either native path.
+    monkeypatch.setattr(
+        plan_mod,
+        "plan_nvfp4_sparse_mla_sm120",
+        lambda *args, **kwargs: plan_mod.NVFP4PlannedCall(
+            variant, 0 if use_prefill else 2
+        ),
+    )
+    runner = flashinfer.mla.SparseMLASm120Wrapper(
+        kv_cache_format="nvfp4", device=q.device
+    )
+    caller_lse = torch.full((num_tokens + 1, 16), 12345.0, device=q.device)
+    output = torch.empty_like(q)
+    workspace = torch.empty(4 << 20, dtype=torch.uint8, device=q.device)
+    results = []
+    for scale in (None, 1.0, math.log(2)):
+        scale_kwargs = {} if scale is None else {"lse_scale": scale}
+        if surface == "wrapper":
+            returned = runner.run(
+                q,
+                cache,
+                indices,
+                output,
+                512**-0.5,
+                topk_length=lengths,
+                attn_sink=sink,
+                out_lse=caller_lse,
+                return_lse=True,
+                **scale_kwargs,
+            )
+        else:
+            caller_view = caller_lse[:num_tokens]
+            output_view = output.unsqueeze(1)
+            returned_output, returned = _core._trtllm_batch_decode_sparse_mla_sm120(
+                query=q.unsqueeze(1),
+                kv_cache=cache,
+                workspace_buffer=workspace,
+                sparse_mla_segments=[_core._SparseMLASegment(indices, lengths)],
+                out=output_view,
+                sm_scale=512**-0.5,
+                sinks=sink,
+                lse=caller_view,
+                return_lse=True,
+                lse_scale=1.0 if scale is None else scale,
+                kv_scale_format="auto",
+                kv_cache_format="nvfp4",
+            )
+            assert returned_output is output_view
+            assert returned is caller_view
+        assert returned.data_ptr() == caller_lse.data_ptr()
+        assert returned.shape == (num_tokens, 16)
+        assert torch.equal(caller_lse[-1], torch.full_like(caller_lse[-1], 12345.0))
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(
+            returned,
+            reference_lse * (1.0 if scale is None else scale),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        results.append((output.clone(), returned.clone()))
+    assert torch.equal(results[0][1], results[1][1])
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][0], results[2][0])
+
+
+def test_nvfp4_sparse_mla_lse_scale_calibration_native_calls():
+    """Fresh calibration closures launch both native signatures with identity scale."""
+    _require_sm120()
+    from types import SimpleNamespace
+    from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
+        get_sparse_mla_nvfp4_sm120_module,
+    )
+    from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4_policy import (
+        _make_calibration_calls,
+    )
+
+    q, cache, indices, _, _, _, _ = _nvfp4_lse_case(2, 16, 128, False)
+    native = get_sparse_mla_nvfp4_sm120_module()
+    results = []
+
+    def decode(*args):
+        assert args[-1] == 1.0
+        native.sparse_mla_sm120_nvfp4_decode(*args)
+        results.append((args[5].clone(), args[6].clone()))
+
+    def prefill(*args):
+        assert args[-1] == 1.0
+        native.sparse_mla_sm120_nvfp4_prefill(*args)
+        results.append((args[3].clone(), args[4].clone()))
+
+    build_decode, run_prefill = _make_calibration_calls(
+        module=SimpleNamespace(
+            sparse_mla_sm120_nvfp4_decode=decode,
+            sparse_mla_sm120_nvfp4_prefill=prefill,
+        ),
+        device=q.device,
+        num_tokens=2,
+        num_heads=16,
+        topk=128,
+        primary_cache=cache,
+        extra_topk=0,
+        extra_cache=None,
+        has_topk_length=True,
+        has_extra_topk_length=False,
+        has_attn_sink=True,
+    )
+    build_decode(2)(indices, None)
+    run_prefill(indices, None)
+    assert len(results) == 2
+    torch.testing.assert_close(results[0][0], results[1][0], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(results[0][1], results[1][1], atol=2e-2, rtol=2e-2)

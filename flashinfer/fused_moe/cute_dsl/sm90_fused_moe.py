@@ -41,6 +41,7 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     moe_unpermute,
+    SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
     validate_cute_dsl_moe_swiglu_config,
@@ -303,11 +304,10 @@ def cute_dsl_fused_moe_bf16(
         * Parallelism: TP by weight shapes; EP via ``num_local_experts`` +
           ``local_expert_offset`` (tokens routed entirely outside the local
           shard contribute zeros).
-        * Shapes: ``hidden % 64 == 0`` (GEMM1's reduction moves whole
-          64-element K tiles), ``I % 32 == 0`` for gated activations (weight
-          interleave; GEMM1's N is ``2I``) and ``I % 64 == 0`` for ``Relu2``
-          (GEMM1's N is ``I``, walked in 64-column tiles); GEMM2's K tail is
-          zero-filled by TMA; ``num_tokens == 0`` is supported.
+        * Shapes: ``hidden % 8 == 0``; ``I % 32 == 0`` for gated activations
+          (32-column up/gate interleave), ``I % 8 == 0`` for ``Relu2``;
+          partial last K and N tiles are handled; ``num_tokens == 0`` is
+          supported.
         * Execution: CUDA-graph capturable; PDL on by default; fused
           finalize (default) is atomic and not bitwise-reproducible —
           ``use_fused_finalize=False`` selects the deterministic path.
@@ -376,7 +376,11 @@ def cute_dsl_fused_moe_bf16(
     """
     if num_local_experts is None:
         num_local_experts = num_experts
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, _ = normalize_cute_dsl_moe_activation_type(
+        activation_type,
+        SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
+        backend="the SM90 CuTe-DSL MoE",
+    )
     validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
@@ -495,7 +499,11 @@ class CuteDslBf16MoEWrapper:
             situ_linear_beta: Optional SiTU tanh clamp of the up branch
                 (requires ``situ_beta``).
         """
-        activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation, _ = normalize_cute_dsl_moe_activation_type(
+            activation_type,
+            SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
+            backend="the SM90 CuTe-DSL MoE",
+        )
         validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)

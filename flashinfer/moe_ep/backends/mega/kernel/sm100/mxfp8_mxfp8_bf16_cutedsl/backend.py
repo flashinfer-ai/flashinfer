@@ -13,17 +13,26 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import mxfp8_cutedsl_runtime_requirements
+from ..genphase_config import GenphaseConfigMixin
+
 from ......core.validation.common import (
+    MoEEpArchError,
+    MoEEpConfigError,
     validate_mega_arch,
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
 from .config import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-from .staging import stage_mega_moe_inputs, validate_mxfp8_forward_inputs
+from .staging import (
+    stage_genphase_inputs,
+    stage_mega_moe_inputs,
+    validate_genphase_forward_inputs,
+    validate_mxfp8_forward_inputs,
+)
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
@@ -45,15 +54,49 @@ def _resolve_gate_up_clamp(
 @register_mega_kernel(
     "sm100_mxfp8_mxfp8_bf16_cutedsl", deprecated_aliases=("mxfp8_cutedsl",)
 )
-class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
+    _config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     supports_output_view = True
 
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        """Validate pipeline options and initialize deferred tuning state."""
         super().__init__(config)
+        if (
+            config.activation != "swiglu"
+            or config.swiglu_alpha is not None
+            or (
+                config.kernel_variant != "genphase"
+                and not config.apply_routing_weights_before_fc2
+            )
+        ):
+            raise MoEEpConfigError(
+                "Activation controls and late routing weights require "
+                "kernel_name='sm100_mxfp8_mxfp8_bf16_cutedsl_next'."
+            )
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
-        # knobs="auto": tune at the first compute() (weights + staged inputs
-        # exist there), then keep the winner for the session.
-        self._autotune_pending = config.knobs == "auto"
+        if config.kernel_variant not in ("inference", "genphase"):
+            raise MoEEpConfigError(
+                f"unsupported kernel_variant {config.kernel_variant!r}"
+            )
+        if config.kernel_variant == "genphase":
+            self._init_genphase_config()
+        elif (
+            config.mma_tiler_mnk is not None
+            or config.cluster_shape_mn is not None
+            or config.schedule_policy is not None
+        ):
+            raise MoEEpConfigError(
+                "mma_tiler_mnk/cluster_shape_mn/schedule_policy require "
+                "kernel_variant='genphase'; "
+                "use knobs for the inference pipeline."
+            )
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
+        # Legacy inference tunes at the first compute(). GenPhase uses the
+        # workspace's v2 selection state.
+        self.supports_auto_workspaces = config.kernel_variant == "genphase"
+        self._autotune_pending = (
+            config.knobs == "auto" and not self.supports_auto_workspaces
+        )
         if self._autotune_pending:
             import warnings
 
@@ -67,12 +110,61 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 stacklevel=3,
             )
 
+    def coordinate_workspace_replacement(self, workspace):
+        if not self.supports_auto_workspaces:
+            return False
+        from ..automatic import coordinate_workspace_replacement
+
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(self, workspace=None):
+        if not self.supports_auto_workspaces:
+            return super().get_tuned_knobs(workspace)
+        from ..automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
+
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_mxfp8_mxfp8_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return mxfp8_cutedsl_runtime_requirements(bootstrap)
+
+    def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
+        """List cached GenPhase profiles when no explicit knob constraints apply."""
+        if self._kernel_config.kernel_variant != "genphase":
+            return super().live_token_buckets(fleet_params)
+        if (
+            self._kernel_config.knobs is not None
+            or self._genphase_constraints()
+            or not torch.cuda.is_available()
+        ):
+            return []
+        from ......kernel_src.sm100.next_cutedsl_megamoe import (
+            genphase_live_token_buckets,
+        )
+
+        return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
+
+    def _workspace_pool_request(self, fleet_params):
+        """Return a pool key and allocator; mutable auto workspaces stay unpooled."""
+        if self._kernel_config.kernel_variant != "genphase":
+            return super()._workspace_pool_request(fleet_params)
+        if self._kernel_config.knobs == "auto":
+            return None
+        from ......kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseSymmBuffer
+
+        config = self._genphase_config(fleet_params)
+        self._check_genphase_selection(config)
+        key = (
+            self.kernel_name(),
+            torch.cuda.current_device(),
+            id(self._ep_comm_group),
+            "genphase",
+            config,
+        )
+        return key, lambda: Sm100GenphaseSymmBuffer(config)
 
     def validate_init(
         self,
@@ -89,12 +181,28 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             # the binding bound is TMA row alignment, not the dg SF word.
             alignment=64,
         )
+        if self._kernel_config.kernel_variant == "genphase":
+            if torch.cuda.is_available():
+                cc = torch.cuda.get_device_capability()
+                if cc not in ((10, 0), (10, 3)):
+                    raise MoEEpArchError(
+                        f"Blackwell GenPhase requires SM100/103; got {cc}."
+                    )
+            self._genphase_config(fleet_params)
 
     def preprocess_weights(
         self,
         weights: MoEWeightPack,
         fleet_params: FleetParams,
     ) -> TransformedMegaWeights:
+        if self._kernel_config.kernel_variant == "genphase":
+            return preprocess_mega_weights(
+                weights,
+                intermediate_size=self._kernel_config.intermediate_size,
+                hidden_size=fleet_params.token_hidden_size,
+                kind=self._kernel_config.kind,
+                kernel_variant="genphase",
+            )
         return preprocess_mega_weights(
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
@@ -110,6 +218,20 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
+        if self._kernel_config.kernel_variant == "genphase":
+            from ......kernel_src.sm100.next_cutedsl_megamoe import (
+                validate_genphase_weights,
+            )
+
+            try:
+                validate_genphase_weights(
+                    transformed_weights,
+                    self._genphase_config(fleet_params),
+                    torch.device("cuda", torch.cuda.current_device()),
+                )
+            except ValueError as exc:
+                raise MoEEpConfigError(str(exc)) from exc
+            return
         validate_transformed_mega_weights(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
@@ -119,14 +241,47 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import (
+        """Allocate the selected pipeline's workspace collectively on the EP group."""
+        if self._kernel_config.kernel_variant == "genphase":
+            from ......kernel_src.sm100.next_cutedsl_megamoe import (
+                Sm100GenphaseSymmBuffer,
+            )
+
+            config = self._genphase_config(fleet_params)
+            self._check_genphase_selection(config)
+            return Sm100GenphaseSymmBuffer(config)
+        from ......kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_mxfp8_mega_moe,
         )
 
         k = self._kernel_config
+        kind = k.kind
+        if kind == "mxfp4_mxfp8":
+            raise MoEEpConfigError(
+                "Mixed MXFP4/MXFP8 requires kernel_variant='genphase'."
+            )
         fp = fleet_params
-        return get_symm_buffer_for_mxfp8_mega_moe(
+        workspace = get_symm_buffer_for_mxfp8_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
             k.top_k,
@@ -134,12 +289,32 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
-            kind=k.kind,
+            kind=kind,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            use_persistent_finalize_kernel=k.resolved_finalize_mode
+            is FinalizeMode.PERSISTENT,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            num_valid_tokens_tensor=k.num_valid_tokens_tensor,
+            knobs=self._workspace_knobs(fleet_params),
         )
+        if k.finalize_mode is FinalizeMode.NONE:
+            workspace._unfinalized_route_map = torch.arange(
+                fp.max_tokens_per_rank * k.top_k,
+                dtype=torch.int32,
+                device=workspace.topk_idx.device,
+            ).view(fp.max_tokens_per_rank, k.top_k)
+            # The kernel folds routing weights into FC1.
+            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
+        return workspace
+
+    def validate_capture_ready(self, workspace, transformed_weights):
+        if (
+            self._kernel_config.kernel_variant == "genphase"
+            and workspace._compiled is None
+        ):
+            raise MoEEpConfigError("Warm up GenPhase before CUDA graph capture")
 
     def validate_forward(
         self,
@@ -148,6 +323,16 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        """Check activation and routing layouts for the selected kernel variant."""
+        if self._kernel_config.kernel_variant == "genphase":
+            validate_genphase_forward_inputs(
+                t,
+                fleet_params,
+                top_k=self._kernel_config.top_k,
+                quantize_input=quantize_input,
+                kind=self._kernel_config.kind,
+            )
+            return
         validate_mxfp8_forward_inputs(
             t.hidden_states,
             t.topk_ids,
@@ -166,6 +351,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        if self._kernel_config.kernel_variant == "genphase":
+            stage_genphase_inputs(t, workspace, quantize_input=quantize_input)
+            return
         num_tokens = t.hidden_states.shape[0]
         if quantize_input:
             stage_mega_moe_inputs(
@@ -180,7 +368,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-            from ......kernel_src.cutedsl_megamoe import (
+            from ......kernel_src.sm100.cutedsl_megamoe import (
                 Mxfp8BlockSize,
                 ceil_div,
                 round_up,
@@ -207,7 +395,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
-            from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+            from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
@@ -218,8 +406,37 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
+        """Launch staged inputs, tuning once first when explicitly requested.
 
+        All EP ranks must enter the initial auto sweep together outside graph
+        capture. With ``output=None``, the result borrows workspace storage.
+        """
+        if self._kernel_config.kernel_variant == "genphase":
+            from ......kernel_src.sm100.next_cutedsl_megamoe import (
+                sm100_genphase_mega_moe,
+            )
+
+            num_tokens = (
+                output.shape[0] if output is not None else workspace.staged_tokens()
+            )
+            from ..automatic import prepare_auto_configuration
+
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, output, num_tokens
+            )
+            view = sm100_genphase_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=num_tokens,
+                fast_math=self._kernel_config.fast_math,
+            )
+            return output if output is not None else view
+        from ......kernel_src.sm100.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
+
+        if self.supports_unfinalized_output:
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -240,9 +457,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from ......kernel_src.cutedsl_megamoe import autotune_mxfp8_mega_moe
+            from ......kernel_src.sm100.cutedsl_megamoe import autotune_mxfp8_mega_moe
 
-            autotune_mxfp8_mega_moe(
+            self._autotune_winner = autotune_mxfp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
@@ -269,15 +486,68 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         # ordering (valid until the next launch on this session's buffers).
         return output if output is not None else view
 
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEMxfp8Inputs,
+            staged_tokens,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        num_tokens = staged_tokens(workspace.topk_idx)
+        if num_tokens is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        clamp = _resolve_gate_up_clamp(self._kernel_config)
+        if clamp is not None:
+            workspace._frontend.set_gate_up_clamp(clamp)
+        # Launch the full padded buffer even when this rank has no live tokens.
+        workspace._frontend.run(
+            MegaMoEMxfp8Inputs(
+                activation=workspace.x,
+                activation_sf=workspace.x_sf,
+                topk_idx=workspace.topk_idx,
+                topk_weights=workspace.topk_weights,
+                fc1_weight=transformed_weights[0][0],
+                fc1_weight_sf=transformed_weights[0][1],
+                fc2_weight=transformed_weights[1][0],
+                fc2_weight_sf=transformed_weights[1][1],
+                output_activation=workspace.output_activation,
+                num_valid_tokens=workspace.num_valid_tokens,
+            ),
+            num_tokens=None,
+            sync=False,
+        )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        return (
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
+            workspace._unfinalized_weights[:num_tokens],
+            workspace._unfinalized_route_map[:num_tokens],
+        )
+
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        """Key immutable workspace configurations; return None for auto tuning."""
         k = self._kernel_config
+        if k.kernel_variant == "genphase":
+            if k.knobs == "auto":
+                return None
+            return (
+                self.kernel_name(),
+                torch.cuda.current_device(),
+                id(self._ep_comm_group),
+                "genphase",
+                self._genphase_config(fleet_params),
+            )
         if k.knobs == "auto":
             # Autotune retunes (and recompiles) the workspace's shared
             # frontend at first compute; give each session its own buffer.
             return None
-        import torch
-
-        from ......core.kernel.workspace_pool import knobs_pool_key
+        from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 
         fp = fleet_params
         return (
@@ -294,7 +564,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.kind,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
-            knobs_pool_key(k.knobs),
+            k.resolved_finalize_mode,
+            epilogue_pool_key(k.num_valid_tokens_tensor),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace) -> None:
@@ -305,7 +577,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

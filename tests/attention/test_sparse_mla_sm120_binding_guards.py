@@ -53,6 +53,7 @@ def _decode_dsv4(module, q, cache, idx, mid, mlse, out, lse, splits, cpb):
         1,  # DSV4
         cpb,
         False,
+        1.0,
     )
 
 
@@ -95,7 +96,20 @@ def test_decode_dsv3_2_cpb_override_out_of_int_range_rejected():
     q, cache, idx, mid, mlse, out, lse = _glm53_decode_case(1, 8, 2176, 34)
     with pytest.raises(RuntimeError, match="chunks_per_block_override"):
         module.sparse_mla_sm120_decode_dsv3_2(
-            q, cache, idx, mid, mlse, out, lse, 34, 512**-0.5, None, None, 3, 2**31 + 8
+            q,
+            cache,
+            idx,
+            mid,
+            mlse,
+            out,
+            lse,
+            34,
+            512**-0.5,
+            None,
+            None,
+            3,
+            2**31 + 8,
+            1.0,
         )
 
 
@@ -128,6 +142,7 @@ def test_nvfp4_decode_cpb_out_of_int_range_rejected():
             None,
             2**31 + 8,
             False,
+            1.0,
         )
 
 
@@ -178,7 +193,7 @@ def test_decode_dsv3_2_num_splits_must_cover_chunk_plan():
     q, cache, idx, mid, mlse, out, lse = _glm53_decode_case(1, 8, 2176, 4)
     with pytest.raises(RuntimeError, match="num_splits"):
         module.sparse_mla_sm120_decode_dsv3_2(
-            q, cache, idx, mid, mlse, out, lse, 4, 512**-0.5, None, None, 3, 1
+            q, cache, idx, mid, mlse, out, lse, 4, 512**-0.5, None, None, 3, 1, 1.0
         )
 
 
@@ -216,6 +231,7 @@ def test_nvfp4_decode_two_split_merge_epilogue():
         None,
         1,
         False,
+        1.0,
     )
     reference, reference_lse = _reference_sparse_attention(
         _dequantize_nvfp4_query(q), _dequantize_nvfp4_cache(cache), indices, 512**-0.5

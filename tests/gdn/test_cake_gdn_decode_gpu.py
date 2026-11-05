@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -147,8 +148,8 @@ def _reference(
     return out.unsqueeze(1).to(torch.bfloat16).contiguous(), state.contiguous()
 
 
-def _load(batch_size: int):
-    route = cake_gdn.select_cake_gdn_decode_variant(
+def _route(batch_size: int):
+    return cake_gdn.select_cake_gdn_decode_variant(
         arch=_arch(),
         batch_size=batch_size,
         io_dtype="bfloat16",
@@ -162,6 +163,10 @@ def _load(batch_size: int):
         seq_len=1,
         use_qk_l2norm=True,
     )
+
+
+def _load(batch_size: int):
+    route = _route(batch_size)
     return route, cake_gdn.load_cake_gdn_kernel(route.variant_name, _arch())
 
 
@@ -323,6 +328,8 @@ def _launch_prefill(
         0,
         _SCALE,
         4,
+        # Launch ABI v2: total_tokens (4 sequences of 64) after num_seqs.
+        4 * 64,
         4,
         num_v_heads,
         total_tiles,
@@ -340,7 +347,11 @@ def _launch(
     state: torch.Tensor | None = None,
     grid_x: int | None = None,
 ) -> None:
-    blocks_per_state = 8 if batch_size < 32 else 1
+    # The grid is ``blocks_per_state`` CTAs per state head; the count is the selected
+    # record's (the CC 10.7 small band runs the four-CTA body), never re-derived here.
+    blocks_per_state = cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+        _route(batch_size).variant_name
+    )
     entry(
         tensors["q"],
         tensors["k"],
@@ -930,17 +941,11 @@ def _launch_bf16_serving(
     batch_size: int,
     num_q_heads: int,
     num_v_heads: int,
+    route_id: str,
 ) -> None:
-    state_heads = batch_size * num_v_heads
-    tile_v = (
-        16
-        if num_q_heads == 4 and num_v_heads == 8
-        else 128
-        if state_heads >= 1024
-        else 64
-        if state_heads >= 512
-        else 32
-    )
+    # The grid is ``V / TILE_V`` CTAs per state head; the tile is the selected
+    # route's (the T=1 band rule and the MTP rule differ), never re-derived here.
+    tile_v = cake_gdn.cake_gdn_bf16_route_tile_v(route_id)
     cache = tensors["intermediate_state"]
     entry(
         tensors["q"],
@@ -961,14 +966,20 @@ def _launch_bf16_serving(
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 32])
+# B 1 / 20: small band (mid4 on sm_107a); 21 / 31: the upper small band (the TMA-state
+# hqsplit_tma3 body on sm_107a, the small body elsewhere); 32 .. 64: the large band (the
+# TMA-state hqsplit_tma3 body on sm_107a, the large body elsewhere).
+@pytest.mark.parametrize("batch_size", [1, 20, 21, 31, 32, 34, 35, 37, 64])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
     expected_out, expected_state = _reference(tensors, initial_state)
     route, entry = _load(batch_size)
-    assert route.route_id.endswith(
-        "nontranspose_small" if batch_size < 32 else "nontranspose_large"
+    band = "small" if batch_size < 32 else "large"
+    assert f"nontranspose_{band}" in route.route_id
+    assert (
+        route.route_id
+        == cake_gdn.cake_gdn_nontranspose_fp32_t1_route(batch_size, _arch())[1]
     )
 
     stream = torch.cuda.Stream()
@@ -1008,6 +1019,146 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
     torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
 
 
+def _require_tma_state_route(batch_size: int):
+    route, entry = _load(batch_size)
+    record = cake_gdn._kernel_record(route.variant_name)
+    if record["tma_abi"] != "grid_constant":
+        pytest.skip(f"{_arch()} runs no TMA-state nontranspose record")
+    return route, entry
+
+
+def test_tma_state_decode_graph_replays_the_state_each_capture_saw() -> None:
+    # The TMA-state body takes the state as a by-value tensor map encoded per call: a graph
+    # captured on one state tensor replays on that tensor, a second capture on another state
+    # tensor replays on its own, and neither replay touches the other tensor.
+    batch_size = 64
+    _require_tma_state_route(batch_size)
+    _, entry = _load(batch_size)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    other = (torch.randn_like(initial) * 0.01).contiguous()
+    other_initial = other.clone()
+    expected_out, expected_state = _reference(tensors, initial)
+    _, expected_other = _reference(tensors, other_initial)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _launch(entry, tensors, batch_size)
+        _launch(entry, tensors, batch_size, state=other)
+    stream.synchronize()
+    tensors["state"].copy_(initial)
+    other.copy_(other_initial)
+    first, second = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(first, stream=stream):
+        _launch(entry, tensors, batch_size)
+    with torch.cuda.graph(second, stream=stream):
+        _launch(entry, tensors, batch_size, state=other)
+    first.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+    assert torch.equal(other, other_initial)
+    after_first = tensors["state"].clone()
+    second.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(other, expected_other, atol=1e-3, rtol=1e-3)
+    assert torch.equal(tensors["state"], after_first)
+
+
+def test_tma_state_decode_refuses_a_misaligned_state_before_launch() -> None:
+    # The tensor map needs a 16-byte aligned base address: a contiguous state view at a
+    # 4-byte offset is refused by the host shim, the state is left untouched and the
+    # stream stays usable.
+    batch_size = 64
+    _require_tma_state_route(batch_size)
+    _, entry = _load(batch_size)
+    tensors = _make_inputs(batch_size)
+    numel = tensors["state"].numel()
+    flat = torch.zeros(numel + 4, device=tensors["state"].device, dtype=torch.float32)
+    misaligned = flat[1 : 1 + numel].view_as(tensors["state"])
+    misaligned.copy_(tensors["state"])
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+    before = misaligned.clone()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _launch(entry, tensors, batch_size, state=misaligned)
+    torch.cuda.synchronize()
+    assert torch.equal(misaligned, before)
+    initial = tensors["state"].clone()
+    expected_out, expected_state = _reference(tensors, initial)
+    _launch(entry, tensors, batch_size)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+# B 21: formerly the mid4_rc_kq128 twin; B 32: formerly the tilev32_x2 twin; B 64:
+# formerly the hqsplit twin.
+@pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
+@pytest.mark.parametrize("batch_size", [21, 32, 64])
+def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma(
+    batch_size: int, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No sm_107a record from 21 rows on runs a state whose base is not 16-byte aligned: the
+    # pointer twins it replaces move the state with 16-byte vector loads and stores (a
+    # misaligned-address fault), and the TMA-state record needs an aligned tensor-map
+    # base.  Through the public API the misaligned call is refused before launch with
+    # the state untouched; the same call on an aligned state runs the TMA-state record
+    # and matches a direct launch of that record bit for bit.
+    route, entry = _require_tma_state_route(batch_size)
+    selected: list[str] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        selected.append(chosen.variant_name)
+        return chosen
+
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    numel = initial.numel()
+
+    def call(state: torch.Tensor) -> None:
+        public_nontranspose_decode(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            state=state,
+            A_log=tensors["A_log"],
+            a=tensors["a"],
+            dt_bias=tensors["dt_bias"],
+            b=tensors["b"],
+            output=tensors["out"],
+            backend=backend,
+        )
+
+    for offset in (1, 2, 3):
+        flat = torch.zeros(numel + 4, device=initial.device, dtype=torch.float32)
+        misaligned = flat[offset : offset + numel].view_as(initial)
+        misaligned.copy_(initial)
+        assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            call(misaligned)
+        torch.cuda.synchronize()
+        assert torch.equal(misaligned, initial)
+    assert selected == [route.variant_name] * 3
+
+    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
+    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
+    tensors["out"].zero_()
+    call(tensors["state"])
+    torch.cuda.synchronize()
+    assert selected[-1] == route.variant_name
+    assert cake_gdn._kernel_record(route.variant_name)["tma_abi"] == "grid_constant"
+    assert torch.equal(tensors["out"], direct["out"])
+    assert torch.equal(tensors["state"], direct["state"])
+    expected_out, expected_state = _reference(tensors, initial)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize(
     (
         "batch_size",
@@ -1032,6 +1183,20 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
         (8, 4, 4, 8, True, True, 4, False),
         (8, 2, 16, 64, True, False, 0, True),
         (8, 4, 16, 64, True, False, 5, True),
+        # Qwen3.5 per-rank T=1 serving geometries at SGLang graph batch sizes
+        # (one row per grid tile of the state-head rule: 16 / 32 / 64 / 128).
+        (1, 1, 16, 32, True, False, 0, False),
+        (16, 1, 16, 32, True, False, 0, False),
+        (64, 1, 16, 32, True, False, 0, True),
+        (2, 1, 8, 16, True, False, 0, False),
+        (48, 1, 8, 16, True, False, 0, False),
+        (3, 1, 4, 8, True, False, 0, False),
+        (8, 1, 8, 32, True, False, 0, False),
+        (24, 1, 8, 32, True, False, 0, True),
+        (4, 1, 4, 16, True, False, 0, False),
+        (128, 1, 4, 16, True, False, 0, False),
+        (1, 1, 2, 8, True, False, 0, False),
+        (96, 1, 2, 8, True, False, 0, False),
     ],
 )
 def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
@@ -1080,6 +1245,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
             batch_size=batch_size,
             num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
+            route_id=route.route_id,
         )
     stream.synchronize()
 
@@ -1109,14 +1275,21 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "num_q_heads", "num_v_heads", "pack_gates"),
+    ("batch_size", "num_q_heads", "num_v_heads", "pack_gates", "seq_len"),
     [
-        (8, 16, 64, True),
-        (8, 16, 32, False),
-        (2, 4, 8, False),
-        (3, 4, 8, False),
-        (5, 4, 8, False),
-        (8, 4, 8, False),
+        (8, 16, 64, True, 4),
+        (8, 16, 32, False, 4),
+        (2, 4, 8, False, 4),
+        (3, 4, 8, False, 4),
+        (5, 4, 8, False, 4),
+        (8, 4, 8, False, 4),
+        # Qwen3.5-35B-A3B TP=2 verify windows (tile16 records specialized to T=7 / T=8)
+        (1, 8, 16, False, 7),
+        (4, 8, 16, False, 7),
+        (1, 8, 16, False, 8),
+        # wide rows (TILE_V_WIDE 32 / 64; the `wide128_vpre` records on sm_107a)
+        (5, 8, 16, False, 7),
+        (8, 16, 64, True, 3),
     ],
 )
 def test_exported_bf16_verify_is_cuda_graph_safe(
@@ -1124,8 +1297,9 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
     num_q_heads: int,
     num_v_heads: int,
     pack_gates: bool,
+    seq_len: int,
 ) -> None:
-    seq_len, cache_steps = 4, 4
+    cache_steps = seq_len
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
         seq_len=seq_len,
@@ -1143,7 +1317,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
     assert isinstance(out, torch.Tensor)
     assert isinstance(cache, torch.Tensor)
     backing_before = backing.clone()
-    _, entry = _load_bf16_serving(
+    route, entry = _load_bf16_serving(
         batch_size=batch_size,
         seq_len=seq_len,
         num_q_heads=num_q_heads,
@@ -1160,6 +1334,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
             batch_size=batch_size,
             num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
+            route_id=route.route_id,
         )
     stream.synchronize()
     eager_out = out.clone()
@@ -1175,6 +1350,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
             batch_size=batch_size,
             num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
+            route_id=route.route_id,
         )
     graph.replay()
     stream.synchronize()
@@ -1515,7 +1691,7 @@ def test_public_cake_gdn_fp32_mtp_verify_is_cuda_graph_safe():
     )
 
 
-@pytest.mark.parametrize("batch_size", (1, 32))
+@pytest.mark.parametrize("batch_size", (1, 24, 32))
 def test_public_cake_gdn_fp32_nontranspose_t1_matches_independent_recurrence_on_stream(
     batch_size,
 ):
@@ -1725,6 +1901,7 @@ def test_public_cake_gdn_decode_invalid_cuda_slots_fail_in_isolated_process(case
         capture_output=True,
         text=True,
         timeout=120,
+        env={**os.environ, "FLASHINFER_CAKE_GDN_VALIDATE_SLOTS": "1"},
     )
     combined = completed.stdout + completed.stderr
     device_asserted = any(

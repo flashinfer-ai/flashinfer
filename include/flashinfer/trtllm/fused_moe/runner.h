@@ -173,7 +173,11 @@ enum class ActivationType : int64_t {
   GegluTanh = 8,
   Identity = 9,
   Situ = 10,
-  InvalidType = 11,  // Must be last
+  InvalidType = 11,  // Must be last among the normally-sequential members
+  // CUTLASS-backend only. Keep these after InvalidType so the existing values
+  // consumed by the TRT-LLM backend remain stable.
+  ClampedRelu2 = 12,
+  PowLU = 13,
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -200,6 +204,10 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "GegluTanh";
     case ActivationType::Situ:
       return "Situ";
+    case ActivationType::ClampedRelu2:
+      return "ClampedRelu2";
+    case ActivationType::PowLU:
+      return "PowLU";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -209,7 +217,8 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ ||
+         activationType == ActivationType::PowLU;
 }
 
 }  // namespace MoE
@@ -399,6 +408,11 @@ struct MoERunnerArgs {
 
   // finalize
   bool do_finalize{true};
+
+  // 4over6 recipe for the per-token GEMM2-input requantization, as the code
+  // decoded by resolveNVFP4Recipe() (nvfp4Recipe.h). The default
+  // (kNVFP44Over6FromEnv) reads FLASHINFER_NVFP4_4OVER6* on every launch.
+  int64_t nvfp4_4over6_code{-1};
 };
 
 struct MoEWorkspace {
@@ -459,6 +473,10 @@ struct MoEConfig {
   int64_t gemm2Config;
 };
 
+// GEMM1 / GEMM2 stages of the fused-MoE runner (trtllm-gen batched GEMM).
+using Gemm1Runner = PermuteGemm1::Runner;
+using Gemm2Runner = Gemm2::Runner;
+
 class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
@@ -508,8 +526,8 @@ class Runner {
   bool mUsePerTokenScalingGemm2;
   bool mUsePerChannelScalingGemm1;
   bool mUsePerChannelScalingGemm2;
-  PermuteGemm1::Runner mPermuteGemm1;
-  Gemm2::Runner mGemm2;
+  Gemm1Runner mPermuteGemm1;
+  Gemm2Runner mGemm2;
 
   // This will be the cartesian product of the passing configs for gemm1 and gemm2
   // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2

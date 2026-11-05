@@ -12,10 +12,9 @@ so its first-touch compile cluster (~4.6s per unique URI) dominated the
 previous single-file wall time.  Isolating it lets that cluster run
 concurrently instead of serialized with every other decode case.
 
-The parametrize matrix below is identical to the original
-``test_trtllm_batch_decode`` except ``backend`` is restricted to
-``["xqa"]``.  ``_test_trtllm_batch_decode`` and all helpers continue to
-live in the decode file and are imported here.
+The parameter matrix below includes only configurations supported by XQA.
+``_test_trtllm_batch_decode`` and all helpers continue to live in the decode
+file and are imported here.
 """
 
 import pytest
@@ -23,58 +22,56 @@ import pytest
 from tests.attention.test_trtllm_gen_attention_decode import (
     _test_trtllm_batch_decode,
 )
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 pytestmark = pytest.mark.long_running
 
 
-@pytest.mark.parametrize("backend", ["xqa"])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 2, 64, 2, 5),
-        (4, 3, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (4, 5, 64, 4, 8),
-        (128, 1, 64, 2, 5),
-        (128, 2, 32, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (128, 5, 16, 2, 5),
-        (256, 1, 64, 4, 8),
-        (256, 2, 16, 2, 8),
-        (256, 3, 64, 4, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
-    ],
+@parametrize_product(
+    {
+        "backend": ["xqa"],
+        "kv_layout": ["HND", "NHD"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 2, 64, 2, 5),
+            (4, 3, 32, 2, 5),
+            (4, 3, 64, 2, 1),
+            (4, 4, 64, 4, 1),
+            (4, 5, 64, 4, 8),
+            (128, 1, 64, 2, 5),
+            (128, 2, 32, 4, 1),
+            (128, 3, 16, 4, 8),
+            (128, 4, 16, 2, 5),
+            (128, 5, 16, 2, 5),
+            (256, 1, 64, 4, 8),
+            (256, 2, 16, 2, 8),
+            (256, 3, 64, 4, 5),
+            (256, 4, 32, 2, 8),
+            (256, 5, 32, 2, 1),
+        ],
+        "window_left": [-1, 127],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("bf16", "fp8", "bf16"),
+            ("fp16", "fp8", "fp16"),
+            ("bf16", "fp8", "fp8"),
+            ("fp16", "fp8", "fp8"),
+        ],
+        "enable_pdl": [True, False, None],
+        "enable_sink": [True, False],
+        "max_in_kv_len": [110],
+        "head_dim": [128, 256],
+        "non_contiguous_query": [False],
+        "skips_softmax": [False],
+        "uses_shared_paged_kv_idx": [True],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("bf16", "fp8", "fp8"),
-        ("fp16", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("non_contiguous_query", [False, True])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,

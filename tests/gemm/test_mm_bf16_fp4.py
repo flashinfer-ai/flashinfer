@@ -13,6 +13,10 @@ from flashinfer.gemm.gemm_bf16_fp4 import (
     _unswizzle_sf_128x4,
 )
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.w4a16_reference import (
+    assert_w4a16_bits,
+    dense_w4a16_reference,
+)
 
 
 # E2M1 (FP4) value table, signed (codes 0-7 positive, 8-15 negative), matching
@@ -46,7 +50,7 @@ def _dequantize_bf16_fp4_torch(b, b_descale, alpha, n, k, block_size):
 
 # Backends covered by the cross-backend contract tests.  New backends get
 # appended here as they land.
-ALL_BACKENDS = ["cudnn", "cute-dsl"]
+ALL_BACKENDS = ["cudnn", "cute-dsl", "cute-dsl-native"]
 
 
 def _skip_if_backend_unavailable(backend: str) -> None:
@@ -162,6 +166,23 @@ def _assert_close_to_reference(out: torch.Tensor, ref: torch.Tensor, backend: st
     assert cos > 0.999, f"{backend}: cosine similarity {cos:.6f} below 0.999"
 
 
+def _uses_exact_w4a16_reference(backend, device):
+    if backend == "cute-dsl":
+        capability = get_compute_capability(device)
+        if capability in ((10, 0), (10, 3), (10, 7)):
+            # Every SM100-family tactic reduces the full K in one accumulator.
+            return True
+        elif capability in ((11, 0), (12, 0), (12, 1)):
+            # These kernels can select split-K/GEMV and have separate layouts.
+            return False
+        else:
+            raise ValueError(f"Unsupported cute-dsl compute capability {capability}")
+    elif backend in ("cudnn", "cute-dsl-native"):
+        return False
+    else:
+        raise ValueError(f"Unsupported test backend {backend!r}")
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -198,12 +219,11 @@ def _make_random_fp4_weights(
 @pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize("m,n,k", PROBLEM_SIZES)
 def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, k):
-    """Backend output must match a hand-rolled fp32 dequant + matmul.
+    """Backend output must match the reference for its arithmetic contract.
 
-    Reference = ``(a.float() @ dequant(b).T).to(bf16)``.  Every backend
-    is expected to produce numerically equivalent output (up to ~1 bf16
-    ULP).  Run with ``auto_tuning`` both off (fallback tactic) and on
-    (so the autotuner's selected tactic is exercised too).
+    SM100-family CuTe DSL uses the shared bit-exact BF16/FP32 W4A16 oracle;
+    other backends retain their FP32 dequant/matmul accuracy contract. Run
+    with autotuning off and on to cover fallback and selected tactics.
     """
     _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
@@ -215,10 +235,13 @@ def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, 
     with autotune(auto_tuning):
         out = mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
 
-    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
-    ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
-
-    _assert_close_to_reference(out, ref, backend)
+    if _uses_exact_w4a16_reference(backend, device):
+        ref = dense_w4a16_reference(a, b_p, sf_p, alpha_p)
+        assert_w4a16_bits(out, ref)
+    else:
+        weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+        ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
+        _assert_close_to_reference(out, ref, backend)
     assert out.shape == (m, n)
     assert out.dtype == torch.bfloat16
 
@@ -244,7 +267,12 @@ def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
         out_one = mm_bf16_fp4(a, b1, sf1, a1, backend=backend)
         out_none = mm_bf16_fp4(a, b0, sf0, a0, backend=backend)
 
-    torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
+    if _uses_exact_w4a16_reference(backend, device):
+        ref = dense_w4a16_reference(a, b0, sf0, a0)
+        assert_w4a16_bits(out_none, ref)
+        assert_w4a16_bits(out_one, ref)
+    else:
+        torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -275,7 +303,8 @@ def test_backend_out_dtype_override(backend):
 def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     """Every enumerated cute-dsl tactic matches the reference and is
     run-to-run deterministic (the autotuner only exercises the winner).
-    Shapes cover even and uneven K splits plus padded M rows."""
+    SM100-family full-K tactics use zero tolerance; SM12x retains its
+    existing split-K/GEMV accuracy checks. Shapes include K and M tails."""
     _skip_if_backend_unavailable("cute-dsl")
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
         _SM100_BF16_FP4_TACTICS,
@@ -294,8 +323,12 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
         b_fp4, b_sf, alpha, backend="cute-dsl"
     )
 
-    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
-    ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
+    use_exact_reference = _uses_exact_w4a16_reference("cute-dsl", device)
+    if use_exact_reference:
+        ref = dense_w4a16_reference(a, b_p, sf_p, alpha_p)
+    else:
+        weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+        ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
 
     cc_major = get_compute_capability(device)[0]
     if cc_major == 10:
@@ -325,9 +358,13 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
             )
             outs.append(out)
         torch.cuda.synchronize()
-        _assert_close_to_reference(
-            outs[0], ref, f"cute-dsl tactic {tactic_index} {cfg}"
-        )
+        if use_exact_reference:
+            assert_w4a16_bits(outs[0], ref)
+            assert_w4a16_bits(outs[1], ref)
+        else:
+            _assert_close_to_reference(
+                outs[0], ref, f"cute-dsl tactic {tactic_index} {cfg}"
+            )
         assert torch.equal(outs[0], outs[1]), (
             f"tactic {tactic_index} {cfg} is not deterministic across runs"
         )
@@ -461,6 +498,58 @@ def test_cute_dsl_fallback_k_splits_selector():
     assert pick(512, 512, 2048, 84) == 1
 
 
+def test_cute_dsl_sm100_fallback_tactic_selector():
+    """Pin the SM100/103 no-autotune tactic pick on a 148-SM part."""
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _SM100_BF16_FP4_TACTICS,
+        _select_sm100_bf16_fp4_default_tactic,
+    )
+
+    tactics = list(_SM100_BF16_FP4_TACTICS)
+
+    def pick(m, n, sm_count=148):
+        return _select_sm100_bf16_fp4_default_tactic(tactics, m, n, sm_count)
+
+    # The row tile widens with m.
+    assert pick(1, 4096)[0][:2] == (128, 8)
+    assert pick(128, 4096)[0][:2] == (128, 32)
+    assert pick(512, 4096)[0][:2] == (128, 128)
+    assert pick(2048, 4096)[0][:2] == (128, 128)
+    # ...and is monotonically non-decreasing in m, for each projection.
+    for n in (4096, 6656, 19968):
+        widths = [pick(m, n)[0][1] for m in (1, 8, 32, 128, 512, 2048, 4096)]
+        assert widths == sorted(widths), f"n={n} row tiles not monotonic: {widths}"
+
+    # A smaller part fills with fewer tiles and affords a wider one.  Not
+    # monotonic in sm_count though: wave quantization breaks it, e.g. m=512,
+    # n=6656 picks 128 / 64 / 192 rows on 132 / 148 / 188 SMs.
+    assert pick(128, 4096, 78)[0][1] > pick(128, 4096, 264)[0][1]
+
+    # Ties resolve to raster-along-N.
+    assert all(
+        p[2] is False for p in (pick(1, 4096), pick(512, 4096), pick(2048, 6656))
+    )
+
+    # Deterministic, and only ever returns a tactic from the candidate list.
+    assert pick(512, 4096) == pick(512, 4096)
+    assert pick(512, 4096) in tactics
+
+
+def test_cute_dsl_sm100_dense_kernel_uses_opt_level_2():
+    """Pin ``--opt-level 2`` on the SM100/103 dense W4A16 compile.
+
+    The CuTe-DSL default is 3, which is slower for this kernel (nvbug 6661624).
+    Opt levels are numerically identical, so no other test catches a change.
+    """
+    import inspect
+
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _get_sm100_bf16_fp4_kernel
+
+    src = inspect.getsource(_get_sm100_bf16_fp4_kernel)
+    assert "--opt-level 2" in src, "SM100 dense W4A16 must compile at opt-level 2"
+    assert "--opt-level 3" not in src
+
+
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_preallocated_out(backend):
     """Caller-provided out tensor is written in place."""
@@ -482,7 +571,12 @@ def test_backend_preallocated_out(backend):
     )
     assert returned.data_ptr() == out_ptr_before
     ref = mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
-    torch.testing.assert_close(returned, ref, atol=ATOL, rtol=RTOL)
+    if _uses_exact_w4a16_reference(backend, device):
+        expected = dense_w4a16_reference(a, b_p, sf_p, alpha_p)
+        assert_w4a16_bits(returned, expected)
+        assert_w4a16_bits(ref, expected)
+    else:
+        torch.testing.assert_close(returned, ref, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -513,7 +607,7 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
 
     b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cute-dsl")
     major, minor = get_compute_capability(device)
-    if major * 10 + minor in (100, 103):
+    if major * 10 + minor in (100, 103, 107):
         assert b_p.dtype == torch.uint8
         assert b_p.shape == b_fp4.shape
         assert sf_p.data_ptr() == b_sf.data_ptr()

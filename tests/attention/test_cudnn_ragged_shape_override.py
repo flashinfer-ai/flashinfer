@@ -79,6 +79,105 @@ def _cudnn_override_available():
     )
 
 
+@pytest.mark.parametrize("initial_lengths", ["q", "kv", "both", "neither"])
+@pytest.mark.parametrize("length_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("causal", [False, True])
+def test_ragged_mask_lengths_survive_replan(
+    initial_lengths, length_device, length_dtype, causal
+):
+    """Fresh length tensors and explicit/inferred transitions update old captures."""
+    if not _cudnn_override_available():
+        pytest.skip("requires cuDNN ragged CUDA Graph support")
+    torch.manual_seed(7438)
+    q = torch.randn(8, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(16, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device="cuda", dtype=torch.float32)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+        backend="cudnn",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+        kv_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+    )
+
+    def plan(mode, qslots, kslots, qlens, klens):
+        lengths = {}
+        for key, include, values in (
+            ("seq_lens_q", mode in ("q", "both"), qlens),
+            ("seq_lens", mode in ("kv", "both"), klens),
+        ):
+            if include:
+                lengths[key] = torch.tensor(
+                    values, device=length_device, dtype=length_dtype
+                )
+        wrapper.plan(
+            _indptr(qslots),
+            _indptr(kslots),
+            8,
+            2,
+            128,
+            q_data_type=q.dtype,
+            causal=causal,
+            max_token_per_sequence=4,
+            max_sequence_kv=8,
+            **lengths,
+        )
+        return (
+            qlens if mode in ("q", "both") else qslots,
+            klens if mode in ("kv", "both") else kslots,
+        )
+
+    def run():
+        return wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, lse_base="ln")
+
+    plan(initial_lengths, [4, 4], [8, 8], [4, 4], [8, 8])
+    run()
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            run()
+        for mode, qslots, kslots, qlens, klens in (
+            (initial_lengths, [3, 3], [6, 6], [3, 3], [6, 6]),
+            ("q", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("kv", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("both", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("neither", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("both", [4, 4], [8, 8], [4, 4], [8, 8]),
+        ):
+            qlens, klens = plan(mode, qslots, kslots, qlens, klens)
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            capture.replay()
+            qstart = kstart = 0
+            for qslot, kslot, nq, nk in zip(qslots, kslots, qlens, klens, strict=True):
+                qq = q[qstart : qstart + nq].double().transpose(0, 1)
+                kk = k[kstart : kstart + nk].double().repeat_interleave(4, 1)
+                vv = v[kstart : kstart + nk].double().repeat_interleave(4, 1)
+                scores = qq @ kk.permute(1, 2, 0) * (128**-0.5)
+                if causal:
+                    mask = torch.arange(nk, device="cuda")[None, :] > (
+                        torch.arange(nq, device="cuda")[:, None] + nk - nq
+                    )
+                    scores.masked_fill_(mask, -torch.inf)
+                expected = (scores.softmax(-1) @ vv.transpose(0, 1)).transpose(0, 1)
+                torch.testing.assert_close(
+                    out[qstart : qstart + nq].double(), expected, atol=0.004, rtol=0.004
+                )
+                torch.testing.assert_close(
+                    lse[qstart : qstart + nq].double(),
+                    scores.logsumexp(-1).T,
+                    atol=4e-4,
+                    rtol=0,
+                )
+                qstart += qslot
+                kstart += kslot
+    finally:
+        capture.reset()
+
+
 requires_override = pytest.mark.skipif(
     not _cudnn_override_available(),
     reason="needs SM100, cuDNN>=9.24 and cudnn-frontend>=1.29",
@@ -220,22 +319,31 @@ def test_short_q_long_kv_rows(q_len):
     _assert_matches_fa2(
         lens, hq, hkv, d, causal=False, kv_lens=kv_lens, return_lse=(q_len != 1)
     )
-    # a stream of such steps builds nothing new
-    before = cudnn_prefill._prefill_graph_builds
+    # Warm the encountered classes, then revisit them in a different order.
+    # Small bounded batches and the broad fallback may use different graphs.
+    steps = []
     for _ in range(4):
-        b2 = int(torch.randint(1, 30, (1,)))
+        batch = int(torch.randint(1, 30, (1,)))
+        steps.append((batch, torch.randint(129, 4096, (batch,)).tolist()))
+
+    def run_step(step):
+        batch, kv = step
         _run(
             "cudnn",
-            [q_len] * b2,
+            [q_len] * batch,
             hq,
             hkv,
             d,
             causal=False,
-            kv_lens=torch.randint(
-                129, 4096, (b2,)
-            ).tolist(),  # stays in the long-kv class
-            return_lse=(q_len != 1),  # same graph family as the parity call above
+            kv_lens=kv,
+            return_lse=(q_len != 1),
         )
+
+    for step in steps:
+        run_step(step)
+    before = cudnn_prefill._prefill_graph_builds
+    for step in reversed(steps):
+        run_step(step)
     assert cudnn_prefill._prefill_graph_builds == before
 
 
@@ -370,3 +478,522 @@ def test_cache_shape_growth_when_exceeded(monkeypatch):
     assert cudnn_prefill._prefill_graph_builds == before + 1
     _run("cudnn", [1000, 20], hq, hkv, d)  # same grown cache shape (1024): no build
     assert cudnn_prefill._prefill_graph_builds == before + 1
+
+
+@requires_override
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("lse_layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("head_dim_qk,num_kv_heads", [(192, 4), (128, 4), (128, 1)])
+@pytest.mark.parametrize("small_q", [False, True], ids=["regular_q", "small_q"])
+def test_bounded_ragged_replan_capture_and_rebinding(
+    causal, lse_layout, head_dim_qk, num_kv_heads, small_q, monkeypatch
+):
+    """One bounded graph handles different batches, totals, pointers and strides."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded packed cache classes are qualified on SM100/SM107")
+    if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=head_dim_qk == 128):
+        pytest.skip("requires FE bounded packed overrides")
+    from cutlass import cute
+
+    workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, backend="cudnn"
+    )
+    graph = None
+    generator = torch.Generator(device="cuda").manual_seed(733)
+    steps = (
+        (([63, 2, 0], [2049, 2011, 0]), ([31, 1, 0, 7], [3001, 127, 0, 4096]))
+        if small_q
+        else (([129, 65, 0], [2049, 2011, 0]), ([241, 1, 0, 128], [3001, 127, 0, 4096]))
+    )
+    for qlens, klens in steps:
+        qo, ko = _indptr(qlens), _indptr(klens)
+        q = torch.randn(
+            sum(qlens),
+            4,
+            head_dim_qk,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        k = torch.randn(
+            sum(klens),
+            num_kv_heads,
+            head_dim_qk,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        v = torch.randn(
+            sum(klens),
+            num_kv_heads,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        out = torch.empty((len(q), 4, 128), device="cuda", dtype=q.dtype)
+        lse = (
+            None
+            if lse_layout is None
+            else torch.empty(
+                (len(q), 4) if lse_layout == "NH" else (4, len(q)), device="cuda"
+            )
+        )
+        wrapper.plan(
+            qo,
+            ko,
+            4,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo=128,
+            causal=causal,
+            q_data_type=q.dtype,
+        )
+
+        def run():
+            return wrapper.run(
+                q,
+                k,
+                v,
+                out=out,
+                lse=lse,
+                return_lse=lse is not None,
+                lse_layout=lse_layout or "NH",
+                lse_base="ln",
+            )
+
+        with monkeypatch.context() as m:
+            if graph is not None:
+                m.setattr(
+                    cute,
+                    "compile",
+                    lambda *a, **kw: pytest.fail(
+                        "new geometry recompiled a bounded plan"
+                    ),
+                )
+            run()
+        prepared = wrapper._cudnn_prepared
+        cache_b, cache_q, cache_kv = prepared.override_cache
+        assert len(qlens) <= cache_b < _OVERRIDE_CACHE_BATCH
+        assert max(qlens) <= cache_q < _OVERRIDE_CACHE_SEQ_LONG
+        assert max(klens) <= cache_kv < _OVERRIDE_CACHE_SEQ_LONG
+        current = prepared.graph
+        if graph is not None:
+            assert current is graph
+        graph = current
+        builds = cudnn_prefill._prefill_graph_builds
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            run()
+        v.mul_(-0.5)
+        out.fill_(float("nan"))
+        if lse is not None:
+            lse.fill_(float("nan"))
+        with monkeypatch.context() as m:
+            m.setattr(
+                cute,
+                "compile",
+                lambda *a, **kw: pytest.fail("warm bounded graph compiled again"),
+            )
+            # Older wrappers stage NH before producing HN. When native HN
+            # is available, it must preserve the allocation-free warm path too.
+            if lse_layout != "HN" or getattr(
+                wrapper._cudnn_prepared, "stats_head_stride", 0
+            ):
+                m.setattr(
+                    torch,
+                    "empty",
+                    lambda *a, **kw: pytest.fail("warm run allocated a tensor"),
+                )
+            old_debug = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                run()
+                capture.replay()
+            finally:
+                torch.cuda.set_sync_debug_mode(old_debug)
+        assert cudnn_prefill._prefill_graph_builds == builds
+        for i, (nq, nk) in enumerate(zip(qlens, klens, strict=True)):
+            if not nq:
+                continue
+            qi = q[qo[i] : qo[i + 1]].double().transpose(0, 1)
+            ki = k[ko[i] : ko[i + 1]].double().transpose(0, 1)
+            vi = v[ko[i] : ko[i + 1]].double().transpose(0, 1)
+            ki = ki.repeat_interleave(4 // num_kv_heads, dim=0)
+            vi = vi.repeat_interleave(4 // num_kv_heads, dim=0)
+            scores = qi @ ki.transpose(-1, -2) * head_dim_qk**-0.5
+            if causal:
+                scores.masked_fill_(
+                    torch.arange(nk, device="cuda")[None, :]
+                    > torch.arange(nq, device="cuda")[:, None] + nk - nq,
+                    -float("inf"),
+                )
+            probs = scores.softmax(-1)
+            ref = probs @ vi
+            bound = torch.finfo(q.dtype).eps / 2 * (probs @ vi.abs() + ref.abs()) + 2e-5
+            error = (out[qo[i] : qo[i + 1]].transpose(0, 1).double() - ref).abs()
+            assert torch.all(error <= bound), float((error / bound).max())
+            if lse is not None:
+                got = lse.T if lse_layout == "NH" else lse
+                torch.testing.assert_close(
+                    got[:, qo[i] : qo[i + 1]].double(),
+                    scores.logsumexp(-1),
+                    atol=3e-4,
+                    rtol=0,
+                )
+        capture.reset()
+
+
+@requires_override
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("head_dim_qk,num_kv_heads", [(192, 4), (128, 1)])
+def test_bounded_ragged_prewarm_classes_before_capture(
+    return_lse, head_dim_qk, num_kv_heads, monkeypatch
+):
+    """Warm declared capacities once, then capture new live shapes in any order."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded packed cache classes are qualified on SM100/SM107")
+    if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=head_dim_qk == 128):
+        pytest.skip("requires FE bounded packed overrides")
+    from cutlass import cute
+
+    workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
+    generator = torch.Generator(device="cuda").manual_seed(734)
+    q = torch.randn(
+        1024, 4, head_dim_qk, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    k = torch.zeros(8192, num_kv_heads, head_dim_qk, device="cuda", dtype=q.dtype)
+    v = torch.ones(8192, num_kv_heads, 128, device="cuda", dtype=q.dtype)
+    out = torch.empty(1024, 4, 128, device="cuda", dtype=q.dtype)
+    lse = torch.empty(1024, 4, device="cuda") if return_lse else None
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, backend="cudnn"
+    )
+
+    total_q = total_kv = 0
+
+    def plan(qlens, klens, q_bound, kv_bound):
+        nonlocal total_q, total_kv
+        total_q, total_kv = sum(qlens), sum(klens)
+        wrapper.plan(
+            _indptr(qlens),
+            _indptr(klens),
+            4,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo=128,
+            q_data_type=q.dtype,
+            causal=False,
+            max_token_per_sequence=q_bound,
+            max_sequence_kv=kv_bound,
+        )
+
+    def run():
+        return wrapper.run(
+            q[:total_q],
+            k[:total_kv],
+            v[:total_kv],
+            out=out[:total_q],
+            lse=lse[:total_q] if lse is not None else None,
+            return_lse=return_lse,
+            lse_base="ln",
+        )
+
+    # Warm capacity classes using fewer live tokens than their bounds.
+    # No bucket size, engine winner or split count is pinned by this test.
+    warm = torch.cuda.Stream()
+    warm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm):
+        plan([63], [2049], 128, 4096)
+        run()
+        plan([129], [2049], 256, 4096)
+        run()
+        plan([321, 1], [4096, 1], 512, 4096)
+        run()
+    torch.cuda.current_stream().wait_stream(warm)
+    builds = cudnn_prefill._prefill_graph_builds
+    captures = []
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(
+                cute, "compile", lambda *a, **kw: pytest.fail("warmed class recompiled")
+            )
+            for qlens, klens, q_bound in (
+                ([241], [3001], 256),
+                ([400, 0], [4096, 0], 512),
+                ([65], [2048], 256),
+                ([2], [3001], 2),
+                ([7], [2049], 7),
+                ([31], [2048], 31),
+            ):
+                # Keep each capture's metadata owner alive. Different wrappers
+                # must also reuse the graph signatures warmed above.
+                wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                    workspace, backend="cudnn"
+                )
+                plan(qlens, klens, q_bound, 4096)
+                capture = torch.cuda.CUDAGraph()
+                captures.append((capture, qlens, klens, wrapper))
+                with torch.cuda.graph(capture):
+                    run()
+            assert cudnn_prefill._prefill_graph_builds == builds
+            # All captures survive later replans; each retains its own indptrs.
+            v.fill_(2)
+            for capture, qlens, klens, _ in captures:
+                out.fill_(float("nan"))
+                if lse is not None:
+                    lse.fill_(float("nan"))
+                capture.replay()
+                torch.testing.assert_close(
+                    out[: sum(qlens)], torch.full_like(out[: sum(qlens)], 2)
+                )
+                if lse is not None:
+                    expected = torch.cat(
+                        [
+                            torch.full(
+                                (nq, 4), float(torch.tensor(nk).log()), device="cuda"
+                            )
+                            for nq, nk in zip(qlens, klens, strict=True)
+                            if nq
+                        ]
+                    )
+                    torch.testing.assert_close(
+                        lse[: sum(qlens)], expected, atol=3e-4, rtol=0
+                    )
+    finally:
+        for capture, _, _, _ in captures:
+            capture.reset()
+
+
+@requires_override
+@pytest.mark.parametrize("head_dim_qk", [192, 128])
+def test_bounded_ragged_older_frontend_keeps_broad_graph(head_dim_qk, monkeypatch):
+    """Old FE keeps its existing graph signature, including SDPA kwargs."""
+    cudnn = cudnn_prefill.cudnn
+    original = cudnn.pygraph.sdpa
+    observed = []
+
+    def old_sdpa(self, *args, **kwargs):
+        assert "max_total_seq_len_q" not in kwargs
+        observed.append(True)
+        return original(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(cudnn, "__version__", "1.30.0")
+        m.setattr(cudnn.pygraph, "sdpa", old_sdpa)
+        cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
+        try:
+            assert not cudnn_prefill._cudnn_supports_bounded_ragged(
+                d128=head_dim_qk == 128
+            )
+            # A distinct head count avoids a prior test's graph-cache entry.
+            _run("cudnn", [129], 5, 5, head_dim_qk, dvo=128, kv_lens=[2049])
+            assert observed
+        finally:
+            cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
+
+
+@requires_override
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_small_workspace_selection_reuse_and_capture(
+    lse_layout, graph_mode, monkeypatch
+):
+    """Smaller workspaces keep valid plans and do not mutate cached captures."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded ragged qualification requires SM100/SM107")
+    import flashinfer.prefill as prefill_module
+
+    qlens, klens = [257, 1, 1], [8192] * 3
+    qo, ko = _indptr(qlens), _indptr(klens)
+    q = torch.zeros(sum(qlens), 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(sum(klens), 4, 128, device="cuda", dtype=q.dtype)
+    v = torch.empty_like(k)
+    expected = torch.empty_like(q)
+    expected_lse = torch.empty(sum(qlens), 16, device="cuda")
+    for i, (nq, nk) in enumerate(zip(qlens, klens, strict=True)):
+        v[ko[i] : ko[i + 1]].fill_(i + 1)
+        expected[qo[i] : qo[i + 1]].fill_(i + 1)
+        rows = torch.arange(nk - nq + 1, nk + 1, device="cuda", dtype=torch.float64)
+        expected_lse[qo[i] : qo[i + 1]] = rows.log().float()[:, None]
+    out = torch.empty_like(q)
+    lse = torch.empty_like(
+        expected_lse if lse_layout == "NH" else expected_lse.T,
+        memory_format=torch.contiguous_format,
+    )
+    workspaces = [
+        torch.empty(mib << 20, device="cuda", dtype=torch.uint8) for mib in (128, 1, 8)
+    ]
+    graph_options = {}
+    if graph_mode:
+        monkeypatch.setenv("FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE", "0")
+        graph_options = dict(
+            use_cuda_graph=True, qo_indptr_buf=qo.cuda(), kv_indptr_buf=ko.cuda()
+        )
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspaces[0], backend="cudnn", **graph_options
+    )
+    captures, graphs = [], []
+
+    def run():
+        wrapper.run(
+            q,
+            k,
+            v,
+            out=out,
+            lse=lse,
+            return_lse=True,
+            lse_layout=lse_layout,
+            lse_base="ln",
+        )
+
+    try:
+        for workspace in (*workspaces, workspaces[0]):
+            wrapper.reset_workspace_buffer(workspace, wrapper._int_workspace_buffer)
+            wrapper.plan(qo, ko, 16, 4, 128, q_data_type=q.dtype, causal=True)
+            run()
+            graph = wrapper._cudnn_prepared.graph
+            assert graph.get_workspace_size() <= workspace.numel()
+            graphs.append(graph)
+            with monkeypatch.context() as m:
+                m.setattr(
+                    prefill_module,
+                    "_reuse_cudnn_prefill_preparation",
+                    lambda *a, **kw: pytest.fail("warm run prepared again"),
+                )
+                capture = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(capture):
+                    run()
+                captures.append(capture)
+            # Earlier captures must still work after selecting another workspace.
+            for captured in captures:
+                out.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                captured.replay()
+                torch.testing.assert_close(out, expected)
+                torch.testing.assert_close(
+                    lse if lse_layout == "NH" else lse.T, expected_lse
+                )
+        assert graphs[-1] is graphs[0]
+    finally:
+        for capture in captures:
+            capture.reset()
+
+
+@requires_override
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
+@pytest.mark.parametrize("shape_override", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+def test_graph_query_capacity_replan_and_capture(
+    monkeypatch, lse_layout, shape_override, dtype, num_kv_heads
+):
+    """Graph capacities are cache keys and survive shorter live replans."""
+    if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=True):
+        pytest.skip("packed D128 capacity requires matching native support")
+    if shape_override and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded D128 override is enabled on SM100/SM107")
+    monkeypatch.setenv(
+        "FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE", str(int(shape_override))
+    )
+    workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
+    klens = [2048] * 3
+    ko = _indptr(klens)
+    k = torch.zeros(sum(klens), num_kv_heads, 128, device="cuda", dtype=dtype)
+    v = torch.empty_like(k)
+    for i in range(3):
+        v[ko[i] : ko[i + 1]].fill_(i + 1)
+    owners, captures, graphs = [], [], []
+    try:
+        for initial in ([128, 1, 1], [128, 128, 128]):
+            qo = _indptr(initial)
+            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace,
+                backend="cudnn",
+                use_cuda_graph=True,
+                qo_indptr_buf=qo.cuda(),
+                kv_indptr_buf=ko.cuda(),
+            )
+            q = torch.zeros(sum(initial), 16, 128, device="cuda", dtype=k.dtype)
+            out = torch.empty_like(q)
+            lse = torch.empty(
+                (16, len(q)) if lse_layout == "HN" else (len(q), 16), device="cuda"
+            )
+            owners.append((wrapper, q, out, lse))
+
+            def plan(lens):
+                wrapper.plan(
+                    _indptr(lens),
+                    ko,
+                    16,
+                    num_kv_heads,
+                    128,
+                    q_data_type=q.dtype,
+                    causal=True,
+                )
+
+            def run():
+                wrapper.run(
+                    q,
+                    k,
+                    v,
+                    out=out,
+                    lse=lse,
+                    return_lse=True,
+                    lse_layout=lse_layout,
+                    lse_base="ln",
+                )
+
+            plan(initial)
+            run()
+            prepared = wrapper._cudnn_prepared
+            capacity = wrapper._cudnn_plan.metadata.max_total_num_rows
+            assert capacity >= sum(initial)
+            graphs.append(prepared.graph)
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture):
+                run()
+            captures.append(capture)
+            # The captured input/output storage remains at its original capacity;
+            # the registered indptr buffers are updated by subsequent plans.
+            for lens in ([128, 0, 0], initial):
+                plan(lens)
+                assert wrapper._cudnn_plan.metadata.max_total_num_rows == capacity
+                assert wrapper._cudnn_prepared is prepared
+                out.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                capture.replay()
+                offset = 0
+                for i, nq in enumerate(lens):
+                    active = slice(offset, offset + nq)
+                    torch.testing.assert_close(
+                        out[active], torch.full_like(out[active], i + 1)
+                    )
+                    reference = (
+                        torch.arange(
+                            klens[i] - nq + 1,
+                            klens[i] + 1,
+                            device="cuda",
+                            dtype=torch.float64,
+                        )
+                        .log()
+                        .float()[:, None]
+                        .expand(nq, 16)
+                    )
+                    actual = lse.T[active] if lse_layout == "HN" else lse[active]
+                    torch.testing.assert_close(actual, reference, atol=3e-4, rtol=0)
+                    offset += nq
+                assert torch.isnan(out[offset:]).all()
+        # Same B/Q/KV and data strides; only the lifetime Q capacity differs.
+        assert graphs[0] is not graphs[1]
+        # A later graph selection must not invalidate either old capture.
+        v.mul_(2)
+        for capture, (_wrapper, _q, out, _lse) in zip(captures, owners, strict=True):
+            out.fill_(float("nan"))
+            capture.replay()
+            assert torch.isfinite(out).all()
+            assert float(out[0, 0, 0]) == 2.0
+    finally:
+        for capture in captures:
+            capture.reset()

@@ -29,7 +29,9 @@ from flashinfer.prims_ts.utils import get_prims_ts_compile_options
 
 def stable_config_hash(cfg: Any, **constexpr_args: Any) -> str:
     """Return a stable cache key for compile-time TS kernel arguments."""
-    if is_dataclass(cfg):
+    if hasattr(cfg, "compile_signature"):
+        payload = cfg.compile_signature()
+    elif is_dataclass(cfg):
         payload = asdict(cfg)
     elif hasattr(cfg, "__dict__"):
         payload = dict(cfg.__dict__)
@@ -51,6 +53,11 @@ def get_compile_options() -> str:
 
 
 _COMPILED_GEMM_CACHE: dict[tuple[str, str, str, int, str], Any] = {}
+
+
+def clear_compiled_gemm_cache() -> None:
+    """Release process-local compiled kernels after all launches synchronize."""
+    _COMPILED_GEMM_CACHE.clear()
 
 
 def _compile_target_key(io: dict) -> tuple[int, str]:

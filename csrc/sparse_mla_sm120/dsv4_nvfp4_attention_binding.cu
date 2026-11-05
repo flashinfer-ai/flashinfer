@@ -24,7 +24,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
                Optional<TensorView> attn_sink, Optional<TensorView> extra_kv_cache,
                Optional<TensorView> extra_indices, Optional<TensorView> extra_topk_length,
                int64_t cpb, bool stage1_only, bool prefill,
-               const execution::ExecutionPlan* prepared = nullptr) {
+               const execution::ExecutionPlan* prepared = nullptr, double lse_scale = 1.0) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   check_attention_alignment(q, alignof(__nv_bfloat162), "q");
   CHECK_CUDA(kv_cache);
@@ -61,8 +61,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   TVM_FFI_ICHECK(!extra_topk_length.has_value() || dual)
       << "extra_topk_length requires an extra cache";
   const auto layout = parse_nvfp4_paged_layout(kv_cache);
-  TVM_FFI_ICHECK_EQ(layout.page_size, execution::FixedPageSize)
-      << "NVFP4 attention supports page_size=64";
+  TVM_FFI_ICHECK_GT(layout.page_size, 0) << "NVFP4 attention requires a positive page_size";
   Dsv4Nvfp4AttentionParams p{};
   p.q = static_cast<const bf16*>(q.data_ptr());
   p.cache = static_cast<const uint8_t*>(kv_cache.data_ptr());
@@ -71,6 +70,8 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   p.out_lse = static_cast<float*>(out_lse.data_ptr());
   p.num_tokens = tokens;
   p.sm_scale = static_cast<float>(sm_scale);
+  p.lse_scale = static_cast<float>(lse_scale);
+  p.page_size = layout.page_size;
   p.page_stride_bytes = layout.page_stride_bytes;
   auto length_pointer = [&](Optional<TensorView> value, const char* name) -> const int* {
     if (!value.has_value()) return nullptr;
@@ -101,7 +102,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
     const auto extra_layout = parse_nvfp4_paged_layout(cache);
     TVM_FFI_ICHECK(
         execution::visit_extra_page(extra_layout.page_size, [](auto) { return true; }).supported)
-        << "NVFP4 extra cache page_size must be 2 or 64";
+        << "NVFP4 extra cache page_size must be 2, 32, or 64";
     p.extra_cache = static_cast<const uint8_t*>(cache.data_ptr());
     p.extra_indices = static_cast<const int32_t*>(idx.data_ptr());
     p.extra_page_size = extra_layout.page_size;
@@ -162,7 +163,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
     const auto& m = prepared->metadata;
     TVM_FFI_ICHECK(
         m.tokens == tokens && m.heads == heads && m.topk == topk && m.extra_topk == p.extra_topk &&
-        m.page_stride_bytes == p.page_stride_bytes &&
+        m.page_size == p.page_size && m.page_stride_bytes == p.page_stride_bytes &&
         m.extra_page_stride_bytes == p.extra_page_stride_bytes &&
         m.extra_page_size == p.extra_page_size && m.has_lengths == topk_length.has_value() &&
         m.has_extra_lengths == extra_topk_length.has_value() && m.has_sink == attn_sink.has_value())
@@ -204,10 +205,11 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
                                Optional<TensorView> extra_kv_cache,
                                Optional<TensorView> extra_indices,
                                Optional<TensorView> extra_topk_length,
-                               int64_t chunks_per_block_override, bool stage1_only) {
+                               int64_t chunks_per_block_override, bool stage1_only,
+                               double lse_scale) {
   attention(q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_splits, sm_scale,
             topk_length, attn_sink, extra_kv_cache, extra_indices, extra_topk_length,
-            chunks_per_block_override, stage1_only, false);
+            chunks_per_block_override, stage1_only, false, nullptr, lse_scale);
 }
 
 void SparseMlaSm120NVFP4Prefill(TensorView q, TensorView kv_cache, TensorView indices,
@@ -215,10 +217,10 @@ void SparseMlaSm120NVFP4Prefill(TensorView q, TensorView kv_cache, TensorView in
                                 Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                                 Optional<TensorView> extra_kv_cache,
                                 Optional<TensorView> extra_indices,
-                                Optional<TensorView> extra_topk_length) {
+                                Optional<TensorView> extra_topk_length, double lse_scale) {
   attention(q, kv_cache, indices, Optional<TensorView>(), Optional<TensorView>(), output, out_lse,
             0, sm_scale, topk_length, attn_sink, extra_kv_cache, extra_indices, extra_topk_length,
-            0, false, true);
+            0, false, true, nullptr, lse_scale);
 }
 
 void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
@@ -226,14 +228,14 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                           TensorView output, TensorView lse, double scale,
                           Optional<TensorView> lengths, Optional<TensorView> sink,
                           Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
-                          Optional<TensorView> extra_lengths) {
+                          Optional<TensorView> extra_lengths, double lse_scale) {
   const auto& plan = execution::unpack_plan(descriptor, true);
   TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) == plan.metadata.tokens &&
                  q.size(1) == plan.metadata.heads)
       << "DSV4 NVFP4 execution plan query mismatch";
   attention(q, cache, indices, mid, mlse, output, lse, plan.chunk_capacity, scale, lengths, sink,
             extra_cache, extra_indices, extra_lengths, plan.cpb,
-            plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan);
+            plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan, lse_scale);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4

@@ -282,11 +282,12 @@ def _check_common_args(
 def _float_to_e8m0_rp_u8(x):
     """Convert positive float32 scale values to E8M0 storage bytes."""
 
-    min_e8m0 = 5.877471754111438e-39  # 2 ** -127
-    safe_x = ct.maximum(x, min_e8m0)
-    exponent = ct.ceil(ct.log2(safe_x)).astype(ct.int32) + 127
-    exponent = ct.minimum(ct.maximum(exponent, 0), 254)
-    return ct.where(x == 0.0, 0, exponent).astype(ct.uint8)
+    bits = ct.bitcast(x, ct.uint32)
+    exponent = (bits >> 23) & 255
+    mantissa = bits & 0x7FFFFF
+    # E8M0 byte zero covers FP32 subnormals through 2**-127, inclusive.
+    round_up = (mantissa != 0) & ((exponent != 0) | (mantissa > 0x400000))
+    return ct.minimum(exponent + round_up.astype(ct.uint32), 254).astype(ct.uint8)
 
 
 @ct.function
@@ -306,15 +307,21 @@ def _quantize_one_128x128_tile(
     tile_grouped = ct.reshape(tile_f32, (BLOCK_M, SCALE_COLS_PER_K_TILE, MX_GROUP_K))
 
     amax = ct.max(ct.abs(tile_grouped), axis=2)
-    scale_float = amax / 448.0
-    scale_byte = _float_to_e8m0_rp_u8(scale_float)
-    reciprocal_scale = ct.where(
-        amax != 0.0,
-        ct.exp2(127.0 - scale_byte.astype(ct.float32)),
-        0.0,
+    scale_float = ct.mul(
+        amax, 1.0 / 448.0, rounding_mode=ct.RoundingMode.RN, flush_to_zero=False
     )
+    scale_byte = _float_to_e8m0_rp_u8(scale_float)
+    inverse_bits = (254 - scale_byte.astype(ct.uint32)) << 23
+    # Match the standalone CUDA/CuTe convention: SF byte zero has no payload.
+    inverse_bits = ct.where(scale_byte == 0, 0, inverse_bits)
+    reciprocal_scale = ct.bitcast(inverse_bits, ct.float32)
 
-    quant_grouped = tile_grouped * ct.expand_dims(reciprocal_scale, 2)
+    quant_grouped = ct.mul(
+        tile_grouped,
+        ct.expand_dims(reciprocal_scale, 2),
+        rounding_mode=ct.RoundingMode.RN,
+        flush_to_zero=False,
+    )
     quant_tile = ct.reshape(quant_grouped, (BLOCK_M, BLOCK_K)).astype(ct.float8_e4m3fn)
     ct.store(output_view, (mt, kt), quant_tile, latency=8)
 
@@ -358,13 +365,15 @@ def _mxfp8_grouped_quant_cutile_persistent_prefix(
     while tile_id < total_tiles:
         lo = 0
         hi = groups
-        while lo + 1 < hi:
+        # Search group end offsets, including a nonempty search for one group.
+        # The zero-iteration start-offset search crashes CUDA 13.2 tileiras.
+        while lo < hi:
             mid = (lo + hi) // 2
-            mid_offset = ct.load(tile_offsets, (mid,), shape=()).item()
+            mid_offset = ct.load(tile_offsets, (mid + 1,), shape=()).item()
             if tile_id < mid_offset:
                 hi = mid
             else:
-                lo = mid
+                lo = mid + 1
 
         g = lo
         group_tile0 = ct.load(tile_offsets, (g,), shape=()).item()

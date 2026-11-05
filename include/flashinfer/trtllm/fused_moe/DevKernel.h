@@ -116,37 +116,62 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
   }
 
-#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
+// Keep the second-input choice compile-time. This doubles the 6 dtype-pair x 3 top-k-unroll x
+// 2 PDL finalize instantiations from 36 to 72 per kernel, trading build time/binary size for an
+// unchanged single-input hot path.
+#define LAUNCH_FINALIZE_PDL(data, types, kernel, numBlocks, numThreads, smemSize, stream)      \
+  if (data.inPtr2 != nullptr) {                                                                \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(types, true), kernel, numBlocks, numThreads, smemSize,  \
+               stream);                                                                        \
+  } else {                                                                                     \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(types, false), kernel, numBlocks, numThreads, smemSize, \
+               stream);                                                                        \
+  }
+
+#define LAUNCH_EXPW(launch, data, kernel, topK, numBlocks, numThreads, smemSize, stream)          \
   if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
-               numThreads, smemSize, stream);                                                     \
+    launch(data, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks, numThreads,         \
+           smemSize, stream);                                                                     \
   } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {           \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks,    \
-               numThreads, smemSize, stream);                                                     \
+    launch(data, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks, numThreads,   \
+           smemSize, stream);                                                                     \
   } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks,      \
-               numThreads, smemSize, stream);                                                     \
+    launch(data, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks, numThreads,     \
+           smemSize, stream);                                                                     \
   } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel,       \
-               numBlocks, numThreads, smemSize, stream);                                          \
+    launch(data, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel, numBlocks,       \
+           numThreads, smemSize, stream);                                                         \
   } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, \
-               numBlocks, numThreads, smemSize, stream);                                          \
+    launch(data, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, numBlocks, \
+           numThreads, smemSize, stream);                                                         \
   } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {   \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel,   \
-               numBlocks, numThreads, smemSize, stream);                                          \
+    launch(data, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel, numBlocks,   \
+           numThreads, smemSize, stream);                                                         \
   } else {                                                                                        \
     FLASHINFER_WARN("Unsupported pair");                                                          \
   }
 
-#define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
-  if (data.topK % 4 == 0) {                                                     \
-    LAUNCH_EXPW(data, kernel, 4, numBlocks, numThreads, smemSize, stream);      \
-  } else if (data.topK % 2 == 0) {                                              \
-    LAUNCH_EXPW(data, kernel, 2, numBlocks, numThreads, smemSize, stream);      \
-  } else {                                                                      \
-    LAUNCH_EXPW(data, kernel, 1, numBlocks, numThreads, smemSize, stream);      \
+#define LAUNCH_TOPK_EXPW_WITH(launch, data, kernel, numBlocks, numThreads, smemSize, stream) \
+  if (data.topK % 4 == 0) {                                                                  \
+    LAUNCH_EXPW(launch, data, kernel, 4, numBlocks, numThreads, smemSize, stream);           \
+  } else if (data.topK % 2 == 0) {                                                           \
+    LAUNCH_EXPW(launch, data, kernel, 2, numBlocks, numThreads, smemSize, stream);           \
+  } else {                                                                                   \
+    LAUNCH_EXPW(launch, data, kernel, 1, numBlocks, numThreads, smemSize, stream);           \
   }
+
+#define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
+  LAUNCH_TOPK_EXPW_WITH(LAUNCH_FINALIZE_PDL, data, kernel, numBlocks, numThreads, smemSize, stream)
+
+// DeepSeek finalize is intrinsically single-input. Keep UseSecondInput fixed to false while still
+// dispatching both PDL variants through LAUNCH_PDL.
+#define LAUNCH_FINALIZE_SINGLE_INPUT_PDL(data, types, kernel, numBlocks, numThreads, smemSize, \
+                                         stream)                                               \
+  LAUNCH_PDL(data, false, LAUNCH_ESC(types, false), kernel, numBlocks, numThreads, smemSize, stream)
+
+#define LAUNCH_TOPK_EXPW_SINGLE_INPUT(data, kernel, numBlocks, numThreads, smemSize, stream)   \
+  LAUNCH_TOPK_EXPW_WITH(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, kernel, numBlocks, numThreads, \
+                        smemSize, stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // NOTE: Old routing-specific macros (LAUNCH_TILEN, LAUNCH_ROUTING_LLAMA4,
@@ -380,6 +405,7 @@ struct Data {
   bool mUseDeepSeekFp8{false};
 
   void* inPtr;
+  void* inPtr2 = nullptr;
   void* outPtr;
   float* inDqSfsPtr = nullptr;
   float* outDqSfsPtr = nullptr;
@@ -397,14 +423,17 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
+template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UseSecondInput_,
+          bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
   using TypeExpW = TypeExpW_;
   static constexpr int TopKUnrollFactor = TopKUnrollFactor_;
+  static constexpr bool UseSecondInput = UseSecondInput_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;
+  Type const* inPtr2;
   TypeExpW const* expertWeightsPtr;
   Type* outPtr;
 
@@ -424,6 +453,7 @@ struct KernelParams {
     KernelParams params;
 
     params.inPtr = (Type*)data.inPtr;
+    params.inPtr2 = (Type*)data.inPtr2;
     params.expertWeightsPtr = (TypeExpW*)data.expertWeightsPtr;
     params.outPtr = (Type*)data.outPtr;
     params.inDqSfsPtr = data.inDqSfsPtr;
