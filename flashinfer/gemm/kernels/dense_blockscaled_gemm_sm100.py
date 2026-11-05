@@ -461,7 +461,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         alpha: cute.Tensor,  # (1,) scalar alpha, or (m,)/(n,) per-token alpha
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -478,7 +478,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             sfa_tensor (cute.Tensor): Scale factor tensor A
             sfb_tensor (cute.Tensor): Scale factor tensor B
             c_tensor (cute.Tensor): Output tensor C
-            max_active_clusters (cutlass.Constexpr): Maximum number of active clusters
+            max_active_clusters (cutlass.Int32): Maximum number of active clusters
             stream (cuda.CUstream): CUDA stream for asynchronous execution
             epilogue_op (cutlass.Constexpr): Optional elementwise lambda function to apply to the output tensor
 
@@ -1703,7 +1703,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Computes the grid size for the kernel launch.
 
@@ -1715,7 +1715,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             cta_tile_shape_mnk (Tuple[int, int, int]): The shape (M, N, K) of the
                 CTA tile.
             cluster_shape_mn (Tuple[int, int]): The shape of a CTA cluster.
-            max_active_clusters (cutlass.Constexpr): The maximum number of
+            max_active_clusters (cutlass.Int32): The maximum number of
                 active clusters supported by the hardware.
 
         Returns:

@@ -321,7 +321,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         alpha: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -345,7 +345,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :param alpha: Single-element tensor containing alpha scaling value
         :type alpha: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
@@ -2142,7 +2142,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -2153,7 +2153,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
 
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
@@ -2488,7 +2488,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         current_stream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,

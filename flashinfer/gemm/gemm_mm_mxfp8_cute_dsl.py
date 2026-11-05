@@ -29,6 +29,72 @@ from .gemm_mm_fp4_cute_dsl import (
 )
 
 
+def _mm_mxfp8_cache_key(tactic, enable_pdl, out_dtype, native_sm107=False):
+    """Use the shared block-scaled disk-name format for MXFP8 specializations."""
+    if native_sm107:
+        from .kernels.utils import (
+            _SM107_MXFP8_MMA_INST_SHAPE_K,
+            _SM107_MXFP8_MMA_TILER_K,
+        )
+
+        tile, cluster, swap, inst_m = tactic
+        family = "sm107"
+        variant = (
+            inst_m,
+            tile[1],
+            _SM107_MXFP8_MMA_INST_SHAPE_K,
+            _SM107_MXFP8_MMA_TILER_K,
+            0,
+        )
+        prefetch = False
+        enable_pdl = False  # The native Rubin kernel has no PDL option.
+    else:
+        tile, cluster, swap, prefetch, slices = tactic
+        family = "sm100sk" if slices > 1 else "sm100"
+        variant = slices if slices > 1 else None
+    return (
+        32,
+        tile,
+        cluster,
+        swap,
+        prefetch,
+        family,
+        variant,
+        enable_pdl,
+        out_dtype,
+        None,
+        None,
+    )
+
+
+def _make_mm_mxfp8_kernel(cache_key):
+    """Construct the same MXFP8 kernel for runtime and CPU AOT exports."""
+    _, tile, cluster, _, prefetch, family, variant, pdl, _, _, _ = cache_key
+    if family == "sm100":
+        from .kernels.dense_blockscaled_gemm_sm100 import (
+            Sm100BlockScaledPersistentDenseGemmKernel,
+        )
+
+        return Sm100BlockScaledPersistentDenseGemmKernel(
+            32, tile, cluster, prefetch, pdl
+        )
+    if family == "sm100sk":
+        from .kernels.dense_blockscaled_gemm_sm100_splitk import (
+            Sm100BlockScaledSplitKGemmKernel,
+        )
+
+        return Sm100BlockScaledSplitKGemmKernel(32, tile, variant, pdl)
+    if family == "sm107":
+        from .kernels.dense_blockscaled_gemm_sm107 import (
+            Sm107BlockScaledPersistentDenseGemmKernel,
+        )
+
+        return Sm107BlockScaledPersistentDenseGemmKernel(
+            32, variant[:3], (*tile, variant[3]), cluster
+        )
+    raise ValueError(f"Unknown MXFP8 kernel type: {family}")
+
+
 @functools.cache
 def _b12x_mxfp8_dsl_supported() -> bool:
     # Probe distribution metadata rather than import cutlass.cute, which

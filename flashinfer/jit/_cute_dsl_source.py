@@ -16,7 +16,8 @@ limitations under the License.
 CuTe-DSL source dependency analysis and hashing for persistent kernel caches.
 
 Callers supply kernel source files through ``extra_key_files``, usually their
-own ``__file__``. ``_hash_source_files`` hashes those explicit files by default.
+own ``__file__``. ``_hash_source_files`` hashes those explicit files by default,
+using relative paths so exported provider objects survive installation relocation.
 With ``FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1``, it also keys the FlashInfer
 helpers those files can use. This protects long-lived CI caches when a shared
 helper changes without editing the kernel's own source file.
@@ -639,7 +640,7 @@ def _key_sources(paths: tuple) -> tuple:
     """
     initializers: dict = {}
     if not cute_dsl_strict_cache_key():
-        # As given, duplicates included: default keys must not change.
+        # As given, duplicates included.
         return [str(p) for p in paths], initializers
     files = {str(p) for p in paths}
     for p in paths:
@@ -663,11 +664,22 @@ def _expand_key_files(paths: tuple) -> tuple:
 def _hash_source_files(paths: tuple) -> str:
     files, initializers = _key_sources(paths)
     sha = hashlib.sha256()
-    for path in sorted(files):
-        sha.update(path.encode())
+    # Provider builds and installed wheels must hash the same relative paths.
+    source_paths = [Path(path).resolve() for path in (*files, *initializers)]
+    root = (
+        Path(os.path.commonpath([str(path.parent) for path in source_paths]))
+        if source_paths
+        else Path()
+    )
+
+    def relative_name(path):
+        return Path(path).resolve().relative_to(root).as_posix()
+
+    for path in sorted(files, key=relative_name):
+        sha.update(relative_name(path).encode())
         with open(path, "rb") as f:
             sha.update(f.read())
-    for path in sorted(initializers):
-        sha.update(f"{path} (initializer)".encode())
+    for path in sorted(initializers, key=relative_name):
+        sha.update(f"{relative_name(path)} (initializer)".encode())
         sha.update(_initializer_digest(Path(path), initializers[path]).encode())
     return sha.hexdigest()
