@@ -42,7 +42,7 @@ from .trtllm_gen_metainfo import (
     RUBIN_CUBIN_ARCHS,
     write_filtered_metainfo,
 )
-from .utils import write_if_different
+from .windows_header_overlay import get_windows_header_overlay
 
 
 def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
@@ -105,43 +105,6 @@ def _alphamoe_nvfp4_sm100_nvcc_flags() -> List[str]:
         "--use_fast_math",
         *common_nvcc_flags,
     ]
-
-
-def _get_windows_bmm_header_overlay(
-    source_root: Path,
-    module_name: str,
-) -> Optional[Path]:
-    if not is_windows:
-        return None
-
-    overlay_root = (
-        jit_env.FLASHINFER_GEN_SRC_DIR / module_name / "windows_bmm_header_overlay"
-    )
-    old_declaration = "constexpr unsigned long XLargeN = 1UL << 35;"
-    new_declaration = "constexpr unsigned long long XLargeN = 1ULL << 35;"
-
-    for header in BMM_EXPORT_HEADERS:
-        source = source_root / header
-        content = source.read_text()
-        if header == "trtllm/gen/CommonUtils.h":
-            old_count = content.count(old_declaration)
-            new_count = content.count(new_declaration)
-            if old_count == 1 and new_count == 0:
-                content = content.replace(old_declaration, new_declaration)
-            elif old_count != 0 or new_count != 1:
-                raise RuntimeError(f"Unexpected XLargeN declaration in {source}")
-
-        destination = (
-            overlay_root
-            / "flashinfer"
-            / "trtllm"
-            / "batched_gemm"
-            / "trtllmGen_bmm_export"
-            / header
-        )
-        write_if_different(destination, content)
-
-    return overlay_root
 
 
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
@@ -417,8 +380,11 @@ def trtllm_gen_fused_moe_build_inputs(
     gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
     if is_windows:
         verify_symlinked_headers(canonical_export_path, BMM_EXPORT_HEADERS, checksum)
-        windows_header_overlay = _get_windows_bmm_header_overlay(
-            canonical_export_path, module_name
+        windows_header_overlay = get_windows_header_overlay(
+            canonical_export_path,
+            module_name,
+            BMM_EXPORT_HEADERS,
+            ("flashinfer", "trtllm", "batched_gemm", "trtllmGen_bmm_export"),
         )
     else:
         symlink_path = (
@@ -490,7 +456,7 @@ def trtllm_gen_fused_moe_build_inputs(
     ]
     include_paths: List[Union[str, Path]] = [
         # On Windows the export headers come from a patched overlay instead of
-        # a symlink (see _get_windows_bmm_header_overlay); it must come first.
+        # a symlink (see windows_header_overlay.py); it must come first.
         *([windows_header_overlay] if windows_header_overlay is not None else []),
         # gen_root supplies both the export-header symlink and the
         # arch-filtered flashinferMetaInfo.h; the artifact's own include/

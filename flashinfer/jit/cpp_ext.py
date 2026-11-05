@@ -9,6 +9,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import uuid
 from packaging.version import Version
 from pathlib import Path
 from typing import List, Mapping, Optional
@@ -139,7 +140,7 @@ def get_cuda_include_overlay(cuda_home: str) -> Optional[Path]:
     if not overlay_header.exists() or overlay_header.read_bytes() != patched_content:
         overlay_dir.mkdir(parents=True, exist_ok=True)
         temporary_header = overlay_header.with_name(
-            f"{overlay_header.name}.{os.getpid()}.tmp"
+            f"{overlay_header.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
         try:
             temporary_header.write_bytes(patched_content)

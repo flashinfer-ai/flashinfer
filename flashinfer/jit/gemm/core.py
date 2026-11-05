@@ -37,7 +37,9 @@ from ..cubin_loader import (
     ensure_symlink,
     verify_symlinked_headers,
 )
+from ..cpp_ext import is_windows
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
+from ..windows_header_overlay import get_windows_header_overlay
 
 GEMM_EXPORT_HEADERS = [
     "Enums.h",
@@ -770,9 +772,25 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
     # share this symlink, or an AOT build (all modules generated, then compiled)
     # lets the last gen_* call's target win and skews the other module's ABI.
     gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
-    symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
-    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
-    verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
+    canonical_export_path = jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path
+    if is_windows:
+        # On Windows the export headers come from a patched overlay instead of
+        # a symlink (see windows_header_overlay.py); it must come first on the
+        # include path.
+        verify_symlinked_headers(canonical_export_path, GEMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = get_windows_header_overlay(
+            canonical_export_path,
+            module_name,
+            GEMM_EXPORT_HEADERS,
+            ("flashinfer", "trtllm", "gemm", "trtllmGen_gemm_export"),
+        )
+    else:
+        symlink_path = (
+            gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
+        )
+        ensure_symlink(symlink_path, canonical_export_path)
+        verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = None
 
     return gen_jit_spec(
         module_name,
@@ -788,6 +806,7 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
         ]
         + _trtllm_gen_gemm_nvcc_flags(enable_rubin),
         extra_include_paths=[
+            *([windows_header_overlay] if windows_header_overlay is not None else []),
             gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
@@ -953,9 +972,25 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
     # share this symlink, or an AOT build (all modules generated, then compiled)
     # lets the last gen_* call's target win and skews the other module's ABI.
     gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
-    symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
-    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
-    verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
+    canonical_export_path = jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path
+    if is_windows:
+        # On Windows the export headers come from a patched overlay instead of
+        # a symlink (see windows_header_overlay.py); it must come first on the
+        # include path.
+        verify_symlinked_headers(canonical_export_path, GEMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = get_windows_header_overlay(
+            canonical_export_path,
+            module_name,
+            GEMM_EXPORT_HEADERS,
+            ("flashinfer", "trtllm", "gemm", "trtllmGen_gemm_export"),
+        )
+    else:
+        symlink_path = (
+            gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
+        )
+        ensure_symlink(symlink_path, canonical_export_path)
+        verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = None
 
     return gen_jit_spec(
         module_name,
@@ -971,6 +1006,7 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
         ]
         + _trtllm_gen_gemm_nvcc_flags(enable_rubin),
         extra_include_paths=[
+            *([windows_header_overlay] if windows_header_overlay is not None else []),
             gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,

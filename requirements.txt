@@ -41,8 +41,8 @@ click
 cuda-python>=12.0
 cuda-tile>=1.4.0
 einops
-nccl-extensions>=0.1.0
-nccl4py>=0.4.1
+nccl-extensions>=0.1.0; sys_platform != "win32"
+nccl4py>=0.4.1; sys_platform != "win32"
 ninja
 numpy
 nvidia-cudnn-frontend>=1.32.0

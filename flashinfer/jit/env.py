@@ -19,10 +19,12 @@ limitations under the License.
 # This helps AOT script to override envs.
 
 import functools
+import getpass
 import logging
 import os
 import pathlib
 import platform
+import re
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
@@ -69,14 +71,41 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
 )
 
 # NOTE(Windows): On Windows the full output paths for JIT-compiled CUDA objects
-# can easily exceed the 260-char MAX_PATH limit.
+# can easily exceed the 260-char MAX_PATH limit: the longest module directory
+# names leave fewer than 20 characters for the cache root.
 # On Linux/macOS we keep the conventional layout: $HOME/.cache/flashinfer/...
-# On Windows we use a flat root at C:\_fij to stay well within MAX_PATH.
+# On Windows the default is a short per-user root at the drive root,
+# %SYSTEMDRIVE%\_fij_<user> (the user name, lower-case alphanumerics, at most six
+# characters); a tag two accounts share is refused by the owner-only check
+# below, never shared.
 FLASHINFER_CACHE_DIR: pathlib.Path
+
+
+def _windows_user_tag() -> str:
+    try:
+        user = getpass.getuser()
+    except (ImportError, OSError, KeyError):
+        user = ""
+    # DOMAIN\user and user@domain forms carry the account name only.
+    user = user.rsplit("\\", 1)[-1].split("@", 1)[0]
+    return re.sub(r"[^a-z0-9]", "", user.lower())[:6] or "user"
+
+
 if os.name == "nt":
     FLASHINFER_CACHE_DIR = pathlib.Path(
-        os.getenv("FLASHINFER_CACHE_DIR", f"{os.getenv('SYSTEMDRIVE')}/_fij")
+        os.getenv(
+            "FLASHINFER_CACHE_DIR",
+            f"{os.getenv('SYSTEMDRIVE', 'C:')}/_fij_{_windows_user_tag()}",
+        )
     )
+    # The default sits at the drive root, where any local account could create it
+    # first: make it owner-only here, before any subdirectory is created, and
+    # refuse one that another account owns. An explicit FLASHINFER_CACHE_DIR is
+    # the user's own choice and is left alone.
+    if os.getenv("FLASHINFER_CACHE_DIR") is None:
+        from ._windows_acl import ensure_private_dir
+
+        ensure_private_dir(FLASHINFER_CACHE_DIR)
 else:
     FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]

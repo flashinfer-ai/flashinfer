@@ -659,6 +659,7 @@ class JitSpecNvcc(JitSpec):
         from .cpp_ext import (
             get_cuda_path,
             build_common_cflags,
+            build_common_cuda_flags,
             build_cflags,
             build_cuda_cflags,
         )
@@ -667,10 +668,20 @@ class JitSpecNvcc(JitSpec):
 
         # Build flags
         common_cflags = build_common_cflags(cuda_home, self.extra_include_dirs)
+        common_cuda_flags = build_common_cuda_flags(common_cflags)
         cflags = build_cflags(common_cflags, self.extra_cflags)
         cuda_cflags = build_cuda_cflags(common_cflags, self.extra_cuda_cflags)
 
-        # Replace $common_cflags and $cuda_home placeholders
+        # Expand the common flag lists first (they have $cuda_home placeholders)
+        common_cflags_expanded = [
+            flag.replace("$cuda_home", cuda_home) for flag in common_cflags
+        ]
+        common_cuda_flags_expanded = [
+            flag.replace("$cuda_home", cuda_home) for flag in common_cuda_flags
+        ]
+
+        # Replace the $common_cflags, $common_cuda_flags, $cuda_home and $name
+        # placeholders the ninja rules use
         def expand_flags(
             flags: List[str], common_cflags_expanded: List[str]
         ) -> List[str]:
@@ -678,16 +689,15 @@ class JitSpecNvcc(JitSpec):
             for flag in flags:
                 if flag == "$common_cflags":
                     expanded.extend(common_cflags_expanded)
+                elif flag == "$common_cuda_flags":
+                    for cuda_flag in common_cuda_flags_expanded:
+                        expanded.append(cuda_flag.replace("$name", self.name))
                 elif "$cuda_home" in flag:
                     expanded.append(flag.replace("$cuda_home", cuda_home))
                 else:
                     expanded.append(flag)
             return expanded
 
-        # Expand common_cflags first (it has $cuda_home placeholders)
-        common_cflags_expanded = [
-            flag.replace("$cuda_home", cuda_home) for flag in common_cflags
-        ]
         cflags_expanded = expand_flags(cflags, common_cflags_expanded)
         cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
         cuda_cflags_by_source = {

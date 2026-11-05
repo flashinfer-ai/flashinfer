@@ -815,6 +815,17 @@ def _system_cuda_tile_compiler_available() -> bool:
     release = _detect_cuda_release()
     if release is None or release < (13, 4):
         return False
+    if os.name == "nt":
+        # Windows has no /usr/local/cuda; the toolkit root comes from
+        # CUDA_HOME/CUDA_PATH or from the nvcc on PATH.
+        nvcc = shutil.which("nvcc")
+        root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if not root and nvcc:
+            root = str(Path(nvcc).resolve().parent.parent)
+        if not root:
+            return False
+        compiler = Path(root) / "bin" / "tileiras.exe"
+        return compiler.is_file()
     compiler = Path("/usr/local/cuda/bin/tileiras")
     return compiler.is_file() and os.access(compiler, os.X_OK)
 
@@ -1109,7 +1120,8 @@ def write_if_different(path: Path, content: str) -> None:
 
 def _create_data_dir(use_symlinks=True):
     # Both source packaging and AOT use this populated CUTLASS checkout.
-    apply_cutlass_patches(_root / "3rdparty" / "cutlass")
+    if os.name == "nt":
+        apply_cutlass_patches(_root / "3rdparty" / "cutlass")
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
