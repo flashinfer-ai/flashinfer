@@ -1412,7 +1412,10 @@ def test_dense_route_table_is_catalog_driven():
 def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
     """A 32-head call whose logits pass ``MAX_LAUNCH_LOGITS`` runs one launch per
     range of query rows (the last range re-anchored to end at Q) with the same bits
-    as one launch, and a plan over that many logits is refused."""
+    as one launch, and a plan over that many logits is refused. With
+    ``clean_logits=True`` every cell matches; with ``clean_logits=False`` only the
+    window cells are defined (a ``"raw"`` route variant leaves the rest unwritten),
+    so only they are compared."""
     _skip_unless_exported()
     keys, heads = 4096, 32
     arch = _runtime.device_arch(torch.device("cuda"))
@@ -1429,14 +1432,24 @@ def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
     weights = torch.randn(queries, heads, device="cuda")
     ke = torch.arange(keys - queries + 1, keys + 1, device="cuda", dtype=torch.int32)
     ks = torch.clamp(ke - 1000, min=0)
-    whole = fp8_mqa_logits(q, (kv, scales), weights, ks, ke).clone()
+    cols = torch.arange(keys, device="cuda")
+    window = (cols >= ks[:, None]) & (cols < ke[:, None])
+    whole = {
+        clean: fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean).clone()
+        for clean in (True, False)
+    }
     # 256 rows of logits per launch: five ranges, the last one short.
     monkeypatch.setattr(
         _runtime, "MAX_LAUNCH_LOGITS", 256 * _runtime.logits_stride(keys)
     )
-    split = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    split = {
+        clean: fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean)
+        for clean in (True, False)
+    }
     torch.cuda.synchronize()
-    assert torch.equal(split, whole)
+    assert torch.equal(split[True], whole[True])
+    assert torch.equal(split[False][window], whole[False][window])
+    assert torch.equal(split[False][window], whole[True][window])
     with pytest.raises(ValueError, match="row ranges"):
         _runtime.DenseMqaPlan("fp8", q, kv, weights, ks, ke, kv_scales=scales)
 
