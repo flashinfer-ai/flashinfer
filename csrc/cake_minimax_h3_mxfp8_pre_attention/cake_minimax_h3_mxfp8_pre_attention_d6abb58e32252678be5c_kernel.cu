@@ -47,42 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 280
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_TMEM_SFA_OFFSET 256
-#define TMEM_TMEM_SFB_OFFSET 264
-#define NUM_TMA_PIPE_STAGES 5
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 34816
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 34816
-#define SMEM_SMEM_SFA_BOX_OFF 33792
-#define SMEM_SMEM_SFA_BOX_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_BOX_STRIDE 34816
-#define SMEM_SMEM_SFB_BOX0_OFF 34304
-#define SMEM_SMEM_SFB_BOX0_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_BOX0_STRIDE 34816
-#define SMEM_SMEM_SFB_BOX1_OFF 34816
-#define SMEM_SMEM_SFB_BOX1_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_BOX1_STRIDE 34816
-#define SMEM_SMEM_SFA_OFF 33792
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 34816
-#define SMEM_SMEM_SFB_OFF 34304
-#define SMEM_SMEM_SFB_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB_STRIDE 34816
-#define SMEM_EPI_STAGING_OFF 175104
-#define SMEM_EPI_STAGING_STAGE_BYTES 16384
-#define SMEM_EPI_STAGING_STRIDE 16384
-#define SMEM_WORK_RESPONSE_OFF 207872
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 208000
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define B_HALF_N 128
@@ -94,7 +58,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_K_ITERS 42
 #define N_TILES 84
 #define SF_K_TILES 42
-#define tiles_per_group (GROUP_M * N_TILES)
 
 #include <math_constants.h>
 
@@ -292,7 +255,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, uint8_t* __restrict__ out_sf, const __grid_constant__ CUtensorMap OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+kernel_cake_minimax_h3_mxfp8_pre_attention_d6abb58e32252678be5c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, uint8_t* __restrict__ out_sf, const __grid_constant__ CUtensorMap OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -324,7 +287,7 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 17408);
@@ -344,8 +307,7 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 207872);
     const int work_response_addr = smem + 207872;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 20 barriers)
-    // Mbarriers at smem_raw[0..160)
+    // Mbarrier init (20 barriers at smem_raw[0..160))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -399,12 +361,10 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_tmem_sfa = taddr + 256;
-    const int tmem_tmem_sfb = taddr + 264;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_tmem_sfa = taddr + 256;
+    const unsigned int tmem_tmem_sfb = taddr + 264;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -427,14 +387,14 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "{\n\t"
                             ".reg .b32 remAddr32;\n\t"
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "fence.proxy.async.shared::cta;\n\t"
                             "clusterlaunchcontrol.try_cancel.async.shared::cta"
@@ -443,11 +403,11 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                             :: "r"(work_response_addr + work_stage * 16 + 0 * 16), "r"(work_full_addr + work_stage * 8)
                             : "memory");
                     }
-                    int group = this_bid / (unsigned int)tiles_per_group;
+                    int group = this_bid / (unsigned int)(GROUP_M * N_TILES);
                     int first_m = group * GROUP_M;
                     int remaining = m_tiles - first_m;
                     int group_size = ((remaining >= GROUP_M) ? GROUP_M : remaining);
-                    int local = this_bid % (unsigned int)tiles_per_group;
+                    int local = this_bid % (unsigned int)(GROUP_M * N_TILES);
                     int bid_m = first_m + local % group_size;
                     int bid_n = local / group_size;
                     int off_m = bid_m * BLOCK_M;
@@ -470,10 +430,10 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                    uint32_t _clc_valid_0 = 0;
-                    uint32_t _clc_ctaid_x_0;
-                    uint32_t _clc_ctaid_y_0;
-                    uint32_t _clc_ctaid_z_0;
+                    uint32_t clc_valid = 0;
+                    uint32_t clc_ctaid_x;
+                    uint32_t clc_ctaid_y;
+                    uint32_t clc_ctaid_z;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -483,7 +443,7 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         "selp.u32 %3, 1, 0, p1;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
                         "}\n"
-                        : "=r"(_clc_ctaid_x_0), "=r"(_clc_ctaid_y_0), "=r"(_clc_ctaid_z_0), "=r"(_clc_valid_0)
+                        : "=r"(clc_ctaid_x), "=r"(clc_ctaid_y), "=r"(clc_ctaid_z), "=r"(clc_valid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -493,13 +453,13 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                     work_stage += 1;
                     if (work_stage == 4) { work_stage = 0; _phase_work_empty ^= 1; _phase_work_full ^= 1; }
-                    if (_clc_valid_0 == 0) {
+                    if (clc_valid == 0) {
                         break;
                     }
-                    this_bid = _clc_ctaid_x_0 + (unsigned int)cta_rank;
+                    this_bid = clc_ctaid_x + (unsigned int)cta_rank;
                 }
                 #pragma unroll 1
                 for (int _ = 0; _ < 5; _++) {
@@ -556,10 +516,10 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                     elect_commit_cg2_multicast(mainloop_done_addr, (uint16_t)(3));
                     _phase_epilogue_done ^= 1;
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    uint32_t _clc_valid_1 = 0;
-                    uint32_t _clc_ctaid_x_1;
-                    uint32_t _clc_ctaid_y_1;
-                    uint32_t _clc_ctaid_z_1;
+                    uint32_t clc_valid_1 = 0;
+                    uint32_t clc_ctaid_x_1;
+                    uint32_t clc_ctaid_y_1;
+                    uint32_t clc_ctaid_z_1;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -569,7 +529,7 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         "selp.u32 %3, 1, 0, p1;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
                         "}\n"
-                        : "=r"(_clc_ctaid_x_1), "=r"(_clc_ctaid_y_1), "=r"(_clc_ctaid_z_1), "=r"(_clc_valid_1)
+                        : "=r"(clc_ctaid_x_1), "=r"(clc_ctaid_y_1), "=r"(clc_ctaid_z_1), "=r"(clc_valid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -580,10 +540,10 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_1 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                     work_stage_1 += 1;
                     if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                    if (_clc_valid_1 == 0) {
+                    if (clc_valid_1 == 0) {
                         break;
                     }
                 }
@@ -607,11 +567,11 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
             for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < m_tiles / CTA_GROUP * N_TILES; _tile_iter_2++) {
                 mbarrier_wait(mainloop_done_addr, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                int group_1 = this_bid_1 / (unsigned int)tiles_per_group;
+                int group_1 = this_bid_1 / (unsigned int)(GROUP_M * N_TILES);
                 int first_m_1 = group_1 * GROUP_M;
                 int remaining_1 = m_tiles - first_m_1;
                 int group_size_1 = ((remaining_1 >= GROUP_M) ? GROUP_M : remaining_1);
-                int local_1 = this_bid_1 % (unsigned int)tiles_per_group;
+                int local_1 = this_bid_1 % (unsigned int)(GROUP_M * N_TILES);
                 int bid_m_1 = first_m_1 + local_1 % group_size_1;
                 int bid_n_1 = local_1 / group_size_1;
                 int off_m_1 = bid_m_1 * BLOCK_M;
@@ -826,13 +786,13 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         float scale_value = __uint_as_float(code << 23);
                         float rcp_scale = approx_rcp(scale_value);
                         float inverse = ((scale_value != 0.0f) ? rcp_scale : 0.0f);
-                        float2 _f2_1 = make_float2(inverse, inverse);
+                        float2 f2 = make_float2(inverse, inverse);
                         float quant[32];
                         #pragma unroll
                         for (int j_7 = 0; j_7 < 16; j_7++) {
                             float2 _f32x2_mul_a_11 = make_float2(values[2 * j_7], values[2 * j_7 + 1]);
                             float2 scaled_1;
-                            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_11), "l"(*(const unsigned long long*)&_f2_1));
+                            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_11), "l"(*(const unsigned long long*)&f2));
                             quant[2 * j_7] = scaled_1.x;
                             quant[2 * j_7 + 1] = scaled_1.y;
                         }
@@ -988,13 +948,13 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                         float scale_value_1 = __uint_as_float(code_1 << 23);
                         float rcp_scale_1 = approx_rcp(scale_value_1);
                         float inverse_1 = ((scale_value_1 != 0.0f) ? rcp_scale_1 : 0.0f);
-                        float2 _f2_2 = make_float2(inverse_1, inverse_1);
+                        float2 f2_1 = make_float2(inverse_1, inverse_1);
                         float quant_1[32];
                         #pragma unroll
                         for (int j_10 = 0; j_10 < 16; j_10++) {
                             float2 _f32x2_mul_a_13 = make_float2(values_1[2 * j_10], values_1[2 * j_10 + 1]);
                             float2 scaled_2;
-                            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_13), "l"(*(const unsigned long long*)&_f2_2));
+                            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_13), "l"(*(const unsigned long long*)&f2_1));
                             quant_1[2 * j_10] = scaled_2.x;
                             quant_1[2 * j_10 + 1] = scaled_2.y;
                         }
@@ -1122,10 +1082,10 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                uint32_t _clc_valid_2 = 0;
-                uint32_t _clc_ctaid_x_2;
-                uint32_t _clc_ctaid_y_2;
-                uint32_t _clc_ctaid_z_2;
+                uint32_t clc_valid_2 = 0;
+                uint32_t clc_ctaid_x_2;
+                uint32_t clc_ctaid_y_2;
+                uint32_t clc_ctaid_z_2;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1135,7 +1095,7 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                     "selp.u32 %3, 1, 0, p1;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
                     "}\n"
-                    : "=r"(_clc_ctaid_x_2), "=r"(_clc_ctaid_y_2), "=r"(_clc_ctaid_z_2), "=r"(_clc_valid_2)
+                    : "=r"(clc_ctaid_x_2), "=r"(clc_ctaid_y_2), "=r"(clc_ctaid_z_2), "=r"(clc_valid_2)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1145,13 +1105,13 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_f4956650691cc2bb5cc0(const __grid_con
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_2 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                 work_stage_2 += 1;
                 if (work_stage_2 == 4) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
-                if (_clc_valid_2 == 0) {
+                if (clc_valid_2 == 0) {
                     break;
                 }
-                this_bid_1 = _clc_ctaid_x_2 + (unsigned int)cta_rank;
+                this_bid_1 = clc_ctaid_x_2 + (unsigned int)cta_rank;
             }
             if (epi_warp == 0) {
                 if (elect_sync()) {
