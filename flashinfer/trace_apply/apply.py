@@ -178,10 +178,13 @@ _loading_locks: dict[tuple[str, str], Lock] = {}
 #: Already-built callables registered by sealed-package loaders (trace_apply/packages).
 #: Consulted before the build path so sealed sources are never materialized
 #: into the on-disk solution cache.
-_preloaded: dict[tuple[str, str], Callable] = {}
+#: {(definition, solution name): (callable, Solution hash or None)}.
+_preloaded: dict[tuple[str, str], tuple[Callable, str | None]] = {}
 
 
-def register_preloaded(definition: str, name: str, fn: Callable) -> None:
+def register_preloaded(
+    definition: str, name: str, fn: Callable, *, solution_hash: str | None = None
+) -> None:
     """Register an already-built callable for a (definition, solution-name) pair.
 
     Sealed-package loaders use this to hand ``enable_apply`` their imported
@@ -189,9 +192,13 @@ def register_preloaded(definition: str, name: str, fn: Callable) -> None:
     boundary instead of building through the loaders, so sealed sources never
     reach the world-writable solution cache. ``reset_loaded`` does not clear
     preloaded entries; they are the caller's to manage via ``clear_preloaded``.
+    ``solution_hash`` (``Solution.hash()``) binds the callable to the one
+    Solution it was built from: a different Solution enabled under the same
+    definition and name is refused at the boundary instead of being served the
+    callable of the first.
     """
     with _loaded_lock:
-        _preloaded[(str(definition), str(name))] = fn
+        _preloaded[(str(definition), str(name))] = (fn, solution_hash)
 
 
 def clear_preloaded() -> None:
@@ -207,7 +214,19 @@ def preloaded_entry(definition: str, name: str) -> Callable | None:
     live one (a foreign ``register_preloaded`` for the same key replaces it).
     """
     with _loaded_lock:
-        return _preloaded.get((str(definition), str(name)))
+        entry = _preloaded.get((str(definition), str(name)))
+        return None if entry is None else entry[0]
+
+
+def _preloaded_for(entry: tuple[Callable, str | None], solution: Solution) -> Callable:
+    fn, bound = entry
+    if bound is not None and bound != solution.hash():
+        raise RuntimeError(
+            f"Trace Apply: the callable preloaded for {solution.definition!r}/"
+            f"{solution.name!r} was built for another Solution ({bound[:12]}, not "
+            f"{solution.hash()[:12]}); disable it before enabling this one"
+        )
+    return fn
 
 
 def _get_loaded_solution(solution: Solution) -> Callable:
@@ -215,7 +234,7 @@ def _get_loaded_solution(solution: Solution) -> Callable:
     with _loaded_lock:
         preloaded = _preloaded.get(key)
         if preloaded is not None:
-            return preloaded
+            return _preloaded_for(preloaded, solution)
         cached = _loaded.get(key)
         if cached is not None:
             return cached
@@ -231,6 +250,11 @@ def _get_loaded_solution(solution: Solution) -> Callable:
                 return cached
         fn = load_solution(solution)
         with _loaded_lock:
+            # A callable preloaded while this build ran wins: the build path
+            # never serves a Solution a sealed loader owns.
+            preloaded = _preloaded.get(key)
+            if preloaded is not None:
+                return _preloaded_for(preloaded, solution)
             _loaded[key] = fn
         return fn
 

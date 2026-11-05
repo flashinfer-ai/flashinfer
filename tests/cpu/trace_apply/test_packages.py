@@ -464,13 +464,27 @@ def test_deferred_import_refuses_replaced_paths(tmp_path, replacement):
         function()
 
 
+@pytest.mark.parametrize("entry", ["nested:run", "nested.kernel:run"])
+def test_module_colon_symbol_entry_points_are_refused_at_verification(tmp_path, entry):
+    # BuildSpec takes only '<file>.py::<symbol>'; verification refuses the
+    # module:symbol spelling before any sealed code runs, instead of letting
+    # load_packages discover it after the import already executed.
+    with pytest.raises(pk.SealedPackageError, match="must be '<file>.py::<symbol>'"):
+        package(
+            tmp_path,
+            {
+                "nested/__init__.py": b"def run(): return 1\n",
+                "nested/kernel.py": b"def run(): return 1\n",
+            },
+            entry,
+        )
+
+
 @pytest.mark.parametrize(
     "entry,filename,helper",
     [
         ("__init__.py::run", "__init__.py", "helper.py"),
         ("nested/__init__.py::run", "nested/__init__.py", "nested/helper.py"),
-        ("nested:run", "nested/__init__.py", "nested/helper.py"),
-        ("nested.kernel:run", "nested/kernel.py", "nested/helper.py"),
     ],
 )
 def test_explicit_module_or_package_entry_point(tmp_path, entry, filename, helper):
@@ -602,13 +616,69 @@ def test_load_packages_strict_refuses_and_loose_collects(tmp_path, sm_gate_off):
 
 def test_duplicate_definitions_refuse(tmp_path, sm_gate_off):
     first = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
-    second = package(tmp_path / "second", {"kernel.py": b"def run(x): return x + 2\n"})
+    # Refused before its module runs: a duplicate never executes sealed code.
+    second = package(
+        tmp_path / "second", {"kernel.py": b"raise AssertionError('imported')\n"}
+    )
     both = tmp_path / "both"
     both.mkdir()
     shutil.copytree(tmp_path / first.digest, both / first.digest)
     shutil.copytree(tmp_path / "second" / second.digest, both / second.digest)
     with pytest.raises(pk.SealedPackageError, match="same definition"):
         pk.load_packages(both, [first.digest, second.digest], enable=False)
+
+
+def test_loose_loading_isolates_a_package_whose_module_raises(tmp_path, sm_gate_off):
+    good = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
+    broken = package(
+        tmp_path / "broken", {"kernel.py": b"raise RuntimeError('boom')\n"}
+    )
+    both = tmp_path / "both"
+    both.mkdir()
+    shutil.copytree(tmp_path / good.digest, both / good.digest)
+    shutil.copytree(tmp_path / "broken" / broken.digest, both / broken.digest)
+    with pytest.raises(RuntimeError, match="boom"):  # strict: the error is the caller's
+        pk.load_packages(both, [broken.digest, good.digest], enable=False)
+    result = pk.load_packages(
+        both, [broken.digest, good.digest], strict=False, enable=False
+    )
+    assert [p.digest for p in result.packages] == [good.digest]
+    assert result.errors[broken.digest].startswith("RuntimeError: boom")
+
+
+def test_preloaded_callable_is_bound_to_its_solution(tmp_path, monkeypatch):
+    import flashinfer.trace_apply.apply as apply_module
+    from flashinfer.trace.solution import Solution
+
+    def sentinel(x):
+        return x
+
+    apply_module.reset_loaded()
+    sealed = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
+    solution = Solution.from_dict(sealed.solution)
+    other = Solution.from_dict(
+        {
+            **sealed.solution,
+            "spec": {**sealed.solution["spec"], "target_hardware": ["sm100", "sm120"]},
+        }
+    )
+    assert (other.definition, other.name) == (solution.definition, solution.name)
+    register_preloaded(
+        sealed.operation, "test_solution", sentinel, solution_hash=solution.hash()
+    )
+    assert _get_loaded_solution(solution) is sentinel
+    with pytest.raises(RuntimeError, match="built for another Solution"):
+        _get_loaded_solution(other)  # same name, another Solution: never served
+
+    # A callable preloaded while a build is in flight wins over the build.
+    clear_preloaded()
+
+    def build(sol):
+        register_preloaded(sol.definition, sol.name, sentinel)
+        return lambda x: x - 1
+
+    monkeypatch.setattr(apply_module, "load_solution", build)
+    assert _get_loaded_solution(solution) is sentinel
 
 
 def test_target_hardware_gate(tmp_path, monkeypatch):

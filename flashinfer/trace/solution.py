@@ -24,6 +24,7 @@ and ``flashinfer.trace_apply``.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -202,15 +203,15 @@ class BuildSpec:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BuildSpec":
-        if (
-            data.get("setup_entry_point") is not None
-            and "destination_passing_style" not in data
+        if data.get("setup_entry_point") is not None and not isinstance(
+            data.get("destination_passing_style"), bool
         ):
             # The state-bearing run ABI never inherits a default
-            # (FlashInfer defaults to False, flashinfer-bench to True).
+            # (FlashInfer defaults to False, flashinfer-bench to True), and a
+            # null would silently read as False.
             raise ValueError(
-                "destination_passing_style must be declared explicitly when "
-                "setup_entry_point is present"
+                "destination_passing_style must be declared explicitly, as a "
+                "boolean, when setup_entry_point is present"
             )
         return cls(
             language=data["language"],
@@ -365,13 +366,19 @@ class Solution:
         )
         if self.spec.setup_entry_point is not None:
             # Appended only when declared, so every Solution without a setup
-            # keeps the hash (and build-cache key) it had before the fields existed.
+            # keeps the hash (and build-cache key) it had before the fields
+            # existed; framed as one JSON document so the fields cannot run
+            # into each other (("a", ["bc"]) and ("ab", ["c"]) differ).
             parts += (
-                "setup",
-                self.spec.setup_entry_point,
-                self.spec.teardown_entry_point or "",
-                self.spec.setup_state_param,
-                *self.spec.setup_inputs,
+                json.dumps(
+                    [
+                        "setup",
+                        self.spec.setup_entry_point,
+                        self.spec.teardown_entry_point,
+                        self.spec.setup_state_param,
+                        list(self.spec.setup_inputs),
+                    ]
+                ),
             )
         for part in parts:
             h.update(part.encode())

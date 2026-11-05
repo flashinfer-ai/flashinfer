@@ -66,7 +66,7 @@ GOLDEN_SOLUTION_HASH = (
 )
 #: The same for the golden setup bundle: the hash tail the four fields add.
 GOLDEN_SETUP_SOLUTION_HASH = (
-    "995a8cb44c501521ee048c4e04fc6eea10dd39c9ac9e09a9cb663d5a4ac43c74"
+    "380cb2da5f3847ce91bec50c6744723a88c8b768cf567ea358614967f9b02b84"
 )
 GOLDEN_SETUP_KEY = ("rmsnorm_h16", "rmsnorm_h16_prepared_weight")
 FI_API = "flashinfer.norm.rmsnorm"
@@ -254,6 +254,14 @@ def test_setup_fields_round_trip_and_hash_neutrality():
             None,
             "setup_state_param 'out' is also an input or output",
         ),
+        (
+            # The context is filled from the sealed Definition: one for another
+            # shape would prepare state for the wrong Definition.
+            {},
+            {**DEFINITION, "name": "other_op"},
+            None,
+            "describes 'other_op', not the solution's definition",
+        ),
     ],
 )
 def test_bad_setup_declarations_are_refused(
@@ -284,6 +292,32 @@ def test_setup_files_must_be_listed_in_sources(tmp_path):
     )
     with pytest.raises(pk.SealedPackageError, match="is not listed in sources"):
         pk.verify_package(tmp_path, digest)
+
+
+def test_destination_passing_style_must_be_a_boolean_with_a_setup(tmp_path):
+    # A null would read as False and leave a destination-passing kernel without
+    # its output buffer; both layers refuse it.
+    spec = {**SETUP_SPEC, "destination_passing_style": None}
+    with pytest.raises(ValueError, match="as a boolean"):
+        Solution.from_dict({**SETUP_SOLUTION, "spec": spec})
+    digest = seal_package(
+        tmp_path,
+        {
+            "solution.json": json_bytes({**SETUP_SOLUTION, "spec": spec}),
+            "kernel.py": SETUP_SOURCE,
+        },
+        sidecar=QUALIFICATION,
+    )
+    with pytest.raises(pk.SealedPackageError, match="as a boolean"):
+        pk.verify_package(tmp_path, digest)
+
+
+def test_setup_fields_are_framed_in_the_hash():
+    def hashed(state_param, inputs):
+        spec = {**SETUP_SPEC, "setup_state_param": state_param, "setup_inputs": inputs}
+        return Solution.from_dict({**SETUP_SOLUTION, "spec": spec}).hash()
+
+    assert hashed("a", ["bc"]) != hashed("ab", ["c"])
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +380,30 @@ def test_golden_setup_package_verifies_binds_and_serves(sm_gate_off):
 
     pk.release_packages()  # teardown(state) per weight set, bindings forgotten
     assert pk.setup_stats() == {} and preloaded_entry(*GOLDEN_SETUP_KEY) is None
+    assert not ta.is_enabled()  # the released Definition left the mapping too
     assert pk.import_entry(sealed) is not bound  # a later import binds afresh
+
+
+def test_release_packages_leaves_curated_solutions_enabled(tmp_path, sm_gate_off):
+    import flashinfer.trace_apply.apply as apply_module
+
+    def curated(hidden_states, weight):
+        return hidden_states
+
+    assert ta.enable_apply({"rmsnorm_h16": curated}) >= 1
+    sealed = setup_package(tmp_path)
+    pk.load_packages(tmp_path, [sealed.digest])
+    assert set(apply_module._solutions) == {"rmsnorm_h16", OPERATION}
+    pk.release_packages()
+    assert apply_module._solutions == {"rmsnorm_h16": curated} and ta.is_enabled()
+
+    # One Definition has one Solution: a sealed package for an enabled one is
+    # refused (strict) or recorded and left out (best effort), never substituted.
+    with pytest.raises(pk.SealedPackageError, match="already has an enabled Solution"):
+        pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    result = pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST], strict=False)
+    assert result.applied == 0 and GOLDEN_SETUP_DIGEST in result.errors
+    assert apply_module._solutions == {"rmsnorm_h16": curated}
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +564,16 @@ def test_context_has_the_documented_keys():
     context = life.contexts[0]
     assert context["axes"] == {} and context["outputs"] == {}
     assert context["inputs"] == {"x": metadata, "out": metadata}
+
+    # A value-returning Solution passes no output buffer: a declared output is
+    # described from the Definition and the resolved axes instead.
+    life = _Lifecycle()
+    bind(life, run=lambda x, state, scale: x * scale, definition=DEFINITION)(
+        x=x, scale=2.0
+    )
+    assert life.contexts[0]["outputs"] == {
+        "out": {"shape": [3, 4], "stride": None, "dtype": "float32", "device": "cuda"}
+    }
 
 
 def test_result_envelope_and_malformed_calls():

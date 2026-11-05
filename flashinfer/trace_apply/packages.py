@@ -307,6 +307,13 @@ def _sealed_file_digests(
         sealed[name] = digest
     for name, digest in sealed.items():
         _canonical_relative(name, manifest_path)
+        if len(Path(name).parts) != 1 or name in (MANIFEST_NAME, BUNDLE_DIR):
+            # A sidecar is a plain file beside the manifest: no directory to
+            # walk, so no parent a link could redirect outside the package.
+            raise SealedPackageError(
+                f"{manifest_path}: sealed file {name!r} must be a plain file name "
+                "beside the manifest"
+            )
         if not SHA256_HEX.fullmatch(digest):
             raise SealedPackageError(
                 f"{manifest_path}: {name} is not sealed with a sha256 digest"
@@ -359,20 +366,24 @@ def _entry_point(
 def _lifecycle_entry(
     solution: Mapping[str, Any], files: Mapping[str, Any], key: str, entry: Any
 ) -> tuple[str, str]:
-    """``_entry_point`` for a setup-lifecycle symbol, plus the two rules the
-    Solution schema adds for it: the ``<file>.py::<symbol>`` spelling alone
-    (``BuildSpec`` takes no ``module:symbol`` here) and a file the Solution lists
-    in ``sources`` (``Solution`` refuses one it does not), so verification
-    refuses what ``Solution.from_dict`` would refuse at load."""
+    """``_entry_point`` for a declared symbol (the entry point, setup or
+    teardown), plus the two rules the Solution schema adds: the
+    ``<file>.py::<symbol>`` spelling alone (``BuildSpec`` takes no
+    ``module:symbol``) and a file the Solution lists in ``sources`` (``Solution``
+    refuses one it does not), so verification refuses what ``Solution.from_dict``
+    would refuse at load, before any sealed code runs."""
     if isinstance(entry, str) and entry.count("::") != 1:
         raise SealedPackageError(
             f"{SOLUTION_NAME}: {key} must be '<file>.py::<symbol>', got {entry!r}"
         )
     resolved = _entry_point(solution, files, key)
+    sources = solution.get("sources")
+    if not isinstance(sources, list):
+        raise SealedPackageError(f"{SOLUTION_NAME}: sources must be a list")
     filename = entry.split("::", 1)[0]
     if not any(
         isinstance(source, Mapping) and source.get("path") == filename
-        for source in solution.get("sources", ())
+        for source in sources
     ):
         raise SealedPackageError(
             f"{SOLUTION_NAME}: {key} file {filename!r} is not listed in sources"
@@ -414,10 +425,10 @@ def _setup_declaration(
             raise SealedPackageError(
                 f"{SOLUTION_NAME}: setup_inputs requires setup_entry_point"
             )
-    elif "destination_passing_style" not in spec:
+    elif not isinstance(spec.get("destination_passing_style"), bool):
         raise SealedPackageError(
             f"{SOLUTION_NAME}: destination_passing_style must be declared "
-            "explicitly when setup_entry_point is present"
+            "explicitly, as a boolean, when setup_entry_point is present"
         )
     if (
         not isinstance(setup_inputs, list)
@@ -602,6 +613,14 @@ def verify_package(
         raise SealedPackageError(
             f"{SOLUTION_NAME}: definition must be a Definition name"
         )
+    sealed_definition = documents.get(DEFINITION_NAME)
+    if sealed_definition is not None and sealed_definition.get("name") != operation:
+        # The setup context is filled from this document; one for another
+        # shape would prepare state for the wrong Definition.
+        raise SealedPackageError(
+            f"{DEFINITION_NAME} describes {sealed_definition.get('name')!r}, not the "
+            f"solution's definition {operation!r}"
+        )
     # The solution's definition is the operation; sealed documents must agree on it.
     _metadata_constraint(
         "operation", [*metadata, (bundle / SOLUTION_NAME, {"operation": operation})]
@@ -631,7 +650,9 @@ def verify_package(
             f"{SOLUTION_NAME} is a {language!r} solution; only Python-family "
             "solutions activate, a compiled family would need nvcc at serving start"
         )
-    entry_point = _entry_point(solution, files)
+    entry_point = _lifecycle_entry(
+        solution, files, "entry_point", spec.get("entry_point")
+    )
     setup_entry_point, teardown_entry_point, setup_inputs, setup_state_param = (
         _setup_declaration(spec, solution, files, documents.get(DEFINITION_NAME))
     )
@@ -719,6 +740,9 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
         raise SealedPackageError(f"no sealed module {fullname!r}")
 
 
+#: Definitions ``load_packages`` enabled from sealed packages in this process;
+#: ``release_packages`` takes exactly these out of Trace Apply's mapping.
+_preloaded_definitions: set[str] = set()
 _bound_lock = threading.Lock()
 #: {(digest, pid): SetupBoundCallable} — one binding per package and process,
 #: so a repeat ``import_entry`` returns the identical object and the states it
@@ -871,13 +895,19 @@ def release_packages() -> None:
 
     Each bound callable tears down the states it retains (``teardown(state)``
     when declared) and leaves the registry, so a later ``import_entry`` binds
-    afresh; ``clear_preloaded`` then disarms the sealed seam as before. Every
-    binding is released before a failed teardown is raised. A binding a
-    CUDA-graph capture has observed is kept, states and all, and stays in
-    ``setup_stats()``: captured graphs replay against the state addresses, so
-    the state lives for the rest of the process (the reason nothing runs at
-    process exit either, where CUDA frees during interpreter teardown).
+    afresh; ``clear_preloaded`` then drops every preloaded entry, and the
+    released Definitions leave Trace Apply's mapping (a route a released
+    binding served would otherwise fall through to the on-disk build path on
+    its next call, the one place sealed sources must never reach); curated
+    Solutions enabled beside them stay enabled. Every binding is released
+    before a failed teardown is raised. A binding a CUDA-graph capture has
+    observed is kept, states and all, and stays in ``setup_stats()``: captured
+    graphs replay against the state addresses, so the state lives for the
+    rest of the process (the reason nothing runs at process exit either, where
+    CUDA frees during interpreter teardown). Callers quiesce their calls
+    first: a call in flight keeps no reference to the state it was handed.
     """
+    from . import apply
     from .setup import SetupStateError
 
     _own_bound()
@@ -893,9 +923,17 @@ def release_packages() -> None:
             except SetupStateError as error:
                 failures.append(error)
     finally:
-        from .apply import clear_preloaded
-
-        clear_preloaded()
+        apply.clear_preloaded()
+        if apply.is_enabled():
+            remaining = {
+                definition: solution
+                for definition, solution in apply._solutions.items()
+                if definition not in _preloaded_definitions
+            }
+            _preloaded_definitions.clear()
+            apply.disable_apply()
+            if remaining:
+                apply.enable_apply(remaining)
     if failures:
         raise SetupStateError(
             f"{len(failures)} of {len(released)} setup-bearing bindings failed to "
@@ -964,38 +1002,69 @@ def load_packages(
             package = verify_package(Path(root), digest)
             if sm_check:
                 check_target_hardware(package.solution)
-            entry = import_entry(package)
             from flashinfer.trace import (
                 Solution,
             )  # after verification: the runtime is trusted now
 
+            # Everything that can refuse the package without running its
+            # code runs before import_entry executes the sealed module.
             if package.operation in solutions:
                 raise SealedPackageError(
                     f"two sealed packages claim the same definition {package.operation!r}"
                 )
             try:
-                solutions[package.operation] = Solution.from_dict(package.solution)
+                solution = Solution.from_dict(package.solution)
             except (KeyError, TypeError, ValueError) as error:
                 # A refusal like the others, so a bad package never makes
                 # ``import flashinfer`` fail through ``_load_packages_from_env``.
                 raise SealedPackageError(
                     f"{SOLUTION_NAME} is not a FlashInfer Solution: {error}"
                 ) from error
+            entry = import_entry(package)
+            solutions[package.operation] = solution
             result.packages.append(package)
-            result.callables[
-                (package.operation, str(solutions[package.operation].name))
-            ] = entry
+            result.callables[(package.operation, str(solution.name))] = entry
         except SealedPackageError as error:
             if strict:
                 raise
             result.errors[digest] = f"{type(error).__name__}: {error}"
+        except Exception as error:  # noqa: BLE001 - best effort isolates each package
+            if strict:
+                raise
+            # A sealed module that raises while importing, or a document shape
+            # the verifier does not refuse, must not take the other packages
+            # down with it on the best-effort path.
+            result.errors[digest] = f"{type(error).__name__}: {error}"
     result.solutions = solutions
     if enable and solutions:
-        from .apply import enable_apply, register_preloaded
+        from . import apply
 
+        # A sealed package joins the mapping that is already enabled (curated
+        # Solutions stay); one Definition has one Solution, so a sealed package
+        # for a Definition already enabled is refused, not substituted.
+        current = dict(apply._solutions) if apply.is_enabled() else {}
+        for definition in sorted(set(current) & set(solutions)):
+            conflict = SealedPackageError(
+                f"definition {definition!r} already has an enabled Solution; disable "
+                "it before loading a sealed package for it"
+            )
+            if strict:
+                raise conflict
+            taken = solutions.pop(definition)
+            for package in result.packages:
+                if package.operation == definition:
+                    result.errors[package.digest] = (
+                        f"{type(conflict).__name__}: {conflict}"
+                    )
+            result.packages = [p for p in result.packages if p.operation != definition]
+            result.callables.pop((definition, str(taken.name)), None)
         for (definition, name), fn in result.callables.items():
-            register_preloaded(definition, name, fn)
-        result.applied = enable_apply(solutions)
+            apply.register_preloaded(
+                definition, name, fn, solution_hash=solutions[definition].hash()
+            )
+        _preloaded_definitions.update(solutions)
+        if solutions:
+            result.applied = apply.enable_apply({**current, **solutions})
     return result
 
 

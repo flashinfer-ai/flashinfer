@@ -188,8 +188,10 @@ rather than left waiting on the lock it holds.
 
 ``release_packages()`` tears down every sealed-package state this process
 retains (``teardown`` when declared; every binding is released before a failed
-teardown is raised), forgets the bound callables and clears the preloaded
-entries; ``setup_stats()`` returns ``{definition: {"runs", "weight_sets",
+teardown is raised), forgets the bound callables, clears the preloaded
+entries and takes the released Definitions out of Trace Apply's mapping, so no
+route can fall through to the on-disk build path afterwards; curated Solutions
+enabled beside them stay enabled. Callers quiesce their calls first. ``setup_stats()`` returns ``{definition: {"runs", "weight_sets",
 "seconds", "retained_bytes", "refused_in_capture"}}`` for the same bindings. A
 binding that a CUDA-graph capture has observed is never released, by
 ``release_packages()`` or by its own ``release()`` (a ``SetupStateError``):
@@ -257,11 +259,13 @@ The digest chain, all of which must hold before any code runs:
   compiled family would need nvcc at serving start, and a
   SOLBench/Kernel-Factory ``spec.languages`` document is refused rather than
   silently translated;
-* a setup declaration on the Solution spec (:ref:`trace_apply_setup`) is
-  validated at verification, with the standard library: both symbols are
-  spelled ``<file>.py::<symbol>``, follow the entry-point rules (a sealed
-  Python file, canonical path, not shadowed) and name a file the Solution
-  lists in ``sources``; ``teardown_entry_point`` requires
+* every declared symbol (the entry point, and the setup and teardown of a
+  setup declaration, :ref:`trace_apply_setup`) is validated at verification,
+  with the standard library, before any sealed code runs: spelled
+  ``<file>.py::<symbol>`` (the form ``BuildSpec`` takes), a sealed Python file
+  on a canonical path, not shadowed by a package, and listed in the Solution's
+  ``sources``; a sealed ``bundle/definition.json`` must name the solution's
+  definition, and sidecars are plain file names beside the manifest; ``teardown_entry_point`` requires
   ``setup_entry_point``, ``destination_passing_style`` is explicit,
   ``setup_inputs`` are distinct identifiers and, when
   ``bundle/definition.json`` is sealed, every setup input is a tensor input of

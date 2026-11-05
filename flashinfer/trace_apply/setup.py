@@ -88,12 +88,16 @@ class SetupStateError(RuntimeError):
 
 
 def _is_capturing(device: Any) -> bool:
-    """Whether the current stream is inside CUDA-graph capture (CUDA devices only)."""
+    """Whether the current stream of ``device`` is inside CUDA-graph capture.
+
+    Asked on the call's device, not on whatever device happens to be current:
+    a capture on another GPU than the current one must still be seen."""
     if device.type != "cuda":
         return False
     import torch
 
-    return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
 
 
 def _call_device(tensors: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
@@ -124,6 +128,22 @@ def _tensor_metadata(tensor: Any) -> dict[str, Any]:
         "stride": list(tensor.stride()),
         "dtype": _dtype_str(tensor.dtype),
         "device": tensor.device.type,
+    }
+
+
+def _declared_metadata(spec: Any, axes: Mapping[str, int]) -> dict[str, Any]:
+    """Metadata of a Definition output with no live buffer: the declared shape
+    with every axis the call resolved, stride unknown, the declared dtype."""
+    shape = spec.get("shape") if isinstance(spec, Mapping) else None
+    return {
+        "shape": [
+            axes.get(axis, axis) if isinstance(axis, str) else axis for axis in shape
+        ]
+        if isinstance(shape, list)
+        else None,
+        "stride": None,
+        "dtype": spec.get("dtype") if isinstance(spec, Mapping) else None,
+        "device": spec.get("device", "cuda") if isinstance(spec, Mapping) else "cuda",
     }
 
 
@@ -375,8 +395,9 @@ class SetupBoundCallable:
                 and name not in outputs
             ):
                 inputs[name] = _tensor_metadata(value)
+        axes = _resolve_axes(definition, kwargs) if definition is not None else {}
         return {
-            "axes": _resolve_axes(definition, kwargs) if definition is not None else {},
+            "axes": axes,
             "device": str(device),
             "rank": rank,
             "world_size": world_size,
@@ -387,10 +408,14 @@ class SetupBoundCallable:
                 if not isinstance(value, torch.Tensor)
             },
             "setup_inputs": dict(zip(self.setup_inputs, tensors, strict=True)),
+            # A declared output is described from its live buffer when the call
+            # passes one (destination passing) and from the Definition and the
+            # resolved axes when it does not (a value-returning Solution).
             "outputs": {
                 name: _tensor_metadata(kwargs[name])
-                for name in outputs
                 if isinstance(kwargs.get(name), torch.Tensor)
+                else _declared_metadata(spec, axes)
+                for name, spec in outputs.items()
             },
         }
 
@@ -432,8 +457,11 @@ class SetupBoundCallable:
 
         Refused once a CUDA-graph capture has observed the binding: captured
         graphs replay against the state addresses, so freeing them would serve
-        recycled memory as weights. Every teardown is attempted; the first
-        failure is raised afterwards, naming how many of them failed."""
+        recycled memory as weights. A shutdown-time operation: the caller
+        quiesces calls first, since a call in flight already holds the state
+        it was handed and a teardown may empty it. Every teardown is
+        attempted; the first failure is raised afterwards, naming how many of
+        them failed."""
         with self._lock:
             if self._frozen:
                 raise SetupStateError(
