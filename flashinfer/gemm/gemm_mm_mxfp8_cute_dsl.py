@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import importlib.metadata
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Sequence
 
 import torch
 
@@ -56,6 +56,7 @@ def _b12x_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "b12x", "auto"] = "auto",
+    extra_tuning_buckets: Optional[Sequence[int]] = None,  # unused
 ):
     if get_cuda_version().major < 13:
         if backend != "b12x":

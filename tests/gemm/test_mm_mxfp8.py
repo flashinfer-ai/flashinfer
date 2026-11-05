@@ -1,3 +1,7 @@
+import inspect
+import typing
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,6 +15,7 @@ from flashinfer import (
 )
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fp8_quantization import mxfp8_quantize
+from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
 from flashinfer.gemm import gemm_base
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
@@ -1100,3 +1105,136 @@ def test_trtllm_raises_for_linear_b_descale():
             a_descale,
             b_descale,
         )
+
+
+@pytest.mark.parametrize("cute_dsl", [False, True])
+def test_mm_mxfp8_extra_tuning_buckets_config(cute_dsl):
+    """CPU-only: extra_tuning_buckets join the default hybrid M buckets."""
+    default = (
+        gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG  # pyright: ignore[reportPrivateUsage]
+        if cute_dsl
+        else gemm_base._MM_MXFP8_TUNING_CONFIG  # pyright: ignore[reportPrivateUsage]
+    )
+    tuning_config = gemm_base._mm_mxfp8_tuning_config  # pyright: ignore[reportPrivateUsage]
+    assert tuning_config(cute_dsl, None) is default
+    assert tuning_config(cute_dsl, ()) is default
+
+    config = tuning_config(cute_dsl, [320, 272, 288, 288, 100000])
+    # Equal bucket sets share one config, so the autotuner's caches stay bounded.
+    assert config is tuning_config(cute_dsl, (272, 288, 320, 100000))
+    # Only the M spec's buckets differ from the default config.
+    assert replace(config, dynamic_tensor_specs=default.dynamic_tensor_specs) == default
+    (spec,) = config.dynamic_tensor_specs
+    (default_spec,) = default.dynamic_tensor_specs
+    assert (spec.input_idx, spec.dim_idx) == (
+        default_spec.input_idx,
+        default_spec.dim_idx,
+    )
+
+    # Tuning profiles the hybrid buckets plus the extra buckets up to the tuned M.
+    assert tuple(spec.gen_tuning_buckets(512)) == tuple(
+        sorted(set(get_hybrid_num_tokens_buckets(512)) | {272, 288, 320})
+    )
+    # A runtime M rounds up to the smallest bucket of either set.
+    for m, bucket in [
+        (1, 1),
+        (100, 128),
+        (256, 256),
+        (257, 272),
+        (272, 272),
+        (273, 288),
+        (300, 320),
+        (321, 512),
+        (600, 768),
+        (99999, 100000),
+        (100001, 131072),
+    ]:
+        assert spec.map_to_tuning_buckets(m) == bucket, m
+    assert default_spec.map_to_tuning_buckets(300) == 512
+
+    # The autotuner keys a runtime M by the extra bucket.
+    m, n, k = 300, 256, 512
+    shapes = ((m, k), (k, n), (1,), (1,), (), (m, n), (1,))
+    assert AutoTuner._find_nearest_profile(shapes, config)[0][0] == 320  # pyright: ignore[reportPrivateUsage]
+    assert AutoTuner._find_nearest_profile(shapes, default)[0][0] == 512  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "buckets", [(0,), (288, -16), (288.0,), (288.5,), ("288",), ([272],)]
+)
+def test_mm_mxfp8_extra_tuning_buckets_rejects_invalid(buckets):
+    """CPU-only: extra_tuning_buckets must be positive integers, whatever the
+    config cache already holds."""
+    gemm_base._mm_mxfp8_tuning_config(True, (288,))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(ValueError, match="extra_tuning_buckets"):
+        gemm_base._mm_mxfp8_tuning_config(True, buckets)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_mm_mxfp8_checkers_accept_every_api_argument():
+    """CPU-only: backend_requirement passes all of mm_mxfp8's arguments, with
+    their defaults, to every backend checker, the common check and the
+    heuristic, so each must accept every mm_mxfp8 parameter."""
+    signature = inspect.signature(mm_mxfp8)
+    checkers = {
+        "cutlass": gemm_base._cutlass_gemm_mxfp8_requirement,  # pyright: ignore[reportPrivateUsage]
+        "trtllm": gemm_base._trtllm_gemm_mxfp8_requirement,  # pyright: ignore[reportPrivateUsage]
+        "cute-dsl": gemm_base._cute_dsl_gemm_mxfp8_requirement,  # pyright: ignore[reportPrivateUsage]
+        "cutedsl_low_latency": gemm_base._cutedsl_low_latency_gemm_mxfp8_requirement,  # pyright: ignore[reportPrivateUsage]
+        "cudnn": gemm_base._cudnn_mm_mxfp8_requirement,  # pyright: ignore[reportPrivateUsage]
+        "b12x": gemm_base._b12x_gemm_mxfp8_requirement,  # pyright: ignore[reportPrivateUsage]
+    }
+    # Every backend mm_mxfp8 names has a checker listed here.
+    backends = set(typing.get_args(signature.parameters["backend"].annotation))
+    assert set(checkers) == backends - {"auto"}
+
+    bound = signature.bind(None, None, None, None)
+    bound.apply_defaults()
+    arguments = dict(bound.arguments)
+    assert "extra_tuning_buckets" in arguments
+    for check in [
+        *checkers.values(),
+        gemm_base._check_mm_mxfp8_problem_size,  # pyright: ignore[reportPrivateUsage]
+    ]:
+        inspect.signature(check).bind(**arguments)
+    inspect.signature(gemm_base._heuristic_func_mm_mxfp8).bind([], **arguments)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "cudnn"])
+def test_mm_mxfp8_extra_tuning_buckets(backend):
+    """Tuning with extra_tuning_buckets stores tactics at the extra buckets, and
+    serving calls that map to them (no autotune context) are correct."""
+    _skip_if_unsupported(backend)
+    if backend == "cudnn" and not gemm_base.CUDNN_AVAILABLE:
+        pytest.skip("cuDNN is not available")
+    extra_buckets = (272, 320)
+    n, k = 1536, 1024
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    def run(m, tune):
+        input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+        input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+            input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, backend
+        )
+        with autotune(tune):
+            out = mm_mxfp8(
+                input_mxfp8,
+                weight_mxfp8.T,
+                input_scale,
+                weight_scale,
+                out_dtype=torch.bfloat16,
+                backend=backend,
+                extra_tuning_buckets=extra_buckets,
+            )
+        _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+    run(512, tune=True)
+    tuned_m = {
+        key.nearest_profile[0][0]
+        for key in tuner.profiling_cache
+        if key.custom_op == "mxfp8_gemm"
+    }
+    assert {*extra_buckets, 256, 512} <= tuned_m, sorted(tuned_m)
+    for m in (260, 300):  # served from the extra buckets 272 and 320
+        run(m, tune=False)
