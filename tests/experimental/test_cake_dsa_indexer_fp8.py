@@ -194,7 +194,8 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         fields = cake_jit.POLICY_FP8[arch]
         assert "static_scan_kinds" in fields and set(fields) <= set(POLICY_FIELDS), arch
         fp8 = fp8_policy_record(record, fields)
-        assert tuple(fp8) == tuple(record) == POLICY_FIELDS
+        # the FP8 record keeps the BF16 record's field order (the registry's, not necessarily POLICY_FIELDS')
+        assert tuple(fp8) == tuple(record) and set(record) == set(POLICY_FIELDS), arch
         assert {f: fp8[f] for f in fields} == fields, arch
         assert {f: fp8[f] for f in POLICY_FIELDS if f not in fields} == {
             f: record[f] for f in POLICY_FIELDS if f not in fields
