@@ -764,11 +764,11 @@ def test_vc_preprocessor_step_schedule():
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
     assert torch.equal(step1.perm, perm0)  # no refresh at step 1
-    perm_ptr = prep._groupings[(1, 1024, 2)]["perm"].data_ptr()
+    perm_ptr = prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
     assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
     # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
-    assert prep._groupings[(1, 1024, 2)]["perm"].data_ptr() == perm_ptr
+    assert prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
@@ -836,3 +836,27 @@ def test_vc_preprocessor_step_schedule():
     qk8 = VCAttentionPreprocessor().prepare(k, v, q=q, denoise_step=(0, 40))
     assert qk8.q.dtype == _FP8 and qk8.q_scale is not None and qk8.demean
     assert torch.equal(qk8.v_scale, vc_quantize_fp8(q, k, v, perm=qk8.perm).v_scale)
+    # A token range groups only the tokens inside it. The others follow in
+    # input order.
+    ranged = VCAttentionPreprocessor().prepare(k, v, grouped_tokens=(200, 900)).perm
+    assert torch.equal(
+        ranged[..., :700].sort(dim=-1).values,
+        torch.arange(200, 900).to(ranged).expand(1, 2, -1),
+    )
+    rest = torch.cat([torch.arange(200), torch.arange(900, 1024)]).to(ranged)
+    assert torch.equal(ranged[..., 700:], rest.expand(1, 2, -1))
+    # A refresh with the range warm-starts from the range's centroids.
+    ranged_prep = VCAttentionPreprocessor()
+    ranged_prep.prepare(k, v, grouped_tokens=(200, 900), denoise_step=(0, 40))
+    refreshed = ranged_prep.prepare(
+        k, v.flip(1), grouped_tokens=(200, 900), denoise_step=(4, 40)
+    )
+    assert torch.equal(refreshed.perm[..., 700:], rest.expand(1, 2, -1))
+    # A new generation seen through one grouping cold-starts the others too.
+    # The range here last refreshed at step 4 of the previous generation.
+    ranged_prep.prepare(k, v, denoise_step=(20, 40))
+    ranged_prep.prepare(k, v, denoise_step=(0, 40))
+    assert torch.equal(
+        ranged_prep.prepare(k, v, grouped_tokens=(200, 900), denoise_step=(1, 40)).perm,
+        ranged,
+    )
