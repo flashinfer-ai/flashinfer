@@ -76,8 +76,9 @@ path had before #8046 that are not entry points (``ROW_RULES``, ``stream_k_plan`
 prepared types ``GemmPlan`` / ``PreparedGemm`` / ``RouterPlan`` / ``PreparedRouterGemm``, ...) read through to the
 deterministic package (module ``__getattr__``); assigning one here does not change the deterministic package's.
 :func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages; a convenience-path
-call of this package captured into a CUDA graph stays valid until then (the arenas keep every buffer a launch was
-bound to, through growths and cache evictions).
+call that this package launches from its arenas, captured into a CUDA graph, stays valid until then (the arenas keep
+every buffer a launch was bound to, through growths and cache evictions); a call it hands to the deterministic package's
+convenience path follows that package's rule (:func:`clear_convenience_caches`).
 """
 
 from __future__ import annotations
@@ -4468,8 +4469,14 @@ def clear_convenience_caches() -> None:
     """Drop every cached convenience-path launch, what the convenience path keeps from the router tables
     (:func:`_router_memo`) and every workspace arena of both packages (this package's launches and the deterministic
     package's).  This invalidates every CUDA graph that captured a convenience-path call: its replay would use freed
-    workspace, so capture such graphs again after it.  A captured convenience-path call of this package stays valid
-    until then (its arena keeps every buffer a launch was bound to, through growths and cache evictions)."""
+    workspace, so capture such graphs again after it.  A captured ``deterministic=False`` convenience-path call that
+    this package launches from its arenas (its programs, and the deterministic programs it launches through its
+    binding) stays valid until then: its arena keeps every buffer a launch was bound to, through growths and cache
+    evictions.  A call this package hands to the deterministic package's convenience path (launch views its binding
+    cannot rebuild from the call's tensors, such as two operands that alias; a batched forward on that package's
+    swapped small-token program; ``torch.use_deterministic_algorithms(True, warn_only=True)``) follows that package's
+    rule: a CUDA graph captures its prepared launch, not its convenience path.  The graphs captured on one stream share
+    its arena: replay them one at a time, and not concurrently with calls on that stream."""
     _drop_convenience_entries()
     deterministic_backend().clear_convenience_caches()
 

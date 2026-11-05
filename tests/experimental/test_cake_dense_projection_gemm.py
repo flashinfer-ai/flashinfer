@@ -6995,7 +6995,8 @@ def _arena_tickets_zero():
     deterministic program's slice counters: both zero between complete launches)."""
     for arena in cake_backend._ATOMIC_ARENAS.values():
         bufs = [arena.buffers.get("k1_tickets")]
-        bufs += [b for b in arena.retired if b.dtype == torch.uint32]
+        # an arena without a ``retired`` list (its growths release the buffer they replace): its live buffers only
+        bufs += [b for b in getattr(arena, "retired", ()) if b.dtype == torch.uint32]
         if any(b is not None and b.to(torch.int64).any() for b in bufs):
             return False
     return True
@@ -9655,6 +9656,10 @@ GRAPH_SAFETY_KINDS = {
     "router_forward": {"k2_stack", "k2_splitk_partials"},
 }
 GRAPH_SAFETY_CASES = tuple(GRAPH_SAFETY_KINDS)
+#: ``(N, K, (T_small, T_large))`` of the k1_forward case: forwards whose deterministic plan splits K across stream-K
+#: units (partial slabs in ``k1_det_ws``) at both token counts on the 148- and 152-SM parts, the large one needing more
+#: slabs (the scenario asserts both).
+GRAPH_SAFETY_K1_FORWARD = (256, 4096, (256, 1000))
 #: Seconds a scenario process may take: a replay on freed workspace can fault, or spin on a counter it reads there.
 GRAPH_SAFETY_TIMEOUT = 300
 #: The byte the filler tensors of :func:`_graph_safety_scenario` hold.
@@ -9738,9 +9743,10 @@ def _graph_safety_calls(case, device, monkeypatch):
             for i, row in enumerate(("indexer_hw", "kv_a"))
         ]
     if case == "k1_forward":
+        N, K, tokens = GRAPH_SAFETY_K1_FORWARD
         return [
-            _graph_safety_k1_forward(T, N, 4096, device, SEED + 112 + i)
-            for i, (T, N) in enumerate(((1000, 128), (4097, 2048)))
+            _graph_safety_k1_forward(T, N, K, device, SEED + 112 + i)
+            for i, T in enumerate(tokens)
         ]
     op = case.split("_")[1]
     return [
@@ -9758,6 +9764,11 @@ def _graph_safety_bound(case, stream):
     elif case == "k1_forward":
         entries = [e for k, e in cake_backend._K1_DET_CACHE.items() if k[1] == key]
         assert entries and all(e.k1 is not None for e in entries)
+        # stream-K partial slabs: the launch writes and reads k1_det_ws (a plan without them binds the 16-element floor
+        # and only adds 0 to dummy counters)
+        assert all(e.plan.ws_f32_elems > 0 for e in entries), [
+            (e.plan.template, e.plan.sk_units) for e in entries
+        ]
     else:
         entries = [e for k, e in cake_backend._K2_ENTRY_CACHE.items() if k[1] == key]
         assert entries and all(e.launch is not None for e in entries)
@@ -9772,10 +9783,11 @@ def _graph_safety_scenario(case: str, mode: str) -> None:
     the capture plans and allocates nothing), then ``mode``: ``"grow"`` -- the larger call on ``s`` grows the arena,
     and an eager call of the captured key binds the grown buffers (the replaced ones lose their last binding);
     ``"evict"`` -- with a cache bound of 1, calls on another stream evict every entry of ``s`` (its arena loses its
-    last cached user).  Then tensors of the sizes of the arena's buffers at capture, filled with
-    :data:`GRAPH_SAFETY_FILL`, are allocated on ``s`` until one takes such a buffer's address or the allocator has no
-    cached block left (the caching allocator hands a freed block out again on the stream it was freed on).  The
-    replay must give the eager result and leave every filler untouched."""
+    last cached user); under ``"grow"`` at least one of the case's kinds must have a new live buffer.  Then tensors of
+    the sizes of the arena's buffers at capture, filled with :data:`GRAPH_SAFETY_FILL`, are allocated on ``s`` until one
+    takes such a buffer's address or the allocator has no cached block left (the caching allocator hands a freed block
+    out again on the stream it was freed on).  The replay must give the eager result and leave every filler
+    untouched."""
     device, _ = _atomic_device_or_skip()
     index = torch.cuda.current_device() if device.index is None else device.index
     with pytest.MonkeyPatch.context() as mp:
@@ -9820,13 +9832,26 @@ def _graph_safety_scenario(case: str, mode: str) -> None:
         torch.cuda.synchronize()
         gc.collect()
         live = cake_backend._ATOMIC_ARENAS.get(key)
+        # the captured kinds whose live buffer is no longer the one the graph was captured with
+        moved = sorted(
+            kind
+            for kind, ptr, _ in captured
+            if live is not None
+            and kind in GRAPH_SAFETY_KINDS[case]
+            and live.buffers[kind].data_ptr() != ptr
+        )
         print(
             "GRAPH_SAFETY_ARENA",
             "kept" if id(live) == arena_id else "dropped",
             {} if live is None else {k: b.nbytes for k, b in live.buffers.items()},
+            "moved",
+            moved,
             flush=True,
         )
         live = None
+        if mode == "grow":
+            # the larger call replaced a buffer the captured launch is bound to
+            assert moved, captured
         fillers, landed = [], []
         with torch.cuda.stream(s):
             for kind, ptr, nbytes in captured:
