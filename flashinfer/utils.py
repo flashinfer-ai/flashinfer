@@ -563,6 +563,23 @@ def is_fa3_prefill_head_dim_supported(head_dim_qk: int, head_dim_vo: int) -> boo
     return (head_dim_qk, head_dim_vo) == (192, 128)
 
 
+def pins_kv_split(fixed_split_size: Optional[int], disable_split_kv: bool) -> bool:
+    """Whether the caller pinned fa2's KV split (``fixed_split_size`` / ``disable_split_kv``)."""
+    return (fixed_split_size is not None and fixed_split_size > 0) or disable_split_kv
+
+
+def check_kv_split_backend(
+    backend: Optional[str], fixed_split_size: Optional[int], disable_split_kv: bool
+) -> None:
+    """Raise when ``backend`` would silently drop a pinned KV split."""
+    if backend == "fa3" and pins_kv_split(fixed_split_size, disable_split_kv):
+        raise ValueError(
+            "fixed_split_size and disable_split_kv are honored only by the fa2 "
+            f"backend; backend={backend!r} would silently ignore them. Use "
+            "backend='fa2' or backend='auto'."
+        )
+
+
 def is_cutlass_backend_supported(
     pos_encoding_mode: int,
     use_fp16_qk_reductions: bool,

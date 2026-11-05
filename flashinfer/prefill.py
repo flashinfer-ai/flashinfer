@@ -106,6 +106,7 @@ from .utils import (
     ceil_div,
     check_lse_base,
     check_lse_layout,
+    check_kv_split_backend,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -118,6 +119,7 @@ from .utils import (
     is_sm110a_supported,
     ln2,
     log2e,
+    pins_kv_split,
     prepare_jit_additional_args,
     register_custom_op,
     register_fake_op,
@@ -3472,14 +3474,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
             module = self._jit_module
         else:
             if backend == "auto":
-                backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    use_custom_mask,
-                    q_data_type,
-                    kv_data_type,
+                backend = (
+                    "fa2"
+                    if pins_kv_split(fixed_split_size, disable_split_kv)
+                    else determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        use_fp16_qk_reduction,
+                        use_custom_mask,
+                        q_data_type,
+                        kv_data_type,
+                    )
                 )
+            check_kv_split_backend(backend, fixed_split_size, disable_split_kv)
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -3869,16 +3876,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and self._jit_module is None
             and not use_token_head_sf
         ):
-            self._backend = determine_attention_backend(
-                self.device,
-                PosEncodingMode[pos_encoding_mode].value,
-                use_fp16_qk_reduction,
-                packed_custom_mask is not None
-                or (self.is_cuda_graph_enabled and self._custom_mask_buf is not None),
-                q_data_type,
-                kv_data_type,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
+            self._backend = (
+                "fa2"
+                if pins_kv_split(fixed_split_size, disable_split_kv)
+                else determine_attention_backend(
+                    self.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    packed_custom_mask is not None
+                    or (
+                        self.is_cuda_graph_enabled and self._custom_mask_buf is not None
+                    ),
+                    q_data_type,
+                    kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                )
             )
             if (
                 self._backend == "fa2"
@@ -3925,6 +3938,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             ):
                 self._backend = "cudnn"
+        check_kv_split_backend(self._backend, fixed_split_size, disable_split_kv)
 
         self._cudnn_paged_bounds = None
         if self._requested_backend == "auto" and self._backend == "cudnn":
@@ -6309,15 +6323,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # use_token_head_sf pins the backend to fa2 (validation block above), so
             # skip auto-resolution/upgrades that would override it.
             if self._requested_backend == "auto" and not use_token_head_sf:
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
+                self._backend = (
+                    "fa2"
+                    if pins_kv_split(fixed_split_size, disable_split_kv)
+                    else determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        use_fp16_qk_reduction,
+                        self._custom_mask_buf is not None,  # use_custom_mask
+                        q_data_type,
+                        kv_data_type,
+                        head_dim_qk=head_dim_qk,
+                        head_dim_vo=head_dim_vo,
+                    )
                 )
                 # SM12x: use fmha_v2 HMMA kernels for large-sequence MHA.
                 # fmha_v2 outperforms FA2 at longer sequences (S>=256) on SM120
@@ -6336,6 +6354,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
                 if (
                     self._backend == "fa2"
+                    and not pins_kv_split(fixed_split_size, disable_split_kv)
                     and self._kv_layout == "NHD"
                     and num_qo_heads == num_kv_heads
                     and same_qk_segments
@@ -6364,7 +6383,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # take the first backend whose kernel serves this problem
                 # exactly; none eligible -> stay on FA2. Explicit backends are
                 # never rewritten.
-                elif self._backend == "fa2":
+                elif self._backend == "fa2" and not pins_kv_split(
+                    fixed_split_size, disable_split_kv
+                ):
                     upgraded = _blackwell_ragged_auto_upgrade(
                         self.device,
                         self._kv_layout,
@@ -6416,6 +6437,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     )
                     if upgraded is not None:
                         self._backend = upgraded
+            check_kv_split_backend(self._backend, fixed_split_size, disable_split_kv)
 
             get_module_args = (
                 q_data_type,
