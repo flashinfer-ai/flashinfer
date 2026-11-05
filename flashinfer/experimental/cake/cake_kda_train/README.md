@@ -256,7 +256,7 @@ saved set do not change.
 
 | `checkpoint_handoff` | engages |
 | --- | --- |
-| `"auto"` (default) | at the head counts of `cake_backend.HANDOFF_HEADS` (2, 4, 8, 12, 16, 32, 64) on the devices of `cake_backend.HANDOFF_VERIFIED` (architecture, SM count, Cake build toolkit): `sm_100a` and `sm_103a` with 148 or 152 SMs, `sm_107a` with 212 SMs, toolkit 13.4; on a problem of `S` tokens in `N` documents at `H` heads with `H * S >= HANDOFF_MIN_HEAD_TOKENS` (196608) and `S >= HANDOFF_MIN_DOC_TOKENS * N` (8192 tokens per document on average) |
+| `"auto"` (default) | at the head counts of `cake_backend.HANDOFF_HEADS` (2, 4, 8, 12, 16, 32, 64) on the devices of `cake_backend.HANDOFF_VERIFIED` (architecture, SM count, Cake build toolkit): `sm_100a` and `sm_103a` with 148 or 152 SMs, `sm_107a` with 212 SMs, toolkit 13.4; on a problem of `S` tokens in `N` documents at `H` heads with `H * S >= cake_backend.HANDOFF_MIN_HEAD_TOKENS` (196608) and `S >= cake_backend.HANDOFF_MIN_DOC_TOKENS * N` (8192 tokens per document on average) |
 | `"on"` | every call it supports (tests and benchmarks) |
 | `"off"` | never |
 
@@ -273,8 +273,13 @@ saved set do not change.
   (x86 hosts), checkpointed step det / ND: `S = 32768` in one or four
   documents and `S = 16384` in one document 1.04-1.14 (admitted);
   `S = 16384` in four documents and `S = 8192` in one or four documents
-  0.92-0.98 (refused).  The other head counts and devices take the same
-  bounds until rows of their own are measured.
+  0.92-0.98 with the hand-off on (refused now; about 0.98 at `S = 8192` in
+  four documents with it off).  The other head counts and devices take the
+  same bounds until rows of their own are measured.
+- `N` counts every document of `cu_seqlens`, zero-length ones too (the
+  check reads its shape only, with no device sync): a pack padded to a fixed
+  document count with empty documents can fall under the mean-length bound
+  although its real documents are long; pass `checkpoint_handoff="on"` there.
 - Elsewhere `"auto"` runs as `"off"`, also when the toolkit cannot be read.
   A new device, toolkit or registry needs the suite on that device before it
   enters `HANDOFF_VERIFIED`.

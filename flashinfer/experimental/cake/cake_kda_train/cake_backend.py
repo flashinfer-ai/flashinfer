@@ -6311,8 +6311,8 @@ HANDOFF_HEADS = frozenset({2, 4, 8, 12, 16, 32, 64})
 # in one document 1.140 / 1.134, in four 1.042 / 1.042, S = 16384 in one 1.088 / 1.059; refused S = 16384 in four
 # 0.975 / 0.967, S = 8192 in one 0.978 / 0.965, in four 0.939 / 0.921 (that B300 row with the hand-off off: 0.985 det
 # first, 0.981 ND first).  Each bound is the smallest value of its quantity on an admitted row.  The other head counts
-# take the token-head bound, and the other devices of HANDOFF_VERIFIED (GB200 and GB300 with a Grace host, R200) both
-# bounds, without measured rows of their own yet.
+# and the other devices of HANDOFF_VERIFIED (GB200 and GB300 with a Grace host, R200) take both bounds, without
+# measured rows of their own yet.
 HANDOFF_MIN_HEAD_TOKENS = 196608
 HANDOFF_MIN_DOC_TOKENS = 8192
 # Row records (the recompute launches the intra twin, the backward no prep) on these (architecture, SM count, full
@@ -7472,6 +7472,8 @@ __all__ = [
     "FWD_TAPE_SLOTS",
     "HANDOFF_HEADS",
     "HANDOFF_LAYOUT",
+    "HANDOFF_MIN_DOC_TOKENS",
+    "HANDOFF_MIN_HEAD_TOKENS",
     "HANDOFF_MODES",
     "HANDOFF_ROWS_VERIFIED",
     "HANDOFF_VERIFIED",

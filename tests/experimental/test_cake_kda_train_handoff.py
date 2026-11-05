@@ -1307,6 +1307,9 @@ def test_auto_follows_the_head_counts_and_the_verified_devices(
         twin = _plan(lengths, H, device).handoff_twin
         assert s["published_rows"] == 0, (tag, s)
         assert s["rows_unverified"] == engaged * (twin is not None), (tag, s)
+        if not engaged and not unverified:
+            nonzero = [name for name in cake_backend._HANDOFF_COUNTERS if s[name]]
+            assert not nonzero, (tag, nonzero, s)
         _check_grads(auto, off, tag)
 
 
