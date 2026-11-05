@@ -277,6 +277,11 @@ def build_inputs(
         raise ValueError("query and key segment lists must have the same length")
     if sum(seg_q_len) != q.shape[0] or sum(seg_k_len) != k.shape[0]:
         raise ValueError("segment lengths must sum to the tensor row counts")
+    if k_scale is not None and float(softmax_scale) != 1.0:
+        # the FP8 form takes softmax_scale=None and the references would still apply it
+        raise ValueError(
+            "the FP8 form folds softmax_scale into w: pass softmax_scale=1.0 with k_scale"
+        )
     device = q.device
     offsets = None
     if q_causal_offsets is not None:
@@ -1260,7 +1265,11 @@ def score_selected(
         rr = rows[r0:r1]
         local = ids[r0:r1].to(torch.int64)
         valid = local >= 0
-        global_ids = k_starts[seg[rr]].unsqueeze(1) + local.clamp_min(0)
+        # a padding id in a trailing empty key segment would point one past the last key: clamp it (``valid``
+        # discards its score)
+        global_ids = (k_starts[seg[rr]].unsqueeze(1) + local.clamp_min(0)).clamp_max(
+            inputs.num_keys - 1
+        )
         wb = inputs.w.index_select(0, rr)
         if inputs.fp8:
             qb = _rows_of(inputs.q, rr)

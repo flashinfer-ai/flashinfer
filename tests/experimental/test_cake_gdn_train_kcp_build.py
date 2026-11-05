@@ -34,8 +34,25 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 PACKAGE = "cake_gdn_train_kcp"
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
 
 
 def _package_import() -> str:
@@ -69,7 +86,8 @@ KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
 # The nine programs of a step and the two output walks (the shipped records by program name: twenty libraries), the
-# three programs of the in-kernel Q / K L2 norm (one library each) and the two test-only records.
+# three programs of the in-kernel Q / K L2 norm and the light replay of #1_l2n (one library each: 24 shipped records)
+# and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
@@ -85,6 +103,7 @@ SHIPPED_PROGRAMS = (
     "bwd_dqkg",
     "gate_epilogue",
     "fwd_prep_l2n",
+    "fwd_prep_replay_l2n",
     "bwd_dqkg_l2n",
     "qk_apply",
 )
@@ -97,7 +116,8 @@ TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # far, the deterministic family's (``gdn_chunk_det_*``): the digests equal the twin's, the prefix differs, so no library
 # of this package is named like a library of ``cake_gdn_det_train_kcp`` (a lever that replaces a program updates
 # its row here).  The output walks' modules are det-neutral (``gdn_chunk_fwdh_out_v1_kcp``,
-# ``gdn_chunk_fwdh_out_tape_v1_kcp``) and no det twin ships them.
+# ``gdn_chunk_fwdh_out_tape_v1_kcp``) and no det twin ships them; the light replay's module
+# (``gdn_chunk_train_fwd_prep_replay_l2n_v1``) is this package's own, with no det twin.
 IDENTITIES = {
     "fwd_prep": (
         f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_v1",
@@ -175,6 +195,10 @@ IDENTITIES = {
     ),
     "fwd_prep_l2n": (
         f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_l2n_v1",
+        {},
+    ),
+    "fwd_prep_replay_l2n": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_train_fwd_prep_replay_l2n_v1",
         {},
     ),
     "bwd_dqkg_l2n": (

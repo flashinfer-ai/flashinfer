@@ -1336,7 +1336,7 @@ class TllmGenFmhaKernel {
 
     // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
     // groups both tokensQ and headsQ into one CTA.
-    if (params.mMaxSeqLenQ > 1) {
+    if (params.mMaxSeqLenQ > 1 && !params.mKeepGqaGenerationQueryTile) {
       selectTileSizeQForGqaGeneration(params, selectKernelParams);
     }
   }

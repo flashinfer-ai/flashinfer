@@ -442,8 +442,11 @@ def cake_causal_conv1d_det_train_backward_workspace_bytes(
     ``grid_mult``; a call whose grid drops CTAs to whole channel-tile ranks,
     ``cake_jit.main_grid``, writes fewer rows), sized by the largest such
     buffer over every backward program of every backward route of the
-    architecture: the call's arguments select the route and the channel count
-    the program, every program writes the leading rows of its own grid inside
+    architecture (a program of another build geometry than the routes'
+    fallbacks counts only at the channel counts it runs,
+    ``cake_jit.workspace_owners``): the call's arguments select the route and
+    the channel count the program, every program writes the leading rows of
+    its own grid inside
     this buffer, and its reduce
     program sums exactly those.  So one buffer serves every route (the bias
     routes' fifth slab makes it 25 % larger than the dweight partials alone,
@@ -466,12 +469,30 @@ def cake_causal_conv1d_det_train_backward_workspace_bytes(
             f"C must be a positive multiple of {CHANNEL_MULTIPLE}, got {C}"
         )
     arch = _device_arch(device)
-    device_index = _device_index(device)
+    return _backward_workspace_bytes(
+        arch,
+        tuple(route_modules(arch, kind) for kind in _loader.backward_kinds(arch)),
+        C,
+        _device_index(device),
+        bwd_grid_mult,
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _backward_workspace_bytes(
+    arch: str,
+    routes: tuple[tuple[str, ...], ...],
+    C: int,
+    device_index: int,
+    bwd_grid_mult: int,
+) -> int:
+    """The backward workspace bytes, once per backward routes' programs, ``C``, device and ``bwd_grid_mult``."""
+
     return max(
         _workspace_bytes(
             owner, C, device_index=device_index, bwd_grid_mult=bwd_grid_mult
         )
-        for owner in workspace_owners(arch)
+        for owner in workspace_owners(arch, C)
     )
 
 
