@@ -9870,11 +9870,17 @@ def test_gpu_prepared_k1_reset_counters():
 # CUDA graphs of the convenience path: an arena keeps every buffer a captured launch is bound to
 # ---------------------------------------------------------------------------
 
-#: The convenience calls :func:`_graph_safety_scenario` captures, by the arena kinds their launches bind: this
-#: package's K1 program (split slots and tickets), the deterministic K1 program through this package's binding
-#: (stream-K slabs and slice counters), this package's router program (the BF16x3 stack) and the deterministic router
-#: program through this package's binding (the stack and the split-K partials).
-GRAPH_SAFETY_CASES = ("k1_wgrad", "k1_forward", "router_wgrad", "router_forward")
+#: The convenience calls :func:`_graph_safety_scenario` captures, with the arena kinds their launches bind (the scenario
+#: asserts them): this package's K1 program (split slots and tickets), the deterministic K1 program through this
+#: package's binding (stream-K slabs and slice counters), this package's router program (the BF16x3 stack) and the
+#: deterministic router program through this package's binding (the stack and the split-K partials).
+GRAPH_SAFETY_KINDS = {
+    "k1_wgrad": {"k1_slots", "k1_tickets"},
+    "k1_forward": {"k1_det_ws", "k1_det_counters"},
+    "router_wgrad": {"k2_stack"},
+    "router_forward": {"k2_stack", "k2_splitk_partials"},
+}
+GRAPH_SAFETY_CASES = tuple(GRAPH_SAFETY_KINDS)
 #: Seconds a scenario process may take: a replay on freed workspace can fault, or spin on a counter it reads there.
 GRAPH_SAFETY_TIMEOUT = 300
 #: The byte the filler tensors of :func:`_graph_safety_scenario` hold.
@@ -9914,8 +9920,19 @@ def _graph_safety_router(op, T, device, seed, monkeypatch):
     X, W, G = _router_inputs(T, device, seed)
     if op == "wgrad":
         out = torch.empty(W.shape, device=device)
-        # a verdict for the row at every token count: this package's stream-K program with its BF16x3 stack
-        _force_router_rule(monkeypatch, "wgrad", G.t(), X, "pairs")
+        # a verdict for the row at every token count: this package's stream-K program with its BF16x3 stack.  It is
+        # set in the device's router table, a verdict table as shipped, so the call takes the router entry point's
+        # cache (_K2_ENTRY_CACHE) as with a shipped verdict; the plain dicts _force_router_rule binds are read on every
+        # call, which leaves that cache unused
+        arch = det_backend.arch_for(device)
+        sm_count = det_backend.device_facts(device).sm_count
+        table, _ = cake_backend.router_rules(arch, sm_count)
+        if table is cake_backend.ROUTER_RULES:
+            # a verdict of ROUTER_RULES applies on this device whatever its SM count
+            monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+        key = (arch, "nn_t", int(X.shape[1]), int(G.shape[1]))
+        monkeypatch.setitem(table, key, "pairs")
+        cake_backend.clear_convenience_caches()
 
         def call(o):
             return cake_backend.router_wgrad(G, X, o, deterministic=False)
@@ -10002,6 +10019,7 @@ def _graph_safety_scenario(case: str, mode: str) -> None:
             (kind, b.data_ptr(), b.numel() * b.element_size())
             for kind, b in cake_backend._ATOMIC_ARENAS[key].buffers.items()
         ]
+        assert GRAPH_SAFETY_KINDS[case] <= {kind for kind, _, _ in captured}, captured
         arena_id = id(cake_backend._ATOMIC_ARENAS[key])
         print("GRAPH_SAFETY_CAPTURED", case, mode, captured, flush=True)
         graph = torch.cuda.CUDAGraph()
