@@ -1029,10 +1029,18 @@ RadixSamplingTieIndexLimit(const OrderedType* ordered, OrderedType pivot, uint32
         state->histogram[0][cta_in_group - base] = local_equal_count;
       }
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, threadIdx.x);
-      if (threadIdx.x == 0) {
-        for (uint32_t c = 0; c < count && base + c < cta_in_group; ++c) {
-          prefix += state->histogram[0][c];
+      // Read peer counts in parallel instead of serializing every load in lane 0.
+      // Only the first warp participates; each CTA needs its own exclusive prefix.
+      if (threadIdx.x < 32) {
+        uint32_t batch_prefix = 0;
+        for (uint32_t c = threadIdx.x; c < count && base + c < cta_in_group; c += 32) {
+          batch_prefix += state->histogram[0][c];
         }
+#pragma unroll
+        for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+          batch_prefix += __shfl_down_sync(0xffffffff, batch_prefix, offset);
+        }
+        if (threadIdx.x == 0) prefix += batch_prefix;
       }
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, threadIdx.x);
     }
@@ -1046,7 +1054,9 @@ RadixSamplingTieIndexLimit(const OrderedType* ordered, OrderedType pivot, uint32
   const uint32_t take =
       row_equal_take > prefix ? min(local_equal_count, row_equal_take - prefix) : 0;
   if (take >= local_equal_count) return UINT32_MAX;
-  return FindSamplingTieIndexLimit<BLOCK_THREADS>(
+  if (local_equal_count == chunk_size) return chunk_start + take;
+  // Bisection avoids a block scan for every index tile before a sparse boundary tie.
+  return FindSamplingTieIndexLimit<BLOCK_THREADS, true>(
       chunk_size, take, [ordered, pivot](uint32_t i) { return ordered[i] == pivot; }, chunk_start);
 }
 

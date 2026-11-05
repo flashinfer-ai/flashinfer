@@ -71,6 +71,57 @@ def test_rejected_boundary_candidate_is_never_returned(
     assert (samples == 2).all(), samples.bincount(minlength=4)
 
 
+@pytest.mark.parametrize("vocab_size", [8192, 131072])
+@pytest.mark.parametrize("mode", ["top_k", "top_p", "joint"])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_large_vocab_sampling_resolves_boundary_ties(vocab_size, mode, deterministic):
+    # A modest output batch keeps Hopper's split-row dispatch active. Ties span
+    # multiple chunks; indices also check per-input-row threshold lookup.
+    probs = torch.zeros((5, vocab_size), dtype=torch.float32, device="cuda")
+    positions = torch.tensor(
+        [3, vocab_size // 4 - 1, vocab_size // 2 + 1, vocab_size - 1],
+        device="cuda",
+    )
+    probs[0, positions] = 0.25
+    probs[1, positions] = torch.tensor([8, 10, 23, 23], device="cuda") / 64
+    probs[2, 0] = 0.5
+    probs[2, positions[:2]] = 0.125
+    probs[2, positions[2:]] = 0.0625
+    probs[2, 1:3] = 0.0625
+    probs[3, positions[:3]] = torch.tensor([0.5, 0.2, 0.2], device="cuda")
+    probs[4, positions[:3]] = torch.tensor([0.5, 0.5, 2**-20], device="cuda")
+    k = torch.tensor([2, 1, 5, 2, vocab_size], dtype=torch.int32, device="cuda")
+    p = torch.tensor([0.5, 0.3, 0.875, 0.52, 1.0], device="cuda")
+    if mode == "joint":
+        p[1] = 0.99
+    expected = _renorm_reference(
+        probs, k=k if mode != "top_p" else None, p=p if mode != "top_k" else None
+    )
+    indices = torch.arange(256, device="cuda", dtype=torch.int64) % len(probs)
+    for offset in (0, 17, 65537):
+        kwargs = dict(
+            indices=indices,
+            deterministic=deterministic,
+            seed=42,
+            offset=offset,
+            return_valid=True,
+        )
+        if mode == "top_k":
+            samples, valid = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, **kwargs
+            )
+        elif mode == "top_p":
+            samples, valid = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, **kwargs
+            )
+        else:
+            samples, valid = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, k, p, filter_apply_order="joint", **kwargs
+            )
+        assert valid.all()
+        assert (expected[indices, samples.long()] > 0).all()
+
+
 @pytest.mark.parametrize("vocab_size", [4, 257, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tensor_params", [False, True])
@@ -308,6 +359,25 @@ def test_explicit_small_index_selection_across_index_tiles(dtype, k):
     expected = torch.arange(k, device="cuda").expand_as(indices)
     assert torch.equal(indices, expected)
     assert torch.equal(values, torch.ones_like(values))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_sparse_tie_prefix_scratch_is_reused_across_rows(dtype, is_deterministic):
+    # More rows than SMs guarantees persistent iterations even with one CTA/group.
+    batch = torch.cuda.get_device_properties(0).multi_processor_count + 4
+    vocab = 32768
+    columns = torch.arange(vocab, device="cuda")
+    logits = (columns % 3 == 0).to(dtype).expand(batch, -1).contiguous()
+    probs = logits / (vocab // 3 + 1)
+    k = torch.tensor([vocab, 17, 1, 513], device="cuda", dtype=torch.int32)
+    k = k.repeat((batch + 3) // 4)[:batch]
+    expected = (columns % 3 == 0) & (columns // 3 < k.unsqueeze(1))
+    for _ in range(3):
+        renormed = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic)
+        masked = flashinfer.sampling.top_k_mask_logits(logits, k)
+        assert torch.equal(renormed > 0, expected)
+        assert torch.equal(torch.isfinite(masked), expected | (k == vocab).unsqueeze(1))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
