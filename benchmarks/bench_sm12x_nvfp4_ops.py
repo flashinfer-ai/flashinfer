@@ -320,7 +320,7 @@ def limit10_baseline(baseline, cache_dir):
 
 
 class Fixture:
-    """Pure-Torch oracle using scalar weight encoding 512, not arbitrary expert scales."""
+    """Pure-Torch oracle with shared or per-expert weight encoding scales."""
 
     def __init__(
         self,
@@ -332,6 +332,7 @@ class Fixture:
         padded_routes=False,
         input_scale=1.0,
         baseline=None,
+        per_expert_scales=False,
     ):
         h, intermediate, experts, topk, gated = CASES[model]
         if shape_override is not None:
@@ -370,10 +371,10 @@ class Fixture:
             if tokens > 1:
                 self.ids[0, -1] = -1
         self.router_weights = torch.randn(tokens, topk, device="cuda").softmax(dim=1)
-        weight_scale = torch.tensor([512.0], device="cuda")
-        self.weight_dequant_scale = (
-            weight_scale.reciprocal().expand(experts).contiguous()
-        )
+        weight_scale = torch.full((experts,), 512.0, device="cuda")
+        if per_expert_scales:
+            weight_scale *= torch.arange(1, experts + 1, device="cuda")
+        self.weight_dequant_scale = weight_scale.reciprocal()
         self.g0 = (2688.0 / self.x.float().abs().amax()).reshape(1)
         _, _, x_decoded = fake_quant(self.x, self.g0)
         weights1, scales1, weights2, scales2, decoded1, decoded2 = (
@@ -384,7 +385,7 @@ class Fixture:
             [],
             [],
         )
-        for _ in range(experts):
+        for expert in range(experts):
             w1 = (
                 torch.randn(
                     intermediate * (2 if self.gated else 1),
@@ -398,8 +399,8 @@ class Fixture:
                 torch.randn(h, intermediate, device="cuda", dtype=torch.bfloat16)
                 / intermediate**0.5
             )
-            q1, sf1, d1 = fake_quant(w1, weight_scale)
-            q2, sf2, d2 = fake_quant(w2, weight_scale)
+            q1, sf1, d1 = fake_quant(w1, weight_scale[expert:expert + 1])
+            q2, sf2, d2 = fake_quant(w2, weight_scale[expert:expert + 1])
             weights1.append(q1)
             scales1.append(pack_sf(sf1))
             weights2.append(q2)
@@ -442,7 +443,7 @@ class Fixture:
                     * self.router_weights[token, slot, None],
                 )
         self.reference, self.bf16_reference = reference.bfloat16(), bf16_reference
-        self.alpha1 = (self.g0 * weight_scale).reciprocal().expand(experts).contiguous()
+        self.alpha1 = (self.g0 * weight_scale).reciprocal()
         self.alpha2 = (self.g1 * weight_scale).reciprocal()
         self.out = torch.empty_like(self.x)
         self.q1 = torch.empty(

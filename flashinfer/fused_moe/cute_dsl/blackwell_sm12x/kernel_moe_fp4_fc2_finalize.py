@@ -974,7 +974,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                     rstage,
                     rphase,
                 )
-                acc.store(acc.load() * alpha[0].to(cutlass.Float32))
+                acc.store(acc.load() * alpha[tile.group].to(cutlass.Float32))
                 moe_epilogue.store_wg_scatter(
                     acc,
                     thr_r2s,
@@ -1196,7 +1196,7 @@ class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
                 tidx,
                 ceil_div(cute.size(gA_u8, mode=[1]), bk >> 1),
             )
-            acc.store(acc.load() * alpha[0].to(cutlass.Float32))
+            acc.store(acc.load() * alpha[group].to(cutlass.Float32))
             sC = storage.sC.get_tensor(epi_smem.outer, swizzle=epi_smem.inner)[
                 None, None, 0
             ]

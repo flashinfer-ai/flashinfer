@@ -197,12 +197,12 @@ def _validate_inputs(
         raise ValueError("a_q must be 2D and b_q must be 3D")
     if a_scale.dtype != torch.uint8 or b_scale.dtype != torch.uint8:
         raise TypeError("a_scale and b_scale must be E4M3 bytes from fp4_quantize")
-    if alpha.dtype != torch.float32 or tuple(alpha.shape) != (1,):
-        raise TypeError("alpha must be float32[1]")
     if m_indptr.ndim != 1 or src_token.ndim != 1 or pair_scales.ndim != 1:
         raise ValueError("routing inputs must be 1D")
     m, packed_k = int(a_q.shape[0]), int(a_q.shape[1])
     e, n, b_packed_k = map(int, b_q.shape)
+    if alpha.dtype != torch.float32 or tuple(alpha.shape) != (e,):
+        raise TypeError("alpha must be float32[num_experts]")
     if packed_k != b_packed_k:
         raise ValueError("a_q and b_q K extents must match")
     if int(m_indptr.shape[0]) != e + 1:
