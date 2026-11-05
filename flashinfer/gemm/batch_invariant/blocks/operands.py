@@ -26,12 +26,23 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
 
 ACC_DTYPE = cutlass.Float32
-IN_DT = {"bf16": cutlass.BFloat16}
+IN_DT = {
+    "bf16": cutlass.BFloat16,
+    "e4m3": cutlass.Float8E4M3FN,
+    "e5m2": cutlass.Float8E5M2,
+}
 OUT_DT = {
     "bf16": cutlass.BFloat16,
+    "f16": cutlass.Float16,  # the fp8 classes' fp16 output
     "f32": cutlass.Float32,
-}  # f32: the split class's workspace partials
-ALIGN = {"bf16": 8, "f32": 4}  # elements per 16-byte TMA alignment
+}  # f32: the split class's workspace partials (and the fp8 direct entry's optional fp32 output)
+ALIGN = {
+    "bf16": 8,
+    "f16": 8,
+    "e4m3": 16,
+    "e5m2": 16,
+    "f32": 4,
+}  # elements per 16-byte TMA alignment
 
 NUM_ACC_STAGE = 2  # TMEM accumulator double buffer
 NUM_C_STAGE_MIN = 2  # C smem stages before the leftover budget is added
@@ -62,12 +73,14 @@ class StaticPlan:
         c_in_smem: bool = True,
         extra_smem_bytes: int = 2048,
         chunks: int = 1,
+        in_fmt: str = "bf16",
     ):
         """``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
         ``extra_smem_bytes`` for a caller's own shared storage (unused by this body). ``chunks`` is the
         class's chunk count: with ``knobs.cta_chunks`` the CTA folds all of them (``cta_chunks`` below) and the
-        TMEM holds the running sum next to the accumulator stages."""
-        assert knobs.well_formed() and knobs.use_tma_store, knobs
+        TMEM holds the running sum next to the accumulator stages. ``in_fmt`` names the operand format whose knob
+        constraints apply."""
+        assert knobs.well_formed(in_fmt) and knobs.use_tma_store, (knobs, in_fmt)
         self.knobs = knobs
         self.chunks = chunks
         self.cta_chunks = (
@@ -86,7 +99,7 @@ class StaticPlan:
         cta_group = (
             tcgen05.CtaGroup.TWO if knobs.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
-        # the instruction variant (A2 surface): kind::f16 K=16, cta_group 1/2, tile MxN
+        # the instruction variant (A2 surface): kind::f16 K=16 or kind::f8f6f4 K=32, cta_group 1/2, tile MxN
         self.tiled_mma = utils.sm100.make_trivial_tiled_mma(
             a_dtype, b_dtype, a_major, b_major, ACC_DTYPE, cta_group, knobs.mma_tiler_mn
         )
@@ -251,18 +264,36 @@ def build_grid(st: StaticPlan, c: cute.Tensor, max_active_clusters):
 
 
 def can_implement(
-    knobs: Knobs, M: int, N: int, K: int, b_major: str = "n", chunks: int = 1
+    knobs: Knobs,
+    M: int,
+    N: int,
+    K: int,
+    b_major: str = "n",
+    chunks: int = 1,
+    in_fmt: str = "bf16",
 ) -> bool:
-    """The body's acceptance: well-formed knobs (TMA store only, so out-of-bounds tiles are fine), 16-byte alignment of
-    each operand's contiguous extent (the K chunk for A and a K-major B, N for an N-major B and for C), a whole
-    number of chunks."""
-    if not knobs.well_formed() or b_major not in ("n", "k"):
+    """The body's acceptance: well-formed knobs for the format (TMA store only, so out-of-bounds tiles are fine), 16-byte
+    alignment of each operand's contiguous extent (the K chunk for A and a K-major B, N for an N-major B and for C), a
+    whole number of chunks; on ``kind::f8f6f4`` with an MN-major B the N step of the 2-CTA instruction is 32, so the
+    16-wide decode tile of the 2-CTA pair needs a K-major weight."""
+    if (
+        in_fmt not in IN_DT
+        or not knobs.well_formed(in_fmt)
+        or b_major not in ("n", "k")
+    ):
         return False
     if K % chunks:
         return False
     if knobs.cta_chunks and chunks == 1:
         return False  # the in-CTA chunk fold is a record of the split classes only
-    Kc, al_in = K // chunks, ALIGN["bf16"]
+    if (
+        in_fmt != "bf16"
+        and knobs.tile_n < 32
+        and knobs.use_2cta_instrs
+        and b_major == "n"
+    ):
+        return False
+    Kc, al_in = K // chunks, ALIGN[in_fmt]
     # the output is stored directly (no fp32 workspace) by the unsplit class and by the in-CTA chunk fold
     al_out = ALIGN["bf16"] if (chunks == 1 or knobs.cta_chunks) else ALIGN["f32"]
     return (

@@ -19,20 +19,38 @@ With `batch_invariant=True` an output's bits depend on the input values and the 
 
 Each class has one fixed dataflow, named and hashed into a **fingerprint**; `flashinfer.batch_invariant.fingerprint(op,
 **dims)` returns it, scoped to (fingerprint, FlashInfer version, architecture). Bitwise equality is the acceptance
-criterion of every test of the mode (`tests/gemm/test_batch_invariant_mm_bf16.py`, `tests/batch_invariant/test_lean.py`).
+criterion of every test of the mode (`tests/gemm/test_batch_invariant_mm_bf16.py`, `tests/gemm/test_batch_invariant_bmm_fp8.py`,
+`tests/batch_invariant/test_lean.py`).
 
 ## Supported operators
 
 | API | Selection | Classes and fingerprint | Supported inputs |
 |---|---|---|---|
 | `mm_bf16` | `backend="auto", batch_invariant=True` | `gemm.bf16.kfold` (one fp32 fold over the K steps) or `gemm.bf16.kchunk[C]` (K cut into `C` chunks, a function of the weight shape alone, so a narrow weight runs it at every M); `fingerprint("mm_bf16", N=, K=)` | bf16 `a (M, K)` row-major and bf16 `b (K, N)` row-major or the transpose of a row-major `(N, K)` weight, `K` and `N` multiples of 8, any `M`; bf16 output; no bias; `pdl` accepted (plain stream order). SM100 / SM103 / SM107 |
+| `bmm_fp8` | `backend="auto", batch_invariant=True` | `gemm.e4m3.kfold.scaled` / `gemm.e5m2.kfold.scaled` (one fp32 fold over the 32-wide fp8 K steps, then `mul.rn` by `A_scale * B_scale` formed once on the device, then one `cvt.rn`) or `gemm.<fmt>.kchunk[C].scaled` (K cut into `C` chunks of whole 32-wide steps, a function of the weight shape and the format alone); every batch element is one launch of the class, so the batch is not a dimension; `fingerprint("bmm_fp8", N=, K=, dtype=, out_dtype=)` | `A (b, M, K)` and `B (b, K, N)` both e4m3 or both e5m2, `B` column-major (the transpose of a row-major `(b, N, K)` weight, the documented layout) or row-major, `K` a multiple of 16 and `N` of 8, any `b` and `M`; the two per-tensor scales as 1-element fp32 tensors; bf16 or fp16 output. SM100 / SM103 / SM107 |
+
+## The dispatcher and the launch grid
+
+Each class has an enumerated configuration space (tile, cluster shape, 2-CTA pairing, raster order, swizzle band, chunk
+fold); every record computes the class, so the choice among them moves time only (R3). `gemm/batch_invariant/heuristic.py`
+orders the records for a shape, layout, format and part by a per-tile roofline estimate: waves of tiles over the part's
+co-resident cluster capacity, each the slower of its MMA and its L2-to-SMEM traffic per k-step, the aggregate L2 bound,
+the operands' HBM bytes plus a share of the bytes the scheduler's tile order fetches again (which operand panels stay
+resident in the L2 across a swizzle band), the epilogue and the split's fixup, with a few empirical constants shared by
+every part and format (none fitted per part). The first record is the default; `autotune(True)` profiles the first ten
+(the best five, each with its raster twin) and keeps the bits by construction. The persistent grid is the device's
+co-resident cluster count for the record's cluster shape (the CuTe DSL's GPC-aware occupancy query, asked once per
+device): a launch parameter that decides which CTA computes which tile and never a bit. The heuristic takes the device's
+queried capacity and L2 size once the API has recorded them, else the family's nominal table; the generated Lean dispatch
+cases are the nominal parts' (`nominal=True`).
 
 ## How to check the proofs
 
 `lean/` holds one Lean 4 project (no Mathlib). Per class it models the dataflow as terms over opaque, correctly rounded
-primitives and proves that every implementation of the class the kernels may run (for example a split reduction with its
-index-addressed workspace, or a pipelined loop with any stage count) is the class's term, and the launch-model
-statements of R1 and R2. The model gives a configuration no way to reach an output element (R3 is immediate in it, and
+primitives (one opaque tensor-core step per operand format: `mma16` for bf16, `mma32` for the fp8 formats, so the fp8
+classes are different terms from the bf16 class even at equal K) and proves that every implementation of the class the
+kernels may run (for example a split reduction with its index-addressed workspace, or a pipelined loop with any stage
+count) is the class's term, including its epilogue chain, and the launch-model statements of R1 and R2. The model gives a configuration no way to reach an output element (R3 is immediate in it, and
 is instantiated on the whole enumerated configuration space); that the kernel realises the model is what the engine's
 lowering trace and the GPU configuration-agreement tests establish. What Lean cannot state is the hardware hypothesis that the instruction variants a
 configuration space selects compute the same per-element function; the GPU configuration-agreement tests check it bit
@@ -45,8 +63,8 @@ every record of a configuration space and every dispatcher pick against the clas
 installed.
 
 Trust statement: **Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`), plus `Lean.ofReduceBool` for the
-named exhaustive table theorems listed in `lean/Axioms.lean`** (checks over hundreds of records, decided by
-`native_decide`; every other generated case is kernel `decide`). `Lean.ofReduceBool` trusts the compiled evaluator for
+named exhaustive checks listed in `lean/Axioms.lean`** (the configuration-space and dispatcher-membership checks over
+hundreds of records per format, decided by `native_decide`; every other generated case is kernel `decide`). `Lean.ofReduceBool` trusts the compiled evaluator for
 those closed Boolean terms; `lake exe axioms` enforces exactly this list and fails on any `sorry`.
 
 ```bash

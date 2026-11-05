@@ -10,7 +10,9 @@ next to this file is the contract: the guarantee (R1-R4), the flag semantics, th
 
 from __future__ import annotations
 
-from typing import Callable, Dict, NamedTuple
+from typing import Callable, Dict, NamedTuple, Union
+
+import torch
 
 from .support import (
     BatchInvariantUnsupportedError,
@@ -35,9 +37,54 @@ def _mm_bf16_fingerprint(N: int, K: int) -> str:
     return spec_fingerprint(K, "bf16", chunks_for(N, K))
 
 
+def _fp8_fmt(dtype: Union[torch.dtype, str]) -> str:
+    """The fp8 class of an input dtype: ``torch.float8_e4m3fn`` / ``"e4m3"`` -> ``"e4m3"``, likewise e5m2."""
+    names = {
+        torch.float8_e4m3fn: "e4m3",
+        torch.float8_e5m2: "e5m2",
+        "e4m3": "e4m3",
+        "e5m2": "e5m2",
+    }
+    if dtype not in names:
+        raise ValueError(
+            f"fingerprint('bmm_fp8') takes dtype torch.float8_e4m3fn or torch.float8_e5m2 (or 'e4m3' / 'e5m2'), not {dtype!r}"
+        )
+    return names[dtype]
+
+
+def _out_fmt(dtype: Union[torch.dtype, str]) -> str:
+    names = {
+        torch.bfloat16: "bf16",
+        torch.float16: "f16",
+        "bf16": "bf16",
+        "f16": "f16",
+        "fp16": "f16",
+    }
+    if dtype not in names:
+        raise ValueError(
+            f"fingerprint('bmm_fp8') takes out_dtype torch.bfloat16 or torch.float16 (or 'bf16' / 'f16'), not {dtype!r}"
+        )
+    return names[dtype]
+
+
+def _bmm_fp8_fingerprint(
+    N: int, K: int, dtype: Union[torch.dtype, str], out_dtype: Union[torch.dtype, str]
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for
+    from ..gemm.batch_invariant.spec import spec_fingerprint
+
+    fmt = _fp8_fmt(dtype)
+    return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint),
+    # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
+    # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)
+    "bmm_fp8": ClassInfo(
+        "gemm.fp8", ("N", "K", "dtype", "out_dtype"), _bmm_fp8_fingerprint
+    ),
 }
 
 
@@ -51,9 +98,15 @@ def fingerprint(op: str, **dims) -> str:
 
     ``mm_bf16`` takes the weight shape ``N, K``: the K steps of the fold and the chunk count (a function of the
     weight shape alone) are the specification; M, the configuration and the weight's layout do not enter it.
+    ``bmm_fp8`` takes ``N, K``, the fp8 input ``dtype`` (``torch.float8_e4m3fn`` or ``torch.float8_e5m2``) and the
+    output ``out_dtype`` (bf16 / fp16): the 32-wide fp8 step, the chain's ``mul.rn`` by the device product of the two
+    per-tensor scales and its conversion are the specification; the scales' values, like the operands, are inputs, and
+    the batch is not a dimension (every element is one launch of the class).
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
+    >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
+    'gemm-e4m3-kfold-scaled-...'
     """
     info = CLASSES.get(op)
     if info is None:
@@ -72,7 +125,8 @@ def fingerprint(op: str, **dims) -> str:
 
 
 def class_name(op: str) -> str:
-    """The consistency class name behind the API ``op`` (e.g. ``"gemm.bf16"``)."""
+    """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
+    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(
