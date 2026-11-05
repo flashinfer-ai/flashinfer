@@ -2230,7 +2230,7 @@ def test_k1_odd_block_exclusions(monkeypatch):
     # verdict
     for key, part, T in (
         (("sm_100a", 1, 4096, 32, "f32"), 148, 65538),
-        (("sm_100a", 1, 5120, 48, "f32"), 152, 98305),
+        (("sm_100a", 1, 5120, 48, "f32"), 148, 98305),
         (("sm_103a", 1, 4096, 32, "f32"), 149, 65665),
     ):
         assert got[(key, part, T)] is None, (key, part, T)
