@@ -2733,32 +2733,37 @@ def test_sm107a_fp8_h8_prefill_rows_take_the_m64_body(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
 @pytest.mark.parametrize("page_size", [2, 64])
-def test_sm107a_fp8_h8_prefill_wider_than_m64_keeps_the_low_head_producer(
-    page_size,
-):
-    """8-head prefill items wider than the M64 bindings accept (``sparse_topk``
-    above 1152) keep the low-head prefill producer on SM107, which has no
-    width limit; 1152 itself takes the multi-tile M64 program."""
+def test_fp8_h8_prefill_wider_than_1152_is_rejected(arch, page_size):
+    """8-head prefill items wider than 1152 sparse slots have no FP8 kernel:
+    the low-head prefill producer stages at most 1152 indices per item (nine
+    tiles of 128) and the M64 bindings require ``sparse_topk <= 1152``.  The
+    route raises instead of launching a producer that writes past its
+    shared-memory index buffer.  1152 itself still routes: the multi-tile M64
+    program on SM107, the low-head prefill producer elsewhere."""
     assert cake._FP8_M64_MAX_WIDTH == 1152
-    for sparse_topk, expected in (
-        (1152, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
-        (1156, "fp8_lowhead_prefill"),
-        (2048, "fp8_lowhead_prefill"),
-    ):
-        route = _route(
-            dtype=torch.float8_e4m3fn,
-            num_heads=8,
-            batch_size=1,
-            max_q_len=1024,
-            ragged=True,
-            sparse_topk=sparse_topk,
-            compressed_page_size=page_size,
-            num_query_tokens=1024,
-            sm_count=_SM107_SM_COUNT,
-            arch="sm_107a",
-        )
-        assert route == expected, (sparse_topk, page_size, route)
+    assert cake._FP8_LOWHEAD_PREFILL_MAX_WIDTH == 1152
+    kwargs = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=8,
+        batch_size=1,
+        max_q_len=1024,
+        ragged=True,
+        compressed_page_size=page_size,
+        num_query_tokens=1024,
+        sm_count=_SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT,
+        arch=arch,
+    )
+    expected = (
+        "fp8_h64_prefill_source_persistent_m64_multi_tile"
+        if arch == "sm_107a"
+        else "fp8_lowhead_prefill"
+    )
+    assert _route(sparse_topk=1152, **kwargs) == expected
+    for sparse_topk in (1156, 1280, 2048):
+        with pytest.raises(ValueError, match=r"sparse_topk \d+ > 1152"):
+            _route(sparse_topk=sparse_topk, **kwargs)
 
 
 @pytest.mark.cpu_only
