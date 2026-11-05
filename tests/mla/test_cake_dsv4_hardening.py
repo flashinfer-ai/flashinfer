@@ -1385,9 +1385,10 @@ def _sglang_case(h_q: int, form: str, *, compressed: bool, tail: str) -> _Case:
     """sglang's DSv4 trtllm-backend call shapes (FP8 query, float scales).
 
     decode: ``[B, 1, H, 512]`` with one ``seq_lens`` entry per row; mtp-dense:
-    ``[B, 4, H, 512]``; mtp-flat: the same batch as sglang passes it (one row per
-    draft token, per-row causal ``seq_lens``); prefill: ragged rows with
-    ``cum_seq_lens_q`` / ``max_q_len`` and 64-row tile-padded tables.
+    ``[B, 4, H, 512]``; mtp-wide: the same with 17 requests (68 rows); mtp-flat:
+    the same batch as mtp-dense as sglang passes it (one row per draft token,
+    per-row causal ``seq_lens``); prefill: ragged rows with ``cum_seq_lens_q`` /
+    ``max_q_len`` and 64-row tile-padded tables.
     """
     width = _compressed_width(h_q) if compressed else 0
     kwargs = dict(
@@ -1408,8 +1409,10 @@ def _sglang_case(h_q: int, form: str, *, compressed: bool, tail: str) -> _Case:
             compressed_lens=_mixed_compressed_lens(rows, width) if width else None,
             **kwargs,
         )
-    if form in ("mtp-dense", "mtp-flat"):
+    if form in ("mtp-dense", "mtp-flat", "mtp-wide"):
         seq = [4, 70, 127, 300, 2048]
+        if form == "mtp-wide":
+            seq = seq * 3 + [513, 1025]
         rows = 4 * len(seq)
         case = _build_case(
             seq_lens=seq,
@@ -1449,13 +1452,28 @@ def test_sglang_swa_only_convention(h_q, form, tail):
     _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
 
 
-@pytest.mark.parametrize("form", ["decode", "mtp-dense"])
-def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(form):
-    """The SWA-only FP8/H64 rows of one wave run the low-head prefill program; as
-    a programmatic dependent it is bitwise equal to the plain launch and, inside
-    a graph, reads the query the copy right before it writes."""
+@pytest.mark.parametrize("form", ["decode", "mtp-dense", "mtp-wide"])
+def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
+    monkeypatch, form
+):
+    """The SWA-only FP8/H64 rows of one wave run the low-head prefill route: on
+    SM107 its early-PV sibling up to 64 rows (8 and 20 rows) and the route's
+    program above (68 rows), elsewhere the route's program.  As a programmatic
+    dependent each is bitwise equal to the plain launch and, inside a graph,
+    reads the query the copy right before it writes."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
     case = _sglang_case(64, form, compressed=False, tail="minus_one")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     route = _route(
         dtype=case.dtype,
         num_heads=case.num_heads,
@@ -1465,11 +1483,14 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(for
         batch_size=case.batch_size,
         compressed_page_size=int(case.compressed_kv_cache.shape[-2]),
         num_query_tokens=case.rows,
-        sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+        sm_count=sm_count,
     )
     assert route == "fp8_lowhead_prefill", route
+    sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
+    early = sm107 and case.rows <= 64 * min(sm_count, 216) // 216
     workspace = _workspace_128mib()
     plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    assert set(launched) == {f"{route}_overlap" if early else route}, launched
     pdl = case.run(
         workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
     )
@@ -1800,6 +1821,8 @@ _OUT_ALIGN_CASES = [
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [4] * 3, width=256, form="q4"),
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [1] * 3, width=256, form="q1"),
     _align_case("fp8_lowhead_prefill", 32, _FP8, [4] * 3),
+    # 66 tokens: above SM107's early-PV sibling ceiling, the route's own program there.
+    _align_case("fp8_lowhead_prefill", 32, _FP8, [22] * 3, form="66-rows"),
     # 12 tokens, sparse_topk 260: two complete tiles and a partial third.
     _align_case("fp8_lowhead_h64", 64, _FP8, [5, 4, 3], "ragged", 132, page=2),
     _align_case("fp8_h64_prefill_source_persistent_m64", 32, _FP8, [257]),
