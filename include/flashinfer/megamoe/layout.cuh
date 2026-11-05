@@ -378,8 +378,15 @@ struct RemoteRegions {
   CUTLASS_HOST_DEVICE uint64_t return_bytes() const {
     return math::align<uint64_t>(capacity * row_bf16_bytes, 128);
   }
+  // Packed slots are shipped in chunks of `kPutChunkTokens`; one arrival
+  // counter per chunk follows the control words.
+  static constexpr uint32_t kPutChunkTokens = 64;
+  CUTLASS_HOST_DEVICE uint32_t num_put_chunks() const {
+    return (capacity + kPutChunkTokens - 1) / kPutChunkTokens;
+  }
   CUTLASS_HOST_DEVICE uint64_t slot_map_bytes() const {
-    return math::align<uint64_t>(capacity * sizeof(int32_t) + 128, 128);
+    return math::align<uint64_t>(
+        capacity * sizeof(int32_t) + 128 + num_put_chunks() * sizeof(uint32_t), 128);
   }
   // Fixed-stride lists the index pass writes before the per-expert totals are
   // known; compacted into the outbound header after the grid sync.
@@ -443,6 +450,10 @@ struct RemoteRegions {
   }
   CUTLASS_HOST_DEVICE uint32_t* launch_epoch() const {
     return packed_token_count(0) + 6;
+  }
+  // Rows packed so far into chunk `chunk` of the outbound staging of `node`.
+  CUTLASS_HOST_DEVICE uint32_t* chunk_done(const uint32_t& node, const uint32_t& chunk = 0) const {
+    return packed_token_count(node) + 32 + chunk;
   }
   CUTLASS_HOST_DEVICE uint32_t* list_scratch(const uint32_t& node, const uint32_t& expert) const {
     return static_cast<uint32_t*>(math::advance_ptr(packed_slot_map(node), slot_map_bytes())) +

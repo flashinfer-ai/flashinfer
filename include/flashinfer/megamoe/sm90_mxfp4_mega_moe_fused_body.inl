@@ -572,6 +572,7 @@ if (warp_idx < kNumDispatchWarps) {
   // Tokens with an expert on another node: packed slot and outbound copy first,
   // so the index pass can write their packed index.
   remote_pack_tokens();
+  remote_put_ready_chunks();
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
   // Write source token-topk indices to remote ranks
