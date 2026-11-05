@@ -868,7 +868,10 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
         pytest.skip(f"{arch} accumulates in K = 64 steps: no bitwise DeepGEMM claim")
     if importlib.util.find_spec("deep_gemm") is None:
         pytest.skip("deep_gemm is not installed")
-    import deep_gemm
+    try:
+        import deep_gemm
+    except (ImportError, OSError) as exc:  # installed, but its extension does not load
+        pytest.skip(f"deep_gemm does not import: {exc}")
 
     inputs = ref.make_fp8_inputs([512], [8192], top_k=2048, seed=67, device="cuda")
     indices, scores = _run(inputs)
