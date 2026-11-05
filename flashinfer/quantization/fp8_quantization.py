@@ -365,13 +365,16 @@ def _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout):
 
 
 def _check_mxfp8_scale_layout(sf_swizzle_layout):
-    """Reject unknown scale layouts before mapping them to backend flags."""
-    if sf_swizzle_layout not in (
+    """Require supported SfLayout members before mapping to backend flags."""
+    if not isinstance(sf_swizzle_layout, SfLayout) or sf_swizzle_layout not in (
         SfLayout.layout_linear,
         SfLayout.layout_128x4,
         SfLayout.layout_8x4,
     ):
-        raise ValueError(f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}")
+        raise ValueError(
+            f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}; "
+            "expected an SfLayout member"
+        )
 
 
 def _check_mxfp8_backend(input, backend, batch_invariant):
@@ -531,7 +534,8 @@ def mxfp8_quantize(
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
-        ``is_sf_swizzled_layout``.
+        ``is_sf_swizzled_layout``. Native and CuTe backends require explicit
+        values to be ``SfLayout`` members, rather than bare integers.
     batch_invariant : bool
         ``True`` runs the batch-invariant MXFP8 quantization class in place
         of the backends (requires ``backend="auto"``): a row's bits depend on

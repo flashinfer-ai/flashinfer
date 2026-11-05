@@ -67,6 +67,23 @@ def test_explicit_host_layout_overrides_legacy_flag():
         mxfp8_quantize.check_inputs(x, False, sf_swizzle_layout=SfLayout.layout_8x4)
 
 
+@pytest.mark.parametrize("backend", ["auto", "cuda"])
+def test_native_rejects_integer_scale_layout_before_jit(monkeypatch, backend):
+    """IntEnum-equal integers must not reach the native consumer's .value read."""
+    x = torch.empty((2, 32), dtype=torch.float32)
+    unexpected = Mock(
+        side_effect=AssertionError("invalid layout reached runtime setup")
+    )
+    monkeypatch.setattr(fp8, "get_mxfp8_quantization_sm100_module", unexpected)
+    monkeypatch.setattr(fp8, "device_support_pdl", unexpected)
+    monkeypatch.setattr(torch, "empty", unexpected)
+    monkeypatch.setattr(torch, "zeros", unexpected)
+    for call in (mxfp8_quantize.check_inputs, mxfp8_quantize):
+        with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
+            call(x, backend=backend, sf_swizzle_layout=0)
+    unexpected.assert_not_called()
+
+
 def test_native_cuda_checks_the_input_device(monkeypatch):
     x = _fake_cuda()
     cc = Mock(return_value=(9, 0))
@@ -136,8 +153,9 @@ def test_native_cuda_rejects_inputs_that_require_a_copy():
         mxfp8_quantize.check_inputs(x, backend="cuda")
 
 
-def test_cute_rejects_invalid_scale_layout_before_runtime_setup(monkeypatch):
-    """An invalid enum must not silently select the 128x4 CuTe scale layout."""
+@pytest.mark.parametrize("sf_layout", [0, 999])
+def test_cute_rejects_invalid_scale_layout_before_runtime_setup(monkeypatch, sf_layout):
+    """Bare integers must not silently select a CuTe scale layout."""
     from flashinfer import cute_dsl
 
     x = _fake_cuda()
@@ -146,7 +164,7 @@ def test_cute_rejects_invalid_scale_layout_before_runtime_setup(monkeypatch):
     monkeypatch.setattr(torch, "empty", unexpected)
     for call in (mxfp8_quantize.check_inputs, mxfp8_quantize):
         with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
-            call(x, backend="cute-dsl", sf_swizzle_layout=999)
+            call(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
     unexpected.assert_not_called()
 
 
