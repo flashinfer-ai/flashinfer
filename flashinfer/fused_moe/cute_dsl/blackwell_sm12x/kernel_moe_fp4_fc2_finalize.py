@@ -24,8 +24,17 @@ from cutlass.cute.runtime import from_dlpack
 
 from ....utils import ceil_div
 from ._moe_utils import moe_epilogue, moe_scheduler
-from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod, WgScatterEpiConfig
-from ._moe_utils.moe_kernel_builder import LoadABConfig, MmaConfig, Sm12xGemmConfig
+from ._moe_utils.moe_epilogue import (
+    EPI_CONFIGS,
+    EpiMethod,
+    WgScatterEpiConfig,
+)
+from ._moe_utils.moe_kernel_builder import (
+    LoadABConfig,
+    MmaConfig,
+    Sm12xDecodeGemmConfig,
+    Sm12xGemmConfig,
+)
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigNvfp4,
     compute_padded_offset,
@@ -42,7 +51,6 @@ REG_PROD_BY_TACTIC = {
     (128, 128, EpiMethod.WG_SCATTER): 88,
     (64, 128, EpiMethod.WG_SCATTER): 88,
     (32, 128, EpiMethod.WG_SCATTER): 88,
-    (8, 128, EpiMethod.WG_SCATTER): 88,
 }
 
 SCATTER_EPIS = (EpiMethod.WG_SCATTER,)
@@ -55,43 +63,46 @@ def make_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
         cutlass.BFloat16,
         cutlass.Float8E4M3FN,
     )
-    assert tuple(tile) in (
-        (128, 128, 128),
-        (64, 128, 128),
-        (32, 128, 128),
-        (8, 128, 128),
-    )
-    bm, bn, bk = tile
+    assert tuple(tile) in ((128, 128, 128), (64, 128, 128), (32, 128, 128))
     assert epi in SCATTER_EPIS, (
         f"{epi} is not implemented here; this epilogue scatters into rows"
     )
-    tactic = (bm, bn, epi)
-    swap = is_swapab(tile)
-    if swap:
-        bm, bn = bn, bm
-        tile = (bm, bn, bk)
-        store_threads = WgScatterEpiConfig.store_threads_for(bf16, tile)
-        epi_cfg = WgScatterEpiConfig(
-            bf16, 8 * 32, store_threads=store_threads, swap_ab=True
-        )
-    else:
-        epi_cfg = EPI_CONFIGS[epi](bf16, 8 * 32)
+    tactic = (tile[0], tile[1], epi)
     return Sm12xGemmConfig(
-        MmaConfig(
-            warp_mma.MmaMXF4NVF4Op(fp4, f32, sf),
-            tile[:2],
-            8,
-            swap_ab=swap,
-        ),
+        MmaConfig(warp_mma.MmaMXF4NVF4Op(fp4, f32, sf), tile[:2], 8),
         LoadABConfig(tile, ab_stage, fp4, fp4),
         Sm120SfConfigNvfp4(sf),
-        epi_cfg,
+        EPI_CONFIGS[epi](bf16, 8 * 32),
         ab_stage,
         tile,
         epi_bar_id=3,
-        union_smem=not swap,
+        union_smem=True,
         reg_prod=REG_PROD_BY_TACTIC[tactic],
         enable_pdl=enable_pdl,
+    )
+
+
+def make_decode_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
+    assert epi == EpiMethod.WG_SCATTER
+    fp4, f32, bf16, sf = (
+        cutlass.Float4E2M1FN,
+        cutlass.Float32,
+        cutlass.BFloat16,
+        cutlass.Float8E4M3FN,
+    )
+    tile = (tile[1], tile[0], tile[2])
+    mma = MmaConfig(warp_mma.MmaMXF4NVF4Op(fp4, f32, sf), tile[:2], 8, swap_ab=True)
+    threads = mma.num_math_warps * Sm12xDecodeGemmConfig.WARP_SIZE
+    load_ab = LoadABConfig(tile, ab_stage, fp4, fp4)
+    load_sf = Sm120SfConfigNvfp4(sf)
+    epi_cfg = WgScatterEpiConfig(
+        bf16,
+        threads,
+        store_threads=WgScatterEpiConfig.store_threads_for(bf16, tile),
+        swap_ab=True,
+    )
+    return Sm12xDecodeGemmConfig(
+        mma, load_ab, load_sf, epi_cfg, ab_stage, tile, enable_pdl=enable_pdl
     )
 
 
@@ -107,18 +118,10 @@ def make_a_sfa_partitions(
     tile,
     sfa_tile_m,
     sfa_tiles_per_block,
-    swap,
 ):
     cta_layout = cute.make_layout(1)
-    if cutlass.const_expr(swap):
-        gA_mkl = cute.local_tile(
-            tma_tensor_a, cute.slice_(tile_mnk, (None, 0, None)), (None, None, None)
-        )
-    else:
-        mA = cute.domain_offset((tile.m_offset, 0), tma_tensor_a)
-        gA_mkl = cute.local_tile(
-            mA, cute.slice_(tile_mnk, (None, 0, None)), (None, None)
-        )
+    mA = cute.domain_offset((tile.m_offset, 0), tma_tensor_a)
+    gA_mkl = cute.local_tile(mA, cute.slice_(tile_mnk, (None, 0, None)), (None, None))
     tAsA, tAgA = cpasync.tma_partition(
         tma_atom_a,
         cutlass.Int32(0),
@@ -126,18 +129,11 @@ def make_a_sfa_partitions(
         cute.group_modes(sA, 0, 2),
         cute.group_modes(gA_mkl, 0, 2),
     )
-    if cutlass.const_expr(swap):
-        gSFA_mkl = cute.local_tile(
-            tma_tensor_sfa,
-            (sfa_tile_m, cute.size(sSFA, mode=[1])),
-            (None, None, None),
-        )
-    else:
-        sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
-        mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
-        gSFA_mkl = cute.local_tile(
-            mSFA, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
-        )
+    sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
+    mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
+    gSFA_mkl = cute.local_tile(
+        mSFA, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
+    )
     tAsSFA, tAgSFA = cpasync.tma_partition(
         tma_atom_sfa,
         cutlass.Int32(0),
@@ -169,31 +165,15 @@ def make_b_sfb_partitions(
     sB,
     sSFB,
     tile_mnk,
-    tile,
     sfb_tile_n,
-    sfb_tiles_per_block,
-    swap,
 ):
     cta_layout = cute.make_layout(1)
-    if cutlass.const_expr(swap):
-        mB = cute.domain_offset((tile.m_offset, 0), tma_tensor_b)
-        gB_nkl = cute.local_tile(
-            mB, cute.slice_(tile_mnk, (0, None, None)), (None, None)
-        )
-        sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
-        mSFB = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfb)
-        gSFB_nkl = cute.local_tile(
-            mSFB, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
-        )
-    else:
-        gB_nkl = cute.local_tile(
-            tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
-        )
-        gSFB_nkl = cute.local_tile(
-            tma_tensor_sfb,
-            (sfb_tile_n, cute.size(sSFB, mode=[1])),
-            (None, None, None),
-        )
+    gB_nkl = cute.local_tile(
+        tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
+    )
+    gSFB_nkl = cute.local_tile(
+        tma_tensor_sfb, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
+    )
     tBsB, tBgB = cpasync.tma_partition(
         tma_atom_b,
         cutlass.Int32(0),
@@ -208,26 +188,7 @@ def make_b_sfb_partitions(
         cute.group_modes(sSFB, 0, 2),
         cute.group_modes(gSFB_nkl, 0, 2),
     )
-    if cutlass.const_expr(swap):
-        if cutlass.const_expr(sfb_tiles_per_block == 1):
-            sfb_n_block = tile.n_block
-        elif cutlass.const_expr(sfb_tiles_per_block == 2):
-            sfb_n_block = tile.n_block >> 1
-        elif cutlass.const_expr(sfb_tiles_per_block == 4):
-            sfb_n_block = tile.n_block >> 2
-        elif cutlass.const_expr(sfb_tiles_per_block == 8):
-            sfb_n_block = tile.n_block >> 3
-        else:
-            sfb_n_block = tile.n_block >> 4
-    else:
-        sfb_n_block = tile.n_block
-    return (
-        tBsB,
-        tBgB,
-        cute.filter_zeros(tBsSFB),
-        cute.filter_zeros(tBgSFB),
-        sfb_n_block,
-    )
+    return (tBsB, tBgB, cute.filter_zeros(tBsSFB), cute.filter_zeros(tBgSFB))
 
 
 @cute.jit
@@ -247,38 +208,23 @@ def copy_a_sfa(
     ab_stages,
     stage,
     phase,
-    swap,
 ):
     for kt in cutlass.range(0, k_tile_count):
         cute.arch.mbarrier_wait(a_empty + stage, phase)
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(a_full + stage, tx_bytes)
-        if cutlass.const_expr(swap):
-            cute.copy(
-                tma_atom_a,
-                tAgA[(None, tile.m_block, kt, tile.group)],
-                tAsA[(None, stage)],
-                tma_bar_ptr=a_full + stage,
-            )
-            cute.copy(
-                tma_atom_sfa,
-                tAgSFA[(None, sfa_m_block, kt, tile.group)],
-                tAsSFA[(None, stage)],
-                tma_bar_ptr=a_full + stage,
-            )
-        else:
-            cute.copy(
-                tma_atom_a,
-                tAgA[(None, tile.m_block, kt)],
-                tAsA[(None, stage)],
-                tma_bar_ptr=a_full + stage,
-            )
-            cute.copy(
-                tma_atom_sfa,
-                tAgSFA[(None, sfa_m_block, kt, 0)],
-                tAsSFA[(None, stage)],
-                tma_bar_ptr=a_full + stage,
-            )
+        cute.copy(
+            tma_atom_a,
+            tAgA[(None, tile.m_block, kt)],
+            tAsA[(None, stage)],
+            tma_bar_ptr=a_full + stage,
+        )
+        cute.copy(
+            tma_atom_sfa,
+            tAgSFA[(None, sfa_m_block, kt, 0)],
+            tAsSFA[(None, stage)],
+            tma_bar_ptr=a_full + stage,
+        )
         stage += 1
         if stage == ab_stages:
             stage = cutlass.Int32(0)
@@ -295,7 +241,6 @@ def copy_b_sfb(
     tBgSFB,
     tBsSFB,
     tile,
-    sfb_n_block,
     b_full,
     b_empty,
     tx_bytes,
@@ -303,38 +248,23 @@ def copy_b_sfb(
     ab_stages,
     stage,
     phase,
-    swap,
 ):
     for kt in cutlass.range(0, k_tile_count):
         cute.arch.mbarrier_wait(b_empty + stage, phase)
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(b_full + stage, tx_bytes)
-        if cutlass.const_expr(swap):
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, tile.n_block, kt)],
-                tBsB[(None, stage)],
-                tma_bar_ptr=b_full + stage,
-            )
-            cute.copy(
-                tma_atom_sfb,
-                tBgSFB[(None, sfb_n_block, kt, 0)],
-                tBsSFB[(None, stage)],
-                tma_bar_ptr=b_full + stage,
-            )
-        else:
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, tile.n_block, kt, tile.group)],
-                tBsB[(None, stage)],
-                tma_bar_ptr=b_full + stage,
-            )
-            cute.copy(
-                tma_atom_sfb,
-                tBgSFB[(None, tile.n_block, kt, tile.group)],
-                tBsSFB[(None, stage)],
-                tma_bar_ptr=b_full + stage,
-            )
+        cute.copy(
+            tma_atom_b,
+            tBgB[(None, tile.n_block, kt, tile.group)],
+            tBsB[(None, stage)],
+            tma_bar_ptr=b_full + stage,
+        )
+        cute.copy(
+            tma_atom_sfb,
+            tBgSFB[(None, tile.n_block, kt, tile.group)],
+            tBsSFB[(None, stage)],
+            tma_bar_ptr=b_full + stage,
+        )
         stage += 1
         if stage == ab_stages:
             stage = cutlass.Int32(0)
@@ -417,6 +347,223 @@ def mma(
     return acc, stage, phase
 
 
+@cute.jit
+def copy_stage(
+    gW_u8,
+    gA_u8,
+    gSFA,
+    gSFB,
+    tAsA,
+    tBsB,
+    sSFA,
+    sSFB,
+    atom,
+    sf_atom,
+    tile,
+    kt,
+    stage,
+    tidx,
+    cfg,
+):
+    bm, bn, bk = cfg.TILE
+    values = cfg.G2S_BITS // cfg.load_ab.a_dtype.width
+    copy_bytes = cfg.G2S_BITS // cutlass.Uint8.width
+    lanes_k = ceil_div(bk, values)
+    shift_n = bn.bit_length() - 1
+    shift_k = lanes_k.bit_length() - 1
+    rows_per_warp = cfg.WARP_SIZE >> shift_k
+    lane, warp = tidx & (cfg.WARP_SIZE - 1), tidx >> (cfg.WARP_SIZE.bit_length() - 1)
+    N, K_bytes = cute.size(gW_u8, mode=[1]), cute.size(gA_u8, mode=[1])
+    row_base = cutlass.Int64(tile.group) * N
+    source_layout = cute.make_layout(((values, 1),), stride=((1, 0),))
+    for step in cutlass.range_constexpr(
+        ceil_div(cute.size(tAsA, mode=[1]), cfg.mma.num_math_warps)
+    ):
+        part = warp + step * cfg.mma.num_math_warps
+        row = tile.m_block * bm + (lane >> shift_k) + part * rows_per_warp
+        address = (
+            gW_u8.iterator
+            + (row_base + row) * K_bytes
+            + kt * (bk >> 1)
+            + (lane & (lanes_k - 1)) * copy_bytes
+        )
+        tAgA = cute.make_tensor(
+            cute.make_ptr(
+                cfg.load_ab.a_dtype,
+                address.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=copy_bytes,
+            ),
+            source_layout,
+        )
+        cute.copy(atom, tAgA, tAsA[None, part, 0, stage])
+    begin = tile.m_offset + tile.n_block * bn
+    rows = max(cutlass.Int32(0), min(tile.m_boundary - begin, cutlass.Int32(bn)))
+    if warp < cute.size(tBsB, mode=[1]):
+        row = (lane >> shift_k) + warp * rows_per_warp
+        if row < rows:
+            address = (
+                gA_u8.iterator
+                + (cutlass.Int64(begin) + row) * K_bytes
+                + kt * (bk >> 1)
+                + (lane & (lanes_k - 1)) * copy_bytes
+            )
+            source = cute.make_tensor(
+                cute.make_ptr(
+                    cfg.load_ab.b_dtype,
+                    address.toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=copy_bytes,
+                ),
+                source_layout,
+            )
+            cute.copy(atom, source, tBsB[None, warp, 0, stage])
+    words = cute.size(sSFA, mode=[1])
+    shift_m = bm.bit_length() - 1
+    for step in cutlass.range_constexpr(ceil_div(bm * words, cfg.threads)):
+        index = tidx + step * cfg.threads
+        row, word = index & (bm - 1), index >> shift_m
+        tAgSFA = cute.make_tensor(
+            gSFA.iterator
+            + cute.crd2idx(
+                (tile.m_block * bm + row, kt * words + word, tile.group), gSFA.layout
+            ),
+            cute.make_layout(1),
+        )
+        tAsSFA = cute.make_tensor(
+            sSFA.iterator + cute.crd2idx((row, word, stage), sSFA.layout),
+            cute.make_layout(1),
+        )
+        cute.copy(sf_atom, tAgSFA, tAsSFA)
+    sf_begin = (
+        compute_padded_offset(
+            tile.m_offset, tile.group, cutlass.Int32(cfg.load_sf.sfb_tile_n(bn))
+        )
+        + tile.n_block * bn
+    )
+    if tidx < bn * words:
+        row, word = tidx & (bn - 1), tidx >> shift_n
+        if row < rows:
+            source = cute.make_tensor(
+                gSFB.iterator
+                + cute.crd2idx((sf_begin + row, kt * words + word, 0), gSFB.layout),
+                cute.make_layout(1),
+            )
+            target = cute.make_tensor(
+                sSFB.iterator + cute.crd2idx((row, word, stage), sSFB.layout),
+                cute.make_layout(1),
+            )
+            cute.copy(sf_atom, source, target)
+
+
+@cute.jit
+def mma_multistage(
+    tiledmma,
+    cfg,
+    sA,
+    sB,
+    sSFA,
+    sSFB,
+    gW_u8,
+    gA_u8,
+    gSFA,
+    gSFB,
+    tAsA,
+    tBsB,
+    atom,
+    sf_atom,
+    tile,
+    tidx,
+    k_tile_count,
+):
+    thr = tiledmma.get_slice(tidx)
+    tCrA = tiledmma.make_fragment_A(thr.partition_A(sA)[None, None, None, 0])
+    tCrB = tiledmma.make_fragment_B(thr.partition_B(sB)[None, None, None, 0])
+    acc = cute.make_rmem_tensor(
+        tiledmma.partition_shape_C(cfg.TILE[:2]), cutlass.Float32
+    )
+    s2r_a = cfg.mma.make_s2r_a(tiledmma, cfg.load_ab.a_smem_dtype, False)
+    s2r_b = cfg.mma.make_s2r_b(tiledmma, cfg.load_ab.b_smem_dtype, False)
+    thr_a, thr_b = s2r_a.get_slice(tidx), s2r_b.get_slice(tidx)
+    tCrA_v, tCrB_v = thr_a.retile(tCrA), thr_b.retile(tCrB)
+    sf_cfg = cfg.load_sf
+    tCrSFA = sf_cfg.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
+    tCrSFB = sf_cfg.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
+    tCrSFA_frg, tCrSFB_frg = (
+        sf_cfg.make_sfa_e4m3_view(tCrSFA),
+        sf_cfg.make_sfb_e4m3_view(tCrSFB),
+    )
+    s2r_sfa = sf_cfg.make_s2r_sf(
+        sf_cfg.get_layoutSFA_TV(tiledmma),
+        (cute.size(tiledmma.permutation_mnk[0]), sf_cfg.KTILE_SF),
+    )
+    s2r_sfb = sf_cfg.make_s2r_sf(
+        sf_cfg.get_layoutSFB_TV(tiledmma),
+        (cute.size(tiledmma.permutation_mnk[1]), sf_cfg.KTILE_SF),
+    )
+    thr_sfa, thr_sfb = s2r_sfa.get_slice(tidx), s2r_sfb.get_slice(tidx)
+    tCrSFA_v, tCrSFB_v = thr_sfa.retile(tCrSFA), thr_sfb.retile(tCrSFB)
+    for initial in cutlass.range_constexpr(cfg.ab_stage - 1):
+        if initial < k_tile_count:
+            copy_stage(
+                gW_u8,
+                gA_u8,
+                gSFA,
+                gSFB,
+                tAsA,
+                tBsB,
+                sSFA,
+                sSFB,
+                atom,
+                sf_atom,
+                tile,
+                initial,
+                initial,
+                tidx,
+                cfg,
+            )
+        cute.arch.cp_async_commit_group()
+    acc.fill(0.0)
+    for kt in cutlass.range(k_tile_count):
+        stage = kt & (cfg.ab_stage - 1)
+        cute.arch.cp_async_wait_group(cfg.ab_stage - 2)
+        cute.arch.sync_threads()
+        tAsA_r = thr_a.partition_S(sA)[None, None, None, stage]
+        tBsB_r = thr_b.partition_S(sB)[None, None, None, stage]
+        tAsSFA = thr_sfa.partition_S(sSFA)[None, None, None, stage]
+        tBsSFB = thr_sfb.partition_S(sSFB)[None, None, None, stage]
+        for k in cutlass.range_constexpr(cute.size(tCrA_v, mode=[2])):
+            cute.copy(s2r_a, tAsA_r[None, None, k], tCrA_v[None, None, k])
+            cute.copy(s2r_b, tBsB_r[None, None, k], tCrB_v[None, None, k])
+        for k in cutlass.range_constexpr(cute.size(tCrSFA_v, mode=[2])):
+            cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
+            cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
+        future = kt + cfg.ab_stage - 1
+        if future < k_tile_count:
+            copy_stage(
+                gW_u8,
+                gA_u8,
+                gSFA,
+                gSFB,
+                tAsA,
+                tBsB,
+                sSFA,
+                sSFB,
+                atom,
+                sf_atom,
+                tile,
+                future,
+                future & (cfg.ab_stage - 1),
+                tidx,
+                cfg,
+            )
+        cute.arch.cp_async_commit_group()
+        cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
+    cute.arch.cp_async_wait_group(0)
+    cute.arch.sync_threads()
+    return acc
+
+
 class CuteDslSm120MoeNvfp4Fc2Finalize:
     def __init__(self, cfg, grid_x):
         self.cfg = cfg
@@ -461,26 +608,15 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         )
         bm, bn, bk = cfg.TILE[0], cfg.TILE[1], cfg.TILE[2]
         m_padded_sf = cute.size(gSFA_u8, mode=[0])
-        if cutlass.const_expr(cfg.mma.swap_ab):
-            t_a, t_b = gW, gA
-            gSFA = cute.make_tensor(
-                cute.recast_ptr(gSFB_u8.iterator, dtype=cfg.load_sf.sf_dtype),
-                cfg.load_sf.deduce_sfa_layout(N, K, E),
-            )
-            gSFB = cute.make_tensor(
-                cute.recast_ptr(gSFA_u8.iterator, dtype=cfg.load_sf.sf_dtype),
-                cfg.load_sf.deduce_sfb_layout(m_padded_sf, K, 1),
-            )
-        else:
-            t_a, t_b = gA, gW
-            gSFA = cute.make_tensor(
-                cute.recast_ptr(gSFA_u8.iterator, dtype=cfg.load_sf.sf_dtype),
-                cfg.load_sf.deduce_sfa_layout(m_padded_sf, K, 1),
-            )
-            gSFB = cute.make_tensor(
-                cute.recast_ptr(gSFB_u8.iterator, dtype=cfg.load_sf.sf_dtype),
-                cfg.load_sf.deduce_sfb_layout(N, K, E),
-            )
+        t_a, t_b = gA, gW
+        gSFA = cute.make_tensor(
+            cute.recast_ptr(gSFA_u8.iterator, dtype=cfg.load_sf.sf_dtype),
+            cfg.load_sf.deduce_sfa_layout(m_padded_sf, K, 1),
+        )
+        gSFB = cute.make_tensor(
+            cute.recast_ptr(gSFB_u8.iterator, dtype=cfg.load_sf.sf_dtype),
+            cfg.load_sf.deduce_sfb_layout(N, K, E),
+        )
         a_layout = utils.LayoutEnum.from_tensor(t_a)
         b_layout = utils.LayoutEnum.from_tensor(t_b)
         a_smem = cfg.load_ab.make_smem_layout_a()
@@ -605,9 +741,9 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         tma_atom_sfa,
         tma_atom_sfb,
         tma_tensor_a: cute.Tensor,
-        tma_tensor_b: cute.Tensor,
+        tma_tensor_b,
         tma_tensor_sfa: cute.Tensor,
-        tma_tensor_sfb: cute.Tensor,
+        tma_tensor_sfb,
         gD: cute.Tensor,
         gTok: cute.Tensor,
         gWt: cute.Tensor,
@@ -626,12 +762,10 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
         bm, bn, bk = cfg.TILE[0], cfg.TILE[1], cfg.TILE[2]
-        swap = cfg.mma.swap_ab
-        pm, pn = (bn, bm) if cutlass.const_expr(swap) else (bm, bn)
         N = cute.size(gD, mode=[1])
         K = cute.size(tma_tensor_a, mode=[1])
         num_groups = cute.size(offsets, mode=[0]) - 1
-        num_n_blocks = ceil_div(N, pn)
+        num_n_blocks = ceil_div(N, bn)
         k_tile_count = ceil_div(K, bk)
         sfa_tile_m = cfg.load_sf.sfa_tile_m(bm)
         sfa_tiles_per_block = cfg.load_sf.sfa_tiles_per_block(bm)
@@ -656,7 +790,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         else:
             sMeta_ptr = stg.sC.data_ptr() + cute.cosize(epi_smem)
         sTok_ptr = cute.recast_ptr(sMeta_ptr, dtype=cfg.I32)
-        meta_rows = bn if cutlass.const_expr(swap) else bm
+        meta_rows = bm
         sTok = cute.make_tensor(sTok_ptr, cute.make_layout(meta_rows))
         sWt = cute.make_tensor(
             cute.recast_ptr(sTok_ptr + meta_rows, dtype=cutlass.Float32),
@@ -692,13 +826,11 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
 
             if warp_idx == self.sched_warp:
                 sched = moe_scheduler.MoeTileScheduler.create(
-                    pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
+                    bm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
                 )
                 prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
                 has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
                 while has:
-                    if cutlass.const_expr(swap):
-                        m_tile, n_tile = n_tile, m_tile
                     prod.publish(
                         sWork,
                         sfull,
@@ -711,7 +843,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                 prod.publish_sentinel(sWork, sfull, sempty)
 
             if warp_idx == self.load_warp_0:
-                if cutlass.const_expr(cfg.enable_pdl and not swap):
+                if cutlass.const_expr(cfg.enable_pdl):
                     cute.arch.griddepcontrol_wait()
                 wstage, wphase = i32(0), i32(1)
                 epi_empty_phase = i32(1)
@@ -732,7 +864,6 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         tile,
                         sfa_tile_m,
                         sfa_tiles_per_block,
-                        swap,
                     )
                     wstage, wphase = copy_a_sfa(
                         tma_atom_a,
@@ -750,13 +881,10 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         cfg.ab_stage,
                         wstage,
                         wphase,
-                        swap,
                     )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
             if warp_idx == self.load_warp_1:
-                if cutlass.const_expr(cfg.enable_pdl and swap):
-                    cute.arch.griddepcontrol_wait()
                 wstage, wphase = i32(0), i32(1)
                 epi_empty_phase = i32(1)
                 cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
@@ -765,7 +893,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                     if cutlass.const_expr(cfg.union_smem):
                         cute.arch.mbarrier_wait(epi_empty, epi_empty_phase)
                         epi_empty_phase ^= 1
-                    tBsB, tBgB, tBsSFB, tBgSFB, sfb_n_block = make_b_sfb_partitions(
+                    tBsB, tBgB, tBsSFB, tBgSFB = make_b_sfb_partitions(
                         tma_atom_b,
                         tma_atom_sfb,
                         tma_tensor_b,
@@ -773,10 +901,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         sB,
                         sSFB,
                         cfg.TILE,
-                        tile,
                         sfb_tile_n,
-                        sfb_tiles_per_block,
-                        swap,
                     )
                     wstage, wphase = copy_b_sfb(
                         tma_atom_b,
@@ -786,7 +911,6 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         tBgSFB,
                         tBsSFB,
                         tile,
-                        sfb_n_block,
                         b_full,
                         b_empty,
                         self.b_sfb_bytes,
@@ -794,7 +918,6 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         cfg.ab_stage,
                         wstage,
                         wphase,
-                        swap,
                     )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
@@ -852,47 +975,253 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                     rphase,
                 )
                 acc.store(acc.load() * alpha[0].to(cutlass.Float32))
-                if cutlass.const_expr(swap):
-                    moe_epilogue.store_wg_scatter_swap(
-                        acc,
-                        thr_r2s,
-                        thr_s2r,
-                        sC,
-                        sTok,
-                        sWt,
-                        gTok,
-                        gWt,
-                        gD,
-                        tile,
-                        (bm, bn),
-                        N,
-                        cfg.epi.out_dtype,
-                        cfg.epi_bar_id,
-                        cfg.mma_threads,
-                        tidx,
-                        cfg.epi.num_store_threads,
-                    )
-                else:
-                    moe_epilogue.store_wg_scatter(
-                        acc,
-                        thr_r2s,
-                        thr_s2r,
-                        sC,
-                        sTok,
-                        sWt,
-                        gTok,
-                        gWt,
-                        gD,
-                        tile,
-                        (bm, bn),
-                        N,
-                        cfg.epi.out_dtype,
-                        epi_empty,
-                        cfg.epi_bar_id,
-                        cfg.mma_threads,
-                        tidx,
-                    )
+                moe_epilogue.store_wg_scatter(
+                    acc,
+                    thr_r2s,
+                    thr_s2r,
+                    sC,
+                    sTok,
+                    sWt,
+                    gTok,
+                    gWt,
+                    gD,
+                    tile,
+                    (bm, bn),
+                    N,
+                    cfg.epi.out_dtype,
+                    epi_empty,
+                    cfg.epi_bar_id,
+                    cfg.mma_threads,
+                    tidx,
+                )
                 tile = cons.get_next_tile(sWork, sfull, sempty)
+
+
+class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
+    def __init__(self, cfg, grid_x):
+        self.cfg, self.grid_x = cfg, grid_x
+
+    @cute.jit
+    def __call__(
+        self,
+        gA_u8: cute.Tensor,
+        gB_u8: cute.Tensor,
+        gSFA_u8: cute.Tensor,
+        gSFB_u8: cute.Tensor,
+        gD: cute.Tensor,
+        gTok: cute.Tensor,
+        gWt: cute.Tensor,
+        offsets: cute.Tensor,
+        alpha: cute.Tensor,
+        stream,
+        worklist=None,
+        workcount=None,
+    ):
+        cfg = self.cfg
+        tiledmma = cfg.mma.make_tiled_mma(cfg.TILE)
+        tiled_r2s, tiled_s2r = (
+            cfg.epi.make_tiled_r2s(tiledmma),
+            cfg.epi.make_tiled_s2r(cfg.TILE),
+        )
+        a_smem, b_smem = (
+            cfg.load_ab.make_smem_layout_a(),
+            cfg.load_ab.make_smem_layout_b(),
+        )
+        sfa_smem = cfg.load_sf.make_smem_layout_sfa(tiledmma, cfg.TILE, cfg.ab_stage)
+        sfb_smem = cfg.load_sf.make_smem_layout_sfb(tiledmma, cfg.TILE, cfg.ab_stage)
+        epi_smem = cfg.epi.make_smem_layout(cfg.TILE)
+        N, K, E = (
+            cute.size(gB_u8, mode=[1]),
+            cute.size(gA_u8, mode=[1]) << 1,
+            cute.size(gB_u8, mode=[0]),
+        )
+        gSFA = cute.make_tensor(
+            cute.recast_ptr(gSFB_u8.iterator, dtype=cfg.load_sf.sf_dtype),
+            cfg.load_sf.deduce_sfa_layout(N, K, E),
+        )
+        gSFB = cute.make_tensor(
+            cute.recast_ptr(gSFA_u8.iterator, dtype=cfg.load_sf.sf_dtype),
+            cfg.load_sf.deduce_sfb_layout(cute.size(gSFA_u8, mode=[0]), K, 1),
+        )
+        values = cfg.G2S_BITS // cfg.load_ab.a_dtype.width
+        lanes_k = ceil_div(cfg.TILE[2], values)
+        lanes_m = cfg.WARP_SIZE >> (lanes_k.bit_length() - 1)
+        atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), cfg.load_ab.a_dtype, num_bits_per_copy=cfg.G2S_BITS
+        )
+        tiled = cute.make_tiled_copy_tv(
+            atom,
+            cute.make_ordered_layout((lanes_m, lanes_k), order=(1, 0)),
+            cute.make_layout((1, values)),
+        )
+        sf_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(),
+            cfg.load_sf.sf_dtype,
+            num_bits_per_copy=cfg.load_sf.sf_dtype.width,
+        )
+
+        @cute.struct
+        class SharedStorage:
+            sA: cute.struct.Align[
+                cute.struct.MemRange[cfg.load_ab.a_dtype, cute.cosize(a_smem)],
+                cfg.SMEM_ALIGN_BYTES,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[cfg.load_ab.b_dtype, cute.cosize(b_smem)],
+                cfg.SMEM_ALIGN_BYTES,
+            ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[cfg.load_sf.sf_dtype, cute.cosize(sfa_smem)],
+                cfg.SMEM_ALIGN_BYTES,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[cfg.load_sf.sf_dtype, cute.cosize(sfb_smem)],
+                cfg.SMEM_ALIGN_BYTES,
+            ]
+            sC: cute.struct.Align[
+                cute.struct.MemRange[cfg.epi.out_dtype, cute.cosize(epi_smem)],
+                cfg.SMEM_ALIGN_BYTES,
+            ]
+            token: cute.struct.MemRange[cutlass.Int32, cfg.TILE[1]]
+            weight: cute.struct.MemRange[cutlass.Float32, cfg.TILE[1]]
+
+        self.storage = SharedStorage
+        self.kernel(
+            gB_u8,
+            gA_u8,
+            gSFA,
+            gSFB,
+            gD,
+            gTok,
+            gWt,
+            offsets,
+            alpha,
+            worklist,
+            workcount,
+            tiledmma,
+            tiled_r2s,
+            tiled_s2r,
+            a_smem,
+            b_smem,
+            sfa_smem,
+            sfb_smem,
+            epi_smem,
+            atom,
+            tiled,
+            sf_atom,
+        ).launch(
+            grid=[self.grid_x, 1, 1],
+            block=[cfg.threads, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=cfg.min_blocks_per_sm,
+            use_pdl=cfg.enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        gW_u8: cute.Tensor,
+        gA_u8: cute.Tensor,
+        gSFA: cute.Tensor,
+        gSFB: cute.Tensor,
+        gD: cute.Tensor,
+        gTok: cute.Tensor,
+        gWt: cute.Tensor,
+        offsets: cute.Tensor,
+        alpha: cute.Tensor,
+        worklist,
+        workcount,
+        tiledmma,
+        tiled_r2s,
+        tiled_s2r,
+        a_smem,
+        b_smem,
+        sfa_smem,
+        sfb_smem,
+        epi_smem,
+        atom,
+        tiled,
+        sf_atom,
+    ):
+        cfg = self.cfg
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        bm, bn, bk = cfg.TILE
+        sfb_tiles_per_block = cfg.load_sf.sfb_tiles_per_block(bn)
+        if cutlass.const_expr(cfg.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+        i32 = cutlass.Int32
+        n_blocks = i32(ceil_div(cute.size(gW_u8, mode=[1]), bm))
+        n_tile, first_work = bidx % n_blocks, bidx // n_blocks
+        work_stride = i32(self.grid_x) // n_blocks
+        shift_m = bn.bit_length() - 1
+        storage = utils.SmemAllocator().allocate(self.storage)
+        for widx in cutlass.range(first_work, workcount[0], work_stride, unroll=1):
+            if widx != first_work:
+                cute.arch.sync_threads()
+            group, r0, rows = worklist[0, widx], worklist[1, widx], worklist[2, widx]
+            begin = offsets[group]
+            m_tile, end = (r0 - begin) >> shift_m, r0 + rows
+            tile = moe_scheduler.MoeWorkTile(
+                n_tile, m_tile, group, begin, end, widx < workcount[0]
+            )
+            sA = storage.sA.get_tensor(a_smem.outer, swizzle=a_smem.inner)
+            sB = storage.sB.get_tensor(b_smem.outer, swizzle=b_smem.inner)
+            sSFA, sSFB = (
+                storage.sSFA.get_tensor(sfa_smem),
+                storage.sSFB.get_tensor(sfb_smem),
+            )
+            subtile = tile.n_block & (sfb_tiles_per_block - 1)
+            sSFB_tile = cute.local_tile(
+                sSFB, (bn, cute.size(sSFB, mode=[1])), (subtile, 0, None)
+            )
+            tAsA = tiled.get_slice(tidx & (cfg.WARP_SIZE - 1)).partition_D(sA)
+            tBsB = tiled.get_slice(tidx & (cfg.WARP_SIZE - 1)).partition_D(sB)
+            acc = mma_multistage(
+                tiledmma,
+                cfg,
+                sA,
+                sB,
+                sSFA,
+                sSFB_tile,
+                gW_u8,
+                gA_u8,
+                gSFA,
+                gSFB,
+                tAsA,
+                tBsB,
+                atom,
+                sf_atom,
+                tile,
+                tidx,
+                ceil_div(cute.size(gA_u8, mode=[1]), bk >> 1),
+            )
+            acc.store(acc.load() * alpha[0].to(cutlass.Float32))
+            sC = storage.sC.get_tensor(epi_smem.outer, swizzle=epi_smem.inner)[
+                None, None, 0
+            ]
+            sTok = storage.token.get_tensor(cute.make_layout(bn))
+            sWt = storage.weight.get_tensor(cute.make_layout(bn))
+            moe_epilogue.store_wg_scatter_swap(
+                acc,
+                tiled_r2s.get_slice(tidx),
+                tiled_s2r.get_slice(tidx),
+                sC,
+                sTok,
+                sWt,
+                gTok,
+                gWt,
+                gD,
+                tile,
+                (bm, bn),
+                cute.size(gD, mode=[1]),
+                cfg.epi.out_dtype,
+                cfg.epi_bar_id,
+                cfg.mma_threads,
+                tidx,
+                cfg.epi.num_store_threads,
+                evict_last=True,
+            )
 
 
 def _stream():
@@ -911,6 +1240,9 @@ def make_args(
     alpha,
     epi_cfg,
     tile,
+    *,
+    worklist=None,
+    workcount=None,
 ):
     sf = lambda tensor: from_dlpack(
         tensor.contiguous(), assumed_align=16
@@ -923,7 +1255,8 @@ def make_args(
             mode=1, stride_order=(0, 1), divisibility=epi_cfg.store_elements
         )
     )
-    return (
+    assert (worklist is None) == (workcount is None)
+    args = (
         from_dlpack(a_q).mark_layout_dynamic(),
         from_dlpack(b_q).mark_layout_dynamic(),
         sf(a_scale),
@@ -935,3 +1268,9 @@ def make_args(
         from_dlpack(alpha).mark_layout_dynamic(),
         _stream(),
     )
+    if worklist is not None:
+        args += (
+            from_dlpack(worklist, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(workcount, assumed_align=4).mark_layout_dynamic(),
+        )
+    return args

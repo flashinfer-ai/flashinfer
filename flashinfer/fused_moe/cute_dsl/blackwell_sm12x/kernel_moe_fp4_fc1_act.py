@@ -27,8 +27,16 @@ from ....tllm_enums import DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA
 from ....tllm_enums import ActivationType
 from ....utils import ceil_div
 from ._moe_utils import moe_activation, moe_epilogue, moe_scheduler
-from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import LoadABConfig, MmaConfig, Sm12xGatedGemmConfig
+from ._moe_utils.moe_epilogue import (
+    EPI_CONFIGS,
+    EpiMethod,
+)
+from ._moe_utils.moe_kernel_builder import (
+    LoadABConfig,
+    MmaConfig,
+    Sm12xGatedGemmConfig,
+    Sm12xUnaryGemmConfig,
+)
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigNvfp4,
     compute_padded_offset,
@@ -42,6 +50,9 @@ def is_swapab(tile):
 
 
 REG_PROD_BY_TACTIC = {
+    (128, 64, EpiMethod.R2G_WG): 40,
+    (64, 64, EpiMethod.R2G_WG): 88,
+    (32, 64, EpiMethod.R2G_WG): 88,
     (128, 128, EpiMethod.R2G_WG): 40,
     (64, 128, EpiMethod.R2G_WG): 88,
     (32, 128, EpiMethod.R2G_WG): 88,
@@ -70,6 +81,9 @@ def make_cfg(
         (64, 128, 128),
         (32, 128, 128),
         (8, 128, 128),
+        (128, 64, 128),
+        (64, 64, 128),
+        (32, 64, 128),
     )
     bm, bn, bk = tile
     tactic = (bm, bn, EpiMethod.DIRECT_STG if is_swapab(tile) else epi)
@@ -80,7 +94,16 @@ def make_cfg(
     else:
         assert epi is EpiMethod.R2G_WG
     tile = (bm, bn, bk)
-    return Sm12xGatedGemmConfig(
+    gated = activation is not ActivationType.Relu2
+    config_cls = Sm12xGatedGemmConfig if gated else Sm12xUnaryGemmConfig
+    activation_op = (
+        moe_activation.make_gated_activation(
+            activation, fastmath, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta
+        )
+        if gated
+        else moe_activation.ReLU2Activation()
+    )
+    return config_cls(
         MmaConfig(warp_mma.MmaMXF4NVF4Op(fp4, f32, sf), tile[:2], 8, swap_ab=swap),
         LoadABConfig(tile, ab_stage, fp4, fp4),
         Sm120SfConfigNvfp4(sf),
@@ -90,9 +113,7 @@ def make_cfg(
         epi_bar_id=3,
         union_smem=not swap,
         reg_prod=REG_PROD_BY_TACTIC[tactic],
-        activation=moe_activation.make_gated_activation(
-            activation, fastmath, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta
-        ),
+        activation=activation_op,
     )
 
 
@@ -129,9 +150,7 @@ def make_a_sfa_partitions(
     )
     if cutlass.const_expr(swap):
         gSFA_mkl = cute.local_tile(
-            tma_tensor_sfa,
-            (sfa_tile_m, cute.size(sSFA, mode=[1])),
-            (None, None, None),
+            tma_tensor_sfa, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
         )
     else:
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
@@ -191,9 +210,7 @@ def make_b_sfb_partitions(
             tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
         )
         gSFB_nkl = cute.local_tile(
-            tma_tensor_sfb,
-            (sfb_tile_n, cute.size(sSFB, mode=[1])),
-            (None, None, None),
+            tma_tensor_sfb, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
         )
     tBsB, tBgB = cpasync.tma_partition(
         tma_atom_b,
@@ -222,6 +239,8 @@ def make_b_sfb_partitions(
             sfb_n_block = tile.n_block >> 4
     else:
         sfb_n_block = tile.n_block
+        if cutlass.const_expr(sfb_tiles_per_block == 2):
+            sfb_n_block = tile.n_block >> 1
     return (
         tBsB,
         tBgB,
@@ -332,7 +351,7 @@ def copy_b_sfb(
             )
             cute.copy(
                 tma_atom_sfb,
-                tBgSFB[(None, tile.n_block, kt, tile.group)],
+                tBgSFB[(None, sfb_n_block, kt, tile.group)],
                 tBsSFB[(None, stage)],
                 tma_bar_ptr=b_full + stage,
             )
@@ -367,9 +386,7 @@ def make_b_sfb_gate_partitions(
         (None, None, None),
     )
     gSFB_nkl = cute.local_tile(
-        tma_tensor_sfb,
-        (tile_mnk[1], cute.size(sSFB, mode=[1])),
-        (None, None, None),
+        tma_tensor_sfb, (tile_mnk[1], cute.size(sSFB, mode=[1])), (None, None, None)
     )
     gSFG_nkl = cute.local_tile(
         cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfb),
@@ -440,9 +457,7 @@ def make_a_sfa_gate_partitions_swap(
         (None, None, None),
     )
     gSFA_mkl = cute.local_tile(
-        tma_tensor_sfa,
-        (tile_mnk[0], cute.size(sSFA, mode=[1])),
-        (None, None, None),
+        tma_tensor_sfa, (tile_mnk[0], cute.size(sSFA, mode=[1])), (None, None, None)
     )
     gSFG_mkl = cute.local_tile(
         cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfa),
@@ -631,26 +646,33 @@ def mma(
     phase,
     up_scale,
     gate_scale,
+    gated: cutlass.Constexpr = True,
 ):
     bm, bn = tile_mn
     thr = tiledmma.get_slice(tidx)
     tCrA = tiledmma.make_fragment_A(thr.partition_A(sA)[None, None, None, 0])
     tCrB = tiledmma.make_fragment_B(thr.partition_B(sB)[None, None, None, 0])
-    tCrG = tiledmma.make_fragment_B(thr.partition_B(sG)[None, None, None, 0])
+    if cutlass.const_expr(gated):
+        tCrG = tiledmma.make_fragment_B(thr.partition_B(sG)[None, None, None, 0])
     shape_c = tiledmma.partition_shape_C((bm, bn))
     acc = cute.make_rmem_tensor(shape_c, acc_dtype)
-    acc_g = cute.make_rmem_tensor(shape_c, acc_dtype)
+    if cutlass.const_expr(gated):
+        acc_g = cute.make_rmem_tensor(shape_c, acc_dtype)
     s2r_a = mma_cfg.make_s2r_a(tiledmma, a_dtype, a_is_m_major)
     s2r_b = mma_cfg.make_s2r_b(tiledmma, b_dtype, b_is_n_major, unpack_bits)
     thr_a, thr_b = s2r_a.get_slice(tidx), s2r_b.get_slice(tidx)
     tCrA_v = thr_a.retile(tCrA)
-    tCrB_v, tCrG_v = thr_b.retile(tCrB), thr_b.retile(tCrG)
+    tCrB_v = thr_b.retile(tCrB)
+    if cutlass.const_expr(gated):
+        tCrG_v = thr_b.retile(tCrG)
     tCrSFA = sf_cfg.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
     tCrSFB = sf_cfg.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
-    tCrSFG = sf_cfg.partition_fragment_SFB(sSFG[None, None, 0], thr, tidx)
+    if cutlass.const_expr(gated):
+        tCrSFG = sf_cfg.partition_fragment_SFB(sSFG[None, None, 0], thr, tidx)
     tCrSFA_frg = sf_cfg.make_sfa_e4m3_view(tCrSFA)
     tCrSFB_frg = sf_cfg.make_sfb_e4m3_view(tCrSFB)
-    tCrSFG_frg = sf_cfg.make_sfb_e4m3_view(tCrSFG)
+    if cutlass.const_expr(gated):
+        tCrSFG_frg = sf_cfg.make_sfb_e4m3_view(tCrSFG)
     s2r_sfa = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFA_TV(tiledmma),
         (cute.size(tiledmma.permutation_mnk[0]), sf_cfg.KTILE_SF),
@@ -661,30 +683,38 @@ def mma(
     )
     thr_sfa, thr_sfb = s2r_sfa.get_slice(tidx), s2r_sfb.get_slice(tidx)
     tCrSFA_v = thr_sfa.retile(tCrSFA)
-    tCrSFB_v, tCrSFG_v = thr_sfb.retile(tCrSFB), thr_sfb.retile(tCrSFG)
+    tCrSFB_v = thr_sfb.retile(tCrSFB)
+    if cutlass.const_expr(gated):
+        tCrSFG_v = thr_sfb.retile(tCrSFG)
     k_blocks = cute.size(tCrA_v, mode=[2])
     sf_blocks = cute.size(tCrSFA_v, mode=[2])
     acc.fill(0.0)
-    acc_g.fill(0.0)
+    if cutlass.const_expr(gated):
+        acc_g.fill(0.0)
     for _ in cutlass.range(0, k_tile_count):
         cute.arch.mbarrier_wait(a_full + stage, phase)
         cute.arch.mbarrier_wait(b_full + stage, phase)
         tAsA = thr_a.partition_S(sA)[None, None, None, stage]
         tBsB = thr_b.partition_S(sB)[None, None, None, stage]
-        tGsG = thr_b.partition_S(sG)[None, None, None, stage]
+        if cutlass.const_expr(gated):
+            tGsG = thr_b.partition_S(sG)[None, None, None, stage]
         tAsSFA = thr_sfa.partition_S(sSFA)[None, None, None, stage]
         tBsSFB = thr_sfb.partition_S(sSFB)[None, None, None, stage]
-        tGsSFG = thr_sfb.partition_S(sSFG)[None, None, None, stage]
+        if cutlass.const_expr(gated):
+            tGsSFG = thr_sfb.partition_S(sSFG)[None, None, None, stage]
         for k in cutlass.range_constexpr(0, k_blocks):
             cute.copy(s2r_a, tAsA[None, None, k], tCrA_v[None, None, k])
             cute.copy(s2r_b, tBsB[None, None, k], tCrB_v[None, None, k])
-            cute.copy(s2r_b, tGsG[None, None, k], tCrG_v[None, None, k])
+            if cutlass.const_expr(gated):
+                cute.copy(s2r_b, tGsG[None, None, k], tCrG_v[None, None, k])
         for k in cutlass.range_constexpr(0, sf_blocks):
             cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
             cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
-            cute.copy(s2r_sfb, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
+            if cutlass.const_expr(gated):
+                cute.copy(s2r_sfb, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
         cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
-        cute.gemm(tiledmma, acc_g, [tCrA, tCrSFA_frg], [tCrG, tCrSFG_frg], acc_g)
+        if cutlass.const_expr(gated):
+            cute.gemm(tiledmma, acc_g, [tCrA, tCrSFA_frg], [tCrG, tCrSFG_frg], acc_g)
         cute.arch.mbarrier_arrive(a_empty + stage)
         cute.arch.mbarrier_arrive(b_empty + stage)
         stage += 1
@@ -692,8 +722,11 @@ def mma(
             stage = cutlass.Int32(0)
             phase ^= 1
     acc.store(acc.load() * up_scale)
-    acc_g.store(acc_g.load() * gate_scale)
-    activation(acc, acc_g)
+    if cutlass.const_expr(gated):
+        acc_g.store(acc_g.load() * gate_scale)
+        activation(acc, acc_g)
+    else:
+        activation(acc)
     return acc, stage, phase
 
 
@@ -727,25 +760,32 @@ def mma_swap(
     phase,
     up_scale,
     gate_scale,
+    gated: cutlass.Constexpr = True,
 ):
     bm, bn = tile_mn
     thr = tiledmma.get_slice(tidx)
     tCrA = tiledmma.make_fragment_A(thr.partition_A(sA)[None, None, None, 0])
-    tCrG = tiledmma.make_fragment_A(thr.partition_A(sG)[None, None, None, 0])
+    if cutlass.const_expr(gated):
+        tCrG = tiledmma.make_fragment_A(thr.partition_A(sG)[None, None, None, 0])
     tCrB = tiledmma.make_fragment_B(thr.partition_B(sB)[None, None, None, 0])
     shape_c = tiledmma.partition_shape_C((bm, bn))
     acc = cute.make_rmem_tensor(shape_c, acc_dtype)
-    acc_g = cute.make_rmem_tensor(shape_c, acc_dtype)
+    if cutlass.const_expr(gated):
+        acc_g = cute.make_rmem_tensor(shape_c, acc_dtype)
     s2r_a = mma_cfg.make_s2r_a(tiledmma, a_dtype, a_is_m_major)
     s2r_b = mma_cfg.make_s2r_b(tiledmma, b_dtype, b_is_n_major, unpack_bits)
     thr_a, thr_b = s2r_a.get_slice(tidx), s2r_b.get_slice(tidx)
-    tCrA_v, tCrG_v = thr_a.retile(tCrA), thr_a.retile(tCrG)
+    tCrA_v = thr_a.retile(tCrA)
+    if cutlass.const_expr(gated):
+        tCrG_v = thr_a.retile(tCrG)
     tCrB_v = thr_b.retile(tCrB)
     tCrSFA = sf_cfg.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
-    tCrSFG = sf_cfg.partition_fragment_SFA(sSFG[None, None, 0], thr, tidx)
+    if cutlass.const_expr(gated):
+        tCrSFG = sf_cfg.partition_fragment_SFA(sSFG[None, None, 0], thr, tidx)
     tCrSFB = sf_cfg.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
     tCrSFA_frg = sf_cfg.make_sfa_e4m3_view(tCrSFA)
-    tCrSFG_frg = sf_cfg.make_sfa_e4m3_view(tCrSFG)
+    if cutlass.const_expr(gated):
+        tCrSFG_frg = sf_cfg.make_sfa_e4m3_view(tCrSFG)
     tCrSFB_frg = sf_cfg.make_sfb_e4m3_view(tCrSFB)
     s2r_sfa = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFA_TV(tiledmma),
@@ -756,31 +796,39 @@ def mma_swap(
         (cute.size(tiledmma.permutation_mnk[1]), sf_cfg.KTILE_SF),
     )
     thr_sfa, thr_sfb = s2r_sfa.get_slice(tidx), s2r_sfb.get_slice(tidx)
-    tCrSFA_v, tCrSFG_v = thr_sfa.retile(tCrSFA), thr_sfa.retile(tCrSFG)
+    tCrSFA_v = thr_sfa.retile(tCrSFA)
+    if cutlass.const_expr(gated):
+        tCrSFG_v = thr_sfa.retile(tCrSFG)
     tCrSFB_v = thr_sfb.retile(tCrSFB)
     k_blocks = cute.size(tCrA_v, mode=[2])
     sf_blocks = cute.size(tCrSFA_v, mode=[2])
     acc.fill(0.0)
-    acc_g.fill(0.0)
+    if cutlass.const_expr(gated):
+        acc_g.fill(0.0)
     for _ in cutlass.range(0, k_tile_count):
         cute.arch.mbarrier_wait(a_full + stage, phase)
         cute.arch.mbarrier_wait(b_full + stage, phase)
         tAsA = thr_a.partition_S(sA)[None, None, None, stage]
-        tGsG = thr_a.partition_S(sG)[None, None, None, stage]
+        if cutlass.const_expr(gated):
+            tGsG = thr_a.partition_S(sG)[None, None, None, stage]
         tBsB = thr_b.partition_S(sB)[None, None, None, stage]
         tAsSFA = thr_sfa.partition_S(sSFA)[None, None, None, stage]
-        tGsSFG = thr_sfa.partition_S(sSFG)[None, None, None, stage]
+        if cutlass.const_expr(gated):
+            tGsSFG = thr_sfa.partition_S(sSFG)[None, None, None, stage]
         tBsSFB = thr_sfb.partition_S(sSFB)[None, None, None, stage]
         for k in cutlass.range_constexpr(0, k_blocks):
             cute.copy(s2r_a, tAsA[None, None, k], tCrA_v[None, None, k])
-            cute.copy(s2r_a, tGsG[None, None, k], tCrG_v[None, None, k])
+            if cutlass.const_expr(gated):
+                cute.copy(s2r_a, tGsG[None, None, k], tCrG_v[None, None, k])
             cute.copy(s2r_b, tBsB[None, None, k], tCrB_v[None, None, k])
         for k in cutlass.range_constexpr(0, sf_blocks):
             cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
-            cute.copy(s2r_sfa, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
+            if cutlass.const_expr(gated):
+                cute.copy(s2r_sfa, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
             cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
         cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
-        cute.gemm(tiledmma, acc_g, [tCrG, tCrSFG_frg], [tCrB, tCrSFB_frg], acc_g)
+        if cutlass.const_expr(gated):
+            cute.gemm(tiledmma, acc_g, [tCrG, tCrSFG_frg], [tCrB, tCrSFB_frg], acc_g)
         cute.arch.mbarrier_arrive(a_empty + stage)
         cute.arch.mbarrier_arrive(b_empty + stage)
         stage += 1
@@ -788,8 +836,11 @@ def mma_swap(
             stage = cutlass.Int32(0)
             phase ^= 1
     acc.store(acc.load() * up_scale)
-    acc_g.store(acc_g.load() * gate_scale)
-    activation(acc, acc_g)
+    if cutlass.const_expr(gated):
+        acc_g.store(acc_g.load() * gate_scale)
+        activation(acc, acc_g)
+    else:
+        activation(acc)
     return acc, stage, phase
 
 
@@ -900,15 +951,17 @@ class CuteDslSm120MoeNvfp4Fc1Act:
         self.a_sfa_bytes = (
             cute.size_in_bytes(cfg.load_ab.a_dtype, a_stage)
             + cute.size_in_bytes(cfg.load_sf.sf_dtype, sfa_stage)
-        ) * (2 if cutlass.const_expr(cfg.mma.swap_ab) else 1)
+        ) * (2 if cutlass.const_expr(cfg.mma.swap_ab and cfg.gated) else 1)
         self.b_sfb_bytes = (
             cute.size_in_bytes(cfg.load_ab.b_dtype, b_stage)
             + cute.size_in_bytes(cfg.load_sf.sf_dtype, sfb_stage)
-        ) * (1 if cutlass.const_expr(cfg.mma.swap_ab) else 2)
+        ) * (2 if cutlass.const_expr(not cfg.mma.swap_ab and cfg.gated) else 1)
 
         epi_full_bars = cfg.epi.num_full_barriers
         epi_empty_bars = cfg.epi.num_empty_barriers
         epi_elems = cute.cosize(epi_smem) if cfg.owns_epi_smem else 0
+        gate_elems = cute.cosize(gate_smem) if cfg.gated else 0
+        gate_sf_elems = cute.cosize(gate_sf_smem) if cfg.gated else 0
 
         @cute.struct
         class SharedStorage:
@@ -928,7 +981,7 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                 cute.struct.MemRange[cfg.load_ab.b_dtype, cute.cosize(b_smem)], 128
             ]
             sG: cute.struct.Align[
-                cute.struct.MemRange[cfg.load_ab.a_dtype, cute.cosize(gate_smem)], 128
+                cute.struct.MemRange[cfg.load_ab.a_dtype, gate_elems], 128
             ]
             sSFA: cute.struct.Align[
                 cute.struct.MemRange[cfg.load_sf.sf_dtype, cute.cosize(sfa_smem)], 128
@@ -937,8 +990,7 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                 cute.struct.MemRange[cfg.load_sf.sf_dtype, cute.cosize(sfb_smem)], 128
             ]
             sSFG: cute.struct.Align[
-                cute.struct.MemRange[cfg.load_sf.sf_dtype, cute.cosize(gate_sf_smem)],
-                128,
+                cute.struct.MemRange[cfg.load_sf.sf_dtype, gate_sf_elems], 128
             ]
             sC: cute.struct.Align[
                 cute.struct.MemRange[cfg.epi.out_dtype, epi_elems], 128
@@ -1026,10 +1078,12 @@ class CuteDslSm120MoeNvfp4Fc1Act:
         stg = smem.allocate(self.storage)
         sA = stg.sA.get_tensor(a_smem.outer, swizzle=a_smem.inner)
         sB = stg.sB.get_tensor(b_smem.outer, swizzle=b_smem.inner)
-        sG = stg.sG.get_tensor(gate_smem.outer, swizzle=gate_smem.inner)
+        sG, sSFG = None, None
+        if cutlass.const_expr(cfg.gated):
+            sG = stg.sG.get_tensor(gate_smem.outer, swizzle=gate_smem.inner)
+            sSFG = stg.sSFG.get_tensor(gate_sf_smem)
         sSFA = stg.sSFA.get_tensor(sfa_smem)
         sSFB = stg.sSFB.get_tensor(sfb_smem)
-        sSFG = stg.sSFG.get_tensor(gate_sf_smem)
         if cutlass.const_expr(cfg.epi.HAS_R2S):
             if cutlass.const_expr(cfg.union_smem):
                 sC_stages = cute.make_tensor(
@@ -1109,7 +1163,7 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                     if cutlass.const_expr(cfg.union_smem):
                         cute.arch.mbarrier_wait(epi_empty, epi_empty_phase)
                         epi_empty_phase ^= 1
-                    if cutlass.const_expr(swap):
+                    if cutlass.const_expr(swap and cfg.gated):
                         (tAsA, tAgA, tGsG, tGgG, tAsSFA, tAgSFA, tGsSFG, tGgSFG) = (
                             make_a_sfa_gate_partitions_swap(
                                 tma_atom_a,
@@ -1188,7 +1242,7 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                     if cutlass.const_expr(cfg.union_smem):
                         cute.arch.mbarrier_wait(epi_empty, epi_empty_phase)
                         epi_empty_phase ^= 1
-                    if cutlass.const_expr(swap):
+                    if cutlass.const_expr(swap or not cfg.gated):
                         tBsB, tBgB, tBsSFB, tBgSFB, sfb_n_block = make_b_sfb_partitions(
                             tma_atom_b,
                             tma_atom_sfb,
@@ -1286,6 +1340,9 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                     )
                 else:
                     sSFB_tile = sSFB
+                gate_mul = cutlass.Float32(0)
+                if cutlass.const_expr(cfg.gated):
+                    gate_mul = gate_scale[tile.group].to(cutlass.Float32)
                 if cutlass.const_expr(swap):
                     acc, rstage, rphase = mma_swap(
                         tiledmma,
@@ -1315,7 +1372,8 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                         rstage,
                         rphase,
                         up_scale[tile.group].to(cutlass.Float32),
-                        gate_scale[tile.group].to(cutlass.Float32),
+                        gate_mul,
+                        gated=cfg.gated,
                     )
                 else:
                     acc, rstage, rphase = mma(
@@ -1346,7 +1404,8 @@ class CuteDslSm120MoeNvfp4Fc1Act:
                         rstage,
                         rphase,
                         up_scale[tile.group].to(cutlass.Float32),
-                        gate_scale[tile.group].to(cutlass.Float32),
+                        gate_mul,
+                        gated=cfg.gated,
                     )
                 if cutlass.const_expr(cfg.epi.METHOD is EpiMethod.DIRECT_STG):
                     moe_epilogue.store_swap(

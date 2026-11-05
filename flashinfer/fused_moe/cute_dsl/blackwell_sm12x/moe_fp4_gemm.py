@@ -21,7 +21,10 @@ import torch
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
-from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
+from ._moe_utils.moe_epilogue import (
+    EPI_CONFIGS,
+    EpiMethod,
+)
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig
 from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
 from .kernel_moe_fp4_gemm import (

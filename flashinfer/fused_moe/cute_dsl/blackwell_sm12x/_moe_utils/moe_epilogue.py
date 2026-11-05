@@ -418,7 +418,9 @@ class WgScatterEpiConfig(R2GWgEpiConfig):
 
     def aux_smem_bytes(self, tile):
         rows = tile[1] if self.swap_ab else tile[0]
-        return rows * (cutlass.Int32.width + cutlass.Float32.width) // 8
+        return (
+            rows * self.epi_stages * (cutlass.Int32.width + cutlass.Float32.width) // 8
+        )
 
 
 EPI_CONFIGS = {
@@ -574,17 +576,25 @@ def ptr_as_int64(tensor: cute.Tensor, offset, *, loc=None, ip=None) -> cutlass.I
 
 
 @dsl_user_op
-def scatter_add_v4_bf16x2(addr, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None):
+def scatter_add_v4_bf16x2(
+    addr, v0, v1, v2, v3, v4, v5, v6, v7, *, evict_last=False, loc=None, ip=None
+):
+    prefix = "{ .reg .b32 p0,p1,p2,p3;"
+    reduction = " red.global.add.noftz.v4.bf16x2 [$0], {p0, p1, p2, p3}; }"
+    if evict_last:
+        prefix += " .reg .b64 policy;"
+        reduction = (
+            " createpolicy.fractional.L2::evict_last.b64 policy, 1.0;"
+            " red.global.add.noftz.L2::cache_hint.v4.bf16x2 [$0], {p0, p1, p2, p3}, policy; }"
+        )
     llvm.inline_asm(
         None,
         [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
         + [v.ir_value(loc=loc, ip=ip) for v in (v0, v1, v2, v3, v4, v5, v6, v7)],
-        "{ .reg .b32 p0,p1,p2,p3;"
-        " cvt.rn.satfinite.bf16x2.f32 p0, $2, $1;"
+        prefix + " cvt.rn.satfinite.bf16x2.f32 p0, $2, $1;"
         " cvt.rn.satfinite.bf16x2.f32 p1, $4, $3;"
         " cvt.rn.satfinite.bf16x2.f32 p2, $6, $5;"
-        " cvt.rn.satfinite.bf16x2.f32 p3, $8, $7;"
-        " red.global.add.noftz.v4.bf16x2 [$0], {p0, p1, p2, p3}; }",
+        " cvt.rn.satfinite.bf16x2.f32 p3, $8, $7;" + reduction,
         "l,f,f,f,f,f,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
@@ -595,8 +605,12 @@ def scatter_add_v4_bf16x2(addr, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=
 
 
 @cute.jit
-def emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7):
-    scatter_add_v4_bf16x2(ptr_as_int64(gOut, base), v0, v1, v2, v3, v4, v5, v6, v7)
+def emit_scatter(
+    gOut, base, v0, v1, v2, v3, v4, v5, v6, v7, evict_last: cutlass.Constexpr = False
+):
+    scatter_add_v4_bf16x2(
+        ptr_as_int64(gOut, base), v0, v1, v2, v3, v4, v5, v6, v7, evict_last=evict_last
+    )
 
 
 @cute.jit
@@ -613,7 +627,9 @@ def stage_scatter_meta(sTok, sWt, gTok, gWt, m_base, m_valid, tidx, bm):
 
 
 @cute.jit
-def smem_to_gmem_scatter(thr_s2r, sC, sTok, sWt, gOut, tile_mn, n_base, hidden):
+def smem_to_gmem_scatter(
+    thr_s2r, sC, sTok, sWt, gOut, tile_mn, n_base, hidden, m_valid
+):
     bm, bn = tile_mn
     f32 = cutlass.Float32
     tDsC = thr_s2r.partition_S(sC)
@@ -633,7 +649,8 @@ def smem_to_gmem_scatter(thr_s2r, sC, sTok, sWt, gOut, tile_mn, n_base, hidden):
             v2, v3 = w * reg[2].to(f32), w * reg[3].to(f32)
             v4, v5 = w * reg[4].to(f32), w * reg[5].to(f32)
             v6, v7 = w * reg[6].to(f32), w * reg[7].to(f32)
-            emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7)
+            if local < m_valid:
+                emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7)
 
 
 @cute.jit
@@ -661,27 +678,31 @@ def store_wg_scatter(
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     rmem_to_smem(convert_acc(acc, out_dtype), thr_r2s, sC)
     m_base = tile.m_offset + tile.m_block * bm
-    stage_scatter_meta(
-        sTok,
-        sWt,
-        gTok,
-        gWt,
-        m_base,
-        min(max(tile.m_boundary - m_base, i32(0)), i32(bm)),
-        tidx,
-        bm,
-    )
+    m_valid = min(max(tile.m_boundary - m_base, i32(0)), i32(bm))
+    stage_scatter_meta(sTok, sWt, gTok, gWt, m_base, m_valid, tidx, bm)
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     smem_to_gmem_scatter(
-        thr_s2r, sC, sTok, sWt, gOut, (bm, bn), tile.n_block * bn, hidden
+        thr_s2r, sC, sTok, sWt, gOut, (bm, bn), tile.n_block * bn, hidden, m_valid
     )
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
-    cute.arch.mbarrier_arrive(epi_empty)
+    if cutlass.const_expr(epi_empty is not None):
+        cute.arch.mbarrier_arrive(epi_empty)
 
 
 @cute.jit
 def smem_to_gmem_scatter_swap(
-    thr_s2r, sC, sTok, sWt, gOut, tile_mn, n_base, hidden, tidx, n_store
+    thr_s2r,
+    sC,
+    sTok,
+    sWt,
+    gOut,
+    tile_mn,
+    n_base,
+    hidden,
+    m_valid,
+    tidx,
+    n_store,
+    evict_last: cutlass.Constexpr = False,
 ):
     bm, bn = tile_mn
     f32 = cutlass.Float32
@@ -702,7 +723,8 @@ def smem_to_gmem_scatter_swap(
                 v2, v3 = w * reg[2].to(f32), w * reg[3].to(f32)
                 v4, v5 = w * reg[4].to(f32), w * reg[5].to(f32)
                 v6, v7 = w * reg[6].to(f32), w * reg[7].to(f32)
-                emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7)
+                if coord[1] < m_valid:
+                    emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7, evict_last)
 
 
 @cute.jit
@@ -724,24 +746,28 @@ def store_wg_scatter_swap(
     mma_threads,
     tidx,
     n_store,
+    evict_last: cutlass.Constexpr = False,
 ):
     bm, bn = tile_mn
     i32 = cutlass.Int32
     rmem_to_smem(convert_acc(acc, out_dtype), thr_r2s, sC)
     m_base = tile.m_offset + tile.n_block * bn
-    stage_scatter_meta(
-        sTok,
-        sWt,
-        gTok,
-        gWt,
-        m_base,
-        min(max(tile.m_boundary - m_base, i32(0)), i32(bn)),
-        tidx,
-        bn,
-    )
+    m_valid = min(max(tile.m_boundary - m_base, i32(0)), i32(bn))
+    stage_scatter_meta(sTok, sWt, gTok, gWt, m_base, m_valid, tidx, bn)
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     smem_to_gmem_scatter_swap(
-        thr_s2r, sC, sTok, sWt, gOut, (bm, bn), tile.m_block * bm, hidden, tidx, n_store
+        thr_s2r,
+        sC,
+        sTok,
+        sWt,
+        gOut,
+        (bm, bn),
+        tile.m_block * bm,
+        hidden,
+        m_valid,
+        tidx,
+        n_store,
+        evict_last,
     )
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
 
@@ -1203,15 +1229,6 @@ def quantize_nvfp4_store(
     for mi in cutlass.range_constexpr(cute.size(tS, mode=[1])):
         for ni in cutlass.range_constexpr(cute.size(tS, mode=[2])):
             src = tS[None, mi, ni]
-            vals = src.load().to(f32)
-            amax = cute.math.abs(vals).reduce(
-                cute.ReductionOp.MAX, init_val=f32(0.0), reduction_profile=0
-            )
-            amax = cute.arch.warp_reduction_max(amax, threads_in_group=2)
-            sf_u32 = cvt_f32_to_e4m3(scale * (amax * f32(1.0 / 6.0)))
-            encode = nvfp4_compute_output_scale(sf_u32, scale)
-            frg = cute.make_fragment_like(src, fp4)
-            frg.store((vals * encode).to(fp4))
             coord = tC[0, mi, ni]
             if cutlass.const_expr(swap):
                 row, col = coord[1], coord[0] >> 4
@@ -1219,7 +1236,22 @@ def quantize_nvfp4_store(
             else:
                 row, col = coord[0], coord[1] >> 4
                 owns_sf = (coord[1] & 15) == 0
-            if m_base + row < m_boundary:
+            valid = m_base + row < m_boundary
+            values = cute.full_like(src, 0.0, f32)
+            amax = f32(0.0)
+            if valid:
+                values = src.load().to(f32)
+                amax = f32(
+                    cute.math.abs(values).reduce(
+                        cute.ReductionOp.MAX, init_val=f32(0.0), reduction_profile=0
+                    )
+                )
+            amax = cute.arch.warp_reduction_max(amax, threads_in_group=2)
+            if valid:
+                sf_u32 = cvt_f32_to_e4m3(scale * (amax * f32(1.0 / 6.0)))
+                encode = nvfp4_compute_output_scale(sf_u32, scale)
+                frg = cute.make_fragment_like(src, fp4)
+                frg.store((values * encode).to(fp4))
                 cute.autovec_copy(frg, tD[None, mi, ni])
                 if owns_sf:
                     index = compute_nvfp4_sf_offset(

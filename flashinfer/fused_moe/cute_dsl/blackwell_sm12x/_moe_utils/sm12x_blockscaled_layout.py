@@ -159,10 +159,7 @@ class Sm120SfConfigNvfp4:
         )
         a_tensor = cute.zipped_divide(
             t_tensor,
-            (
-                cute.make_layout(atom_shape_mnk[0]),
-                cute.make_layout(self.KTILE_SF),
-            ),
+            (cute.make_layout(atom_shape_mnk[0]), cute.make_layout(self.KTILE_SF)),
         )
         tv_tensor = cute.composition(a_tensor, (atom_sf_layout, None))
         return cute.zipped_divide(
@@ -186,10 +183,7 @@ class Sm120SfConfigNvfp4:
         )
         a_tensor = cute.zipped_divide(
             t_tensor,
-            (
-                cute.make_layout(atom_shape_mnk[1]),
-                cute.make_layout(self.KTILE_SF),
-            ),
+            (cute.make_layout(atom_shape_mnk[1]), cute.make_layout(self.KTILE_SF)),
         )
         tv_tensor = cute.composition(a_tensor, (atom_sf_layout, None))
         return cute.zipped_divide(
@@ -273,7 +267,8 @@ class Sm120SfConfigNvfp4:
             ),
         )
         return cute.make_tensor(
-            cute.recast_ptr(fragment.iterator, dtype=self.mma_sf_dtype), layout
+            cute.recast_ptr(fragment.iterator, dtype=self.mma_sf_dtype),
+            layout,
         )
 
     def make_sfa_e4m3_view(self, fragment):

@@ -24,8 +24,15 @@ from cutlass.cute.runtime import from_dlpack
 
 from ....utils import ceil_div
 from ._moe_utils import moe_epilogue, moe_scheduler
-from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import LoadABConfig, MmaConfig, Sm12xGemmConfig
+from ._moe_utils.moe_epilogue import (
+    EPI_CONFIGS,
+    EpiMethod,
+)
+from ._moe_utils.moe_kernel_builder import (
+    LoadABConfig,
+    MmaConfig,
+    Sm12xGemmConfig,
+)
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigNvfp4,
     compute_padded_offset,
@@ -114,9 +121,7 @@ def make_a_sfa_partitions(
     )
     if cutlass.const_expr(swap):
         gSFA_mkl = cute.local_tile(
-            tma_tensor_sfa,
-            (sfa_tile_m, cute.size(sSFA, mode=[1])),
-            (None, None, None),
+            tma_tensor_sfa, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
         )
     else:
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
@@ -176,9 +181,7 @@ def make_b_sfb_partitions(
             tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
         )
         gSFB_nkl = cute.local_tile(
-            tma_tensor_sfb,
-            (sfb_tile_n, cute.size(sSFB, mode=[1])),
-            (None, None, None),
+            tma_tensor_sfb, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
         )
     tBsB, tBgB = cpasync.tma_partition(
         tma_atom_b,

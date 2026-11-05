@@ -26,9 +26,16 @@ from ....tllm_enums import DEFAULT_SITU_BETA as SITU_BETA
 from ....tllm_enums import DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA
 from ....tllm_enums import ActivationType
 from ....utils import ceil_div
+from ....utils import round_up as align
 from ._moe_utils.heuristic import select_fc1_act_tile
-from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
+from ._moe_utils.moe_epilogue import (
+    EPI_CONFIGS,
+    EpiMethod,
+)
+from ._moe_utils.moe_kernel_builder import (
+    Sm12xGemmConfig,
+    dsl_targets_sm12x,
+)
 from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
 from .kernel_moe_fp4_fc1_act import (
     CuteDslSm120MoeNvfp4Fc1Act,
@@ -45,18 +52,18 @@ def epi_tactics(tile):
     return tuple(epi for epi in candidates if EPI_CONFIGS[epi].supports_tile(tile))
 
 
-def resolve_stage(tile, epi):
+def resolve_stage(tile, epi, activation=ActivationType.Swiglu):
     return Sm12xGemmConfig.max_ab_stage(
-        functools.partial(make_cfg, epi=epi, activation=ActivationType.Swiglu),
+        functools.partial(make_cfg, epi=epi, activation=activation),
         tuple(tile),
     )
 
 
-def resolve_stage_store(tile):
+def resolve_stage_store(tile, activation=ActivationType.Swiglu):
     best = None
     for epi in epi_tactics(tile):
         try:
-            stage = resolve_stage(tile, epi)
+            stage = resolve_stage(tile, epi, activation)
         except (AssertionError, ValueError, DSLUserCodeError):
             continue
         if best is None or stage > best[0]:
@@ -68,8 +75,8 @@ def resolve_stage_store(tile):
 
 class CuteDslSm120GroupedNvfp4Fc1ActOp:
     OUT_DTYPES = (torch.bfloat16,)
-    TILES = ((128, 128), (64, 128), (32, 128), (8, 128))
-    ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Situ)
+    TILES = ((128, 128), (64, 128), (32, 128), (8, 128), (128, 64), (64, 64), (32, 64))
+    ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Situ, ActivationType.Relu2)
 
     def __init__(
         self,
@@ -96,9 +103,9 @@ class CuteDslSm120GroupedNvfp4Fc1ActOp:
         self.activation = activation
         self.situ_beta, self.situ_linear_beta = (situ_beta, situ_linear_beta)
         if epi is None:
-            self.ab_stage, self.epi = resolve_stage_store(self.tile)
+            self.ab_stage, self.epi = resolve_stage_store(self.tile, activation)
         else:
-            self.ab_stage, self.epi = resolve_stage(self.tile, epi), epi
+            self.ab_stage, self.epi = resolve_stage(self.tile, epi, activation), epi
         self.tactic = (self.tile[0], self.tile[1], self.epi)
         self.cfg = make_cfg(
             self.tile,
@@ -126,15 +133,17 @@ class CuteDslSm120GroupedNvfp4Fc1ActOp:
     def is_constructible(cls, tile, epi=None, activation=ActivationType.Swiglu) -> bool:
         if not dsl_targets_sm12x():
             return False
+        if tile[1] == 64 and activation is not ActivationType.Relu2:
+            return False
         if epi is not None and (
             epi not in epi_tactics(tile) or not EPI_CONFIGS[epi].supports_tile(tile)
         ):
             return False
         try:
             if epi is None:
-                stage, epi = resolve_stage_store(tuple(tile))
+                stage, epi = resolve_stage_store(tuple(tile), activation)
             else:
-                stage = resolve_stage(tuple(tile), epi)
+                stage = resolve_stage(tuple(tile), epi, activation)
             CuteDslSm120MoeNvfp4Fc1Act(
                 make_cfg(
                     tuple(tile),
@@ -164,6 +173,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActOp:
             cls.is_valid_dtypes(out_dtype)
             and cls.is_valid_tile(tile)
             and activation in cls.ACTIVATIONS
+            and (tile[1] == 128 or activation is ActivationType.Relu2)
             and cls.is_valid_alignment(n, k, tile)
             and any(
                 candidate in epi_tactics(tile)
@@ -183,7 +193,11 @@ TACTICS = tuple(
     (bm, bn, epi)
     for bm, bn in CuteDslSm120GroupedNvfp4Fc1ActOp.TILES
     for epi in epi_tactics((bm, bn, PLAIN_TILE_K))
-    if CuteDslSm120GroupedNvfp4Fc1ActOp.is_constructible((bm, bn, PLAIN_TILE_K), epi)
+    if CuteDslSm120GroupedNvfp4Fc1ActOp.is_constructible(
+        (bm, bn, PLAIN_TILE_K),
+        epi,
+        ActivationType.Relu2 if bn == 64 else ActivationType.Swiglu,
+    )
 )
 
 
@@ -236,17 +250,35 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
 
 
 def select_tile(*, total_rows: int, n: int, k: int, num_experts: int, num_sms: int):
+    tile_n = 128 if n % 128 == 0 else 64
     return select_fc1_act_tile(
         total_rows=total_rows,
         n=n,
         num_experts=num_experts,
         num_sms=num_sms,
-        tiles=CuteDslSm120GroupedNvfp4Fc1ActOp.TILES,
+        tiles=tuple(
+            (bm, bn)
+            for bm, bn in CuteDslSm120GroupedNvfp4Fc1ActOp.TILES
+            if bn == tile_n
+        ),
         gran_k=PLAIN_TILE_K,
     )
 
 
-def _validate_inputs(a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale):
+def _validate_inputs(
+    a_q,
+    a_scale,
+    b_q,
+    b_scale,
+    m_indptr,
+    up_scale,
+    gate_scale,
+    activation=ActivationType.Swiglu,
+):
+    if gate_scale is None:
+        if activation is not ActivationType.Relu2:
+            raise TypeError("gate_scale is required for gated activations")
+        gate_scale = up_scale
     tensors = (a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale)
     if any(t.device != a_q.device for t in tensors):
         raise ValueError("all inputs must be on the same device")
@@ -261,7 +293,7 @@ def _validate_inputs(a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale)
     if m_indptr.dtype != torch.int32 or m_indptr.ndim != 1:
         raise TypeError("m_indptr must be a 1D int32 tensor")
     e, n2 = int(b_q.shape[0]), int(b_q.shape[1])
-    if n2 % 2 != 0:
+    if activation is not ActivationType.Relu2 and n2 % 2 != 0:
         raise ValueError("b_q projection extent must be even")
     for name, scale in (("up_scale", up_scale), ("gate_scale", gate_scale)):
         if scale.dtype != torch.float32 or tuple(scale.shape) != (e,):
@@ -273,7 +305,7 @@ def _validate_inputs(a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale)
     m, packed_k = int(a_q.shape[0]), int(a_q.shape[1])
     k = packed_k * 2
     want_a_scale = (compute_padded_offset(m, e, 128), ceil_div(k, 16))
-    want_b_scale = (e * n2, ceil_div(k, 16))
+    want_b_scale = (e * align(n2, 128), ceil_div(k, 16))
     if tuple(a_scale.shape) != want_a_scale:
         raise ValueError(f"a_scale shape must be {want_a_scale}")
     if tuple(b_scale.shape) != want_b_scale:
@@ -297,8 +329,22 @@ def cute_dsl_sm12x_fc1_act_nvfp4(
     situ_beta: float = SITU_BETA,
     situ_linear_beta: float = SITU_LINEAR_BETA,
 ) -> torch.Tensor:
-    _validate_inputs(a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale)
-    n, k = int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
+    _validate_inputs(
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        m_indptr,
+        up_scale,
+        gate_scale,
+        activation,
+    )
+    if gate_scale is None:
+        gate_scale = up_scale
+    n, k = (
+        int(b_q.shape[1]) // (1 if activation is ActivationType.Relu2 else 2),
+        int(b_q.shape[2]) * 2,
+    )
     props = torch.cuda.get_device_properties(a_q.device)
     grid_x = props.multi_processor_count
     sm_version = f"sm_{props.major}{props.minor}"
@@ -381,7 +427,10 @@ class _Fc1ActRunner(TunableRunner):
 
     def valid_tactics(self, inputs):
         _, _, b_q, _, _, _, _ = inputs
-        n, k = int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
+        n, k = (
+            int(b_q.shape[1]) // (1 if self.activation is ActivationType.Relu2 else 2),
+            int(b_q.shape[2]) * 2,
+        )
         return [
             tactic
             for tactic in TACTICS
@@ -399,14 +448,17 @@ class _Fc1ActRunner(TunableRunner):
         a_q, _, b_q, _, _, _, _ = inputs
         return torch.zeros(
             int(a_q.shape[0]),
-            int(b_q.shape[1]) // 2,
+            int(b_q.shape[1]) // (1 if self.activation is ActivationType.Relu2 else 2),
             dtype=self.out_dtype,
             device=a_q.device,
         )
 
     def launch(self, inputs, out, tactic):
         a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale = inputs
-        n, k = int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
+        n, k = (
+            int(b_q.shape[1]) // (1 if self.activation is ActivationType.Relu2 else 2),
+            int(b_q.shape[2]) * 2,
+        )
         props = torch.cuda.get_device_properties(a_q.device)
         grid_x = props.multi_processor_count
         epi = None
