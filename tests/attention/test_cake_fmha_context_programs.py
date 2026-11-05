@@ -3190,6 +3190,37 @@ def test_cake_context_form_program_takes_the_callers_lse_and_sinks(
             )
 
 
+@pytest.mark.parametrize("form", ("LSE", "NC_LSE"))
+def test_cake_context_form_program_takes_a_one_token_lse_of_any_token_stride(
+    monkeypatch, form
+) -> None:
+    """A contiguous ``[tokens, heads]`` LSE of one token may carry any stride
+    along its tokens, which moves no element: the program takes it, as the
+    JIT module does."""
+
+    is_causal = _FP8_FORMS[form][0]
+    module = _stand_in_module("context_fp8", f"RUNTIME_PACK8_{form}", form=form)
+    lse = torch.empty_strided((1, 32), (7, 1))
+    assert lse.is_contiguous()
+    query = torch.zeros((1, 32, 128), dtype=torch.float8_e4m3fn)
+    values = _launch_values(
+        monkeypatch,
+        torch.arange(4, dtype=torch.int32).view(1, 4),
+        shared=True,
+        batch=1,
+        module=module,
+        query=query,
+        out=torch.empty_like(query),
+        cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32),
+        max_q_len=1,
+        is_causal=is_causal,
+        lse=lse,
+        lse_stride_tokens=lse.stride(0),
+        lse_stride_heads=lse.stride(1),
+    )
+    assert values["LSE_ptr"].data_ptr() == lse.data_ptr()
+
+
 def test_cake_context_program_passes_a_contiguous_shared_table_itself(
     monkeypatch,
 ) -> None:

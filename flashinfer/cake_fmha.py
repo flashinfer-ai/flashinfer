@@ -8406,7 +8406,13 @@ class CakeFmhaContextProgramModule:
         # one sink per query head.
         lse_out = sinks_in = unread_f32
         if lse is not None:
-            if (lse_stride_tokens, lse_stride_heads) != (query.shape[1], 1):
+            # the caller's strides must give every token and head that offset;
+            # a stride along a dimension of size 1 (one token, or one head)
+            # moves no element, as in the JIT module
+            tokens, heads = query.shape[0], query.shape[1]
+            if (tokens > 1 and lse_stride_tokens != heads) or (
+                heads > 1 and lse_stride_heads != 1
+            ):
                 raise RuntimeError(
                     "a Cake FMHA context program writes a contiguous "
                     "[tokens, heads] LSE"
