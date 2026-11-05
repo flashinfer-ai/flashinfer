@@ -615,10 +615,13 @@ def test_target_hardware_gate(tmp_path, monkeypatch):
     import flashinfer.trace_apply.apply as apply_mod
 
     sealed = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
-    monkeypatch.setattr(apply_mod, "current_sm", lambda device=None: "120")
-    with pytest.raises(pk.SealedPackageError, match="not this GPU"):
+    # current_sm answers the prefixed form ("sm120"); the fixture targets sm100.
+    monkeypatch.setattr(apply_mod, "current_sm", lambda device=None: "sm120")
+    with pytest.raises(pk.SealedPackageError, match=r"not this GPU \(sm120\)"):
         pk.load_packages(tmp_path, [sealed.digest], enable=False)
-    monkeypatch.setattr(apply_mod, "current_sm", lambda device=None: "100")
+    pk.check_target_hardware({"spec": {"target_hardware": []}})  # every GPU
+    pk.check_target_hardware({"spec": {"target_hardware": ["sm100", "sm120a"]}})
+    monkeypatch.setattr(apply_mod, "current_sm", lambda device=None: "sm100")
     pk.load_packages(tmp_path, [sealed.digest], enable=False)  # fixture targets sm100
     monkeypatch.setattr(apply_mod, "current_sm", lambda device=None: None)
     pk.load_packages(tmp_path, [sealed.digest], enable=False)  # no GPU: skip

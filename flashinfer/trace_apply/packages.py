@@ -922,20 +922,22 @@ def check_target_hardware(solution: Mapping[str, Any], *, device: Any = None) ->
 
     ``apply.current_sm`` answers None on a machine with no visible GPU (a
     build host, a CPU-only container): the check is skipped then, so callers
-    that must not skip pass an explicit device.
+    that must not skip pass an explicit device. An empty list targets every
+    GPU; an entry the ``sm<number>`` grammar cannot read excludes nothing.
     """
     from .apply import current_sm
 
     sm = current_sm(device)
     if sm is None:
         return
+    current = _sm_number(sm) or sm
     hardware = (solution.get("spec") or {}).get("target_hardware") or []
-    if all(
-        (number := _sm_number(str(item))) is not None and number != sm
+    if hardware and all(
+        (number := _sm_number(str(item))) is not None and number != current
         for item in hardware
     ):
         raise SealedPackageError(
-            f"sealed solution targets {list(hardware)}, not this GPU (sm{sm})"
+            f"sealed solution targets {list(hardware)}, not this GPU ({sm})"
         )
 
 
