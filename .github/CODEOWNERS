@@ -15,6 +15,8 @@
 # ── Catch-all: full approvers and the bot cover everything not matched below ──
 * @flashinfer-bot @yzh119 @yyihuang @bkryu @aleozlx @YangXu1990uiuc @Anerudhan @Jingfan-Sun
 
+.github/CODEOWNERS @yzh119 @bkryu @aleozlx @kahyunnam @YangXu1990uiuc @Anerudhan @Jingfan-Sun
+
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
