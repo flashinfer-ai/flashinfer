@@ -1304,8 +1304,8 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
         assert route.program == ("decode_smallm", SHAPE_ROWS[row][-1][target]), row
 
 
-def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
-    """Driver queries over ``state``: the current stream's handle, its ID, its
+def _fake_context_queries(monkeypatch, state, calls):
+    """Driver queries over ``state``: the current stream's handle, its
     context's handle, ID and SM count (``contexts`` overrides the ID and SM
     count per context handle, ``current`` is the thread's current context,
     ``stream_err`` fails the stream's context query); ``calls`` logs each
@@ -1315,9 +1315,6 @@ def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
         return state.get("contexts", {}).get(
             context, (state["context_id"], state["sms"])
         )
-
-    def stream_id(stream):
-        return 0, state["stream_id"]
 
     def stream_context(stream):
         assert stream == state["stream"]
@@ -1334,20 +1331,16 @@ def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
     monkeypatch.setattr(
         torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
     )
-    monkeypatch.setattr(cake_api, "_STREAM_SM_COUNTS", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_SM_COUNTS", {})
-    monkeypatch.setattr(cake_api, "_CU_STREAMS", {})
     monkeypatch.setattr(
         cake_api,
         "_CONTEXT_QUERIES",
         (
-            stream_id if stream_ids else None,
             stream_context,
             lambda: (0, state.get("current", state["handle"])),
             context_id,
             context_resource,
             "sm",
-            lambda stream: stream,
         ),
     )
 
@@ -1355,14 +1348,14 @@ def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
 def test_cake_fmha_smallm_partition_sm_count_follows_a_reused_stream_handle(
     monkeypatch,
 ) -> None:
-    """Without stream IDs, a stream handle (and a context handle) reused by a
-    new green context of another size reads the new context's SM count: the
-    count is cached per context ID, which the driver never reuses."""
+    """A stream handle (and a context handle) reused by a new green context of
+    another size reads the new context's SM count: the count is cached per
+    context ID, which the driver never reuses."""
 
-    state = {"stream": 7, "stream_id": None, "handle": 0x10, "context_id": 1}
+    state = {"stream": 7, "handle": 0x10, "context_id": 1}
     state["sms"] = 64
     calls = []
-    _fake_context_queries(monkeypatch, state, calls, stream_ids=False)
+    _fake_context_queries(monkeypatch, state, calls)
     assert cake_api._stream_context_sm_count(0) == 64
     assert cake_api._stream_context_sm_count(0) == 64
     assert calls == [1]
@@ -1373,48 +1366,42 @@ def test_cake_fmha_smallm_partition_sm_count_follows_a_reused_stream_handle(
     assert calls == [1, 2]
 
 
-def test_cake_fmha_smallm_partition_sm_count_is_cached_per_stream_id(
+def test_cake_fmha_smallm_partition_sm_count_is_cached_per_context_id(
     monkeypatch,
 ) -> None:
-    """The SM count is cached per stream ID: a launch on a known stream reads
-    no context, and a reused stream handle with a new ID (a new green context)
-    reads its own context.  The per-thread default stream, whose context is the
-    thread's, is resolved to its context on every launch."""
+    """The SM count is cached per context ID: a launch on a stream of a known
+    context reads no SM resource, a stream of a new context reads its own, and
+    the per-thread default stream is resolved to the thread's context."""
 
-    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state = {"stream": 7, "handle": 0x10, "context_id": 1}
     state["sms"] = 64
     calls = []
-    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    _fake_context_queries(monkeypatch, state, calls)
     assert cake_api._stream_context_sm_count(0) == 64
-    state["context_id"] = 99  # a hit reads no context
     assert cake_api._stream_context_sm_count(0) == 64
     assert calls == [1]
-    state.update(stream_id=12, context_id=2, sms=32)
+    state.update(stream=8, handle=0x30, context_id=2, sms=32)
     assert cake_api._stream_context_sm_count(0) == 32
     assert calls == [1, 2]
-    state.update(stream=2, stream_id=None, context_id=3, sms=48)
-    assert cake_api._stream_context_sm_count(0) == 48
-    assert cake_api._stream_context_sm_count(0) == 48
-    assert calls == [1, 2, 3]
+    state.update(stream=2, handle=0x10, context_id=1, sms=64)
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1, 2]
 
 
-def test_cake_fmha_smallm_partition_sm_count_of_a_failed_stream_query_is_not_cached(
+def test_cake_fmha_smallm_partition_sm_count_of_a_failed_stream_query_is_the_current_contexts(
     monkeypatch,
 ) -> None:
     """When the stream's context query fails (say, after a recoverable launch
-    error) the launch is planned on the current context's SM count, which is
-    not cached under the stream's ID; once the query answers, the stream's own
-    context is read and cached."""
+    error) the launch is planned on the current context's SM count; once the
+    query answers, the stream's own context is read."""
 
-    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state = {"stream": 7, "handle": 0x10, "context_id": 1}
     state.update(sms=32, current=0x20, contexts={0x20: (5, 148)}, stream_err=1)
     calls = []
-    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    _fake_context_queries(monkeypatch, state, calls)
     assert cake_api._stream_context_sm_count(0) == 148
-    assert cake_api._STREAM_SM_COUNTS == {}
     state["stream_err"] = 0
     assert cake_api._stream_context_sm_count(0) == 32
-    assert cake_api._STREAM_SM_COUNTS == {11: 32}
     assert cake_api._stream_context_sm_count(0) == 32
     assert calls == [5, 1]
 
@@ -1895,6 +1882,16 @@ def _smallm_partition_child(sms, rows, api, green=None):
             launch_sms = cake_api._smallm_launch_sm_count(torch.device("cuda"))
             got = _run_decode(case)
             stream.synchronize()
+            eager_served = [(r.program, r.num_split) for r in served]
+            # The same launch captured into a CUDA graph on the partition's
+            # stream: planning it must not invalidate the capture.
+            served.clear()
+            out = torch.empty_like(case.out)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                _run_decode(case, out=out)
+            graph.replay()
+            stream.synchronize()
         faulthandler.dump_traceback_later(1500, exit=True)
         reference = _bf16_reference(case, [0])[0]
         print(
@@ -1903,7 +1900,9 @@ def _smallm_partition_child(sms, rows, api, green=None):
                     "row": row,
                     "partition": partition,
                     "launch_sms": launch_sms,
-                    "served": [(r.program, r.num_split) for r in served],
+                    "served": eager_served,
+                    "graph_served": [(r.program, r.num_split) for r in served],
+                    "replayed": torch.equal(_bits(out), _bits(got)),
                     "tiles": SHAPE_ROWS[row][2] * SHAPE_ROWS[row][6],
                     "max_abs": (got.float() - reference).abs().max().item(),
                     "close": torch.allclose(
@@ -1934,7 +1933,9 @@ def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     with no partition setting) the small-M rows plan at most 32 splits per tile
     and complete (the full device's 65- and 152-way programs
     would wait forever for CTAs the partition cannot hold, and its nine-CTA
-    cluster would not launch), matching the FP32 reference."""
+    cluster would not launch), matching the FP32 reference; the same launch
+    captured into a CUDA graph on the partition's stream plans the same split
+    and replays bitwise."""
 
     _require_full_device()
     result = subprocess.run(
@@ -1972,6 +1973,8 @@ def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
         assert program != ["decode_smallm", "N64_P64_Q8_C9"], record
         assert num_split >= 1 and record["tiles"] * num_split <= partition, record
         assert record["close"], record
+        assert record["graph_served"] == record["served"], record
+        assert record["replayed"], record
 
 
 # --- BF16 boundaries (host-only) ---------------------------------------------
