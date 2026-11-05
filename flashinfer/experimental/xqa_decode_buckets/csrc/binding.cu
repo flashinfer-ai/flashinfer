@@ -58,7 +58,10 @@ void bucket_plan(TensorView lengths, TensorView tasks, TensorView requests, Tens
 #else
   auto p = plan_params(lengths, tasks, requests, spans, header, ctas, aligned);
   ffi::CUDADeviceGuard device_guard(lengths.device().device_id);
-  buckets::assign<<<1, 128, 0, get_stream(lengths.device())> > >(p);
+  const auto stream = get_stream(lengths.device());
+  // clang-format off: CUDA launch delimiters must remain adjacent.
+  buckets::assign<<<1, 128, 0, stream>>>(p);
+  // clang-format on
   checkCuda(cudaPeekAtLastError());
 #endif
 }
