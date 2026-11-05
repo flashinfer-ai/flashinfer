@@ -344,7 +344,7 @@ class QkvNormRopeExchangeOverlap:
     ``words_capacity_small_m=0`` on SM107 restore the previous plans).
     On SM100 and SM103 the per-destination launch gate reads its threshold by hidden size
     (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``; ``per_dest_k_table=0`` in the same variable restores the one-band
-    threshold, an explicit ``per_dest_large_m`` replaces the table).  SM103 groups of 8 ranks run a call whose
+    threshold, an explicit ``per_dest_large_m`` replaces the table).  SM103 and SM100 groups of 8 ranks run a call whose
     destination band is not a multiple of 256 columns while every Q / K / V group is (e.g. hidden 3072) with the
     256-column pair tile across band edges from 4096 rows per rank on, as one persistent launch
     (``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; ``xband_min_m=N`` in the same variable sets the

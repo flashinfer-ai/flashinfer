@@ -104,15 +104,15 @@ On SM100 and SM103 the per-destination launch gate reads its threshold by the
 call's hidden size (``plans.SHAPE_GATE_K_TABLE``, resolved once per session by
 :func:`resolve_shape_gate_k_table`; ``per_dest_k_table=0`` in
 ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` restores the one-band threshold, an
-explicit ``per_dest_large_m`` replaces the table).  SM103 groups of 8 ranks ship
-the cross-destination-band gate (``plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``,
+explicit ``per_dest_large_m`` replaces the table).  SM103 and SM100 groups of 8
+ranks ship the cross-destination-band gate (``plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``,
 :func:`resolve_xband_min_m`; ``xband_min_m=0`` switches it off): a call whose
 destination band is not a multiple of 256 columns while every Q / K / V group is
 (e.g. hidden 3072 over 8 ranks) runs the 256-column pair tile across band edges
 from ``4096`` rows on, as one persistent launch of the cross-destination-band
-build of the session's producer build (``loader.xband_variant``; its tiles carry
-both heads' destinations).  The default yields where that build is not
-delivered.  Neither changes the stored bits.
+build of the session's producer build (``loader.xband_variant``: its staged
+twin for a bulk build; its tiles carry both heads' destinations).  The default
+yields where that build is not delivered.  Neither changes the stored bits.
 
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words

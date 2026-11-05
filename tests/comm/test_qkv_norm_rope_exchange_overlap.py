@@ -899,7 +899,7 @@ def test_shape_gates_resolution(monkeypatch):
 
 def test_shape_gate_k_table_and_xband_defaults():
     """The per-destination launch threshold by hidden size (``SHAPE_GATE_K_TABLE``; SM100 / SM103) and the
-    cross-destination-band gate (``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; SM103 with 8 ranks): the tables, their
+    cross-destination-band gate (``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; SM103 and SM100 with 8 ranks): the tables, their
     lookups and the verdicts ``gate_rows`` / ``plan_row`` derive from them."""
 
     assert plans.SHAPE_GATE_K_TABLE == {
@@ -910,7 +910,10 @@ def test_shape_gate_k_table_and_xband_defaults():
         ("sm_103a", 4): ((0, 32768), (6144, 16384)),
         ("sm_103a", 2): ((0, 32768), (4096, 16384)),
     }
-    assert plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD == {("sm_103a", 8): 4096}
+    assert plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD == {
+        ("sm_103a", 8): 4096,
+        ("sm_100a", 8): 4096,
+    }
     assert plans.XBAND_BN == plans.PAIR_BN == 256
     xb_fields = plans.TILE_FIELDS_XB
     assert xb_fields == (*plans.TILE_FIELDS, "dest1", "base_elem1")
@@ -1211,13 +1214,24 @@ def test_producer_key_grammar():
     """Producer route keys: ``producer_bn<bn>[_pair][_<variant>][_fold<phase>]``; ``parse_producer_key`` is the
     inverse and refuses every other spelling."""
 
-    assert loader.PRODUCER_VARIANTS == ("", "ow256", "bulk_ow256", "bulk")
+    assert loader.PRODUCER_VARIANTS == (
+        "",
+        "ow256",
+        "bulk_ow256",
+        "bulk",
+        "fma",
+        "ow256_fma",
+        "bulk_ow256_fma",
+    )
     assert loader.SHIPPED_VARIANT == ""
     assert loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH == {
         "": 128,
         "ow256": 256,
         "bulk_ow256": 256,
         "bulk": 128,
+        "fma": 128,
+        "ow256_fma": 256,
+        "bulk_ow256_fma": 256,
     }
     assert loader.producer_key(256, True) == "producer_bn256_pair"
     assert loader.producer_key(128, False) == "producer_bn128"
@@ -1239,6 +1253,13 @@ def test_producer_key_grammar():
     assert (
         loader.fold_producer_key(256, True, 1, "bulk")
         == "producer_bn256_pair_bulk_fold1"
+    )
+    assert (
+        loader.producer_key(128, True, "bulk_ow256_fma")
+        == "producer_bn128_pair_bulk_ow256_fma"
+    )
+    assert (
+        loader.fold_producer_key(256, True, 0, "fma") == "producer_bn256_pair_fma_fold0"
     )
     parse = loader.parse_producer_key
     for block_n in plans.BLOCK_N_CHOICES:
@@ -1270,15 +1291,32 @@ def test_producer_key_grammar():
         loader.fold_producer_key(128, False, 2)
     with pytest.raises(ValueError, match="producer build variant"):
         loader.producer_key(128, False, "wide")
-    # Cross-destination-band builds: ``<variant>_xb`` of the 256-column pair tile only.
+    # Cross-destination-band builds: ``<variant>_xb`` of the 256-column pair tile only, on the staged row stores (a
+    # bulk build maps to the cross-destination-band build of its staged twin).
     assert loader.XBAND_SUFFIX == "xb" and loader.XBAND_BLOCK_N == plans.XBAND_BN
     assert (
         loader.xband_variant() == "xb" and loader.xband_variant("ow256") == "ow256_xb"
     )
+    assert (
+        loader.xband_variant("bulk_ow256") == "ow256_xb"
+        and loader.xband_variant("bulk") == "xb"
+    )
+    # The fused multiply-add builds keep their trailing ``fma`` token after ``xb``.
+    assert (
+        loader.xband_variant("fma") == "xb_fma"
+        and loader.xband_variant("ow256_fma") == "ow256_xb_fma"
+    )
+    assert loader.xband_variant("bulk_ow256_fma") == "ow256_xb_fma"
     for variant in loader.PRODUCER_VARIANTS:
         xb = loader.xband_variant(variant)
+        staged = loader.XBAND_STAGED_VARIANT[variant]
+        assert (
+            "bulk" not in staged
+            and loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[staged]
+            == (loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[variant])
+        )
         assert loader.is_xband_variant(xb) and not loader.is_xband_variant(variant)
-        assert loader.base_variant(xb) == variant == loader.base_variant(variant)
+        assert loader.base_variant(xb) == staged == loader.base_variant(staged)
         plain = loader.producer_key(256, True, xb)
         assert plain == f"producer_bn256_pair_{xb}"
         assert parse(plain) == (256, True, xb, None)
@@ -1310,8 +1348,9 @@ def test_producer_variant_default_table():
     table = loader.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD
     assert table == {
         "sm_90a": {2: "", 4: "", 8: ""},
-        "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
-        "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
+        # SM100 / SM103: the fused multiply-add epilogue builds
+        "sm_100a": {2: "fma", 4: "ow256_fma", 8: "bulk_ow256_fma"},
+        "sm_103a": {2: "fma", 4: "ow256_fma", 8: "ow256_fma"},
         # SM107: groups of 4 ranks run the bulk-row-store build (measured there); 2 ranks the baseline build
         "sm_107a": {2: "", 4: "bulk", 8: ""},
     }
@@ -1421,7 +1460,7 @@ def test_producer_variant_resolution(monkeypatch):
                             resolve(arch, world_size, block_n)
                 monkeypatch.setenv(env, "shipped")
                 assert resolve(arch, world_size, block_n) == ("", "env")
-                for name in ("ow256", "bulk_ow256", "bulk"):
+                for name in loader.PRODUCER_VARIANTS[1:]:
                     monkeypatch.setenv(env, name)
                     if name in delivered:
                         assert resolve(arch, world_size, block_n) == (name, "env")
@@ -2462,8 +2501,14 @@ def _run_worker(rank, world_size, port):
                 from_opt_out = opt_out_session(x, w_qkv, q_scale, k_scale, cos_sin)
                 torch.cuda.synchronize(device)
                 _check_outputs(default_session, from_default, expected)
-                for one, other in zip(from_default, from_opt_out, strict=True):
-                    assert torch.equal(one, other)
+                if default_variant.endswith("fma"):
+                    # The fused multiply-add build rounds the norm and RoPE
+                    # multiply-adds once, so its bits can differ from the
+                    # baseline build's: both are checked against the reference.
+                    _check_outputs(opt_out_session, from_opt_out, expected)
+                else:
+                    for one, other in zip(from_default, from_opt_out, strict=True):
+                        assert torch.equal(one, other)
             if loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[default_variant] == 256:
                 # A contiguous ``cos_sin`` view that starts 16 bytes into its allocation: the wide-load build
                 # refuses it on every rank before any collective, naming the opt-out.
