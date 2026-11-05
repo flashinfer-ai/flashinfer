@@ -1558,6 +1558,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
         _check_kv_layout(kv_layout)
 
+        self._batch_invariant = None
+        if batch_invariant:
+            from .attention.batch_invariant.wrappers import BatchInvariantAttention
+
+            self._batch_invariant = BatchInvariantAttention(
+                float_workspace_buffer,
+                kv_layout,
+                "decode",
+                backend,
+                jit_args,
+                use_cuda_graph=use_cuda_graph,
+            )
+
         if backend in ("cute-dsl", "cudnn") and jit_args is not None:
             raise NotImplementedError(
                 f"{backend} backend does not support jit_args customization"
@@ -1657,19 +1670,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._requested_backend = backend
         self._cudnn_auto = False
         self._cudnn_auto_frozen: Optional[bool] = None
-
-        self._batch_invariant = None
-        if batch_invariant:
-            from .attention.batch_invariant.wrappers import BatchInvariantAttention
-
-            self._batch_invariant = BatchInvariantAttention(
-                float_workspace_buffer,
-                kv_layout,
-                "decode",
-                backend,
-                jit_args,
-                use_cuda_graph=use_cuda_graph,
-            )
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -2405,6 +2405,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_kv_data_type = kv_data_type
             self._window_left = window_left
             self._q_len_per_req = q_len_per_req
+            self._sm_scale = sm_scale
+            self._pos_encoding_mode = pos_encoding_mode
+            self._logits_soft_cap = logits_soft_cap
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
             return
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
@@ -3390,6 +3395,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 enable_pdl=enable_pdl,
+                sm_scale=self._sm_scale,
+                pos_encoding_mode=self._pos_encoding_mode,
+                logits_soft_cap=self._logits_soft_cap,
+                rope_scale=self._rope_scale,
+                rope_theta=self._rope_theta,
             )
 
         if getattr(self, "_use_token_head_sf", False):

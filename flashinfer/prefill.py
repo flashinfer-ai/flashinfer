@@ -3875,6 +3875,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._causal = causal
             self._window_left = window_left
             self._sm_scale = sm_scale
+            self._pos_encoding_mode = pos_encoding_mode
+            self._logits_soft_cap = logits_soft_cap
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
             self._cached_q_data_type = q_data_type
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
@@ -4918,6 +4922,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl=enable_pdl,
                 use_fp16_softmax=use_fp16_softmax,
                 uses_spcompress=uses_spcompress,
+                sm_scale=self._sm_scale,
+                pos_encoding_mode=self._pos_encoding_mode,
+                logits_soft_cap=self._logits_soft_cap,
+                rope_scale=self._rope_scale,
+                rope_theta=self._rope_theta,
             )
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -5736,6 +5745,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Defaults to ``False``.
         """
         _check_kv_layout(kv_layout)
+
+        self._batch_invariant = None
+        if batch_invariant:
+            from .attention.batch_invariant.wrappers import BatchInvariantAttention
+
+            self._batch_invariant = BatchInvariantAttention(
+                float_workspace_buffer,
+                kv_layout,
+                "ragged",
+                backend,
+                jit_args,
+                use_cuda_graph=use_cuda_graph,
+            )
         if variant_owns_mask and backend != "fa2":
             raise ValueError(
                 "variant_owns_mask is only supported on the fa2 backend: the "
@@ -5770,19 +5792,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "under MaskMode.CUSTOM."
             )
         self._variant_owns_mask = variant_owns_mask
-
-        self._batch_invariant = None
-        if batch_invariant:
-            from .attention.batch_invariant.wrappers import BatchInvariantAttention
-
-            self._batch_invariant = BatchInvariantAttention(
-                float_workspace_buffer,
-                kv_layout,
-                "ragged",
-                backend,
-                jit_args,
-                use_cuda_graph=use_cuda_graph,
-            )
 
         self._cute_dsl_wrapper = None
         self._prims_backend = None
@@ -6183,6 +6192,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._causal = causal
             self._window_left = window_left
             self._sm_scale = sm_scale
+            self._pos_encoding_mode = pos_encoding_mode
+            self._logits_soft_cap = logits_soft_cap
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
             self._cached_q_data_type = q_data_type
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
@@ -7211,6 +7224,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=None,
                 enable_pdl=enable_pdl,
+                sm_scale=self._sm_scale,
+                pos_encoding_mode=self._pos_encoding_mode,
+                logits_soft_cap=self._logits_soft_cap,
+                rope_scale=self._rope_scale,
+                rope_theta=self._rope_theta,
             )
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type

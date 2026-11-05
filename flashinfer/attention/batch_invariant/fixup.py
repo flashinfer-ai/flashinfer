@@ -451,13 +451,15 @@ class SplitKVFixup:
         window_left: Int32,
         Hq: Int32,
         num_groups: Int32,
+        grid_y: Int32,
         max_rows: Int32,
         stream,
     ):
-        # grid: (row blocks of a group, groups); a block handles 128 / (D / V) rows, V = wide_vec(D) output columns per thread
+        # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows, V = wide_vec(D) output columns
+        # per thread, and strides over the groups beyond grid.y
         rows_per_block = THREADS // (self.D // wide_vec(self.D))
-        self.kernel(mWs, mO, mGroups, c, nc, window_left, Hq).launch(
-            grid=[cute.ceil_div(max_rows, rows_per_block), num_groups, 1],
+        self.kernel(mWs, mO, mGroups, c, nc, window_left, Hq, num_groups).launch(
+            grid=[cute.ceil_div(max_rows, rows_per_block), grid_y, 1],
             block=[THREADS, 1, 1],
             stream=stream,
             use_pdl=self.pdl,
@@ -473,12 +475,14 @@ class SplitKVFixup:
         nc: Float32,
         window_left: Int32,
         Hq: Int32,
+        num_groups: Int32,
     ):
         D, g, C = self.D, self.g, self.C
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()  # every partial row of the attention grid is complete and visible before any read
         tidx, _, _ = cute.arch.thread_idx()
-        bx, grp, _ = cute.arch.block_idx()
+        bx, grp0, _ = cute.arch.block_idx()
+        _, grid_y, _ = cute.arch.grid_dim()
         V = wide_vec(D)
         thr_per_row = D // V
         rows_per_block = THREADS // thr_per_row
@@ -494,52 +498,59 @@ class SplitKVFixup:
         sA1 = sbuf[0, ri, None]
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
-        rows = mGroups[(grp, G_ROWS)]
-        # every thread of the block reaches the fold's barriers: a row past the group's rows folds a clamped (valid) row and stores nothing
-        live = r < rows
-        rr = r
-        if rr > rows - 1:
-            rr = rows - 1
-        q_tok0 = mGroups[(grp, G_QTOK0)]
-        kv_len = mGroups[(grp, G_KVLEN)]
-        q_len = mGroups[(grp, G_QLEN)]
-        token = q_tok0 + rr // g
-        pos = kv_len - q_len + token
-        o = cute.make_rmem_tensor(cute.make_layout((V,)), Float32)
-        l = fold_row_coop(
-            mWs,
-            sA1,
-            sA2,
-            sL,
-            mGroups[(grp, G_SLOT)],
-            rows,
-            mGroups[(grp, G_CHUNK_LO)],
-            mGroups[(grp, G_NCHUNKS)],
-            pos,
-            c,
-            nc,
-            window_left,
-            rr,
-            d0,
-            o,
-            is_scan_warp,
-            lane,
-            D,
-            C,
-            self.WS,
-            V,
-        )
-        if live:
-            inv = CuteF32.div(Float32(1.0), l)
-            out_row = (
-                (mGroups[(grp, G_QBASE)] + token) * Hq
-                + mGroups[(grp, G_KVHEAD)] * g
-                + rr % g
+        for grp in cutlass.range(grp0, num_groups, grid_y):
+            rows = mGroups[(grp, G_ROWS)]
+            # every thread of the block reaches the fold's barriers: a row past the group's rows folds a clamped (valid) row and stores nothing
+            live = r < rows
+            rr = r
+            if rr > rows - 1:
+                rr = rows - 1
+            q_tok0 = mGroups[(grp, G_QTOK0)]
+            kv_len = mGroups[(grp, G_KVLEN)]
+            q_len = mGroups[(grp, G_QLEN)]
+            token = q_tok0 + rr // g
+            pos = kv_len - q_len + token
+            o = cute.make_rmem_tensor(cute.make_layout((V,)), Float32)
+            l = fold_row_coop(
+                mWs,
+                sA1,
+                sA2,
+                sL,
+                mGroups[(grp, G_SLOT)],
+                rows,
+                mGroups[(grp, G_CHUNK_LO)],
+                mGroups[(grp, G_NCHUNKS)],
+                pos,
+                c,
+                nc,
+                window_left,
+                rr,
+                d0,
+                o,
+                is_scan_warp,
+                lane,
+                D,
+                C,
+                self.WS,
+                V,
             )
-            for e in cutlass.range_constexpr(V):
-                mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
-                    CuteF32.mul(o[e], inv), Float32(0.0)
-                ).to(mO.element_type)
+            if live:
+                inv = CuteF32.div(Float32(1.0), l)
+                out_row = (
+                    (mGroups[(grp, G_QBASE)] + token) * Hq
+                    + mGroups[(grp, G_KVHEAD)] * g
+                    + rr % g
+                )
+                for e in cutlass.range_constexpr(V):
+                    mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
+                        CuteF32.mul(o[e], inv), Float32(0.0)
+                    ).to(mO.element_type)
+            cute.arch.sync_threads()  # the block's smem rows are reused by the next group
+
+
+MAX_GRID_Y = (
+    65535  # the hardware's grid.y limit; the fixup strides over the groups beyond it
+)
 
 
 @functools.cache
@@ -569,6 +580,7 @@ def get_fixup(D: int, g: int):
             Float32(1.0),
             Float32(-1.0),
             Int32(-1),
+            Int32(1),
             Int32(1),
             Int32(1),
             Int32(1),

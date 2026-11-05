@@ -323,7 +323,7 @@ def plan_attention(
         if sm_count is not None
         else (
             torch.cuda.get_device_properties(device).multi_processor_count
-            if device.type == "cuda"
+            if torch.device(device).type == "cuda"
             else 204
         )
     )
@@ -463,7 +463,7 @@ def run_attention(
     ragged: bool = False,
 ) -> torch.Tensor:
     from .blocks.compile import get_compiled_attention
-    from .fixup import get_fixup
+    from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
 
     total_q, Hq, D = q.shape
@@ -604,6 +604,7 @@ def run_attention(
             int(window_left),
             int(Hq),
             int(len(fx)),
+            int(min(len(fx), MAX_GRID_Y)),
             int(max_rows),
         )
     return out

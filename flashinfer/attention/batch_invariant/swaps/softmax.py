@@ -5,9 +5,9 @@ key ``t`` of every tile and the ``n_pad`` scores ``S^T[t, n]`` of the unit's row
 
 * copies its ``n_pad`` scores out of TMEM (one ``Ld32x32b x n_pad``), masks them by absolute key per row (``select``; only on boundary
   tiles of live rows),
-* reduces the tile's row maximum over the 128 keys: the engine's ``rowmax`` plan under ``key: [(32, lane)]`` (five xor shuffles: the
-  canonical pairwise tree over the warp's 32 adjacent keys) in every warp, then the four warp partials through smem in warp order --
-  the top two levels of the same 128-leaf tree;
+* reduces the tile's row maximum over the 128 keys: a warp-wide ``redux.sync`` ``fmax`` over the warp's 32 adjacent keys (the same bits as the
+  engine's ``rowmax`` plan's pairwise shuffle tree: ``max`` is exact under the declared total order) in every warp, then the four
+  warp partials through smem in warp order -- the top two levels of the 128-leaf tree;
 * forms ``m' = fmax(m, m_t)`` and ``alpha`` per row exactly as ``spec.alpha_term`` (every thread redundantly: the 128 threads hold identical
   ``m`` chains), hands ``alpha`` to the correction warpgroup at once (its ``O^T`` rescale overlaps the exponentials),
 * forms the probabilities ``p_n = EX2(fma(s_n, c, mul(m', nc)))`` of its key for every row (``fma2`` pairs of rows), reduces them over the
@@ -66,13 +66,6 @@ def _pairwise(vals, combine):
     while len(vals) > 1:
         vals = [combine(vals[i], vals[i + 1]) for i in range(0, len(vals), 2)]
     return vals[0]
-
-
-@cute.jit
-def warp_reduce(plan, value: Float32, peers) -> Float32:
-    """One row's reduction over this warp's 32 keys: the engine plan's five lane steps from this thread's value."""
-    state, start = canon.init_state(plan, CuteF32, _OneLoader(value))
-    return canon.run(plan, state, start, peers, CuteF32)
 
 
 def lane_masks(plan) -> list:

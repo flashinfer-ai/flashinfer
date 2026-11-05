@@ -117,6 +117,8 @@ class BatchInvariantAttention:
         "max_item_len_ptr": "the causal mask with an optional sliding window (no multi-item scoring)",
         "v_indptr": "the offsets of kv_indptr for V",
         "o_indptr": "the offsets of qo_indptr for the output",
+        "rope_scale": "no fused RoPE (apply RoPE to q / k beforehand)",
+        "rope_theta": "no fused RoPE (apply RoPE to q / k beforehand)",
     }
 
     def refuse(self, **args) -> None:
@@ -324,6 +326,12 @@ class BatchInvariantAttention:
                 )
         kv_indptr_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
         qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        if bool((kv_indptr_host < 0).any()):
+            raise unsupported(
+                CLASS,
+                f"a negative kv_indptr entry ({int(kv_indptr_host.min())})",
+                "non-negative KV offsets",
+            )
         if qo_host.numel() != kv_indptr_host.numel():
             raise unsupported(
                 CLASS,
@@ -452,14 +460,18 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here);
-        # the plan is published only once everything it runs with exists
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from a
+        # snapshot: a later in-place change by the caller cannot reach a plan built from the old values; the plan is published only once
+        # everything it runs with exists
         kv_indptr_dev = kv_indptr.to(
-            device=self.device, dtype=torch.int32, non_blocking=non_blocking
+            device=self.device, dtype=torch.int32, non_blocking=non_blocking, copy=True
         ).contiguous()
         kv_indices_dev = (
             kv_indices.to(
-                device=self.device, dtype=torch.int32, non_blocking=non_blocking
+                device=self.device,
+                dtype=torch.int32,
+                non_blocking=non_blocking,
+                copy=True,
             ).contiguous()
             if kv_indices is not None
             else torch.zeros(1, dtype=torch.int32, device=self.device)
@@ -494,9 +506,33 @@ class BatchInvariantAttention:
         enable_pdl: Optional[bool] = None,
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
+        sm_scale: Optional[float] = None,
+        pos_encoding_mode=None,
+        logits_soft_cap: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
+        """The wrappers' ``run`` arguments; ``sm_scale`` .. ``rope_theta`` are the per-call options the deprecated ``forward()`` sets on the
+        wrapper: they must agree with the plan (``sm_scale``) or be the class's defaults."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        if sm_scale is not None and float(sm_scale) != self._sm_scale:
+            raise unsupported(
+                CLASS,
+                f"sm_scale {sm_scale} at run() after planning {self._sm_scale}",
+                "the planned sm_scale",
+            )
+        if logits_soft_cap is not None and logits_soft_cap > 0:
+            raise unsupported(
+                CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
+            )
+        if pos_encoding_mode not in ("NONE", 0, None):
+            raise unsupported(
+                CLASS,
+                f"pos_encoding_mode {pos_encoding_mode!r}",
+                'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
+            )
+        self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,

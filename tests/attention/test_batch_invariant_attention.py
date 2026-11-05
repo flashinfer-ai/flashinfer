@@ -953,6 +953,32 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             1.0 / math.sqrt(128),
         )
     assert dec.resolved_backend == "batch_invariant"
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # the deprecated forward()'s sm_scale cannot differ from the plan's
+        w._batch_invariant.run(
+            pr.q,
+            k,
+            v,
+            out=None,
+            return_lse=False,
+            lse=None,
+            window_left=None,
+            sm_scale=0.5,
+        )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # a negative kv_indptr entry
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr - 1,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            **kw,
+        )
     # page-table metadata on the CPU is staged to the device (as the other wrappers accept)
     ref = bits(run_paged_prefill(pr))
     w.plan(
@@ -1102,3 +1128,43 @@ def test_output_beyond_2_31_elements():
         assert planned.plan.ws_rows > 0, merge
         assert torch.equal(bits(big_out[-ql:]), bits(alone_out)), merge
         del outs, big_out, alone_out
+
+
+@needs_device
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and torch.cuda.get_device_properties(0).total_memory < (60 << 30),
+    reason="needs tens of GB of device memory (the large problems and their pools)",
+)
+def test_fixup_beyond_grid_y_limit():
+    """More split groups than the hardware's grid.y extent (65,535): the fixup kernel strides over them; the same bits as the wrapper's
+    own plan of the batch (R3)."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    n, D = (
+        8200,
+        64,
+    )  # 8,200 requests x 8 KV heads = 65,600 two-chunk decode units, every one a split group folded by the fixup
+    pr = Problem([1] * n, [520] * n, 32, 8, D, 16, seed=18)
+    ref, _ = run_decode(pr)
+    cfg = replace(engine.default_config(D=D), split_policy="split", merge="fixup")
+    planned = engine.plan_attention(
+        pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, D, 16, -1, cfg, None, pr.device
+    )
+    assert len(planned.plan.fixup_groups) > 65535
+    out = engine.run_attention(
+        planned,
+        pr.q,
+        pr.k_nhd,
+        pr.v_nhd,
+        pr.kv_indptr,
+        pr.kv_indices,
+        1.0 / math.sqrt(D),
+        -1,
+        "NHD",
+        None,
+        cfg,
+    )
+    assert torch.equal(bits(out), bits(ref))
