@@ -984,6 +984,25 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
             assert program(64, 8, 36, sm) == above
             assert program(256, 8, 36, sm) == above
         assert program(37, 4, 36, 148) == above and program(36, 4, 36, 148) == below
+        # below the grid, at least four query rows where no request can split (8 x (b + 3 - 1 + 8) > grid): the
+        # program without the fold body; fewer rows, or a batch where a split fits, keep the planner program
+        assert variants["near_grid_regime"] == {"min_q_len": 4}
+        for sm in (148, 152):
+            b_split_free = sm // 8 - 9
+            # the agentx b16 q8 row (128 pairs) and the guard's edge
+            assert program(16, 8, 36, sm, q_len=8) == above
+            assert program(b_split_free, 8, 36, sm, q_len=8) == above
+            assert program(b_split_free, 8, 132, sm, q_len=8) == above
+            assert program(b_split_free - 1, 8, 36, sm, q_len=8) == below
+            assert program(16, 8, 36, sm, q_len=7) == above
+            assert program(16, 8, 36, sm, q_len=4) == above
+            assert program(16, 8, 36, sm, q_len=3) == below
+            assert program(b_split_free - 1, 8, 36, sm, q_len=4) == below
+            assert program(16, 8, 36, sm) == below
+            # the one-wave b1 row keeps the static program at eight query rows
+            assert program(1, 8, 36, sm, q_len=8) == static
+        assert program(28, 4, 36, 148, q_len=8) == above
+        assert program(27, 4, 36, 148, q_len=8) == below
         # single KV head: nine requests of seven chunks fit (9 x 15 = 135), ten do not
         assert program(9, 1, 25, 148) == static and program(10, 1, 25, 148) == below
     with pytest.raises(ValueError, match="sm_count"):
@@ -1098,8 +1117,13 @@ def test_bf16_program_row_selection(monkeypatch) -> None:
 # launch binding owns both). The adapters pass the arguments in this order.
 _FAMILY_SMEM = {
     "dcp_spec_bf16_balanced": 226304,
-    "dcp_spec_bf16_fp8_balanced": 160768,
     "dcp_spec_bf16_fp8_d256_balanced": 226304,
+}
+# Families whose programs differ in dynamic shared memory: each member defines its
+# program's DYNAMIC_SMEM_BYTES (the binding launches with it).  The E4M3 head_dim-128
+# program 0 holds a four-stage K ring, programs 1 and 2 a three-stage one.
+_PROGRAM_SMEM = {
+    "dcp_spec_bf16_fp8_balanced": {0: 177152, 1: 160768, 2: 160768},
 }
 _LAUNCH_PARAMETERS = [
     "Q", "K", "V", "O_ptr", "LSE_ptr", "page_table", "causal_seqlens_kv_global",
@@ -1123,6 +1147,32 @@ _Q_BOX_TOKENS = {
     "dcp_spec_bf16_fp8_balanced": lambda program: 8,
     "dcp_spec_bf16_fp8_d256_balanced": lambda program: 2,
 }
+
+# Programs that ship one generated source per (program, packed-row) instance: the program
+# and the packed-row tile are fixed in each text, which serves both architectures.  The
+# family's other programs share its one folded kernel.cu.
+_PER_INSTANCE_PROGRAMS = {
+    "dcp_spec_bf16_fp8_balanced": (0,),
+    "dcp_spec_bf16_fp8_d256_balanced": (1, 2),
+}
+
+
+def _member_program(variants, member) -> int | None:
+    return None if variants is None else int(member["selector"][variants["key"]])
+
+
+def _per_instance(family: str, program: int | None) -> bool:
+    return program in _PER_INSTANCE_PROGRAMS.get(family, ())
+
+
+def _member_source(family: str, variants, programs, member) -> str:
+    program = _member_program(variants, member)
+    if _per_instance(family, program):
+        n_rows = member["selector"]["n_rows"]
+        return (
+            f"cuda/dcp_spec/{family}/cake_fmha_{family}_program{program}_n{n_rows}.cu"
+        )
+    return programs[program]
 
 
 def test_balanced_families_ship_one_program_per_selector_with_both_packed_instances() -> (
@@ -1160,50 +1210,74 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
             dict(sorted(member["selector"].items()))
             for member in entry["source_family"]
         ] == expected_selectors, family
+        per_instance = {
+            _member_source(family, variants, programs, member): _per_instance(
+                family, _member_program(variants, member)
+            )
+            for member in entry["source_family"]
+        }
+        sources = sorted(per_instance)
         assert sorted(
             path.name for path in (csrc_dir / "cuda" / "dcp_spec" / family).iterdir()
-        ) == sorted({Path(program).name for program in programs.values()})
+        ) == sorted(Path(source).name for source in sources)
         texts = {}
-        for value, program in programs.items():
-            assert (csrc_dir / program).is_file(), program
-            program_text = (csrc_dir / program).read_text()
-            assert (
-                program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
-            )
+        for source in sources:
+            assert (csrc_dir / source).is_file(), source
+            program_text = (csrc_dir / source).read_text()
+            if per_instance[source]:
+                # the instance's packed-row tile and program are fixed in its text
+                assert "N_ROWS" not in program_text
+                assert (
+                    f"CAKE_FMHA_DCP_{str(variants['key']).upper()}" not in program_text
+                )
+            else:
+                assert (
+                    program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n")
+                    == 1
+                )
             # one text for both architectures: codegen's device-pass guard selects the sm_100a lowering
             assert "#if __CUDA_ARCH__ == 1000" in program_text
             assert "const __grid_constant__ CUtensorMap" in program_text
             assert "TensorMap const*" not in program_text
-            texts[value] = program_text
-        if variants is not None:
+            texts[source] = program_text
+        folded = {text for source, text in texts.items() if not per_instance[source]}
+        if variants is not None and folded:
             knob = f"CAKE_FMHA_DCP_{str(variants['key']).upper()}"
-            # one folded source for every program of the family
-            assert len(set(texts.values())) == 1
-            (text,) = set(texts.values())
+            # one folded source for every program of the family that is not per instance
+            assert len(folded) == 1
+            (text,) = folded
             # every `#if <knob>` block (bare, `== v`, `!= v` or `== a || <knob> == b`
             # form) closes with its `#endif  // <knob>...` twin
             opens = re.findall(rf"^#if {knob}(?: |$)", text, re.MULTILINE)
             closes = re.findall(rf"^#endif  // {knob}(?: |$)", text, re.MULTILINE)
             assert len(opens) == len(closes) > 0
         for member in entry["source_family"]:
-            program = programs[
-                None if variants is None else int(member["selector"][variants["key"]])
-            ]
-            assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            program_value = (
-                None if variants is None else int(member["selector"][variants["key"]])
-            )
-            assert member["defines"] == {
+            source = _member_source(family, variants, programs, member)
+            assert member["sources"] == {"sm_100a": source, "sm_103a": source}
+            program = _member_program(variants, member)
+            expected_defines = {
                 "N_ROWS": member["selector"]["n_rows"],
-                "Q_BOX_TOKENS": _Q_BOX_TOKENS[family](program_value),
+                "Q_BOX_TOKENS": _Q_BOX_TOKENS[family](program),
             }
+            if family in _PROGRAM_SMEM:
+                expected_defines["DYNAMIC_SMEM_BYTES"] = _PROGRAM_SMEM[family][program]
+            assert member["defines"] == expected_defines
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
         assert entry["launch_binding"] == f"cake_fmha_launch_{family}"
         assert f"cudaError_t cake_fmha_launch_{family}(" in header
         assert entry["public_symbol"].endswith(f"cake_fmha_{family}")
         assert entry["threads"] == 384
-        assert entry["dynamic_shared_memory_bytes"] == _FAMILY_SMEM[family]
+        if family in _PROGRAM_SMEM:
+            # one source of truth: the members' DYNAMIC_SMEM_BYTES, read by the binding
+            assert "dynamic_shared_memory_bytes" not in entry
+            binding = (csrc_dir / entry["binding_source"]).read_text()
+            assert "#ifndef DYNAMIC_SMEM_BYTES" in binding
+            assert not any(
+                str(smem) in binding for smem in _PROGRAM_SMEM[family].values()
+            )
+        else:
+            assert entry["dynamic_shared_memory_bytes"] == _FAMILY_SMEM[family]
         assert entry["parametric_macros"] == ["N_ROWS"]
         expected = list(_LAUNCH_PARAMETERS)
         if family == "dcp_spec_bf16_balanced":
@@ -1297,6 +1371,7 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
         for family in DCP_BALANCED_FAMILIES:
             variants = jit_dcp.dcp_balanced_program_variants(family)
             programs = [None] if variants is None else list(variants["values"])
+            members = get_dcp_spec_registry()["families"][family]["source_family"]
             for n_rows in DCP_BALANCED_N_ROWS:
                 for program in programs:
                     spec = jit_dcp.gen_dcp_spec_balanced_module(
@@ -1312,12 +1387,23 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
                     body, launch_binding, api_binding = (
                         Path(source) for source in spec.sources
                     )
-                    assert body.name == "kernel.cu" and body.parent.name == family
+                    selector = {"n_rows": n_rows}
+                    if variants is not None:
+                        selector[str(variants["key"])] = int(program)
+                    (member,) = [m for m in members if m["selector"] == selector]
+                    # the body the registry member names for this instance
+                    assert body.name in {
+                        Path(s).name for s in member["sources"].values()
+                    }
+                    assert body.parent.name == family
                     if variants is not None:
                         knob = f"CAKE_FMHA_DCP_{str(variants['key']).upper()}"
                         assert f"-D{knob}={program}" in spec.extra_cuda_cflags
                     assert body.parent.parent.name == "dcp_spec"
                     assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
+                    if "DYNAMIC_SMEM_BYTES" in member["defines"]:
+                        smem = member["defines"]["DYNAMIC_SMEM_BYTES"]
+                        assert f"-DDYNAMIC_SMEM_BYTES={smem}" in spec.extra_cuda_cflags
                     assert launch_binding.name == f"cake_fmha_{family}_binding.cu"
                     assert launch_binding.parent.name == "bindings"
                     assert api_binding.name == f"cake_fmha_{family}_jit_binding.cu"

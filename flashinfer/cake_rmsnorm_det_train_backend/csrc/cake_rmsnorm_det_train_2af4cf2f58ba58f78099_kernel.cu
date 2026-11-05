@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_FOLD_OFF 0
-#define SMEM_RED_FOLD_STAGE_BYTES 10240
-#define SMEM_RED_FOLD_STRIDE 10240
-#define SMEM_GRP_FOLD_OFF 10240
-#define SMEM_GRP_FOLD_STAGE_BYTES 1024
-#define SMEM_GRP_FOLD_STRIDE 1024
-#define SMEM_TOTAL 11264
-#define THREADS 640
-
 #include <math_constants.h>
 
 extern "C" {
@@ -77,7 +67,7 @@ kernel_cake_rmsnorm_det_train_2af4cf2f58ba58f78099(float* __restrict__ partial, 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red_fold = reinterpret_cast<float*>(smem_raw + 0);
     const int red_fold_addr = smem + 0;
     float* grp_fold = reinterpret_cast<float*>(smem_raw + 10240);

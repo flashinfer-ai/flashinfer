@@ -794,6 +794,47 @@ UE8M0_PROGRAMS = {
     "tailpipe_wsmem": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
 }
 UE8M0_ARCHES = ["sm_107a"]
+# The weight-staging tail form of each quantized layout and FP8 scale mode
+# on sm_107a (WSMEM_SM_PROGRAMS: "fp8_group128" the raw scale mode's,
+# "fp8_group128_ue8m0" the UE8M0 mode's, "nvfp4" the NVFP4 layout's) takes
+# launches on the devices of an SM count alone, at the split count and grid
+# of the program it replaces (16 splits, or 13 at the tailpipe regime's
+# larger two-wave counts, so the same outputs; its launch stages the RMSNorm
+# weight, 4096 BF16 values, in shared memory): the
+# deterministic launches of the plain variant's regime ("bf16") at the token
+# counts of that count's WSMEM_SM_DETERMINISTIC_TOKENS and the launches of the
+# tailpipe regime outside the deterministic mode at those of WSMEM_SM_TOKENS
+# (inclusive ranges; routes keyed on "num_sms": a selection without the SM
+# count, or without the FP8 scale mode, takes none of those).
+WSMEM_SM_PROGRAMS = {
+    "fp8_group128": "cake_mega_mhc_892d774130f06423fd7c",
+    "fp8_group128_ue8m0": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+    "nvfp4": "cake_mega_mhc_12e5bcc41e7940e7d511",
+}
+WSMEM_SM_DETERMINISTIC_TOKENS = {
+    208: {
+        "fp8_group128": [[1472, 1664], [1984, 3328]],
+        "fp8_group128_ue8m0": [[1472, 1664], [2048, 2496], [2944, 3328]],
+        "nvfp4": [[1536, 1664], [2048, 2048], [2112, 2496], [2944, 3328]],
+    },
+    216: {
+        "fp8_group128": [[1408, 1728], [1984, 2560], [2880, 3456]],
+        "fp8_group128_ue8m0": [[1536, 1728], [2048, 2560], [3008, 3456]],
+        "nvfp4": [[1536, 1728], [3008, 3456]],
+    },
+}
+WSMEM_SM_TOKENS = {
+    208: {
+        "fp8_group128": [[1665, 2496], [2816, 3328]],
+        "fp8_group128_ue8m0": [[1472, 1664], [1665, 2496], [2944, 3328]],
+        "nvfp4": [[1665, 2496], [2497, 3328]],
+    },
+    216: {
+        "fp8_group128": [[2113, 2560], [2880, 3456]],
+        "fp8_group128_ue8m0": [[1536, 1728], [1729, 2560], [3008, 3456]],
+        "nvfp4": [[1664, 1728], [2113, 2560], [2561, 3456]],
+    },
+}
 # The plain FP8 group-128 variant's fast-division program on sm_107a (its FP8
 # store divides through one reciprocal per lane, as the tail forms' store does):
 # the raw scale mode (fp8_sf_ue8m0=False) launches it in the plain variant's
@@ -846,11 +887,19 @@ FAST_CHAIN_DETERMINISTIC_TOKENS = {
     "nvfp4": [],
 }
 FAST_CHAIN_ARCHES = ["sm_107a"]
+# The launches outside the deterministic mode that a fast coefficient-chain
+# form takes in its program's regime on the devices of an SM count alone, per
+# FAST_CHAIN_PROGRAMS key: the token counts of that count's FAST_CHAIN_SM_TOKENS
+# (inclusive ranges; routes keyed on "num_sms").
+FAST_CHAIN_SM_TOKENS = {}
 # The UE8M0 mode's deterministic launches of the plain variant's regime ("bf16")
 # that the UE8M0 tailpipe program takes on UE8M0_ARCHES (the same 16 splits and
 # launch, so the same outputs): the token counts of
 # UE8M0_DETERMINISTIC_TAIL_TOKENS (inclusive ranges).
 UE8M0_DETERMINISTIC_TAIL_TOKENS = [[1024, 3328]]
+# ... and on the devices of an SM count alone, the token counts of that
+# count's UE8M0_DETERMINISTIC_TAIL_SM_TOKENS (routes keyed on "num_sms").
+UE8M0_DETERMINISTIC_TAIL_SM_TOKENS = {}
 # The UE8M0 mode's deterministic launches of the plain regime that the UE8M0
 # tailpipe program's fast coefficient-chain form takes on FAST_CHAIN_ARCHES (the
 # same 16 splits and launch, so the same outputs): the token counts of
@@ -889,16 +938,22 @@ CHAIN_PACK_SM_TOKENS = {
         "raw_tail": [[929, 968]],
         "ue8m0_plain": [[930, 936], [952, 968]],
     },
+    216: {
+        "raw_tail": [[1057, 1104]],
+    },
 }
 CHAIN_PACK_ARCHES = ["sm_107a"]
 
 
-def _fast_chain_program(layout, regime, arch, tokens, deterministic, ue8m0=None):
+def _fast_chain_program(
+    layout, regime, arch, tokens, deterministic, ue8m0=None, num_sms=None
+):
     """The fast_chain program a launch of ``layout`` in ``regime`` on ``arch``
     takes (``ue8m0``: the FP8 scale mode; the UE8M0 mode reads the
     "fp8_group128_ue8m0" key and its "_plain" key, the other modes the layout's
-    key and its "_plain" key), or None where its regime's program keeps the
-    launch."""
+    key and its "_plain" key; ``num_sms``: the device's SM count, whose
+    FAST_CHAIN_SM_TOKENS ranges join FAST_CHAIN_TOKENS), or None where its
+    regime's program keeps the launch."""
     if layout == "fp8_group128" and ue8m0:
         keys = [layout + "_ue8m0", layout + "_ue8m0_plain"]
     else:
@@ -910,25 +965,36 @@ def _fast_chain_program(layout, regime, arch, tokens, deterministic, ue8m0=None)
             or regime != FAST_CHAIN_REGIMES[key]
         ):
             continue
-        ranges = (
-            FAST_CHAIN_DETERMINISTIC_TOKENS if deterministic else FAST_CHAIN_TOKENS
-        )[key]
+        ranges = [
+            *(FAST_CHAIN_DETERMINISTIC_TOKENS if deterministic else FAST_CHAIN_TOKENS)[
+                key
+            ],
+            *(
+                []
+                if deterministic
+                else FAST_CHAIN_SM_TOKENS.get(num_sms, {}).get(key, [])
+            ),
+        ]
         if any(first <= tokens <= last for first, last in ranges):
             return FAST_CHAIN_PROGRAMS[key]
     return None
 
 
-def _ue8m0_program(regime, tokens, deterministic):
+def _ue8m0_program(regime, tokens, deterministic, num_sms=None):
     """The UE8M0 program a launch in ``regime`` on sm_107a takes where no
     fast_chain route names it: at the deterministic launches of the plain regime
     the UE8M0 tailpipe program's fast coefficient-chain form at
     UE8M0_DETERMINISTIC_CHAIN_TOKENS and the UE8M0 tailpipe program at
-    UE8M0_DETERMINISTIC_TAIL_TOKENS, else the regime's own."""
+    UE8M0_DETERMINISTIC_TAIL_TOKENS (with ``num_sms``, the device's SM count, and
+    that count's UE8M0_DETERMINISTIC_TAIL_SM_TOKENS), else the regime's own."""
     if regime == "bf16" and deterministic:
         for first, last in UE8M0_DETERMINISTIC_CHAIN_TOKENS:
             if first <= tokens <= last:
                 return FAST_CHAIN_PROGRAMS["fp8_group128_ue8m0"]
-        for first, last in UE8M0_DETERMINISTIC_TAIL_TOKENS:
+        for first, last in (
+            *UE8M0_DETERMINISTIC_TAIL_TOKENS,
+            *UE8M0_DETERMINISTIC_TAIL_SM_TOKENS.get(num_sms, []),
+        ):
             if first <= tokens <= last:
                 return UE8M0_PROGRAMS["tailpipe"]
     return UE8M0_PROGRAMS[regime]
@@ -974,6 +1040,71 @@ def _chain_pack_program(
     if any(first <= tokens <= last for first, last in ranges):
         return CHAIN_PACK_PROGRAMS[key]
     return None
+
+
+def _sm_count_program(
+    layout, regime, arch, tokens, deterministic, ue8m0=None, num_sms=None
+):
+    """The program the routes keyed on "num_sms" give a launch of ``layout`` in
+    ``regime`` on ``arch`` on a device of ``num_sms`` SMs (the SM-count tables
+    WSMEM_SM_DETERMINISTIC_TOKENS, WSMEM_SM_TOKENS,
+    UE8M0_DETERMINISTIC_TAIL_SM_TOKENS, FAST_CHAIN_SM_TOKENS and
+    CHAIN_PACK_SM_TOKENS; ``ue8m0``: the FP8 scale mode), or None where the
+    selection without the SM count keeps the launch."""
+    if num_sms is None or arch != "sm_107a":
+        return None
+    if (regime, deterministic) in (("bf16", True), ("tailpipe", False)):
+        key = layout if layout == "nvfp4" else None
+        if layout == "fp8_group128" and ue8m0 is not None:
+            key = "fp8_group128_ue8m0" if ue8m0 else "fp8_group128"
+        table = WSMEM_SM_DETERMINISTIC_TOKENS if deterministic else WSMEM_SM_TOKENS
+        for first, last in table.get(num_sms, {}).get(key, []):
+            if first <= tokens <= last:
+                return WSMEM_SM_PROGRAMS[key]
+    if layout == "fp8_group128" and ue8m0 and regime == "bf16" and deterministic:
+        for first, last in UE8M0_DETERMINISTIC_TAIL_SM_TOKENS.get(num_sms, []):
+            if first <= tokens <= last:
+                return UE8M0_PROGRAMS["tailpipe"]
+    launch = (layout, regime, arch, tokens, deterministic, ue8m0)
+    for model in (_fast_chain_program, _chain_pack_program):
+        program = model(*launch, num_sms=num_sms)
+        if program is not None and model(*launch) is None:
+            return program
+    return None
+
+
+def _sm_count_routes():
+    """The routes the SM-count tables name: (program, SM count, layout, regime,
+    deterministic, fp8_sf_ue8m0 key or None, token ranges)."""
+    rows = []
+    for table, deterministic, regime in (
+        (WSMEM_SM_DETERMINISTIC_TOKENS, True, "bf16"),
+        (WSMEM_SM_TOKENS, False, "tailpipe"),
+    ):
+        for count, names in table.items():
+            for name, ranges in names.items():
+                layout = name.removesuffix("_ue8m0")
+                mode = None if layout == "nvfp4" else name.endswith("_ue8m0")
+                program = WSMEM_SM_PROGRAMS[name]
+                rows.append(
+                    (program, count, layout, regime, deterministic, mode, ranges)
+                )
+    for count, ranges in UE8M0_DETERMINISTIC_TAIL_SM_TOKENS.items():
+        program = UE8M0_PROGRAMS["tailpipe"]
+        rows.append((program, count, "fp8_group128", "bf16", True, True, ranges))
+    for count, names in FAST_CHAIN_SM_TOKENS.items():
+        for name, ranges in names.items():
+            layout = name.removesuffix("_plain").removesuffix("_ue8m0")
+            mode = True if "_ue8m0" in name else None
+            regime = FAST_CHAIN_REGIMES[name]
+            program = FAST_CHAIN_PROGRAMS[name]
+            rows.append((program, count, layout, regime, False, mode, ranges))
+    for count, names in CHAIN_PACK_SM_TOKENS.items():
+        for name, ranges in names.items():
+            mode = name == "ue8m0_plain"
+            program = CHAIN_PACK_PROGRAMS[name]
+            rows.append((program, count, "fp8_group128", "bf16", False, mode, ranges))
+    return [row for row in rows if row[-1]]
 
 
 def _variant_program(layout, regime, arch, ue8m0=True):
@@ -1427,7 +1558,8 @@ def test_h4096_values_and_replay(tokens, layout):
         assert plan.config["regime"] == regime
         assert plan.program == plan.config["program"]
         assert plan.program == (
-            _fast_chain_program(layout, regime, _arch, tokens, False, True)
+            _sm_count_program(layout, regime, _arch, tokens, False, True, sms)
+            or _fast_chain_program(layout, regime, _arch, tokens, False, True)
             or _variant_program(layout, regime, _arch)
         )
     assert set(plan.outputs) == {*BF16_OUTPUTS, *QUANT_OUTPUTS[layout]}
@@ -1664,7 +1796,8 @@ def test_h4096_variant_tail_forms_are_bitwise_the_plain_variant(monkeypatch, lay
         kw = layout_kwargs(layout, values)
         dispatched = prepare_mega_mhc(**values, sf_layout=layout, **kw)
         assert dispatched.program == (
-            _fast_chain_program(layout, regimes[t], arch, t, False, True)
+            _sm_count_program(layout, regimes[t], arch, t, False, True, sms)
+            or _fast_chain_program(layout, regimes[t], arch, t, False, True)
             or _variant_program(layout, regimes[t], arch)
         )
         assert dispatched.config["regime"] == regimes[t]
@@ -1935,10 +2068,15 @@ def test_h4096_fp8_ue8m0_routes_select_the_pow2_programs():
         rest = {k: v for k, v in route[0].items() if k != "fp8_sf_ue8m0"}
         assert dict(rest, program=None) == dict(twin[0], program=None)
     # The deterministic tail routes: the UE8M0 plain route keyed on
-    # "deterministic" and "tokens" with the UE8M0 tailpipe program, ahead of it;
+    # "deterministic" and "tokens" with the UE8M0 tailpipe program, ahead of it
+    # (the routes keyed on "num_sms": their own test);
     # the tailpipe record has the plain record's arg_plan, launch and options.
     tail, plain = UE8M0_PROGRAMS["tailpipe"], UE8M0_PROGRAMS["bf16"]
-    routes = [r for r in _runtime.ROUTES if r["program"] == tail and "tokens" in r]
+    routes = [
+        r
+        for r in _runtime.ROUTES
+        if r["program"] == tail and "tokens" in r and "num_sms" not in r
+    ]
     (route,) = [r for r in _runtime.ROUTES if r["program"] == plain]
     assert [r["tokens"] for r in routes] == [UE8M0_DETERMINISTIC_TAIL_TOKENS]
     for r in routes:
@@ -2097,7 +2235,8 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
     mode, the other regimes and sm_100a / sm_103a keep their programs. Each
     record is its program's record on FAST_CHAIN_ARCHES alone with its own
     kernel; its routes are that program's route keyed on "deterministic" and
-    "tokens", ahead of that route."""
+    "tokens", ahead of that route (the routes keyed on "num_sms": their own
+    test)."""
     plains = {
         "bf16": TAIL_PROGRAMS["tailpipe"],
         "fp8_group128": VARIANT_PROGRAMS["fp8_group128"]["tailpipe_wsmem"],
@@ -2123,6 +2262,7 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
             for r in _runtime.ROUTES
             if r["program"] == program
             and _runtime.route_regime(r) == FAST_CHAIN_REGIMES[name]
+            and "num_sms" not in r
         ]
         (route,) = [
             r for r in _runtime.ROUTES if r["program"] == plain and "tokens" not in r
@@ -2360,7 +2500,8 @@ def test_h4096_chain_pack_routes_select_the_chain_pack_programs():
                             assert got[0] not in pack, (arch, regime, t, count)
     assert served == pack
     # Every edge of every SM-count range: its SM count selects the program at
-    # both ends, every other SM count and a selection without one do not, and
+    # both ends, every other SM count (outside its own ranges) and a selection
+    # without one do not, and
     # one past each end the program is not selected (outside its other ranges).
     key = (4096, 64, False, False, "fp8_group128", "sm_107a")
     for count, table in CHAIN_PACK_SM_TOKENS.items():
@@ -2382,7 +2523,11 @@ def test_h4096_chain_pack_routes_select_the_chain_pack_programs():
                         got = _runtime.select_program(
                             *key, regime="bf16", **launch, **sms
                         )
-                        if not any(a <= t <= b for a, b in CHAIN_PACK_TOKENS[name]):
+                        own = [
+                            *CHAIN_PACK_TOKENS[name],
+                            *CHAIN_PACK_SM_TOKENS.get(other, {}).get(name, []),
+                        ]
+                        if not any(a <= t <= b for a, b in own):
                             assert got[0] != program, (name, other, t)
                 for t in (first - 1, last + 1):
                     if any(a <= t <= b for a, b in inside):
@@ -2459,6 +2604,197 @@ def test_h4096_chain_pack_plans_follow_the_device_sm_count(monkeypatch, ue8m0):
         sms,
         served,
     )
+
+
+def test_h4096_sm_count_routes_select_their_programs():
+    """The routes keyed on "num_sms" serve the devices of the SM count they list
+    alone: on sm_107a a launch at the token counts of an SM-count table for the
+    caller's SM count (WSMEM_SM_DETERMINISTIC_TOKENS, WSMEM_SM_TOKENS,
+    UE8M0_DETERMINISTIC_TAIL_SM_TOKENS, FAST_CHAIN_SM_TOKENS,
+    CHAIN_PACK_SM_TOKENS) takes that table's program (_sm_count_program); every
+    other launch, every other SM count, a selection without the SM count and
+    sm_100a / sm_103a select what the selection without the SM count selects.
+    Each such route lists one SM count and its program ships for sm_107a alone;
+    the ranges of one table key may span several routes.
+    Each weight-staging tail form (WSMEM_SM_PROGRAMS), launched in the plain or
+    the tailpipe regime, has the argument plan and compile options of that
+    regime's record of its layout and scale mode; its launch differs in the
+    staged RMSNorm weight alone (4096 BF16 values of dynamic shared memory)."""
+    tables = _sm_count_routes()
+    routes = [r for r in _runtime.ROUTES if "num_sms" in r]
+    assert all(len(r["num_sms"]) == 1 for r in routes)
+    listed = [
+        (
+            r["program"],
+            r["num_sms"][0],
+            r["sf_layout"],
+            r["regime"],
+            r["deterministic"],
+            r.get("fp8_sf_ue8m0"),
+            r["tokens"],
+        )
+        for r in routes
+    ]
+    merged = {}
+    for *key, ranges in listed:
+        merged.setdefault(tuple(key), []).extend(ranges)
+    listed = [(*key, sorted(ranges)) for key, ranges in merged.items()]
+    want = [(*row[:-1], sorted(row[-1])) for row in tables]
+    assert sorted(listed, key=str) == sorted(want, key=str)
+    assert {r["num_sms"][0] for r in routes} <= set(H4096_SM_COUNTS)
+    for r in routes:
+        assert _runtime.record_arches(_runtime.PROGRAMS[r["program"]]) == ["sm_107a"]
+        assert (r["hidden"], r["num_splits"], r["shifted"], r["shared_sf"]) == (
+            4096,
+            "runtime",
+            False,
+            False,
+        )
+        assert r["defines"] == {}
+    for name, program in WSMEM_SM_PROGRAMS.items():
+        if name.endswith("_ue8m0"):
+            programs = UE8M0_PROGRAMS
+        else:
+            programs = VARIANT_PROGRAMS[name]
+        assert program == programs["tailpipe_wsmem"]
+        staged = _runtime.PROGRAMS[program]
+        for regime in ("bf16", "tailpipe"):
+            plain = _runtime.PROGRAMS[programs[regime]]
+            assert staged["arg_plan"] == plain["arg_plan"]
+            assert staged["compile_options"] == plain["compile_options"]
+            assert staged["launch"] == dict(
+                plain["launch"],
+                dynamic_smem_bytes=plain["launch"]["dynamic_smem_bytes"] + 4096 * 2,
+            )
+    edges = {
+        e + d for row in tables for pair in row[-1] for e in pair for d in (-1, 0, 1)
+    }
+    tokens = sorted(
+        t for t in {*H4096_RULE_TOKENS, *edges} if 1 <= t <= _runtime.MAX_TOKENS
+    )
+    counts = (None, *H4096_SM_COUNTS)
+    served = set()
+    for layout in H4096_LAYOUTS:
+        modes = (None, False, True) if layout == "fp8_group128" else (None,)
+        if not _runtime.supported("sm_107a", 4096, layout):
+            continue
+        for regime, splits in (("bf16", 64), ("tailpipe", 16), ("tailpipe_wsmem", 16)):
+            key = (4096, splits, False, False, layout)
+            for t in tokens:
+                for deterministic in (False, True):
+                    for ue8m0 in modes:
+                        mode = {} if ue8m0 is None else {"fp8_sf_ue8m0": ue8m0}
+                        launch = {"tokens": t, "deterministic": deterministic, **mode}
+                        for arch in H4096_ARCHES:
+                            try:
+                                shared = _runtime.select_program(
+                                    *key, arch, regime=regime, **launch
+                                )
+                            except NotImplementedError:
+                                continue
+                            for count in counts:
+                                sms = {} if count is None else {"num_sms": count}
+                                got = _runtime.select_program(
+                                    *key, arch, regime=regime, **launch, **sms
+                                )
+                                want = _sm_count_program(
+                                    layout, regime, arch, t, deterministic, ue8m0, count
+                                )
+                                assert got == ((want, {}) if want else shared), (
+                                    layout,
+                                    regime,
+                                    arch,
+                                    t,
+                                    deterministic,
+                                    ue8m0,
+                                    count,
+                                )
+                                if want:
+                                    served.add(want)
+    assert served == {row[0] for row in tables}
+
+
+@pytest.mark.parametrize(
+    "layout, ue8m0, deterministic",
+    (
+        ("nvfp4", None, True),
+        ("nvfp4", None, False),
+        ("fp8_group128", True, True),
+        ("fp8_group128", True, False),
+        ("fp8_group128", False, True),
+        ("fp8_group128", False, False),
+    ),
+)
+def test_h4096_sm_count_plans_follow_the_device_sm_count(
+    monkeypatch, layout, ue8m0, deterministic
+):
+    """On an sm_107a device, a plan at the edges of every SM-count range of the
+    tables of its layout, scale mode and mode (the chain-packing ranges: their
+    own test) takes the program the model names for the device's SM count and
+    writes bitwise the outputs of the plan selected without the SM count, at the
+    same split count and grid. A plan a weight-staging tail form
+    (WSMEM_SM_PROGRAMS) serves launches at 16 splits (13 at the tailpipe
+    regime's two-wave counts) with that form's own dynamic shared memory (the
+    replaced program's plus the staged RMSNorm weight)."""
+    _skip_unless_exported(4096, layout)
+    arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    if arch != "sm_107a":
+        pytest.skip("the SM-count routes serve sm_107a alone")
+    rows = [
+        row
+        for row in _sm_count_routes()
+        if row[2] == layout
+        and row[4] == deterministic
+        and row[5] in ((None, ue8m0) if not ue8m0 else (ue8m0,))
+        and row[0] not in CHAIN_PACK_PROGRAMS.values()
+    ]
+    tokens = sorted(
+        {e + d for row in rows for pair in row[-1] for e in pair for d in (-1, 0, 1)}
+    )
+    if not tokens:
+        pytest.skip(f"no SM-count range for {layout} ue8m0={ue8m0} det={deterministic}")
+    select = _runtime.select_program
+
+    def without_sms(*args, **kw):
+        kw.pop("num_sms", None)
+        return select(*args, **kw)
+
+    mode = {} if ue8m0 is None else {"fp8_sf_ue8m0": ue8m0}
+    served = 0
+    for t in tokens:
+        values = inputs_h4096(t)
+        kw = layout_kwargs(layout, values)
+        plan = prepare_mega_mhc(
+            **values, sf_layout=layout, deterministic=deterministic, **mode, **kw
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(_runtime, "select_program", without_sms)
+            base = prepare_mega_mhc(
+                **values, sf_layout=layout, deterministic=deterministic, **mode, **kw
+            )
+        regime = plan.config["regime"]
+        assert base.config["regime"] == regime
+        want = _sm_count_program(layout, regime, arch, t, deterministic, ue8m0, sms)
+        assert plan.program == (want or base.program), (t, sms, regime)
+        served += want is not None
+        assert base.config["num_splits"] == plan.config["num_splits"]
+        assert base.config["num_launch_sms"] == plan.config["num_launch_sms"]
+        if want in WSMEM_SM_PROGRAMS.values():
+            assert regime == ("bf16" if deterministic else "tailpipe")
+            assert plan.config["num_splits"] in ((16,) if deterministic else (13, 16))
+            smem = _runtime.PROGRAMS[base.program]["launch"]["dynamic_smem_bytes"]
+            assert (
+                _runtime.PROGRAMS[plan.program]["launch"]["dynamic_smem_bytes"]
+                == smem + 4096 * 2
+            )
+        for each in (plan, base):
+            poison(each.outputs)
+            each.run()
+        torch.cuda.synchronize()
+        check_h4096_layout(plan.outputs, values, layout, **mode, **kw)
+        for out in (*BF16_OUTPUTS, *QUANT_OUTPUTS[layout]):
+            assert bitwise_equal(plan.outputs[out], base.outputs[out]), (t, out)
+    assert bool(served) == any(row[1] == sms for row in rows), (sms, served)
 
 
 def test_h4096_quant_keyword_rules():

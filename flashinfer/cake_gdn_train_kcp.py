@@ -23,18 +23,33 @@ Every entry takes ``deterministic: bool = True``:
   objects of ``flashinfer.cake_gdn_det_train_kcp``: bitwise reproducible at
   the same topology.
 * ``deterministic=False`` runs the non-deterministic package
-  ``flashinfer.experimental.cake_gdn_train_kcp``: the same contract and the
-  same accuracy budgets, not bitwise equal to the deterministic route
+  ``flashinfer.experimental.cake_gdn_train_kcp``: the same entry points and
+  the same accuracy budgets, not bitwise equal to the deterministic route
   (run-to-run reproducible today for a fixed plan and partition; later
-  versions may use unordered reductions).
+  versions may use unordered reductions); it also takes the
+  non-deterministic-only ``save_mode`` values below.
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic route and warns once per process.
+
+Non-deterministic-only ``save_mode`` values (``ND_ONLY_SAVE_MODES``):
+``"light_akk"`` (the light saved set plus the forward's BF16 ``Akk`` tape;
+the backward's prep replay reads the tape instead of solving the block
+inverse; it needs ``use_qk_l2norm_in_kernel=True``).  Only
+``deterministic=False`` takes them.  The deterministic route refuses them
+with a ``ValueError`` that names ``deterministic=False``: on every compute
+entry and in ``gdn_saved_bytes_kcp`` / ``gdn_workspace_bytes_kcp``, as a
+keyword, a knob or an options field, and also for a ``deterministic=False``
+call that torch's deterministic algorithms route there.  The deterministic
+route takes ``"light"`` and ``"full"`` only.
 
 The mode is never stored in the context: a context, a partition and the byte
 queries of either route describe the same plan.  A saved set is read only by
 the backward of the route that produced it, and an options instance is
 converted to the routed package's options type (mappings and keywords work for
-both).  Thin experimental entry points: the partition / context plan, the host
+both; on the deterministic route an ``OptionsKcp`` with the default
+``reuse_recompute_tapes="auto"`` takes that route's own default for the call's
+final ``graph``: ``False`` under replay, whether replay comes from the instance,
+the ``graph`` keyword or a knob).  Thin experimental entry points: the partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
 live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
@@ -87,6 +102,26 @@ _FEATURE = "Cake context-parallel packed GDN chunked training (SM100/SM103/SM107
 DEFAULT_SCALE = 128**-0.5
 
 
+# ``save_mode`` values that only the non-deterministic package takes (opt-in tiers; see the module docstring).
+ND_ONLY_SAVE_MODES = ("light_akk",)
+
+
+def _refuse_nd_only(entry: str, options: Any, kw: dict) -> None:
+    """On the deterministic route: refuse a non-deterministic-only ``save_mode`` given as a keyword or knob (``kw``)
+    or as an options field (a mapping or an options instance)."""
+    modes = [kw.get("save_mode")]
+    if isinstance(options, dict):
+        modes.append(options.get("save_mode"))
+    elif options is not None and dataclasses.is_dataclass(options):
+        modes.append(getattr(options, "save_mode", None))
+    for mode in modes:
+        if isinstance(mode, str) and mode in ND_ONLY_SAVE_MODES:
+            raise ValueError(
+                f"{entry}: save_mode={mode!r} is a non-deterministic-only tier: it needs deterministic=False "
+                "(with torch's deterministic algorithms off); the deterministic route refuses it"
+            )
+
+
 # The routed modules are imported on first use and cached: a call does not repeat the import.
 @functools.cache
 def _pkg():
@@ -132,13 +167,24 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
     (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
-    routes take every field, ``use_qk_l2norm_in_kernel`` included."""
+    routes take every field, ``use_qk_l2norm_in_kernel`` included.  On the deterministic route a non-deterministic
+    instance whose ``reuse_recompute_tapes`` is the default ``"auto"`` maps that field to ``None`` whatever its own
+    ``graph`` field says: the deterministic package resolves it to its own default with the call's final ``graph``
+    (the instance's, the ``graph`` keyword's or a knob's): ``"auto"`` under ``"off"``, ``False`` under replay.  An
+    explicit ``True`` passes and is refused there under replay."""
     if options is None or isinstance(options, dict):
         return options
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
     if isinstance(options, own) or not dataclasses.is_dataclass(options):
         return options
-    return {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    fields = {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    if (
+        det
+        and isinstance(fields.get("reuse_recompute_tapes"), str)
+        and fields["reuse_recompute_tapes"] == "auto"
+    ):
+        fields["reuse_recompute_tapes"] = None
+    return fields
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -264,11 +310,12 @@ def chunk_gdn_fwd_kcp(
     workspace : WorkspaceKcp, optional
         A reused caller-held workspace (``gdn_workspace_bytes_kcp``); without one the call allocates its own.
     options, **knobs
-        Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
+        Keyword-only options (``save_mode`` ``"light"`` | ``"full"`` | ``"light_akk"`` (non-deterministic route
+        only, see the module docstring), ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
-        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (``False`` with ``graph="replay"``; see
-        :func:`chunk_gdn_kcp`),
+        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (the deterministic route: ``False`` with
+        ``graph="replay"``; see :func:`chunk_gdn_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
 
@@ -281,6 +328,7 @@ def chunk_gdn_fwd_kcp(
     route's backward only).
     """
     if _deterministic(deterministic, "chunk_gdn_fwd_kcp"):
+        _refuse_nd_only("chunk_gdn_fwd_kcp", options, knobs)
         return _det().chunk_gdn_det_fwd_kcp(
             q,
             k,
@@ -351,6 +399,7 @@ def chunk_gdn_bwd_kcp(
     budgets, not bitwise equal to the deterministic route, on the non-deterministic one.
     """
     if _deterministic(deterministic, "chunk_gdn_bwd_kcp"):
+        _refuse_nd_only("chunk_gdn_bwd_kcp", options, knobs)
         if saved is not None and not isinstance(saved, _det().SavedDetKcp):
             raise ValueError(
                 "chunk_gdn_bwd_kcp: the saved set comes from the non-deterministic route "
@@ -425,8 +474,15 @@ def chunk_gdn_kcp(
     ``recompute_output``) and takes the replay form otherwise -- a region this node closes keeps today's speed and
     memory; ``True`` always keeps them, ``False`` never (the replay form).  One kept set is
     live at a time: in a checkpoint segment holding several GDN layers only the last layer skips the replay (the
-    earlier layers replay as before).  Not available with ``graph="replay"``: there the default resolves to
-    ``False`` and an explicit ``True`` / ``"auto"`` is refused.
+    earlier layers replay as before).  On the deterministic route it is not available with ``graph="replay"`` (the
+    default resolves to ``False``, so does an ``OptionsKcp``'s default ``"auto"``, and an explicit ``True`` /
+    ``"auto"`` is refused); on the non-deterministic route a caller-held workspace keeps its own tapes under
+    ``graph="replay"`` and the backward binds them only while the workspace made no other call in between (else the
+    replay form); the kept tapes add no memory there, while the recompute's own hand-off graph holds its static
+    results like every graph key (one more saved set per checkpointed layer and, when that recompute launches the
+    output program -- ``recompute_output="always"``, or ``True`` with a later saver -- a full static output); there
+    ``"auto"`` decides only from ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per rank (a smaller
+    recompute replays the original forward's graph: its host-bound step gains nothing from the hand-off).
 
     ``recompute_output`` (keyword-only, ``"auto"`` default | ``"always"``): torch's recompute of a checkpointed
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
@@ -435,9 +491,11 @@ def chunk_gdn_kcp(
     early stop is on, and the torch release -- ``torch.__version__`` without its local ``+cuNNN`` build tag -- is one
     of the package's verified releases, ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
     of the region that saves the output (another layer, a norm), a reentrant checkpoint, a forward outside a
-    recompute, a non-executable node, another torch build (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]`` records the
-    decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
-    unconditional launch.
+    recompute, a non-executable node, another torch build, and under ``graph="replay"`` with the default
+    ``reuse_recompute_tapes="auto"`` a rank below ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` (reason ``"small"``; an
+    explicit ``True`` / ``False`` reads the proof at every size) (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]``
+    records the decision and its reason).  The gradients and the retained bytes are unchanged either way;
+    ``"always"`` is the unconditional launch.
 
     ``recompute_handle`` (keyword-only, default ``None``; a :class:`RecomputeHandleKcp`): the checkpoint recompute
     of this forward runs without cross-rank communication.  The original forward exchanges as always and stores
@@ -463,10 +521,22 @@ def chunk_gdn_kcp(
     convolution call, and this call shares one of them.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
     outside the backward that finds an entry raises (a handle reused across micro-steps).
 
+    ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
+    output) get the full backward speed as the views of
+    ``flashinfer.experimental.cake_gdn_train_kcp.packed_qkv_views_kcp`` or
+    ``flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp``: both helpers' split nodes pass a packed gradient
+    row on without a copy.  The non-deterministic package writes that row only for the outputs of either helper, the
+    deterministic one whenever the operands' pointers and strides are those of one row.  Plain ``split`` / ``view``
+    views of the row give the same results, but torch's split backward concatenates ``dq`` / ``dk`` / ``dv`` into a
+    new row: on the non-deterministic route, about 0.2 ms (6-7 %) more backward per call at ``(16, 48)`` and 32,768
+    tokens on B200 and GB300 and 0.17 ms (7-8 %) on R200, with the in-kernel norm off or on
+    (``flashinfer/experimental/cake_gdn_train_kcp/README.md``, "Packed Q/K/V").
+
     ``deterministic`` (default ``True``) selects the route (see the module docstring); the checkpoint recompute of a
     forward runs the forward's route as long as the torch deterministic-algorithms setting does not change in between.
     """
     if _deterministic(deterministic, "chunk_gdn_kcp"):
+        _refuse_nd_only("chunk_gdn_kcp", options, {"save_mode": save_mode})
         return _det().chunk_gdn_det_kcp(
             q,
             k,
@@ -508,8 +578,12 @@ def gdn_workspace_bytes_kcp(
 ) -> int:
     r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
-    the per-phase terms are ``gdn_workspace_layout_kcp`` of the package) on the route ``deterministic`` selects."""
+    the per-phase terms are ``gdn_workspace_layout_kcp`` of the package) on the route ``deterministic`` selects.
+    ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint: under
+    ``torch.utils.checkpoint(use_reentrant=False)`` that call runs as ``"light"`` and binds the ``save_mode="light"``
+    figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``."""
     if _deterministic(deterministic, "gdn_workspace_bytes_kcp"):
+        _refuse_nd_only("gdn_workspace_bytes_kcp", kw.get("options"), kw)
         return _det().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
     return _pkg().gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
@@ -521,6 +595,7 @@ def gdn_saved_bytes_kcp(
     r"""Saved-set bytes of one layer on this rank (``save_mode``, ``save_transfer`` as keywords), counted per
     crossing fragment, on the route ``deterministic`` selects."""
     if _deterministic(deterministic, "gdn_saved_bytes_kcp"):
+        _refuse_nd_only("gdn_saved_bytes_kcp", kw.get("options"), kw)
         return _det().gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
     return _pkg().gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 

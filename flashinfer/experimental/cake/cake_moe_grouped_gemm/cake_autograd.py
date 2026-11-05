@@ -18,7 +18,9 @@ limitations under the License.
 # the forward projection ``Y = X @ W[e].T`` with the activation gradient
 # ``dX = G @ W[e]`` and the weight gradient ``dW[e] = G[e].T @ X[e]`` in
 # ``backward``.  The forward and the activation gradient run this package's
-# copies of the deterministic programs (the deterministic bits; a
+# copies of the deterministic programs, but for the sm_100a activation
+# gradient's L2 evict-first twin, this package's own build of the
+# deterministic wide tile (the deterministic bits; a
 # non-reentrant activation-checkpoint replay of the forward gives the same
 # ``Y``); the weight gradient may add its split tail with unordered fp32
 # reductions (``cake_backend``, numerical mode).  ``CakeGroupedMm`` calls the
@@ -28,6 +30,13 @@ limitations under the License.
 # before the GEMM runs, as it does for a built-in op: a non-reentrant
 # checkpoint with early stop on (the torch default) then skips the recomputed
 # GEMM when these are the last saves of the innermost checkpointed region.
+#
+# ``fuse_wgrad_accumulation=True`` follows the Megatron / Transformer Engine
+# convention: the backward adds the weight gradient into ``w.main_grad`` (read
+# at backward time) with the package's accumulate mode instead of returning it,
+# and returns a fresh placeholder gradient for ``w`` when ``w`` carries the
+# ``grad_added_to_main_grad`` attribute (``torch.zeros`` under
+# ``w.zero_out_wgrad``), else none.
 
 from __future__ import annotations
 
@@ -37,9 +46,22 @@ from .cake_backend import (
     _alert_not_deterministic,
     _prepare_wgrad,
     _require_deterministic_false,
+    _require_flag,
     prepare_grouped_gemm_dgrad,
     prepare_grouped_gemm_fwd,
 )
+
+_MAIN_GRAD_DTYPES = (torch.float32, torch.bfloat16)
+
+# -1 outside the autograd engine; inside a backward, a forward runs only as torch's
+# checkpoint recompute, whose ``w`` may be an alias without ``w``'s Python attributes
+# (an inner region of nested non-reentrant checkpoints).  The backward of the original
+# forward reads its own ``ctx.w`` and checks ``main_grad`` there.
+_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
+
+
+def _in_backward() -> bool:
+    return _GRAPH_TASK_ID is not None and _GRAPH_TASK_ID() != -1
 
 
 def _fwd_op(
@@ -63,6 +85,44 @@ def _wgrad_op(
 ) -> None:
     # The caller (``CakeGroupedMm.backward``) has raised the deterministic-mode alert.
     _prepare_wgrad(g, x, offs, out, None, num_groups)._run()
+
+
+def _wgrad_acc_op(
+    g: torch.Tensor,
+    x: torch.Tensor,
+    offs: torch.Tensor,
+    main_grad: torch.Tensor,
+    num_groups: int,
+) -> None:
+    # ``main_grad[e] += G[e].T @ X[e]``; the caller has raised the deterministic-mode alert.
+    _prepare_wgrad(g, x, offs, main_grad, None, num_groups, accumulate=True)._run()
+
+
+def _main_grad(w: torch.Tensor, entry: str) -> torch.Tensor:
+    """``w.main_grad``, checked: a tensor of ``w``'s shape, fp32 or bf16, on ``w``'s device, with unit stride
+    along the last dimension (``ValueError`` otherwise)."""
+    main_grad = getattr(w, "main_grad", None)
+    if not isinstance(main_grad, torch.Tensor):
+        raise ValueError(
+            f"{entry}: fuse_wgrad_accumulation=True adds the weight gradient into w.main_grad, and w has "
+            f"no main_grad tensor (got {type(main_grad).__name__}); a reentrant checkpoint "
+            "(use_reentrant=True) passes detached copies of its inputs without it, use "
+            "use_reentrant=False"
+        )
+    if (
+        tuple(main_grad.shape) != tuple(w.shape)
+        or main_grad.dtype not in _MAIN_GRAD_DTYPES
+        or main_grad.device != w.device
+        or main_grad.dim() != 3
+        or main_grad.stride(2) != 1
+    ):
+        raise ValueError(
+            f"{entry}: w.main_grad must be a float32 or bfloat16 tensor of w's shape "
+            f"{list(w.shape)} on {w.device} with unit stride along the last dimension; got "
+            f"{main_grad.dtype} {list(main_grad.shape)} on {main_grad.device}, strides "
+            f"{list(main_grad.stride())}"
+        )
+    return main_grad
 
 
 def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
@@ -105,6 +165,16 @@ class CakeGroupedMm(torch.autograd.Function):
     ``CakeGroupedMm.apply(x, w, offs, False)`` launches inside ``forward``
     and a checkpoint always recomputes it, as does the wrapper under
     ``torch.jit.trace`` and ``torch.compile``.
+
+    The sixth argument, ``fuse_wgrad_accumulation`` (default ``False``), makes
+    the backward add the weight gradient into ``w.main_grad`` instead
+    (:func:`cake_grouped_mm`); ``forward`` then keeps the Python object ``w``
+    on ``ctx`` (a saved tensor unpacked under a checkpoint has no attributes).
+    ``forward`` runs with grad mode off and cannot tell whether autograd
+    records the call, so it does not check ``main_grad``:
+    :func:`cake_grouped_mm` checks it before ``apply`` when autograd records
+    the call, and the backward checks it again (the only check of a direct
+    ``apply``).
     """
 
     @staticmethod
@@ -115,21 +185,36 @@ class CakeGroupedMm(torch.autograd.Function):
         offs: torch.Tensor,
         deterministic: bool,
         _launch=None,
+        fuse_wgrad_accumulation: bool = False,
     ):
         _require_deterministic_false(deterministic, "CakeGroupedMm")
+        _require_flag(
+            fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedMm"
+        )
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
         if _launch is not _DEFER_FWD:
             _fwd_op(x, w, offs, y)
         ctx.save_for_backward(x, w, offs)
         ctx.num_groups = num_groups
+        ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        # The parameter itself: its main_grad is read at backward time (it may be re-pointed).
+        ctx.w = w if fuse_wgrad_accumulation else None
         return y
 
     @staticmethod
     def backward(ctx, grad_y: torch.Tensor):
         x, w, offs = ctx.saved_tensors
+        fuse = ctx.fuse_wgrad_accumulation and ctx.needs_input_grad[1]
         if ctx.needs_input_grad[1]:
             _alert_not_deterministic("CakeGroupedMm.backward")
+        if fuse and torch.is_grad_enabled():
+            raise NotImplementedError(
+                "CakeGroupedMm.backward: fuse_wgrad_accumulation=True adds into w.main_grad, which a "
+                "double backward (create_graph=True) cannot differentiate; use "
+                "fuse_wgrad_accumulation=False"
+            )
+        main_grad = _main_grad(ctx.w, "CakeGroupedMm.backward") if fuse else None
         # The autograd engine runs backward on a worker thread that has not
         # touched the CUDA runtime yet; the programs encode their TMA
         # descriptors through the driver API, which needs the primary context
@@ -140,7 +225,21 @@ class CakeGroupedMm(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             dx = torch.empty_like(x, dtype=torch.bfloat16)
             _dgrad_op(g, w, offs, dx)
-        if ctx.needs_input_grad[1]:
+        if fuse:
+            _wgrad_acc_op(g, x, offs, main_grad, ctx.num_groups)
+            param = ctx.w
+            if hasattr(param, "grad_added_to_main_grad"):
+                # Megatron's convention: flag the accumulation and return a fresh placeholder, which
+                # AccumulateGrad and the gradient hooks then see (never a cached tensor: AccumulateGrad
+                # keeps a gradient with no other reference as w.grad).
+                param.grad_added_to_main_grad = True
+                fill = (
+                    torch.zeros
+                    if getattr(param, "zero_out_wgrad", False)
+                    else torch.empty
+                )
+                dw = fill(param.shape, dtype=param.dtype, device=param.device)
+        elif ctx.needs_input_grad[1]:
             dw = torch.empty(
                 ctx.num_groups, w.shape[1], w.shape[2], dtype=w.dtype, device=w.device
             )
@@ -153,6 +252,8 @@ def cake_grouped_mm(
     w: torch.Tensor,
     offs: torch.Tensor,
     deterministic: bool = True,
+    *,
+    fuse_wgrad_accumulation: bool = False,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
@@ -172,6 +273,29 @@ def cake_grouped_mm(
         ``flashinfer.experimental.cake_moe_grouped_det_gemm.cake_grouped_det_mm``
         (or the facade ``flashinfer.experimental.cake.grouped_mm.cake_grouped_mm``
         with ``deterministic=True``).
+    fuse_wgrad_accumulation : bool
+        ``False`` (default): the backward returns ``w``'s gradient as below.
+        ``True`` (Megatron's ``gradient_accumulation_fusion``): ``w.main_grad``
+        must be an fp32 or bf16 tensor of ``w``'s shape on its device with unit
+        stride along the last dimension (``ValueError``, checked at the forward
+        call when autograd records it: ``w`` requires grad, grad mode is on and
+        the call is not a checkpoint recompute inside a backward; and again at
+        the backward, which reads ``w.main_grad`` then).  Under
+        ``torch.no_grad()`` or inference mode the forward needs no
+        ``main_grad``.  The backward adds ``dW`` into it in place
+        (``main_grad[e] += G[e].T @ X[e]``, the package's accumulate mode, fused
+        into the weight-gradient kernel where the route serves it) and returns
+        for ``w`` a fresh ``torch.empty`` of ``w``'s shape and dtype when ``w``
+        has the attribute ``grad_added_to_main_grad`` (set to ``True``;
+        ``torch.zeros`` when ``w.zero_out_wgrad`` is true), else ``None``:
+        ``w.grad`` is then untouched and no gradient hook of ``w`` fires.  Every
+        backward adds (``retain_graph`` twice adds twice), also a
+        ``torch.autograd.grad`` whose ``inputs`` exclude ``w`` (split
+        backward-weight schedules are not supported); a ``w`` that does not
+        require grad is never added to.  Not supported (``NotImplementedError``)
+        under ``torch.jit.trace``, ``torch.compile`` and a ``create_graph``
+        backward; under a reentrant checkpoint ``w`` arrives detached, without
+        ``main_grad`` (``ValueError``).
 
     Returns
     -------
@@ -189,13 +313,35 @@ def cake_grouped_mm(
         built-in op.
     """
     _require_deterministic_false(deterministic, "cake_grouped_mm")
+    _require_flag(fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "cake_grouped_mm")
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         raise ValueError(f"x and w must be bfloat16 (got {x.dtype} and {w.dtype})")
     if torch.jit.is_tracing() or torch.compiler.is_compiling():
+        if fuse_wgrad_accumulation:
+            # A backward that writes a tensor the graph does not return is invisible to a trace and
+            # to AOTAutograd.
+            raise NotImplementedError(
+                "cake_grouped_mm: fuse_wgrad_accumulation=True is not supported under torch.jit.trace "
+                "or torch.compile"
+            )
         # A trace records ``apply`` only, and Dynamo cannot lift the deferred
         # launch out of a checkpointed region: keep the launch inside ``forward``.
         return CakeGroupedMm.apply(x, w, offs, deterministic)
+    # Only a call that autograd records needs ``main_grad`` before the backward, so it is
+    # checked here, where grad mode is the caller's (``forward`` runs with it off): not
+    # under ``no_grad`` or inference mode, and not in a checkpoint recompute inside a
+    # backward, whose ``w`` may lack ``main_grad`` (the original forward's backward checks).
+    if (
+        fuse_wgrad_accumulation
+        and w.requires_grad
+        and torch.is_grad_enabled()
+        and not _in_backward()
+    ):
+        _main_grad(w, "cake_grouped_mm")
     # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
-    y = CakeGroupedMm.apply(x, w, offs, deterministic, _DEFER_FWD)
+    if fuse_wgrad_accumulation:
+        y = CakeGroupedMm.apply(x, w, offs, deterministic, _DEFER_FWD, True)
+    else:
+        y = CakeGroupedMm.apply(x, w, offs, deterministic, _DEFER_FWD)
     _fill_fwd(x, w, offs, y)
     return y

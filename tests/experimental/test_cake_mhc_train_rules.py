@@ -27,8 +27,9 @@ and record scalars of every hidden size on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
-  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records and its
-  token owner's group-row forms, renamed and otherwise equal field for field
+  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records, its
+  token owner's group-row forms and its activation-checkpoint carry (role
+  ``fn_split_carry``), renamed and otherwise equal field for field
   (a per-CTA token owner may select by the ``R`` regimes of its program where
   the deterministic record names that program), plus the programs of this
   package: at hidden 4096 ``cake_mhc_train_fn_split_atomic__tv128_dep`` on
@@ -36,7 +37,7 @@ and record scalars of every hidden size on its boards of record
   sm_107a, ``cake_mhc_train_bwd_slab_atomic__dynr`` and
   ``cake_mhc_train_bwd_slab_atomic__lpt`` on all three and their slab-fastest
   copies ``cake_mhc_train_bwd_slab_atomic__dynr_os`` /
-  ``cake_mhc_train_bwd_slab_atomic__lpt_os`` on sm_100a / sm_103a; at 5120
+  ``cake_mhc_train_bwd_slab_atomic__lpt_os`` on all three too; at 5120
   and 7168 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
   ``cake_mhc_train_bwd_slab_atomic__dynr__h<H>`` and
   ``cake_mhc_train_bwd_slab_atomic__dynr_os__h<H>`` on sm_100a / sm_103a and
@@ -46,17 +47,18 @@ and record scalars of every hidden size on its boards of record
   replace (the fn splits with the static PDL attribute: they follow the
   token-owner pass), and each ``_os`` record is its base record of the same
   size under its own name and program, on the architectures of its base record
-  whose ``BWD_SLAB_ORDER`` of the size has a ``"slab"`` band (none on sm_107a);
+  whose ``BWD_SLAB_ORDER`` of the size, or a board cell of
+  ``BWD_SLAB_ORDER_OVERRIDES`` at the size, has a ``"slab"`` band (on sm_107a
+  the cell of the 212-SM board alone);
 * no record, route, record scalar or PDL edge names a deterministic library;
 * every route and the selection on every route equal the deterministic ones,
   except ``bwd_finish``: the deterministic token-owner records, the atomic fn
   split of the architecture and size, the column slab's forms (one per call by
   ``bwd_slab_atomic_program``: ``dynr``, ``lpt``, ``dynr_os`` and ``lpt_os`` at
-  hidden 4096 on sm_100a / sm_103a and at 5120 and 7168 on sm_100a; ``dynr``
-  and ``lpt`` on sm_107a, whose unit order is ``"chunk"`` at every token count;
-  on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no reduction; every
-  program the column slab's tables can name has a record on the route, and
-  every ``_os`` record a band of the tables that names it;
+  hidden 4096 on every architecture and at 5120 and 7168 on sm_100a; on
+  sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no reduction; every
+  program the column slab's tables and board cells can name has a record on
+  the route, and every ``_os`` record a band of them that names it;
 * the PDL bands without an SM count are the deterministic ones; this package's
   own bands (``PDL_BAND_OVERRIDES``, B200 with 148 SMs only) replace them on
   that board alone, the most specific key first (the order of the keys under a
@@ -68,11 +70,18 @@ and record scalars of every hidden size on its boards of record
   the per-size tables the deterministic ones without the column-slab,
   reduction and group-row tables), but this package's own column-slab rule
   (``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``,
-  ``lpt_chunks``, ``bwd_slab_order``, ``bwd_slab_atomic_program``,
-  ``slab_plan``; ``host_plan`` itself is the deterministic one without its
-  group-row keys): its geometries, its token-count bands (the unit order of
-  record, and the banded calibration form under a test table) and its
-  selection at every hidden size (where the size's table calibrates the
+  ``BWD_SLAB_ORDER_OVERRIDES``, ``BWD_SLAB_LPT_OVERRIDES``, ``lpt_chunks``,
+  ``bwd_slab_order``, ``bwd_slab_atomic_program``, ``slab_plan``;
+  ``host_plan`` itself is the deterministic one without its group-row keys):
+  its geometries, its token-count bands (the unit order of record, and the
+  banded calibration form under a test table), its board cells (those of
+  record: sm_107a with 212 SMs at 4096, and the order cell of sm_103a with 152
+  SMs at 7168, whose ``"slab"`` bands below 63092 hold column-slab chunk counts
+  of at least 19; the exact key ``(arch, SM count, hidden)`` under a test
+  table; every other board, the 212-SM board to 1876 tokens and the 152-SM
+  board outside those ``"slab"`` bands, selecting and planning as without
+  them, also in the route plans) and
+  its selection at every hidden size (where the size's table calibrates the
   architecture: every architecture at 4096, sm_100a at 5120 and 7168; elsewhere
   the one-size chunks of ``k7_chunks`` without running the screen), its
   call-time lookup and a workspace envelope that never runs its screen;
@@ -149,10 +158,11 @@ ATOMIC = {
         f"cake_mhc_train_bwd_slab_atomic__lpt__h{hidden}": NEW_HIDDEN_LPT_ARCHES
         for hidden in NEW_HIDDEN_SIZES
     },
-    # The slab-fastest copies, on the architectures whose BWD_SLAB_ORDER bands of the size hold a "slab" band
-    # (lpt_os where the size's two-size calibration of the architecture is not None too).
-    "cake_mhc_train_bwd_slab_atomic__dynr_os": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab_atomic__lpt_os": ("sm_100a", "sm_103a"),
+    # The slab-fastest copies, on the architectures whose BWD_SLAB_ORDER bands of the size, or a board cell of
+    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band (lpt_os where the size's
+    # two-size calibration of the architecture is not None too).
+    "cake_mhc_train_bwd_slab_atomic__dynr_os": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_bwd_slab_atomic__lpt_os": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_slab_atomic__dynr_os__h5120": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab_atomic__lpt_os__h5120": ("sm_100a",),
     "cake_mhc_train_bwd_slab_atomic__dynr_os__h7168": ("sm_100a", "sm_103a"),
@@ -168,7 +178,7 @@ DET_DYNR = "cake_mhc_det_train_bwd_slab__dynr"
 # "chunk" to 2047 / 5108 tokens at hidden 4096 / 7168 and "slab" above, "slab" at every token count at 5120; on
 # sm_103a "chunk" to 13278 / 28825 / 63091 tokens at hidden 4096 / 5120 / 7168 and "slab" above; "chunk" at every size
 # on sm_107a, which routes neither 5120 nor 7168) and the two-size calibration at hidden 4096 (BWD_SLAB_LPT: one
-# (o_tiles, keep) per architecture).
+# (o_tiles, keep) per architecture); the board cells of record replace both on their board alone (below).
 ORDER = {
     4096: {
         "sm_100a": ((2047, "chunk"), (None, "slab")),
@@ -187,6 +197,113 @@ ORDER = {
     },
 }
 LPT_OF_RECORD = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5, 0.97)}
+# The board cells of record (BWD_SLAB_ORDER_OVERRIDES / BWD_SLAB_LPT_OVERRIDES, keyed (arch, SM count, hidden)): R200
+# with 212 SMs at hidden 4096 keeps the chunk order and (0.5, 0.97) to 1876 tokens, then runs the slab order with (0.5,
+# 0.985) to 33600 tokens, (0.5, 0.98) to 34368 and (0.5, 0.97) above; GB300 (sm_103a with 152 SMs) at hidden 7168 has an
+# order cell alone (no lpt record of the size there): the chunk order to 33792 tokens, then the slab order on 47 of the
+# 48 token-count segments in 33793..63091 whose column-slab chunk count is at least 19 (GB300_CELL_MIN_P; GB300_CELL_TIE
+# keeps the chunk order), its last band from 62465 running into the table's slab band from 63092.
+ORDER_OVERRIDES = {
+    ("sm_107a", 212, 4096): ((1876, "chunk"), (None, "slab")),
+    ("sm_103a", 152, 7168): (
+        (33792, "chunk"),
+        (34048, "slab"),
+        (35264, "chunk"),
+        (35328, "slab"),
+        (36096, "chunk"),
+        (36480, "slab"),
+        (36608, "chunk"),
+        (36800, "slab"),
+        (37376, "chunk"),
+        (37696, "slab"),
+        (37888, "chunk"),
+        (38016, "slab"),
+        (38144, "chunk"),
+        (38272, "slab"),
+        (38400, "chunk"),
+        (38912, "slab"),
+        (39424, "chunk"),
+        (40128, "slab"),
+        (40960, "chunk"),
+        (41344, "slab"),
+        (41984, "chunk"),
+        (42688, "slab"),
+        (43008, "chunk"),
+        (43200, "slab"),
+        (43264, "chunk"),
+        (44160, "slab"),
+        (44544, "chunk"),
+        (44992, "slab"),
+        (45312, "chunk"),
+        (46208, "slab"),
+        (46592, "chunk"),
+        (46656, "slab"),
+        (46848, "chunk"),
+        (47424, "slab"),
+        (48128, "chunk"),
+        (48640, "slab"),
+        (49152, "chunk"),
+        (50112, "slab"),
+        (50432, "chunk"),
+        (51072, "slab"),
+        (51200, "chunk"),
+        (51584, "slab"),
+        (51712, "chunk"),
+        (52288, "slab"),
+        (52480, "chunk"),
+        (53568, "slab"),
+        (54016, "chunk"),
+        (54720, "slab"),
+        (55040, "chunk"),
+        (55936, "slab"),
+        (56320, "chunk"),
+        (57536, "slab"),
+        (57600, "chunk"),
+        (59584, "slab"),
+        (59904, "chunk"),
+        (60800, "slab"),
+        (61184, "chunk"),
+        (62208, "slab"),
+        (62464, "chunk"),
+        (None, "slab"),
+    ),
+}
+LPT_OVERRIDES = {
+    ("sm_107a", 212, 4096): (
+        (1876, (0.5, 0.97)),
+        (33600, (0.5, 0.985)),
+        (34368, (0.5, 0.98)),
+        (None, (0.5, 0.97)),
+    ),
+}
+# The GB300 order cell and the token counts it changes: BWD_SLAB_ORDER of sm_103a at 7168 runs the chunk order to
+# 63091 tokens and the slab order above, so the cell differs from it in its "slab" bands in GB300_CELL_SPAN alone, at
+# GB300_CELL_SLAB_T token counts, each with a column-slab chunk count (k7_chunks at 152 SMs and hidden 7168) of at
+# least GB300_CELL_MIN_P: the chunk counts at which the slab order was measured faster there.
+GB300_CELL = ("sm_103a", 152, 7168)
+GB300_CELL_SPAN = (33793, 63091)
+GB300_CELL_SLAB_T = 18355
+GB300_CELL_MIN_P = 19
+# The one segment of chunk count 19 in GB300_CELL_SPAN that keeps the chunk order (it read a tie on the second node).
+GB300_CELL_TIE = (34817, 35264)
+# The boards the column slab's board cells are checked on: the boards of record (the deterministic package's
+# RULES_BOARDS, shared with it: 208 and 216 SMs on sm_107a; GB300, the board of the order cell at 7168, is one) and
+# R200 with 212 SMs, the board of the cells of record at 4096.
+SLAB_BOARDS = (*det.RULES_BOARDS, ("sm_107a", 212))
+# Both sides of every band edge of the board cells of record, and of the table band the GB300 cell runs into.
+OVERRIDE_EDGES = tuple(
+    sorted(
+        {
+            t + side
+            for cells in (ORDER_OVERRIDES, LPT_OVERRIDES)
+            for cell in cells.values()
+            for t, _value in cell
+            if t is not None
+            for side in (0, 1)
+        }
+        | {GB300_CELL_SPAN[1], GB300_CELL_SPAN[1] + 1}
+    )
+)
 # The lpt record's chunk scalars (cake_jit.slab_plan), in kernel-parameter order (P, rpc, p_big, rpc_small).
 LPT_HOST_KEYS = (
     "lpt_parts",
@@ -201,9 +318,12 @@ LPT_SWEEP = tuple(
 )
 # The kernel test's screen calibration (o_tiles, keep), the working value the rule is exercised at on every board.
 LPT_SCREEN = (1.0, 0.99)
-# The 19 benchmark token counts of the BWD_SLAB_LPT calibration, and per board the geometries the table of record picks
-# there (the token counts its comment names; every other one keeps the one-size form: dynr, or dynr_os where the
-# BWD_SLAB_ORDER band is "slab").
+# The 19 benchmark token counts of the BWD_SLAB_LPT calibration, and per board the geometries the tables of record pick
+# there (on sm_100a / sm_103a the token counts the comment of BWD_SLAB_LPT names; on sm_107a with 212 SMs, under its
+# board cell, those of (0.5, 0.97), which the cell keeps to 1876 tokens (1024; 1536 fires under neither) and whose
+# geometries its band (0.5, 0.985) keeps at 2048 / 2560 / 3072 / 3584 (the screen's best geometry does not depend on
+# keep), and 15566 / 15590 / 16263 / 32768, which that band adds; every other one keeps the one-size form: dynr, or
+# dynr_os where the board's unit-order band is "slab").
 BENCH_T = (1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 8192, 14928, 15288, 15566, 15590, 16114, 16132, 16164,
            16263, 32768, 65536)  # fmt: skip
 LPT_FIRES = (
@@ -214,7 +334,8 @@ LPT_FIRES = (
                       14928: (8, 2112, 7, 192), 15288: (10, 2048, 7, 320), 16132: (10, 2176, 7, 320),
                       16164: (10, 2176, 7, 320), 16263: (8, 2304, 7, 192)}),
     ("sm_107a", 212, {1024: (4, 320, 3, 64), 2048: (4, 640, 3, 128), 2560: (4, 832, 3, 64), 3072: (4, 960, 3, 192),
-                      3584: (4, 1152, 3, 128)}),
+                      3584: (4, 1152, 3, 128), 15566: (18, 1152, 13, 128), 15590: (18, 1152, 13, 128),
+                      16263: (17, 1216, 13, 128), 32768: (14, 2496, 13, 320)}),
 )  # fmt: skip
 # At hidden 5120 and 7168, the token counts the two-size rule of the size is pinned at (the benchmark token counts and
 # 24576), and per board and size the geometries the table of record (BWD_SLAB_LPT_HIDDEN) picks there: on B200 the
@@ -232,6 +353,10 @@ LPT_FIRES_HIDDEN = (
 # splits, whose libraries the forward does not share, have no copy either).
 DROPPED = (DET_PREFIX + "bwd_slab__", DET_PREFIX + "bwd_reduce__")
 DROPPED_ROLES = ("bwd_slab", "bwd_reduce")
+# The deterministic activation-checkpoint carry, which this package does not copy either (its checkpointed backward
+# keeps its atomic fn split): the role of the dual-layout fn split the carry launches, and the carry's table and rules.
+CARRY_ROLES = ("fn_split_carry",)
+CARRY_RULES = ("FN_SPLIT_CARRY", "fn_split_carry", "carried_modules")
 # The deterministic group-row forms, which this package does not copy either (its column slab folds the token owner's
 # per-CTA partials): the token-owner records whose program ends in GROUP_ROWS (the reduction's "_trows" forms go with
 # the dropped reduction), the per-size table and rule that select them (BWD_ROW_BANDS, bwd_group_rows) and the host-plan
@@ -392,11 +517,32 @@ def _calibration_at(entry, T: int):
     return _band_at(T, entry)
 
 
+def _order_cell(arch: str, sm: int | None, hidden: int = HIDDEN) -> tuple:
+    """The unit-order bands a call on ``arch`` with ``sm`` SMs (``None``: no SM count) at ``hidden`` reads at call
+    time: the cell of ``BWD_SLAB_ORDER_OVERRIDES`` under the exact key ``(arch, sm, hidden)``, else the size's
+    ``BWD_SLAB_ORDER`` entry of the architecture."""
+    key = (arch, sm, hidden)
+    if sm is not None and key in nd.BWD_SLAB_ORDER_OVERRIDES:
+        return nd.BWD_SLAB_ORDER_OVERRIDES[key]
+    return nd.BWD_SLAB_ORDER[hidden][arch]
+
+
+def _lpt_cell(arch: str, sm: int | None, hidden: int = HIDDEN):
+    """The two-size calibration entry a call on ``arch`` with ``sm`` SMs (``None``: no SM count) at ``hidden`` reads at
+    call time: the cell of ``BWD_SLAB_LPT_OVERRIDES`` under the exact key ``(arch, sm, hidden)``, else the size's
+    table entry of the architecture (:func:`_lpt_table`)."""
+    key = (arch, sm, hidden)
+    if sm is not None and key in nd.BWD_SLAB_LPT_OVERRIDES:
+        return nd.BWD_SLAB_LPT_OVERRIDES[key]
+    return _lpt_table(hidden)[arch]
+
+
 def _program_at(T: int, sm: int, arch: str, hidden: int = HIDDEN) -> str:
     """The column slab's program at ``T`` under the tables read at call time: ``lpt`` where ``lpt_chunks`` gives a
-    geometry, else ``dynr``; ``_os`` appended where the size's ``BWD_SLAB_ORDER`` band of ``T`` is ``"slab"``."""
+    geometry, else ``dynr``; ``_os`` appended where the board's unit-order band of ``T`` (:func:`_order_cell`) is
+    ``"slab"``."""
     base = "lpt" if nd.lpt_chunks(T, sm, arch, hidden=hidden) else "dynr"
-    order = _band_at(T, nd.BWD_SLAB_ORDER[hidden][arch])
+    order = _band_at(T, _order_cell(arch, sm, hidden))
     return base + ("_os" if order == "slab" else "")
 
 
@@ -503,13 +649,15 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     None
 ):
     """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*``, the
-    backward fn splits and the token owner's group-row forms (``DET_GROUP_ROWS``) under the ``cake_mhc_train_`` prefix
+    backward fn splits, the checkpoint carry's records (``CARRY_ROLES``) and the token owner's group-row forms
+    (``DET_GROUP_ROWS``) under the ``cake_mhc_train_`` prefix
     (the record equal field for field after the rename: arches, hidden size, build knobs, launch, arguments, rules;
     a token-owner record whose deterministic rule names its program through ``bwd_token_program`` may select by the
     ``R`` regimes of that program instead, ``chunk_rows_band``: the same calls on its architectures, which have no
     token-count band, outside the group-row bands) plus the programs of this package (``ATOMIC``); the dropped records
-    are exactly the deterministic column-slab and reduction roles, and the backward fn splits and the group-row token
-    owners are the only other records without a copy (no record of this package names a group-row program)."""
+    are exactly the deterministic column-slab and reduction roles, and the backward fn splits, the carry records and
+    the group-row token owners are the only other records without a copy (no record of this package names a
+    group-row program or has a carry role, and the carry's table and rules, ``CARRY_RULES``, have no copy)."""
     assert tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
     assert {record["hidden"] for record in DET_MODULES.values()} == set(HIDDEN_SIZES)
     assert DET_MODULES == det.MODULES
@@ -524,12 +672,15 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
         name for name in DET_MODULES if _det_role(name) == "fn_split_bwd"
     }
     assert backward_splits and not backward_splits & dropped
+    carries = {name for name in DET_MODULES if _det_role(name) in CARRY_ROLES}
+    assert carries and not carries & dropped
     assert {_det_role(name) for name in DET_GROUP_ROWS} <= {"bwd_token"}
     copied = {
         _renamed(name): name
         for name in DET_MODULES
         if name not in dropped
         and name not in backward_splits
+        and name not in carries
         and name not in DET_GROUP_ROWS
     }
     assert all(name.startswith(ND_PREFIX) for name in copied)
@@ -537,6 +688,11 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     expected = set(copied) | set(ATOMIC)
     assert set(nd.MODULES) == expected, sorted(set(nd.MODULES) ^ expected)
     assert not [name for name in nd.MODULES if GROUP_ROWS in name]
+    assert not [
+        name for name, record in nd.MODULES.items() if record["role"] in CARRY_ROLES
+    ]
+    for name in CARRY_RULES:
+        assert hasattr(det, name) and not hasattr(nd, name), name
     for name, det_name in copied.items():
         record, reference = nd.MODULES[name], _renamed(det.MODULES[det_name])
         rule = reference["select_rule"]
@@ -570,15 +726,16 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
     arguments without ``dfn_part`` and adds ``dfn``, ``param_partial``, ``dscale``, ``dbase``, ``chunks`` and
     ``accumulate``.  At every hidden size the column slab's records select by ``bwd_slab_atomic_program`` (programs
     ``dynr`` / ``lpt`` / ``dynr_os`` / ``lpt_os``: the last ``__`` part of the name without the size suffix; on
-    sm_107a, whose route holds the ``dynr`` and ``lpt`` records, and on sm_103a at 5120 and 7168, whose route holds
-    the ``dynr`` and ``dynr_os`` records, the rule names one of these at every token count); the ``lpt`` record of a
-    size is its ``dynr`` record with the ``lpt_chunks`` chunk rule, its chunk scalars ``P`` / ``rpc`` bound to the
-    ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after the ticket, on the architectures the size's table
-    calibrates (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168: a calibration without the record
-    would select no column slab, a record without one would never run); the ``dynr_os`` / ``lpt_os`` record of a size,
-    where the size has one, is its ``dynr`` / ``lpt`` record (the slab-fastest build has the same kernel parameters,
-    launch and chunk rule) under its own name and program key, on the architectures of that record whose
-    ``BWD_SLAB_ORDER`` of the size has a ``"slab"`` band."""
+    sm_103a at 5120 and 7168, whose route holds the ``dynr`` and ``dynr_os`` records, the rule names one of these at
+    every token count, and on sm_107a the ``_os`` ones only on the board of its cell of ``BWD_SLAB_ORDER_OVERRIDES``);
+    the ``lpt`` record of a size is its ``dynr`` record with the ``lpt_chunks`` chunk rule, its chunk scalars ``P`` /
+    ``rpc`` bound to the ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after the ticket, on the architectures
+    the size's table calibrates (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168: a calibration
+    without the record would select no column slab, a record without one would never run); the ``dynr_os`` /
+    ``lpt_os`` record of a size, where the size has one, is its ``dynr`` / ``lpt`` record (the slab-fastest build has
+    the same kernel parameters, launch and chunk rule) under its own name and program key, on the architectures of
+    that record whose ``BWD_SLAB_ORDER`` of the size, or a board cell of ``BWD_SLAB_ORDER_OVERRIDES`` at the size,
+    has a ``"slab"`` band."""
     for name, arches in ATOMIC.items():
         record = nd.MODULES[name]
         hidden = record["hidden"]
@@ -775,9 +932,8 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
     """``ROUTES``: the deterministic architectures and route keys of every hidden size (5120 and 7168 on sm_100a /
     sm_103a only); every route the renamed deterministic route except ``bwd_finish``, which is the deterministic
     token-owner records but the group-row forms (renamed, in route order), the atomic fn split of the architecture
-    and size and the column slab's forms of the size (``dynr``, ``lpt``, ``dynr_os``, ``lpt_os``; on sm_107a ``dynr``
-    and ``lpt``; on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``).  Every record is routed, on exactly its
-    architectures."""
+    and size and the column slab's forms of the size (``dynr``, ``lpt``, ``dynr_os``, ``lpt_os``; on sm_103a at 5120
+    and 7168 ``dynr`` and ``dynr_os``).  Every record is routed, on exactly its architectures."""
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
@@ -827,10 +983,10 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
     run-time counts: every kind selects the renamed deterministic records of the per-CTA rules (:func:`_det_per_cta`),
     except ``bwd_finish``: (the deterministic token-owner record(s) of the call renamed, the atomic fn split of the
     size, the column slab's form of the call -- the size's ``lpt`` record where ``lpt_chunks`` gives a geometry of the
-    size under the table of record, else its ``dynr`` record, as its ``_os`` copy where the size's ``BWD_SLAB_ORDER``
-    band is ``"slab"``) -- one fn split, one column slab, no reduction.  The deterministic selection of record holds
-    the group-row form (``GROUP_ROWS``) of that token owner's program where ``bwd_group_rows`` holds at the count of
-    record, that token owner itself everywhere else."""
+    size under the table of record, else its ``dynr`` record, as its ``_os`` copy where the board's unit-order band
+    is ``"slab"``: :func:`_program_at`) -- one fn split, one column slab, no reduction.  The deterministic selection
+    of record holds the group-row form (``GROUP_ROWS``) of that token owner's program where ``bwd_group_rows`` holds
+    at the count of record, that token owner itself everywhere else."""
     for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in T_VALUES):
         for iters in (det.SINKHORN_ITERS, *RUN_TIME_ITERS):
             for kind in det.KINDS:
@@ -879,32 +1035,82 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                     assert shipped == per_cta, (what, shipped)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arch", "sm"), (*det.RULES_BOARDS, ("sm_100a", 152), ("sm_103a", 148))
+)
+def test_x_hint_band_edges_follow_the_deterministic_rule(arch: str, sm: int) -> None:
+    """On both sides of every edge of the deterministic ``FWD_MAP_XNRM`` bands (the token counts where the mapping
+    pass runs its program's ``_xn`` form, whose X loads carry the L2 hint EVICT_NORMAL: at hidden 4096 on sm_100a,
+    sm_103a and sm_107a, none at 5120 / 7168), on the boards of record, GB200 (sm_100a with 152 SMs) and B300
+    (sm_103a with 148 SMs), at every hidden size of the architecture: ``fwd_map_program`` is the deterministic
+    program, an ``_xn`` form exactly inside a band of the size, and ``fwd_prepare`` / ``fwd_recompute`` select the
+    renamed deterministic records, whose mapping-pass record runs an ``_xn`` library exactly there."""
+    assert nd.FWD_MAP_XNRM == det.FWD_MAP_XNRM
+    edges = {
+        t
+        for hidden in HIDDEN_SIZES
+        for bands in det._tab("FWD_MAP_XNRM", hidden).values()
+        for above, at_most in bands
+        for t in (above, above + 1, at_most, at_most + 1)
+    }
+    assert edges
+    for hidden in _arch_sizes(arch):
+        bands = det._tab("FWD_MAP_XNRM", hidden)[arch]
+        for T in sorted(t for t in edges if t > 0):
+            what = (arch, sm, hidden, T)
+            inside = any(above < T <= at_most for above, at_most in bands)
+            program = nd.fwd_map_program(T, sm, arch, hidden)
+            assert program == det.fwd_map_program(T, sm, arch, hidden), what
+            assert program.endswith("_xn") == inside, (what, program)
+            for kind in ("fwd_prepare", "fwd_recompute"):
+                names = nd.selected_modules(arch, hidden, kind, rows=T, sm_count=sm)
+                det_names = det.selected_modules(
+                    arch, hidden, kind, rows=T, sm_count=sm
+                )
+                assert names == tuple(_renamed(n) for n in det_names), (what, kind)
+                maps = [n for n in names if nd.MODULES[n]["role"] == "fwd_map"]
+                assert maps and all(
+                    nd.MODULES[n]["library"].endswith("_xn") == inside for n in maps
+                ), (what, kind, maps)
+
+
 def _possible_programs(arch: str, hidden: int) -> set[str]:
     """The programs ``bwd_slab_atomic_program`` can name on ``arch`` at ``hidden`` under the tables read at call
-    time: on each stretch of token counts where both the size's ``BWD_SLAB_ORDER`` band and its calibration band are
-    constant, ``dynr`` (the screen may pick no geometry) and ``lpt`` where the calibration is not ``None``, each with
-    ``_os`` where the order is ``"slab"``."""
-    order = nd.BWD_SLAB_ORDER[hidden][arch]
-    entry = _lpt_table(hidden)[arch]
-    bands = entry if entry is not None and isinstance(entry[0], tuple) else ()
-    edges = sorted({t for t, _ in (*order, *bands) if t is not None})
+    time, on every board: the size's ``BWD_SLAB_ORDER`` and calibration entries (every SM count without a board cell)
+    and, per SM count with a board cell of the size in ``BWD_SLAB_ORDER_OVERRIDES`` or ``BWD_SLAB_LPT_OVERRIDES``, the
+    pair the board resolves (:func:`_order_cell`, :func:`_lpt_cell`; a board reads its two cells together, never one
+    board's order with another's calibration).  Per pair, on each stretch of token counts where both its order band
+    and its calibration band are constant, ``dynr`` (the screen may pick no geometry) and ``lpt`` where the
+    calibration is not ``None``, each with ``_os`` where the order is ``"slab"``."""
+    boards = {None} | {
+        sm
+        for cells in (nd.BWD_SLAB_ORDER_OVERRIDES, nd.BWD_SLAB_LPT_OVERRIDES)
+        for a, sm, h in cells
+        if (a, h) == (arch, hidden)
+    }
     programs = set()
-    for T in (1, *(t + 1 for t in edges)):
-        suffix = "_os" if _band_at(T, order) == "slab" else ""
-        programs.add("dynr" + suffix)
-        if _calibration_at(entry, T) is not None:
-            programs.add("lpt" + suffix)
+    for sm in boards:
+        order, entry = _order_cell(arch, sm, hidden), _lpt_cell(arch, sm, hidden)
+        bands = entry if entry is not None and isinstance(entry[0], tuple) else ()
+        edges = sorted({t for t, _ in (*order, *bands) if t is not None})
+        for T in (1, *(t + 1 for t in edges)):
+            suffix = "_os" if _band_at(T, order) == "slab" else ""
+            programs.add("dynr" + suffix)
+            if _calibration_at(entry, T) is not None:
+                programs.add("lpt" + suffix)
     return programs
 
 
 @pytest.mark.cpu_only
 def test_slab_tables_route_every_program_they_name() -> None:
     """On every architecture and routed hidden size: every program the column slab's tables can name (``BWD_SLAB_LPT`` /
-    ``BWD_SLAB_LPT_HIDDEN`` with ``BWD_SLAB_ORDER``) has its record on the ``bwd_finish`` route (a program without one
-    would select no column slab), one record per program; and every ``_os`` record on the route is one the tables can
-    name: ``dynr_os`` needs a ``"slab"`` band of the size, ``lpt_os`` a calibration band other than ``None`` that
-    overlaps one.  A size an architecture does not route has ``"chunk"`` bands alone (a ``"slab"`` band would name a
-    slab-fastest program that has no record there)."""
+    ``BWD_SLAB_LPT_HIDDEN`` with ``BWD_SLAB_ORDER``, and on each board with a cell of ``BWD_SLAB_ORDER_OVERRIDES`` /
+    ``BWD_SLAB_LPT_OVERRIDES`` its two cells: :func:`_possible_programs`) has its record on the ``bwd_finish`` route
+    (a program without one would select no column slab), one record per program; and every ``_os`` record on the
+    route is one they can name: ``dynr_os`` needs a ``"slab"`` band of the size, ``lpt_os`` a calibration band other
+    than ``None`` that overlaps one on the same board.  A size an architecture does not route has ``"chunk"`` bands
+    alone (a ``"slab"`` band would name a slab-fastest program that has no record there)."""
     for hidden, by_arch in nd.BWD_SLAB_ORDER.items():
         for arch, bands in by_arch.items():
             if hidden not in _arch_sizes(arch):
@@ -1496,7 +1702,7 @@ _SHARED_TABLES = (
     "GSTATS_COLS", "TOKP_COLS", "DZP_COLS", "PARAM_COLS", "TICKET_WORDS", "STATS_LAYOUT", "GSTATS_LAYOUT",
     "TOKP_LAYOUT", "PARAM_LAYOUT", "RULES_SM_COUNTS", "RULES_BOARDS", "RULES_T_VALUES", "PK_BANDS",
     "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT", "FWD_MAP_CLAIM",
-    "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "K5_GRID_BANDS",
+    "FWD_MAP_XNRM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "K5_GRID_BANDS",
     "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS", "FWD_FINISH_COL_SPLIT", "K3_TILING",
     "K6_CTAS_PER_SM", "PDL_PATHS", "SELECT_RULE_KINDS", "RUN_TIME_ITERS_ROLES",
 )  # fmt: skip
@@ -1510,6 +1716,8 @@ _OWN_RULES = (
     "BWD_SLAB_LPT",
     "BWD_SLAB_LPT_HIDDEN",
     "BWD_SLAB_ORDER",
+    "BWD_SLAB_ORDER_OVERRIDES",
+    "BWD_SLAB_LPT_OVERRIDES",
     "lpt_chunks",
     "bwd_slab_order",
     "bwd_slab_atomic_program",
@@ -1526,9 +1734,9 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     group-row keys) on every token count of record; the deterministic column-slab, reduction and group-row rules
     (``GROUP_ROW_RULES``) are absent and ``PROGRAM_RULES`` drops the first two for this package's column-slab rule
     (``bwd_slab_atomic_program``, with ``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``,
-    ``lpt_chunks``, ``bwd_slab_order`` and ``slab_plan``: none of them in the deterministic registry); a rules row is
-    the deterministic row without its column-slab and reduction program columns, with this package's backward
-    workspace bytes."""
+    ``BWD_SLAB_ORDER_OVERRIDES``, ``BWD_SLAB_LPT_OVERRIDES``, ``lpt_chunks``, ``bwd_slab_order`` and ``slab_plan``:
+    none of them in the deterministic registry); a rules row is the deterministic row without its column-slab and
+    reduction program columns, with this package's backward workspace bytes."""
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
     # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
@@ -1603,7 +1811,8 @@ def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
     package's backward workspace bytes, on every token count of record; the host plan and every copied rule give the
     deterministic per-CTA outputs (:func:`_det_per_cta`; the host plan without its group-row keys); the per-size
     tables are read through ``_tab`` (a size it does not spell is a ``KeyError``, never the H 4096 value; the column
-    slab's ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` / ``BWD_SLAB_ORDER`` are no per-size tables of ``_tab``).
+    slab's ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` / ``BWD_SLAB_ORDER`` and its board cells
+    ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` are no per-size tables of ``_tab``).
     ``rules_table()`` holds the H 4096 rows, then each other size's."""
     dropped_columns = {"bwd_slab_program", "bwd_reduce_program", "bwd_reduce_grid"}
     for hidden in NEW_HIDDEN_SIZES:
@@ -1652,7 +1861,13 @@ def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
         assert nd._tab(name, HIDDEN) is getattr(nd, name), name
         with pytest.raises(KeyError):
             nd._tab(name, 6144)
-    for name in ("BWD_SLAB_LPT", "BWD_SLAB_LPT_HIDDEN", "BWD_SLAB_ORDER"):
+    for name in (
+        "BWD_SLAB_LPT",
+        "BWD_SLAB_LPT_HIDDEN",
+        "BWD_SLAB_ORDER",
+        "BWD_SLAB_ORDER_OVERRIDES",
+        "BWD_SLAB_LPT_OVERRIDES",
+    ):
         for hidden in HIDDEN_SIZES:
             with pytest.raises(KeyError):
                 nd._tab(name, hidden)
@@ -1722,12 +1937,14 @@ def test_launch_grids_at_the_new_hidden_sizes(arch: str, sm: int, monkeypatch) -
 
 # ----------------------------------------------------------------------------------------------------------------
 # The column slab's two-size rule and unit order (this package's own: BWD_SLAB_LPT, BWD_SLAB_LPT_HIDDEN,
-# BWD_SLAB_ORDER, lpt_chunks, bwd_slab_order, bwd_slab_atomic_program, slab_plan)
+# BWD_SLAB_ORDER, BWD_SLAB_ORDER_OVERRIDES, BWD_SLAB_LPT_OVERRIDES, lpt_chunks, bwd_slab_order,
+# bwd_slab_atomic_program, slab_plan)
 
 
 def _clear_plans() -> None:
     """Drop the package's cached route plans (an experiment that edits ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` /
-    ``BWD_SLAB_ORDER`` or replaces ``lpt_chunks`` clears them on entry and exit)."""
+    ``BWD_SLAB_ORDER`` / ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` or replaces ``lpt_chunks`` clears
+    them on entry and exit)."""
     pkg._PLANS.clear()
     pkg._FAST_ROUTES.clear()
 
@@ -1780,13 +1997,13 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
     the size's table of record (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168) and under the
     kernel test's screen ``(1.0, 0.99)`` where the architecture has the size's ``lpt`` record: ``None`` never fires;
     ``bwd_slab_atomic_program`` is ``lpt`` exactly where ``lpt_chunks`` gives a geometry, else ``dynr``, with ``_os``
-    where the size's ``BWD_SLAB_ORDER`` band is ``"slab"``, and the selection holds that one column-slab record of the
-    size; ``slab_plan`` is the geometry, else the one-size chunks of ``host_plan``.  A geometry is 64-token
-    multiples, ``1 <= p_big <= P <= 32``, big chunks within six tiles under the one-size chunks, covering the tokens:
-    two sizes (the big chunks leave tokens, a smaller small chunk) or one (``p_big = P``, the last chunk holding
-    tokens); its list-scheduling makespan over the size's ``H / 64`` slabs (a scheduler of this test) is at most
-    ``keep`` times the one-size chunks'.  The firing token counts are printed; under the screen the rule fires on B200
-    (148 SMs) at every size."""
+    where the board's unit-order band (:func:`_order_cell`: the size's ``BWD_SLAB_ORDER``, or the board's cell) is
+    ``"slab"``, and the selection holds that one column-slab record of the size; ``slab_plan`` is the geometry, else
+    the one-size chunks of ``host_plan``.  A geometry is 64-token multiples, ``1 <= p_big <= P <= 32``, big chunks
+    within six tiles under the one-size chunks, covering the tokens: two sizes (the big chunks leave tokens, a smaller
+    small chunk) or one (``p_big = P``, the last chunk holding tokens); its list-scheduling makespan over the size's
+    ``H / 64`` slabs (a scheduler of this test) is at most ``keep`` times the one-size chunks'.  The firing token
+    counts are printed; under the screen the rule fires on B200 (148 SMs) at every size."""
     table = _lpt_table(hidden)
     value = table[arch] if calibration == "record" else LPT_SCREEN
     fired, counted = [], 0
@@ -1800,7 +2017,7 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
                 geometry = nd.lpt_chunks(T, sm, arch, hidden=hidden)
                 if _calibration_at(value, T) is None:
                     assert geometry is None, what
-                order = _band_at(T, nd.BWD_SLAB_ORDER[hidden][arch])
+                order = _band_at(T, _order_cell(arch, sm, hidden))
                 program = nd.bwd_slab_atomic_program(T, sm, arch, hidden)
                 assert program == ("lpt" if geometry else "dynr") + (
                     "_os" if order == "slab" else ""
@@ -1856,10 +2073,11 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm", "fires"), LPT_FIRES)
 def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -> None:
-    """Under the table of record the two-size schedule runs exactly at the benchmark token counts of ``LPT_FIRES``,
-    with these geometries: a table that stops firing would ship dynr alone without a failing test.  The program is
-    ``lpt`` or ``lpt_os`` there (``dynr`` / ``dynr_os`` elsewhere), ``_os`` exactly where the ``BWD_SLAB_ORDER`` band
-    is ``"slab"``."""
+    """Under the tables of record (the board's cells where it has them) the two-size schedule runs exactly at the
+    benchmark token counts of ``LPT_FIRES``, with these geometries: a table that stops firing would ship dynr alone
+    without a failing test.  The program is ``lpt`` or ``lpt_os`` there (``dynr`` / ``dynr_os`` elsewhere), ``_os``
+    exactly where the board's unit-order band (:func:`_order_cell`) is ``"slab"``: on sm_107a with 212 SMs the
+    chunk-order programs at 1024 and 1536, the ``_os`` ones from 2048."""
     _clear_plans()
     try:
         got = {T: nd.lpt_chunks(T, sm, arch) for T in BENCH_T}
@@ -1871,7 +2089,7 @@ def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -
         fires
     )
     for T, program in programs.items():
-        slab_order = _band_at(T, nd.BWD_SLAB_ORDER[HIDDEN][arch]) == "slab"
+        slab_order = _band_at(T, _order_cell(arch, sm)) == "slab"
         assert program.endswith("_os") == slab_order, (T, program)
 
 
@@ -1898,7 +2116,7 @@ def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
         fires
     )
     for T, program in programs.items():
-        slab_order = _band_at(T, nd.BWD_SLAB_ORDER[hidden][arch]) == "slab"
+        slab_order = _band_at(T, _order_cell(arch, sm, hidden)) == "slab"
         assert program.endswith("_os") == slab_order, (T, program)
     assert bool(fires) == (arch in ATOMIC[_lpt(hidden)]), (arch, hidden)
     for T, geometry in fires.items():
@@ -2099,13 +2317,14 @@ def test_column_slab_rule_without_a_calibration_of_the_size(
     arch: str, sm: int, hidden: int, monkeypatch
 ) -> None:
     """At hidden 5120 and 7168 on an architecture without the size's ``lpt`` record the size's table is ``None`` and
-    the column slab runs its one-size ``dynr`` record (``dynr_os`` where the size's ``BWD_SLAB_ORDER`` band is
-    ``"slab"``) at every token count.  With ``_lpt_plan`` replaced by a function that raises (the rule never runs the
-    screen there), at the token counts of record, of ``LPT_SWEEP`` and of ``LPT_HIDDEN_T``: ``lpt_chunks`` is
-    ``None`` and ``bwd_slab_atomic_program`` ``dynr`` / ``dynr_os``; ``slab_plan`` is the one-size chunks of
-    ``k7_chunks`` at the size (``P`` and the rows per chunk of the deterministic ``host_plan`` of the size: both
-    backwards sum the partials of the same chunks); where the architecture routes the size the ``bwd_finish``
-    selection holds that record of the size."""
+    the column slab runs its one-size ``dynr`` record (``dynr_os`` where the board's unit-order band, the size's
+    ``BWD_SLAB_ORDER`` or the board's cell: :func:`_order_cell`, is ``"slab"``) at every token count.  With
+    ``_lpt_plan`` replaced by a function that raises (the rule never runs the screen there), at the token counts of
+    record, of ``LPT_SWEEP`` and of ``LPT_HIDDEN_T``: ``lpt_chunks`` is ``None`` and ``bwd_slab_atomic_program``
+    ``dynr`` / ``dynr_os``; ``slab_plan`` is the one-size chunks of ``k7_chunks`` at the size (``P`` and the rows per
+    chunk of the deterministic ``host_plan`` of the size: both backwards sum the partials of the same chunks); where
+    the architecture routes the size the ``bwd_finish`` selection holds that record of the size.  The order of some
+    of these token counts is the board's cell's, not the table's, on GB300 at 7168 (:data:`GB300_CELL`) alone."""
 
     def screen(*_args, **_kwargs):
         raise AssertionError(
@@ -2114,11 +2333,12 @@ def test_column_slab_rule_without_a_calibration_of_the_size(
 
     assert _lpt_table(hidden)[arch] is None, (arch, hidden)
     monkeypatch.setattr(nd, "_lpt_plan", screen)
-    checked = 0
+    checked = by_cell = 0
     for T in sorted(set(T_VALUES) | set(LPT_SWEEP) | set(LPT_HIDDEN_T)):
         what = (arch, sm, hidden, T)
         assert nd.lpt_chunks(T, sm, arch, hidden=hidden) is None, what
-        order = _band_at(T, nd.BWD_SLAB_ORDER[hidden][arch])
+        order = _band_at(T, _order_cell(arch, sm, hidden))
+        by_cell += order != _band_at(T, nd.BWD_SLAB_ORDER[hidden][arch])
         program = "dynr" + ("_os" if order == "slab" else "")
         assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == program, what
         plan = det.host_plan(T, sm, arch, hidden)
@@ -2140,6 +2360,7 @@ def test_column_slab_rule_without_a_calibration_of_the_size(
             assert slabs == [_record_of(program, hidden)], (what, names)
         checked += 1
     assert checked
+    assert (by_cell > 0) == ((arch, sm, hidden) == GB300_CELL), by_cell
 
 
 def _valid_calibration(value) -> bool:
@@ -2160,8 +2381,9 @@ def _valid_bands(bands: tuple, valid) -> bool:
     )
 
 
-# A banded calibration the rule is checked under (bands are a form of BWD_SLAB_LPT, not a table of record) and the
-# token counts it is checked at: both sides of each band edge, below and above them.
+# A banded calibration the rule is checked under (bands are a form of BWD_SLAB_LPT, whose entries of record are not
+# banded; the board cell of record of BWD_SLAB_LPT_OVERRIDES is) and the token counts it is checked at: both sides of
+# each band edge, below and above them.
 _BANDS = ((33600, (0.5, 0.985)), (34368, (0.5, 0.98)), (None, (0.5, 0.97)))
 _BAND_T = (1, 2049, 16263, 32768, 33599, 33600, 33601, 34368, 34369, 40000, 65536)
 
@@ -2171,10 +2393,11 @@ _BAND_T = (1, 2049, 16263, 32768, 33599, 33600, 33601, 34368, 34369, 40000, 6553
 def test_banded_lpt_calibration(sm: int) -> None:
     """``BWD_SLAB_LPT`` is the table of record (``LPT_OF_RECORD``); every entry of it and of ``BWD_SLAB_LPT_HIDDEN``
     is ``None``, one ``(o_tiles, keep)`` with ``o_tiles > 0`` and ``0 < keep <= 1``, or token-count bands of such
-    values ending in an unbounded one.  With sm_107a's entry banded (``_BANDS``) at 208, 212 and 216 SMs the
-    calibration of a token count is ``(0.5, 0.985)`` to 33600 tokens, ``(0.5, 0.98)`` to 34368 and ``(0.5, 0.97)``
-    above (both sides of each edge), and ``lpt_chunks`` is the rule under the scalar table of that calibration; bands
-    that leave a token count uncovered are a ``ValueError``."""
+    values ending in an unbounded one.  With the board cells emptied (``BWD_SLAB_ORDER_OVERRIDES``,
+    ``BWD_SLAB_LPT_OVERRIDES``: the 212-SM board reads the table too) and sm_107a's entry banded (``_BANDS``) at 208,
+    212 and 216 SMs the calibration of a token count is ``(0.5, 0.985)`` to 33600 tokens, ``(0.5, 0.98)`` to 34368 and
+    ``(0.5, 0.97)`` above (both sides of each edge), and ``lpt_chunks`` is the rule under the scalar table of that
+    calibration; bands that leave a token count uncovered are a ``ValueError``."""
     assert nd.BWD_SLAB_LPT == LPT_OF_RECORD
     for hidden in HIDDEN_SIZES:
         for arch, entry in _lpt_table(hidden).items():
@@ -2188,6 +2411,8 @@ def test_banded_lpt_calibration(sm: int) -> None:
     with pytest.MonkeyPatch.context() as patch:
         _clear_plans()
         try:
+            patch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
+            patch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {})
             patch.setitem(nd.BWD_SLAB_LPT, arch, bands)
             assert [
                 nd._lpt_calibration(T, arch) for T in (33600, 33601, 34368, 34369)
@@ -2219,8 +2444,12 @@ def test_slab_order_bands(arch: str, sm: int) -> None:
     both sides of every band edge, and another order or bands that leave a token count uncovered are a
     ``ValueError``.  The table is read at call time: with the bands ``((2049, "slab"), (None, "chunk"))`` at every
     hidden size of the board's architecture, 2049 tokens select the ``_os`` copy of the form ``lpt_chunks`` picks
-    where the architecture has that record of the size (where it has none, as on sm_107a, the ``"slab"`` band is a
-    ``ValueError`` of the selection, never a backward without the column slab) and 2050 tokens the form itself."""
+    where the architecture has that record of the size (on sm_107a at 208 and 216 SMs too: its H 4096 route holds
+    the ``_os`` records for the 212-SM board's cell; where an architecture has none the ``"slab"`` band is a
+    ``ValueError`` of the selection, never a backward without the column slab) and 2050 tokens the form itself.  The
+    table decides on the boards of record but GB300 at 7168, whose order cell (:data:`GB300_CELL`, the one board cell
+    of a board of record) decides there instead: 2049 and 2050 tokens select the form of the cell's first band, the
+    chunk order, whatever the table names."""
     assert nd.BWD_SLAB_ORDER == ORDER
     for hidden, per_arch in nd.BWD_SLAB_ORDER.items():
         assert set(per_arch) == set(det.ARCHES), hidden
@@ -2238,6 +2467,8 @@ def test_slab_order_bands(arch: str, sm: int) -> None:
                         T,
                     )
     assert set(nd.BWD_SLAB_ORDER) == set(HIDDEN_SIZES)
+    cells = {h for a, s, h in nd.BWD_SLAB_ORDER_OVERRIDES if (a, s) == (arch, sm)}
+    assert cells == ({GB300_CELL[2]} if (arch, sm) == GB300_CELL[:2] else set()), cells
     with pytest.MonkeyPatch.context() as patch:
         _clear_plans()
         try:
@@ -2246,6 +2477,11 @@ def test_slab_order_bands(arch: str, sm: int) -> None:
                 patch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, bands)
                 for T, suffix in ((2049, "_os"), (2050, "")):
                     what = (hidden, T)
+                    # the board's cell decides there, not the patched table
+                    if hidden in cells:
+                        cell = ORDER_OVERRIDES[arch, sm, hidden]
+                        assert _band_at(T, cell) == "chunk", (what, cell[0])
+                        suffix = ""
                     geometry = nd.lpt_chunks(T, sm, arch, hidden=hidden)
                     program = nd.bwd_slab_atomic_program(T, sm, arch, hidden)
                     assert program == ("lpt" if geometry else "dynr") + suffix, what
@@ -2271,6 +2507,457 @@ def test_slab_order_bands(arch: str, sm: int) -> None:
                 nd.bwd_slab_order(2050, arch)
         finally:
             _clear_plans()
+
+
+def _valid_lpt_cell(cell) -> bool:
+    """A calibration entry: ``None``, one ``(o_tiles, keep)`` or token-count bands of such values."""
+    if cell is not None and isinstance(cell[0], tuple):
+        return _valid_bands(cell, _valid_calibration)
+    return _valid_calibration(cell)
+
+
+@pytest.mark.cpu_only
+def test_slab_overrides_of_record() -> None:
+    """``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` are the board cells of record (:data:`ORDER_OVERRIDES`,
+    :data:`LPT_OVERRIDES`), exported and well formed: each key is ``(arch, sm, hidden)`` with a known architecture, an
+    SM count that is a positive int (never ``None``: the table itself is the cell of every SM count) and a hidden size
+    the architecture routes (an int, never ``None``: a cell of every size would apply a 4096 calibration at 5120 and
+    7168); an order cell is token-count bands of ``"chunk"`` / ``"slab"``, a calibration cell ``None``, one
+    ``(o_tiles, keep)`` or bands of such values.  On each board with a cell, on both sides of every band edge of its
+    two cells: every program they can name has its record on the ``bwd_finish`` route of the size (a ``"slab"`` band
+    the ``dynr_os`` record, and ``lpt_os`` where the calibration is not ``None``); ``bwd_slab_order`` and
+    ``_lpt_calibration`` read the cells with the board's SM count and the tables without one.  Below the order cell's
+    first ``"slab"`` band the calibration cell has no band of its own (its first bound at or above that band's lower
+    edge) and reads the table's calibration: the bands start where the slab order does."""
+    assert nd.BWD_SLAB_ORDER_OVERRIDES == ORDER_OVERRIDES
+    assert nd.BWD_SLAB_LPT_OVERRIDES == LPT_OVERRIDES
+    assert {"BWD_SLAB_ORDER_OVERRIDES", "BWD_SLAB_LPT_OVERRIDES"} <= set(nd.__all__)
+    for cells, valid in (
+        (
+            nd.BWD_SLAB_ORDER_OVERRIDES,
+            lambda cell: _valid_bands(cell, lambda order: order in ("chunk", "slab")),
+        ),
+        (nd.BWD_SLAB_LPT_OVERRIDES, _valid_lpt_cell),
+    ):
+        assert cells
+        for key, cell in cells.items():
+            arch, sm, hidden = key
+            assert arch in nd.ARCHES, key
+            assert type(sm) is int and sm > 0, key
+            assert type(hidden) is int, key
+            assert hidden in nd.supported_hidden_sizes(arch), key
+            assert valid(cell), (key, cell)
+    boards = sorted({*nd.BWD_SLAB_ORDER_OVERRIDES, *nd.BWD_SLAB_LPT_OVERRIDES})
+    for arch, sm, hidden in boards:
+        key = (arch, sm, hidden)
+        order, entry = _order_cell(arch, sm, hidden), _lpt_cell(arch, sm, hidden)
+        table_order = nd.BWD_SLAB_ORDER[hidden][arch]
+        table_entry = _lpt_table(hidden)[arch]
+        bands = entry if entry is not None and isinstance(entry[0], tuple) else ()
+        edges = sorted({t for t, _ in (*order, *bands) if t is not None})
+        route = nd.route_modules(arch, hidden, "bwd_finish")
+        for T in sorted({1, *edges, *(t + 1 for t in edges)}):
+            what = (key, T)
+            calibration = _calibration_at(entry, T)
+            assert nd.bwd_slab_order(T, arch, hidden, sm_count=sm) == _band_at(
+                T, order
+            ), what
+            assert nd._lpt_calibration(T, arch, hidden, sm_count=sm) == calibration, (
+                what
+            )
+            assert nd.bwd_slab_order(T, arch, hidden) == _band_at(T, table_order), what
+            assert nd._lpt_calibration(T, arch, hidden) == _calibration_at(
+                table_entry, T
+            ), what
+            suffix = "_os" if _band_at(T, order) == "slab" else ""
+            programs = ["dynr" + suffix] + (
+                ["lpt" + suffix] if calibration is not None else []
+            )
+            for program in programs:
+                assert _record_of(program, hidden) in route, (what, program)
+        first_slab = [i for i, (_t, o) in enumerate(order) if o == "slab"]
+        if first_slab and first_slab[0] > 0:
+            chunk_to = order[first_slab[0] - 1][0]
+            if bands:
+                assert bands[0][0] is None or bands[0][0] >= chunk_to, (key, bands)
+            for T in (1, chunk_to):
+                assert _calibration_at(entry, T) == _calibration_at(table_entry, T), (
+                    key,
+                    T,
+                )
+
+
+@pytest.mark.cpu_only
+def test_gb300_cell_follows_the_chunk_count() -> None:
+    """The shipped GB300 order cell (``BWD_SLAB_ORDER_OVERRIDES[GB300_CELL]``) holds where it was measured: its
+    ``"slab"`` bands below 63092 are the token-count segments of :data:`GB300_CELL_SPAN` whose column-slab chunk count
+    ``P`` (``k7_chunks`` at 152 SMs and hidden 7168: the chunks ``slab_plan`` and the launch grid read) is at least 19
+    and where the slab order read faster (all of them but :data:`GB300_CELL_TIE`).  Over every token count of the span:
+    each one in a ``"slab"`` band has ``P >= 19`` (18355 of them), so each one with ``P < 19`` lies in a ``"chunk"``
+    band, and each one in a ``"chunk"`` band has ``P < 19`` but the segment that keeps the chunk order
+    (:data:`GB300_CELL_TIE`, ``P`` 19) -- a change of ``k7_chunks`` or of the cell that moves the chunk count under the
+    bands fails here, not on a device.  Outside the span the cell names the table's order: ``"chunk"`` to 33792 (its
+    first band; ``P`` 4 at 33792, 19 at 33793 and at 63091) and ``"slab"`` from 63092 (its last band, which starts below
+    the span's end)."""
+    arch, sm, hidden = GB300_CELL
+    cell = nd.BWD_SLAB_ORDER_OVERRIDES[GB300_CELL]
+    table = nd.BWD_SLAB_ORDER[hidden][arch]
+    (lo, hi), (tie_lo, tie_hi) = GB300_CELL_SPAN, GB300_CELL_TIE
+    assert table == ((hi, "chunk"), (None, "slab")), table
+    assert cell[0] == (lo - 1, "chunk") and cell[-1] == (None, "slab"), cell
+    assert cell[-2][0] < hi, cell
+    assert _band_at(tie_lo, cell) == _band_at(tie_hi, cell) == "chunk", cell
+    assert [nd.k7_chunks(T, sm, hidden=hidden)[0] for T in (lo - 1, lo, hi)] == [
+        4,
+        19,
+        19,
+    ]
+    slab_t, previous = 0, 0
+    for t_upper, order in cell:
+        upper = hi if t_upper is None else min(t_upper, hi)
+        for T in range(max(previous + 1, lo), upper + 1):
+            P = nd.k7_chunks(T, sm, hidden=hidden)[0]
+            if order == "slab":
+                assert P >= GB300_CELL_MIN_P, (T, P, t_upper)
+                slab_t += 1
+            elif tie_lo <= T <= tie_hi:
+                assert P == GB300_CELL_MIN_P, (T, P)
+            else:
+                assert P < GB300_CELL_MIN_P, (T, P, t_upper)
+        if t_upper is None or t_upper >= hi:
+            break
+        previous = t_upper
+    assert slab_t == GB300_CELL_SLAB_T, slab_t
+
+
+# A test table for the lookup of the board cells, which reads the cells of the exact key (arch, SM count, hidden
+# size) alone: the cells of sm_107a with 212 SMs at 4096 differ from the tables at every token count of
+# SLAB_PRECEDENCE_T, and the keys with None (no SM count; every hidden size) match no call.
+SLAB_PRECEDENCE_ORDER = {
+    ("sm_107a", 212, 4096): ((2048, "slab"), (None, "chunk")),
+    ("sm_107a", None, 4096): ((None, "slab"),),
+    ("sm_107a", 216, None): ((None, "slab"),),
+    ("sm_100a", 212, 4096): ((None, "chunk"),),
+}
+SLAB_PRECEDENCE_LPT = {
+    ("sm_107a", 212, 4096): ((2048, None), (None, (1.0, 0.99))),
+    ("sm_107a", None, 4096): (1.0, 0.95),
+    ("sm_107a", 216, None): (1.0, 0.95),
+    ("sm_100a", 212, 4096): None,
+}
+SLAB_PRECEDENCE_T = (1, 2048, 2049, 65536)
+# (arch, SM count, the key whose cells the calls read: None for the tables BWD_SLAB_ORDER / BWD_SLAB_LPT).
+SLAB_PRECEDENCE = (
+    ("sm_107a", 212, ("sm_107a", 212, 4096)),  # (arch, sm, hidden)
+    ("sm_107a", 216, None),  # the tables, not (arch, 216, None): a key names its hidden size
+    ("sm_107a", 208, None),  # the tables: no key names the board
+    ("sm_107a", None, None),  # the tables, not (arch, None, 4096): a call without an SM count
+    ("sm_100a", 212, ("sm_100a", 212, 4096)),  # (arch, sm, hidden) of another architecture
+    ("sm_100a", 148, None),  # the tables
+)  # fmt: skip
+
+
+@pytest.mark.cpu_only
+def test_slab_override_lookup(monkeypatch) -> None:
+    """The lookup of the board cells under a test table (:data:`SLAB_PRECEDENCE_ORDER`, :data:`SLAB_PRECEDENCE_LPT`):
+    a call with an SM count reads the cells of the exact key ``(arch, sm_count, hidden)``; every other call -- another
+    SM count or architecture, no SM count -- reads ``BWD_SLAB_ORDER`` / ``BWD_SLAB_LPT``, and the keys with ``None``
+    match nothing (:data:`SLAB_PRECEDENCE`).  ``bwd_slab_atomic_program`` and ``lpt_chunks`` pass the SM count:
+    ``_os`` exactly where the order read is ``"slab"``, no geometry where the calibration read is ``None``.  An error
+    names what it read (the cell's key, or the table, architecture and size), and ``sm_count`` is a keyword: as a
+    fourth positional argument it is a ``TypeError``, never a value bound to another parameter."""
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", SLAB_PRECEDENCE_ORDER)
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", SLAB_PRECEDENCE_LPT)
+    on_212 = []
+    for arch, sm, key in SLAB_PRECEDENCE:
+        for T in SLAB_PRECEDENCE_T:
+            what = (arch, sm, T)
+            if key is None:
+                order = _band_at(T, ORDER[HIDDEN][arch])
+                calibration = _calibration_at(LPT_OF_RECORD[arch], T)
+            else:
+                order = _band_at(T, SLAB_PRECEDENCE_ORDER[key])
+                calibration = _calibration_at(SLAB_PRECEDENCE_LPT[key], T)
+            assert nd.bwd_slab_order(T, arch, HIDDEN, sm_count=sm) == order, what
+            assert nd._lpt_calibration(T, arch, HIDDEN, sm_count=sm) == calibration, (
+                what
+            )
+            if (arch, sm) == ("sm_107a", 212):
+                on_212.append((order, calibration))
+            if sm is None:
+                continue
+            geometry = nd.lpt_chunks(T, sm, arch)
+            if calibration is None:
+                assert geometry is None, what
+            program = nd.bwd_slab_atomic_program(T, sm, arch)
+            assert program == ("lpt" if geometry else "dynr") + (
+                "_os" if order == "slab" else ""
+            ), what
+    assert on_212 == [
+        ("slab", None),
+        ("slab", None),
+        ("chunk", (1.0, 0.99)),
+        ("chunk", (1.0, 0.99)),
+    ]
+    key = ("sm_107a", 212, 4096)
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {key: ((2048, "slab"),)})
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {key: ((2048, (1.0, 0.99)),)})
+    with pytest.raises(ValueError) as error:
+        nd.bwd_slab_order(2049, "sm_107a", sm_count=212)
+    assert str(error.value).startswith(
+        f"BWD_SLAB_ORDER_OVERRIDES[{key!r}] leaves T = 2049 uncovered"
+    ), error.value
+    with pytest.raises(ValueError) as error:
+        nd.lpt_chunks(2049, 212, "sm_107a")
+    assert str(error.value).startswith(
+        f"BWD_SLAB_LPT_OVERRIDES[{key!r}] leaves T = 2049 uncovered"
+    ), error.value
+    assert nd.bwd_slab_order(2049, "sm_107a", sm_count=216) == "chunk"
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {key: ((None, "slabs"),)})
+    with pytest.raises(ValueError) as error:
+        nd.bwd_slab_order(1, "sm_107a", sm_count=212)
+    assert str(error.value).startswith(
+        f"BWD_SLAB_ORDER_OVERRIDES[{key!r}] names the unit order 'slabs'"
+    ), error.value
+    monkeypatch.setitem(nd.BWD_SLAB_ORDER[HIDDEN], "sm_107a", ((2048, "chunk"),))
+    with pytest.raises(ValueError) as error:
+        nd.bwd_slab_order(2049, "sm_107a", sm_count=216)
+    assert str(error.value).startswith(
+        "BWD_SLAB_ORDER of sm_107a at hidden 4096 leaves T = 2049 uncovered"
+    ), error.value
+    with pytest.raises(TypeError):
+        nd.bwd_slab_order(2049, "sm_107a", HIDDEN, 212)
+    with pytest.raises(TypeError):
+        nd._lpt_calibration(2049, "sm_107a", HIDDEN, 212)
+
+
+def _cell_changes(arch: str, sm: int, hidden: int, T: int) -> bool:
+    """Whether the board cells of record change the column slab of the board ``(arch, sm)`` at ``hidden`` and ``T``:
+    where the board's order cell names another order than the size's ``BWD_SLAB_ORDER`` -- on R200 with 212 SMs at
+    4096 from 1877 tokens (its calibration cell differs from the table there alone), on GB300 at 7168 in the cell's
+    ``"slab"`` bands in :data:`GB300_CELL_SPAN`."""
+    key = (arch, sm, hidden)
+    return key in ORDER_OVERRIDES and _band_at(T, ORDER_OVERRIDES[key]) != _band_at(
+        T, ORDER[hidden][arch]
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm"), sorted({*SLAB_BOARDS, *PDL_BOARDS}))
+def test_slab_overrides_change_only_their_board(
+    arch: str, sm: int, monkeypatch
+) -> None:
+    """The board cells of record change the column slab of their own board alone: on every board (the boards of
+    record, GB200, B300 and R200 with 212 SMs), at every hidden size the architecture routes, at the token counts of
+    record and of ``LPT_SWEEP`` and on both sides of every band edge of the cells and of the table band the GB300 cell
+    runs into (:data:`OVERRIDE_EDGES`: 33792 / 33793 and 63091 / 63092 among them), ``bwd_slab_atomic_program``,
+    ``slab_plan``, the ``bwd_finish`` selection and its column-slab launch's per-call PDL argument on every path equal
+    their values with both tables of board cells emptied -- except on sm_107a with 212 SMs at hidden 4096 from 1877
+    tokens and on sm_103a with 152 SMs at hidden 7168 in the ``"slab"`` bands of its cell up to 63091
+    (:func:`_cell_changes`).  There the program is the ``_os`` copy of a form where the tables name a chunk-order
+    form, the selection holds its record as its one column slab after the same token owner and fn split, and the PDL
+    argument is unchanged.  On every board each value is also its value with the board's cells (where it has them)
+    written into ``BWD_SLAB_ORDER`` / ``BWD_SLAB_LPT`` instead: a cell is the table entry of its board."""
+    token_counts = sorted({*T_VALUES, *LPT_SWEEP, *OVERRIDE_EDGES})
+
+    def column_slab() -> dict:
+        found = {}
+        for hidden in _arch_sizes(arch):
+            for T in token_counts:
+                names = nd.selected_modules(
+                    arch, hidden, "bwd_finish", rows=T, sm_count=sm
+                )
+                slabs = [n for n in names if nd.MODULES[n]["role"] == "bwd_slab"]
+                assert len(slabs) == 1, (hidden, T, names)
+                found[hidden, T] = (
+                    nd.bwd_slab_atomic_program(T, sm, arch, hidden),
+                    nd.slab_plan(T, sm, arch, hidden),
+                    names,
+                    tuple(
+                        nd.enable_pdl(slabs[0], T, arch, path, sm_count=sm)
+                        for path in nd.PDL_PATHS
+                    ),
+                )
+        return found
+
+    shipped = column_slab()
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {})
+    tables = column_slab()
+    own = [h for h in _arch_sizes(arch) if (arch, sm, h) in ORDER_OVERRIDES]
+    for hidden in own:
+        key = (arch, sm, hidden)
+        monkeypatch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ORDER_OVERRIDES[key])
+        if key in LPT_OVERRIDES:
+            monkeypatch.setitem(_lpt_table(hidden), arch, LPT_OVERRIDES[key])
+    cells = column_slab() if own else tables
+    changed = set()
+    for (hidden, T), (program, _plan, names, pdl) in shipped.items():
+        what = (hidden, T)
+        assert shipped[hidden, T] == cells[hidden, T], what
+        if not _cell_changes(arch, sm, hidden, T):
+            assert shipped[hidden, T] == tables[hidden, T], what
+            continue
+        table_program, _table_plan, table_names, table_pdl = tables[hidden, T]
+        assert program.endswith("_os") and not table_program.endswith("_os"), (
+            what,
+            program,
+            table_program,
+        )
+        assert names[:-1] == table_names[:-1], (what, names, table_names)
+        assert names[-1] == _record_of(program, hidden), (what, names)
+        assert pdl == table_pdl, what
+        changed.add((hidden, T))
+    assert bool(changed) == bool(own), (own, changed)
+    if (arch, sm) == ("sm_107a", 212):
+        assert changed == {(HIDDEN, T) for T in token_counts if T > 1876}, changed
+    if (arch, sm) == GB300_CELL[:2]:
+        (lo, hi), cell = GB300_CELL_SPAN, ORDER_OVERRIDES[GB300_CELL]
+        assert changed == {
+            (GB300_CELL[2], T)
+            for T in token_counts
+            if lo <= T <= hi and _band_at(T, cell) == "slab"
+        }, changed
+
+
+def _route_plan_slabs(
+    monkeypatch, arch: str, hidden: int, sm: int, token_counts: tuple
+) -> dict:
+    """The backward's column-slab launch in the route plans of a device of ``arch`` with ``sm`` SMs at ``hidden``, per
+    token count of ``token_counts``: ``(record, lpt)`` (the device's SM count, architecture and module loader
+    replaced: nothing is built or launched; both plan caches emptied first, since they are keyed by the device index,
+    not its SM count).  Each plan holds one column-slab launch, the record ``bwd_slab_atomic_program`` names with the
+    device's SM count; ``lpt`` is the ``lpt_*`` values an ``lpt`` / ``lpt_os`` launch binds, those of ``slab_plan``
+    (``None`` for another record, which binds none of them)."""
+    path = "backward"
+    values = (
+        *pkg._CALL_VALUES["bwd_finish"],
+        *(name for name, _ in pkg._WORKSPACE_VALUES["bwd_finish"]),
+    )
+    placeholders = tuple(f"<{name}>" for name in values)
+
+    class _Module:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __getattr__(self, entry: str) -> tuple[str, str]:
+            return (self.name, entry)
+
+    monkeypatch.setattr(nd, "device_arch", lambda _index: arch)
+    monkeypatch.setattr(nd, "load", lambda name, _arch: _Module(name))
+    monkeypatch.setattr(nd, "sm_count", lambda _index: sm)
+    monkeypatch.setattr(pkg, "_PLANS", {})
+    monkeypatch.setattr(pkg, "_FAST_ROUTES", {})
+    found = {}
+    for T in token_counts:
+        what = (sm, T)
+        route = pkg._fast_route(arch, "bwd_finish", T, hidden, 0, path)
+        launches = [
+            (run, arguments)
+            for run, arguments in route.launches
+            if nd.MODULES[run[0]]["role"] == "bwd_slab"
+        ]
+        assert len(launches) == 1, (what, [run for run, _ in route.launches])
+        ((name, _entry), arguments) = launches[0]
+        record = nd.MODULES[name]
+        bound = {
+            record["logical"][key]: value
+            for (kind, key), value in zip(
+                record["arg_plan"],
+                arguments(placeholders + route.statics),
+                strict=True,
+            )
+            if kind == "parameter"
+        }
+        program = nd.bwd_slab_atomic_program(T, sm, arch, hidden)
+        assert name == _record_of(program, hidden), (what, name, program)
+        lpt = None
+        if name in (_lpt(hidden), _lpt_os(hidden)):
+            lpt = tuple(bound[key] for key in LPT_HOST_KEYS)
+            plan = nd.slab_plan(T, sm, arch, hidden)
+            assert lpt == tuple(plan[key] for key in LPT_HOST_KEYS), (what, lpt)
+        else:
+            assert not set(LPT_HOST_KEYS) & set(bound), (what, bound)
+        found[T] = (name, lpt)
+    return found
+
+
+@pytest.mark.cpu_only
+def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
+    """The route plans bind the column slab of the device's board: on sm_107a with 208, 212 and 216 SMs (the device's
+    SM count, architecture and module loader replaced: nothing is built or launched; both plan caches emptied for
+    every board and table state, since they are keyed by the device index, not its SM count), at 1876, 1877, 4096 and
+    15566 tokens, the backward's one column-slab launch is the record ``bwd_slab_atomic_program`` names with the
+    device's SM count, and an ``lpt`` / ``lpt_os`` launch binds the ``lpt_*`` values of ``slab_plan``.  Against the
+    plans with both tables of board cells emptied, only the 212-SM board's differ, and only from 1877 tokens:
+    ``dynr_os`` at 1877 and 4096 where the tables run ``dynr``, and at 15566 ``lpt_os`` with the geometry of
+    :data:`LPT_FIRES` where the tables run ``dynr``."""
+    arch, hidden = "sm_107a", HIDDEN
+    boards, token_counts = (208, 212, 216), (1876, 1877, 4096, 15566)
+    shipped = {
+        sm: _route_plan_slabs(monkeypatch, arch, hidden, sm, token_counts)
+        for sm in boards
+    }
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {})
+    tables = {
+        sm: _route_plan_slabs(monkeypatch, arch, hidden, sm, token_counts)
+        for sm in boards
+    }
+    for sm in boards:
+        if sm != 212:
+            assert shipped[sm] == tables[sm], (sm, shipped[sm], tables[sm])
+    fires = next(f for a, s, f in LPT_FIRES if (a, s) == (arch, 212))
+    assert shipped[212][1876] == tables[212][1876], shipped[212][1876]
+    assert {T: tables[212][T] for T in token_counts[1:]} == {
+        1877: (SLAB, None),
+        4096: (SLAB, None),
+        15566: (SLAB, None),
+    }, tables[212]
+    assert {T: shipped[212][T] for T in token_counts[1:]} == {
+        1877: (SLAB_OS, None),
+        4096: (SLAB_OS, None),
+        15566: (LPT_OS, fires[15566]),
+    }, shipped[212]
+
+
+@pytest.mark.cpu_only
+def test_route_plan_binds_the_gb300_cell(monkeypatch) -> None:
+    """The route plans bind the GB300 order cell (:data:`GB300_CELL`) on its board alone: on sm_103a at hidden 7168
+    with 148 SMs (B300, no cell) and 152 SMs (GB300; :func:`_route_plan_slabs`), at 33920 and 37952 tokens (in
+    ``"slab"`` bands of the cell: chunk counts 19 and 27 at 152 SMs), 49152 (in a ``"chunk"`` band: 4) and 63092 (the
+    tables' ``"slab"`` band), the backward's one column-slab launch is ``dynr__h7168`` or ``dynr_os__h7168`` (sm_103a
+    routes no lpt record of the size).  Against the plans with both tables of board cells emptied only the 152-SM
+    board's differ, at 33920 and 37952: ``dynr_os__h7168`` where the tables run ``dynr__h7168``; at 49152 both boards
+    run ``dynr__h7168`` and at 63092 ``dynr_os__h7168``."""
+    arch, sm, hidden = GB300_CELL
+    boards, token_counts = (148, sm), (33920, 37952, 49152, 63092)
+    assert [nd.k7_chunks(T, sm, hidden=hidden)[0] for T in token_counts[:3]] == [
+        19,
+        27,
+        4,
+    ]
+    shipped = {
+        board: _route_plan_slabs(monkeypatch, arch, hidden, board, token_counts)
+        for board in boards
+    }
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {})
+    tables = {
+        board: _route_plan_slabs(monkeypatch, arch, hidden, board, token_counts)
+        for board in boards
+    }
+    dynr, dynr_os = (_slab(hidden), None), (_slab_os(hidden), None)
+    assert shipped[148] == tables[148] == tables[sm], (shipped[148], tables)
+    assert tables[sm] == {33920: dynr, 37952: dynr, 49152: dynr, 63092: dynr_os}, (
+        tables[sm]
+    )
+    assert shipped[sm] == {
+        33920: dynr_os,
+        37952: dynr_os,
+        49152: dynr,
+        63092: dynr_os,
+    }, shipped[sm]
 
 
 @pytest.mark.cpu_only
@@ -2326,8 +3013,9 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
 @pytest.mark.cpu_only
 def test_library_names_and_record_scalars() -> None:
     """``library_name`` is ``<library>_<arch>`` on the record's architectures and a ``RuntimeError`` elsewhere;
-    ``RECORD_SCALARS`` is the deterministic table of every hidden size renamed without the backward fn splits (the
-    forward fn split of each size ``want_t = 0``; the atomic fn splits take no ``want_t``)."""
+    ``RECORD_SCALARS`` is the deterministic table of every hidden size renamed without the backward fn splits and the
+    checkpoint carry's records, ``CARRY_ROLES`` (the forward fn split of each size ``want_t = 0``; the atomic fn
+    splits take no ``want_t``)."""
     for name, record in nd.MODULES.items():
         for arch in det.ARCHES:
             if arch in record["arches"]:
@@ -2338,7 +3026,7 @@ def test_library_names_and_record_scalars() -> None:
     assert {
         _renamed(name): scalars
         for name, scalars in DET_RECORD_SCALARS.items()
-        if _det_role(name) != "fn_split_bwd"
+        if _det_role(name) not in ("fn_split_bwd", *CARRY_ROLES)
     } == nd.RECORD_SCALARS
     assert {
         ND_PREFIX + "fn_split" + _suffix(hidden): {"want_t": 0}

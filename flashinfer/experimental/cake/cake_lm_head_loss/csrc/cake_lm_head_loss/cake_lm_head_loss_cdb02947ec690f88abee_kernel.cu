@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" {

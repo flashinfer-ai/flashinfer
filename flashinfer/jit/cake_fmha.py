@@ -2253,6 +2253,22 @@ def load_cake_fmha_compat_module(target: CakeFmhaTarget):
     return module
 
 
+def gen_cake_fmha_stream_context_module() -> JitSpec:
+    """The host library the small-M decode reads its launch stream's SM count
+    with (``csrc/cake_fmha_stream_context.cpp``; no device code)."""
+
+    return gen_jit_spec(
+        name="cake_fmha_stream_context",
+        sources=[jit_env.FLASHINFER_CSRC_DIR / "cake_fmha_stream_context.cpp"],
+        extra_ldflags=["-lcuda"],
+    )
+
+
+@functools.cache
+def load_cake_fmha_stream_context_module():
+    return gen_cake_fmha_stream_context_module().build_and_load()
+
+
 __all__ = [
     "CAKE_FMHA_BALANCED_DTYPES",
     "CAKE_FMHA_BALANCED_FP8_Q_DTYPES",
@@ -2276,6 +2292,7 @@ __all__ = [
     "gen_cake_fmha_decode_native_bf16_module",
     "gen_cake_fmha_decode_native_fp16_hd512_module",
     "gen_cake_fmha_decode_native_fp16_nhd_module",
+    "gen_cake_fmha_stream_context_module",
     "get_cake_fmha_context_bf16_uri",
     "get_cake_fmha_context_fp8_uri",
     "get_cake_fmha_context_nvfp4_uri",
@@ -2304,4 +2321,5 @@ __all__ = [
     "load_cake_fmha_decode_native_bf16_module",
     "load_cake_fmha_decode_native_fp16_hd512_module",
     "load_cake_fmha_decode_native_fp16_nhd_module",
+    "load_cake_fmha_stream_context_module",
 ]

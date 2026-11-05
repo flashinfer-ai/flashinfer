@@ -47,37 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_U_OFFSET 0
-#define TMEM_ACC_W_OFFSET 256
-#define NUM_ONE_STAGES 1
-#define NUM_RING_STAGES 2
-#define NUM_ACCS_STAGES 2
-#define NUM_WORK_STAGES 4
-#define SMEM_AKK_BLOCKS_OFF 1024
-#define SMEM_AKK_BLOCKS_STAGE_BYTES 8192
-#define SMEM_AKK_BLOCKS_STRIDE 8192
-#define SMEM_VB_S_OFF 33792
-#define SMEM_VB_S_STAGE_BYTES 32768
-#define SMEM_VB_S_STRIDE 98304
-#define SMEM_KB_S_OFF 66560
-#define SMEM_KB_S_STAGE_BYTES 32768
-#define SMEM_KB_S_STRIDE 98304
-#define SMEM_AKK_K_OFF 1024
-#define SMEM_AKK_K_STAGE_BYTES 32768
-#define SMEM_AKK_K_STRIDE 98304
-#define SMEM_VB_MN_OFF 33792
-#define SMEM_VB_MN_STAGE_BYTES 32768
-#define SMEM_VB_MN_STRIDE 98304
-#define SMEM_KB_MN_OFF 66560
-#define SMEM_KB_MN_STAGE_BYTES 32768
-#define SMEM_KB_MN_STRIDE 98304
-#define SMEM_WORK_RESP_OFF 197632
-#define SMEM_WORK_RESP_STAGE_BYTES 16
-#define SMEM_WORK_RESP_STRIDE 16
-#define SMEM_TOTAL 197760
-#define THREADS 448
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -199,7 +168,7 @@ kernel_cake_kda_train_eac26fffb3df8780302c(const __grid_constant__ CUtensorMap a
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* akk_blocks = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int akk_blocks_addr = smem + 1024;
     __nv_bfloat16* vb_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
@@ -215,8 +184,7 @@ kernel_cake_kda_train_eac26fffb3df8780302c(const __grid_constant__ CUtensorMap a
     unsigned int* work_resp = reinterpret_cast<unsigned int*>(smem_raw + 197632);
     const int work_resp_addr = smem + 197632;
 
-    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 21 barriers)
-    // Mbarriers at smem_raw[0..168)
+    // Mbarrier init (21 barriers at smem_raw[0..168))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -273,11 +241,9 @@ kernel_cake_kda_train_eac26fffb3df8780302c(const __grid_constant__ CUtensorMap a
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_u = taddr;
-    const int tmem_acc_w = taddr + 256;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_u = taddr;
+    const unsigned int tmem_acc_w = taddr + 256;
 
     // ---- Role: epi_u ----
     if (warp <= 3) {

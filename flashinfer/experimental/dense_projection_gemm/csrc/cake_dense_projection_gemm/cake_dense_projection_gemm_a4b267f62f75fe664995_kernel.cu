@@ -47,20 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 8
-#define NUM_ACC_PIPE_STAGES 2
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 28672
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 12288
-#define SMEM_SMEM_B_STRIDE 28672
-#define SMEM_TOTAL 230400
-#define THREADS 320
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -204,6 +190,7 @@ kernel_cake_dense_projection_gemm_a4b267f62f75fe664995(const __grid_constant__ C
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 21 barriers)
     // Mbarriers at smem_raw[0..168)
@@ -258,6 +245,7 @@ kernel_cake_dense_projection_gemm_a4b267f62f75fe664995(const __grid_constant__ C
 
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
 

@@ -713,21 +713,23 @@ def _program_id(name: str) -> str:
 DX_BITWISE_WITH = {
     # sm_100a H512 row (1280, inf); det module at T 16385
     "cake_rmsnorm_train_d0bde38aa443d42a5f04": "cake_rmsnorm_det_train_ad1a5a3c5f88e3d10036",
-    # sm_100a H1536 row (36864, inf); det module at T 65536
+    # sm_100a H1536 row (36864, 78784]; det module at T 65536
     "cake_rmsnorm_train_ae610afdf77ff6714a5b": "cake_rmsnorm_det_train_b457c4d134e44476dc6f",
-    # sm_100a H2048 column (0, 336]; det module at T 257
+    # sm_100a H2048 column (64, 336]; det module at T 257
     "cake_rmsnorm_train_64e6aa82bb2c6d4ea978": "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9",
-    # sm_100a H2048 help row (7168, 11264] and (13608, 45056]; det module at T 16385
+    # sm_100a H2048 help row (7168, 11264] and (13608, 65536]; det module at T 16385 and
+    # 65536
     "cake_rmsnorm_train_0fa4f255caf709d09f66": "cake_rmsnorm_det_train_ceeef043ac64f37fc529",
-    # sm_100a H4096 column (0, 1152]; det module at T 257
+    # sm_100a H4096 column (64, 1152]; det module at T 257
     "cake_rmsnorm_train_4822793ea0c954c11af6": "cake_rmsnorm_det_train_59270fb249dcba1ff679",
-    # sm_100a H4096 help row (4608, 36864]; det module at T 16385
+    # sm_100a H4096 help row (4608, 36864] and (44032, 65536]; det module at T 16385 and
+    # 65536
     "cake_rmsnorm_train_15e157d2ee9080d206a9": "cake_rmsnorm_det_train_35a0b0ca6b2060313255",
-    # sm_100a H6144 column (0, 1152]; det module at T 257 (the help row differs)
+    # sm_100a H6144 column (64, 1152]; det module at T 257 (the help row differs)
     "cake_rmsnorm_train_44508df7dab2ab688f85": "cake_rmsnorm_det_train_5c804aed7ad14b99e1d0",
-    # sm_100a H6144 residual column (0, 1408]; the det residual program (every T)
+    # sm_100a H6144 residual column (64, 1408]; the det residual program (every T)
     "cake_rmsnorm_train_864e84f3d874f850c091": "cake_rmsnorm_det_train_0dcdc563be377247044e",
-    # sm_100a H6144 residual help row (1408, inf); the det residual program (every T)
+    # sm_100a H6144 residual help row (1408, 65536]; the det residual program (every T)
     "cake_rmsnorm_train_3fbfdd750cbeb47032b5": "cake_rmsnorm_det_train_0dcdc563be377247044e",
 }
 
@@ -866,28 +868,45 @@ def test_repeated_launches_against_fp64_and_det(
 # H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE, the
 # deterministic package's compensated det pair (compensated per-chunk dw sums)
 # from there up to H5120_ACCURACY_EDGE, and the FP64-accumulating single kernel
-# (on sm_103a its twosum form) above it.  The plain edge is the deterministic
-# package's own switch to its compensated pair; the accuracy edge, per weight
-# dtype, is the largest token count at which the compensated pair's dw is
-# measured within ACCURACY_MARGIN of the per-element budget: T 65536, and T 57344
-# for the FP32 weight on R200 (0.877 of the budget at T 65536).  The margin is
-# taken against the FP64 reference at the kernel's FP32 rstd; against the FP64
-# reference at the FP64 rstd (which differs from it by the forward's FP32 rstd
-# rounding, the same for the deterministic package) the dw stays within the
-# budget.  Worst dw element over its budget at the kernel's rstd, 60 inputs of
-# each of three input families, BF16 and FP32 weight: B200 plain pair <= 0.236
-# up to T 6144, compensated pair <= 0.781 up to T 65536, single <= 0.643 at
-# T 65537; GB300 plain pair <= 0.245 up to T 5120, compensated pair <= 0.657 up
-# to T 65536, twosum single <= 0.0006 at T 65537 and 81920; R200 plain pair
-# <= 0.499 (216 SMs) and <= 0.545 (212 SMs) up to T 19968, compensated pair
-# <= 0.767 (BF16 weight, up to T 65536; 0.837 at T 65536 on 216 SMs) and
-# <= 0.732 (FP32 weight, up to T 57344), single <= 0.639 at T 65537 (BF16
-# weight) and <= 0.633 at T 57345 (FP32 weight) (212 SMs).
+# (on sm_103a and sm_107a its kblock form) above it; a single kernel also runs
+# from T 1 up to T 22 with FP32 weight on sm_100a and with both weight dtypes on
+# sm_103a, up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
+# weight up to T 896 on sm_100a.  The plain
+# edge is the deterministic package's own switch to its compensated pair.  The
+# accuracy edge is T 65536, the top of the qualified range, on
+# sm_100a, T 61952 on sm_103a and T 49152 on sm_107a, for both weight dtypes:
+# on GB300 the compensated pair's worst dw element reaches 0.888 of its budget
+# at T 62464 (FP32 weight; the two weight dtypes' compensated pairs compute
+# the same dw for equal inputs), and on the 216-SM R200 board 0.867 at T 53248
+# (BF16 weight, 200 inputs of each of three families) and 0.905 at T 57344
+# (FP32 weight), above ACCURACY_MARGIN.  The margin is taken against the FP64
+# reference at the kernel's FP32 rstd; against the FP64 reference at the FP64
+# rstd (which differs from it by the forward's FP32 rstd rounding, the same
+# for the deterministic package) the forms this test runs stay within the
+# budget, while the compensated pair above the sm_107a edge reaches 1.012 of
+# it at T 53248 on the 216-SM board.  Worst dw element over its budget at the
+# kernel's rstd, 60 or more inputs of each of three input families, BF16 and
+# FP32 weight: B200 plain pair <= 0.236 up to T 6144, compensated pair
+# <= 0.781 up to T 65536, single <= 0.643 at T 65537; GB300 plain pair
+# <= 0.245 up to T 5120, compensated pair <= 0.739 up to T 61952, kblock
+# single <= 0.688 at the sampled T from 61953 to 131072; R200 plain pair
+# <= 0.499 (216 SMs) and <= 0.545 (212 SMs) up to T 19968, compensated pair up
+# to T 49152 <= 0.825 (both weights) on 212 SMs, <= 0.759 (BF16 weight) and
+# <= 0.787 (FP32 weight) on 216 SMs (<= 0.818 at T 49152 over 200 inputs of
+# each of three families, both weights), single <= 0.703 (BF16 weight) and
+# <= 0.633 (FP32 weight) at the sampled T from 49152 to 65537 (212 SMs;
+# <= 0.608 and <= 0.646 from 49152 to 65537 on 216 SMs); its sm_107a kblock form
+# above T 49152 <= 0.807 (BF16 weight) and <= 0.719 (FP32 weight) at the sampled
+# T from 49153 to 131072 (212 SMs).
 H5120_PLAIN_EDGE = {"sm_100a": 6144, "sm_103a": 5120, "sm_107a": 19968}
+# FP32 weight: the plain det pair's top where a single kernel runs between it and
+# the compensated pair for dw accuracy (None: no plain det pair runs below the
+# compensated pair)
+H5120_PLAIN_TOP_F32 = {"sm_100a": None, "sm_107a": 4096}
 H5120_ACCURACY_EDGE = {
-    "sm_100a": {"bf16": 65536, "f32": 65536},
-    "sm_103a": {"bf16": 65536, "f32": 65536},
-    "sm_107a": {"bf16": 65536, "f32": 57344},
+    "sm_100a": {"bf16": 56256, "f32": 56256},
+    "sm_103a": {"bf16": 61952, "f32": 61952},
+    "sm_107a": {"bf16": 49152, "f32": 49152},
 }
 ACCURACY_MARGIN = 0.85
 ACCURACY_SEEDS = 20
@@ -925,8 +944,13 @@ def test_h5120_dw_accuracy_edge(side: str, w: str, family: str) -> None:
     FP64 ``rstd`` every form's stays within the budget."""
     _skip_unless_route(5120, w_dtype=w)
     plain_edge, edge = H5120_PLAIN_EDGE[_arch()], H5120_ACCURACY_EDGE[_arch()][w]
+    plain_top = (
+        H5120_PLAIN_TOP_F32.get(_arch(), plain_edge) if w == "f32" else plain_edge
+    )
+    if side == "plain" and plain_top is None:
+        pytest.skip(f"no plain det pair runs below the compensated pair ({w} weight)")
     rows = {
-        "plain": plain_edge,
+        "plain": plain_top,
         "compensated": plain_edge + 1,
         "edge": edge,
         "above": edge + 1,
@@ -938,12 +962,13 @@ def test_h5120_dw_accuracy_edge(side: str, w: str, family: str) -> None:
     )
     # the plain and the compensated det pair are different programs; the
     # compensated pair runs from one above the plain edge to the accuracy edge
-    plain = _window_records(5120, "bwd", False, w, plain_edge)
     compensated = _window_records(5120, "bwd", False, w, plain_edge + 1)
-    library = loader.MODULES[plain[0]]["library"]
-    assert library != loader.MODULES[compensated[0]]["library"], (
-        f"T={plain_edge} and T={plain_edge + 1} run the same program {library}"
-    )
+    if plain_top is not None:
+        plain = _window_records(5120, "bwd", False, w, plain_top)
+        library = loader.MODULES[plain[0]]["library"]
+        assert library != loader.MODULES[compensated[0]]["library"], (
+            f"T={plain_top} and T={plain_edge + 1} run the same program {library}"
+        )
     assert compensated == _window_records(5120, "bwd", False, w, edge)
     eps = EPS[5120]
     worst, worst_fp64_rstd = 0.0, 0.0

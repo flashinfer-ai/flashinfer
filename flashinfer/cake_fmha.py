@@ -42,6 +42,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_decode_quant_bf16q_module,
     load_cake_fmha_decode_quant_fp8_module,
     load_cake_fmha_decode_quant_nvfp4_module,
+    load_cake_fmha_stream_context_module,
 )
 from .cake_fmha_request_ordered import (
     CakeFmhaRequestOrderedDecodePlan,
@@ -74,6 +75,7 @@ class CakeFmhaDecodeRoute:
         "decode_aligned_fp16",
         "decode_aligned_bf16_hd64",
         "decode_aligned_bf16_hd256",
+        "decode_aligned_bf16_mtp_q32",
         "decode_balanced_bf16",
         "decode_balanced_fp16",
         "decode_balanced_fp8",
@@ -102,8 +104,12 @@ class CakeFmhaDecodeRoute:
     # one identifier ``flashinfer.jit.cake_fmha_aligned_hd64.ALIGNED_HD64_BF16``
     # that ``aligned_hd64_selected`` chose; aligned hd256 q1 decode: the
     # identifier (``flashinfer.jit.cake_fmha_aligned_hd256.ALIGNED_HD256_BF16`` /
-    # ``ALIGNED_HD256_CGA2_BF16`` / ``ALIGNED_HD256_CGA4_BF16``) of the program
-    # ``aligned_hd256_program`` named; ``None`` on every other route.
+    # ``ALIGNED_HD256_CGA2_BF16`` / ``ALIGNED_HD256_CGA4_BF16`` /
+    # ``ALIGNED_HD256_CGA8_BF16``) of the program
+    # ``aligned_hd256_program`` named; aligned speculative decode (1 to 4 query
+    # tokens per request): the identifier
+    # ``flashinfer.jit.cake_fmha_aligned_mtp_q32.ALIGNED_MTP_Q32_CGA2_BF16`` of the
+    # program ``spec_q32_cga_program`` named; ``None`` on every other route.
     aligned_program: str | None = None
     # Generated decode program: ``(family, identifier)`` of the in-tree program
     # (``flashinfer.jit.cake_fmha_<family>.<identifier>``) the route launches,
@@ -324,11 +330,11 @@ _ALIGNED_HD64_SKIP_CORR_THRESHOLD = 0.0
 
 # The aligned hd256 q1 decode programs are likewise a generated in-tree unit,
 # ``csrc/cake_fmha_aligned_hd256/`` with the loader
-# ``flashinfer.jit.cake_fmha_aligned_hd256``: three BF16 programs shipped for
+# ``flashinfer.jit.cake_fmha_aligned_hd256``: four BF16 programs shipped for
 # sm_100a and sm_103a whose 8-row query tile holds a KV head's eight query
 # heads.  The persistent program runs one CTA per (request, KV head) tile and
 # feeds its persistent loop through cluster launch control; the cluster
-# programs split each tile's KV sequence over a cluster of 2 or 4 CTAs and
+# programs split each tile's KV sequence over a cluster of 2, 4 or 8 CTAs and
 # merge the partials through distributed shared memory.
 # ``aligned_hd256_program`` names a launch's program as ``(kind, CTAs per
 # tile)``; the route's component chain is that program's identifier below.  The
@@ -340,6 +346,7 @@ _ALIGNED_HD256_PROGRAM_IDS: dict[tuple[str, int], str] = {
     ("persistent", 1): "ALIGNED_HD256_BF16",
     ("cga", 2): "ALIGNED_HD256_CGA2_BF16",
     ("cga", 4): "ALIGNED_HD256_CGA4_BF16",
+    ("cga", 8): "ALIGNED_HD256_CGA8_BF16",
 }
 # Program identifier -> (CTAs per (request, KV head) tile, program name): the
 # CTAs are the launch grid's x extent and the record's cluster ``(CTAs, 1, 1)``.
@@ -347,9 +354,10 @@ _ALIGNED_HD256_PROGRAMS: dict[str, tuple[int, str]] = {
     "ALIGNED_HD256_BF16": (1, "cake_fmha_aligned_hd256_50326788c79371d913ba"),
     "ALIGNED_HD256_CGA2_BF16": (2, "cake_fmha_aligned_hd256_3d8340c8d395be9c7587"),
     "ALIGNED_HD256_CGA4_BF16": (4, "cake_fmha_aligned_hd256_7ba007d1a2873ce28e12"),
+    "ALIGNED_HD256_CGA8_BF16": (8, "cake_fmha_aligned_hd256_dc665a26118a54d4ccb7"),
 }
 # The bindings' host parameters, in the kernels' order (then the grid); the
-# three programs share them.
+# four programs share them.
 _ALIGNED_HD256_HOST_PARAMS = (
     "Q",
     "K",
@@ -370,11 +378,57 @@ _ALIGNED_HD256_HOST_PARAMS = (
 _ALIGNED_HD256_SKIP_CORR_THRESHOLD = 0.0
 
 
+# The aligned speculative-decode (MTP verify) program is likewise a generated
+# in-tree unit, ``csrc/cake_fmha_aligned_mtp_q32/`` with the loader
+# ``flashinfer.jit.cake_fmha_aligned_mtp_q32``: one BF16 program shipped for
+# sm_100a and sm_103a whose 32-row query tile holds the 1 to 4 query tokens of a
+# KV head's eight query heads (row ``token x 8 + head``), so a request's KV head
+# is read once for every one of its tokens.  The program splits each (request,
+# KV head) tile's KV sequence over a cluster of 2 CTAs and merges the partials
+# through distributed shared memory, under the causal speculative-decode mask
+# (token ``j`` of a request of ``L`` tokens attends the first
+# ``L - (q_len - 1 - j)``).  ``spec_q32_cga_program`` names a launch's program as
+# ``("cga", CTAs per tile)``; the route's component chain is that program's
+# identifier below.  The table pins the delivered record's name and a loader
+# whose record differs fails closed at load.
+_ALIGNED_MTP_Q32_COMPONENT = "decode_aligned_bf16_mtp_q32"
+# ``spec_q32_cga_program`` verdict -> the program identifier.
+_ALIGNED_MTP_Q32_PROGRAM_IDS: dict[tuple[str, int], str] = {
+    ("cga", 2): "ALIGNED_MTP_Q32_CGA2_BF16",
+}
+# Program identifier -> (CTAs per (request, KV head) tile, program name): the
+# CTAs are the launch grid's x extent and the record's cluster ``(CTAs, 1, 1)``.
+_ALIGNED_MTP_Q32_PROGRAMS: dict[str, tuple[int, str]] = {
+    "ALIGNED_MTP_Q32_CGA2_BF16": (2, "cake_fmha_aligned_mtp_q32_a1e5ddfa63d266952503"),
+}
+# The binding's host parameters, in the kernel's order (then the grid).
+_ALIGNED_MTP_Q32_HOST_PARAMS = (
+    "Q",
+    "K",
+    "V",
+    "O",
+    "page_table",
+    "seq_lens_kv",
+    "max_pages_per_seq",
+    "softmax_scale_log2",
+    "num_q_heads",
+    "num_kv_heads",
+    "heads_per_kv",
+    "batch_size",
+    "seq_len_q",
+    "skip_corr_threshold",
+)
+# The kernel's correction-skip threshold: 0 disables the skip (the value every
+# validation of the program used).
+_ALIGNED_MTP_Q32_SKIP_CORR_THRESHOLD = 0.0
+
+
 # The generated paged context programs: the units ``csrc/cake_fmha_context_bf16/``,
 # ``csrc/cake_fmha_context_fp8/`` and ``csrc/cake_fmha_context_nvfp4/`` whose
 # loaders ``flashinfer.jit.cake_fmha_context_{bf16,fp8,nvfp4}`` publish one
-# ``CakeProgram`` constant per program.  Every program is causal, without LSE
-# or sink.  Per target, a route key ``(component, scale form, num_q_heads,
+# ``CakeProgram`` constant per program.  Every program of these tables is
+# causal, without LSE or sink (the FP8 programs of the other forms have their
+# own table, ``_CONTEXT_FP8_RUNTIME_FORM_ROUTES``).  Per target, a route key ``(component, scale form, num_q_heads,
 # num_kv_heads, pack_g, num_m_blocks, page_size, exact class)`` names the
 # program serving it.  The scale form is ``"host"`` (host-scalar scales; the
 # BF16 output scale is 1) or ``"device"`` (both FP8 / NVFP4 scales are device
@@ -414,30 +468,75 @@ _CONTEXT_PROGRAM_ROUTES: dict[
 # persistent CTA per SM).  A loader whose record differs fails closed at load.
 _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ("context_bf16", "Q8192"): (
-        "cake_fmha_context_bf16_eb5b942877557703876d",
+        "cake_fmha_context_bf16_4846f01db726c36dfe88",
         256,
         False,
     ),
-    ("context_bf16", "B128"): ("cake_fmha_context_bf16_31373706c9fcb1a2b1db", 2, False),
+    ("context_bf16", "B128"): ("cake_fmha_context_bf16_3a71b4d96d0cdfb0513e", 2, False),
     ("context_bf16", "Q511_SM100A"): (
-        "cake_fmha_context_bf16_fe2dfd2eb24d75a1bccc",
+        "cake_fmha_context_bf16_4621c524ebfd2b2bb926",
         11,
         True,
     ),
     ("context_bf16", "Q511_SM103A"): (
-        "cake_fmha_context_bf16_8bd7d679916961178c03",
+        "cake_fmha_context_bf16_ea4e4fc120a1a50b6101",
         11,
         True,
     ),
     ("context_bf16", "Q257_SM100A"): (
-        "cake_fmha_context_bf16_d400e81a0185922f0097",
+        "cake_fmha_context_bf16_0dacafa48890bec55adf",
         6,
         True,
     ),
     ("context_bf16", "Q257_SM103A"): (
-        "cake_fmha_context_bf16_5fa928327be121e0c987",
+        "cake_fmha_context_bf16_a7a7514ecb102296c143",
         6,
         True,
+    ),
+    ("context_bf16", "RUNTIME_PACK1"): (
+        "cake_fmha_context_bf16_0e97d38f12331ab6bf15",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2"): (
+        "cake_fmha_context_bf16_2fd6b5d88ab61e1b00cd",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4"): (
+        "cake_fmha_context_bf16_a43572c3d68d52af005e",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5"): (
+        "cake_fmha_context_bf16_b9fcf2cc30ac830a5612",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6"): (
+        "cake_fmha_context_bf16_332d799e56da647e1489",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7"): (
+        "cake_fmha_context_bf16_99afb64fff4548ad0af8",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8"): (
+        "cake_fmha_context_bf16_f7d40147af812ca23526",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12"): (
+        "cake_fmha_context_bf16_de6d5f8c9e69623b5baa",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16"): (
+        "cake_fmha_context_bf16_7c076f3c4a8dd7a6ab97",
+        None,
+        False,
     ),
     ("context_fp8", "B256"): ("cake_fmha_context_fp8_d910d4336baa2166efb0", 1, False),
     ("context_fp8", "B256_SCALE_PTR"): (
@@ -485,6 +584,96 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ("context_nvfp4", "Q511_SCALE_PTR_SM103A"): (
         "cake_fmha_context_nvfp4_1b4750660638d644a971",
         16,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK1_SM100A"): (
+        "cake_fmha_context_nvfp4_86d0c41d97852b032e2b",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK1_SM103A"): (
+        "cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK2_SM100A"): (
+        "cake_fmha_context_nvfp4_85759514a21c2f7af98e",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK2_SM103A"): (
+        "cake_fmha_context_nvfp4_06d8cd436fe722542cfe",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK4_SM100A"): (
+        "cake_fmha_context_nvfp4_72dab1767cf5d92e3932",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK4_SM103A"): (
+        "cake_fmha_context_nvfp4_dfc2b69916b570e5656e",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK5_SM100A"): (
+        "cake_fmha_context_nvfp4_3dc30e785b083d6ab935",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK5_SM103A"): (
+        "cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK6_SM100A"): (
+        "cake_fmha_context_nvfp4_e214794d1c7e780bbb9b",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK6_SM103A"): (
+        "cake_fmha_context_nvfp4_183aa672fdfdebe90f8c",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK7_SM100A"): (
+        "cake_fmha_context_nvfp4_8238132fab08fc8a1519",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK7_SM103A"): (
+        "cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK8_SM100A"): (
+        "cake_fmha_context_nvfp4_9c67cb54b6dcaeda2935",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK8_SM103A"): (
+        "cake_fmha_context_nvfp4_a7e740ed276553b8299f",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK12_SM100A"): (
+        "cake_fmha_context_nvfp4_069ac3e5e2f6bba89935",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK12_SM103A"): (
+        "cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK16_SM100A"): (
+        "cake_fmha_context_nvfp4_db6cae7b4015feede42b",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK16_SM103A"): (
+        "cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd",
+        None,
         False,
     ),
     # The FP8 runtime-size programs: the m-block count is a launch argument.
@@ -695,6 +884,337 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    # The FP8 runtime-size programs of packs 7 and 5 (the calls of that JIT
+    # pack): every page size and page 64, then the sm103a 4-stage ring builds
+    # with each stage's P tile in the other stage's S columns.
+    ("context_fp8", "RUNTIME_PACK7"): (
+        "cake_fmha_context_fp8_deed18c419e94dcae492",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5"): (
+        "cake_fmha_context_fp8_6aa58bfdfad6e2b3b070",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_PAGE64"): (
+        "cake_fmha_context_fp8_1d475a87368eff01cd07",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_PAGE64"): (
+        "cake_fmha_context_fp8_6697efee895077ff75db",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_PX"): (
+        "cake_fmha_context_fp8_c1e7b4a95bde95adfb5b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_PX"): (
+        "cake_fmha_context_fp8_82494a452a599bcce06b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_PAGE64_PX"): (
+        "cake_fmha_context_fp8_12f3911feb73818fea63",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_PAGE64_PX"): (
+        "cake_fmha_context_fp8_783cc42f6c36478cc6d1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6"): (
+        "cake_fmha_context_fp8_0fc78080232eae07fc8b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12"): (
+        "cake_fmha_context_fp8_ce478d84f15b7c0ee7f6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16"): (
+        "cake_fmha_context_fp8_2d54b7d14e534a107e70",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_PAGE64"): (
+        "cake_fmha_context_fp8_4315154de6b6492fddba",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_PAGE64"): (
+        "cake_fmha_context_fp8_2598d3427a6230e965ca",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_PAGE64"): (
+        "cake_fmha_context_fp8_5bca98ec850d2a56d4fa",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_PX"): (
+        "cake_fmha_context_fp8_d05673294d892173f58b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_PX"): (
+        "cake_fmha_context_fp8_611fce7f1f4f9ddaf157",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_PX"): (
+        "cake_fmha_context_fp8_45a79a6e2dc0278bc02f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_PAGE64_PX"): (
+        "cake_fmha_context_fp8_3f6317f5fefc0c435974",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_PAGE64_PX"): (
+        "cake_fmha_context_fp8_fb8adba84de1e52fbabe",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_PAGE64_PX"): (
+        "cake_fmha_context_fp8_0018f22cd0b10e1e5a2a",
+        None,
+        False,
+    ),
+    # The FP8 runtime-size programs of the other forms (_CONTEXT_FP8_FORMS:
+    # non-causal, LSE, attention sink, non-causal LSE, non-causal sink) of
+    # packs 1, 2, 4, 8, 7, 5, 6, 12 and 16, every page size, both targets.
+    ("context_fp8", "RUNTIME_PACK1_NC"): (
+        "cake_fmha_context_fp8_3c94aa56b26bc9692ddb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC"): (
+        "cake_fmha_context_fp8_c51d1037e40d5f686012",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC"): (
+        "cake_fmha_context_fp8_a82e724d7beb4543ed1b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC"): (
+        "cake_fmha_context_fp8_23cb749a9b56174b06dd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC"): (
+        "cake_fmha_context_fp8_39e77cfad484d671bdf1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC"): (
+        "cake_fmha_context_fp8_b3f2a547db0024e7513c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC"): (
+        "cake_fmha_context_fp8_18c01ba2bfdf7cfc1213",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC"): (
+        "cake_fmha_context_fp8_bbd1c3ad0faffa4e4032",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC"): (
+        "cake_fmha_context_fp8_5e8e9f8a2ac80ec689dc",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_LSE"): (
+        "cake_fmha_context_fp8_68188eb65e57813cd400",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_LSE"): (
+        "cake_fmha_context_fp8_2649fc5e2adde4764d44",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_LSE"): (
+        "cake_fmha_context_fp8_4ad5fa7c3a77046179a0",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_LSE"): (
+        "cake_fmha_context_fp8_d20c132ce7ac8015f3aa",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_LSE"): (
+        "cake_fmha_context_fp8_57a2591a9a94e34f9a3f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_LSE"): (
+        "cake_fmha_context_fp8_07270c5949daaef8b88e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_LSE"): (
+        "cake_fmha_context_fp8_d888d7d5891a43b77019",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_LSE"): (
+        "cake_fmha_context_fp8_6ccee1242099503af08e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_LSE"): (
+        "cake_fmha_context_fp8_6936e327f65dc978c02b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_SINK"): (
+        "cake_fmha_context_fp8_8d70f2cc8a0c2b0d85a8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_SINK"): (
+        "cake_fmha_context_fp8_0afb1ba0634298237a87",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_SINK"): (
+        "cake_fmha_context_fp8_888cb4ba77655cc02f4f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_SINK"): (
+        "cake_fmha_context_fp8_51b98d91b3e326c15a2b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_SINK"): (
+        "cake_fmha_context_fp8_b6a31d0d586eeb8c3467",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_SINK"): (
+        "cake_fmha_context_fp8_00086e1974145b14d190",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_SINK"): (
+        "cake_fmha_context_fp8_08d3eec257ffff36dfb9",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_SINK"): (
+        "cake_fmha_context_fp8_b7359427ad11f8d60682",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_SINK"): (
+        "cake_fmha_context_fp8_fde5af9c61501f5e206d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_LSE"): (
+        "cake_fmha_context_fp8_09a88e2efd0f3faa4ba1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_LSE"): (
+        "cake_fmha_context_fp8_2f3a9e2ef72f854708c5",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_LSE"): (
+        "cake_fmha_context_fp8_78bde5f2e6bc5116f8b9",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_LSE"): (
+        "cake_fmha_context_fp8_eb6d79120a92bd55db14",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_LSE"): (
+        "cake_fmha_context_fp8_401f00f170131bb034b2",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_LSE"): (
+        "cake_fmha_context_fp8_2ddf5d3394e9bfd463f8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_LSE"): (
+        "cake_fmha_context_fp8_30f9d749610756b11ead",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_LSE"): (
+        "cake_fmha_context_fp8_480ac91cd4870a828748",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_LSE"): (
+        "cake_fmha_context_fp8_98f676c27683dfddb23e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_SINK"): (
+        "cake_fmha_context_fp8_f16c6db9ade62789b231",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_SINK"): (
+        "cake_fmha_context_fp8_448286e8962b3662fcbc",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_SINK"): (
+        "cake_fmha_context_fp8_c97a06bf21cccad88264",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_SINK"): (
+        "cake_fmha_context_fp8_b3c47455115a96c31bdf",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_SINK"): (
+        "cake_fmha_context_fp8_0ccbe98304525493ba7b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_SINK"): (
+        "cake_fmha_context_fp8_fb85e9569bb460503e8f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_SINK"): (
+        "cake_fmha_context_fp8_9edf17ea3e8ae77bf128",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_SINK"): (
+        "cake_fmha_context_fp8_257a42a1c41329734128",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_SINK"): (
+        "cake_fmha_context_fp8_4d7e46490a68fabfe45e",
+        None,
+        False,
+    ),
     # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
     ("context_fp8", "RUNTIME_SK_PACK8"): (
         "cake_fmha_context_fp8_2b603161717df80f5fad",
@@ -747,7 +1267,9 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
 # The FP8 runtime-size context programs: every length, head count, m-block
 # count and page size is a launch argument, so one program serves every causal
 # FP8 call without LSE or sink whose GQA group its pack (the query heads one
-# 128-row tile stage holds) divides; pack 1 serves every group.  Per target,
+# 128-row tile stage holds) divides; pack 1 serves every group, and a pack of
+# :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` the calls of its own JIT pack that
+# no dividing pack serves.  Per target,
 # ``(pack_g, page_size)`` names the program: a page-64 program folds the page
 # arithmetic into constants, ``None`` serves every page size 16 .. 1024.  The
 # host consults them only for a call no exact route serves, and only where
@@ -763,6 +1285,16 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (4, None): "RUNTIME_PACK4",
         (2, None): "RUNTIME_PACK2",
         (1, None): "RUNTIME_PACK1",
+        (7, 64): "RUNTIME_PACK7_PAGE64",
+        (5, 64): "RUNTIME_PACK5_PAGE64",
+        (7, None): "RUNTIME_PACK7",
+        (5, None): "RUNTIME_PACK5",
+        (6, 64): "RUNTIME_PACK6_PAGE64",
+        (12, 64): "RUNTIME_PACK12_PAGE64",
+        (16, 64): "RUNTIME_PACK16_PAGE64",
+        (6, None): "RUNTIME_PACK6",
+        (12, None): "RUNTIME_PACK12",
+        (16, None): "RUNTIME_PACK16",
     },
     "sm103a": {
         (8, 64): "RUNTIME_PACK8_PAGE64_PX",
@@ -773,6 +1305,92 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (4, None): "RUNTIME_PACK4_PX",
         (2, None): "RUNTIME_PACK2_PX",
         (1, None): "RUNTIME_PACK1_PX",
+        (7, 64): "RUNTIME_PACK7_PAGE64_PX",
+        (5, 64): "RUNTIME_PACK5_PAGE64_PX",
+        (7, None): "RUNTIME_PACK7_PX",
+        (5, None): "RUNTIME_PACK5_PX",
+        (6, 64): "RUNTIME_PACK6_PAGE64_PX",
+        (12, 64): "RUNTIME_PACK12_PAGE64_PX",
+        (16, 64): "RUNTIME_PACK16_PAGE64_PX",
+        (6, None): "RUNTIME_PACK6_PX",
+        (12, None): "RUNTIME_PACK12_PX",
+        (16, None): "RUNTIME_PACK16_PX",
+    },
+}
+# The runtime-size BF16 programs (``RUNTIME_PACK<g>``): the persistent
+# programs of the head-group-packed kernel with every size a launch argument.
+# Their tile work is that of the JIT module of the same pack, so their output
+# is the JIT module's bit for bit; a program serves only the calls whose JIT
+# pack (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g,
+# page_size)`` names the program (``None``: every page size 16 .. 1024).  The
+# host consults them only for a causal call without LSE or sink that no exact
+# route serves, except the calls of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
+_CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16",
+        (12, None): "RUNTIME_PACK12",
+        (8, None): "RUNTIME_PACK8",
+        (7, None): "RUNTIME_PACK7",
+        (6, None): "RUNTIME_PACK6",
+        (5, None): "RUNTIME_PACK5",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16",
+        (12, None): "RUNTIME_PACK12",
+        (8, None): "RUNTIME_PACK8",
+        (7, None): "RUNTIME_PACK7",
+        (6, None): "RUNTIME_PACK6",
+        (5, None): "RUNTIME_PACK5",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+}
+# Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
+# JIT pack above 1 whose ``max_q_len`` is a power of two of at least
+# ``queries``, over at least ``keys`` cache keys, keeps the JIT module.  The
+# JIT module, compiled for the call's sizes, runs a power-of-two query length
+# faster than its neighbours; there the runtime-size program ran slower than
+# it beyond the A/A band (B200, 10 layouts, batch x queries x keys at 32 query
+# and 4 KV heads: 1 x 8192 x 14336 .. 24576, 2 and 4 x 8192 x 16384, 1 x 16384
+# x 16384; also packs 2, 4 and 16 at 8192 queries and pack 16 at 4096 and
+# 16384), while 8064, 8320, 12288 and 24576 queries ran faster on the program.
+_CONTEXT_BF16_RUNTIME_POW2_Q: dict[str, tuple[int, int]] = {"sm100a": (4096, 14336)}
+
+# The runtime-size NVFP4 programs (``RUNTIME_PACK<g>_SM100A`` /
+# ``RUNTIME_PACK<g>_SM103A``): the persistent programs of the fused NVFP4
+# kernel with every size and the scale source a launch argument, one per
+# target with that target's schedule options.  Their tile work is that of the
+# JIT module of the same pack, so their output is the JIT module's bit for
+# bit; a program serves only the calls whose JIT pack
+# (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g, page_size)``
+# names the program (``None``: the page size of every NVFP4 route, 16).  The
+# host consults them only for a call that no exact route serves.
+_CONTEXT_NVFP4_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_SM100A",
+        (12, None): "RUNTIME_PACK12_SM100A",
+        (8, None): "RUNTIME_PACK8_SM100A",
+        (7, None): "RUNTIME_PACK7_SM100A",
+        (6, None): "RUNTIME_PACK6_SM100A",
+        (5, None): "RUNTIME_PACK5_SM100A",
+        (4, None): "RUNTIME_PACK4_SM100A",
+        (2, None): "RUNTIME_PACK2_SM100A",
+        (1, None): "RUNTIME_PACK1_SM100A",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_SM103A",
+        (12, None): "RUNTIME_PACK12_SM103A",
+        (8, None): "RUNTIME_PACK8_SM103A",
+        (7, None): "RUNTIME_PACK7_SM103A",
+        (6, None): "RUNTIME_PACK6_SM103A",
+        (5, None): "RUNTIME_PACK5_SM103A",
+        (4, None): "RUNTIME_PACK4_SM103A",
+        (2, None): "RUNTIME_PACK2_SM103A",
+        (1, None): "RUNTIME_PACK1_SM103A",
     },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
@@ -798,11 +1416,55 @@ _CONTEXT_FP8_SHORT_KV_ROUTES: dict[str, dict[str, tuple[str, int]]] = {
         "RUNTIME_PACK4_PX_Q1": ("RUNTIME_PACK4_Q1", 128),
         "RUNTIME_PACK2_PX_Q1": ("RUNTIME_PACK2_Q1", 128),
         "RUNTIME_PACK1_PX_Q1": ("RUNTIME_PACK1_Q1", 128),
+        "RUNTIME_PACK7_PX": ("RUNTIME_PACK7", 128),
+        "RUNTIME_PACK5_PX": ("RUNTIME_PACK5", 128),
+        "RUNTIME_PACK7_PAGE64_PX": ("RUNTIME_PACK7_PAGE64", 128),
+        "RUNTIME_PACK5_PAGE64_PX": ("RUNTIME_PACK5_PAGE64", 128),
+        "RUNTIME_PACK6_PX": ("RUNTIME_PACK6", 128),
+        "RUNTIME_PACK12_PX": ("RUNTIME_PACK12", 128),
+        "RUNTIME_PACK16_PX": ("RUNTIME_PACK16", 128),
+        "RUNTIME_PACK6_PAGE64_PX": ("RUNTIME_PACK6_PAGE64", 128),
+        "RUNTIME_PACK12_PAGE64_PX": ("RUNTIME_PACK12_PAGE64", 128),
+        "RUNTIME_PACK16_PAGE64_PX": ("RUNTIME_PACK16_PAGE64", 128),
     },
 }
 # The packs the runtime programs ship besides 1: a pack serves every GQA group
 # it divides.
 _CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
+# The packs whose runtime-size programs serve the calls whose JIT pack
+# (:func:`_context_pack_g`) is that pack itself where the dividing pack of
+# :data:`_CONTEXT_FP8_RUNTIME_PACKS` would run more tile work than the JIT
+# module (:func:`_context_fp8_runtime_route_pack`): two query stages of
+# ``128 // pack`` tokens per tile (125, 126, 126, 120 or 128 of the 128 rows),
+# the JIT module's tiles, without split-KV or one-stage programs.
+_CONTEXT_FP8_RUNTIME_OWN_PACKS = (7, 5, 6, 12, 16)
+# The forms of an FP8 call besides the causal one without LSE or sink, as
+# ``(is_causal, return_lse, enable_sink)`` -> form: the runtime-size programs
+# of each form serve the calls of that form (``_CONTEXT_FP8_RUNTIME_FORM_ROUTES``).
+_CONTEXT_FP8_FORMS: dict[tuple[bool, bool, bool], str] = {
+    (False, False, False): "NC",
+    (True, True, False): "LSE",
+    (True, False, True): "SINK",
+    (False, True, False): "NC_LSE",
+    (False, False, True): "NC_SINK",
+}
+# Per target, ``(form, pack_g, page_size)`` -> the runtime-size program of an
+# FP8 call of that form (``None``: every page size): the program of its pack
+# (:func:`_context_fp8_runtime_form_pack`), the 3-stage K/V ring with each
+# stage's P tile in its own S columns on both targets.  It writes the LSE (log2
+# units, one float per query row and head) or reads the sinks of the call.
+_CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], str]] = {
+    target: {
+        (form, pack, None): f"RUNTIME_PACK{pack}_{form}"
+        for form in _CONTEXT_FP8_FORMS.values()
+        for pack in (
+            1,
+            *_CONTEXT_FP8_RUNTIME_PACKS[::-1],
+            *_CONTEXT_FP8_RUNTIME_OWN_PACKS,
+        )
+    }
+    for target in ("sm100a", "sm103a")
+}
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack
 # whose tiles number at most that many, in place of the one-stage choice: such
@@ -843,6 +1505,7 @@ _CONTEXT_FP8_SPLIT_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     target: {
         key: "RUNTIME_SK" + name.removeprefix("RUNTIME").removesuffix("_PX")
         for key, name in routes.items()
+        if key[0] not in _CONTEXT_FP8_RUNTIME_OWN_PACKS
     }
     for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
 }
@@ -872,7 +1535,11 @@ _CONTEXT_FP8_SPLIT_PROGRAMS = frozenset(
 # tile of it holds at most one stage of query tokens and its plan predicts a
 # gain (:func:`_context_fp8_one_stage_choice`); other calls keep their route.
 _CONTEXT_FP8_ONE_STAGE_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
-    target: {key: name + "_Q1" for key, name in routes.items()}
+    target: {
+        key: name + "_Q1"
+        for key, name in routes.items()
+        if key[0] not in _CONTEXT_FP8_RUNTIME_OWN_PACKS
+    }
     for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
 }
 # Per target, the page-64 one-stage programs whose short-KV chain (the entry
@@ -1025,6 +1692,110 @@ _CONTEXT_FP8_RUNTIME_PARAMS = (
 )
 
 
+# A runtime-size BF16 program takes the sizes after the BF16 parameters: the
+# m-block count, the whole 8-unit L2 sections of the tile order (bit 31: the
+# tail order, :data:`_CONTEXT_BF16_TAIL_INTERLEAVE`), the work units per
+# request, the query heads, the GQA group and the log2 page size.
+_CONTEXT_BF16_RUNTIME_PARAMS = (
+    *_CONTEXT_HOST_PARAMS["context_bf16"],
+    "m_blocks",
+    "full_sections",
+    "bh_units",
+    "q_heads",
+    "group",
+    "page_shift",
+)
+
+# The tail order of a causal runtime-size BF16 launch.  Its work units past the
+# last whole 8-unit section run one unit's m-blocks after another, or, with
+# this bit of ``full_sections`` set, interleaved like a section: every tail
+# unit's m-block, the largest first.  The order moves no tile's work, so the
+# output is the same bit for bit; the launch takes the order of the shorter
+# modelled makespan (:func:`_context_bf16_tail_interleave`).
+_CONTEXT_BF16_TAIL_INTERLEAVE = 1 << 31
+# The tail-order model: a tile costs its KV blocks plus this many; the
+# interleaved order must be shorter by this fraction; a launch of more waves
+# than this keeps the plain order.
+_CONTEXT_BF16_TAIL_TILE_COST = 2
+_CONTEXT_BF16_TAIL_MARGIN = 0.005
+_CONTEXT_BF16_TAIL_MAX_WAVES = 32
+
+
+def _context_bf16_tail_makespan(costs: list[int], num_ctas: int) -> int:
+    """The finish time of a persistent launch over tiles of ``costs`` in tile
+    order: CTA ``i`` runs tile ``i`` first and claims its next tile from the
+    counter when it starts one."""
+
+    first = min(num_ctas, len(costs))
+    ends = costs[:first]
+    claims = [(0, cta) for cta in range(first)]
+    for cost in costs[first:]:
+        _, cta = heapq.heappop(claims)
+        start = ends[cta]
+        ends[cta] = start + cost
+        heapq.heappush(claims, (start, cta))
+    return max(ends)
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_bf16_tail_interleave(
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    units_per_batch: int,
+    m_block_tokens: int,
+    num_ctas: int,
+) -> bool:
+    """Whether a causal runtime-size BF16 launch runs its tail units
+    interleaved: two or more of them, and the modelled makespan of that order
+    shorter than the plain one's by :data:`_CONTEXT_BF16_TAIL_MARGIN`.  Every
+    request at the planned maxima; a tile's KV blocks are those of its
+    bottom-right causal bound (a bound below zero wraps to every block, as the
+    kernel's unsigned bound does)."""
+
+    total_bh = batch_size * units_per_batch
+    full_sections, tail_units = divmod(total_bh, 8)
+    m_blocks = max((max_q_len + m_block_tokens - 1) // m_block_tokens, 1)
+    if (
+        tail_units < 2
+        or num_ctas <= 0
+        or m_blocks * total_bh > _CONTEXT_BF16_TAIL_MAX_WAVES * num_ctas
+    ):
+        return False
+    full_n = max((max_kv_len + 127) // 128, 1)
+    shift = max_kv_len - max_q_len
+    # tile costs per m-block, the largest (last) m-block first
+    cost = []
+    for m_block in reversed(range(m_blocks)):
+        top = (m_block + 1) * m_block_tokens + shift
+        blocks = full_n if top < 0 or top >= max_kv_len else (top + 127) // 128
+        cost.append(_CONTEXT_BF16_TAIL_TILE_COST + max(blocks, 1))
+    head = [
+        cost[(tile >> 3) % m_blocks] for tile in range(8 * m_blocks * full_sections)
+    ]
+    tail = range(tail_units * m_blocks)
+    plain = head + [cost[r % m_blocks] for r in tail]
+    interleaved = head + [cost[r // tail_units] for r in tail]
+    return _context_bf16_tail_makespan(interleaved, num_ctas) < (
+        1.0 - _CONTEXT_BF16_TAIL_MARGIN
+    ) * _context_bf16_tail_makespan(plain, num_ctas)
+
+
+# A runtime-size NVFP4 program takes the sizes after the NVFP4 parameters: the
+# scale source (0: the host scalars, 1: the device scalars), the m-block count,
+# the whole 8-unit L2 sections of the tile order, the work units per request,
+# the query heads and the GQA group.
+_CONTEXT_NVFP4_RUNTIME_PARAMS = (
+    *_CONTEXT_HOST_PARAMS["context_nvfp4"],
+    "scale_source",
+    "m_blocks",
+    "full_sections",
+    "bh_units",
+    "q_heads",
+    "heads_group",
+)
+
+
 # A split-KV FP8 program takes the runtime-size parameters, then the split
 # plan, the FP32 partials and the per-tile arrival counters.
 _CONTEXT_FP8_SPLIT_PARAMS = (
@@ -1047,6 +1818,10 @@ def _context_program_params(
     if program in _CONTEXT_FP8_SPLIT_PROGRAMS:
         return _CONTEXT_FP8_SPLIT_PARAMS
     if num_m_blocks is None:
+        if component == "context_bf16":
+            return _CONTEXT_BF16_RUNTIME_PARAMS
+        if component == "context_nvfp4":
+            return _CONTEXT_NVFP4_RUNTIME_PARAMS
         return _CONTEXT_FP8_RUNTIME_PARAMS
     return _CONTEXT_HOST_PARAMS[component]
 
@@ -1155,7 +1930,7 @@ def cake_fmha_aligned_hd256_launch_grid(
     program, batch_size: int, num_kv_heads: int
 ) -> tuple[int, int, int]:
     """The launch grid of one aligned hd256 q1 decode: ``(CTAs, num_kv_heads,
-    batch_size)``, one CTA (the persistent program) or one cluster of 2 / 4 CTAs
+    batch_size)``, one CTA (the persistent program) or one cluster of 2 / 4 / 8 CTAs
     (``blockIdx.x`` the cluster rank) per (request, KV head) tile, ``blockIdx.y``
     the KV head and ``blockIdx.z`` the request.  ``program`` is the generated
     loader's ``CakeProgram`` record; its ``cluster`` is ``(CTAs, 1, 1)``.  The
@@ -1165,9 +1940,38 @@ def cake_fmha_aligned_hd256_launch_grid(
     return int(program.cluster[0]), int(num_kv_heads), int(batch_size)
 
 
+def _aligned_mtp_q32_route_program(
+    route: CakeFmhaDecodeRoute,
+) -> tuple[int, str] | None:
+    """``(CTAs per tile, pinned program name)`` of an aligned speculative-decode
+    route, or ``None`` when the route's program identifier is not the module's."""
+
+    if route.component != _ALIGNED_MTP_Q32_COMPONENT or route.aligned_program is None:
+        return None
+    return _ALIGNED_MTP_Q32_PROGRAMS.get(route.aligned_program)
+
+
+def cake_fmha_aligned_mtp_q32_launch_grid(
+    program, batch_size: int, num_kv_heads: int
+) -> tuple[int, int, int]:
+    """The launch grid of one aligned speculative decode: ``(CTAs, num_kv_heads,
+    batch_size)``, one cluster of the program's CTAs per (request, KV head) tile
+    (``blockIdx.x`` the cluster rank, ``blockIdx.y`` the KV head, ``blockIdx.z``
+    the request); the tile's 32-row query tile holds every query token of the
+    request.  ``program`` is the generated loader's ``CakeProgram`` record; its
+    ``cluster`` is ``(CTAs, 1, 1)``."""
+
+    return int(program.cluster[0]), int(num_kv_heads), int(batch_size)
+
+
 def _route_components(
     route: CakeFmhaDecodeRoute | CakeFmhaContextRoute,
 ) -> tuple[str, ...]:
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component == _ALIGNED_MTP_Q32_COMPONENT
+    ):
+        return (route.aligned_program,) if route.aligned_program is not None else ()
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == _ALIGNED_HD256_COMPONENT
@@ -1221,6 +2025,11 @@ def cake_fmha_route_is_optimized(
 
     if route is None:
         return False
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component == _ALIGNED_MTP_Q32_COMPONENT
+    ):
+        return _aligned_mtp_q32_route_program(route) is not None
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == _ALIGNED_HD256_COMPONENT
@@ -1314,122 +2123,58 @@ def _smallm_sm_count(device: torch.device) -> int:
     return count
 
 
-# (CUDA device index, raw stream handle, current CUDA context handle) -> the
-# SM count of the stream's context: the device's for a primary-context stream,
-# the partition's for a green context's.  Read once per key: the hot path is a
-# torch stream lookup, a thread-local context read and this dict.
-_STREAM_SM_COUNTS: dict[tuple[int, int, int], int] = {}
-# ``(cuCtxGetCurrent, cuStreamGetCtx, cuCtxGetDevResource, SM resource type)``
-# of ``cuda.bindings.driver`` once resolved; ``False`` without them (then a
-# launch is planned on the device's SM count).
-_CONTEXT_QUERIES: Any = None
+# ``stream_context_sm_count(stream, device)`` of the stream-context library
+# (``csrc/cake_fmha_stream_context.cpp``) once loaded: the SM count of the CUDA
+# context a raw stream handle runs on (a green context's partition), ``-1`` when
+# the driver cannot tell; ``False`` when the library cannot be loaded (then a
+# launch is planned on the device's SM count).  One FFI call per launch: the same
+# driver queries through the Python bindings cost several microseconds of host
+# time per launch.
+_STREAM_CONTEXT_SM_COUNT: Any = None
 
 
-def _context_queries() -> Any:
-    global _CONTEXT_QUERIES
-    if _CONTEXT_QUERIES is None:
+def _stream_context_query() -> Any:
+    global _STREAM_CONTEXT_SM_COUNT
+    if _STREAM_CONTEXT_SM_COUNT is None:
         try:
-            from cuda.bindings import driver
-
-            _CONTEXT_QUERIES = (
-                driver.cuCtxGetCurrent,
-                driver.cuStreamGetCtx,
-                driver.cuCtxGetDevResource,
-                driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+            module = load_cake_fmha_stream_context_module()
+            _STREAM_CONTEXT_SM_COUNT = module.stream_context_sm_count
+        except Exception as error:  # noqa: BLE001
+            warnings.warn(
+                "cake_fmha: the stream-context library did not load, so small-M "
+                "decode splits are planned on the device's SM count (a launch on "
+                f"an SM partition may not complete): {error}",
+                RuntimeWarning,
+                stacklevel=2,
             )
-        except (ImportError, AttributeError):
-            _CONTEXT_QUERIES = False
-    return _CONTEXT_QUERIES
+            _STREAM_CONTEXT_SM_COUNT = False
+    return _STREAM_CONTEXT_SM_COUNT
 
 
-def _stream_context_sm_count(index: int) -> int | None:
-    """The SM count of the CUDA context of device ``index``'s current torch
-    stream (a green context's stream runs on its partition; the legacy default
-    stream runs on the thread's current context); ``None`` when the driver
-    cannot tell."""
-
-    queries = _CONTEXT_QUERIES
-    if queries is None:
-        queries = _context_queries()
-    if not queries:
-        return None
-    get_current, stream_context, context_resource, sm_type = queries
-    stream = torch._C._cuda_getCurrentRawStream(index)
-    err, current = get_current()
-    if int(err):
-        return None
-    key = (index, stream, int(current))
-    count = _STREAM_SM_COUNTS.get(key)
-    if count is None:
-        err, context = stream_context(stream)
-        if int(err) or not int(context):
-            context = current
-        if not int(context):
-            return None
-        err, resource = context_resource(context, sm_type)
-        if int(err):
-            return None
-        count = _STREAM_SM_COUNTS[key] = int(resource.sm.smCount)
-    return count
-
-
-# Whether this process may launch the small-M route on a stream of an SM
-# partition (a green context).  Set when FlashInfer's green-context helpers or
-# torch create a green context (observed below), by
-# ``FLASHINFER_CAKE_FMHA_SM_PARTITIONS=1`` or by
-# :func:`enable_cake_fmha_sm_partitions`.  Until then a launch is planned on
-# the device's SM count without reading its stream.
-_SMALLM_SM_PARTITIONS = os.environ.get("FLASHINFER_CAKE_FMHA_SM_PARTITIONS") == "1"
+# Whether a small-M launch plans its split count on the SMs of its stream's
+# CUDA context (a green context's partition) instead of the device's.  On by
+# default: FlashInfer cannot observe every partition a launch may run on (a
+# torch green context created, or its stream taken, before FlashInfer was
+# imported; torch 2.13's ``GreenContext.create`` returns the C++ base class, so
+# no Python wrapper sees its ``Stream()``; a green context of the driver API or
+# another library), and a split count planned on more SMs than the stream holds
+# never completes.  ``FLASHINFER_CAKE_FMHA_SM_PARTITIONS=0`` or
+# ``enable_cake_fmha_sm_partitions(False)`` plans on the device's SM count
+# without reading the stream, for a process that never launches on a partition;
+# FlashInfer's green-context helpers (``flashinfer.green_ctx``) turn it back on.
+_SMALLM_SM_PARTITIONS = os.environ.get("FLASHINFER_CAKE_FMHA_SM_PARTITIONS") != "0"
 
 
 def enable_cake_fmha_sm_partitions(enabled: bool = True) -> None:
     """Plan small-M decode splits on the SMs of the launch stream's CUDA
-    context.  On by itself once FlashInfer's green-context helpers or torch
-    create a green context; a process that partitions the device by other
-    means (the driver API directly) enables it."""
+    context (the default), or with ``enabled=False`` on the device's SM count
+    without reading the stream.  Turn it off only in a process that never
+    launches the small-M route on an SM partition: a split count planned on
+    more SMs than the stream's context holds never completes.  Creating
+    green-context streams with ``flashinfer.green_ctx`` turns it back on."""
 
     global _SMALLM_SM_PARTITIONS
     _SMALLM_SM_PARTITIONS = bool(enabled)
-
-
-def _observe_torch_green_contexts() -> None:
-    """Enable the partition-aware plan when ``torch.cuda.green_contexts``
-    creates a green context or hands out its stream or context (which covers a
-    green context created before FlashInfer was imported); if torch's class
-    cannot be observed, enable it now."""
-
-    try:
-        from torch.cuda.green_contexts import GreenContext
-    except ImportError:
-        return
-
-    def observed(function):
-        @functools.wraps(function)
-        def enable_then_call(*args, **kwargs):
-            enable_cake_fmha_sm_partitions()
-            return function(*args, **kwargs)
-
-        enable_then_call._cake_fmha_observed = True  # type: ignore[attr-defined]
-        return enable_then_call
-
-    for name in ("__init__", "create", "Stream", "set_context"):
-        member = vars(GreenContext).get(name)
-        static = isinstance(member, staticmethod)
-        function = member.__func__ if static else member
-        if not callable(function) or getattr(function, "_cake_fmha_observed", False):
-            continue
-        try:
-            setattr(
-                GreenContext,
-                name,
-                staticmethod(observed(function)) if static else observed(function),
-            )
-        except (AttributeError, TypeError):
-            enable_cake_fmha_sm_partitions()
-            return
-
-
-_observe_torch_green_contexts()
 
 
 def _smallm_launch_sm_count(
@@ -1437,17 +2182,35 @@ def _smallm_launch_sm_count(
 ) -> int:
     """The SMs a small-M launch on ``device``'s current torch stream can hold
     at once: the device's (:func:`_smallm_sm_count`, or ``device_sm_count``
-    when the caller has it), bounded by the stream's CUDA context (a green
-    context's partition).  Every split of a small-M tile waits for all of them,
-    so a split count planned on more SMs than the stream's context holds never
-    completes."""
+    when the caller has it), bounded by the SMs of the stream's CUDA context (a
+    green context's partition).  Every split of a small-M tile waits for all of
+    them, so a split count planned on more SMs than the stream's context holds
+    never completes.
+
+    Every launch reads its stream's context: the legacy and per-thread default
+    streams run on the thread's current context, any other stream on its own
+    (``cuStreamGetCtx``; where that does not answer, before CUDA 13 for a stream
+    of ``cuGreenCtxStreamCreate``, its green context).  The device's primary
+    context is retained once and known by its handle, so a launch on one of its
+    streams makes one driver call; any other context's count is cached per
+    context ID (``cuCtxGetId``), which the driver never reuses, unlike a
+    destroyed context's or stream's handle.  The stream is not keyed by
+    ``cuStreamGetId``: on a stream being captured into a CUDA graph that query
+    returns ``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`` and invalidates the
+    capture (driver 580, in global and relaxed capture modes alike), while the
+    context queries are legal during a capture."""
 
     count = _smallm_sm_count(device) if device_sm_count is None else device_sm_count
     if device.type != "cuda":
         return count
+    query = _STREAM_CONTEXT_SM_COUNT
+    if query is None:
+        query = _stream_context_query()
+    if not query:
+        return count
     index = device.index if device.index is not None else torch.cuda.current_device()
-    partition = _stream_context_sm_count(index)
-    return count if partition is None or partition >= count else partition
+    partition = query(torch._C._cuda_getCurrentRawStream(index), index)
+    return count if partition < 0 or partition >= count else partition
 
 
 # On-device load-balanced split-KV decode (Cake routes ``decode_balanced_bf16_v1``
@@ -1941,7 +2704,7 @@ def aligned_hd64_selected(
 # program of cluster size N.  ``arch`` is the source's target spelling and ``sm_count``
 # the device's multiprocessor count.
 #
-# Copied at source revision ``94f177693211b2abc624c487ffd64bb1f8094a17``;
+# Copied at source revision ``38d7a8878e025385ab9f995b1b0ae5d722685dc2``;
 # ``tests/attention/test_cake_fmha_aligned_hd256.py`` holds the source selector
 # test's expectations.
 # ---------------------------------------------------------------------------
@@ -1970,6 +2733,7 @@ SEL_HD256_PINS = {
         ((512, 32768), ("persistent", 1)),  # uniform_b64_hkv8_s32768
         ((1024, 32768), ("persistent", 1)),  # uniform_b128_hkv8_s32768
         ((1024, 4096), ("persistent", 1)),  # uniform_b128_hkv8_s4096
+        ((8, 4096), ("cga", 8)),  # uniform_b1_hkv8_s4096
     ),
     "sm_103a": (  # derived at 152 SMs
         ((16, 237569), None),  # agentx_b16_hkv1
@@ -1985,6 +2749,7 @@ SEL_HD256_PINS = {
         ((512, 32768), None),  # uniform_b64_hkv8_s32768
         ((1024, 32768), ("persistent", 1)),  # uniform_b128_hkv8_s32768
         ((1024, 4096), ("persistent", 1)),  # uniform_b128_hkv8_s4096
+        ((8, 4096), ("cga", 8)),  # uniform_b1_hkv8_s4096
     ),
 }
 # Band rectangles per target: ((tiles_lo, tiles_hi, kv_lo, kv_hi), program), inclusive
@@ -2052,6 +2817,91 @@ def aligned_hd256_program(
         return None
     kv_ctas = -(-max_seq_len_kv // SEL_HD256_KV_PER_CTA_SPLIT)
     ctas_kv = min(kv_ctas, max(1, sm_count // tiles))
+    return program if ctas_kv == program[1] else None
+
+
+# ---------------------------------------------------------------------------
+# Aligned speculative-decode grouped decode selector: a Python mirror of the
+# source selector.
+#
+# Source of truth: the kernel source's selector (module
+# ``trtllm_fmha_forgen_bf16_q32_grouped_cga`` of the
+# ``attention_decode_bf16_paged_spec`` family: ``SEL_Q32CGA_*``,
+# ``spec_q32_cga_program``).  The constants and comments are copied verbatim
+# (names and values; the formatter re-wraps long code lines) and the function
+# keeps the source's signature and semantics; change the source first, then
+# re-copy.  ``None`` keeps the present route ``decode_balanced_bf16``;
+# ``("cga", N)`` selects the aligned speculative-decode program of cluster size
+# N.  ``arch`` is the source's target spelling and ``sm_count`` the device's
+# multiprocessor count.
+#
+# Copied at source revision ``1e504c05e3b59b960735759fc085c5edcc606da1``;
+# ``tests/attention/test_cake_fmha_aligned_mtp_q32.py`` holds the source selector
+# test's expectations.
+# ---------------------------------------------------------------------------
+SEL_Q32CGA_ARCHS = ("sm_100a", "sm_103a")
+# Query heads per KV head of the port (its kernel_requires); other groups keep the present route.
+SEL_Q32CGA_GROUP = 8
+# Query tokens per request the port's 32-row Q tile holds (its kernel_requires: 1 <= q_len <= 4).
+SEL_Q32CGA_MAX_Q_LEN = 4
+# FlashInfer's trtllm-gen split puts a sequence's KV on at most ceil(max_kv / SEL_Q32CGA_KV_PER_CTA_SPLIT) CTAs
+# (twice the class's 256-token KV step).
+SEL_Q32CGA_KV_PER_CTA_SPLIT = 512
+# FlashInfer takes the CGA reduction only for a split of 2 to SEL_Q32CGA_MAX_CGA_CTAS CTAs (the largest cluster).
+SEL_Q32CGA_MAX_CGA_CTAS = 16
+# Pinned points per target: ((batch_size, num_kv_heads, max_seq_len_kv, q_len), program), program ("cga", N) = the
+# cluster-of-N config; an empty tuple = the present route everywhere on that target.
+SEL_Q32CGA_PINS = {
+    "sm_100a": (  # derived at 148 SMs
+        ((8, 8, 4096, 3), ("cga", 2)),  # uniform_b8_hkv8_s4096_mtp3
+    ),
+    "sm_103a": (),  # derived at 152 SMs: the present route serves the mtp3 row
+}
+
+
+def spec_q32_cga_program(
+    batch_size: int,
+    num_kv_heads: int,
+    max_seq_len_kv: int,
+    *,
+    q_len: int,
+    num_q_heads: int,
+    arch: str,
+    sm_count: int,
+) -> "tuple[str, int] | None":
+    """The cluster config of this program for one launch, or ``None`` for the host's present route, from host
+    metadata only.
+
+    ``None`` unless ``1 <= q_len <= SEL_Q32CGA_MAX_Q_LEN``, exactly ``SEL_Q32CGA_GROUP`` query heads per KV head and
+    ``arch`` in ``SEL_Q32CGA_ARCHS``.  Otherwise the target's pinned points on ``(batch_size, num_kv_heads,
+    max_seq_len_kv, q_len)`` decide.  A program ``("cga", N)`` is returned only when FlashInfer's trtllm-gen split at
+    ``sm_count`` SMs picks the CGA class at the same cluster size: ``N == min(ceil(max_kv /
+    SEL_Q32CGA_KV_PER_CTA_SPLIT), max(1, sm_count // tiles))`` with ``tiles = batch_size * num_kv_heads`` (one Q tile
+    per (request, KV head) at ``q_len <= 4``, so the split's base CTAs are ``tiles``) and ``1 < N <=
+    SEL_Q32CGA_MAX_CGA_CTAS``.  Selection is a performance choice only: each config handles any lengths up to
+    ``max_pages_per_seq * PAGE_SIZE``.
+    """
+    if not 1 <= q_len <= SEL_Q32CGA_MAX_Q_LEN:
+        return None
+    if num_q_heads != SEL_Q32CGA_GROUP * num_kv_heads:
+        return None
+    if arch not in SEL_Q32CGA_ARCHS:
+        return None
+    tiles = batch_size * num_kv_heads
+    if batch_size <= 0 or num_kv_heads <= 0 or max_seq_len_kv <= 0 or sm_count <= 0:
+        return None
+    program = None
+    point = (batch_size, num_kv_heads, max_seq_len_kv, q_len)
+    for pin, pinned in SEL_Q32CGA_PINS[arch]:
+        if pin == point:
+            program = pinned
+            break
+    if program is None:
+        return None
+    kv_ctas = -(-max_seq_len_kv // SEL_Q32CGA_KV_PER_CTA_SPLIT)
+    ctas_kv = min(kv_ctas, max(1, sm_count // tiles))
+    if not 1 < ctas_kv <= SEL_Q32CGA_MAX_CGA_CTAS:
+        return None
     return program if ctas_kv == program[1] else None
 
 
@@ -2138,6 +2988,15 @@ def _decode_native_workspace_supported(
     if pages_per_block == 4:
         padded_pages = (padded_pages + 3) // 4 * 4
     needs_page_padding = source_pages != padded_pages
+    if pages_per_block == 8:
+        # The BF16 binding pads a table its 16-byte page-id loads cannot read
+        # in place too (a width of a multiple of four pages, 16-byte base).
+        padded_pages = max(required_pages, (source_pages + 3) // 4 * 4)
+        needs_page_padding = (
+            source_pages < required_pages
+            or source_pages % 4 != 0
+            or block_tables.data_ptr() % 16 != 0
+        )
 
     cursor = (batch_size * 4 + 15) // 16 * 16
     if needs_page_padding:
@@ -2464,17 +3323,21 @@ def _decode_route_runs_program(route: CakeFmhaDecodeRoute) -> bool:
 def _decode_program_record(route: CakeFmhaDecodeRoute) -> tuple[str, str] | None:
     """``(program name, launch)`` the module pins for the route's program, or
     ``None`` when the route names no program or one this module does not
-    route on its target."""
+    route on its target (a length-aware twin runs where its stream-K
+    program is routed)."""
 
     if route.program is None:
         return None
-    family, identifier = route.program
     routes = _DECODE_PROGRAM_ROUTES.get(route.target, {})
-    if not any(
-        key[0] == family and served == identifier for key, served in routes.items()
-    ):
+    routed = {(key[0], served) for key, served in routes.items()}
+    routed |= {
+        twin
+        for program, twin in _DECODE_PROGRAM_LENGTH_AWARE.items()
+        if program in routed
+    }
+    if route.program not in routed:
         return None
-    return _DECODE_PROGRAMS.get((family, identifier))
+    return _DECODE_PROGRAMS.get(route.program)
 
 
 def _decode_program_lookup(
@@ -3588,6 +4451,10 @@ _DECODE_PROGRAM_ROUTES["sm100a"].update(
         ("decode_bf16", "device", 4, 1, 32, 4, 16, False, True): "DEC_B4C4_DS",
         ("decode_bf16", "host", 256, 1, 32, 4, 16, True, False): "DEC_SINK",
         ("decode_bf16", "device", 256, 1, 32, 4, 16, True, False): "DEC_SINK_DS",
+        ("decode_bf16", "host", 128, 1, 32, 4, 16, False, True): "DEC_B128",
+        ("decode_bf16", "device", 128, 1, 32, 4, 16, False, True): "DEC_B128_DS",
+        ("decode_bf16", "host", 256, 1, 32, 4, 16, True, True): "DEC_SINK",
+        ("decode_bf16", "device", 256, 1, 32, 4, 16, True, True): "DEC_SINK_DS",
     }
 )
 _DECODE_PROGRAM_ROUTES["sm103a"].update(
@@ -3598,16 +4465,20 @@ _DECODE_PROGRAM_ROUTES["sm103a"].update(
         ("decode_bf16", "device", 4, 1, 32, 4, 16, False, True): "DEC_B4C4_DS",
         ("decode_bf16", "host", 256, 1, 32, 4, 16, True, False): "DEC_SINK",
         ("decode_bf16", "device", 256, 1, 32, 4, 16, True, False): "DEC_SINK_DS",
+        ("decode_bf16", "host", 128, 1, 32, 4, 16, False, True): "DEC_B128",
+        ("decode_bf16", "device", 128, 1, 32, 4, 16, False, True): "DEC_B128_DS",
+        ("decode_bf16", "host", 256, 1, 32, 4, 16, True, True): "DEC_SINK",
+        ("decode_bf16", "device", 256, 1, 32, 4, 16, True, True): "DEC_SINK_DS",
     }
 )
 _DECODE_PROGRAMS.update(
     {
         ("decode_bf16", "DEC_B128"): (
-            "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
+            "cake_fmha_decode_bf16_bc385ebf14604aab347e",
             "streamk",
         ),
         ("decode_bf16", "DEC_B128_DS"): (
-            "cake_fmha_decode_bf16_4771b35b3b41de52fc15",
+            "cake_fmha_decode_bf16_0e44456c4d63adb24711",
             "streamk",
         ),
         ("decode_bf16", "DEC_B4C4"): (
@@ -3626,8 +4497,25 @@ _DECODE_PROGRAMS.update(
             "cake_fmha_decode_bf16_394b0caa8e0362fe9988",
             "bhq",
         ),
+        ("decode_bf16", "DEC_B128_LA"): (
+            "cake_fmha_decode_bf16_c64d254f01952ec24d95",
+            "streamk",
+        ),
+        ("decode_bf16", "DEC_B128_LA_DS"): (
+            "cake_fmha_decode_bf16_fdf3768a052c6ca9cd83",
+            "streamk",
+        ),
     }
 )
+# The length-aware twins of the stream-K programs: the same launch with each
+# request's units sized by its own length instead of ``max_seq_len``, so a
+# batch whose lengths differ streams only its requests' own KV blocks.  A
+# call runs the twin only when it asks for the length-aware schedule
+# (``length_aware_schedule``); its default route keeps the stream-K program.
+_DECODE_PROGRAM_LENGTH_AWARE: dict[tuple[str, str], tuple[str, str]] = {
+    ("decode_bf16", "DEC_B128"): ("decode_bf16", "DEC_B128_LA"),
+    ("decode_bf16", "DEC_B128_DS"): ("decode_bf16", "DEC_B128_LA_DS"),
+}
 
 
 def _decode_exact_sink_member_cannot_finish(
@@ -3652,6 +4540,34 @@ def _decode_exact_sink_member_cannot_finish(
     )
 
 
+def _decode_bf16_program_padded_table(
+    workspace_bytes: int, batch_size: int, max_seq_len: int
+) -> tuple[int, int]:
+    """``(byte offset, pages per row)`` of the page table a stream-K or BHQ
+    BF16 decode program reads when the caller's table does not fit its
+    kernels: eight pages per evened 128-token block, at least four blocks, in
+    the last 256-byte-aligned bytes of the workspace (a negative offset: the
+    workspace cannot hold it).  The columns past the caller's width hold page
+    0, as the JIT binding pads them."""
+
+    blocks = (max_seq_len + 127) // 128
+    pages = 8 * max(4, blocks + blocks % 2)
+    return (workspace_bytes - batch_size * pages * 4) // 256 * 256, pages
+
+
+def _decode_bf16_program_table_fits(
+    launch: str, block_tables: torch.Tensor, pages: int
+) -> bool:
+    """Whether a program of ``launch`` reads the caller's page table in place:
+    at least ``pages`` wide, and for a stream-K program (16-byte page-id
+    loads) a width of a multiple of four pages on a 16-byte-aligned base."""
+
+    width = int(block_tables.shape[-1])
+    if width < pages:
+        return False
+    return launch != "streamk" or (width % 4 == 0 and block_tables.data_ptr() % 16 == 0)
+
+
 def _decode_bf16_program_select(
     device: torch.device,
     *,
@@ -3673,18 +4589,27 @@ def _decode_bf16_program_select(
     kv_layout: str,
     uses_shared_paged_kv_idx: bool,
     no_block_scales: bool,
+    pad_table: bool = False,
+    length_aware_schedule: bool = False,
 ) -> tuple[tuple[str, str], bool] | None:
     """``(program, device_scales)`` of a BF16 decode launch the generated
-    programs serve, or ``None``.
+    programs serve, or ``None``.  With ``length_aware_schedule`` a stream-K
+    hit runs its length-aware twin (:data:`_DECODE_PROGRAM_LENGTH_AWARE`).
 
     A hit takes a contiguous query, 16-token HND pages of head dim 128, a
-    contiguous int32 shared page table at least as wide as the kernels read
-    (eight pages per evened 128-token block, at least four blocks), int32
-    lengths (the kernels derive each request's causal prefix from them), no
-    LSE, window, block scales or output scale, one scale form (host: bmm2 1)
-    and a workspace holding the kernels' LSE scratch.  A stream-K program
-    also needs a batch of at least two requests per CTA group and a
-    workspace holding its split scratch and counters
+    contiguous int32 shared page table the kernels read in place (eight
+    pages per evened 128-token block, at least four blocks; a stream-K
+    program's 16-byte loads also need a width of a multiple of four pages,
+    :func:`_decode_bf16_program_table_fits`), int32 lengths (the kernels
+    derive each request's causal prefix from them), no LSE, window, block
+    scales or output scale, one scale form (host: bmm2 1) and a workspace
+    holding the kernels' LSE scratch.  With ``pad_table`` a stream-K or BHQ
+    program also takes a table that does not fit, read as a padded copy at
+    the end of the workspace past its scratch
+    (:func:`_decode_bf16_program_padded_table`); the copy is a separate
+    launch, so the route asks for it only when no JIT member serves the
+    launch.  A stream-K program also needs a batch of at least two requests
+    per CTA group and a workspace holding its split scratch and counters
     (:func:`_decode_streamk_layout`).
     """
 
@@ -3712,8 +4637,6 @@ def _decode_bf16_program_select(
         return None
     blocks = (max_seq_len + 127) // 128
     even = max(4, blocks + blocks % 2)
-    if int(block_tables.shape[-1]) < 8 * even:
-        return None
     if not _decode_native_workspace_supported(
         workspace_buffer,
         query,
@@ -3747,6 +4670,10 @@ def _decode_bf16_program_select(
                 and _smallm_sm_count(device) < batch_size * q_len * num_kv_heads
             ):
                 return None
+            # The end of the launch's own workspace scratch (LSE, then a
+            # stream-K program's split scratch and counters).
+            end = (batch_size * 4 + 15) // 16 * 16
+            end += int(query.shape[0]) * num_q_heads * 4
             # A stream-K program cuts each request into at most two parts on
             # adjacent CTA groups, which needs two requests per group; its
             # split scratch follows the LSE scratch in the workspace.
@@ -3759,6 +4686,17 @@ def _decode_bf16_program_select(
                 end = _decode_streamk_layout(batch_size, rows, grid)[2]
                 if groups == 0 or _decode_program_bytes_of(workspace_buffer) < end:
                     return None
+                if length_aware_schedule:
+                    program = _DECODE_PROGRAM_LENGTH_AWARE.get(program, program)
+            if not _decode_bf16_program_table_fits(launch, block_tables, 8 * even) and (
+                not pad_table
+                or launch == "cluster"
+                or _decode_bf16_program_padded_table(
+                    _decode_program_bytes_of(workspace_buffer), batch_size, max_seq_len
+                )[0]
+                < end
+            ):
+                return None
             return program, form == "device"
     return None
 
@@ -3782,7 +4720,9 @@ def _decode_bf16_program_values(
     **unused: Any,
 ) -> list[tuple[Any, Any, dict[str, Any]]]:
     """The one launch of a BF16 decode program.  The kernels read the page
-    table in place (row stride its width), each request's length (its causal
+    table in place (row stride its width), or a table that does not fit them
+    as a copy padded with page 0 at the end of the workspace
+    (:func:`_decode_bf16_program_padded_table`), each request's length (its causal
     prefix is the length less the query length) and write the per-row LSE
     to scratch in the workspace (the JIT route's offset).  A pointer the
     program does not read (a host-scale program's scales, an absent sink)
@@ -3794,6 +4734,18 @@ def _decode_bf16_program_values(
     rows = int(query.shape[0]) * int(query.shape[1])
     lse_offset = (route.batch_size * 4 + 15) // 16 * 16
     unread = seq_lens.view(torch.float32)
+    flat = _decode_program_bytes(workspace_buffer)
+    page_table = block_tables
+    offset, pages = _decode_bf16_program_padded_table(
+        flat.numel(), route.batch_size, max_seq_len
+    )
+    if not _decode_bf16_program_table_fits(module.launch, block_tables, pages):
+        width = min(int(block_tables.shape[-1]), pages)
+        page_table = _decode_program_workspace(
+            flat, offset, route.batch_size * pages * 4, torch.int32
+        ).view(route.batch_size, pages)
+        page_table[:, :width].copy_(block_tables[:, :width])
+        page_table[:, width:].zero_()
     if module.route.device_scales:
         if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
             bmm2_scale, torch.Tensor
@@ -3813,17 +4765,17 @@ def _decode_bf16_program_values(
         "V": value_cache,
         "O_ptr": out,
         "LSE_ptr": _decode_program_workspace(
-            _decode_program_bytes(workspace_buffer),
+            flat,
             lse_offset,
             rows * 4,
             torch.float32,
         ),
-        "page_table": block_tables,
+        "page_table": page_table,
         "causal_seqlens_kv_global": seq_lens,
         "scale_log2_ptr": scale_ptr,
         "bmm2_ptr": bmm2_ptr,
         "sinks_ptr": unread if sinks is None else sinks,
-        "max_pages_per_seq": int(block_tables.shape[-1]),
+        "max_pages_per_seq": int(page_table.shape[-1]),
         "max_local_seq_len": max_seq_len,
         "softmax_scale_log2": softmax_scale_log2,
         "window_left": -1,
@@ -3957,11 +4909,16 @@ def select_cake_fmha_decode_route(
     lse: torch.Tensor | None = None,
     multi_ctas_kv_counter_buffer: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
+    length_aware_schedule: bool = False,
 ) -> CakeFmhaDecodeRoute | None:
     """Select an exact product decode route without broadening its contract.
 
     ``enable_pdl`` is the caller's launch mode; a generated program whose split-KV
     reducer waits on the decode grid serves only a call that asks for it.
+
+    ``length_aware_schedule`` is the caller's opt-in to the length-aware twin of
+    a stream-K BF16 program (:data:`_DECODE_PROGRAM_LENGTH_AWARE`); every other
+    route ignores it.
 
     A launch with ``lse`` takes the program route of the same launch without
     it, with ``return_lse`` set, when its JIT member is the route the module
@@ -4137,22 +5094,6 @@ def select_cake_fmha_decode_route(
         smallm_rows = _smallm_tile_rows_for(q_len, group)
         smallm_tiles = batch_size * num_kv_heads
         smallm_sm_count = _smallm_sm_count(device)
-        # The small-M split count is planned on the SMs the launch's stream
-        # holds (a green context's partition); the other routes keep the
-        # device's SM count.
-        smallm_launch_sm_count = (
-            _smallm_launch_sm_count(device, smallm_sm_count)
-            if _SMALLM_SM_PARTITIONS
-            and smallm_rows is not None
-            and query.shape[2] == 256
-            else smallm_sm_count
-        )
-        smallm_num_split = _smallm_num_split(
-            tiles=smallm_tiles,
-            sm_count=smallm_launch_sm_count,
-            max_seq_len=max_seq_len,
-            n_rows=smallm_rows or 64,
-        )
         if (
             query.is_contiguous()
             and query.shape[2] == 64
@@ -4227,52 +5168,67 @@ def select_cake_fmha_decode_route(
             and not isinstance(bmm1_scale, torch.Tensor)
             and _tma_paged_kv_strides_supported(key_cache)
             and _tma_paged_kv_strides_supported(value_cache)
-            and smallm_num_split >= 1
-            and _smallm_workspace_supported(
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            # The small-M split count is planned on the SMs the launch's
+            # stream holds (a green context's partition); the other routes
+            # keep the device's SM count.  Only a launch this route can take
+            # reads its stream, and more tiles than the device's SMs take no
+            # split on any partition, so such a launch reads none either.
+            smallm_launch_sm_count = (
+                _smallm_launch_sm_count(device, smallm_sm_count)
+                if _SMALLM_SM_PARTITIONS and 0 < smallm_tiles <= smallm_sm_count
+                else smallm_sm_count
+            )
+            smallm_num_split = _smallm_num_split(
+                tiles=smallm_tiles,
+                sm_count=smallm_launch_sm_count,
+                max_seq_len=max_seq_len,
+                n_rows=smallm_rows,
+            )
+            if smallm_num_split >= 1 and _smallm_workspace_supported(
                 workspace_buffer,
                 query,
                 tiles=smallm_tiles,
                 num_split=smallm_num_split,
                 n_rows=smallm_rows,
                 lse=lse,
-            )
-            and no_block_scales
-            and not isinstance(bmm2_scale, torch.Tensor)
-            and float(bmm2_scale) == 1.0
-            and (o_scale is None or float(o_scale) == 1.0)
-        ):
-            smallm_program = _decode_smallm_program_select(
-                device,
-                n_rows=smallm_rows,
-                page_size=page_size,
-                q_len=q_len,
-                group=group,
-                tiles=smallm_tiles,
-                max_seq_len=max_seq_len,
-                num_split=smallm_num_split,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                whole_device=smallm_launch_sm_count >= smallm_sm_count,
-            )
-            smallm_key, smallm_split = smallm_program or (None, smallm_num_split)
-            candidate = CakeFmhaDecodeRoute(
-                target=_cake_fmha_target(device),
-                batch_size=batch_size,
-                q_len=q_len,
-                num_q_heads=num_q_heads,
-                num_kv_heads=num_kv_heads,
-                has_sink=False,
-                has_window=False,
-                use_scale_ptr=False,
-                retain_kv_l2=local_blocks <= 9,
-                component="decode_native_bf16_hd256_smallm",
-                page_size=page_size,
-                num_split=smallm_split,
-                program=smallm_key,
-            )
-            if smallm_key is not None:
-                return candidate
-            return candidate if cake_fmha_route_is_optimized(candidate) else None
+            ):
+                smallm_program = _decode_smallm_program_select(
+                    device,
+                    n_rows=smallm_rows,
+                    page_size=page_size,
+                    q_len=q_len,
+                    group=group,
+                    tiles=smallm_tiles,
+                    max_seq_len=max_seq_len,
+                    num_split=smallm_num_split,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    whole_device=smallm_launch_sm_count >= smallm_sm_count,
+                )
+                smallm_key, smallm_split = smallm_program or (None, smallm_num_split)
+                candidate = CakeFmhaDecodeRoute(
+                    target=_cake_fmha_target(device),
+                    batch_size=batch_size,
+                    q_len=q_len,
+                    num_q_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    has_sink=False,
+                    has_window=False,
+                    use_scale_ptr=False,
+                    retain_kv_l2=local_blocks <= 9,
+                    component="decode_native_bf16_hd256_smallm",
+                    page_size=page_size,
+                    num_split=smallm_split,
+                    program=smallm_key,
+                )
+                if smallm_key is not None:
+                    return candidate
+                return candidate if cake_fmha_route_is_optimized(candidate) else None
         if (
             query.is_contiguous()
             and query.shape[2] == 256
@@ -4311,7 +5267,7 @@ def select_cake_fmha_decode_route(
             # selector's bands for this target read one faster than the
             # balanced route below and the trtllm-gen split at this device's
             # SM count picks that program's kernel class (the persistent
-            # program, or the cluster program of 2 / 4 CTAs).  They read the
+            # program, or the cluster program of 2 / 4 / 8 CTAs).  They read the
             # K / V pools and the query in place (contiguous; their TMA maps
             # derive every stride from the shapes) with an int32 page table
             # and lengths.
@@ -4379,6 +5335,35 @@ def select_cake_fmha_decode_route(
                 counter_buffer=multi_ctas_kv_counter_buffer,
             )
         ):
+            # Eight query heads per KV head and 1 to 4 query tokens per request
+            # (``q_len x 8`` rows: one 32-row query tile per (request, KV
+            # head)): the aligned speculative-decode program where the source
+            # selector pins it faster than the balanced route below and the
+            # trtllm-gen split at this device's SM count picks its cluster size.
+            # It reads the K / V pools and the query in place (contiguous; its
+            # TMA maps derive every stride from the shapes) with an int32 page
+            # table and lengths.
+            if (
+                key_cache.is_contiguous()
+                and value_cache.is_contiguous()
+                and block_tables.dtype == torch.int32
+                and seq_lens.dtype == torch.int32
+            ):
+                aligned_mtp = spec_q32_cga_program(
+                    batch_size,
+                    num_kv_heads,
+                    max_seq_len,
+                    q_len=q_len,
+                    num_q_heads=num_q_heads,
+                    arch=_ALIGNED_PROGRAM_TARGET[_cake_fmha_target(device)],
+                    sm_count=smallm_sm_count,
+                )
+                if aligned_mtp in _ALIGNED_MTP_Q32_PROGRAM_IDS:
+                    return route(
+                        _ALIGNED_MTP_Q32_COMPONENT,
+                        selected_page_size=16,
+                        aligned_program=_ALIGNED_MTP_Q32_PROGRAM_IDS[aligned_mtp],
+                    )
             # Long-context / ragged decode: the on-device balanced scheduler
             # splits long requests into chunks and merges them on device.
             return route("decode_balanced_bf16", selected_page_size=16)
@@ -4386,8 +5371,7 @@ def select_cake_fmha_decode_route(
         # native JIT members; a launch they do not serve keeps those.  An LSE
         # launch is selected as the same launch without it and decided at the
         # native member below.
-        bf16_program = _decode_bf16_program_select(
-            device,
+        program_kwargs = dict(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -4406,26 +5390,10 @@ def select_cake_fmha_decode_route(
             kv_layout=kv_layout,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             no_block_scales=no_block_scales,
+            length_aware_schedule=length_aware_schedule,
         )
-        program_route = None
-        if bf16_program is not None:
-            program_route = CakeFmhaDecodeRoute(
-                target=_cake_fmha_target(device),
-                batch_size=batch_size,
-                q_len=q_len,
-                num_q_heads=num_q_heads,
-                num_kv_heads=num_kv_heads,
-                has_sink=sinks is not None,
-                has_window=False,
-                use_scale_ptr=bf16_program[1],
-                retain_kv_l2=local_blocks <= 9,
-                component="decode_native_bf16",
-                page_size=16,
-                program=bf16_program[0],
-                device_scales=bf16_program[1],
-            )
-            if lse is None:
-                return program_route
+        bf16_program = _decode_bf16_program_select(device, **program_kwargs)
+        native = None
         if (
             query.is_contiguous()
             and query.shape[2] == 128
@@ -4455,16 +5423,44 @@ def select_cake_fmha_decode_route(
             ):
                 # A launch the exact sink member cannot finish takes the
                 # compat route (a program it fits took its program above).
-                return None
-            # The LSE launch keeps the program route of the launch without it
-            # when that route's JIT member is this one; the route runs the
-            # member (see _decode_route_runs_program).
-            if program_route is not None and native == dataclass_replace(
-                program_route, program=None, device_scales=False, return_lse=True
-            ):
-                return dataclass_replace(program_route, return_lse=True)
-            return native
-        return None
+                native = None
+        if bf16_program is None and lse is None and native is None:
+            # No JIT member serves the launch: a program whose kernels read
+            # more of the page table than the caller's holds takes it with a
+            # padded copy of the table (one more launch, still far from the
+            # compat route).
+            bf16_program = _decode_bf16_program_select(
+                device, **program_kwargs, pad_table=True
+            )
+        program_route = None
+        if bf16_program is not None:
+            program_route = CakeFmhaDecodeRoute(
+                target=_cake_fmha_target(device),
+                batch_size=batch_size,
+                q_len=q_len,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                has_sink=sinks is not None,
+                has_window=False,
+                use_scale_ptr=bf16_program[1],
+                retain_kv_l2=local_blocks <= 9,
+                component="decode_native_bf16",
+                page_size=16,
+                program=bf16_program[0],
+                device_scales=bf16_program[1],
+            )
+            if lse is None:
+                return program_route
+        if native is None:
+            return None
+        # The LSE launch keeps the program route of the launch without it
+        # when that route's JIT member is this one; the route runs the
+        # member (see _decode_route_runs_program).
+        if program_route is not None and native == dataclass_replace(
+            program_route, program=None, device_scales=False, return_lse=True
+        ):
+            return dataclass_replace(program_route, return_lse=True)
+        return native
 
     if dtypes == (torch.float16,) * 4:
         # Aligned hd128 q1 decode in FP16: the same programs traced with FP16
@@ -5175,6 +6171,138 @@ def _run_cake_fmha_aligned_hd256_decode(
         module.entry(*arguments)
 
 
+@dataclass(frozen=True)
+class CakeFmhaAlignedMtpQ32DecodeModule:
+    """One loaded aligned speculative-decode program: the route it serves, the
+    ``CakeProgram`` record, its exact target and the binding's ``run`` entry.
+    Distinct from the aligned single-token module classes (hd128
+    :class:`CakeFmhaAlignedDecodeModule`, hd64
+    :class:`CakeFmhaAlignedHd64DecodeModule`, hd256
+    :class:`CakeFmhaAlignedHd256DecodeModule`): this one launches the program
+    whose query tile holds every query token of a request."""
+
+    route: CakeFmhaDecodeRoute
+    program: Any
+    target: str
+    entry: Any
+
+
+def _load_cake_fmha_aligned_mtp_q32_decode_module(
+    route: CakeFmhaDecodeRoute,
+) -> CakeFmhaAlignedMtpQ32DecodeModule:
+    """Build and load the aligned speculative-decode program of ``route`` on the
+    route's target.
+
+    The loader ``flashinfer.jit.cake_fmha_aligned_mtp_q32`` is generated by the
+    Cake export beside ``csrc/cake_fmha_aligned_mtp_q32/``; it is imported here,
+    lazily, so route selection never needs it.  The record's launch facts and
+    argument names are checked against the host launch once, at load.
+    """
+
+    from .jit import cake_fmha_aligned_mtp_q32
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    pinned = _aligned_mtp_q32_route_program(route)
+    if pinned is None:
+        raise RuntimeError(
+            f"Cake FMHA aligned MTP decode route names no program: {route.aligned_program!r}"
+        )
+    ctas, program_name = pinned
+    program = getattr(cake_fmha_aligned_mtp_q32, route.aligned_program, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.cake_fmha_aligned_mtp_q32 publishes no CakeProgram {route.aligned_program!r}"
+        )
+    if program.name != program_name:
+        raise RuntimeError(
+            f"flashinfer.jit.cake_fmha_aligned_mtp_q32.{route.aligned_program} is "
+            f"{program.name}; this module pins {program_name}"
+        )
+    target = _ALIGNED_PROGRAM_TARGET[route.target]
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    if tuple(program.args) != (*_ALIGNED_MTP_Q32_HOST_PARAMS, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*_ALIGNED_MTP_Q32_HOST_PARAMS, *GRID_ARGS]}"
+        )
+    if tuple(program.cluster) != (ctas, 1, 1):
+        raise RuntimeError(
+            f"{program.name} launches cluster {tuple(program.cluster)}; the route "
+            f"expects {(ctas, 1, 1)}"
+        )
+    return CakeFmhaAlignedMtpQ32DecodeModule(
+        route=route,
+        program=program,
+        target=target,
+        entry=program.entry(target),
+    )
+
+
+def _run_cake_fmha_aligned_mtp_q32_decode(
+    module: CakeFmhaAlignedMtpQ32DecodeModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    bmm1_scale: float,
+) -> None:
+    """Launch one aligned speculative decode on the current torch stream.
+
+    The binding's host parameters, in the kernel's order: the query token rows
+    (``Q``, TMA source, ``[batch x q_len, num_q_heads, 128]``), the K and V pools
+    (TMA sources; the contiguous ``[pages, num_kv_heads, 16, 128]`` HND pools
+    viewed as ``[pages x num_kv_heads, 16, 128]``), the output rows (``[batch x
+    q_len x num_q_heads, 128]``), the page table, the device lengths,
+    ``max_pages_per_seq`` (the page table's row width), the log2-domain softmax
+    scale, the head counts, ``heads_per_kv`` (the query heads per KV head: a
+    plain int the binding turns into the kernel's fast divisor), the batch size,
+    ``seq_len_q`` (the uniform query tokens per request) and the correction-skip
+    threshold (0: disabled); then the grid of
+    :func:`cake_fmha_aligned_mtp_q32_launch_grid`.
+    """
+
+    route = module.route
+    if (
+        tuple(query.shape) != (route.batch_size * route.q_len, route.num_q_heads, 128)
+        or key_cache.shape[1] != route.num_kv_heads
+        or tuple(block_tables.shape[:1]) != (route.batch_size,)
+    ):
+        raise RuntimeError(
+            "Cake FMHA aligned MTP decode launch does not match its selected route"
+        )
+    grid = cake_fmha_aligned_mtp_q32_launch_grid(
+        module.program, route.batch_size, route.num_kv_heads
+    )
+    values = {
+        "Q": query,
+        "K": key_cache.view(-1, 16, 128),
+        "V": value_cache.view(-1, 16, 128),
+        "O": out.view(-1, 128),
+        "page_table": block_tables,
+        "seq_lens_kv": seq_lens,
+        "max_pages_per_seq": int(block_tables.shape[1]),
+        "softmax_scale_log2": float(bmm1_scale) * log2e,
+        "num_q_heads": route.num_q_heads,
+        "num_kv_heads": route.num_kv_heads,
+        "heads_per_kv": route.num_q_heads // route.num_kv_heads,
+        "batch_size": route.batch_size,
+        "seq_len_q": route.q_len,
+        "skip_corr_threshold": _ALIGNED_MTP_Q32_SKIP_CORR_THRESHOLD,
+        "grid_x": grid[0],
+        "grid_y": grid[1],
+        "grid_z": grid[2],
+    }
+    arguments = [values[name] for name in module.program.args]
+    with torch.cuda.device(query.device), tvm_ffi.use_torch_stream():
+        module.entry(*arguments)
+
+
 def _resolve_cake_fmha_decode_module(
     device: torch.device, route: CakeFmhaDecodeRoute | None
 ) -> tuple[Any, bool]:
@@ -5186,7 +6314,9 @@ def _resolve_cake_fmha_decode_module(
     :class:`CakeFmhaAlignedHd64DecodeModule` (launched by
     :func:`_run_cake_fmha_aligned_hd64_decode`), an aligned hd256 q1 route to
     a :class:`CakeFmhaAlignedHd256DecodeModule` (launched by
-    :func:`_run_cake_fmha_aligned_hd256_decode`), a generated decode program
+    :func:`_run_cake_fmha_aligned_hd256_decode`), an aligned speculative-decode
+    route to a :class:`CakeFmhaAlignedMtpQ32DecodeModule` (launched by
+    :func:`_run_cake_fmha_aligned_mtp_q32_decode`), a generated decode program
     route to a :class:`CakeFmhaDecodeProgramModule` (launched by
     :func:`_run_cake_fmha_decode_program`), every other optimized route to a
     module exposing ``cake_paged_attention_decode``.
@@ -5205,6 +6335,8 @@ def _resolve_cake_fmha_decode_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device)), False
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
+    if route.component == _ALIGNED_MTP_Q32_COMPONENT:
+        return _load_cake_fmha_aligned_mtp_q32_decode_module(route), True
     if route.component == _ALIGNED_HD256_COMPONENT:
         return _load_cake_fmha_aligned_hd256_decode_module(route), True
     if route.component == _ALIGNED_HD64_COMPONENT:
@@ -5378,6 +6510,58 @@ def _context_fp8_runtime_pack(pack_g: int) -> int:
     return 1
 
 
+def _context_fp8_runtime_route_pack(
+    max_q_len: int, max_kv_len: int, num_q_heads: int, pack_g: int
+) -> int | None:
+    """The pack of the runtime-size FP8 program a call of JIT pack ``pack_g``
+    takes: the dividing pack (:func:`_context_fp8_runtime_pack`) unless it
+    runs more tile work than the JIT pack, else ``pack_g`` itself where it is
+    a pack of :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS`, else ``None`` (the JIT
+    module)."""
+
+    pack = _context_fp8_runtime_pack(pack_g)
+    # A shipped pack below the JIT pack holds fewer query heads per tile: it
+    # may run more tile work than the JIT pack.
+    if pack == pack_g or (num_q_heads // pack) * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // pack)
+    ) <= (num_q_heads // pack_g) * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // pack_g)
+    ):
+        return pack
+    return pack_g if pack_g in _CONTEXT_FP8_RUNTIME_OWN_PACKS else None
+
+
+# Per target, the keys from which the sm100a rule of many query rows at long
+# query lengths (:func:`_context_fp8_runtime_serves`) no longer keeps the JIT
+# module: over these caches the runtime-size program ran 1.4 .. 3.3 % faster
+# back to back at the power limit and was not slower cold (1.0 .. 4.2 % faster
+# in the median) (timed B200: packs 1, 2, 4 and 8, 128 .. 2048 query tokens,
+# 2^20 and 2^21 query rows, 16 .. 256 requests, pages 16 and 64, 1024 ..
+# 16384 keys, on two B200 boards).
+_CONTEXT_FP8_RUNTIME_ROWS_KV: dict[str, int] = {"sm100a": 1024}
+# Per target, ``(keys, streams)``: a call of a pack of
+# :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` over a cache of more keys with more
+# (request, KV head) streams keeps the JIT module.  There the cache reads set
+# the call's time: the runtime-size program saved 1 .. 3 % in the median, but
+# in some memory layouts its slowest round fell inside the A/A band (timed
+# B200, ten seeded layouts of four rounds: 16384 keys, 256 .. 1024 streams);
+# at 8192 keys (512 and 1024 streams), and at 16384 keys with 64 streams, it
+# ran faster than the A/A band in every layout.
+_CONTEXT_FP8_RUNTIME_OWN_LONG_KV: dict[str, tuple[int, int]] = {"sm100a": (8192, 64)}
+# Per target, ``(keys, streams)``: an FP8 call of a form of
+# :data:`_CONTEXT_FP8_FORMS` over a cache of more keys with more (request, KV
+# head) streams keeps the JIT module, at every pack.  There the cache reads set
+# the call's time: the runtime-size program saved 0.5 .. 3 % in the median,
+# but in some memory layouts its slowest round fell inside the A/A band (timed
+# B200 and GB300, ten seeded layouts of four rounds: 16384 keys, 1024 streams,
+# one (B200) and 128 query tokens); with 256 streams over 16384 keys, and at
+# 8192 keys with 1024 streams, it ran faster than the A/A band in every layout.
+_CONTEXT_FP8_RUNTIME_FORM_LONG_KV: dict[str, tuple[int, int]] = {
+    "sm100a": (8192, 256),
+    "sm103a": (8192, 256),
+}
+
+
 @functools.lru_cache(maxsize=1024)
 def _context_fp8_runtime_serves(
     target: str,
@@ -5393,24 +6577,150 @@ def _context_fp8_runtime_serves(
     pack is ``pack_g``; a pure function of its arguments, cached like
     :func:`_context_pack_g`)."""
 
-    pack = _context_fp8_runtime_pack(pack_g)
-    # A shipped pack below the JIT pack holds fewer query heads per tile: it
-    # may run more tile work than the JIT pack.
-    if pack != pack_g and (num_q_heads // pack) * _context_tile_mma_work(
-        max_q_len, max_kv_len, 2 * (128 // pack)
-    ) > (num_q_heads // pack_g) * _context_tile_mma_work(
-        max_q_len, max_kv_len, 2 * (128 // pack_g)
+    pack = _context_fp8_runtime_route_pack(max_q_len, max_kv_len, num_q_heads, pack_g)
+    if pack is None:
+        return False
+    return _context_fp8_runtime_pack_serves(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, num_kv_heads, pack
+    )
+
+
+def _context_fp8_runtime_pack_serves(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack: int,
+) -> bool:
+    """The rules of :func:`_context_fp8_runtime_serves` for a call whose
+    runtime-size program runs at ``pack``."""
+
+    long_kv = _CONTEXT_FP8_RUNTIME_OWN_LONG_KV.get(target)
+    if (
+        long_kv is not None
+        and pack in _CONTEXT_FP8_RUNTIME_OWN_PACKS
+        and max_kv_len > long_kv[0]
+        and batch_size * num_kv_heads > long_kv[1]
     ):
         return False
     # sm100a: calls this long run back to back at the board power limit, where
     # the runtime program's SM clock drops below the JIT module's: many
-    # (request, KV head) streams, or many query rows at long query lengths.
+    # (request, KV head) streams, or many query rows at long query lengths
+    # over short caches (from :data:`_CONTEXT_FP8_RUNTIME_ROWS_KV` keys the
+    # runtime program ran faster).  The programs of
+    # :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` keep the rule over every cache:
+    # over 1024 keys they ran up to 1.2 % slower than the JIT module at 1024
+    # and 2048 query tokens (timed B200).
     return not (
         target == "sm100a"
         and (
             batch_size * num_kv_heads >= 2048
-            or (max_q_len >= 128 and batch_size * num_q_heads * max_q_len >= 1 << 20)
+            or (
+                max_q_len >= 128
+                and batch_size * num_q_heads * max_q_len >= 1 << 20
+                and (
+                    max_kv_len < _CONTEXT_FP8_RUNTIME_ROWS_KV.get(target, 1 << 62)
+                    or pack in _CONTEXT_FP8_RUNTIME_OWN_PACKS
+                )
+            )
         )
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_runtime_form_serves(
+    target: str,
+    form: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+) -> bool:
+    """Whether the runtime-size program of ``form`` (``_CONTEXT_FP8_FORMS``)
+    serves an FP8 call of that form that no exact route serves (``False``
+    keeps the JIT module, whose pack is ``pack_g``): at the pack of
+    :func:`_context_fp8_runtime_form_pack`, under the rules of the causal call
+    without LSE or sink (:func:`_context_fp8_runtime_pack_serves`) and of
+    :data:`_CONTEXT_FP8_RUNTIME_FORM_LONG_KV`.  A pure
+    function of its arguments, cached."""
+
+    pack = _context_fp8_runtime_form_pack(
+        target, form, max_q_len, max_kv_len, num_q_heads, pack_g
+    )
+    if pack is None:
+        return False
+    long_kv = _CONTEXT_FP8_RUNTIME_FORM_LONG_KV.get(target)
+    if (
+        long_kv is not None
+        and max_kv_len > long_kv[0]
+        and batch_size * num_kv_heads > long_kv[1]
+    ):
+        return False
+    return _context_fp8_runtime_pack_serves(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, num_kv_heads, pack
+    )
+
+
+def _context_fp8_runtime_form_pack(
+    target: str,
+    form: str,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    pack_g: int,
+) -> int | None:
+    """The pack of the runtime-size program of ``form`` for a call of JIT pack
+    ``pack_g``, or ``None`` (the JIT module).  A non-causal form takes the
+    pack the causal call without LSE or sink would take
+    (:func:`_context_fp8_runtime_route_pack`): each of its rows reads every
+    key block of its request.  A causal form takes the JIT pack itself: the
+    tokens of a tile decide which key blocks its P.V reads, and a row whose
+    keys end before a block still multiplies that block's V by 0; where the
+    slots past a request's last key hold NaN, only the JIT's tiles give the
+    JIT's bytes."""
+
+    if form in ("NC", "NC_LSE", "NC_SINK"):
+        return _context_fp8_runtime_route_pack(
+            max_q_len, max_kv_len, num_q_heads, pack_g
+        )
+    forms = _CONTEXT_FP8_RUNTIME_FORM_ROUTES.get(target) or {}
+    return pack_g if (form, pack_g, None) in forms else None
+
+
+# Per target, the query-head tiles (``batch_size x num_q_heads`` at pack 1) from
+# which a pack-1 call whose query tokens fit one stage runs the one-stage
+# program of pack 1 where the runtime-size program would serve it: the
+# one-stage choice (:func:`_context_fp8_one_stage_choice`) admits at most
+# :data:`_CONTEXT_FP8_SPLIT_MAX_WAVES` waves of such tiles, and past them the
+# one-stage program ran 1.2 .. 1.4x faster than the runtime-size program
+# (timed B200: heads 16/16, 32/32 and 64/64, 4 .. 128 query tokens, 640 ..
+# 1536 tiles over 2048 .. 16384 keys, pages 16 and 64, cold L2 and back to
+# back).
+_CONTEXT_FP8_RUNTIME_ONE_STAGE_TILES: dict[str, int] = {"sm100a": 640}
+
+
+def _context_fp8_runtime_one_stage(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+) -> bool:
+    """Whether a pack-1 call the runtime-size program serves runs the one-stage
+    program of pack 1 instead (:data:`_CONTEXT_FP8_RUNTIME_ONE_STAGE_TILES`)."""
+
+    tiles = _CONTEXT_FP8_RUNTIME_ONE_STAGE_TILES.get(target)
+    return (
+        tiles is not None
+        and pack_g == 1
+        and num_q_heads == num_kv_heads
+        and max_q_len <= 128
+        and batch_size * num_q_heads >= tiles
     )
 
 
@@ -5434,22 +6744,27 @@ def _context_fp8_power_one_stage(
 ) -> bool:
     """Whether a causal FP8 call without LSE or sink that no exact route
     serves, kept on the JIT module by the power limit, runs the one-stage
-    program of the JIT pack ``pack_g`` (a shipped pack whose 128-row stage
-    holds every query token) instead.  Every query row meets the same KV blocks in the same order as
+    program of the JIT pack ``pack_g`` (a shipped pack with one-stage programs
+    whose 128-row stage holds every query token) instead.  Every query row meets the same KV blocks in the same order as
     in the JIT module's tile of two stages."""
 
     return (
         target in _CONTEXT_FP8_POWER_ONE_STAGE_TARGETS
         and _context_fp8_runtime_pack(pack_g) == pack_g
         and max_q_len <= 128 // pack_g
-        and not _context_fp8_runtime_serves(
-            target,
-            batch_size,
-            max_q_len,
-            max_kv_len,
-            num_q_heads,
-            num_kv_heads,
-            pack_g,
+        and (
+            not _context_fp8_runtime_serves(
+                target,
+                batch_size,
+                max_q_len,
+                max_kv_len,
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+            )
+            or _context_fp8_runtime_one_stage(
+                target, batch_size, max_q_len, num_q_heads, num_kv_heads, pack_g
+            )
         )
     )
 
@@ -6503,8 +7818,21 @@ def select_cake_fmha_context_route(
                 num_kv_heads,
                 pack_g,
             )
+            and not (
+                _CONTEXT_FP8_ONE_STAGE_ROUTES.get(target)
+                and _context_fp8_runtime_one_stage(
+                    target,
+                    batch_size,
+                    max_q_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    pack_g,
+                )
+            )
         ):
-            pack = _context_fp8_runtime_pack(pack_g)
+            pack = _context_fp8_runtime_route_pack(
+                max_q_len, max_kv_len, num_q_heads, pack_g
+            )
             program = runtime.get((pack, page_size)) or runtime.get((pack, None))
             if program is not None:
                 runtime_pack = pack
@@ -6515,6 +7843,42 @@ def select_cake_fmha_context_route(
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # A BF16 call no exact route serves: the runtime-size program of its
+        # JIT pack and page size (the same tile work as the JIT module), but
+        # not for the power-of-two query lengths of
+        # :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
+        runtime_bf16 = _CONTEXT_BF16_RUNTIME_ROUTES.get(target)
+        pow2_q = _CONTEXT_BF16_RUNTIME_POW2_Q.get(target)
+        jit_pow2 = (
+            pow2_q is not None
+            and pack_g > 1
+            and max_q_len >= pow2_q[0]
+            and max_q_len & (max_q_len - 1) == 0
+            and max_kv_len >= pow2_q[1]
+        )
+        if (
+            program is None
+            and component == "context_bf16"
+            and runtime_bf16
+            and not jit_pow2
+        ):
+            program = runtime_bf16.get((pack_g, page_size)) or runtime_bf16.get(
+                (pack_g, None)
+            )
+        # An NVFP4 call no exact route serves: the runtime-size program of its
+        # JIT pack (the same tile work as the JIT module), where the CUDA
+        # toolkit builds the NVFP4 programs; else the JIT module, which needs
+        # no PTX ISA 9.4 instruction.
+        runtime_nvfp4 = _CONTEXT_NVFP4_RUNTIME_ROUTES.get(target)
+        if (
+            program is None
+            and component == "context_nvfp4"
+            and runtime_nvfp4
+            and context_nvfp4_programs_unavailable() is None
+        ):
+            program = runtime_nvfp4.get((pack_g, page_size)) or runtime_nvfp4.get(
+                (pack_g, None)
+            )
         # An FP8 call of at most the keys of its route's short-KV entry, where
         # the target names one: the entry's program (the same schedule, pack,
         # m-blocks and arguments).
@@ -6529,11 +7893,18 @@ def select_cake_fmha_context_route(
         # names (:func:`_context_fp8_split_choice`) and the page size, where the
         # split plan predicts a gain and the workspace holds its partials; the
         # runtime pack's own plan, where it has one, when the workspace cannot
-        # hold the chosen pack's partials; else the call keeps its program.
+        # hold the chosen pack's partials; else the call keeps its program (a
+        # call of a pack of :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` always).
         split = _CONTEXT_FP8_SPLIT_ROUTES.get(target)
         sm_count = _context_split_sm_count(device)
         split_plan: tuple[int, int, int] | None = None
-        if program is not None and component == "context_fp8" and split and sm_count:
+        if (
+            program is not None
+            and component == "context_fp8"
+            and split
+            and sm_count
+            and runtime_pack not in _CONTEXT_FP8_RUNTIME_OWN_PACKS
+        ):
             pack = _context_fp8_runtime_pack(pack_g)
             choice = _context_fp8_split_choice(
                 target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
@@ -6592,7 +7963,8 @@ def select_cake_fmha_context_route(
         # entry's program; where the program has none, it runs the program
         # itself if :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS` names it
         # and the pack is that smallest pack, and keeps its launch otherwise.
-        # Else the call keeps its launch.  An exact program's tiles
+        # Else the call keeps its launch, as a call of a pack of
+        # :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` does.  An exact program's tiles
         # hold two query stages of its pack: at a smaller pack, one stage holds
         # every query token of a tile.
         one_stage = _CONTEXT_FP8_ONE_STAGE_ROUTES.get(target)
@@ -6600,7 +7972,12 @@ def select_cake_fmha_context_route(
         if exact_fp8_pack is not None:
             stage_pack = _context_fp8_runtime_pack(exact_fp8_pack)
         short_runtime = shortened and runtime_pack is not None
-        if stage_pack is not None and one_stage and sm_count:
+        if (
+            stage_pack is not None
+            and stage_pack not in _CONTEXT_FP8_RUNTIME_OWN_PACKS
+            and one_stage
+            and sm_count
+        ):
             one_stage_pack = _context_fp8_one_stage_choice(
                 target,
                 batch_size,
@@ -6725,6 +8102,41 @@ def select_cake_fmha_context_route(
             )
         ):
             program = one_wave
+    elif component == "context_fp8":
+        # An FP8 call of another form (non-causal, LSE or sink) that no exact
+        # route serves: the runtime-size program of its form at its pack
+        # (:func:`_context_fp8_runtime_form_pack`), where it serves that call
+        # (:func:`_context_fp8_runtime_form_serves`); else the JIT module.
+        form = _CONTEXT_FP8_FORMS.get((is_causal, lse is not None, sinks is not None))
+        forms = _CONTEXT_FP8_RUNTIME_FORM_ROUTES.get(target)
+        if (
+            form is not None
+            and forms
+            and _context_fp8_runtime_form_serves(
+                target,
+                form,
+                batch_size,
+                max_q_len,
+                max_kv_len,
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+            )
+        ):
+            pack = _context_fp8_runtime_form_pack(
+                target, form, max_q_len, max_kv_len, num_q_heads, pack_g
+            )
+            program = forms.get((form, pack, page_size)) or forms.get(
+                (form, pack, None)
+            )
+            if program is not None:
+                pack_g = pack
+                tok_per_stage = 128 // pack
+                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
+                    2 * tok_per_stage
+                )
+                total_bh = batch_size * (num_q_heads // pack)
+                l2_swizzle = 8 if total_bh % 8 == 0 else 1
     return CakeFmhaContextRoute(
         target=target,
         component=component,
@@ -6820,20 +8232,26 @@ class CakeFmhaContextProgramModule:
         count ``batch_size x num_q_heads / pack_g``.  A device-scale program
         reads the raw bmm1 scale and the bmm2 scale through device
         pointers; a host-scalar program takes them as scalars and never reads
-        the pointers.  The LSE, sink and Q-length pointers are unread (the
-        programs write no LSE, take no sink and derive the query lengths from
-        ``cum_seq_lens_q``): they point at a small per-device buffer.  A
+        the pointers.  The Q-length pointer is unread (the programs derive the
+        query lengths from ``cum_seq_lens_q``), and so are the LSE and sink
+        pointers but in a program of an LSE or sink form, which takes the
+        caller's: an unread pointer points at a small per-device buffer.  A
         runtime-size program also takes the scale source, the m-block count of
         ``max_q_len``, the head counts, the GQA group and the log2 page size of
         this launch.
         """
 
         route = self.route
-        if lse is not None or attention_sinks is not None:
-            # route selection keeps such calls on the JIT module: the unread
-            # pointers below never stand in for a caller's LSE or sinks
+        form = (route.return_lse, route.enable_sink, route.is_causal)
+        given = (lse is not None, attention_sinks is not None, bool(is_causal))
+        if given[:2] != form[:2] or (form != (False, False, True) and given != form):
+            # route selection keeps such calls on the JIT module or on the
+            # program of their form: the unread pointers below never stand in
+            # for a caller's LSE or sinks, and a program of an FP8 form takes
+            # the calls of its causal mask only
             raise RuntimeError(
-                "a Cake FMHA context program writes no LSE and takes no sinks"
+                "a Cake FMHA context program serves the causal mask, LSE and "
+                "sinks of its route only"
             )
         if self.runtime:
             num_q_heads = query.shape[1]
@@ -6898,6 +8316,25 @@ class CakeFmhaContextProgramModule:
                 partial_o = partial_ml = _unread_pointers(device)[0]
                 tile_counters = counter[:1]
         unread_f32, unread_i32 = _unread_pointers(device)
+        # A program of an LSE or sink form (runtime-size FP8) writes the LSE of
+        # every query row and head at ``token x num_q_heads + head`` and reads
+        # one sink per query head.
+        lse_out = sinks_in = unread_f32
+        if lse is not None:
+            # the caller's strides must give every token and head that offset;
+            # a stride along a dimension of size 1 (one token, or one head)
+            # moves no element, as in the JIT module
+            tokens, heads = query.shape[0], query.shape[1]
+            if (tokens > 1 and lse_stride_tokens != heads) or (
+                heads > 1 and lse_stride_heads != 1
+            ):
+                raise RuntimeError(
+                    "a Cake FMHA context program writes a contiguous "
+                    "[tokens, heads] LSE"
+                )
+            lse_out = lse
+        if attention_sinks is not None:
+            sinks_in = attention_sinks
         # The kernel reads page ``p`` of request ``b`` at ``page_table[b x
         # page_row_stride + p]``: pass 1-D views over the caller's own table
         # storage (no copy) that span every row, and its true row stride.
@@ -6965,10 +8402,31 @@ class CakeFmhaContextProgramModule:
                 row_stride,
                 num_ctas,
                 counter,
-                num_ctas,
-                1,
-                1,
             )
+            if self.runtime:
+                arguments = (
+                    *arguments,
+                    num_m_blocks,
+                    total_bh // 8
+                    | (
+                        _CONTEXT_BF16_TAIL_INTERLEAVE
+                        if is_causal
+                        and _context_bf16_tail_interleave(
+                            int(batch_size),
+                            int(max_q_len),
+                            int(max_kv_len),
+                            units_per_batch,
+                            self.m_block_tokens,
+                            num_ctas,
+                        )
+                        else 0
+                    ),
+                    units_per_batch,
+                    num_q_heads,
+                    num_q_heads // key_cache.shape[1],
+                    key_cache.shape[2].bit_length() - 1,
+                )
+            arguments = (*arguments, num_ctas, 1, 1)
         elif route.component == "context_nvfp4":
             arguments = (
                 query.view(torch.uint8),
@@ -6993,18 +8451,26 @@ class CakeFmhaContextProgramModule:
                 bmm1_ptr,
                 bmm2_ptr,
                 bmm1_is_log2,
-                num_ctas,
-                1,
-                1,
             )
+            if self.runtime:
+                arguments = (
+                    *arguments,
+                    1 if device_scales else 0,
+                    num_m_blocks,
+                    total_bh // 8,
+                    units_per_batch,
+                    num_q_heads,
+                    num_q_heads // key_cache.shape[1],
+                )
+            arguments = (*arguments, num_ctas, 1, 1)
         elif self.runtime:
             arguments = (
                 query.view(torch.uint8),
                 key_cache.view(torch.uint8),
                 value_cache.view(torch.uint8),
                 out.view(torch.uint8),
-                unread_f32,
-                unread_f32,
+                lse_out,
+                sinks_in,
                 page_table_k,
                 page_table_v,
                 unread_i32,

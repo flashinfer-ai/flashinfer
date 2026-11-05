@@ -733,7 +733,7 @@ def test_public_api_cake_rejects_other_fp8_forms_and_head_counts(monkeypatch) ->
 
 
 def test_public_api_enable_pdl_gate(monkeypatch) -> None:
-    """The mixed-cache Cake route forwards ``enable_pdl`` (None = device default); the NVFP4 Cake route still rejects it."""
+    """The mixed-cache route resolves the PDL default; NVFP4 rejects PDL."""
 
     calls: list[dict] = []
 
@@ -746,7 +746,10 @@ def test_public_api_enable_pdl_gate(monkeypatch) -> None:
         mla_core, "_trtllm_batch_decode_sparse_mla_dsv4_sm120", fake_sm120
     )
     _public_api_call("cake")
-    assert calls[-1]["enable_pdl"] is None
+    assert calls[-1]["enable_pdl"] is False
+    monkeypatch.setattr(mla_core, "device_support_pdl", lambda device: True)
+    _public_api_call("cake")
+    assert calls[-1]["enable_pdl"] is True
     _public_api_call("cake", enable_pdl=True)
     assert calls[-1]["enable_pdl"] is True
     _public_api_call("cake", enable_pdl=False)

@@ -54,35 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_det_topk_e1e316281190b2a3203b
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_SCRATCH_OFF 0
-#if CAKE_INDEXER_THREADS == 512
-#define SMEM_SCRATCH_STAGE_BYTES 18528
-#define SMEM_SCRATCH_STRIDE 18528
-#define SMEM_TOTAL 18560
-#define THREADS 512
-#elif CAKE_INDEXER_THREADS == 256
-#define SMEM_SCRATCH_STAGE_BYTES 9280
-#define SMEM_SCRATCH_STRIDE 9280
-#define SMEM_TOTAL 9344
-#define THREADS 256
-#elif CAKE_INDEXER_THREADS == 128
-#define SMEM_SCRATCH_STAGE_BYTES 4640
-#define SMEM_SCRATCH_STRIDE 4640
-#define SMEM_TOTAL 4736
-#define THREADS 128
-#elif CAKE_INDEXER_THREADS == 64
-#define SMEM_SCRATCH_STAGE_BYTES 2336
-#define SMEM_SCRATCH_STRIDE 2336
-#define SMEM_TOTAL 2432
-#define THREADS 64
-#else
-#define SMEM_SCRATCH_STAGE_BYTES 1184
-#define SMEM_SCRATCH_STRIDE 1184
-#define SMEM_TOTAL 1280
-#define THREADS 32
-#endif
-
 #include <math_constants.h>
 #include <cub/block/block_radix_sort.cuh>
 
@@ -119,7 +90,7 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int t
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* scratch = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int scratch_addr = smem + 0;
 

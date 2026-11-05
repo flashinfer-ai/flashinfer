@@ -362,8 +362,10 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cuda", "cute-dsl"] = "cuda",
+    backend: Literal["auto", "cuda", "cute-dsl"] = "auto",
     sf_swizzle_layout: Optional[SfLayout] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MxFP8 format.
 
@@ -385,14 +387,26 @@ def mxfp8_quantize(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
-    backend : {"cuda", "cute-dsl"}
+    backend : {"auto", "cuda", "cute-dsl"}
         Backend to use:
 
-        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
+          under ``batch_invariant=True`` (which requires ``"auto"``).
+        - ``"cuda"``: stable JIT-compiled CUDA kernel.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
+    batch_invariant : bool
+        ``True`` runs the batch-invariant MXFP8 quantization class in place
+        of the backends (requires ``backend="auto"``): a row's bits depend on
+        its values alone, not on the batch it is quantized in, its position,
+        the configuration chosen or the SM count, and the result is
+        deterministic. The dataflow is TransformerEngine's MXFP8 chain,
+        fingerprinted as ``flashinfer.batch_invariant.fingerprint("mxfp8_quantize")``.
+        Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -410,15 +424,30 @@ def mxfp8_quantize(
     """
     sf_vec_size = 32
 
-    assert input.shape[-1] % sf_vec_size == 0
-    assert backend in ("cuda", "cute-dsl"), (
-        f"backend must be 'cuda' or 'cute-dsl', got '{backend}'"
-    )
-
     if sf_swizzle_layout is None:
         sf_swizzle_layout = (
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        from ..batch_invariant.quantization.mx_api import (
+            mxfp8_quantize_batch_invariant,
+        )
+
+        return mxfp8_quantize_batch_invariant(
+            input, sf_swizzle_layout, alignment, enable_pdl
+        )
+
+    assert input.shape[-1] % sf_vec_size == 0
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
+    )
+    if backend == "auto":
+        backend = "cuda"
 
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -1230,3 +1259,46 @@ def per_token_group_quant_8bit(
         )
 
     raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")
+
+
+def mxfp8_quantize_bshd(
+    x: torch.Tensor, backend: Literal["cuda", "cute-dsl"] = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a ``[B, S, H, D]`` attention operand to MXFP8 for the PrimTS
+    context kernel.
+
+    The data stays in ``[B, S, H, D]`` order, so the rows are quantized in
+    place of any transpose. The scales come back as the kernel's
+    ``[B, H, tiles, 128, 4]`` byte atoms, one per 128-token tile and head with
+    one E8M0 scale per 32 channels, in the 128x4 order of the block-scaled
+    tensor-core instruction. ``S`` is padded to whole tiles with zero scales.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Half-precision ``[B, S, H, D]`` tensor with ``D`` a multiple of 32.
+    backend : {"cuda", "cute-dsl"}
+        Quantizer backend, as for :func:`mxfp8_quantize`.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(data, scales)``, the ``float8_e4m3fn`` data in the input layout and
+        the ``[B, H, tiles, 128, 4]`` uint8 scale atoms.
+    """
+    batch_size, seq_len, num_heads, head_dim = x.shape
+    data, scales = mxfp8_quantize(
+        x.reshape(batch_size * seq_len * num_heads, head_dim),
+        is_sf_swizzled_layout=False,
+        backend=backend,
+    )
+    tiles = (seq_len + 127) // 128
+    scales = scales.view(batch_size, seq_len, num_heads, head_dim // 32)
+    scales = torch.nn.functional.pad(
+        scales.permute(0, 2, 1, 3), (0, 0, 0, tiles * 128 - seq_len)
+    )
+    # Row r of a tile sits at byte 16 * (r % 32) + 4 * (r // 32) + block.
+    scales = scales.reshape(batch_size, num_heads, tiles, 4, 32, head_dim // 32)
+    return data.view(x.shape), scales.permute(0, 1, 2, 4, 3, 5).reshape(
+        batch_size, num_heads, tiles, 128, 4
+    )

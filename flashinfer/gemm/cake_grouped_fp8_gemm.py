@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared contiguous grouped FP8 GEMM launches on Blackwell (SM100a, SM103a).
+"""Prepared contiguous grouped FP8 GEMM launches on Blackwell (SM100a, SM103a, SM107a).
 
 This is the generated Cake program family for the same mathematical
 contract as :func:`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous`:
@@ -29,7 +29,8 @@ same words, a single-run layout of at most 128 routed rows per group runs the
 store16 programs (:func:`bs_store16`): they write each expert run's routed
 rows rounded up to 16 rows instead of 32.  Every block-scaled route
 accumulates each output in the same K order, so the route never changes the
-bits of a routed row.
+bits of a routed row.  SM107a runs the block-scaled family alone, on its
+non-swapped routes (:func:`bs_route_for_shape`); FP32 scales raise there.
 
 The host side selects one kernel route per problem shape and output
 alignment, resolves the launch grid from the device SM count (queried once per
@@ -323,6 +324,10 @@ def _unaligned_cg2_route(
     return single if load_single < load_cg2 else shape_route
 
 
+# The architecture whose single-run BLOCK_N rule is its own (:func:`bs_block_n`).
+BS_SM107A_ARCH = "sm_107a"
+
+
 def bs_block_n(
     m: int,
     n: int,
@@ -331,6 +336,7 @@ def bs_block_n(
     *,
     alignment: int = BS_BLOCK_M,
     num_groups: int | None = None,
+    arch: str | None = None,
 ) -> int:
     """``BLOCK_N`` of the block-scaled family.
 
@@ -348,8 +354,12 @@ def bs_block_n(
       rows plus each group's alignment padding and the 128-row round-up), would
       at one row per run fill more 128-column tiles than the device has SMs.
 
-    The choice never changes the output bits: every route accumulates each
-    output in the same K order.
+    On SM107a (``arch="sm_107a"``) a single-run problem (``alignment`` a
+    multiple of 128) runs 256 columns below 32 K blocks whatever the number of M
+    blocks.
+
+    The choice never changes the output bits of a single-run problem: both of
+    its routes accumulate each output in the same K order.
     """
     if n % B_SCALE_BLOCK_N:
         raise ValueError(f"N must be a multiple of {B_SCALE_BLOCK_N}, got {n}")
@@ -362,6 +372,8 @@ def bs_block_n(
     if k_blocks < 16 or m_blocks >= 3 * sm_count:
         return 256
     if alignment % BS_BLOCK_M == 0:
+        if arch == BS_SM107A_ARCH:
+            return 256 if k_blocks < 32 else 128
         return 256 if k_blocks < 32 and m_blocks < 2 * sm_count else 128
     if num_groups is not None:
         routed = m - num_groups * (alignment - 1) - (BS_BLOCK_M - 1)
@@ -379,8 +391,9 @@ def bs_route_for_shape(
     alignment: int,
     sm_count: int,
     num_groups: int | None = None,
+    arch: str | None = None,
 ) -> str:
-    """Select the block-scaled route for packed UE8M0 scales."""
+    """Select the block-scaled route for packed UE8M0 scales (``arch``: see :func:`bs_block_n`)."""
     if alignment <= 0 or alignment % BS_SUB_ROWS:
         raise ValueError(
             f"alignment must be a positive multiple of {BS_SUB_ROWS}, got {alignment}"
@@ -389,7 +402,9 @@ def bs_route_for_shape(
         raise ValueError(
             f"block-scaled grouped FP8 GEMM requires positive K divisible by {BS_BLOCK_K}; got K={k}"
         )
-    block_n = bs_block_n(m, n, k, sm_count, alignment=alignment, num_groups=num_groups)
+    block_n = bs_block_n(
+        m, n, k, sm_count, alignment=alignment, num_groups=num_groups, arch=arch
+    )
     single_run = alignment % BS_BLOCK_M == 0
     return {
         (128, True): BS_N128_ROUTE,
@@ -409,6 +424,7 @@ BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
 BS_SWAP_RP32_ROUTE = "bs_ue8m0_swap_rp32"
 BS_SWAP_RP32_S11_ROUTE = "bs_ue8m0_swap_rp32_s11"
 BS_SWAP_C1_ROUTE = "bs_ue8m0_swap_c1"
+BS_SWAP_BM64_ROUTE = "bs_ue8m0_swap_bm64"
 BS_SWAP_ROUTES = frozenset(
     {
         BS_SWAP_ROUTE,
@@ -419,6 +435,7 @@ BS_SWAP_ROUTES = frozenset(
         BS_SWAP_RP32_ROUTE,
         BS_SWAP_RP32_S11_ROUTE,
         BS_SWAP_C1_ROUTE,
+        BS_SWAP_BM64_ROUTE,
     }
 )
 BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
@@ -504,12 +521,33 @@ BS_SWAP_SM100_SMALL_KEEP = frozenset(
         (640, 1024, 768, 32),
         (640, 1024, 1024, 32),
         (768, 1536, 1024, 32),
-        (896, 1024, 512, 64),
         (896, 1280, 1024, 64),
         (1152, 512, 256, 32),
         (1152, 1024, 512, 32),
         (1152, 1024, 1024, 32),
         (1280, 512, 4096, 32),
+    }
+)
+# These compact layouts, ``(m, n, k, alignment)``, take BS_SWAP_C1_ROUTE on
+# BS_SWAP_SMALL_ARCHS outside its one-wave rule: on a 152-SM GB300 the
+# one-CTA program was faster there than the routes the rule selects.
+BS_SWAP_SM103_SMALL_ADMIT = frozenset(
+    {
+        (768, 1024, 256, 32),
+        (896, 1024, 512, 64),
+        (1024, 1024, 512, 32),
+        (1152, 256, 1536, 32),
+        (1664, 384, 128, 128),
+    }
+)
+# These compact layouts, ``(m, n, k, alignment)``, take BS_SWAP_BM64_ROUTE on
+# BS_SWAP_SMALL_ARCHS: on a 152-SM GB300 its swap-AB program with 64-row M
+# blocks on two-CTA clusters was faster there than BS_SWAP_RP32_ROUTE, the
+# route these layouts take otherwise.
+BS_SWAP_SM103_BM64_ADMIT = frozenset(
+    {
+        (1024, 1024, 1024, 64),
+        (1536, 1024, 1024, 64),
     }
 )
 
@@ -578,7 +616,10 @@ def bs_swap_small_route(
       ``BS_SWAP_C1_ROUTE``.
 
     On ``BS_SWAP_SM100_SMALL_ARCHS`` the layouts of ``BS_SWAP_SM100_SMALL_KEEP``
-    keep the other swap-AB routes.
+    keep the other swap-AB routes.  On ``BS_SWAP_SMALL_ARCHS`` the layouts of
+    ``BS_SWAP_SM103_SMALL_ADMIT`` take ``BS_SWAP_C1_ROUTE`` at any wave count.
+    There the layouts of ``BS_SWAP_SM103_BM64_ADMIT`` take
+    ``BS_SWAP_BM64_ROUTE`` (64-row M blocks on two-CTA clusters).
 
     Every 32-row block of a layout whose alignment is a multiple of 32 holds
     one group's rows, so both programs serve the single-run and the multi-run
@@ -596,6 +637,10 @@ def bs_swap_small_route(
         return _bs_swap_small_route_sm100(
             m, n, k, alignment=alignment, sm_count=sm_count
         )
+    if (m, n, k, alignment) in BS_SWAP_SM103_SMALL_ADMIT:
+        return BS_SWAP_C1_ROUTE
+    if (m, n, k, alignment) in BS_SWAP_SM103_BM64_ADMIT:
+        return BS_SWAP_BM64_ROUTE
     blocks = math.ceil(m / BS_SUB_ROWS)
     if n % 256:
         if (
@@ -634,9 +679,12 @@ def bs_swap_route_for_shape(
     layout less each group's largest alignment padding.
 
     - Take the route of :func:`bs_swap_small_route` when it selects one
-      (``BS_SWAP_SMALL_ARCHS`` one wave of CTAs, ``BS_SWAP_SM100_SMALL_ARCHS``
-      up to ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` tiles per SM; any group
-      count; its one-CTA program also takes N an odd multiple of 128).
+      (``BS_SWAP_SMALL_ARCHS`` one wave of CTAs or a layout of
+      ``BS_SWAP_SM103_SMALL_ADMIT``, ``BS_SWAP_SM100_SMALL_ARCHS`` up to
+      ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` tiles per SM; any group count; its
+      one-CTA program also takes N an odd multiple of 128).
+      On ``BS_SWAP_SMALL_ARCHS`` it also selects ``BS_SWAP_BM64_ROUTE`` for
+      the layouts of ``BS_SWAP_SM103_BM64_ADMIT``.
     - Otherwise keep the non-swapped routes when N is not a multiple of 256
       (the swapped tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
@@ -726,6 +774,9 @@ BS_STORE16_ROUTES = {
     BS_SWAP_CARRY_ROUTE: BS_SWAP_CARRY_S16_ROUTE,
 }
 BS_STORE16_ARCHS = frozenset({"sm_100a", "sm_103a"})
+# Architectures with programs of the FP32-scale (promotion) family; SM107a ships
+# the block-scaled family alone.
+FP32_SCALE_ARCHS = frozenset({"sm_100a", "sm_103a"})
 
 
 def bs_store16(m: int, *, alignment: int, num_groups: int | None) -> bool:
@@ -826,9 +877,11 @@ def _launch_plan(
     arch: str | None,
     aligned: Optional[bool],
     tile_starts: Optional[Mapping[int, Sequence[int]]] = None,
+    device_arch: str | None = None,
 ) -> tuple[str, tuple[int, int, int]]:
     """:func:`launch_plan` with the layout a validated launch read (``aligned``
-    and ``tile_starts``, see :func:`_route`)."""
+    and ``tile_starts``, see :func:`_route`) and the device's architecture
+    (``device_arch``, which selects its BLOCK_N rule, :func:`bs_block_n`)."""
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
     if block_scaled:
@@ -837,7 +890,13 @@ def _launch_plan(
                 "block-scaled grouped FP8 GEMM requires a 16-byte-aligned output"
             )
         route = bs_route_for_shape(
-            m, n, k, alignment=alignment, sm_count=sm_count, num_groups=num_groups
+            m,
+            n,
+            k,
+            alignment=alignment,
+            sm_count=sm_count,
+            num_groups=num_groups,
+            arch=device_arch or arch,
         )
         if arch is not None:
             route = (
@@ -1535,7 +1594,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
     fill_padding: bool = False,
     alignment: int = 128,
 ) -> PreparedGroupGemmFp8NtGroupwiseContiguous:
-    r"""Prepare a contiguous grouped FP8 GEMM launch on SM100a / SM103a.
+    r"""Prepare a contiguous grouped FP8 GEMM launch on SM100a / SM103a / SM107a.
 
     Parameters
     ----------
@@ -1616,7 +1675,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
 
     Notes
     -----
-    Requires an SM100a (compute capability 10.0) or SM103a (10.3) device and a
+    Requires an SM100a (compute capability 10.0), SM103a (10.3) or SM107a
+    (10.7; packed UE8M0 scales only) device and a
     registered generated program for the selected route.  All tensors must
     live on the same CUDA device and, except ``out``, be 16-byte aligned.
     Preparation performs no device work: the SM count of the device is read
@@ -1633,7 +1693,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
     arch = device_arch(device_index)
     if arch is None:
         raise NotImplementedError(
-            "prepared contiguous grouped FP8 GEMM requires an SM100a or SM103a device "
+            "prepared contiguous grouped FP8 GEMM requires an SM100a, SM103a or SM107a device "
             f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
             f"got {torch.cuda.get_device_capability(device_index)}"
         )
@@ -1675,6 +1735,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         )
         swap_surfaces = _swap_scale_surfaces(a_scale, b_scale, m=m, n=n, k=k)
     else:
+        if arch not in FP32_SCALE_ARCHS:
+            raise NotImplementedError(
+                f"contiguous grouped FP8 GEMM with float32 scales has no generated program "
+                f"for {arch}; pass packed UE8M0 int32 scales"
+            )
         a_scale = _require_tensor(
             a_scale,
             "a_scale",
@@ -1750,6 +1815,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         arch=arch if swap_surfaces is not None else None,
         aligned=aligned,
         tile_starts=tile_starts,
+        device_arch=arch,
     )
     if (
         layout is not None

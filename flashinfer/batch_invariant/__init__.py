@@ -150,3 +150,8 @@ __all__ = [
     "fingerprint",
     "is_supported_device",
 ]
+
+# The quantization classes register themselves here (their module keeps the mode's registry generic).
+from .quantization.classes import register as _register_quantization  # noqa: E402
+
+_register_quantization(CLASSES, ClassInfo)

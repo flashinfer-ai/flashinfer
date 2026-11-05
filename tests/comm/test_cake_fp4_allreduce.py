@@ -18,8 +18,9 @@ Distributed correctness of the Cake NVFP4-transport tensor-parallel all-reduce.
 One test per (family, input format, world size): the ``allreduce`` family on two
 ranks (one-shot) and four ranks (two-shot) with bfloat16 partials or
 pre-quantised NVFP4 records, and the ``rmsnorm`` family (the two-rank one-shot
-exchange fused with the residual add and the Gemma RMSNorm; bfloat16, NVFP4 and
-MXFP8 outputs).  Each test spawns one process per rank on CUDA devices
+exchange fused with the residual add and the Gemma RMSNorm, bfloat16, NVFP4 and
+MXFP8 outputs; the four-rank two-shot exchange fused with them, bfloat16 input
+and output).  Each test spawns one process per rank on CUDA devices
 ``0..world_size-1`` and checks, against the exact float32 reference of
 ``tests/comm/cake_fp4_allreduce_reference.py`` (its sum of squares in the order
 of the fused-norm program the launch runs, from the registry): the workspace
@@ -68,18 +69,30 @@ RECORD_BYTES = ref.RECORD_BYTES
 DEFAULT_CAPACITY = 16384
 LARGER_CAPACITY = 4096  # the odd-row cases run under this capacity
 # Fewer rows than teams / warps, one row per team plus some, the smallest
-# production tier and the largest tier; the four-rank cases are multiples of 4,
-# and bv0_rows() adds the grid-derived tier that selects the bv-0 two-shot
-# schedule (no fixed row count does so on every shipped grid). The fused norm
+# production tier and the largest tier; the four-rank cases add row counts that
+# end in a partial quad (7, 2053), and bv0_rows() adds the grid-derived tier
+# that selects the bv-0 two-shot schedule (no fixed row count does so on every
+# shipped grid). The fused norm
 # adds the 4096-row tier, which runs its residual-prefetch programs (18 to 28
 # rows per CTA on 148 or 160 SMs).
 ROWS = {
     ("allreduce", 2): (3, 6, 1024, 16384),
-    ("allreduce", 4): (4, 8, 44, 1024, 16384),
+    ("allreduce", 4): (4, 7, 8, 44, 1024, 2053, 16384),
     ("rmsnorm", 2): (3, 11, 1024, 4096, 16384),
+    ("rmsnorm", 4): (1, 7, 44, 2049, 6000, 16384),
 }
-ODD_ROWS = {("allreduce", 2): 1031, ("allreduce", 4): 1028, ("rmsnorm", 2): 1031}
-SMALL_ROWS = {("allreduce", 2): 3, ("allreduce", 4): 4, ("rmsnorm", 2): 3}
+ODD_ROWS = {
+    ("allreduce", 2): 1031,
+    ("allreduce", 4): 1029,
+    ("rmsnorm", 2): 1031,
+    ("rmsnorm", 4): 1029,
+}
+SMALL_ROWS = {
+    ("allreduce", 2): 3,
+    ("allreduce", 4): 4,
+    ("rmsnorm", 2): 3,
+    ("rmsnorm", 4): 3,
+}
 MID_ROWS = 1024
 
 
@@ -109,6 +122,7 @@ CASES = [
     ("allreduce", "nvfp4", 4),
     ("rmsnorm", "bf16", 2),
     ("rmsnorm", "nvfp4", 2),
+    ("rmsnorm", "bf16", 4),
 ]
 OUTPUTS = (
     CakeFp4AllReduceFusedNormOutput.BF16,
@@ -463,12 +477,6 @@ def _validation(workspace, input_format, world_size, device):
             lambda: call(x, out=torch.zeros((rows + 1, HIDDEN), **bf16)),
             "out rows",
         )
-        if world_size == 4:
-            _expect(
-                ValueError,
-                lambda: call(torch.zeros((6, HIDDEN), **bf16)),
-                "rows not a multiple of 4",
-            )
         _expect(
             ValueError,
             lambda: cake_fp4_allreduce_nvfp4(records, scales, workspace),
@@ -510,12 +518,6 @@ def _validation(workspace, input_format, world_size, device):
             lambda: call(records, out=torch.zeros((rows + 1, HIDDEN), **bf16)),
             "out rows",
         )
-        if world_size == 4:
-            _expect(
-                ValueError,
-                lambda: call(torch.zeros((6, RECORD_BYTES), **u8)),
-                "rows not a multiple of 4",
-            )
         _expect(
             ValueError,
             lambda: cake_fp4_allreduce(x, workspace),
@@ -651,7 +653,7 @@ class NormCase:
 def _ss_order(workspace, rows: int, output: CakeFp4AllReduceFusedNormOutput) -> str:
     """The sum-of-squares order of the fused-norm program a launch with ``rows`` rows and ``output`` runs on
     this workspace's target (its registry record): the reference must sum in that order."""
-    return PROGRAMS[workspace.program(rows, output.value)]["ss_order"]
+    return ref.ss_order_of(PROGRAMS[workspace.program(rows, output.value)])
 
 
 def _norm_case(
@@ -661,12 +663,13 @@ def _norm_case(
     device: torch.device,
     *,
     ss_order: str,
+    world_size: int = 2,
     eps: float = ref.EPS,
     weight_bias: float = ref.WEIGHT_BIAS,
 ) -> NormCase:
-    """The inputs of one fused launch and its reference, summing the squares in ``ss_order`` (the order of the
-    program the launch runs on this target, :func:`_ss_order`)."""
-    xs = ref.partials(rows, seed, 2, device)
+    """The inputs of one fused launch on ``world_size`` ranks and its reference, summing the squares in
+    ``ss_order`` (the order of the program the launch runs on this target, :func:`_ss_order`)."""
+    xs = ref.partials(rows, seed, world_size, device)
     residual = ref.residual(rows, seed, device)
     weight = ref.weight(seed, device)
     if input_format == "bf16":
@@ -778,14 +781,17 @@ def _rmsnorm_cases(
     """Two launches per row count and output format on one workspace; the second into caller-provided buffers."""
     for rows in rows_list:
         program = workspace.program(rows, output.value)
-        assert program.endswith("_pf") == loader.select_prefetch(
-            rows, workspace.grid
-        ), (
-            program,
-            rows,
-            workspace.grid,
-        )
-        ss_order = PROGRAMS[program]["ss_order"]
+        if workspace.world_size == 2:
+            assert program.endswith("_pf") == loader.select_prefetch(
+                rows, workspace.grid
+            ), (
+                program,
+                rows,
+                workspace.grid,
+            )
+        else:
+            assert PROGRAMS[program]["bv"] == loader.select_bv(rows, workspace.grid)
+        ss_order = ref.ss_order_of(PROGRAMS[program])
         assert ("_sop" in program) == (ss_order == "perm"), program
         previous = None
         for launch in range(LAUNCHES_PER_CASE):
@@ -795,6 +801,7 @@ def _rmsnorm_cases(
                 ref.launch_seed(seed + 17 * rows + 1000 * len(output.value), launch),
                 device,
                 ss_order=ss_order,
+                world_size=workspace.world_size,
             )
             spec, expected = _spec_and_expected(case, output)
             buffers = _given_buffers(previous) if previous is not None else {}
@@ -825,6 +832,7 @@ def _rmsnorm_runtime_scalars(workspace, input_format, rank, device, group, seed)
             seed + 555,
             device,
             ss_order=ss_order,
+            world_size=workspace.world_size,
             eps=eps,
             weight_bias=weight_bias,
         )
@@ -850,7 +858,14 @@ def _rmsnorm_negative_controls(workspace, input_format, rank, device, group, see
     """Stale expectations must fail: a reference with weight bias 1 + 2^-7, or (NVFP4 input) a wrong static scale."""
     rows = MID_ROWS
     ss_order = _ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16)
-    case = _norm_case(input_format, rows, seed + 99, device, ss_order=ss_order)
+    case = _norm_case(
+        input_format,
+        rows,
+        seed + 99,
+        device,
+        ss_order=ss_order,
+        world_size=workspace.world_size,
+    )
     spec = CakeFp4AllReduceFusedNormSpec(weight=case.weight)
     result = case.launch(workspace, rank, spec)
     torch.cuda.synchronize(device)
@@ -912,7 +927,12 @@ def _rmsnorm_back_to_back(workspace, input_format, rank, device, group, seed):
     calls = []
     for call in range(BACK_TO_BACK_CALLS):
         case = _norm_case(
-            input_format, rows, seed + 7777 * call, device, ss_order=ss_order
+            input_format,
+            rows,
+            seed + 7777 * call,
+            device,
+            ss_order=ss_order,
+            world_size=workspace.world_size,
         )
         out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
         residual_out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
@@ -936,7 +956,7 @@ def _rmsnorm_back_to_back(workspace, input_format, rank, device, group, seed):
 
 
 def _rmsnorm_alternating_rows(workspace, input_format, rank, device, group, seed):
-    key = ("rmsnorm", 2)
+    key = ("rmsnorm", workspace.world_size)
     sequence = (ROWS[key][-1], SMALL_ROWS[key], ROWS[key][-1], MID_ROWS)
     for call, rows in enumerate(sequence):
         case = _norm_case(
@@ -945,6 +965,7 @@ def _rmsnorm_alternating_rows(workspace, input_format, rank, device, group, seed
             seed + 31 * call,
             device,
             ss_order=_ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16),
+            world_size=workspace.world_size,
         )
         result = case.launch(
             workspace, rank, CakeFp4AllReduceFusedNormSpec(weight=case.weight)
@@ -968,6 +989,7 @@ def _rmsnorm_graph_replay(workspace, input_format, rank, device, group, seed):
         seed + 4242,
         device,
         ss_order=_ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16),
+        world_size=workspace.world_size,
     )
     spec = CakeFp4AllReduceFusedNormSpec(weight=case.weight)
     out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
@@ -1184,19 +1206,28 @@ def _rmsnorm_validation(workspace, input_format, device):
     )
 
 
-def _rmsnorm_suite(input_format, rank, device, group):
-    key = ("rmsnorm", 2)
+def _rmsnorm_suite(input_format, world_size, rank, device, group):
+    key = ("rmsnorm", world_size)
     seed = SEEDS["rmsnorm"]
+    # The four-rank fused norm ships the bfloat16 output.
+    outputs = OUTPUTS if world_size == 2 else OUTPUTS[:1]
     workspace = CakeFp4AllReduceWorkspace(
         group, family="rmsnorm", input_format=input_format, device=device
     )
     try:
         _check_workspace(
-            workspace, "rmsnorm", input_format, 2, rank, device, DEFAULT_CAPACITY
+            workspace,
+            "rmsnorm",
+            input_format,
+            world_size,
+            rank,
+            device,
+            DEFAULT_CAPACITY,
         )
-        for output in OUTPUTS:
+        tiers = ROWS[key] if world_size == 2 else (*ROWS[key], bv0_rows(workspace.grid))
+        for output in outputs:
             _rmsnorm_cases(
-                workspace, output, ROWS[key], input_format, rank, device, group, seed
+                workspace, output, tiers, input_format, rank, device, group, seed
             )
         _rmsnorm_runtime_scalars(workspace, input_format, rank, device, group, seed)
         _rmsnorm_negative_controls(workspace, input_format, rank, device, group, seed)
@@ -1214,6 +1245,7 @@ def _rmsnorm_suite(input_format, rank, device, group):
         seed,
         device,
         ss_order=_ss_order(workspace, 8, CakeFp4AllReduceFusedNormOutput.BF16),
+        world_size=world_size,
     )
     _expect(
         RuntimeError,
@@ -1230,9 +1262,9 @@ def _rmsnorm_suite(input_format, rank, device, group):
         device=device,
     ) as larger:
         _check_workspace(
-            larger, "rmsnorm", input_format, 2, rank, device, LARGER_CAPACITY
+            larger, "rmsnorm", input_format, world_size, rank, device, LARGER_CAPACITY
         )
-        for output in OUTPUTS[:2]:
+        for output in outputs[:2]:
             _rmsnorm_cases(
                 larger,
                 output,
@@ -1267,7 +1299,7 @@ def _worker(
         if family == "allreduce":
             _allreduce_suite(input_format, world_size, rank, device, group)
         else:
-            _rmsnorm_suite(input_format, rank, device, group)
+            _rmsnorm_suite(input_format, world_size, rank, device, group)
     finally:
         dist.destroy_process_group()
 

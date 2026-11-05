@@ -80,3 +80,32 @@ lake exe axioms                                # the axiom policy: 0 with sorry,
 
 The Lean steps are not run in CI. The `lean/` directory is part of the repository only: it has no `__init__.py` and
 no package data entry, so no `.lean` file is in the wheel.
+
+## Quantization
+
+The quantizers have no cross-row reduction: a block's scale and codes depend on that block alone (per-token NVFP4: on
+its row, whose amax sets the row's global scale), so FlashInfer's own kernels are already batch invariant in the R1 / R2
+sense. What `batch_invariant=True` adds is a specified, fingerprinted
+dataflow (R3 across the enumerated configurations, R4 across the scale-factor layouts and the input dtypes that widen
+exactly), a closed-form dispatcher whose every pick is a member of one enumerated space, and the exact CPU model and Lean
+statements of the chains. The flag requires `backend="auto"` (the default, which runs the CUDA kernel without the flag) on the
+three operators and on `fp4_quantize`, their shared entry point.
+
+| API | Classes and fingerprint | Numerics | Supported inputs |
+|---|---|---|---|
+| `mxfp8_quantize` | `mxfp8.quant`; `fingerprint("mxfp8_quantize")` (no dimension: one specification per format) | TransformerEngine's MXFP8 chain: block amax as a pairwise `max` tree over `abs`, the UE8M0 scale `cvt.rp.satfinite.ue8m0(amax * fp32(1/448))`, the exact inverse `2^(127 - e8)` at every byte, the elements `cvt.rn.satfinite.e4m3(mul.rn(x, inv))`. The corners are part of the chain: a block whose amax is below `448 * 2^-127` (scale byte 0) keeps its values under the exact inverse, a NaN element gives `0x7F`, `-inf` gives `-448` | bf16 / f16 / fp32 inputs of shape `(..., K)`, `K` a multiple of 32 and rows of at most 128 KiB, `alignment` padding; the 128x4, 8x4 and linear scale layouts (placements of the store: the same bytes); SM100 / SM103 / SM107 |
+| `mxfp4_quantize` | `mxfp4.quant`; `fingerprint("mxfp4_quantize")` | TransformerEngine's MXFP4 recipe: the same chain carried to e2m1 (`fp32(1/6)`, `cvt.rn.satfinite.e2m1`; the tiny-block threshold `6 * 2^-127`) | as above (`K` a multiple of 32); the three layouts |
+| `nvfp4_quantize` | per-tensor `nvfp4.quant` (`fingerprint("nvfp4_quantize")`), per-token `nvfp4.quant.pertoken` (`fingerprint("nvfp4_quantize_per_token", K=)`: the row amax tree spans the row, so the row length is a dimension) | TransformerEngine's NVFP4 recipe with every operation correctly rounded or exact: the block amax as a pairwise `max` tree over `abs`, `sf = cvt.rn.satfinite.e4m3(amax * (gs * fp32(1/6)))`, `inv = fmin(1 / (sf * (1 / gs)), FLT_MAX)` with correctly rounded divisions, the elements `cvt.rn.satfinite.e2m1(mul.rn(x, inv))`; per token the row's global scale `gs = nzor(fmin((1 / gs_inv) / ramax, FLT_MAX), 1)` (`ramax` the row amax tree; `FLT_MAX` for an all-zero row) and the returned per-token scale `1 / gs` | bf16 / f16 / fp32 inputs, `K` a multiple of 16; the per-tensor global scale an input (a float or a 1-element fp32 tensor), the per-token inverse base scale; the three layouts and `do_shuffle` (FlashInfer's own host shuffles applied to the class's linear-layout bytes; a multiple of 32 rows, as FlashInfer's shuffle requires); `sf_vec_size` 16; no 4over6 recipe, no fp8 input, no `expanded_idx_to_permuted_idx`, no `out_scale`; SM100 / SM103 / SM107 |
+| `fp4_quantize` | the entry point behind `nvfp4_quantize` (per tensor) and `mxfp4_quantize`: `sf_vec_size=16, sf_use_ue8m0=False` runs `nvfp4.quant`, `sf_vec_size=32, sf_use_ue8m0=True` runs `mxfp4.quant` | those chains | its own argument forms: `is_sf_swizzled_layout` / `is_sf_8x4_layout`, `global_scale` None as the scale 1.0, `is_global_scale_inversed` as one correctly rounded fp32 division, a column-major input quantized as the transpose of its row-major view (the entry point's placement) and the `(rows, columns)` scale view; other recipes, fp8 inputs and a 4over6 recipe raise |
+
+The chains are the contract: named by the fingerprints, stated in Lean and checked against their exact CPU model, they are
+what the classes promise with respect to TransformerEngine's recipes. FlashInfer's other quantizer backends are not a
+reference for the classes and nothing is promised relative to them: their numerics may change within their own tolerances.
+
+The quantizers' dispatcher is a closed form of `(M, K, element bytes, SM count, layout)`: one configuration per call, no
+autotuning (`quantization/mx_schedule.py`, `quantization/nvfp4_schedule.py`), fitted on CUPTI sweeps of both parts.
+The Lean model (`lean/BIKernels/Canon.lean`, `Semantics.lean`, `MXQuant.lean`, `Quant.lean`) states the engine's reduction
+orders and the chains; `lake exe quantconformance` prints its terms for the generated cases
+(`lean/BIKernels/QuantCases.lean`, rendered by `quantization/lean_cases.py`), which the device-free test
+`tests/batch_invariant/test_quant_lean.py` compares with the Python specification. Tests:
+`tests/quantization/test_batch_invariant_mx_quantize.py` (both MX formats) and `test_batch_invariant_nvfp4_quantize.py`.

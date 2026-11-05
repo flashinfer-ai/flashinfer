@@ -83,7 +83,7 @@ class _CutlassAutoRunner(TunableRunner):
                 a.device, a.shape[0], b.shape[0], k, down.shape[1]
             ),
         )
-        workspace = cutlass._get_cache_buf(
+        workspace = cutlass._get_stream_cache_buf(
             "nvfp4_svdquant_gemm_workspace", size, a.device
         )
         if self.linear:

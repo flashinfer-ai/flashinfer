@@ -148,7 +148,7 @@ except ImportError:
 
 from ..jit.cubin_loader import setup_cubin_loader
 from ..utils import (
-    _get_cache_buf,
+    _get_stream_cache_buf,
     determine_gemm_backend,
     get_indptr,
     is_float8,
@@ -895,7 +895,7 @@ def mm_bf16(
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return mm_bf16_cutile(a, b, out)
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     if backend == "auto":
@@ -1188,7 +1188,7 @@ def bmm_bf16(
             get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
         return out
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
@@ -3546,7 +3546,7 @@ def tgv_gemm_sm100(
             b_descale,
             a_descale,
             out.T,
-            _get_cache_buf(
+            _get_stream_cache_buf(
                 "tgv_gemm_sm100_blockscaled_workspace",
                 DEFAULT_WORKSPACE_SIZE,
                 a.device,
@@ -6469,7 +6469,7 @@ def mm_fp8(
     elif backend == "cutedsl_low_latency":
         k = a.shape[1]
         scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
-        workspace = _get_cache_buf(
+        workspace = _get_stream_cache_buf(
             "mm_fp8_low_latency_workspace",
             DEFAULT_WORKSPACE_SIZE + sum(scale_sizes),
             a.device,
@@ -6489,7 +6489,8 @@ def mm_fp8(
             b_descale,
             a_descale,
             out.T,
-            workspace[sum(scale_sizes) :],
+            # Fixed length keeps the tuner cache key stable.
+            workspace[sum(scale_sizes) : sum(scale_sizes) + DEFAULT_WORKSPACE_SIZE],
             (n, m, k, 1),
             alpha,
             None,
@@ -6501,7 +6502,7 @@ def mm_fp8(
     elif runner_names:
         # bmm_fp8 runners with batch 1; (n, k) row-major is bmm_fp8's column-major B.
         unit_scale = _fp8_unit_scale(a.device)
-        workspace_buffer = _get_cache_buf(
+        workspace_buffer = _get_stream_cache_buf(
             "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
         )
         fp8_gemm_sm100(
@@ -7933,7 +7934,7 @@ def mm_mxfp8(
             dtype=out_dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -10150,7 +10151,7 @@ def mm_fp4(
             dtype=out_dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -10520,7 +10521,7 @@ def bmm_fp8(
             dtype=dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
@@ -10821,7 +10822,7 @@ def gemm_fp8_nt_groupwise(
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -11352,10 +11353,10 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    int_workspace_buffer = _get_cache_buf(
+    int_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    float_workspace_buffer = _get_cache_buf(
+    float_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_fp8_nt_groupwise_float_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
@@ -11600,10 +11601,10 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    int_workspace_buffer = _get_cache_buf(
+    int_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_mxfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    float_workspace_buffer = _get_cache_buf(
+    float_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_mxfp4_nt_groupwise_float_workspace",
         DEFAULT_WORKSPACE_SIZE,
         a.device,
@@ -11852,10 +11853,10 @@ def group_gemm_nvfp4_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    int_workspace_buffer = _get_cache_buf(
+    int_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_nvfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    float_workspace_buffer = _get_cache_buf(
+    float_workspace_buffer = _get_stream_cache_buf(
         "group_gemm_nvfp4_nt_groupwise_float_workspace",
         DEFAULT_WORKSPACE_SIZE,
         a.device,
@@ -12313,7 +12314,7 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12459,7 +12460,9 @@ def batch_deepgemm_fp8_nt_groupwise(
         ``"cake"`` runs the generated Cake programs for the band they own
         (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
         (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
-        (4096, 2048)}``; bfloat16 output; FP32 accumulation with the same
+        (4096, 2048)}``; SM107a: the masked BLOCK_N programs, ``(n, k)`` in
+        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}`` with float32
+        scales; bfloat16 output; FP32 accumulation with the same
         ordered block-scale application as DeepGEMM) and raises for every other
         problem.  With ``backend="cake"`` the scales may also be the native
         MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes
@@ -13275,7 +13278,7 @@ def bmm_mxfp8(
             dtype=dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 

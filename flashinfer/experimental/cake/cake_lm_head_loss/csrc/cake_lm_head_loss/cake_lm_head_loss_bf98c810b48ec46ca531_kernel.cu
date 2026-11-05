@@ -54,9 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_lm_head_loss_bf98c810b48ec46ca531
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {

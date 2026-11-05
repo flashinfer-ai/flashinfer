@@ -88,7 +88,7 @@ collective runs. The delivered architectures and world sizes are recorded in
 the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
 a device or group outside them raises instead of falling back.
 Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
-delivered route's column tile (256 on SM100), ``K_l`` a
+delivered route's column tile (256 on SM100 / SM103), ``K_l`` a
 positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
 process's torch symmetric-memory backend being the default ``CUDA`` backend or
 ``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
@@ -667,12 +667,39 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
+Existing callers can continue passing ``max_elems=...`` instead of
+``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
+Pass only one capacity argument. ``comm.max_elems`` remains available in the
+construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
+new packed-chunk API.
+
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
     workspace = comm.create_workspace()
     q_global = torch.empty(B, S_global, H_local, D,
                            dtype=q.dtype, device=q.device)
     comm.scatter_heads(q, out=q_global, workspace=workspace)
+
+**Packed chunk exchange.** ``exchange_chunks`` follows the byte-oriented
+communicator API: it accepts contiguous ``[1, 1, P, C]`` tensors, sends chunk
+``r`` to rank ``r``, and receives chunks in source-rank order. A packed Lowp
+payload uses ``dtype=torch.uint8``; this describes its existing encoding and
+does not quantize or cast it. The NCCL and NVLink backends use NCCL for
+this operation; the fused NVLink kernel applies only to ordinary head-layout
+transforms. The experimental PCIe backend retains its registered-output path.
+A one-rank exchange without an explicit output is an identity; explicit outputs
+must not overlap the input.
+
+For chunk exchange on NCCL or NVLink, ``allocate_output(x, "exchange_chunks",
+dtype=...)`` creates ordinary PyTorch receive storage. PCIe chunk outputs and
+NVLink Cake direct head-transform outputs follow the registration and lifetime
+rules described above. ``create_workspace(max_elems=...)`` and
+``UlyssesWorkspace`` retain their element-based staging capacities::
+
+    # send_u8: destination-major, contiguous uint8 [P, chunk_bytes].
+    chunks = send_u8.view(1, 1, P, -1)
+    received = comm.allocate_output(chunks, "exchange_chunks", dtype=torch.uint8)
+    comm.exchange_chunks(chunks, out=received, dtype=torch.uint8)
 
 .. autoclass:: UlyssesCommunicator
     :members:
@@ -685,6 +712,66 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
     :show-inheritance:
 
     .. automethod:: __init__
+
+Prepared Low-Precision QKV Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The public Lowp interface is :class:`UlyssesCommunicator` together with
+:class:`UlyssesQKVWorkspace` and :class:`UlyssesQKV`. Statistics, quantization
+and payload primitives are private implementation details. See the
+:download:`design document <../design_docs/ulysses_lowp.md>` for the numerical
+contract and kernel-level validation.
+
+``prepare_qkv`` is a collective preparation method; all ranks call it in the
+same order before attention. It allocates a dedicated mixed-dtype workspace
+from the local QKV shape. Ordinary ``create_workspace`` remains rank-local.
+``scatter_qkv`` currently supports the SageAttention2 encoding only::
+
+    # The original floating Q/K/V total is a conservative wire-byte budget.
+    with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
+                             device=q.device, backend="nccl") as comm:
+        workspace = comm.prepare_qkv(q.shape, used_sequence=used)
+        encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
+        # A framework adapter calls Sage with encoded.q/k/v and the scales.
+        # It returns [B, P*L, H/P, D], in encoded.input_dtype, with a zero tail.
+        output = comm.gather_heads(sage_adapter(encoded))
+        # After the previous attention has consumed the buffers:
+        encoded = comm.scatter_qkv(q_next, k_next, v_next,
+                                   workspace=workspace, out=encoded)
+
+The result contains INT8 Q/K, FP8 E4M3 V, three FP32 scales, the Sage layout,
+logical and used sequence lengths, and the original input dtype. It accepts
+FP16/BF16 inputs on homogeneous SM90 or SM120 groups, D=64/128, and P=2/4/8.
+The last input dimension is dense and each row must be 16-byte aligned;
+projection views need not be fully contiguous. The input padding after the
+used global prefix must already be zero.
+
+Statistics use NCCL on the communicator's group. The packed payload goes
+through ``exchange_chunks``; its current NCCL and NVLink backend implementations
+both use NCCL without another layout conversion or payload copy.
+``workspace.transport`` reports that actual transport. Preparation checks NCCL
+capability even for an NVLink communicator. The prepared Lowp API accepts
+NCCL and NVLink communicators; it collectively rejects the experimental PCIe
+backend before JIT or workspace allocation.
+``max_bytes`` must cover the full combined Q/K/V payload, including scales and
+chunk alignment. Preparation computes and validates the exact requirement;
+one floating Q tensor's byte size is generally insufficient. The example's
+``3 * q.nbytes`` covers both supported layouts. NCCL preparation allocates the
+actual payload size, not the full budget. Statistics and final outputs are
+additional allocations, so ``max_bytes`` is not a total memory budget.
+
+``out=None`` returns independent storage. ``out=`` requires matching tensor
+geometry and metadata, including the exact used length and original dtype.
+Output fields must not overlap one another, inputs or workspace scratch.
+A workspace belongs to its creating communicator and cannot be used after
+that communicator closes. Calls are serialized on the current CUDA stream.
+Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
+
+.. autoclass:: UlyssesQKV
+    :members:
+
+.. autoclass:: UlyssesQKVWorkspace
+    :members:
 
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -768,16 +855,27 @@ count (``launches_per_call``).
 The producer build is selected per architecture and world size
 (``cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
-operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
-build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; on SM107 a group of 4 ranks runs the build with bulk row stores
-(``bulk``); groups of 2 ranks and SM90 run the baseline build.  Every build
-stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
-and norm-weight tensors (a misaligned view raises and names the opt-out).  The
+operand loads, bulk row stores and the fused multiply-add epilogue
+(``bulk_ow256_fma``), a group of 4 ranks the build with wide operand loads and
+the fused multiply-add epilogue (``ow256_fma``) and a group of 2 ranks the
+baseline build with the fused multiply-add epilogue (``fma``); on SM103 groups
+of 8 and 4 ranks run ``ow256_fma`` and groups of 2 ranks ``fma``; on SM107 a
+group of 4 ranks runs the build with bulk row stores (``bulk``); the other
+groups of 2 ranks and SM90 run the baseline build.  The ``fma`` builds contract
+the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
+their stored bits can differ from those of the builds without it; both agree
+within the kernel's accuracy tolerance, and the builds without the fused
+multiply-add epilogue store identical bits.  Every build requires ``cos_sin``
+and norm-weight tensors that start at 16-byte-aligned addresses, the wide-load
+builds at 32-byte-aligned ones (a misaligned view raises; for the 32-byte bases
+the error names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
 ``shipped`` / a delivered build name) overrides the selection per session,
-rank-uniformly; the baseline build stays delivered beside every variant, and a
-build that is not delivered for the session's tile width raises and names the
+rank-uniformly; the baseline build stays delivered beside every variant.  A
+default build that is not delivered for the session's tile width (the two-rank
+``fma`` build at a 128-column tile, for example hidden 768 with 6 heads over 2
+ranks) runs the baseline build instead; a build named by the environment
+variable that is not delivered for the tile width raises and names the
 delivered ones.  The host plan's group scaling follows the same keying
 (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``): on SM100
 groups of 4 and 2 ranks and on SM103 every group size double the token-tile
@@ -788,9 +886,20 @@ ranks, SM90 and SM107 keep the baseline plan.  ``FLASHINFER_QKV_EXCHANGE_GROUP_M
 
 Per-architecture row-count gates shape each call's host plan: on SM100 and
 SM103 a call with at most 4096 rows per rank publishes one readiness word per
-destination, and a call with at least 16384 rows per rank launches the producer
-once per destination run of its tile table (the first launch carrying the
-folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
+destination, and a call with at least a threshold of rows per rank launches the
+producer once per destination run of its tile table (the first launch carrying
+the folded rendezvous); the threshold depends on the world size and the hidden
+size (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``: 8192, 16384 or 32768 rows,
+``per_dest_k_table=0`` restores the single threshold of 16384 and an explicit
+``per_dest_large_m`` replaces the table).  On SM103 and SM100 a group of 8 ranks
+runs a call whose destination band is not a multiple of 256 columns while every
+Q / K / V group is (for example hidden 3072) with at least 4096 rows per rank
+on the 256-column pair tile across band edges, each tile storing its two heads
+to their own destinations, as one persistent launch
+(``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``;
+``xband_min_m=0`` switches it off, and it stays off where its producer build
+is not delivered, for example under the ``shipped`` producer build).  On SM90 a
+call with at most 4096 rows per rank publishes one
 readiness word per destination, a call with at least 16384 rows per rank runs the
 persistent producer grid over every SM (no reserved SMs), and the per-destination
 launch gate is off; SM107 has no per-architecture gate.  Three cells differ from these
@@ -806,12 +915,13 @@ delivered Blackwell route ships it today, so the session refuses at
 construction when a 256-column call can reach the gate (``max_tokens >= N``),
 naming the gate -- and is refused on SM90, which builds no pair tile.  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
-``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``)
+``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``,
+plus ``per_dest_k_table=0|1`` and ``xband_min_m=N``)
 overrides them per session, rank-uniformly (``words_capacity_small_m=4096`` on
 SM90 with 8 ranks and ``words_capacity_small_m=0`` on SM107 restore the previous
 plans); ``describe()`` reports the resolved
 build (``producer_variant``), scale (``group_m_scale``) and gates
-(``shape_gates``) with their sources, and every prepared row's verdict
+(``shape_gates``, ``shape_gate_k_table``, ``xband_min_m``) with their sources, and every prepared row's verdict
 (``prepared_row_plans``, including its ``reserved_sms``).  The first three gates
 change the host plan only -- neither the tile table nor the stored bits; the
 pair-tile gate changes the producer program and the tile table (no lockstep
