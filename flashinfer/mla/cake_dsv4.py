@@ -142,7 +142,9 @@ after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 
 from __future__ import annotations
 
+import ctypes
 import functools
+import os
 import threading
 import weakref
 from dataclasses import dataclass, field
@@ -1063,7 +1065,9 @@ def _fp8_h64_uses_m64_body(
 # one box TMA (-0.35..-0.42 us on the 128/256-token SWA rows); every wider item
 # runs the program without that block, which measured at +0.03..+0.11 us of
 # load-warp code layout on the multi-tile rows even when the in-kernel gate
-# kept it off.  Same bits from both programs.
+# kept it off.  Same bits from both programs.  SM107 runs the multi-tile
+# program's launches on its four-stage sibling where this process can launch
+# it (:func:`_kv4_variant`).
 def _fp8_h64_m64_program(sparse_topk: int) -> str:
     if sparse_topk == _TILE_KV:
         return "fp8_h64_prefill_source_persistent_m64"
@@ -1949,12 +1953,134 @@ _K64_SIBLING_ROUTES = frozenset({"fp8_h128_prefill_source_persistent_uniform"})
 # and trailed it by up to 4 % below.
 _K64_SIBLING_MIN_TOKENS = {"sm_107a": 48}
 
+# The dynamic shared memory of the K=64 sibling programs whose bindings launch
+# them in CUDA 13.4's oversized shared-memory mode (above the 232448 B standard
+# opt-in ceiling of SM107), per architecture.  The binding sets that mode
+# through the CUDA runtime its JIT module links (``libcudart`` by soname, so
+# the copy already in the process, e.g. torch's runtime wheel); a runtime
+# older than 13.4 rejects it ("cudaFuncSetAttribute failed: invalid argument")
+# even on a driver that supports it, so those launches run the program they
+# would run without the sibling instead (:func:`_k64_sibling_launchable`,
+# :func:`_k64_variant`).
+_K64_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 272512}
 
-def _k64_variant(route: str, *, arch: str, num_query_tokens: int) -> str:
-    """The variant a launch of ``route`` over ``num_query_tokens`` rows runs:
-    its K=64 sibling when ``arch`` has a floor in ``_K64_SIBLING_MIN_TOKENS``,
-    the launch meets it and ``arch`` routes the sibling to a program other than
-    the route's, else ``route``."""
+# The routes with a four-stage sibling ``<route>_kv4`` on an architecture whose
+# oversized shared-memory mode holds two more 64 KiB K/V stages (SM107): the
+# multi-tile M64 program with a four-stage K/V ring in that mode, where the
+# route's program has two stages, with the route's arguments, grid and launch
+# and the same output bits.  R200 (208 SMs), eight back-to-back calls per CUDA
+# graph and single cold calls: the four-stage program led the two-stage one by
+# 0.4-28.8 % on every multi-tile row but one and tied or trailed it by up to
+# 2.3 % on that one, 64-head 2 x 257-token prefill on topk128x items 256 wide.
+_KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_tile"})
+
+# The dynamic shared memory of the four-stage sibling programs, per
+# architecture (the route's two-stage program takes 191616 B).  Their bindings
+# launch them in the oversized mode, as the K=64 siblings' bindings do, so a
+# process that cannot launch them runs the route's program instead
+# (:func:`_kv4_sibling_launchable`, :func:`_kv4_variant`).
+_KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
+
+# The CUDA toolkit and runtime (``cudaRuntimeGetVersion``) version that added
+# the oversized shared-memory mode, and the driver's device attribute for its
+# ceiling (CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK).
+_OVERSIZED_SMEM_CUDA_VERSION = "13.4"
+_OVERSIZED_SMEM_CUDART_VERSION = 13040
+_CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK = 150
+
+
+def _shared_library(soname: str) -> Optional[ctypes.CDLL]:
+    """The process's copy of shared library ``soname``: the one already mapped
+    (the copy a JIT module linking ``soname`` binds to), else the one the
+    dynamic linker finds (JIT modules loaded later bind to it), else ``None``."""
+    for mode in (os.RTLD_NOLOAD | os.RTLD_NOW, ctypes.DEFAULT_MODE):
+        try:
+            return ctypes.CDLL(soname, mode=mode)
+        except OSError:
+            continue
+    return None
+
+
+def _cuda_runtime_version(major: int) -> Optional[int]:
+    """``cudaRuntimeGetVersion`` of ``libcudart.so.<major>``, the runtime the
+    JIT modules link (``-lcudart``, no rpath), or ``None`` when that library
+    does not load or the call fails."""
+    cudart = _shared_library(f"libcudart.so.{major}")
+    if cudart is None:
+        return None
+    version = ctypes.c_int(0)
+    if cudart.cudaRuntimeGetVersion(ctypes.pointer(version)) != 0:
+        return None
+    return version.value
+
+
+def _device_oversized_smem_per_block(device: torch.device) -> Optional[int]:
+    """The oversized shared-memory ceiling per block of ``device``, read from
+    the driver (a runtime older than 13.4 does not know the attribute), or
+    ``None`` when the driver does not report it (one older than 13.4 has no
+    oversized mode)."""
+    cuda = _shared_library("libcuda.so.1")
+    if cuda is None:
+        return None
+    ordinal = torch.cuda.current_device() if device.index is None else device.index
+    handle = ctypes.c_int(0)
+    value = ctypes.c_int(0)
+    if cuda.cuInit(0) != 0 or cuda.cuDeviceGet(ctypes.pointer(handle), ordinal) != 0:
+        return None
+    attribute = _CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK
+    if cuda.cuDeviceGetAttribute(ctypes.pointer(value), attribute, handle) != 0:
+        return None
+    return value.value
+
+
+@functools.lru_cache(maxsize=None)
+def _oversized_smem_launchable(smem_bytes: int, device: torch.device) -> bool:
+    """Whether this process can launch a program of ``smem_bytes`` dynamic
+    shared memory in the oversized mode on ``device``: it needs a CUDA toolkit
+    of at least 13.4 (the program's binding does not build below it), a CUDA
+    runtime of at least 13.4 in the process (an older one rejects the mode) and
+    a driver that reports an oversized ceiling holding ``smem_bytes`` (one that
+    reports none has no mode)."""
+    from ..jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
+
+    if not is_cuda_version_at_least(_OVERSIZED_SMEM_CUDA_VERSION):
+        return False
+    runtime = _cuda_runtime_version(get_cuda_version().major)
+    if runtime is None or runtime < _OVERSIZED_SMEM_CUDART_VERSION:
+        return False
+    ceiling = _device_oversized_smem_per_block(device)
+    return ceiling is not None and ceiling >= smem_bytes
+
+
+def _k64_sibling_launchable(arch: str, device: torch.device) -> bool:
+    """Whether this process can launch ``arch``'s K=64 sibling on ``device``.
+
+    A sibling within the standard opt-in ceiling always can; one in the
+    oversized mode can when :func:`_oversized_smem_launchable` passes for its
+    shared memory."""
+    smem_bytes = _K64_SIBLING_OVERSIZED_SMEM_BYTES.get(arch)
+    return smem_bytes is None or _oversized_smem_launchable(smem_bytes, device)
+
+
+def _kv4_sibling_launchable(arch: str, device: torch.device) -> bool:
+    """Whether this process can launch ``arch``'s four-stage sibling on
+    ``device``, as :func:`_k64_sibling_launchable` for the K=64 sibling."""
+    smem_bytes = _KV4_SIBLING_OVERSIZED_SMEM_BYTES.get(arch)
+    return smem_bytes is None or _oversized_smem_launchable(smem_bytes, device)
+
+
+def _k64_variant(
+    route: str, *, arch: str, num_query_tokens: int, device: torch.device
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows on
+    ``device`` runs: its K=64 sibling when ``arch`` has a floor in
+    ``_K64_SIBLING_MIN_TOKENS``, the launch meets it, ``arch`` routes the
+    sibling to a program other than the route's and this process can launch
+    that program on ``device`` (:func:`_k64_sibling_launchable`), else
+    ``route``.  When only that launch check fails, launches of at least
+    ``_FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS`` rows (the short-query launches
+    SM107 keeps on the uniform route only for the sibling) run the lane-issued
+    route ``fp8_h128_prefill_source_persistent`` instead."""
     if route not in _K64_SIBLING_ROUTES:
         return route
     min_tokens = _K64_SIBLING_MIN_TOKENS.get(arch)
@@ -1966,7 +2092,28 @@ def _k64_variant(route: str, *, arch: str, num_query_tokens: int) -> str:
     sibling = f"{route}_k64"
     if programs.get(sibling, programs.get(route)) == programs.get(route):
         return route
+    if not _k64_sibling_launchable(arch, device):
+        if num_query_tokens >= _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+            return "fp8_h128_prefill_source_persistent"
+        return route
     return sibling
+
+
+def _kv4_variant(route: str, *, arch: str, device: torch.device) -> str:
+    """The variant a launch of ``route`` on ``device`` runs: its four-stage
+    sibling when ``route`` is in ``_KV4_SIBLING_ROUTES``, ``arch`` routes the
+    sibling to a program other than the route's and this process can launch
+    that program on ``device`` (:func:`_kv4_sibling_launchable`), else
+    ``route``."""
+    if route not in _KV4_SIBLING_ROUTES:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{route}_kv4"
+    if programs.get(sibling, programs.get(route)) == programs.get(route):
+        return route
+    return sibling if _kv4_sibling_launchable(arch, device) else route
 
 
 def _pdl_variant(
@@ -2520,7 +2667,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     ):
         parts = L.partials(1)
         program = _pdl_variant(
-            _k64_variant(route, arch=L.arch, num_query_tokens=T),
+            _k64_variant(route, arch=L.arch, num_query_tokens=T, device=v["Q"].device),
             arch=L.arch,
             enable_pdl=v["enable_pdl"],
             num_query_tokens=T,
@@ -2536,10 +2683,12 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # One CTA per token (cta_group::1, M = 64); same kernel kwargs as the
         # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
         # caller-owned workspace), grid = tokens.  Both M64 programs share the
-        # kernel ABI; _fp8_h64_m64_program picks one by the item width.
+        # kernel ABI; _fp8_h64_m64_program picks one by the item width.  SM107
+        # runs the multi-tile program's launches on its four-stage sibling
+        # where this process can launch it (_kv4_variant).
         parts = L.partials(1)
         program = _pdl_variant(
-            route,
+            _kv4_variant(route, arch=L.arch, device=v["Q"].device),
             arch=L.arch,
             enable_pdl=v["enable_pdl"],
             num_query_tokens=T,

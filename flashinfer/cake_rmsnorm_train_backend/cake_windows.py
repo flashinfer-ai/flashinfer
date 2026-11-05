@@ -139,30 +139,35 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (524288, None, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
         ),
         "bwd_h512": (
-            (0, 26, "cake_rmsnorm_train_d0bde38aa443d42a5f04"),
-            (26, 1024, "cake_rmsnorm_train_09601d42628de24f6f87"),
+            (0, 227, "cake_rmsnorm_train_5f3e3fccaea795d0a806"),
+            (227, 1024, "cake_rmsnorm_train_09601d42628de24f6f87"),
             (1024, 1280, "cake_rmsnorm_train_123db0b2f7fb38cfab03"),
             (1280, None, "cake_rmsnorm_train_d0bde38aa443d42a5f04"),
         ),
         "bwd_w32_h512": (
-            (0, 292, "cake_rmsnorm_train_aa7c5a5407cba063b9d5"),
+            (0, 227, "cake_rmsnorm_train_942503b80a21f22cd392"),
+            (227, 292, "cake_rmsnorm_train_aa7c5a5407cba063b9d5"),
             (292, 960, "cake_rmsnorm_train_9f07cea1d13b923ed91e"),
             (960, None, "cake_rmsnorm_train_fd08c6f436eb6071fa22"),
         ),
         "bwd_h1536": (
             (0, 64, "cake_rmsnorm_train_38e972a94141a1961c90"),
-            (64, 1024, "cake_rmsnorm_train_7dc29629ff21625607f8"),
+            (64, 384, "cake_rmsnorm_train_dc478ac1195882aedee6"),
+            (384, 1024, "cake_rmsnorm_train_7dc29629ff21625607f8"),
             (1024, 4096, "cake_rmsnorm_train_c1a9efdf06c3087b4efe"),
             (4096, 32768, "cake_rmsnorm_train_21c8bb55c8d672b63952"),
             (32768, 36864, "cake_rmsnorm_train_b457c4d134e44476dc6f"),
-            (36864, None, "cake_rmsnorm_train_ae610afdf77ff6714a5b"),
+            (36864, 78784, "cake_rmsnorm_train_ae610afdf77ff6714a5b"),
+            (78784, None, "cake_rmsnorm_train_b42efd6bf06148d75151"),
         ),
         "bwd_w32_h1536": (
             (0, 64, "cake_rmsnorm_train_d5a621af7a24e403b5f3"),
-            (64, 1024, "cake_rmsnorm_train_baff9ecbafe7de1e6030"),
-            (1024, 4096, "cake_rmsnorm_train_17d9cdfd157ba4b86c2b"),
+            (64, 384, "cake_rmsnorm_train_3ddc5ca5ad86c7725d7e"),
+            (384, 1024, "cake_rmsnorm_train_baff9ecbafe7de1e6030"),
+            (1024, 4096, "cake_rmsnorm_train_4b6981c10fd40a9d8aec"),
             (4096, 32768, "cake_rmsnorm_train_4bf450b6af0314ed03be"),
-            (32768, None, "cake_rmsnorm_train_4b6981c10fd40a9d8aec"),
+            (32768, 75776, "cake_rmsnorm_train_4b6981c10fd40a9d8aec"),
+            (75776, None, "cake_rmsnorm_train_e2b99fee32764cfd1295"),
         ),
         "bwd_h2048": (
             (0, 64, "cake_rmsnorm_train_ef052c0918725ffa68d4"),
@@ -173,18 +178,20 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (7168, 11264, "cake_rmsnorm_train_0fa4f255caf709d09f66"),
             (11264, 13608, "cake_rmsnorm_train_c73074cf44f07fcf3bb6"),
             (13608, 45056, "cake_rmsnorm_train_0fa4f255caf709d09f66"),
-            (45056, 58880, "cake_rmsnorm_train_ceeef043ac64f37fc529"),
-            (58880, None, "cake_rmsnorm_train_0fa4f255caf709d09f66"),
+            (45056, 58880, "cake_rmsnorm_train_0fa4f255caf709d09f66"),
+            (58880, 65536, "cake_rmsnorm_train_0fa4f255caf709d09f66"),
+            (65536, None, "cake_rmsnorm_train_83f905ffd00c0ef641e2"),
         ),
         "bwd_w32_h2048": (
             (0, 64, "cake_rmsnorm_train_382e45788ace3ff40ba1"),
             (64, 336, "cake_rmsnorm_train_17493054fed5409b6df9"),
-            (336, 3072, "cake_rmsnorm_train_07f9f2fbea7163639c27"),
-            (3072, 4096, "cake_rmsnorm_train_d96a14fe8882bbd9ec2e"),
+            (336, 1024, "cake_rmsnorm_train_17493054fed5409b6df9"),
+            (1024, 4096, "cake_rmsnorm_train_ba7dbf6a07744268705e"),
             (4096, 15403, "cake_rmsnorm_train_b187e5989302def22b2d"),
             (15403, 45056, "cake_rmsnorm_train_ba7dbf6a07744268705e"),
-            (45056, 58880, "cake_rmsnorm_train_7e6a0b631aea3edf51f9"),
-            (58880, None, "cake_rmsnorm_train_ba7dbf6a07744268705e"),
+            (45056, 58880, "cake_rmsnorm_train_ba7dbf6a07744268705e"),
+            (58880, 65536, "cake_rmsnorm_train_ba7dbf6a07744268705e"),
+            (65536, None, "cake_rmsnorm_train_9f775c72c1335f4b08ac"),
         ),
         "bwd_h4096": (
             (0, 64, "cake_rmsnorm_train_231e01eca0459c2c0bf5"),
@@ -193,52 +200,58 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (4096, 4608, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
             (4608, 36864, "cake_rmsnorm_train_15e157d2ee9080d206a9"),
             (36864, 44032, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
-            (44032, None, "cake_rmsnorm_train_15e157d2ee9080d206a9"),
+            (44032, 65536, "cake_rmsnorm_train_15e157d2ee9080d206a9"),
+            (65536, None, "cake_rmsnorm_train_c67fc8b9d1b1edb8d7da"),
         ),
         "bwd_w32_h4096": (
             (0, 64, "cake_rmsnorm_train_ce1f7d216ecc0a1573b9"),
             (64, 1792, "cake_rmsnorm_train_8616070567821eaa3e35"),
-            (1792, 3584, "cake_rmsnorm_train_0c84999caf2b86c2e09e"),
+            (1792, 3584, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
             (3584, 36864, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
             (36864, 44032, "cake_rmsnorm_train_626aed743358c27513f1"),
-            (44032, None, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
+            (44032, 65536, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
+            (65536, None, "cake_rmsnorm_train_9ebd0232954f1b1842f7"),
         ),
         "bwd_h5120": (
             (0, 64, "cake_rmsnorm_train_cc082d1fc7f42b4b3f2c"),
             (64, 896, "cake_rmsnorm_train_080e0a6c3b18e9bad790"),
             (896, 6144, "cake_rmsnorm_train_b482c84dbffcd75a4a4c"),
-            (6144, 65536, "cake_rmsnorm_train_c145ef195d7aeb04f242"),
-            (65536, None, "cake_rmsnorm_train_2f05000ca9242ea4d6cb"),
+            (6144, 56256, "cake_rmsnorm_train_c145ef195d7aeb04f242"),
+            (56256, None, "cake_rmsnorm_train_ade9f6a4f10b069ba8a3"),
         ),
         "bwd_w32_h5120": (
             (0, 64, "cake_rmsnorm_train_244b7d841d62d9721c99"),
-            (64, 256, "cake_rmsnorm_train_6042554b427634669739"),
-            (256, 6144, "cake_rmsnorm_train_40227b2a2b2122628d58"),
-            (6144, 65536, "cake_rmsnorm_train_9479b1298a1b19d4d996"),
-            (65536, None, "cake_rmsnorm_train_de8f6091077dc7ac5947"),
+            (64, 1792, "cake_rmsnorm_train_68f6e584c687c30c0084"),
+            (1792, 6144, "cake_rmsnorm_train_de8f6091077dc7ac5947"),
+            (6144, 56256, "cake_rmsnorm_train_9479b1298a1b19d4d996"),
+            (56256, None, "cake_rmsnorm_train_fc2a52a2c9bf8c5be9af"),
         ),
         "bwd_h6144": (
             (0, 64, "cake_rmsnorm_train_d70f2562a592151ec4f9"),
             (64, 1152, "cake_rmsnorm_train_44508df7dab2ab688f85"),
             (1152, 4096, "cake_rmsnorm_train_5c804aed7ad14b99e1d0"),
             (4096, 5632, "cake_rmsnorm_train_b93bf060d4d3defc8150"),
-            (5632, None, "cake_rmsnorm_train_9433061da18b2db4299d"),
+            (5632, 65536, "cake_rmsnorm_train_9433061da18b2db4299d"),
+            (65536, None, "cake_rmsnorm_train_10a41132a42d594ce6dd"),
         ),
         "bwd_residual_h6144": (
             (0, 64, "cake_rmsnorm_train_7b0f5a6a8769473c322e"),
             (64, 1408, "cake_rmsnorm_train_864e84f3d874f850c091"),
-            (1408, None, "cake_rmsnorm_train_3fbfdd750cbeb47032b5"),
+            (1408, 65536, "cake_rmsnorm_train_3fbfdd750cbeb47032b5"),
+            (65536, None, "cake_rmsnorm_train_1609f7969c50fba7f2c7"),
         ),
         "bwd_w32_h6144": (
             (0, 64, "cake_rmsnorm_train_9b37923697ee8ca52a9e"),
             (64, 1168, "cake_rmsnorm_train_b3e6531e46667901ab91"),
             (1168, 3584, "cake_rmsnorm_train_41b80b6af97974feb181"),
-            (3584, None, "cake_rmsnorm_train_a562656cef5bf5dda160"),
+            (3584, 65536, "cake_rmsnorm_train_a562656cef5bf5dda160"),
+            (65536, None, "cake_rmsnorm_train_45cf60e3cd8603c2abeb"),
         ),
         "bwd_w32_residual_h6144": (
             (0, 64, "cake_rmsnorm_train_ac9d69f94aabfc68aa40"),
             (64, 1408, "cake_rmsnorm_train_71d36617003ab7742a77"),
-            (1408, None, "cake_rmsnorm_train_a640d0b799889f785ad5"),
+            (1408, 65536, "cake_rmsnorm_train_a640d0b799889f785ad5"),
+            (65536, None, "cake_rmsnorm_train_d3d674373d17aaf425c0"),
         ),
     },
     "sm_103a": {
@@ -399,7 +412,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (3072, 4096, "cake_rmsnorm_train_9ac8d21e46a658e7913f"),
             (4096, 16384, "cake_rmsnorm_train_caf6978ed0a17fbf65b9"),
             (16384, 32768, "cake_rmsnorm_train_caf6978ed0a17fbf65b9"),
-            (32768, 61952, "cake_rmsnorm_train_302f64db6abe79e5259e"),
+            (32768, 58496, "cake_rmsnorm_train_302f64db6abe79e5259e"),
+            (58496, 61952, "cake_rmsnorm_train_018f0cd723106f709f11"),
             (61952, None, "cake_rmsnorm_train_8bd89a4c834f80db8a34"),
         ),
         "bwd_w32_h2048": (
@@ -408,7 +422,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (3072, 4096, "cake_rmsnorm_train_d96a14fe8882bbd9ec2e"),
             (4096, 16384, "cake_rmsnorm_train_07f9f2fbea7163639c27"),
             (16384, 32768, "cake_rmsnorm_train_07f9f2fbea7163639c27"),
-            (32768, 61952, "cake_rmsnorm_train_e98cb156abfe1666c76f"),
+            (32768, 58496, "cake_rmsnorm_train_e98cb156abfe1666c76f"),
+            (58496, 61952, "cake_rmsnorm_train_ca8ca4674a3dbd89ad16"),
             (61952, None, "cake_rmsnorm_train_88c6c6b2af1922f4c1a9"),
         ),
         "bwd_h4096": (
@@ -581,38 +596,41 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (36864, None, "cake_rmsnorm_train_172a47a15d4c1a76c061"),
         ),
         "bwd_w32_h256": (
-            (0, 1296, "cake_rmsnorm_train_8de0131445eed6eeabb7"),
-            (1296, 1536, "cake_rmsnorm_train_5e0c6208d4b426f79faa"),
-            (1536, 36864, "cake_rmsnorm_train_8de0131445eed6eeabb7"),
+            (0, 36864, "cake_rmsnorm_train_8de0131445eed6eeabb7"),
             (36864, None, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
         ),
         "bwd_h512": (
-            (0, 77, "cake_rmsnorm_train_d0bde38aa443d42a5f04"),
+            (0, 77, "cake_rmsnorm_train_5f3e3fccaea795d0a806"),
             (77, 1024, "cake_rmsnorm_train_3feed5026e1156d2fba2"),
             (1024, 4096, "cake_rmsnorm_train_3feed5026e1156d2fba2"),
             (4096, 16384, "cake_rmsnorm_train_dfaf378aa8ad93e68bbd"),
-            (16384, None, "cake_rmsnorm_train_eb141cc9e0a93c6f0ce3"),
+            (16384, 49152, "cake_rmsnorm_train_eb141cc9e0a93c6f0ce3"),
+            (49152, None, "cake_rmsnorm_train_30501ccec48cc058333a"),
         ),
         "bwd_w32_h512": (
-            (0, 229, "cake_rmsnorm_train_fd08c6f436eb6071fa22"),
+            (0, 229, "cake_rmsnorm_train_942503b80a21f22cd392"),
             (229, 1024, "cake_rmsnorm_train_b841d64bbcaefff5ce7b"),
             (1024, 4096, "cake_rmsnorm_train_fd08c6f436eb6071fa22"),
             (4096, 16384, "cake_rmsnorm_train_383f709cd5c4fadd9436"),
-            (16384, None, "cake_rmsnorm_train_03efa681eb38f59b00c2"),
+            (16384, 49152, "cake_rmsnorm_train_03efa681eb38f59b00c2"),
+            (49152, None, "cake_rmsnorm_train_26fbe8e6f07a658e26f6"),
         ),
         "bwd_h1536": (
             (0, 64, "cake_rmsnorm_train_38e972a94141a1961c90"),
             (64, 1024, "cake_rmsnorm_train_7dc29629ff21625607f8"),
             (1024, 16384, "cake_rmsnorm_train_6a428da2227972ae18ae"),
             (16384, 53248, "cake_rmsnorm_train_56d26996239835327501"),
-            (53248, None, "cake_rmsnorm_train_3f75f4a81f2fb8269389"),
+            (53248, 65536, "cake_rmsnorm_train_3f75f4a81f2fb8269389"),
+            (65536, None, "cake_rmsnorm_train_dca25ace64c075a81625"),
         ),
         "bwd_w32_h1536": (
             (0, 64, "cake_rmsnorm_train_d5a621af7a24e403b5f3"),
-            (64, 1024, "cake_rmsnorm_train_baff9ecbafe7de1e6030"),
-            (1024, 16384, "cake_rmsnorm_train_e63beae98c236ce26335"),
+            (64, 256, "cake_rmsnorm_train_3ddc5ca5ad86c7725d7e"),
+            (256, 1024, "cake_rmsnorm_train_baff9ecbafe7de1e6030"),
+            (1024, 16384, "cake_rmsnorm_train_7c0dd63f0b011049603e"),
             (16384, 53248, "cake_rmsnorm_train_de8e07d4cb312b06dbc4"),
-            (53248, None, "cake_rmsnorm_train_7c0dd63f0b011049603e"),
+            (53248, 65536, "cake_rmsnorm_train_7c0dd63f0b011049603e"),
+            (65536, None, "cake_rmsnorm_train_ccd94d87e9036a0b2faf"),
         ),
         "bwd_h2048": (
             (0, 64, "cake_rmsnorm_train_ef052c0918725ffa68d4"),
@@ -624,10 +642,10 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
         ),
         "bwd_w32_h2048": (
             (0, 64, "cake_rmsnorm_train_382e45788ace3ff40ba1"),
-            (64, 127, "cake_rmsnorm_train_810989bdea464df479ce"),
+            (64, 127, "cake_rmsnorm_train_7a3e5eb75314492eebdb"),
             (127, 256, "cake_rmsnorm_train_6b13aa49e0c0414d9041"),
             (256, 1024, "cake_rmsnorm_train_838a9a4054731f7942af"),
-            (1024, 16384, "cake_rmsnorm_train_9e5ec75a15ac2bff0e4b"),
+            (1024, 16384, "cake_rmsnorm_train_810989bdea464df479ce"),
             (16384, 50176, "cake_rmsnorm_train_838a9a4054731f7942af"),
             (50176, None, "cake_rmsnorm_train_810989bdea464df479ce"),
         ),
@@ -637,15 +655,17 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (256, 1024, "cake_rmsnorm_train_a647fccc3d9fa9134733"),
             (1024, 4096, "cake_rmsnorm_train_d41a514f5210e9adc39f"),
             (4096, 36864, "cake_rmsnorm_train_ee4a9053bb25b8d49fcf"),
-            (36864, None, "cake_rmsnorm_train_f11a86167db4f8e9a5da"),
+            (36864, 65536, "cake_rmsnorm_train_f11a86167db4f8e9a5da"),
+            (65536, None, "cake_rmsnorm_train_5e9d7baa36814bb7aaf6"),
         ),
         "bwd_w32_h4096": (
             (0, 64, "cake_rmsnorm_train_ce1f7d216ecc0a1573b9"),
-            (64, 256, "cake_rmsnorm_train_a1f537fc94bde175bb3c"),
+            (64, 256, "cake_rmsnorm_train_0af20ef9ee6868c5569d"),
             (256, 1024, "cake_rmsnorm_train_dc439f8335327e482025"),
             (1024, 4096, "cake_rmsnorm_train_b08633208e60b8ce94fd"),
             (4096, 24064, "cake_rmsnorm_train_0f1859b9fe9e47668a1c"),
-            (24064, None, "cake_rmsnorm_train_a1f537fc94bde175bb3c"),
+            (24064, 65536, "cake_rmsnorm_train_a1f537fc94bde175bb3c"),
+            (65536, None, "cake_rmsnorm_train_23cee954b648495ceef1"),
         ),
         "bwd_h5120": (
             (0, 64, "cake_rmsnorm_train_cc082d1fc7f42b4b3f2c"),
@@ -657,33 +677,37 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
         "bwd_w32_h5120": (
             (0, 64, "cake_rmsnorm_train_244b7d841d62d9721c99"),
             (64, 4096, "cake_rmsnorm_train_cd612de56c0985bb4caa"),
-            (4096, 19968, "cake_rmsnorm_train_468cc4d1b8128187b4b3"),
+            (4096, 19968, "cake_rmsnorm_train_dd795e849940a49d0d29"),
             (19968, 49152, "cake_rmsnorm_train_7b9e10b21b75d4615135"),
             (49152, None, "cake_rmsnorm_train_6cedccdf3a58f23f260f"),
         ),
         "bwd_h6144": (
             (0, 64, "cake_rmsnorm_train_d70f2562a592151ec4f9"),
-            (64, 30720, "cake_rmsnorm_train_5d292172df772adb17ae"),
-            (30720, None, "cake_rmsnorm_train_ddedaa3be7466a4faa97"),
+            (64, 19456, "cake_rmsnorm_train_5d292172df772adb17ae"),
+            (19456, 30720, "cake_rmsnorm_train_19e18371f9243bd1a91a"),
+            (30720, None, "cake_rmsnorm_train_083b5f2e2a0d1b4f1c82"),
         ),
         "bwd_residual_h6144": (
             (0, 64, "cake_rmsnorm_train_7b0f5a6a8769473c322e"),
             (64, 448, "cake_rmsnorm_train_0dcdc563be377247044e"),
             (448, 3584, "cake_rmsnorm_train_864e84f3d874f850c091"),
             (3584, 7168, "cake_rmsnorm_train_0dcdc563be377247044e"),
-            (7168, None, "cake_rmsnorm_train_87d2866c1ea3bcc08b13"),
+            (7168, None, "cake_rmsnorm_train_c07ab5f16934c0cc8421"),
         ),
         "bwd_w32_h6144": (
             (0, 64, "cake_rmsnorm_train_9b37923697ee8ca52a9e"),
-            (64, 28672, "cake_rmsnorm_train_7d2f6707bfa3d2cd60bb"),
-            (28672, None, "cake_rmsnorm_train_e77387f14390ba486055"),
+            (64, 2304, "cake_rmsnorm_train_44c5b870a7dcbb8de924"),
+            (2304, 19456, "cake_rmsnorm_train_e77387f14390ba486055"),
+            (19456, 28672, "cake_rmsnorm_train_b83f8b3d546630a60675"),
+            (28672, None, "cake_rmsnorm_train_25f9b466fa418dd2afc4"),
         ),
         "bwd_w32_residual_h6144": (
             (0, 64, "cake_rmsnorm_train_ac9d69f94aabfc68aa40"),
-            (64, 448, "cake_rmsnorm_train_56f988dde54db37f09d9"),
+            (64, 96, "cake_rmsnorm_train_c8bc10e76c624f5f4534"),
+            (96, 448, "cake_rmsnorm_train_56f988dde54db37f09d9"),
             (448, 3584, "cake_rmsnorm_train_71d36617003ab7742a77"),
             (3584, 7168, "cake_rmsnorm_train_56f988dde54db37f09d9"),
-            (7168, None, "cake_rmsnorm_train_647589443d4915ca8fde"),
+            (7168, None, "cake_rmsnorm_train_e655055ead76f8df4d24"),
         ),
     },
 }
@@ -725,20 +749,24 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "fwd_w32_residual_h6144": ((256, "same"), (1024, "ulp")),
         "bwd_h256": ((20480, "same"), (92160, "same"), (524288, "same")),
         "bwd_w32_h256": ((20480, "same"), (92160, "same"), (524288, "same")),
-        "bwd_h512": ((26, "same"), (1024, "same"), (1280, "same")),
-        "bwd_w32_h512": ((292, "same"), (960, "same")),
+        "bwd_h512": ((227, "same"), (1024, "same"), (1280, "same")),
+        "bwd_w32_h512": ((227, "same"), (292, "same"), (960, "same")),
         "bwd_h1536": (
             (64, "same"),
+            (384, "same"),
             (1024, "same"),
             (4096, "same"),
             (32768, "same"),
             (36864, "same"),
+            (78784, "same"),
         ),
         "bwd_w32_h1536": (
             (64, "same"),
+            (384, "same"),
             (1024, "same"),
             (4096, "same"),
             (32768, "same"),
+            (75776, "same"),
         ),
         "bwd_h2048": (
             (64, "same"),
@@ -750,15 +778,17 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (13608, "same"),
             (45056, "same"),
             (58880, "same"),
+            (65536, "same"),
         ),
         "bwd_w32_h2048": (
             (64, "same"),
             (336, "same"),
-            (3072, "same"),
+            (1024, "same"),
             (4096, "same"),
             (15403, "same"),
             (45056, "same"),
             (58880, "same"),
+            (65536, "same"),
         ),
         "bwd_h4096": (
             (64, "same"),
@@ -767,6 +797,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (4608, "same"),
             (36864, "same"),
             (44032, "same"),
+            (65536, "same"),
         ),
         "bwd_w32_h4096": (
             (64, "same"),
@@ -774,13 +805,30 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (3584, "same"),
             (36864, "same"),
             (44032, "same"),
+            (65536, "same"),
         ),
-        "bwd_h5120": ((64, "same"), (896, "same"), (6144, "same"), (65536, "same")),
-        "bwd_w32_h5120": ((64, "same"), (256, "same"), (6144, "same"), (65536, "same")),
-        "bwd_h6144": ((64, "same"), (1152, "same"), (4096, "same"), (5632, "same")),
-        "bwd_residual_h6144": ((64, "same"), (1408, "same")),
-        "bwd_w32_h6144": ((64, "same"), (1168, "same"), (3584, "same")),
-        "bwd_w32_residual_h6144": ((64, "same"), (1408, "same")),
+        "bwd_h5120": ((64, "same"), (896, "same"), (6144, "same"), (56256, "same")),
+        "bwd_w32_h5120": (
+            (64, "same"),
+            (1792, "same"),
+            (6144, "same"),
+            (56256, "same"),
+        ),
+        "bwd_h6144": (
+            (64, "same"),
+            (1152, "same"),
+            (4096, "same"),
+            (5632, "same"),
+            (65536, "same"),
+        ),
+        "bwd_residual_h6144": ((64, "same"), (1408, "same"), (65536, "same")),
+        "bwd_w32_h6144": (
+            (64, "same"),
+            (1168, "same"),
+            (3584, "same"),
+            (65536, "same"),
+        ),
+        "bwd_w32_residual_h6144": ((64, "same"), (1408, "same"), (65536, "same")),
     },
     "sm_103a": {
         "fwd_h1536": ((1536, "ulp"), (3584, "same"), (6144, "same")),
@@ -860,6 +908,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (4096, "same"),
             (16384, "same"),
             (32768, "same"),
+            (58496, "same"),
             (61952, "same"),
         ),
         "bwd_w32_h2048": (
@@ -868,6 +917,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (4096, "same"),
             (16384, "same"),
             (32768, "same"),
+            (58496, "same"),
             (61952, "same"),
         ),
         "bwd_h4096": (
@@ -961,20 +1011,35 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "fwd_residual_h6144": ((256, "ulp"), (1024, "ulp")),
         "fwd_w32_residual_h6144": ((256, "ulp"), (1024, "ulp")),
         "bwd_h256": ((1056, "same"), (3584, "same"), (36864, "same")),
-        "bwd_w32_h256": ((1296, "same"), (1536, "same"), (36864, "same")),
-        "bwd_h512": ((77, "same"), (1024, "same"), (4096, "same"), (16384, "same")),
+        "bwd_w32_h256": ((36864, "same"),),
+        "bwd_h512": (
+            (77, "same"),
+            (1024, "same"),
+            (4096, "same"),
+            (16384, "same"),
+            (49152, "same"),
+        ),
         "bwd_w32_h512": (
             (229, "same"),
             (1024, "same"),
             (4096, "same"),
             (16384, "same"),
+            (49152, "same"),
         ),
-        "bwd_h1536": ((64, "same"), (1024, "same"), (16384, "same"), (53248, "same")),
-        "bwd_w32_h1536": (
+        "bwd_h1536": (
             (64, "same"),
             (1024, "same"),
             (16384, "same"),
             (53248, "same"),
+            (65536, "same"),
+        ),
+        "bwd_w32_h1536": (
+            (64, "same"),
+            (256, "same"),
+            (1024, "same"),
+            (16384, "same"),
+            (53248, "same"),
+            (65536, "same"),
         ),
         "bwd_h2048": (
             (64, "same"),
@@ -997,6 +1062,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (1024, "same"),
             (4096, "same"),
             (36864, "same"),
+            (65536, "same"),
         ),
         "bwd_w32_h4096": (
             (64, "same"),
@@ -1004,6 +1070,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (1024, "same"),
             (4096, "same"),
             (24064, "same"),
+            (65536, "same"),
         ),
         "bwd_h5120": ((64, "same"), (4096, "same"), (19968, "same"), (49152, "same")),
         "bwd_w32_h5120": (
@@ -1012,16 +1079,22 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (19968, "same"),
             (49152, "same"),
         ),
-        "bwd_h6144": ((64, "same"), (30720, "same")),
+        "bwd_h6144": ((64, "same"), (19456, "same"), (30720, "same")),
         "bwd_residual_h6144": (
             (64, "same"),
             (448, "same"),
             (3584, "same"),
             (7168, "same"),
         ),
-        "bwd_w32_h6144": ((64, "same"), (28672, "same")),
+        "bwd_w32_h6144": (
+            (64, "same"),
+            (2304, "same"),
+            (19456, "same"),
+            (28672, "same"),
+        ),
         "bwd_w32_residual_h6144": (
             (64, "same"),
+            (96, "same"),
             (448, "same"),
             (3584, "same"),
             (7168, "same"),
@@ -1050,11 +1123,13 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
     "sm_100a": {
         "bwd_h1536": (
             (0, 64, None),
-            (64, 1024, 132),
+            (64, 384, None),
+            (384, 1024, 132),
             (1024, 4096, 100),
             (4096, 32768, 100),
             (32768, 36864, 132),
-            (36864, None, None),
+            (36864, 78784, None),
+            (78784, None, None),
         ),
         "bwd_h2048": (
             (0, 64, None),
@@ -1065,8 +1140,9 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (7168, 11264, 132),
             (11264, 13608, 100),
             (13608, 45056, 132),
-            (45056, 58880, 100),
-            (58880, None, 132),
+            (45056, 58880, 132),
+            (58880, 65536, 132),
+            (65536, None, 132),
         ),
         "bwd_h256": (
             (0, 20480, None),
@@ -1081,11 +1157,12 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (4096, 4608, 132),
             (4608, 36864, None),
             (36864, 44032, 132),
-            (44032, None, None),
+            (44032, 65536, None),
+            (65536, None, None),
         ),
         "bwd_h512": (
-            (0, 26, None),
-            (26, 1024, None),
+            (0, 227, None),
+            (227, 1024, None),
             (1024, 1280, 132),
             (1280, None, None),
         ),
@@ -1093,33 +1170,42 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (0, 64, 100),
             (64, 896, None),
             (896, 6144, None),
-            (6144, 65536, None),
-            (65536, None, 132),
+            (6144, 56256, None),
+            (56256, None, 132),
         ),
         "bwd_h6144": (
             (0, 64, None),
             (64, 1152, 132),
             (1152, 4096, 132),
             (4096, 5632, 132),
-            (5632, None, 100),
+            (5632, 65536, 100),
+            (65536, None, 100),
         ),
-        "bwd_residual_h6144": ((0, 64, None), (64, 1408, 100), (1408, None, 100)),
+        "bwd_residual_h6144": (
+            (0, 64, None),
+            (64, 1408, 100),
+            (1408, 65536, 100),
+            (65536, None, 100),
+        ),
         "bwd_w32_h1536": (
             (0, 64, None),
-            (64, 1024, 132),
-            (1024, 4096, 100),
+            (64, 384, None),
+            (384, 1024, 132),
+            (1024, 4096, None),
             (4096, 32768, 100),
-            (32768, None, None),
+            (32768, 75776, None),
+            (75776, None, None),
         ),
         "bwd_w32_h2048": (
             (0, 64, None),
             (64, 336, None),
-            (336, 3072, 100),
-            (3072, 4096, 100),
+            (336, 1024, None),
+            (1024, 4096, 132),
             (4096, 15403, 100),
             (15403, 45056, 132),
-            (45056, 58880, 100),
-            (58880, None, 132),
+            (45056, 58880, 132),
+            (58880, 65536, 132),
+            (65536, None, 132),
         ),
         "bwd_w32_h256": (
             (0, 20480, None),
@@ -1130,26 +1216,38 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
         "bwd_w32_h4096": (
             (0, 64, None),
             (64, 1792, None),
-            (1792, 3584, 132),
+            (1792, 3584, None),
             (3584, 36864, None),
             (36864, 44032, 132),
-            (44032, None, None),
+            (44032, 65536, None),
+            (65536, None, None),
         ),
-        "bwd_w32_h512": ((0, 292, None), (292, 960, None), (960, None, None)),
+        "bwd_w32_h512": (
+            (0, 227, None),
+            (227, 292, None),
+            (292, 960, None),
+            (960, None, None),
+        ),
         "bwd_w32_h5120": (
             (0, 64, 100),
-            (64, 256, None),
-            (256, 6144, None),
-            (6144, 65536, None),
-            (65536, None, 132),
+            (64, 1792, None),
+            (1792, 6144, 132),
+            (6144, 56256, None),
+            (56256, None, 132),
         ),
         "bwd_w32_h6144": (
             (0, 64, None),
             (64, 1168, 132),
             (1168, 3584, 132),
-            (3584, None, 100),
+            (3584, 65536, 100),
+            (65536, None, 100),
         ),
-        "bwd_w32_residual_h6144": ((0, 64, None), (64, 1408, 100), (1408, None, 100)),
+        "bwd_w32_residual_h6144": (
+            (0, 64, None),
+            (64, 1408, 100),
+            (1408, 65536, 100),
+            (65536, None, 100),
+        ),
     },
     "sm_103a": {
         "bwd_h1536": (
@@ -1167,7 +1265,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (3072, 4096, 100),
             (4096, 16384, 100),
             (16384, 32768, 100),
-            (32768, 61952, 100),
+            (32768, 58496, 100),
+            (58496, 61952, 100),
             (61952, None, 132),
         ),
         "bwd_h256": (
@@ -1234,7 +1333,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (3072, 4096, 100),
             (4096, 16384, 100),
             (16384, 32768, 100),
-            (32768, 61952, 100),
+            (32768, 58496, 100),
+            (58496, 61952, 100),
             (61952, None, 132),
         ),
         "bwd_w32_h256": (
@@ -1292,7 +1392,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (64, 1024, None),
             (1024, 16384, 100),
             (16384, 53248, 100),
-            (53248, None, None),
+            (53248, 65536, None),
+            (65536, None, None),
         ),
         "bwd_h2048": (
             (0, 64, None),
@@ -1314,14 +1415,16 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (256, 1024, 100),
             (1024, 4096, 100),
             (4096, 36864, 100),
-            (36864, None, 132),
+            (36864, 65536, 132),
+            (65536, None, 132),
         ),
         "bwd_h512": (
             (0, 77, None),
             (77, 1024, None),
             (1024, 4096, 100),
             (4096, 16384, 100),
-            (16384, None, 100),
+            (16384, 49152, 100),
+            (49152, None, None),
         ),
         "bwd_h5120": (
             (0, 64, 100),
@@ -1330,7 +1433,12 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (19968, 49152, 100),
             (49152, None, 132),
         ),
-        "bwd_h6144": ((0, 64, None), (64, 30720, 100), (30720, None, 100)),
+        "bwd_h6144": (
+            (0, 64, None),
+            (64, 19456, 100),
+            (19456, 30720, 100),
+            (30720, None, 100),
+        ),
         "bwd_residual_h6144": (
             (0, 64, None),
             (64, 448, 100),
@@ -1340,52 +1448,58 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
         ),
         "bwd_w32_h1536": (
             (0, 64, None),
-            (64, 1024, None),
-            (1024, 16384, 100),
+            (64, 256, None),
+            (256, 1024, None),
+            (1024, 16384, None),
             (16384, 53248, 100),
-            (53248, None, None),
+            (53248, 65536, None),
+            (65536, None, None),
         ),
         "bwd_w32_h2048": (
             (0, 64, None),
             (64, 127, None),
             (127, 256, None),
             (256, 1024, 100),
-            (1024, 16384, 100),
+            (1024, 16384, None),
             (16384, 50176, 100),
             (50176, None, None),
         ),
-        "bwd_w32_h256": (
-            (0, 1296, None),
-            (1296, 1536, None),
-            (1536, 36864, None),
-            (36864, None, None),
-        ),
+        "bwd_w32_h256": ((0, 36864, None), (36864, None, None)),
         "bwd_w32_h4096": (
             (0, 64, None),
-            (64, 256, 132),
+            (64, 256, None),
             (256, 1024, 100),
             (1024, 4096, 100),
             (4096, 24064, 100),
-            (24064, None, 132),
+            (24064, 65536, 132),
+            (65536, None, 132),
         ),
         "bwd_w32_h512": (
             (0, 229, None),
             (229, 1024, None),
             (1024, 4096, None),
             (4096, 16384, 100),
-            (16384, None, 100),
+            (16384, 49152, 100),
+            (49152, None, None),
         ),
         "bwd_w32_h5120": (
             (0, 64, 100),
             (64, 4096, 100),
-            (4096, 19968, 100),
+            (4096, 19968, 132),
             (19968, 49152, 100),
             (49152, None, 132),
         ),
-        "bwd_w32_h6144": ((0, 64, None), (64, 28672, 100), (28672, None, 100)),
+        "bwd_w32_h6144": (
+            (0, 64, None),
+            (64, 2304, 132),
+            (2304, 19456, 100),
+            (19456, 28672, 100),
+            (28672, None, 100),
+        ),
         "bwd_w32_residual_h6144": (
             (0, 64, None),
-            (64, 448, 100),
+            (64, 96, 100),
+            (96, 448, 100),
             (448, 3584, 100),
             (3584, 7168, 100),
             (7168, None, 100),
@@ -1407,13 +1521,13 @@ WHOLE_SM: dict[str, dict[str, tuple[tuple[int, int | None], ...]]] = {
         "fwd_h6144": ((4096, None),),
         "fwd_w32_h6144": ((4096, None),),
         "bwd_h1536": ((1024, 53248),),
-        "bwd_w32_h1536": ((1024, 53248),),
+        "bwd_w32_h1536": ((16384, 53248),),
         "bwd_h2048": ((256, 50176),),
-        "bwd_w32_h2048": ((256, 50176),),
+        "bwd_w32_h2048": ((256, 1024), (16384, 50176)),
         "bwd_h4096": ((1024, 36864),),
         "bwd_w32_h4096": ((1024, 24064),),
         "bwd_residual_h6144": ((64, 448), (3584, 7168)),
-        "bwd_w32_residual_h6144": ((64, 448), (3584, 7168)),
+        "bwd_w32_residual_h6144": ((96, 448), (3584, 7168)),
     },
 }
 WHOLE_SM_REMEDY = "Beside those, leave some SMs free of the resident kernel."
@@ -1429,30 +1543,34 @@ moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
 and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
-max(|dx|, rms(dx)) of the deterministic backward's ``dx``, not always bitwise equal to
+``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
 scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a fixed
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
-``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` and on sm_107a of
-``bwd_h2048`` (and of their FP32-weight routes), the lowest window of each of those
-routes that runs its top window's program, the lowest window on sm_103a of
-``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_w32_h5120``, the lowest window of
-``bwd_w32_h512`` on sm_100a and sm_103a, and the sm_100a ``bwd_h256`` window from
-20480 to 92160 rows, run a twosum single kernel: each thread keeps its ``dw`` column
-sums exact (error-free FP32 products, TwoSum compensation) and adds them to the FP64
-sums once, so the ``dw`` error does not grow with ``T``; its ``dw`` is not bitwise
-reproducible either.  On sm_103a the top window of ``bwd_h4096`` and ``bwd_h5120``
-and on sm_107a the top window of ``bwd_h5120`` (and of their FP32-weight routes) run a
-kblock single kernel: each thread adds the ``dw`` products of a block of 8 rows in
-FP32 and keeps the block sums as FP32 TwoSum pairs, which it adds to the FP64 sums
-once, so the ``dw`` error grows slowly with ``T`` (at most 0.81 of the per-element
-budget at the sampled ``T`` up to 131072 on GB300 and R200); its ``dw`` is not bitwise
-reproducible either.  A window marked
+``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` and on sm_107a
+of ``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` (and of their
+FP32-weight routes), the windows above T 49152 of sm_107a ``bwd_h512``, above T 65536
+of sm_107a ``bwd_h4096`` and of sm_100a ``bwd_h2048``, ``bwd_h4096``, ``bwd_h6144`` and
+``bwd_residual_h6144``, above T 56256 of sm_100a ``bwd_h5120`` (both weight dtypes) and
+above T 78784 of sm_100a ``bwd_h1536`` and above T 75776 of ``bwd_w32_h1536``, the
+lowest window of each of those routes that runs its top window's program, the lowest
+window on sm_103a of ``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_w32_h5120``, the lowest
+window of ``bwd_w32_h512`` on sm_103a and its window from T 227 to 292 on sm_100a, and
+the sm_100a ``bwd_h256`` window from 20480 to 92160 rows, run a twosum single kernel:
+each thread keeps its ``dw`` column sums exact (error-free FP32 products, TwoSum
+compensation) and adds them to the FP64 sums once, so the ``dw`` error does not grow
+with ``T``; its ``dw`` is not bitwise reproducible either.  On sm_103a the top window
+of ``bwd_h4096`` and ``bwd_h5120`` and on sm_107a the top window of ``bwd_h5120`` (and
+of their FP32-weight routes) run a kblock single kernel: each thread adds the ``dw``
+products of a block of 8 rows in FP32 and keeps the block sums as FP32 TwoSum pairs,
+which it adds to the FP64 sums once, so the ``dw`` error grows slowly with ``T`` (at
+most 0.81 of the per-element budget at the sampled ``T`` up to 131072 on GB300 and
+R200); its ``dw`` is not bitwise reproducible either.  A window marked
 ``(det pair)`` runs the deterministic package's main kernel and fixed-order dw reduce,
 rendered into this package; on ``bwd_h5120`` (both weight dtypes) the det pair windows
 above T 6144 on sm_100a, 5120 on sm_103a and 19968 on sm_107a run the deterministic
-package's compensated programs (compensated per-chunk ``dw`` sums) up to T 65536, the
-top of the qualified range, on sm_100a, up to T 61952 on sm_103a and up to T 49152 on
+package's compensated programs (compensated per-chunk ``dw`` sums) up to T 56256 on
+sm_100a, up to T 61952 on sm_103a and up to T 49152 on
 sm_107a, the single kernel above.  On sm_103a ``bwd_h256`` (both weight dtypes) every
 window above 1080 rows runs a det pair.  Their main kernels are those the
 deterministic package runs for those rows on a device with 152 or more SMs, except
@@ -1466,12 +1584,33 @@ package runs above 80896 rows on sm_100a also runs from 92160 to 524288 rows on
 sm_100a; the twosum single kernel runs above, where that pair's worst ``dw`` element
 exceeds 0.85 of the budget at some sampled row counts.  On sm_103a
 ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic package runs
-from T 4096, for ``dw`` accuracy.  On 36 backward routes the lowest window, from T 1 up
-to a token count from 3 to 320 (1056 to 1296 rows on ``bwd_h256`` and its FP32-weight
-route), runs a single kernel for ``dw`` accuracy: there, over 60 inputs of each of
-three families, the det pair's median ``dw`` error, or on the FP32-weight,
+from T 4096, for ``dw`` accuracy.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
+from T 1024 to 4096 runs the single kernel of its window from T 32768 to 75776,
+``bwd_w32_h2048`` from T 1024 to 4096 and ``bwd_w32_h4096`` from T 1792 to 3584 the
+single kernel whose twosum form runs their top window, ``bwd_w32_h2048`` from T 336 to
+1024 the column-task kernel of its window from T 64 to 336 (its CTAs first sum whole
+columns of ``dw`` over every row) and ``bwd_w32_h5120`` from T 1792 to 6144 the single
+kernel whose twosum form runs its top window; on sm_107a ``bwd_w32_h6144`` from T 19456
+to 28672 runs the det pair the deterministic package runs above T 19456,
+``bwd_w32_h2048`` from T 1024 to 16384 the single kernel of its largest token counts,
+``bwd_w32_h5120`` from T 4096 to 19968 a row single kernel, and ``bwd_w32_h1536`` from
+T 1024 to 16384 and ``bwd_w32_h6144`` from T 2304 to 19456 the single kernel whose
+twosum form runs their top window; each replaces a pair whose ``dw`` error exceeds the
+FP32 eager reduction's at some sampled ``T`` of that pair's window.  On sm_100a
+``bwd_h2048`` and ``bwd_w32_h2048`` from T 45056 to 58880 run the single kernel of
+their neighbouring windows, within 2 % of the det pair's time (worst ``dw`` element
+over both weight dtypes: 0.969 of the budget for the det pair, 0.800 for the single
+kernel; every 64th ``T``, 120 inputs per family).  On sm_107a ``bwd_h6144`` from
+T 19456 to 30720 runs, for now, the det pair the deterministic package runs there; the
+pair of its window below stays within the ``dw`` budget there and takes 0.97x to 0.99x
+the det pair's time.  On sm_100a ``bwd_h512`` and ``bwd_w32_h512`` up to T 227 run the
+deterministic package's column-task program of that window, which is faster there.  On
+18 backward routes the lowest window, from T 1 up to a token count from 64 to 229 (1056
+to 1080 rows on ``bwd_h256`` and its FP32-weight route and 36864 rows on sm_107a
+``bwd_w32_h256``), runs a single kernel for ``dw`` accuracy: there, over 60 inputs of
+each of three families, the det pair's median ``dw`` error, or on the FP32-weight,
 ``bwd_h5120`` and ``bwd_h256`` routes its worst ``dw`` error, exceeds the FP32 eager
-reduction's at some sampled ``T`` (measured on B200, GB300 and R200 with 212 SMs).
+reduction's at some sampled ``T`` (measured on GB300 and R200 with 212 SMs).
 On ``bwd_h1536``, ``bwd_h2048``, ``bwd_h4096``, ``bwd_h5120``, ``bwd_h6144`` and
 ``bwd_residual_h6144`` (and their FP32-weight routes) the lowest window, up to T 64 (on
 sm_103a up to T 32 on ``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_h6144``, up to T 48 on
@@ -1495,30 +1634,34 @@ moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
 and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
-max(|dx|, rms(dx)) of the deterministic backward's ``dx``, not always bitwise equal to
+``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
 scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a fixed
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
-``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` and on sm_107a of
-``bwd_h2048`` (and of their FP32-weight routes), the lowest window of each of those
-routes that runs its top window's program, the lowest window on sm_103a of
-``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_w32_h5120``, the lowest window of
-``bwd_w32_h512`` on sm_100a and sm_103a, and the sm_100a ``bwd_h256`` window from
-20480 to 92160 rows, run a twosum single kernel: each thread keeps its ``dw`` column
-sums exact (error-free FP32 products, TwoSum compensation) and adds them to the FP64
-sums once, so the ``dw`` error does not grow with ``T``; its ``dw`` is not bitwise
-reproducible either.  On sm_103a the top window of ``bwd_h4096`` and ``bwd_h5120``
-and on sm_107a the top window of ``bwd_h5120`` (and of their FP32-weight routes) run a
-kblock single kernel: each thread adds the ``dw`` products of a block of 8 rows in
-FP32 and keeps the block sums as FP32 TwoSum pairs, which it adds to the FP64 sums
-once, so the ``dw`` error grows slowly with ``T`` (at most 0.81 of the per-element
-budget at the sampled ``T`` up to 131072 on GB300 and R200); its ``dw`` is not bitwise
-reproducible either.  A window marked
+``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` and on sm_107a
+of ``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` (and of their
+FP32-weight routes), the windows above T 49152 of sm_107a ``bwd_h512``, above T 65536
+of sm_107a ``bwd_h4096`` and of sm_100a ``bwd_h2048``, ``bwd_h4096``, ``bwd_h6144`` and
+``bwd_residual_h6144``, above T 56256 of sm_100a ``bwd_h5120`` (both weight dtypes) and
+above T 78784 of sm_100a ``bwd_h1536`` and above T 75776 of ``bwd_w32_h1536``, the
+lowest window of each of those routes that runs its top window's program, the lowest
+window on sm_103a of ``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_w32_h5120``, the lowest
+window of ``bwd_w32_h512`` on sm_103a and its window from T 227 to 292 on sm_100a, and
+the sm_100a ``bwd_h256`` window from 20480 to 92160 rows, run a twosum single kernel:
+each thread keeps its ``dw`` column sums exact (error-free FP32 products, TwoSum
+compensation) and adds them to the FP64 sums once, so the ``dw`` error does not grow
+with ``T``; its ``dw`` is not bitwise reproducible either.  On sm_103a the top window
+of ``bwd_h4096`` and ``bwd_h5120`` and on sm_107a the top window of ``bwd_h5120`` (and
+of their FP32-weight routes) run a kblock single kernel: each thread adds the ``dw``
+products of a block of 8 rows in FP32 and keeps the block sums as FP32 TwoSum pairs,
+which it adds to the FP64 sums once, so the ``dw`` error grows slowly with ``T`` (at
+most 0.81 of the per-element budget at the sampled ``T`` up to 131072 on GB300 and
+R200); its ``dw`` is not bitwise reproducible either.  A window marked
 ``(det pair)`` runs the deterministic package's main kernel and fixed-order dw reduce,
 rendered into this package; on ``bwd_h5120`` (both weight dtypes) the det pair windows
 above T 6144 on sm_100a, 5120 on sm_103a and 19968 on sm_107a run the deterministic
-package's compensated programs (compensated per-chunk ``dw`` sums) up to T 65536, the
-top of the qualified range, on sm_100a, up to T 61952 on sm_103a and up to T 49152 on
+package's compensated programs (compensated per-chunk ``dw`` sums) up to T 56256 on
+sm_100a, up to T 61952 on sm_103a and up to T 49152 on
 sm_107a, the single kernel above.  On sm_103a ``bwd_h256`` (both weight dtypes) every
 window above 1080 rows runs a det pair.  Their main kernels are those the
 deterministic package runs for those rows on a device with 152 or more SMs, except
@@ -1532,12 +1675,33 @@ package runs above 80896 rows on sm_100a also runs from 92160 to 524288 rows on
 sm_100a; the twosum single kernel runs above, where that pair's worst ``dw`` element
 exceeds 0.85 of the budget at some sampled row counts.  On sm_103a
 ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic package runs
-from T 4096, for ``dw`` accuracy.  On 36 backward routes the lowest window, from T 1 up
-to a token count from 3 to 320 (1056 to 1296 rows on ``bwd_h256`` and its FP32-weight
-route), runs a single kernel for ``dw`` accuracy: there, over 60 inputs of each of
-three families, the det pair's median ``dw`` error, or on the FP32-weight,
+from T 4096, for ``dw`` accuracy.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
+from T 1024 to 4096 runs the single kernel of its window from T 32768 to 75776,
+``bwd_w32_h2048`` from T 1024 to 4096 and ``bwd_w32_h4096`` from T 1792 to 3584 the
+single kernel whose twosum form runs their top window, ``bwd_w32_h2048`` from T 336 to
+1024 the column-task kernel of its window from T 64 to 336 (its CTAs first sum whole
+columns of ``dw`` over every row) and ``bwd_w32_h5120`` from T 1792 to 6144 the single
+kernel whose twosum form runs its top window; on sm_107a ``bwd_w32_h6144`` from T 19456
+to 28672 runs the det pair the deterministic package runs above T 19456,
+``bwd_w32_h2048`` from T 1024 to 16384 the single kernel of its largest token counts,
+``bwd_w32_h5120`` from T 4096 to 19968 a row single kernel, and ``bwd_w32_h1536`` from
+T 1024 to 16384 and ``bwd_w32_h6144`` from T 2304 to 19456 the single kernel whose
+twosum form runs their top window; each replaces a pair whose ``dw`` error exceeds the
+FP32 eager reduction's at some sampled ``T`` of that pair's window.  On sm_100a
+``bwd_h2048`` and ``bwd_w32_h2048`` from T 45056 to 58880 run the single kernel of
+their neighbouring windows, within 2 % of the det pair's time (worst ``dw`` element
+over both weight dtypes: 0.969 of the budget for the det pair, 0.800 for the single
+kernel; every 64th ``T``, 120 inputs per family).  On sm_107a ``bwd_h6144`` from
+T 19456 to 30720 runs, for now, the det pair the deterministic package runs there; the
+pair of its window below stays within the ``dw`` budget there and takes 0.97x to 0.99x
+the det pair's time.  On sm_100a ``bwd_h512`` and ``bwd_w32_h512`` up to T 227 run the
+deterministic package's column-task program of that window, which is faster there.  On
+18 backward routes the lowest window, from T 1 up to a token count from 64 to 229 (1056
+to 1080 rows on ``bwd_h256`` and its FP32-weight route and 36864 rows on sm_107a
+``bwd_w32_h256``), runs a single kernel for ``dw`` accuracy: there, over 60 inputs of
+each of three families, the det pair's median ``dw`` error, or on the FP32-weight,
 ``bwd_h5120`` and ``bwd_h256`` routes its worst ``dw`` error, exceeds the FP32 eager
-reduction's at some sampled ``T`` (measured on B200, GB300 and R200 with 212 SMs).
+reduction's at some sampled ``T`` (measured on GB300 and R200 with 212 SMs).
 On ``bwd_h1536``, ``bwd_h2048``, ``bwd_h4096``, ``bwd_h5120``, ``bwd_h6144`` and
 ``bwd_residual_h6144`` (and their FP32-weight routes) the lowest window, up to T 64 (on
 sm_103a up to T 32 on ``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_h6144``, up to T 48 on
@@ -1647,30 +1811,34 @@ moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
 and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
-max(|dx|, rms(dx)) of the deterministic backward's ``dx``, not always bitwise equal to
+``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
 scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a fixed
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
-``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` and on sm_107a of
-``bwd_h2048`` (and of their FP32-weight routes), the lowest window of each of those
-routes that runs its top window's program, the lowest window on sm_103a of
-``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_w32_h5120``, the lowest window of
-``bwd_w32_h512`` on sm_100a and sm_103a, and the sm_100a ``bwd_h256`` window from
-20480 to 92160 rows, run a twosum single kernel: each thread keeps its ``dw`` column
-sums exact (error-free FP32 products, TwoSum compensation) and adds them to the FP64
-sums once, so the ``dw`` error does not grow with ``T``; its ``dw`` is not bitwise
-reproducible either.  On sm_103a the top window of ``bwd_h4096`` and ``bwd_h5120``
-and on sm_107a the top window of ``bwd_h5120`` (and of their FP32-weight routes) run a
-kblock single kernel: each thread adds the ``dw`` products of a block of 8 rows in
-FP32 and keeps the block sums as FP32 TwoSum pairs, which it adds to the FP64 sums
-once, so the ``dw`` error grows slowly with ``T`` (at most 0.81 of the per-element
-budget at the sampled ``T`` up to 131072 on GB300 and R200); its ``dw`` is not bitwise
-reproducible either.  A window marked
+``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` and on sm_107a
+of ``bwd_h1536``, ``bwd_h2048``, ``bwd_h6144`` and ``bwd_residual_h6144`` (and of their
+FP32-weight routes), the windows above T 49152 of sm_107a ``bwd_h512``, above T 65536
+of sm_107a ``bwd_h4096`` and of sm_100a ``bwd_h2048``, ``bwd_h4096``, ``bwd_h6144`` and
+``bwd_residual_h6144``, above T 56256 of sm_100a ``bwd_h5120`` (both weight dtypes) and
+above T 78784 of sm_100a ``bwd_h1536`` and above T 75776 of ``bwd_w32_h1536``, the
+lowest window of each of those routes that runs its top window's program, the lowest
+window on sm_103a of ``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_w32_h5120``, the lowest
+window of ``bwd_w32_h512`` on sm_103a and its window from T 227 to 292 on sm_100a, and
+the sm_100a ``bwd_h256`` window from 20480 to 92160 rows, run a twosum single kernel:
+each thread keeps its ``dw`` column sums exact (error-free FP32 products, TwoSum
+compensation) and adds them to the FP64 sums once, so the ``dw`` error does not grow
+with ``T``; its ``dw`` is not bitwise reproducible either.  On sm_103a the top window
+of ``bwd_h4096`` and ``bwd_h5120`` and on sm_107a the top window of ``bwd_h5120`` (and
+of their FP32-weight routes) run a kblock single kernel: each thread adds the ``dw``
+products of a block of 8 rows in FP32 and keeps the block sums as FP32 TwoSum pairs,
+which it adds to the FP64 sums once, so the ``dw`` error grows slowly with ``T`` (at
+most 0.81 of the per-element budget at the sampled ``T`` up to 131072 on GB300 and
+R200); its ``dw`` is not bitwise reproducible either.  A window marked
 ``(det pair)`` runs the deterministic package's main kernel and fixed-order dw reduce,
 rendered into this package; on ``bwd_h5120`` (both weight dtypes) the det pair windows
 above T 6144 on sm_100a, 5120 on sm_103a and 19968 on sm_107a run the deterministic
-package's compensated programs (compensated per-chunk ``dw`` sums) up to T 65536, the
-top of the qualified range, on sm_100a, up to T 61952 on sm_103a and up to T 49152 on
+package's compensated programs (compensated per-chunk ``dw`` sums) up to T 56256 on
+sm_100a, up to T 61952 on sm_103a and up to T 49152 on
 sm_107a, the single kernel above.  On sm_103a ``bwd_h256`` (both weight dtypes) every
 window above 1080 rows runs a det pair.  Their main kernels are those the
 deterministic package runs for those rows on a device with 152 or more SMs, except
@@ -1684,12 +1852,33 @@ package runs above 80896 rows on sm_100a also runs from 92160 to 524288 rows on
 sm_100a; the twosum single kernel runs above, where that pair's worst ``dw`` element
 exceeds 0.85 of the budget at some sampled row counts.  On sm_103a
 ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic package runs
-from T 4096, for ``dw`` accuracy.  On 36 backward routes the lowest window, from T 1 up
-to a token count from 3 to 320 (1056 to 1296 rows on ``bwd_h256`` and its FP32-weight
-route), runs a single kernel for ``dw`` accuracy: there, over 60 inputs of each of
-three families, the det pair's median ``dw`` error, or on the FP32-weight,
+from T 4096, for ``dw`` accuracy.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
+from T 1024 to 4096 runs the single kernel of its window from T 32768 to 75776,
+``bwd_w32_h2048`` from T 1024 to 4096 and ``bwd_w32_h4096`` from T 1792 to 3584 the
+single kernel whose twosum form runs their top window, ``bwd_w32_h2048`` from T 336 to
+1024 the column-task kernel of its window from T 64 to 336 (its CTAs first sum whole
+columns of ``dw`` over every row) and ``bwd_w32_h5120`` from T 1792 to 6144 the single
+kernel whose twosum form runs its top window; on sm_107a ``bwd_w32_h6144`` from T 19456
+to 28672 runs the det pair the deterministic package runs above T 19456,
+``bwd_w32_h2048`` from T 1024 to 16384 the single kernel of its largest token counts,
+``bwd_w32_h5120`` from T 4096 to 19968 a row single kernel, and ``bwd_w32_h1536`` from
+T 1024 to 16384 and ``bwd_w32_h6144`` from T 2304 to 19456 the single kernel whose
+twosum form runs their top window; each replaces a pair whose ``dw`` error exceeds the
+FP32 eager reduction's at some sampled ``T`` of that pair's window.  On sm_100a
+``bwd_h2048`` and ``bwd_w32_h2048`` from T 45056 to 58880 run the single kernel of
+their neighbouring windows, within 2 % of the det pair's time (worst ``dw`` element
+over both weight dtypes: 0.969 of the budget for the det pair, 0.800 for the single
+kernel; every 64th ``T``, 120 inputs per family).  On sm_107a ``bwd_h6144`` from
+T 19456 to 30720 runs, for now, the det pair the deterministic package runs there; the
+pair of its window below stays within the ``dw`` budget there and takes 0.97x to 0.99x
+the det pair's time.  On sm_100a ``bwd_h512`` and ``bwd_w32_h512`` up to T 227 run the
+deterministic package's column-task program of that window, which is faster there.  On
+18 backward routes the lowest window, from T 1 up to a token count from 64 to 229 (1056
+to 1080 rows on ``bwd_h256`` and its FP32-weight route and 36864 rows on sm_107a
+``bwd_w32_h256``), runs a single kernel for ``dw`` accuracy: there, over 60 inputs of
+each of three families, the det pair's median ``dw`` error, or on the FP32-weight,
 ``bwd_h5120`` and ``bwd_h256`` routes its worst ``dw`` error, exceeds the FP32 eager
-reduction's at some sampled ``T`` (measured on B200, GB300 and R200 with 212 SMs).
+reduction's at some sampled ``T`` (measured on GB300 and R200 with 212 SMs).
 On ``bwd_h1536``, ``bwd_h2048``, ``bwd_h4096``, ``bwd_h5120``, ``bwd_h6144`` and
 ``bwd_residual_h6144`` (and their FP32-weight routes) the lowest window, up to T 64 (on
 sm_103a up to T 32 on ``bwd_h4096``, ``bwd_w32_h4096`` and ``bwd_h6144``, up to T 48 on
@@ -1720,24 +1909,24 @@ those, leave some SMs free of the resident kernel.  Measured with
 K KB or more, ``-`` that it starts beside every measured size; an architecture or
 route not listed is unmeasured.
 
-* ``sm_100a`` ``bwd_h1536``: (0, 64] -, (64, 1024] >= 132, (1024, 4096] >= 100, (4096, 32768] >= 100, (32768, 36864] >= 132, (36864, inf) -
-* ``sm_100a`` ``bwd_h2048``: (0, 64] -, (64, 336] -, (336, 3072] >= 100, (3072, 4096] >= 100, (4096, 7168] >= 100, (7168, 11264] >= 132, (11264, 13608] >= 100, (13608, 45056] >= 132, (45056, 58880] >= 100, (58880, inf) >= 132
+* ``sm_100a`` ``bwd_h1536``: (0, 64] -, (64, 384] -, (384, 1024] >= 132, (1024, 4096] >= 100, (4096, 32768] >= 100, (32768, 36864] >= 132, (36864, 78784] -, (78784, inf) -
+* ``sm_100a`` ``bwd_h2048``: (0, 64] -, (64, 336] -, (336, 3072] >= 100, (3072, 4096] >= 100, (4096, 7168] >= 100, (7168, 11264] >= 132, (11264, 13608] >= 100, (13608, 45056] >= 132, (45056, 58880] >= 132, (58880, 65536] >= 132, (65536, inf) >= 132
 * ``sm_100a`` ``bwd_h256``: (0, 20480] -, (20480, 92160] -, (92160, 524288] -, (524288, inf) -
-* ``sm_100a`` ``bwd_h4096``: (0, 64] -, (64, 1152] -, (1152, 4096] >= 132, (4096, 4608] >= 132, (4608, 36864] -, (36864, 44032] >= 132, (44032, inf) -
-* ``sm_100a`` ``bwd_h512``: (0, 26] -, (26, 1024] -, (1024, 1280] >= 132, (1280, inf) -
-* ``sm_100a`` ``bwd_h5120``: (0, 64] >= 100, (64, 896] -, (896, 6144] -, (6144, 65536] -, (65536, inf) >= 132
-* ``sm_100a`` ``bwd_h6144``: (0, 64] -, (64, 1152] >= 132, (1152, 4096] >= 132, (4096, 5632] >= 132, (5632, inf) >= 100
-* ``sm_100a`` ``bwd_residual_h6144``: (0, 64] -, (64, 1408] >= 100, (1408, inf) >= 100
-* ``sm_100a`` ``bwd_w32_h1536``: (0, 64] -, (64, 1024] >= 132, (1024, 4096] >= 100, (4096, 32768] >= 100, (32768, inf) -
-* ``sm_100a`` ``bwd_w32_h2048``: (0, 64] -, (64, 336] -, (336, 3072] >= 100, (3072, 4096] >= 100, (4096, 15403] >= 100, (15403, 45056] >= 132, (45056, 58880] >= 100, (58880, inf) >= 132
+* ``sm_100a`` ``bwd_h4096``: (0, 64] -, (64, 1152] -, (1152, 4096] >= 132, (4096, 4608] >= 132, (4608, 36864] -, (36864, 44032] >= 132, (44032, 65536] -, (65536, inf) -
+* ``sm_100a`` ``bwd_h512``: (0, 227] -, (227, 1024] -, (1024, 1280] >= 132, (1280, inf) -
+* ``sm_100a`` ``bwd_h5120``: (0, 64] >= 100, (64, 896] -, (896, 6144] -, (6144, 56256] -, (56256, inf) >= 132
+* ``sm_100a`` ``bwd_h6144``: (0, 64] -, (64, 1152] >= 132, (1152, 4096] >= 132, (4096, 5632] >= 132, (5632, 65536] >= 100, (65536, inf) >= 100
+* ``sm_100a`` ``bwd_residual_h6144``: (0, 64] -, (64, 1408] >= 100, (1408, 65536] >= 100, (65536, inf) >= 100
+* ``sm_100a`` ``bwd_w32_h1536``: (0, 64] -, (64, 384] -, (384, 1024] >= 132, (1024, 4096] -, (4096, 32768] >= 100, (32768, 75776] -, (75776, inf) -
+* ``sm_100a`` ``bwd_w32_h2048``: (0, 64] -, (64, 336] -, (336, 1024] -, (1024, 4096] >= 132, (4096, 15403] >= 100, (15403, 45056] >= 132, (45056, 58880] >= 132, (58880, 65536] >= 132, (65536, inf) >= 132
 * ``sm_100a`` ``bwd_w32_h256``: (0, 20480] -, (20480, 92160] -, (92160, 524288] -, (524288, inf) -
-* ``sm_100a`` ``bwd_w32_h4096``: (0, 64] -, (64, 1792] -, (1792, 3584] >= 132, (3584, 36864] -, (36864, 44032] >= 132, (44032, inf) -
-* ``sm_100a`` ``bwd_w32_h512``: (0, 292] -, (292, 960] -, (960, inf) -
-* ``sm_100a`` ``bwd_w32_h5120``: (0, 64] >= 100, (64, 256] -, (256, 6144] -, (6144, 65536] -, (65536, inf) >= 132
-* ``sm_100a`` ``bwd_w32_h6144``: (0, 64] -, (64, 1168] >= 132, (1168, 3584] >= 132, (3584, inf) >= 100
-* ``sm_100a`` ``bwd_w32_residual_h6144``: (0, 64] -, (64, 1408] >= 100, (1408, inf) >= 100
+* ``sm_100a`` ``bwd_w32_h4096``: (0, 64] -, (64, 1792] -, (1792, 3584] -, (3584, 36864] -, (36864, 44032] >= 132, (44032, 65536] -, (65536, inf) -
+* ``sm_100a`` ``bwd_w32_h512``: (0, 227] -, (227, 292] -, (292, 960] -, (960, inf) -
+* ``sm_100a`` ``bwd_w32_h5120``: (0, 64] >= 100, (64, 1792] -, (1792, 6144] >= 132, (6144, 56256] -, (56256, inf) >= 132
+* ``sm_100a`` ``bwd_w32_h6144``: (0, 64] -, (64, 1168] >= 132, (1168, 3584] >= 132, (3584, 65536] >= 100, (65536, inf) >= 100
+* ``sm_100a`` ``bwd_w32_residual_h6144``: (0, 64] -, (64, 1408] >= 100, (1408, 65536] >= 100, (65536, inf) >= 100
 * ``sm_103a`` ``bwd_h1536``: (0, 64] -, (64, 1024] >= 132, (1024, 4096] >= 100, (4096, 14928] >= 132, (14928, 15566] >= 100, (15566, 46592] >= 100, (46592, inf) -
-* ``sm_103a`` ``bwd_h2048``: (0, 64] -, (64, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 61952] >= 100, (61952, inf) >= 132
+* ``sm_103a`` ``bwd_h2048``: (0, 64] -, (64, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 58496] >= 100, (58496, 61952] >= 100, (61952, inf) >= 132
 * ``sm_103a`` ``bwd_h256``: (0, 1080] -, (1080, 5120] -, (5120, 12288] -, (12288, 40960] -, (40960, 97280] -, (97280, 720896] -, (720896, 1572864] -, (1572864, inf) -
 * ``sm_103a`` ``bwd_h4096``: (0, 32] -, (32, 256] -, (256, 1024] -, (1024, 4096] >= 132, (4096, 50176] >= 132, (50176, inf) -
 * ``sm_103a`` ``bwd_h512``: (0, 26] -, (26, 1024] -, (1024, 4096] -, (4096, 32768] -, (32768, inf) -
@@ -1745,29 +1934,29 @@ route not listed is unmeasured.
 * ``sm_103a`` ``bwd_h6144``: (0, 32] -, (32, 4096] >= 132, (4096, 49152] >= 132, (49152, inf) >= 100
 * ``sm_103a`` ``bwd_residual_h6144``: (0, 48] -, (48, 56] >= 100, (56, 304] >= 100, (304, 1920] >= 100, (1920, 2816] >= 100, (2816, 4608] >= 100, (4608, 5632] >= 100, (5632, 32768] >= 100, (32768, inf) >= 100
 * ``sm_103a`` ``bwd_w32_h1536``: (0, 64] -, (64, 320] -, (320, 1024] >= 132, (1024, 4096] >= 100, (4096, 14928] >= 132, (14928, 15566] >= 100, (15566, 37888] >= 100, (37888, inf) -
-* ``sm_103a`` ``bwd_w32_h2048``: (0, 64] -, (64, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 61952] >= 100, (61952, inf) >= 132
+* ``sm_103a`` ``bwd_w32_h2048``: (0, 64] -, (64, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 58496] >= 100, (58496, 61952] >= 100, (61952, inf) >= 132
 * ``sm_103a`` ``bwd_w32_h256``: (0, 1080] -, (1080, 5120] -, (5120, 12288] -, (12288, 40960] -, (40960, 97280] -, (97280, 720896] -, (720896, 1572864] -, (1572864, inf) -
 * ``sm_103a`` ``bwd_w32_h4096``: (0, 32] -, (32, 256] -, (256, 1024] -, (1024, 4096] >= 132, (4096, 9216] >= 132, (9216, inf) -
 * ``sm_103a`` ``bwd_w32_h512``: (0, 292] -, (292, 960] -, (960, 32768] -, (32768, inf) -
 * ``sm_103a`` ``bwd_w32_h5120``: (0, 48] >= 100, (48, 5120] >= 132, (5120, 61952] >= 132, (61952, inf) >= 132
 * ``sm_103a`` ``bwd_w32_h6144``: (0, 48] -, (48, 320] >= 132, (320, 448] >= 132, (448, 4096] >= 132, (4096, 49152] >= 132, (49152, inf) >= 100
 * ``sm_103a`` ``bwd_w32_residual_h6144``: (0, 48] -, (48, 320] >= 100, (320, 1824] >= 100, (1824, 3584] >= 100, (3584, 4608] >= 100, (4608, 5632] >= 100, (5632, 15872] >= 100, (15872, inf) >= 100
-* ``sm_107a`` ``bwd_h1536``: (0, 64] -, (64, 1024] -, (1024, 16384] >= 100, (16384, 53248] >= 100, (53248, inf) -
+* ``sm_107a`` ``bwd_h1536``: (0, 64] -, (64, 1024] -, (1024, 16384] >= 100, (16384, 53248] >= 100, (53248, 65536] -, (65536, inf) -
 * ``sm_107a`` ``bwd_h2048``: (0, 64] -, (64, 256] -, (256, 1024] >= 100, (1024, 16384] >= 100, (16384, 50176] >= 100, (50176, inf) -
 * ``sm_107a`` ``bwd_h256``: (0, 1056] -, (1056, 3584] -, (3584, 36864] -, (36864, inf) -
-* ``sm_107a`` ``bwd_h4096``: (0, 64] -, (64, 256] >= 100, (256, 1024] >= 100, (1024, 4096] >= 100, (4096, 36864] >= 100, (36864, inf) >= 132
-* ``sm_107a`` ``bwd_h512``: (0, 77] -, (77, 1024] -, (1024, 4096] >= 100, (4096, 16384] >= 100, (16384, inf) >= 100
+* ``sm_107a`` ``bwd_h4096``: (0, 64] -, (64, 256] >= 100, (256, 1024] >= 100, (1024, 4096] >= 100, (4096, 36864] >= 100, (36864, 65536] >= 132, (65536, inf) >= 132
+* ``sm_107a`` ``bwd_h512``: (0, 77] -, (77, 1024] -, (1024, 4096] >= 100, (4096, 16384] >= 100, (16384, 49152] >= 100, (49152, inf) -
 * ``sm_107a`` ``bwd_h5120``: (0, 64] >= 100, (64, 4096] >= 100, (4096, 19968] >= 100, (19968, 49152] >= 100, (49152, inf) >= 132
-* ``sm_107a`` ``bwd_h6144``: (0, 64] -, (64, 30720] >= 100, (30720, inf) >= 100
+* ``sm_107a`` ``bwd_h6144``: (0, 64] -, (64, 19456] >= 100, (19456, 30720] >= 100, (30720, inf) >= 100
 * ``sm_107a`` ``bwd_residual_h6144``: (0, 64] -, (64, 448] >= 100, (448, 3584] >= 100, (3584, 7168] >= 100, (7168, inf) >= 100
-* ``sm_107a`` ``bwd_w32_h1536``: (0, 64] -, (64, 1024] -, (1024, 16384] >= 100, (16384, 53248] >= 100, (53248, inf) -
-* ``sm_107a`` ``bwd_w32_h2048``: (0, 64] -, (64, 127] -, (127, 256] -, (256, 1024] >= 100, (1024, 16384] >= 100, (16384, 50176] >= 100, (50176, inf) -
-* ``sm_107a`` ``bwd_w32_h256``: (0, 1296] -, (1296, 1536] -, (1536, 36864] -, (36864, inf) -
-* ``sm_107a`` ``bwd_w32_h4096``: (0, 64] -, (64, 256] >= 132, (256, 1024] >= 100, (1024, 4096] >= 100, (4096, 24064] >= 100, (24064, inf) >= 132
-* ``sm_107a`` ``bwd_w32_h512``: (0, 229] -, (229, 1024] -, (1024, 4096] -, (4096, 16384] >= 100, (16384, inf) >= 100
-* ``sm_107a`` ``bwd_w32_h5120``: (0, 64] >= 100, (64, 4096] >= 100, (4096, 19968] >= 100, (19968, 49152] >= 100, (49152, inf) >= 132
-* ``sm_107a`` ``bwd_w32_h6144``: (0, 64] -, (64, 28672] >= 100, (28672, inf) >= 100
-* ``sm_107a`` ``bwd_w32_residual_h6144``: (0, 64] -, (64, 448] >= 100, (448, 3584] >= 100, (3584, 7168] >= 100, (7168, inf) >= 100
+* ``sm_107a`` ``bwd_w32_h1536``: (0, 64] -, (64, 256] -, (256, 1024] -, (1024, 16384] -, (16384, 53248] >= 100, (53248, 65536] -, (65536, inf) -
+* ``sm_107a`` ``bwd_w32_h2048``: (0, 64] -, (64, 127] -, (127, 256] -, (256, 1024] >= 100, (1024, 16384] -, (16384, 50176] >= 100, (50176, inf) -
+* ``sm_107a`` ``bwd_w32_h256``: (0, 36864] -, (36864, inf) -
+* ``sm_107a`` ``bwd_w32_h4096``: (0, 64] -, (64, 256] -, (256, 1024] >= 100, (1024, 4096] >= 100, (4096, 24064] >= 100, (24064, 65536] >= 132, (65536, inf) >= 132
+* ``sm_107a`` ``bwd_w32_h512``: (0, 229] -, (229, 1024] -, (1024, 4096] -, (4096, 16384] >= 100, (16384, 49152] >= 100, (49152, inf) -
+* ``sm_107a`` ``bwd_w32_h5120``: (0, 64] >= 100, (64, 4096] >= 100, (4096, 19968] >= 132, (19968, 49152] >= 100, (49152, inf) >= 132
+* ``sm_107a`` ``bwd_w32_h6144``: (0, 64] -, (64, 2304] >= 132, (2304, 19456] >= 100, (19456, 28672] >= 100, (28672, inf) >= 100
+* ``sm_107a`` ``bwd_w32_residual_h6144``: (0, 64] -, (64, 96] >= 100, (96, 448] >= 100, (448, 3584] >= 100, (3584, 7168] >= 100, (7168, inf) >= 100
 
 Programs that need a whole SM wait beside any kernel resident on every SM, whatever
 its carveout: the deterministic package's whole-SM programs where this package runs
@@ -1777,54 +1966,55 @@ Beside those, leave some SMs free of the resident kernel.
 * ``sm_103a`` ``bwd_residual_h6144``: (56, 304], (1920, 2816], (4608, 5632]
 * ``sm_103a`` ``bwd_w32_residual_h6144``: (48, 320], (1824, 3584], (4608, 5632]
 * ``sm_107a`` ``bwd_h1536``: (1024, 53248]
-* ``sm_107a`` ``bwd_w32_h1536``: (1024, 53248]
+* ``sm_107a`` ``bwd_w32_h1536``: (16384, 53248]
 * ``sm_107a`` ``bwd_h2048``: (256, 50176]
-* ``sm_107a`` ``bwd_w32_h2048``: (256, 50176]
+* ``sm_107a`` ``bwd_w32_h2048``: (256, 1024], (16384, 50176]
 * ``sm_107a`` ``bwd_h4096``: (1024, 36864]
 * ``sm_107a`` ``bwd_w32_h4096``: (1024, 24064]
 * ``sm_107a`` ``bwd_residual_h6144``: (64, 448], (3584, 7168]
-* ``sm_107a`` ``bwd_w32_residual_h6144``: (64, 448], (3584, 7168]
+* ``sm_107a`` ``bwd_w32_residual_h6144``: (96, 448], (3584, 7168]
 
 * ``sm_100a`` ``bwd_h256``: (0, 20480] 195c4317 = (20480, 92160] 172a47a1 =
   (92160, 524288] 083ea823 (det pair) = (524288, inf) 172a47a1
-* ``sm_100a`` ``bwd_h512``: (0, 26] d0bde38a = (26, 1024] 09601d42 (det pair) =
+* ``sm_100a`` ``bwd_h512``: (0, 227] 5f3e3fcc = (227, 1024] 09601d42 (det pair) =
   (1024, 1280] 123db0b2 (det pair) = (1280, inf) d0bde38a
-* ``sm_100a`` ``bwd_w32_h512``: (0, 292] aa7c5a54 = (292, 960] 9f07cea1 (det pair) =
-  (960, inf) fd08c6f4
-* ``sm_100a`` ``bwd_h1536``: (0, 64] 38e972a9 = (64, 1024] 7dc29629 (det pair) =
-  (1024, 4096] c1a9efdf (det pair) = (4096, 32768] 21c8bb55 (det pair) =
-  (32768, 36864] b457c4d1 (det pair) = (36864, inf) ae610afd
-* ``sm_100a`` ``bwd_w32_h1536``: (0, 64] d5a621af = (64, 1024] baff9ecb (det pair) =
-  (1024, 4096] 17d9cdfd (det pair) = (4096, 32768] 4bf450b6 (det pair) =
-  (32768, inf) 4b6981c1
+* ``sm_100a`` ``bwd_w32_h512``: (0, 227] 942503b8 = (227, 292] aa7c5a54 =
+  (292, 960] 9f07cea1 (det pair) = (960, inf) fd08c6f4
+* ``sm_100a`` ``bwd_h1536``: (0, 64] 38e972a9 = (64, 384] dc478ac1 =
+  (384, 1024] 7dc29629 (det pair) = (1024, 4096] c1a9efdf (det pair) =
+  (4096, 32768] 21c8bb55 (det pair) = (32768, 36864] b457c4d1 (det pair) =
+  (36864, 78784] ae610afd = (78784, inf) b42efd6b
+* ``sm_100a`` ``bwd_w32_h1536``: (0, 64] d5a621af = (64, 384] 3ddc5ca5 =
+  (384, 1024] baff9ecb (det pair) = (1024, 4096] 4b6981c1 =
+  (4096, 32768] 4bf450b6 (det pair) = (32768, 75776] 4b6981c1 = (75776, inf) e2b99fee
 * ``sm_100a`` ``bwd_h2048``: (0, 64] ef052c09 = (64, 336] 64e6aa82 =
   (336, 3072] caf6978e (det pair) = (3072, 4096] 9ac8d21e (det pair) =
   (4096, 7168] c73074cf (det pair) = (7168, 11264] 0fa4f255 =
-  (11264, 13608] c73074cf (det pair) = (13608, 45056] 0fa4f255 =
-  (45056, 58880] ceeef043 (det pair) = (58880, inf) 0fa4f255
+  (11264, 13608] c73074cf (det pair) = (13608, 45056] 0fa4f255 = (45056, 58880] 0fa4f255
+  = (58880, 65536] 0fa4f255 = (65536, inf) 83f905ff
 * ``sm_100a`` ``bwd_w32_h2048``: (0, 64] 382e4578 = (64, 336] 17493054 =
-  (336, 3072] 07f9f2fb (det pair) = (3072, 4096] d96a14fe (det pair) =
-  (4096, 15403] b187e598 (det pair) = (15403, 45056] ba7dbf6a =
-  (45056, 58880] 7e6a0b63 (det pair) = (58880, inf) ba7dbf6a
+  (336, 1024] 17493054 = (1024, 4096] ba7dbf6a = (4096, 15403] b187e598 (det pair) =
+  (15403, 45056] ba7dbf6a = (45056, 58880] ba7dbf6a = (58880, 65536] ba7dbf6a =
+  (65536, inf) 9f775c72
 * ``sm_100a`` ``bwd_h4096``: (0, 64] 231e01ec = (64, 1152] 4822793e =
   (1152, 4096] 9a830956 (det pair) = (4096, 4608] 35a0b0ca (det pair) =
-  (4608, 36864] 15e157d2 = (36864, 44032] 35a0b0ca (det pair) = (44032, inf) 15e157d2
+  (4608, 36864] 15e157d2 = (36864, 44032] 35a0b0ca (det pair) = (44032, 65536] 15e157d2
+  = (65536, inf) c67fc8b9
 * ``sm_100a`` ``bwd_w32_h4096``: (0, 64] ce1f7d21 = (64, 1792] 86160705 =
-  (1792, 3584] 0c84999c (det pair) = (3584, 36864] f7573bcb =
-  (36864, 44032] 626aed74 (det pair) = (44032, inf) f7573bcb
+  (1792, 3584] f7573bcb = (3584, 36864] f7573bcb = (36864, 44032] 626aed74 (det pair) =
+  (44032, 65536] f7573bcb = (65536, inf) 9ebd0232
 * ``sm_100a`` ``bwd_h5120``: (0, 64] cc082d1f = (64, 896] 080e0a6c =
-  (896, 6144] b482c84d (det pair) = (6144, 65536] c145ef19 (det pair) =
-  (65536, inf) 2f05000c
-* ``sm_100a`` ``bwd_w32_h5120``: (0, 64] 244b7d84 = (64, 256] 6042554b (det pair) =
-  (256, 6144] 40227b2a (det pair) = (6144, 65536] 9479b129 (det pair) =
-  (65536, inf) de8f6091
+  (896, 6144] b482c84d (det pair) = (6144, 56256] c145ef19 (det pair) =
+  (56256, inf) ade9f6a4
+* ``sm_100a`` ``bwd_w32_h5120``: (0, 64] 244b7d84 = (64, 1792] 68f6e584 =
+  (1792, 6144] de8f6091 = (6144, 56256] 9479b129 (det pair) = (56256, inf) fc2a52a2
 * ``sm_100a`` ``bwd_h6144``: (0, 64] d70f2562 = (64, 1152] 44508df7 =
   (1152, 4096] 5c804aed (det pair) = (4096, 5632] b93bf060 (det pair) =
-  (5632, inf) 9433061d
+  (5632, 65536] 9433061d = (65536, inf) 10a41132
 * ``sm_100a`` ``bwd_residual_h6144``: (0, 64] 7b0f5a6a = (64, 1408] 864e84f3 =
-  (1408, inf) 3fbfdd75
+  (1408, 65536] 3fbfdd75 = (65536, inf) 1609f796
 * ``sm_100a`` ``bwd_w32_h6144``: (0, 64] 9b379236 = (64, 1168] b3e6531e =
-  (1168, 3584] 41b80b6a (det pair) = (3584, inf) a562656c
+  (1168, 3584] 41b80b6a (det pair) = (3584, 65536] a562656c = (65536, inf) 45cf60e3
 * ``sm_103a`` ``bwd_h256``: (0, 1080] 195c4317 = (1080, 5120] af005462 (det pair) =
   (5120, 12288] a385ae16 (det pair) = (12288, 40960] af005462 (det pair) =
   (40960, 97280] a385ae16 (det pair) = (97280, 720896] 083ea823 (det pair) =
@@ -1844,8 +2034,8 @@ Beside those, leave some SMs free of the resident kernel.
   (15566, 37888] 109f19bb (det pair) = (37888, inf) 963a7ca8
 * ``sm_103a`` ``bwd_h2048``: (0, 64] ef052c09 = (64, 3072] caf6978e (det pair) =
   (3072, 4096] 9ac8d21e (det pair) = (4096, 16384] caf6978e (det pair) =
-  (16384, 32768] caf6978e (det pair) = (32768, 61952] 302f64db (det pair) =
-  (61952, inf) 8bd89a4c
+  (16384, 32768] caf6978e (det pair) = (32768, 58496] 302f64db (det pair) =
+  (58496, 61952] 018f0cd7 (det pair) = (61952, inf) 8bd89a4c
 * ``sm_103a`` ``bwd_h4096``: (0, 32] 3dbab232 = (32, 256] 50044ee3 (det pair) =
   (256, 1024] ad2bb26e (det pair) = (1024, 4096] 24643edc (det pair) =
   (4096, 50176] 35a0b0ca (det pair) = (50176, inf) 8250eb92
@@ -1871,39 +2061,45 @@ Beside those, leave some SMs free of the resident kernel.
   (4608, 5632] 56f988dd (det pair) = (5632, 15872] 3c390339 = (15872, inf) 56c46a20
 * ``sm_107a`` ``bwd_h256``: (0, 1056] 195c4317 = (1056, 3584] 5450d398 (det pair) =
   (3584, 36864] 195c4317 = (36864, inf) 172a47a1
-* ``sm_107a`` ``bwd_w32_h256``: (0, 1296] 8de01314 = (1296, 1536] 5e0c6208 (det pair) =
-  (1536, 36864] 8de01314 = (36864, inf) 7c2aa4b4
-* ``sm_107a`` ``bwd_h512``: (0, 77] d0bde38a = (77, 1024] 3feed502 (det pair) =
+* ``sm_107a`` ``bwd_w32_h256``: (0, 36864] 8de01314 = (36864, inf) 7c2aa4b4
+* ``sm_107a`` ``bwd_h512``: (0, 77] 5f3e3fcc = (77, 1024] 3feed502 (det pair) =
   (1024, 4096] 3feed502 (det pair) = (4096, 16384] dfaf378a (det pair) =
-  (16384, inf) eb141cc9 (det pair)
-* ``sm_107a`` ``bwd_w32_h512``: (0, 229] fd08c6f4 = (229, 1024] b841d64b (det pair) =
+  (16384, 49152] eb141cc9 (det pair) = (49152, inf) 30501cce
+* ``sm_107a`` ``bwd_w32_h512``: (0, 229] 942503b8 = (229, 1024] b841d64b (det pair) =
   (1024, 4096] fd08c6f4 = (4096, 16384] 383f709c (det pair) =
-  (16384, inf) 03efa681 (det pair)
+  (16384, 49152] 03efa681 (det pair) = (49152, inf) 26fbe8e6
 * ``sm_107a`` ``bwd_h1536``: (0, 64] 38e972a9 = (64, 1024] 7dc29629 (det pair) =
   (1024, 16384] 6a428da2 (det pair) = (16384, 53248] 56d26996 (det pair) =
-  (53248, inf) 3f75f4a8
+  (53248, 65536] 3f75f4a8 = (65536, inf) dca25ace
+* ``sm_107a`` ``bwd_w32_h1536``: (0, 64] d5a621af = (64, 256] 3ddc5ca5 =
+  (256, 1024] baff9ecb (det pair) = (1024, 16384] 7c0dd63f =
+  (16384, 53248] de8e07d4 (det pair) = (53248, 65536] 7c0dd63f = (65536, inf) ccd94d87
 * ``sm_107a`` ``bwd_h2048``: (0, 64] ef052c09 = (64, 256] 84efa2af (det pair) =
   (256, 1024] 845cdcd8 (det pair) = (1024, 16384] 81c3d8ab (det pair) =
   (16384, 50176] 845cdcd8 (det pair) = (50176, inf) 1a3df5ac
-* ``sm_107a`` ``bwd_w32_h2048``: (0, 64] 382e4578 = (64, 127] 810989bd =
+* ``sm_107a`` ``bwd_w32_h2048``: (0, 64] 382e4578 = (64, 127] 7a3e5eb7 =
   (127, 256] 6b13aa49 (det pair) = (256, 1024] 838a9a40 (det pair) =
-  (1024, 16384] 9e5ec75a (det pair) = (16384, 50176] 838a9a40 (det pair) =
-  (50176, inf) 810989bd
+  (1024, 16384] 810989bd = (16384, 50176] 838a9a40 (det pair) = (50176, inf) 810989bd
 * ``sm_107a`` ``bwd_h4096``: (0, 64] 231e01ec = (64, 256] 0da5dd4b (det pair) =
   (256, 1024] a647fccc (det pair) = (1024, 4096] d41a514f (det pair) =
-  (4096, 36864] ee4a9053 (det pair) = (36864, inf) f11a8616
-* ``sm_107a`` ``bwd_w32_h4096``: (0, 64] ce1f7d21 = (64, 256] a1f537fc =
+  (4096, 36864] ee4a9053 (det pair) = (36864, 65536] f11a8616 = (65536, inf) 5e9d7baa
+* ``sm_107a`` ``bwd_w32_h4096``: (0, 64] ce1f7d21 = (64, 256] 0af20ef9 =
   (256, 1024] dc439f83 (det pair) = (1024, 4096] b0863320 (det pair) =
-  (4096, 24064] 0f1859b9 (det pair) = (24064, inf) a1f537fc
+  (4096, 24064] 0f1859b9 (det pair) = (24064, 65536] a1f537fc = (65536, inf) 23cee954
 * ``sm_107a`` ``bwd_h5120``: (0, 64] cc082d1f = (64, 4096] 838c077d (det pair) =
   (4096, 19968] 6816fb80 (det pair) = (19968, 49152] b8b0913b (det pair) =
   (49152, inf) 56634f53
-* ``sm_107a`` ``bwd_h6144``: (0, 64] d70f2562 = (64, 30720] 5d292172 (det pair) =
-  (30720, inf) ddedaa3b
+* ``sm_107a`` ``bwd_w32_h5120``: (0, 64] 244b7d84 = (64, 4096] cd612de5 (det pair) =
+  (4096, 19968] dd795e84 = (19968, 49152] 7b9e10b2 (det pair) = (49152, inf) 6cedccdf
+* ``sm_107a`` ``bwd_h6144``: (0, 64] d70f2562 = (64, 19456] 5d292172 (det pair) =
+  (19456, 30720] 19e18371 (det pair) = (30720, inf) 083b5f2e
 * ``sm_107a`` ``bwd_residual_h6144``: (0, 64] 7b0f5a6a = (64, 448] 0dcdc563 (det pair) =
-  (448, 3584] 864e84f3 = (3584, 7168] 0dcdc563 (det pair) = (7168, inf) 87d2866c
-* ``sm_107a`` ``bwd_w32_h6144``: (0, 64] 9b379236 = (64, 28672] 7d2f6707 (det pair) =
-  (28672, inf) e77387f1
+  (448, 3584] 864e84f3 = (3584, 7168] 0dcdc563 (det pair) = (7168, inf) c07ab5f1
+* ``sm_107a`` ``bwd_w32_h6144``: (0, 64] 9b379236 = (64, 2304] 44c5b870 =
+  (2304, 19456] e77387f1 = (19456, 28672] b83f8b3d (det pair) = (28672, inf) 25f9b466
+* ``sm_107a`` ``bwd_w32_residual_h6144``: (0, 64] ac9d69f9 = (64, 96] c8bc10e7 =
+  (96, 448] 56f988dd (det pair) = (448, 3584] 71d36617 =
+  (3584, 7168] 56f988dd (det pair) = (7168, inf) e655055e
 """
 
 SECTIONS: dict[str, str] = {"fwd": FORWARD_SECTION, "bwd": BACKWARD_SECTION}

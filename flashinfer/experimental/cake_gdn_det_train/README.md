@@ -73,7 +73,10 @@ runs `wy_tc2`: the chains and outputs of `wy_tc` (the same bits) with a
 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
 on an SM where `wy_tc` fits four.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
-state.  The backward runs the adjoint scan, either `dv_local` plus a register
+state.  On `sm_107a`, a forward scan of one launch whose `segments x HV` CTAs
+take at most half the SMs runs `fwd_ho_vh2`: two CTAs per segment and value
+head, each the scan and output of one half of the value columns (the same
+bits).  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),
 which a host-side cost rule selects on the host-table route.  On that route a
 split `(64, 1)` plan runs the second pass of its adjoint scan on `dhu_tc2`,

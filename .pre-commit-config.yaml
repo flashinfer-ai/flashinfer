@@ -14,7 +14,8 @@
 # Note the pre-commit hooks shoule only be used for formatting, but not for linting.
 # For linting consider using CI.
 # These manifest-authenticated generated sources must remain byte-exact.
-files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/cake_fmha/))
+# Keep imported selective TopK CuTe DSL kernels byte-faithful to their source.
+files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/cake_fmha/|flashinfer/experimental/attn_scores/kernels/selective_topk/))
 
 # The kernel_src */src trees (and the manifest-sealed cake_sm90_bf16_megamoe_* GEMM
 # sources of moe_ep/kernel_src/sm90/cake_bf16_megamoe) and blackwell_msa CUDA snapshots are generated or
@@ -83,7 +84,7 @@ repos:
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break their static source-registry identities.
         exclude: |
-          (?x)^(3rdparty/.*|csrc/cake_device_helpers/.*|csrc/cake_bf16_bmm/.*|csrc/cake_batch_deepgemm_fp8/.*|csrc/fused_moe/warp_decode/.*|flashinfer/jit/aot_config.py|csrc/cake_concat_mla_k/.*|csrc/cake_fmha_aligned/.*|csrc/cake_fmha_aligned_hd64/.*|csrc/cake_fmha_aligned_hd256/.*|csrc/cake_fmha_aligned_mtp_q32/.*|csrc/cake_vsa/.*|csrc/cake_vsa_balanced/.*|csrc/cake_vsa_sm90/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/gdn/cake/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*|csrc/alphamoe_nvfp4_(?:sm100|c[0-9]+_[a-z_]+)\.cu)$
+          (?x)^(3rdparty/.*|csrc/cake_device_helpers/.*|csrc/cake_bf16_bmm/.*|csrc/cake_batch_deepgemm_fp8/.*|csrc/fused_moe/warp_decode/.*|flashinfer/jit/aot_config.py|csrc/cake_concat_mla_k/.*|csrc/cake_fmha_aligned/.*|csrc/cake_fmha_aligned_hd64/.*|csrc/cake_fmha_aligned_hd256/.*|csrc/cake_fmha_aligned_mtp_q32/.*|csrc/cake_vsa/.*|csrc/cake_vsa_balanced/.*|csrc/cake_vsa_sm120/.*|csrc/cake_vsa_sm90/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/gdn/cake/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*|csrc/alphamoe_nvfp4_(?:sm100|c[0-9]+_[a-z_]+)\.cu)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at

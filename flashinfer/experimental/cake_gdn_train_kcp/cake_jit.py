@@ -85,6 +85,12 @@ In-kernel Q / K L2 norm (option ``use_qk_l2norm_in_kernel``; three programs, rec
 leaves ``records_of_program`` empty and ``select_record`` refuses them (:func:`l2n_records_shipped` says which).
 :data:`L2N_RECORD_PLANS` is their host plan, which the records repeat.
 
+The light backward's solve-free replay of #1 (``save_mode="light_akk"``, which keeps the BF16 ``Akk`` tape):
+
+  #1 * ``fwd_prep_replay_l2n`` ``fwd_prep_l2n`` reading the forward's saved ``akk`` instead of forming it (no
+                             ``K K^T`` Gram, no block inverse): every other output bit for bit ``fwd_prep_l2n``'s,
+                             ``akk`` read, not written; grid (NC, H_qk), two resident CTAs per SM as #1
+
 Provenance of the rules: ``flashinfer/experimental/cake_kda_train/cake_kcp_jit.py`` (records_of_program,
 select_record, launch_grid; sha256 c405e7dcd36c9cbe0ff01e3e3194fd760491504655bda28a646c2067a23b4c90) at
 FlashInfer 13d7fcf4041635f5b7f573bb0dbab23570ae1034, adapted to the GDN vocabulary; the loader glue moved to
@@ -143,6 +149,7 @@ PROGRAMS = (
     "fwd_prep_l2n",
     "bwd_dqkg_l2n",
     "qk_apply",
+    "fwd_prep_replay_l2n",
 )
 # The programs of the in-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel``).
 L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
@@ -164,6 +171,7 @@ LOCAL_PROGRAMS = (
     "fwd_prep_l2n",
     "bwd_dqkg_l2n",
     "qk_apply",
+    "fwd_prep_replay_l2n",
 )
 
 # Logical argument names :func:`.cake_backend.run_module` binds; every record maps its kernel parameter names onto this
@@ -701,6 +709,76 @@ MODULES: dict[str, dict[str, Any]] = {
             "w_out": "w",
         },
         "program": "fwd_prep_l2n",
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
+    "fwd_prep_replay_l2n": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "g"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "aqk_out"],
+            ["buffer", "akk"],
+            ["buffer", "g_cum"],
+            ["buffer", "rowscale"],
+            ["buffer", "qscale"],
+            ["buffer", "gamma"],
+            ["buffer", "qn_out"],
+            ["buffer", "kn_out"],
+            ["buffer", "q_rstd"],
+            ["buffer", "k_rstd"],
+            ["parameter", "rstd_tstride"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks_by_qk_heads"},
+        "kernel_symbol": "kernel_cake_gdn_train_195b67aef14b675e26d5",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 113664,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_195b67aef14b675e26d5",
+        "logical": {
+            "akk": "akk",
+            "aqk_out": "aqk",
+            "beta": "beta",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "g": "g",
+            "g_cum": "g_cum",
+            "gamma": "gamma",
+            "k_rstd": "k_rstd",
+            "k_tma": "k",
+            "kn_out": "kn",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_qk_heads",
+            "q_rstd": "q_rstd",
+            "q_tma": "q",
+            "qn_out": "qn",
+            "qscale": "qscale",
+            "rowscale": "rowscale",
+            "rstd_tstride": "rstd_tstride",
+            "scale": "scale",
+            "u_out": "u",
+            "v_tma": "v",
+            "w_out": "w",
+        },
+        "program": "fwd_prep_replay_l2n",
         "select_rule": {"kind": "always"},
         "variant": None,
     },

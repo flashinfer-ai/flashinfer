@@ -39,9 +39,9 @@ prepared.launch()   # allocation-free; prepared.template / .grid / .module_name 
 
 # K2: FP32 router GEMM through split-BF16x3 emulation
 gemm.router_fp32_det_gemm(A, B, out, splits=None)                  # convenience path (cached plan)
-gemm.router_det_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
+gemm.router_det_forward(X, W, out=None, splits=None)       # out[T, N] = X[T, K] @ W[N, K].T
 gemm.router_det_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
-gemm.router_det_wgrad(G, X, out=None, splits=6)            # out[N, K] = G[T, N].T @ X[T, K]
+gemm.router_det_wgrad(G, X, out=None, splits=None)         # out[N, K] = G[T, N].T @ X[T, K]
 prepared = gemm.prepare_router_fp32_det_gemm(A, B, out, splits=None)
 prepared.launch()   # re-splits B, launches, reduces the split-K partials; .splits
 ```
@@ -223,17 +223,27 @@ split take `enable_pdl` too and wait before their first global access.
   `out [M, N]` with unit inner stride and 16-byte rows; `N` a multiple of 8.
   A single-split `kk` / `kn` launch stores 16-byte vectors straight into `out`,
   so `out` must then start at a 16-byte aligned address.
-* The operand layouts select the instance and the production split-K count:
+* The operand layouts select the instance and the default split-K count:
   `kk` (forward, 4 splits), `kn` (input gradient, 1), both MN-major -> the
   swapped transposed-store weight gradient `nn_t` (6 splits; `out.T = B.T
   A.T`).  An MN-major `A` with a K-major `B` has no instance.
+  `ROUTER_SPLIT_RULES` replaces the default count (`router_splits`, used when
+  `splits` is `None`) for N = 256 rows measured faster with another count on a
+  device: by architecture, SM count, layout, hidden size H and token-count
+  window T 16129-16384:
+  `sm_100a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
+  `sm_100a` at 148 / 152 SMs, weight gradient H 6144: 3 splits;
+  `sm_103a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
+  `sm_103a` at 148 / 152 SMs, weight gradient H 6144: 3 splits.
 * Every `launch()` re-splits the second operand into the retained
   `[3, outer, inner]` BF16 stack in the operand's own layout (exact three-way
   split, no allocation: one launch of the fused split program
   `split_fp32_det_bf16x3` when this checkout registers it for the device, else a
   five-op torch chain through an fp32 scratch -- the same bits either way),
   launches, and sums the split-K partials on the host in a fixed order.  Splits, chunk boundaries and the reduction order are
-  fixed: bit-exact run to run.  Error against an FP64 reference: FP32-class
+  fixed: bit-exact run to run.  The bits are a function of the split count:
+  another count (a caller's `splits`, or a `ROUTER_SPLIT_RULES` count that a
+  later version adds or changes) gives other bits within the same accuracy.  Error against an FP64 reference: FP32-class
   (`rel_fro` about 2e-7 to 4e-7 on the GLM-5.2 router shapes).
 
 ## Layout of this package

@@ -996,9 +996,11 @@ def autotune(
     **Unsupported sizes** -- Sizes that a kernel cannot handle are filtered
     out during profiling (``get_valid_tactics``).  If a tactic still fails at
     runtime the error is caught, a warning is logged, and that tactic is
-    skipped.  At inference time, ``map_to_tuning_buckets`` maps the runtime
-    size to the nearest profiled bucket, so an unsupported raw size never
-    reaches the kernel directly.
+    skipped, unless the failure leaves the CUDA context unusable (an illegal
+    memory access, a device-side assert): then tuning raises an error naming
+    the op, runner, tactic and input shapes.  At inference time,
+    ``map_to_tuning_buckets`` maps the runtime size to the nearest profiled
+    bucket, so an unsupported raw size never reaches the kernel directly.
 
     **Round-up beyond the largest bucket** -- When ``round_up=True`` and the
     runtime size exceeds every bucket, the value is clamped to the largest
@@ -1255,6 +1257,10 @@ class _TuningGroupError(RuntimeError):
     """A group-wide failure; do not retry it as a rank-local tactic error."""
 
 
+class _StickyCudaError(RuntimeError):
+    """The CUDA context is unusable after a failed tactic; stop tuning."""
+
+
 def _tuning_group_agreement(phase, selection, status=0, error=None):
     """Exchange a fixed-size phase/selection fingerprint and failure status.
 
@@ -1350,6 +1356,31 @@ def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
         "cache", selection if local_hit else None, int(not local_hit)
     )
     return not status and agreed
+
+
+def _sticky_cuda_error() -> Exception | None:
+    """Return the error that left the CUDA context unusable, if any.
+
+    The first synchronize may fail just to report the failed tactic itself. A
+    sticky error (an illegal memory access, a device-side assert, ...) cannot
+    be cleared and fails every later CUDA call, so it fails the second too.
+
+    The capture check comes before both: a device synchronize during capture
+    does not merely fail, it invalidates the capture, and suppressing its
+    exception would hide that. ``rank_tactics`` reaches here with no capture
+    pre-check of its own, unlike ``choose_one``.
+    """
+    if not torch.cuda.is_initialized():
+        return None
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        with contextlib.suppress(Exception):
+            torch.cuda.synchronize()
+        torch.cuda.synchronize()
+    except Exception as error:
+        return error
+    return None
 
 
 @dataclass(frozen=True)
@@ -2998,7 +3029,7 @@ class AutoTuner:
             profiles = []
             try:
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
-            except _TuningGroupError:
+            except (_TuningGroupError, _StickyCudaError):
                 raise
             except Exception as exc:
                 if _tune_process_group is None:
@@ -3100,7 +3131,7 @@ class AutoTuner:
                             input_preparation_oom = True
                             tensors = None
                             prepared_input_batches = None
-                        except _TuningGroupError:
+                        except (_TuningGroupError, _StickyCudaError):
                             raise
                         except Exception as exc:
                             if _tune_process_group is None:
@@ -3164,7 +3195,7 @@ class AutoTuner:
                                 runner_preparation_oom = True
                                 tensors = None
                                 prepared_input_batches = None
-                            except _TuningGroupError:
+                            except (_TuningGroupError, _StickyCudaError):
                                 raise
                             except Exception as exc:
                                 if _tune_process_group is None:
@@ -3207,7 +3238,7 @@ class AutoTuner:
                                 runner_preparation_oom = True
                                 tensors = None
                                 prepared_input_batches = None
-                            except _TuningGroupError:
+                            except (_TuningGroupError, _StickyCudaError):
                                 raise
                             except Exception as exc:
                                 if _tune_process_group is None:
@@ -3268,18 +3299,6 @@ class AutoTuner:
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
 
-                                    # Clear any pending async CUDA errors (e.g.
-                                    # cudaErrorIllegalInstruction from a failed
-                                    # kernel warmup run) so they don't surface
-                                    # later during CUDA graph capture.
-                                    # torch.cuda.synchronize() surfaces the error
-                                    # but does NOT clear the sticky CUDA error flag;
-                                    # only cudaGetLastError() resets it.
-                                    with contextlib.suppress(Exception):
-                                        torch.cuda.synchronize()
-                                    with contextlib.suppress(Exception):
-                                        torch.cuda.cudart().cudaGetLastError()
-
                                     # Record the failed tactic value for the
                                     # blocklist generator.
                                     self.stats.failed_tactics.setdefault(
@@ -3302,6 +3321,9 @@ class AutoTuner:
                                             tuning_config,
                                             r.get_cache_key_extras(tensors),
                                         )
+                                    )
+                                    self._stop_on_lost_cuda_context(
+                                        e, custom_op, r, tac, tensors
                                     )
 
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
@@ -3546,7 +3568,7 @@ class AutoTuner:
                         f"while ranking '{custom_op}'"
                     ) from e
 
-            except _TuningGroupError:
+            except (_TuningGroupError, _StickyCudaError):
                 raise
             except Exception as exc:
                 if _tune_process_group is None:
@@ -3592,7 +3614,7 @@ class AutoTuner:
                     raise
                 input_preparation_oom = True
                 tensors = None
-            except _TuningGroupError:
+            except (_TuningGroupError, _StickyCudaError):
                 raise
             except Exception as exc:
                 if _tune_process_group is None:
@@ -3631,7 +3653,7 @@ class AutoTuner:
                     raise
                 runner_preparation_oom = True
                 tensors = None
-            except _TuningGroupError:
+            except (_TuningGroupError, _StickyCudaError):
                 raise
             except Exception as exc:
                 if _tune_process_group is None:
@@ -3656,7 +3678,7 @@ class AutoTuner:
                     raise
                 runner_preparation_oom = True
                 tensors = None
-            except _TuningGroupError:
+            except (_TuningGroupError, _StickyCudaError):
                 raise
             except Exception as exc:
                 if _tune_process_group is None:
@@ -3686,10 +3708,7 @@ class AutoTuner:
                         f"[Autotuner]: Skipping tactic {runner} {tac} while "
                         f"ranking {custom_op}: {e}"
                     )
-                    with contextlib.suppress(Exception):
-                        torch.cuda.synchronize()
-                    with contextlib.suppress(Exception):
-                        torch.cuda.cudart().cudaGetLastError()
+                    self._stop_on_lost_cuda_context(e, custom_op, runner, tac, tensors)
                     time_measured = float("inf")
                 scored.append((time_measured, tac))
 
@@ -3721,6 +3740,33 @@ class AutoTuner:
             ranked_cache[cache_key] = (policy, tuple(ranked))
 
             return ranked[:k]
+
+    def _stop_on_lost_cuda_context(
+        self,
+        error: Exception,
+        custom_op: str,
+        runner: TunableRunner,
+        tactic: Any,
+        inputs: list[Any],
+    ) -> None:
+        """Stop tuning once the CUDA context is unusable after a failed tactic.
+
+        Every later CUDA call in the process fails then, so skipping the tactic
+        only moves the failure to an unrelated runner. A tuning-group member
+        stops too: it cannot rejoin the per-tactic reduces on a dead context.
+        The faulting kernel may have run before the tactic, e.g. as the
+        runner's preparation, so the message names where it was detected.
+        """
+        lost = _sticky_cuda_error()
+        if lost is None:
+            return
+        detail = str(lost).partition("\n")[0]
+        raise _StickyCudaError(
+            f"[Autotuner]: the CUDA context is unusable ({detail}), detected when "
+            f"{type(runner).__name__} tactic {tactic!r} failed while tuning "
+            f"{custom_op} with input shapes {self._get_input_sizes(inputs)}; every "
+            "later CUDA call in this process fails."
+        ) from error
 
     def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""

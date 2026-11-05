@@ -1732,9 +1732,9 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
     assert "scan:l6:u1:s1:f0" not in keys
     rule, base = plans(262144, 262144, 1, 0)
     assert rule == base and base.scan_key == "scan:pair_wide:u1:s1:f0"
-    # a split call keeps its split (4 queries over 22018 keys: five narrow splits)
+    # a split call keeps its split (4 queries over 22018 keys: 12 narrow splits, split_fit_rule)
     rule, base = plans(4, 22018, 1, 0)
-    assert rule == base and (base.kind, base.n_split) == ("split", 5)
+    assert rule == base and (base.kind, base.n_split) == ("split", 12)
     # 600 queries over 100 mean tiles: the l6 unit would split two ways (no split_l6 program), so the plan stays
     assert p.split_rule_for(600, 600 // 2 + 100 * 128, 1, 1, 212, p.block_q_l6) == 2
     rule, base = plans(600, 600 // 2 + 100 * 128, 1, 0)
@@ -1863,29 +1863,22 @@ def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
 
 
 def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
-    """sm_100a / sm_103a ``split_fit_rule`` [4096]: a split call whose mean unit keys fit ceil(keys / top_k) <= split_max
-    splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the floor rule,
-    and so does a call the floor rule does not split.  sm_107a has no fit rule."""
-    for arch in ("sm_100a", "sm_103a"):
+    """``split_fit_rule`` [4096] on every architecture: a split call whose mean unit keys fit ceil(keys / top_k) <=
+    split_max splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the
+    floor rule, and so does a call the floor rule does not split."""
+    for arch, grid in (("sm_100a", 152), ("sm_103a", 152), ("sm_107a", 212)):
         p = policy_for(arch)
         assert p.split_fit_rule == [4096], arch
         # 4 queries x 22018 keys: floor rule 5, fit ceil(22016 / 2048) = 11 -> 12 (two splits per chunk)
-        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True) == 5
-        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 2048) == 12
-        assert p.split_rule_for(4, 30466, 1, 1, 152, p.block_q_l6, False, 2048) == 16
+        assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True) == 5
+        assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True, 2048) == 12
+        assert p.split_rule_for(4, 30466, 1, 1, grid, p.block_q_l6, False, 2048) == 16
         # 41986 keys need 21 splits > split_max: the floor rule's 10
-        assert p.split_rule_for(4, 41986, 1, 1, 152, p.block_q_l6, True, 2048) == 10
+        assert p.split_rule_for(4, 41986, 1, 1, grid, p.block_q_l6, True, 2048) == 10
         # top_k 4096: one split per chunk, ceil(22016 / 4096) = 6
-        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 4096) == 6
+        assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True, 4096) == 6
         # the floor rule does not split 8192 keys: no fit split either
-        assert p.split_rule_for(1, 8192, 1, 1, 152, p.block_q_l6, True, 2048) == 1
-    assert policy_for("sm_107a").split_fit_rule is None
-    assert (
-        policy_for("sm_107a").split_rule_for(
-            4, 22018, 1, 1, 212, policy_for("sm_107a").block_q_l6, True, 2048
-        )
-        == 5
-    )
+        assert p.split_rule_for(1, 8192, 1, 1, grid, p.block_q_l6, True, 2048) == 1
 
 
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():

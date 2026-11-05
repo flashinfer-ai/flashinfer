@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared MiniMax-H3 MXFP8 pre-attention operation.
 
-Two generated programs, each shipped for the exact targets ``sm_100a`` and
+Two generated stages, shipped for the exact targets ``sm_100a`` and
 ``sm_103a``:
 
 * ``NORM``: RMSNorm + indexed AdaLN + MXFP8 quantize of the hidden states, one
@@ -13,11 +13,13 @@ Two generated programs, each shipped for the exact targets ``sm_100a`` and
   destination-major MXFP8 pack.  The FP32 accumulation runs in the K order of
   a block-scaled MXFP8 GEMM and is rounded to BF16 before the epilogue, so the
   epilogue reads the BF16 QKV projection such a GEMM writes; the projection
-  never leaves the SM.
+  never leaves the SM.  ``sm_103a`` runs ``FUSED_TILE_LANE``, the same GEMM
+  whose epilogue warps take their TMEM lane address at the top of every
+  tile; ``sm_100a`` runs ``FUSED``.  Both write the same bytes.
 
 The token count ``M`` and the destination geometry are launch parameters: any
 ``M >= 1`` and every destination partition count ``P`` in ``(1, 2, 4, 8)`` run
-the same two programs.  Tensor maps are passed by value: the fused stage's
+the same two stages.  Tensor maps are passed by value: the fused stage's
 binding encodes its five maps on every launch, and no descriptor workspace
 exists.
 
@@ -42,7 +44,11 @@ import tvm_ffi
 
 from flashinfer.gemm import gemm_base
 from flashinfer.jit import cake_program
-from flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention import FUSED, NORM
+from flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention import (
+    FUSED,
+    FUSED_TILE_LANE,
+    NORM,
+)
 
 _HIDDEN = 5376
 _HEADS = 56
@@ -133,6 +139,14 @@ def minimax_h3_mxfp8_target(device: torch.device) -> str:
             f"10.0 or 10.3, got {capability[0]}.{capability[1]}"
         )
     return target
+
+
+def minimax_h3_mxfp8_gemm_program(target: str) -> cake_program.CakeProgram:
+    """Fused GEMM program of ``target``.
+
+    ``FUSED_TILE_LANE`` on ``sm_103a`` and ``FUSED`` on ``sm_100a``.
+    """
+    return FUSED_TILE_LANE if target in FUSED_TILE_LANE.targets else FUSED
 
 
 def _gemm_row_tiles(M: int) -> int:
@@ -353,7 +367,8 @@ def prepare_minimax_h3_mxfp8_pre_attention(
         debug_k_words = debug_k_bf16.view(torch.uint32).reshape(-1)
     target = minimax_h3_mxfp8_target(device)
     norm_run = NORM.entry(target)
-    gemm_run = FUSED.entry(target)
+    gemm_program = minimax_h3_mxfp8_gemm_program(target)
+    gemm_run = gemm_program.entry(target)
     values = {
         "x": x,
         "x_norm_weight": x_norm_weight,
@@ -392,7 +407,9 @@ def prepare_minimax_h3_mxfp8_pre_attention(
         "SCALE_STRIDE": out_sf_stride,
     }
     norm_args = _call_args(NORM, values, grid=minimax_h3_mxfp8_launch_grid("norm", M))
-    gemm_args = _call_args(FUSED, values, grid=minimax_h3_mxfp8_launch_grid("gemm", M))
+    gemm_args = _call_args(
+        gemm_program, values, grid=minimax_h3_mxfp8_launch_grid("gemm", M)
+    )
     return PreparedMiniMaxH3Mxfp8PreAttention(
         M=M,
         P=P,
@@ -409,6 +426,7 @@ def prepare_minimax_h3_mxfp8_pre_attention(
 
 __all__ = [
     "PreparedMiniMaxH3Mxfp8PreAttention",
+    "minimax_h3_mxfp8_gemm_program",
     "minimax_h3_mxfp8_launch_grid",
     "minimax_h3_mxfp8_rows_per_destination",
     "minimax_h3_mxfp8_target",
