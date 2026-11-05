@@ -58,13 +58,6 @@ const auto remote_pack_tokens = [&]() {
             }
           }
           if (lane_idx == 0) remote.packed_slot_map(j)[token_idx] = slot;
-          if (slot >= 0) {
-            // The chunk's rows are complete once its counter reaches the chunk size.
-            __threadfence();
-            __syncwarp();
-            if (lane_idx == 0)
-              ptx::red_add_rel(remote.chunk_done(j, slot / layout::RemoteRegions::kPutChunkTokens), 1u);
-          }
           __syncwarp();
         }
       }
@@ -87,56 +80,9 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
   }
 };
 
-// Ship chunk `chunk` of the packed rows (rows, scales, ids, weights) of node
-// `j`, `rows` of them, to the mirror's inbox. Called by a full warp.
-const auto remote_put_chunk = [&](const comm::RemoteIO<kNumRemoteNodes>& io, const uint32_t& j,
-                                  const uint32_t& chunk, const uint32_t& rows) {
-  if constexpr (kNumRemoteNodes > 0) {
-    constexpr uint32_t kChunk = layout::RemoteRegions::kPutChunkTokens;
-    const uint32_t at = remote_links.peers[j].node_at_mirror;
-    auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
-    auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
-    const uint64_t first = static_cast<uint64_t>(chunk) * kChunk;
-    io.put_warp(j, dst_block + first * kHidden, src_block + first * kHidden,
-                static_cast<uint64_t>(rows) * kHidden, lane_idx, false, nullptr, 0);
-    io.put_warp(j, dst_block + sf_block_offset + first * kSFBytes,
-                src_block + sf_block_offset + first * kSFBytes, static_cast<uint64_t>(rows) * kSFBytes,
-                lane_idx, false, nullptr, 0);
-    io.put_warp(j, dst_block + idx_block_offset + first * kIdxBytes,
-                src_block + idx_block_offset + first * kIdxBytes,
-                math::align<uint64_t>(static_cast<uint64_t>(rows) * kIdxBytes, 16), lane_idx, false,
-                nullptr, 0);
-    io.put_warp(j, dst_block + weights_block_offset + first * kWeightBytes,
-                src_block + weights_block_offset + first * kWeightBytes,
-                math::align<uint64_t>(static_cast<uint64_t>(rows) * kWeightBytes, 16), lane_idx,
-                false, nullptr, 0);
-  }
-};
-
-// Before the grid sync, SM 0's last dispatch warp ships every chunk that is
-// already complete, overlapping the transfer with the other SMs' packing.
-// `chunks_sent[j]` carries the progress into `remote_send`.
-uint32_t chunks_sent[kNumRemoteNodes > 0 ? kNumRemoteNodes : 1] = {};
-const auto remote_put_ready_chunks = [&]() {
-  if constexpr (kNumRemoteNodes > 0) {
-    if (sm_idx != 0 or warp_idx != kNumDispatchWarps - 1) return;
-    comm::RemoteIO<kNumRemoteNodes> io(remote_links);
-    constexpr uint32_t kChunk = layout::RemoteRegions::kPutChunkTokens;
-#pragma unroll 1
-    for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
-      while (chunks_sent[j] < remote.num_put_chunks() and
-             ptx::ld_acq(remote.chunk_done(j, chunks_sent[j])) == kChunk) {
-        remote_put_chunk(io, j, chunks_sent[j], kChunk);
-        ++chunks_sent[j];
-      }
-    }
-  }
-};
-
-// SM 0 after the grid sync, one remote node at a time: the last dispatch warp
-// ships the remaining chunks while the warps compact the lists; the header
-// goes last and carries the signal, which orders every earlier put on the
-// same context before it.
+// SM 0 after the grid sync, one remote node at a time: warp 0 ships the packed
+// rows while both warps compact the lists; the header goes last and carries
+// the signal, which orders every earlier put on the same context before it.
 const auto remote_send = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     if (sm_idx != 0) return;
@@ -151,13 +97,19 @@ const auto remote_send = [&]() {
       auto* entries = remote.header_entries(header);
       const uint32_t num_packed = *remote.packed_token_count(j);
       if (thread_idx == 0) remote.header_control(header)[0] = num_packed;
-      if (warp_idx == kNumDispatchWarps - 1) {
-        constexpr uint32_t kChunk = layout::RemoteRegions::kPutChunkTokens;
-        for (uint32_t c = chunks_sent[j]; c * kChunk < num_packed; ++c)
-          remote_put_chunk(io, j, c, cute::min(kChunk, num_packed - c * kChunk));
-        // Counters of this layer are consumed; clear them for the next launch.
-        for (uint32_t c = lane_idx; c < remote.num_put_chunks(); c += 32)
-          *remote.chunk_done(j, c) = 0;
+      if (warp_idx == 0 and num_packed > 0) {
+        auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
+        auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
+        io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
+                    false, nullptr, 0);
+        io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset,
+                    static_cast<uint64_t>(num_packed) * kSFBytes, lane_idx, false, nullptr, 0);
+        io.put_warp(j, dst_block + idx_block_offset, src_block + idx_block_offset,
+                    math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kIdxBytes, 16),
+                    lane_idx, false, nullptr, 0);
+        io.put_warp(j, dst_block + weights_block_offset, src_block + weights_block_offset,
+                    math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kWeightBytes, 16),
+                    lane_idx, false, nullptr, 0);
       }
       for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads)
         counts[e] = static_cast<uint32_t>(
@@ -179,7 +131,7 @@ const auto remote_send = [&]() {
         for (uint32_t k = lane_idx; k < counts[e]; k += 32) entries[starts[e] + k] = src[k];
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      if (warp_idx == kNumDispatchWarps - 1)
+      if (warp_idx == 0)
         io.put_warp(j, remote.inbox_header(at), header, remote.header_used_bytes(num_entries),
                     lane_idx, true, remote.inbox_flag(at), comm::remote_inbox_signal(at));
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
