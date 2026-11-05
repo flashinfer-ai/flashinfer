@@ -1636,8 +1636,12 @@ def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch, l2n) -> 
         _, saved_g = cake_kcp.chunk_kda_fwd_kcp(
             *ops, ctx, workspace=ws, graph="replay", **GK, **L2, deterministic=False
         )
+        bwd(saved_g)  # the backward arena: a graph key sees the workspace's pools
+        events = []
         for _ in range(2):
             bwd(saved_g, graph="replay")
+            events.append(cake_kcp.LAST_CALL["bwd"].get("graph_event"))
+        assert events == ["eager", "capture"], events
         _, saved = cake_kcp.chunk_kda_fwd_kcp(
             *ops, ctx, workspace=ws, **GK, **L2, deterministic=False
         )
