@@ -11966,11 +11966,18 @@ def group_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        On SM100 / SM103 / SM107 the DeepGEMM kernels consume UE8M0 scales: each
+        ``torch.float32`` scale is converted by keeping only its exponent, i.e.
+        to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
+        applied up to 2x too small, without an error. Pass power-of-two scales
+        (for example ``2 ** ceil(log2(amax / 448))``, as ``per_token_cast_to_fp8``
+        and ``per_block_cast_to_fp8`` in ``flashinfer.testing.utils`` produce).
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
+        of the original float32 tensor for each group. The same power-of-two requirement as
+        `a_scale` applies.
 
     m_indices : torch.Tensor
         Group assignment tensor of shape ``(m,)`` with ``torch.int32`` dtype. Each element
@@ -12000,7 +12007,7 @@ def group_deepgemm_fp8_nt_groupwise(
     --------
     >>> import torch
     >>> from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
     >>>
     >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
     >>> m_per_group, n, k = 128, 2048, 4096
@@ -12394,11 +12401,18 @@ def batch_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(batch_size, m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        On SM100 / SM103 / SM107 the default DeepGEMM backend consumes UE8M0 scales: each
+        ``torch.float32`` scale is converted by keeping only its exponent, i.e.
+        to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
+        applied up to 2x too small, without an error. Pass power-of-two scales
+        (for example ``2 ** ceil(log2(amax / 448))``, as ``per_token_cast_to_fp8``
+        and ``per_block_cast_to_fp8`` in ``flashinfer.testing.utils`` produce).
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
+        of the original float32 tensor for each group. The same power-of-two requirement as
+        `a_scale` applies.
 
     masked_m : torch.Tensor
         Masking tensor of shape ``(batch_size,)`` with ``torch.int32`` dtype. Each element
@@ -12450,7 +12464,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     --------
     >>> import torch
     >>> from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
     >>>
     >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
     >>> m, n, k = 128, 2048, 4096
