@@ -10982,8 +10982,9 @@ def test_raw_gate_r1c_recovers_from_an_aborted_backward(device, manifest) -> Non
         assert ws._param_acc_dirty[0] is False
 
 
+@pytest.mark.parametrize("l2n", ("off", "fused"))
 def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
-    device, manifest, monkeypatch
+    device, manifest, monkeypatch, l2n
 ) -> None:
     """Under ``torch.use_deterministic_algorithms(True)`` a raw backward of an R1c row (:func:`_r1c_glm`) raises
     PyTorch's alert naming ``chunk_kda_bwd`` and the deterministic package before it allocates or launches anything
@@ -10991,25 +10992,35 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
     and no call enters ``cake_backend._workspace``, which takes a per-call workspace and runs every launch), and with
     ``warn_only=True`` warns once and runs (results of the R1c bound).  On ``sm_107a`` (the deterministic pair) the
     backward gives no such warning and every result is bitwise the deterministic package's.  The g mode is outside
-    the R1c rows: no such warning.  (The forwards run with torch's deterministic algorithms off; only this
-    package's alert is under test.)"""
+    the R1c rows: no such warning.  Nor is the in-kernel Q/K L2 norm (``l2n="fused"``,
+    ``use_qk_l2norm_in_kernel=True``) on any architecture: its raw backward finishes the parameter gradients with
+    ``param_finalize_l2n``, the deterministic finalize, launches no R1c record and gives no such warning, and every
+    result is bitwise the deterministic package's l2n mode.  (The forwards run with torch's deterministic
+    algorithms off; only this package's alert is under test.)"""
     arch = cake_jit.device_arch(device.index)
     alert = "chunk_kda_bwd does not have a deterministic implementation"
     lengths = (63, 1, 65)
     S, N = sum(lengths), len(lengths)
+    L2 = {"use_qk_l2norm_in_kernel": True} if l2n != "off" else {}
     saved_mode = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
     )
     seen = 0
     for heads in (4, 64):
-        alerts = _r1c_glm(arch, heads) is not None
-        assert (
-            cake_backend._r1c_alert_due(arch, heads, cake_jit.sm_count(device.index))
-            is alerts
-        )
+        alerts = _r1c_glm(arch, heads) is not None and l2n == "off"
+        sm = cake_jit.sm_count(device.index)
+        assert cake_backend._r1c_alert_due(arch, heads, sm, l2n) is alerts
         inputs = make_raw_inputs(lengths, heads, device)
-        ref_out, ref, _ = _rg_reference(inputs)
+        if l2n == "off":
+            ref_out, ref, _ = _rg_reference(inputs)
+        else:
+            # the deterministic package's l2n mode: the same programs on every row, bit for bit
+            d_out, d_saved = _rg_fwd(inputs, det=True, **L2)
+            d_grads = _rg_bwd(inputs, d_saved, det=True, **L2)
+            named = dict(zip(RAW_RETURN_NAMES, d_grads, strict=True))
+            ref_out, ref = _clone_all(d_out, named)
+            ref[R1C_KEY] = None
         launched: list = []
         ws = KdaWorkspace.for_problem(
             S,
@@ -11017,6 +11028,7 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
             heads,
             device,
             gate="raw",
+            l2n=l2n,
             launcher=_rg_recorder(launched),
             deterministic=False,
         )
@@ -11024,7 +11036,7 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
         gq = [g_inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")]
         try:
             torch.use_deterministic_algorithms(False)
-            out, saved = _rg_fwd(inputs, workspace=ws)
+            out, saved = _rg_fwd(inputs, workspace=ws, **L2)
             assert launched and _bits_equal_counted(out, ref_out)
             _, g_saved = chunk_kda_fwd(*gq)
             torch.cuda.synchronize(device)
@@ -11048,7 +11060,7 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
             torch.use_deterministic_algorithms(True, warn_only=True)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                got = _rg_bwd(inputs, saved, workspace=ws)
+                got = _rg_bwd(inputs, saved, workspace=ws, **L2)
                 torch.cuda.synchronize(device)
             ours = [w for w in caught if alert in str(w.message)]
             assert len(ours) == (1 if alerts else 0), [str(w.message) for w in caught]
@@ -11060,6 +11072,11 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
             # the backward that ran went through the patched _workspace with the caller's workspace (the check
             # above is not vacuous)
             assert launched and entered and not any(entered)
+            if l2n != "off":
+                # the deterministic parameter finalize, never an R1c record
+                names = {row[0] for row in launched}
+                assert "param_finalize_l2n" in names, names
+                assert not names & R1C_RECORDS, names
             monkeypatch.setattr(cake_backend, "_workspace", take)
             seen += len(ours)
             _rg_check(got, ref, tag=(arch, heads, "torch deterministic"))
@@ -11071,4 +11088,4 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(
             assert not [w for w in caught if alert in str(w.message)]
         finally:
             torch.use_deterministic_algorithms(saved_mode[0], warn_only=saved_mode[1])
-    assert seen == (0 if arch == "sm_107a" else 2)
+    assert seen == (0 if arch == "sm_107a" or l2n != "off" else 2)

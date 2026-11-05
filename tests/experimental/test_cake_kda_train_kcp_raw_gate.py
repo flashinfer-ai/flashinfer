@@ -1579,17 +1579,30 @@ def test_raw_gate_rows_match_single_rank_and_fp64(row) -> None:
     assert report["pass"], report
 
 
-def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch) -> None:
+@pytest.mark.parametrize("l2n", ("off", "fused"))
+def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch, l2n) -> None:
     """Under ``torch.use_deterministic_algorithms(True)`` a raw KCP backward of an R1c row (``sm_100a`` / ``sm_103a``)
     raises PyTorch's alert naming ``chunk_kda_bwd_kcp`` before it allocates or launches anything (no backward
     recorded), eagerly and on a captured graph's replay; with ``warn_only=True`` it warns and runs, once per call,
     also when its graph capture fails and the call prepares again to run eagerly.  On ``sm_107a`` (the
-    deterministic pair) the backward raises no such alert and gives no such warning.  The warning names the caller
-    outside flashinfer (this file)."""
+    deterministic pair) the backward raises no such alert and gives no such warning.  Nor does it with the in-kernel
+    Q/K L2 norm (``l2n="fused"``, ``use_qk_l2norm_in_kernel=True``) on any architecture, a captured graph's replay
+    included: the mode's raw backward finishes the parameter gradients with ``param_finalize_l2n``, the
+    deterministic finalize, and runs no R1c pair.  The warning names the caller outside flashinfer (this file)."""
     _skip_unless_runnable(1)
+    if l2n != "off":
+        missing = cake_kcp_plan.qk_l2norm_missing(
+            "fused", "raw", cake_kcp_plan.qk_l2norm_arch()
+        )
+        if missing is not None:
+            pytest.skip(
+                f"use_qk_l2norm_in_kernel=True cannot run on the KCP route yet: {missing}"
+            )
     device = torch.device("cuda", torch.cuda.current_device())
     arch = cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
     r1c = arch in R1C_ARCHES
+    alerts = r1c and l2n == "off"
+    L2 = {"use_qk_l2norm_in_kernel": True} if l2n != "off" else {}
     alert = "chunk_kda_bwd_kcp does not have a deterministic implementation"
     lengths, H = (100, 640, 77), 4
     part, cu = _partition(lengths, 1, "contiguous")
@@ -1605,7 +1618,7 @@ def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch) -> None:
         lower_bound=LB,
     )
     ops = tuple(o[n] for n in ("q", "k", "v", "g", "beta"))
-    ws = cake_kcp.WorkspaceKcp(use_gate_in_kernel=True)
+    ws = cake_kcp.WorkspaceKcp(use_gate_in_kernel=True, **L2)
     mode = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
@@ -1613,7 +1626,7 @@ def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch) -> None:
 
     def bwd(saved, **kw):
         return cake_kcp.chunk_kda_bwd_kcp(
-            *ops, ctx, o["dout"], saved=saved, workspace=ws, **GK, **kw, deterministic=False
+            *ops, ctx, o["dout"], saved=saved, workspace=ws, **GK, **L2, **kw, deterministic=False
         )  # fmt: skip
 
     cake_kcp.graph_cache_clear()
@@ -1621,28 +1634,37 @@ def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch) -> None:
         torch.use_deterministic_algorithms(False)
         # a captured backward to replay below, and a saved set for the eager calls
         _, saved_g = cake_kcp.chunk_kda_fwd_kcp(
-            *ops, ctx, workspace=ws, graph="replay", **GK, deterministic=False
+            *ops, ctx, workspace=ws, graph="replay", **GK, **L2, deterministic=False
         )
         for _ in range(2):
             bwd(saved_g, graph="replay")
         _, saved = cake_kcp.chunk_kda_fwd_kcp(
-            *ops, ctx, workspace=ws, **GK, deterministic=False
+            *ops, ctx, workspace=ws, **GK, **L2, deterministic=False
         )
         torch.cuda.synchronize(device)
         before = cake_kcp.LAST_CALL.get("bwd")
         torch.use_deterministic_algorithms(True)
-        if r1c:
+        if alerts:
             for kw in ({}, {"graph": "replay"}):
                 with pytest.raises(RuntimeError, match=alert):
                     bwd(saved_g if kw else saved, **kw)
                 assert cake_kcp.LAST_CALL.get("bwd") is before, kw
         torch.use_deterministic_algorithms(True, warn_only=True)
+        if l2n != "off":
+            # the captured graph's replay (its own alert check) gives none either
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                grads = bwd(saved_g, graph="replay")
+            torch.cuda.synchronize(device)
+            assert cake_kcp.LAST_CALL["bwd"].get("graph_event") == "replay"
+            assert not [w for w in caught if alert in str(w.message)]
+            assert len(grads) == len(TOKEN_GRADS + PARAM_GRADS)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             grads = bwd(saved)
         torch.cuda.synchronize(device)
         ours = [w for w in caught if alert in str(w.message)]
-        assert len(ours) == (1 if r1c else 0), [str(w.message) for w in caught]
+        assert len(ours) == (1 if alerts else 0), [str(w.message) for w in caught]
         assert all(w.category is UserWarning for w in ours)
         # attributed to the caller outside flashinfer (bwd, in this file)
         assert all(
@@ -1666,7 +1688,7 @@ def test_gpu_raw_r1c_alerts_under_torch_deterministic_mode(monkeypatch) -> None:
                 grads = bwd(saved, graph="replay")
             torch.cuda.synchronize(device)
             ours = [w for w in caught if alert in str(w.message)]
-            assert len(ours) == (1 if r1c else 0), (i, [str(w.message) for w in caught])
+            assert len(ours) == int(alerts), (i, [str(w.message) for w in caught])
             assert len(grads) == len(TOKEN_GRADS + PARAM_GRADS)
         assert failed == ["bwd"], failed
     finally:
