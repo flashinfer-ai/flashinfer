@@ -3,7 +3,7 @@
 """NVFP4/MXFP8 causal/noncausal attention timing and accuracy sweep.
 
 Run in your activated environment from the repository root:
-    CUDA_VISIBLE_DEVICES=3 PYTHONPATH="$PWD" python benchmarks/bench_blockscaled_expcast.py
+    CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_blockscaled_expcast.py
 
 Run the explicit Q/KV cases below with both masks, both schedulers and three JIT variants:
 blockscaled exp2, blockscaled expcast, and regular BF16 QK exp2.
@@ -13,14 +13,9 @@ Q/K and decoded V, with FP32 accumulation. Report each path's error versus
 FP16, its RMSE increase over matched blockscaled exp2 (percentage points),
 and direct error versus blockscaled exp2. Regular Q/K are cast to BF16.
 
-Compiler defaults: registers 192/96/32, threshold 2^-8, P offset +8,
-full-tile P publication, dtype-derived KV stages, scale 1/sqrt(D), no PDL.
-Timing: 5 warmups, 30 measured iterations, CUDA Graph, CUPTI/event fallback.
-Warm-cache policy for both backends (no L2 flush or tensor rotation).
-Each CSV row records the actual timing_backend and cold_l2_cache=False.
 TFLOP/s counts QK and PV GEMMs only (4*B*Hq*D*attended_pairs), accounting
 for bottom-right causal masking. Compilation/quantization/reference are excluded.
-Edit constants below; results go to profiling/expcast-b200/expcast_configs_gqa.csv. See EXPCAST.md.
+Edit constants below; results go to profiling/expcast-b200/expcast_configs_gqa.csv.
 """
 
 import csv
