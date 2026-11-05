@@ -1086,8 +1086,10 @@ TIER_ROUTES = {
     "sm_100a": {
         "fwd_long": 2400,
         "fwd_mid": 976,
-        "bwd_bf16_long": 1280,
-        "bwd_f32_long": 1280,
+        "bwd_bf16_long": 12000,
+        "bwd_f32_long": 12000,
+        "bwd_bf16_mid": 800,
+        "bwd_f32_mid": 800,
     },
     "sm_103a": {
         "fwd_xlong": 3000,
@@ -1221,15 +1223,18 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         got = loader.module_for_rows("sm_103a", "fwd", rows, sm_count)
         assert got == routes103[role], (rows, role)
     # the backward on sm_100a: the short backward up to 256 rows whatever the
-    # SMs, the backward, then the long backward from 1280 rows per SM; on
-    # sm_107a the short backward up to 256 rows, then the backward
+    # SMs, the backward, then the mid backward from 800 rows per SM, then the
+    # long backward from 12000; on sm_107a the short backward up to 256 rows,
+    # then the backward
     for role in ("bwd_bf16", "bwd_f32"):
         for rows, tier in (
             (1, "_short"),
             (256, "_short"),
             (257, ""),
-            (1280 * sm_count - 1, ""),
-            (1280 * sm_count, "_long"),
+            (800 * sm_count - 1, ""),
+            (800 * sm_count, "_mid"),
+            (12000 * sm_count - 1, "_mid"),
+            (12000 * sm_count, "_long"),
         ):
             got = loader.module_for_rows("sm_100a", role, rows, sm_count)
             assert got == routes[role + tier], (role, rows)
@@ -1680,8 +1685,8 @@ def test_long_backward_cta_rule(rows, sm_count):
 def test_bulk_long_backward_cta_rule(rows, sm_count):
     # sm_100a's and sm_103a's long backward: the backward's 256-thread CTAs of
     # 16-row blocks, at most 5 CTAs per SM (a quarter more than an SM holds at
-    # once), from 1280 rows per SM on sm_100a and from 12000 on sm_103a (below
-    # it the mid backward); the workspace is the backward's.
+    # once), from 12000 rows per SM (below it the mid backward); the workspace
+    # is the backward's.
     for arch in ("sm_100a", "sm_103a"):
         for role in ("bwd_bf16", "bwd_f32"):
             name = loader.ROUTES[arch][f"{role}_long"]
@@ -1691,7 +1696,7 @@ def test_bulk_long_backward_cta_rule(rows, sm_count):
             assert record["grid_rule"] == {
                 "ctas_per_sm": 5,
                 "kind": "row_claims",
-                "min_rows_per_sm": {"sm_100a": 1280, "sm_103a": 12000},
+                "min_rows_per_sm": {"sm_100a": 12000, "sm_103a": 12000},
                 "rows_per_cta": 16,
             }
             assert record["launch"] == loader.MODULES[base]["launch"]
