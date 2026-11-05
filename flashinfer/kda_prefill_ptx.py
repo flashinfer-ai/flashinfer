@@ -18,6 +18,7 @@ import math
 
 import torch
 
+from .kda_host_offsets import cu_seqlens_to_list
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace,
     _bind_workspace,
@@ -236,7 +237,7 @@ def _launch_ptx_kda(
             ):
                 offsets = entry["offsets"]
             else:
-                offsets = cu_seqlens.tolist()
+                offsets = cu_seqlens_to_list(cu_seqlens)
             if (
                 offsets[0] != 0
                 or offsets[-1] != B * T

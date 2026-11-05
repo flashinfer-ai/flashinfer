@@ -23,6 +23,7 @@ from typing import Optional
 
 import torch
 
+from .kda_host_offsets import register_cu_seqlens_cast
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace,
     _bind_workspace,
@@ -455,7 +456,9 @@ def _run_cute_dsl_kda_prefill(
                 "packed backend='cute-dsl' prefill requires int64 cu_seqlens "
                 "during CUDA graph capture"
             )
+        source = cu_seqlens
         cu_seqlens = cu_seqlens.to(torch.int64)
+        register_cu_seqlens_cast(cu_seqlens, source)
 
     compiled = _get_compiled_cute_dsl_kda(
         lower_bound=float(lower_bound),

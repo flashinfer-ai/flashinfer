@@ -43,6 +43,7 @@ from typing import (
 
 import torch
 
+from .kda_host_offsets import host_cu_seqlens_for
 from .utils import get_compute_capability
 
 if TYPE_CHECKING:
@@ -518,6 +519,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._generated_affine_state_indices_destination_ptr: Optional[int] = None
         self._packed_metadata_lock = threading.Lock()
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
+        self._packed_metadata_host_key: Optional[tuple] = None
         self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
         self._packed_metadata: Optional[_PackedTaskMetadata] = None
         self._bound_stream_ptr: Optional[int] = None
@@ -2652,6 +2654,7 @@ def _cached_packed_task_metadata(
 ) -> _PackedTaskMetadata:
     """Cache host-built sequence order and optional persistent task bins."""
 
+    host_offsets = host_cu_seqlens_for(cu_seqlens)
     version = None if cu_seqlens.is_inference() else int(cu_seqlens._version)
     capturing = torch.cuda.is_current_stream_capturing()
     signature = (
@@ -2663,6 +2666,23 @@ def _cached_packed_task_metadata(
     )
     with workspace._packed_metadata_lock:
         cached_metadata = workspace._packed_metadata
+        host_key = (
+            None
+            if host_offsets is None
+            else (
+                host_offsets,
+                total_tokens,
+                num_heads,
+                sm_count,
+                build_persistent_plan,
+            )
+        )
+        if (
+            host_key is not None
+            and workspace._packed_metadata_host_key == host_key
+            and cached_metadata is not None
+        ):
+            return cached_metadata
         if (
             (version is not None or capturing)
             and workspace._packed_metadata_tensor is cu_seqlens
@@ -2676,7 +2696,11 @@ def _cached_packed_task_metadata(
                 "CUDA graph capture; eagerly invoke the same offsets once "
                 "with this RecurrentKDAPrefillWorkspace before capture"
             )
-        offsets = tuple(int(value) for value in cu_seqlens.tolist())
+        offsets = (
+            host_offsets
+            if host_offsets is not None
+            else tuple(int(value) for value in cu_seqlens.tolist())
+        )
         if (
             not offsets
             or offsets[0] != 0
@@ -2715,7 +2739,8 @@ def _cached_packed_task_metadata(
             offsets,
             sequence_lengths,
         )
-        workspace._packed_metadata_tensor = cu_seqlens
+        workspace._packed_metadata_tensor = cu_seqlens if host_key is None else None
+        workspace._packed_metadata_host_key = host_key
         workspace._packed_metadata_signature = signature
         workspace._packed_metadata = metadata
         return metadata

@@ -19,6 +19,7 @@ import math
 import torch
 
 from .cute_dsl.availability import is_cute_dsl_experimental_available
+from .kda_host_offsets import cu_seqlens_to_list
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace,
     _bind_workspace,
@@ -224,7 +225,7 @@ def _launch_persistent_kda(
             offsets = (
                 list(range(0, B * T + 1, T))
                 if cu_seqlens is None
-                else cu_seqlens.tolist()
+                else cu_seqlens_to_list(cu_seqlens)
             )
             if (
                 offsets[0] != 0

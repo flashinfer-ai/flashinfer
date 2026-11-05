@@ -26,7 +26,7 @@ decode and speculative decode retain the backend exposed by
 
 import functools
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence, Union
 
 import torch
 
@@ -36,6 +36,7 @@ from . import kda_prefill_cute as _kda_prefill_cute
 from . import kda_prefill_cute_small_bh as _kda_prefill_cute_small_bh
 from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cute_dsl.availability import is_cute_dsl_available
+from .kda_host_offsets import accepts_cu_seqlens_host
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
@@ -163,6 +164,7 @@ def _try_cudnn_kda_prefill(
 
 
 @flashinfer_api(trace=recurrent_kda_trace)
+@accepts_cu_seqlens_host
 def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -195,6 +197,7 @@ def recurrent_kda(
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Union[torch.Tensor, Sequence[int]]] = None,
     backend: Literal[
         "auto",
         "cute-dsl",
@@ -352,6 +355,15 @@ def recurrent_kda(
         kg_cache (Optional[torch.Tensor]):
             Frozen-verify only: slot-indexed bf16 (raw key | raw gate)
             cache ``[num_slots, HV, T_max, 2*K]``.
+        cu_seqlens_host (Optional[Union[torch.Tensor, Sequence[int]]]):
+            Host copy of ``cu_seqlens`` (a 1-D CPU tensor or a sequence of
+            ints, same values and length). Packed prefill routes that need the
+            sequence lengths on the host (small-BH, CuTe DSL decomp, Cake) use
+            it instead of reading ``cu_seqlens`` back from the device, which
+            costs a stream synchronization per call and cannot be cached for
+            inference tensors. Serving frameworks that already hold the batch
+            offsets on the host should pass them. The values are trusted, not
+            checked against the device tensor. Keyword-only. Default: ``None``.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
             permutation of shape ``[N]``. CuTe DSL packed engine calls generate

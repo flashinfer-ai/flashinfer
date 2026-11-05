@@ -102,6 +102,8 @@ import cutlass.experimental.primitives as prims
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from ..kda_host_offsets import cast_source_of, host_cu_seqlens_for
+
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
@@ -6258,7 +6260,9 @@ def host(
 _CU_CONTENTS_MEMO: dict = {}
 
 
-def _cu_seqlens_contents(cu_seqlens: torch.Tensor) -> tuple:
+def _cu_seqlens_contents(
+    cu_seqlens: torch.Tensor, reuse_inference_memo: bool = True
+) -> tuple:
     """cu_seqlens contents as a host tuple, sync-free on the steady path.
 
     Every plan/decision cache keys on the CONTENTS of cu_seqlens: keying on
@@ -6275,20 +6279,25 @@ def _cu_seqlens_contents(cu_seqlens: torch.Tensor) -> tuple:
     owner is a different (dead or dying) object; and an unchanged
     `_version` (catches in-place mutation, which shares the version
     counter across views). Tensors without version counters (inference
-    mode) memoize with version None and still get the identity protection.
+    mode) memoize with version None and still get the identity protection;
+    ``reuse_inference_memo=False`` re-reads them instead.
     """
 
+    host_contents = host_cu_seqlens_for(cu_seqlens)
+    if host_contents is not None:
+        return host_contents
     key = cu_seqlens.data_ptr()
-    try:
-        ver = cu_seqlens._version
-    except Exception:  # inference tensors track no version counter
-        ver = None
+    ver = None if cu_seqlens.is_inference() else cu_seqlens._version
     ent = _CU_CONTENTS_MEMO.get(key)
-    if ent is not None:
+    if ent is not None and (ver is not None or reuse_inference_memo):
         wr, memo_ver, contents = ent
         if wr() is cu_seqlens and memo_ver == ver:
             return contents
-    contents = tuple(int(x) for x in cu_seqlens.cpu().tolist())
+    source = cast_source_of(cu_seqlens)
+    if source is not None:
+        contents = _cu_seqlens_contents(source, reuse_inference_memo=False)
+    else:
+        contents = tuple(int(x) for x in cu_seqlens.cpu().tolist())
     _CU_CONTENTS_MEMO[key] = (weakref.ref(cu_seqlens), ver, contents)
     return contents
 
