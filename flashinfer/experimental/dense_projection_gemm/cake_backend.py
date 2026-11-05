@@ -837,6 +837,46 @@ K1_CHAIN_RANGES_BY_SM: dict[
     },
 }
 # fmt: on
+#: Token ranges at which a row runs this package's one-split program of one accumulation chain on the parts of exactly
+#: one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, block_n), ...)}`` (keys as in
+#: :data:`K1_SPLIT_RULES`): a token count from ``min_tokens`` to ``max_tokens`` runs the transposed-store program of
+#: that tile width at one split, at an even and at an odd number of 64-element K blocks alike, in place of the routing
+#: of every table above except :data:`K1_CHAIN_RANGES_BY_SM` (the row's verdict, its range of
+#: :data:`K1_TWO_SPLIT_RANGES_BY_SM` and its entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` and
+#: :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS`); every other token count, part and row keeps that routing.  Each CTA
+#: pair adds its tile's whole token reduction in one accumulator and stores the tile once (no workspace, no ticket).
+#: On 152-SM sm_100a and sm_103a parts the FP32 rows ``4096 -> 32`` and ``4096 -> 128`` run 64-wide tiles at one split
+#: (16 and 32 tiles) where that routing runs two splits of 64-wide tiles or the deterministic program.  The ranges were
+#: measured against that routing (and against the deterministic program at the odd block counts from 1025 tokens) on
+#: a GB200 and a GB300 part, at 256 to 4096 tokens, under the rule of :data:`K1_SPLIT_RULES` with cold
+#: L2 and the GPU span of the operation (CUPTI): in every run faster in eager launches and in CUDA graph replays, in
+#: both launch orders, in one process for all token counts and in a fresh process per token count, no more than 3 %
+#: slower next to a kernel holding 8, 16 or 32 SMs, and the backward pass and the checkpointed step no more than 1.3 %
+#: slower.  A range runs from its first measured token count to the last one at which the program passed, and holds no
+#: measured token count that failed; the token counts between two consecutive measured ones take it too (not
+#: measured).  Below 256 tokens (not measured), from the first failing token count up (``4096 -> 32``: 2304 on both
+#: GPUs, and 2049 against the two-split program; ``4096 -> 128``: 3584 on sm_100a, 3072 on sm_103a) and on parts of
+#: any other SM count the routing of the tables above holds.  The output met the deterministic package's FP32 budget
+#: against FP64 (relative Frobenius error at most 5e-5, max error at most 1e-3 times the largest reference element) in
+#: every one of 20 runs of 10 seeds at every measured token count of the ranges (worst relative Frobenius error
+#: 3.54e-6); from 1024 tokens up, where the deterministic program adds the halves of an output's token reduction in two
+#: partials, that error was 2.10 to 2.38 times the deterministic program's (reported, not a rule), and at 256 to 800
+#: tokens the same.  The protocol, the measured token counts and the times are in the 152-SM one-split table of the
+#: README.
+# fmt: off
+K1_ONE_SPLIT_RANGES_BY_SM: dict[
+    tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, int], ...]]
+] = {
+    ("sm_100a", 152): {
+        ("sm_100a", 1, 4096, 32, "f32"): ((256, 2048, 64),),
+        ("sm_100a", 1, 4096, 128, "f32"): ((256, 3328, 64),),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 4096, 32, "f32"): ((256, 2048, 64),),
+        ("sm_103a", 1, 4096, 128, "f32"): ((256, 2816, 64),),
+    },
+}
+# fmt: on
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
@@ -901,13 +941,19 @@ def k1_plan(
     those entries, every other ``K`` below the floor and a ``K`` too short for the split count (:func:`k1_splits_fit`)
     run the deterministic program.  A ``K`` of the row's ranges in :data:`K1_CHAIN_RANGES_BY_SM` for exactly
     ``sm_count`` (:func:`k1_chain_plan`) returns that range's tile width at one split before any of these tables: the
-    program of :func:`k1_chain_plan`'s chain count."""
+    program of :func:`k1_chain_plan`'s chain count; next, a ``K`` of the row's ranges in
+    :data:`K1_ONE_SPLIT_RANGES_BY_SM` for exactly ``sm_count`` returns that range's tile width at one split (one
+    chain), before the other tables."""
     chained = k1_chain_plan(
         arch=arch, L=L, M=M, N=N, K=K, out_f32=out_f32, sm_count=sm_count
     )
     if chained is not None:
         return chained[0], 1
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    one_split = K1_ONE_SPLIT_RANGES_BY_SM.get((arch, int(sm_count)), {})
+    for lo, hi, block_n in one_split.get(key, ()):
+        if lo <= int(K) <= hi:
+            return int(block_n), 1
     floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
     first, last = K1_SPLIT_RULES_BY_SM_TOKENS
     in_window = first <= int(K) <= last
