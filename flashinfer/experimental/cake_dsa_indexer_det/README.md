@@ -140,9 +140,9 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   FP8 `static_scan_kinds` itself.
   `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
   and maps the decided kind to a registered FP8 kind
-  (`FP8_KIND_FALLBACK`: `wide` -> `narrow`, `pair_l6` -> `l6`, `pair_narrow` /
-  `pair_wide` -> `narrow`, `split_wide` -> `split_narrow`, and `split_l6` ->
-  `split_narrow` where no FP8 `split_l6` program is registered); the program
+  (`FP8_KIND_FALLBACK`: `wide` / `pair_wide` / `pair_l6` -> `l6`, the largest
+  FP8 unit, `pair_narrow` -> `narrow`, `split_wide` -> `split_narrow`, and
+  `split_l6` -> `split_narrow` where no FP8 `split_l6` program is registered); the program
   runs without a CTA pair, in the plain unit order, in its sampled-fit form,
   with the decided tile unroll where an FP8 program of it is registered
   (else the smallest registered one) and in the longest-first order where

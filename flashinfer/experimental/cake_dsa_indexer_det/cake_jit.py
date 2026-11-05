@@ -1108,11 +1108,15 @@ POLICY: dict[str, dict[str, Any]] = {
 # The FP8 input form's dispatch record of an architecture is its ``POLICY``
 # record with these fields replaced (``cake_policy.fp8_policy_record``); each
 # names its own ``static_scan_kinds``: on sm_107a every FP8 scan program keeps
-# the static unit enumeration.
+# the static unit enumeration.  sm_107a keeps no split-fit rule until the FP8
+# split programs are measured under one.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {"static_scan_kinds": []},
     "sm_103a": {"static_scan_kinds": []},
-    "sm_107a": {"static_scan_kinds": ["l6", "narrow", "split_narrow"]},
+    "sm_107a": {
+        "static_scan_kinds": ["l6", "narrow", "split_narrow"],
+        "split_fit_rule": None,
+    },
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5676"
 

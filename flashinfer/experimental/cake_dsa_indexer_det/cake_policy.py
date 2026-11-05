@@ -161,11 +161,13 @@ FORMS = (BF16, FP8)
 # The FP8 scan programs exist for the narrow, l6 and split kinds only, with no snake order and in the sampled-fit form.
 # An FP8 call runs the decision procedure of ``select_program`` under the FP8 record (``fp8_policy_record``); a decided
 # kind without an FP8 program runs the FP8 program of the kind below (same unit geometry where it has one, unpaired).
+# A wide unit (8 queries) runs the l6 unit (6 queries), the largest FP8 unit: per key tile it reads K once for 6 queries
+# rather than for the narrow unit's 4.
 FP8_KIND_FALLBACK = {
-    "wide": "narrow",
+    "wide": "l6",
     "pair_l6": "l6",
     "pair_narrow": "narrow",
-    "pair_wide": "narrow",
+    "pair_wide": "l6",
     "split_wide": "split_narrow",
     "split_l6": "split_narrow",
 }
