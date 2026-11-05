@@ -1159,12 +1159,14 @@ def k_band_threshold(bands: Sequence[tuple[int, int]], hidden: int) -> int:
 # xband_min_m`` runs the cross-destination-band plan as one persistent launch (it takes precedence over the
 # per-destination launch gate); ``0`` = never.  A threshold is at least ``PAIR_MIN_M`` (the eligible rows pair only
 # from there) and applies on the pair architectures only.  ``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD`` lists the cells that
-# ship it (every other cell: 0): SM103 groups of 8 ranks, where it was measured; SM100 groups of 8 ranks keep it off
-# (their default producer build stores through bulk row copies, which the cross-band tile does not support).  The
-# tile table and the producer program change; the stored bits do not.
+# ship it (every other cell: 0): SM103 and SM100 groups of 8 ranks.  The cross-band tile stores through the staged
+# row path, so on SM100, whose default producer build at 8 ranks stores through bulk row copies, the cross-band rows run
+# the staged build of the same operand load width.  The tile table and the producer program change; the stored bits do
+# not.
 XBAND_BN = 256
 XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], int] = {
     ("sm_103a", 8): 4096,
+    ("sm_100a", 8): 4096,
 }
 
 

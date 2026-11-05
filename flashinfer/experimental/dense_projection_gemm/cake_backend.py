@@ -60,7 +60,9 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
 
   Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
   both modes: a recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input
-  gradient splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  On the
+  gradient splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward
+  rows of :data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another
+  plan of those programs with ``deterministic=False``: the single-CTA program, every tile's whole K in one CTA.  On the
   convenience path a call of ``deterministic=False`` that
   runs a deterministic program (the K1 forward and input gradient, a K2 row without a verdict) launches it through a
   binding of this package (the deterministic package's plan and programs, and the reduction of its split-K partials in
@@ -79,7 +81,10 @@ package's sibling on first use, never through an absolute ``flashinfer`` import;
 path had before #8046 that are not entry points (``ROW_RULES``, ``stream_k_plan``, ``wgrad_views``, the plan and
 prepared types ``GemmPlan`` / ``PreparedGemm`` / ``RouterPlan`` / ``PreparedRouterGemm``, ...) read through to the
 deterministic package (module ``__getattr__``); assigning one here does not change the deterministic package's.
-:func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages.
+:func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages; a convenience-path
+call that this package launches from its arenas, captured into a CUDA graph, stays valid until then (the arenas keep
+every buffer a launch was bound to, through growths and cache evictions); a call it hands to the deterministic package's
+convenience path follows that package's rule (:func:`clear_convenience_caches`).
 """
 
 from __future__ import annotations
@@ -150,7 +155,8 @@ def use_deterministic_backend(module: ModuleType) -> None:
     under another name, without the ``flashinfer`` package around it) vendors the deterministic package too and
     binds its ``cake_backend`` here before the first call that needs it.  Binding drops this package's convenience
     caches and arenas (:func:`_drop_convenience_entries`): their entries hold the plans and programs of the package
-    bound before."""
+    bound before.  Like :func:`clear_convenience_caches`, it invalidates the CUDA graphs that captured a
+    convenience-path call of this package."""
     missing = [
         name for key, name in DETERMINISTIC_NAMES.items() if not hasattr(module, name)
     ]
@@ -221,7 +227,8 @@ def _resolve_deterministic(deterministic: bool, api: str) -> bool:
 #: operations are keyed by the operand layouts of the launched GEMM (``kk`` forward, ``kn`` input gradient, ``nn``
 #: weight gradient; ``nk`` has no training use), K2 by the layout class of ``router_layout_class``.
 ROUTES: dict[str, str] = {
-    "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split
+    "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split (the
+    # rows of K1_FORWARD_RULES_BY_SM: another plan of the deterministic programs, whole K per tile)
     "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split
     "k1_nk": "det",
     "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count
@@ -336,10 +343,10 @@ K1_SPLIT_RULES:dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] =
     ("sm_103a", 1, 6144, 32, "bf16"): (64, 2), ("sm_103a", 1, 6144, 32, "f32"): (64, 2),
     ("sm_103a", 1, 6144, 128, "bf16"): (128, 2), ("sm_103a", 1, 6144, 128, "f32"): (128, 2),
     # sm_107a (216 SMs): two to four splits; the one-split rows store whole tiles (deterministic) and win where the
-    # deterministic package's sm_107a program of the row is slower (the FP32 one-split rows up to 960 tokens only:
-    # K1_SPLIT_RULE_EXCLUDED_TOKENS).  d_out 64 BF16 at d_in 4096 is not faster than the
-    # deterministic plan in every run; d_in 4096 to d_out 512 BF16 (192 CTAs) and to d_out 4096 FP32 (216 CTAs) need
-    # more SMs than a kernel holding 32 SMs leaves free and lose next to it
+    # deterministic package's sm_107a program of the row is slower (the FP32 one-split rows up to 40960 tokens on
+    # 216 SMs, 5120 -> 1024 to 32768, and up to 960 on more SMs: K1_SPLIT_RULE_EXCLUDED_TOKENS).  d_out 64 BF16 at
+    # d_in 4096 is not faster than the deterministic plan in every run; d_in 4096 to d_out 512 BF16 (192 CTAs) and to
+    # d_out 4096 FP32 (216 CTAs) need more SMs than a kernel holding 32 SMs leaves free and lose next to it
     ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
     ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
     ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
@@ -428,19 +435,30 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: or in graph replays).  The 208-SM entry of ``4096 -> 1024`` FP32 at 16384 tokens comes from a later strict
 #: re-measurement of the restored window on a 208-SM R200 part: the deterministic program's plan there (160-wide tiles)
 #: was faster, and the row's program was 14.5 % slower at the operation and left the checkpointed step 6.3 % slower in
-#: graph replays.  The open-ended sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows
-#: ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 961 tokens
-#: (16 K blocks) up, outside the ranges of :data:`K1_CHAIN_RANGES_BY_SM` (which come first).  From there the
-#: deterministic program of these rows cuts the token reduction into units of ``ceil(blocks / 2)`` K blocks and adds the
-#: partials in a fixed order (its automatic two-way split), while their one-split program adds the whole token reduction
-#: of an output in one chain; up to 960 tokens the two give the same bits.  Measured with the 216-SM plan on 212-SM R200
-#: parts (the same program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an
-#: FP64 reference, each row on two parts, 5 seeds, at 512 to 65536 tokens, the one-split program's output met the
-#: deterministic package's FP32 error budget (5e-5) on every seed up to 40960 tokens (1.86e-5 at 16384 tokens, 3.77e-5
-#: at 32768; 2.0 to 2.4 times the deterministic program's error from 961 tokens: reported) and missed it on every seed
-#: from 45056 tokens up (7.6e-5 at 65536 tokens, where the deterministic program's is 3.8e-5).  Its time from 961 to
-#: 40960 tokens on 216-SM parts has not been measured under the rule above, so these entries are unchanged
-#: (qualification on a 216-SM part pending).
+#: graph replays. The open-ended sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows
+#: ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961
+#: tokens up (``5120 -> 1024`` from 32769, below) because their one-split program's FP64 relative Frobenius error
+#: exceeds the deterministic package's FP32 error budget (5e-5) on every seed there.  That program adds the whole token
+#: reduction of an output in one chain, and its error grows about linearly with the token count.  Measured with the
+#: 216-SM plan on 212-SM R200 parts (the same program and accumulation order as on 216 SMs; the error does not depend on
+#: the SM count) against an FP64 reference, each row on two parts, 5 seeds, at 512 to 65536 tokens: within the budget on
+#: every seed up to 40960 tokens (1.86e-5 at 16384 tokens, 3.77e-5 at 32768) and above it on every seed from 45056
+#: tokens up (7.6e-5 at 65536 tokens, where the deterministic program's is 3.8e-5).  The range has no upper bound: the
+#: error keeps growing with the token count.  The token counts between 40960 and 45056 run the deterministic program too
+#: (not measured).  From 961 tokens (16 K blocks) up the deterministic program of these rows cuts the token reduction
+#: into units of ``ceil(blocks / 2)`` K blocks and adds the partials in a fixed order (its automatic two-way split);
+#: there the one-split program's error is 2.0 to 2.4 times the deterministic program's (reported); up to 960 tokens the
+#: two give the same bits.  A later strict re-measurement on a 216-SM R200 part, each failure reproduced in a second
+#: run, moved two more token ranges to the deterministic program on 216-SM parts: ``5120 -> 1024`` from 32769 tokens
+#: up, whose one-split program left the checkpointed step 1.6 to 5.3 % slower at 36864 and 40960 tokens (eager launches
+#: or graph replays; the weight gradient itself took 0.87 to 0.92 times the deterministic program's time, and the output
+#: met the FP32 budget), while it kept the rule and the 1.3 % bound at 16385 to 32768 tokens; and ``4096 -> 1024`` at
+#: 16384 tokens, where its 216-SM override (:data:`K1_SPLIT_OVERRIDES_BY_SM`) failed the rule above in 4 and then 5 of
+#: its 8 cells (two launch layouts in both orders, eager launches and graph replays; median time ratios 0.982 to 0.995
+#: there).  The 217-SM entries keep the four rows on the deterministic program from 961 tokens up on parts of more than
+#: 216 SMs, the route they took before that measurement: the one-split program's time at 961 to 40960 tokens was
+#: measured on 216-SM parts only (where the ranges of :data:`K1_CHAIN_RANGES_BY_SM` come first), and no part of more
+#: SMs was measured.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -484,10 +502,12 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
         (216, 16384, 16384),
     ),
     ("sm_107a", 1, 4096, 512, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384), (216, 961, None),
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
+        (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
     ("sm_107a", 1, 4096, 1024, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 961, None),
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
+        (216, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
     ("sm_107a", 1, 5120, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 32, "f32"): ((216, 512, 512),),
@@ -499,9 +519,11 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
         (208, 16231, 16231), (212, 16231, 16231), (216, 512, 512), (216, 16231, 16231),
         (216, 16384, 16384),
     ),
-    ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384), (216, 961, None)),
+    ("sm_107a", 1, 5120, 512, "f32"): (
+        (212, 16231, 16231), (212, 16384, 16384), (216, 40961, None), (217, 961, None),
+    ),
     ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
-    ("sm_107a", 1, 5120, 1024, "f32"): ((216, 961, None),),
+    ("sm_107a", 1, 5120, 1024, "f32"): ((216, 32769, None), (217, 961, None)),
     ("sm_107a", 1, 6144, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 8192, 128, "bf16"): ((216, 512, 512), (216, 65536, 65536)),
     ("sm_107a", 1, 8192, 128, "f32"): ((216, 512, 512), (216, 65536, 65536)),
@@ -587,12 +609,12 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
 #: checkpointed step 2.0 to 2.3 % slower in graph replays at 16173 tokens (two measurements), the backward pass 1.6 and
 #: 2.0 % slower in eager launches at 20481 and 28673 tokens, and failed the K1 rule in one of 8 groups at 18433 tokens,
 #: while it kept the rule and the 1.3 % bound at 1025, 4097, 6145, 8193, 10241, 12289 and 14337 tokens.  sm_107a
-#: ``8192 -> 128`` FP32 (two splits on 212 and 216 SMs) has an entry from 216 SMs up only: at an odd block count from
+#: ``8192 -> 128`` FP32 (two splits on 212 and 216 SMs) has an entry from 217 SMs up only: at an odd block count from
 #: 1025 to 8192 tokens, where its deterministic program's two-way split runs while one wave's operands fit the L2 (to
 #: 7808 tokens with 126 MiB of L2, to between 4097 and 8192 tokens on a 212-SM R200), its output differs from the
-#: deterministic program's and met the FP32 budget on every seed (10 seeds on 212-SM parts with the 212-SM and the
-#: 216-SM plan; an error 1.04 to 1.14 times the deterministic program's at 1025 to 4097 tokens: reported), and its time
-#: there was measured on 212-SM parts only.
+#: deterministic program's and met the FP32 budget on every seed (10 seeds; an error 1.04 to 1.14 times the
+#: deterministic program's at 1025 to 4097 tokens: reported), and its time there was measured on 212-SM and 216-SM parts
+#: only, so parts of more SMs keep the deterministic program there (the route they took before the 216-SM measurement).
 # fmt: off
 K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -604,7 +626,7 @@ K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS: dict[
     ("sm_100a", 1, 5120, 48, "f32"): ((148, 65538, None),),
     ("sm_103a", 1, 4096, 32, "f32"): ((148, 65538, None),),
     ("sm_103a", 1, 4096, 48, "f32"): ((152, 14338, 32767), (152, 65538, None)),
-    ("sm_107a", 1, 8192, 128, "f32"): ((216, 1025, 8192),),
+    ("sm_107a", 1, 8192, 128, "f32"): ((217, 1025, 8192),),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
@@ -790,13 +812,21 @@ K1_TWO_SPLIT_RANGES_BY_SM: dict[
 #: :data:`K1_SPLIT_RULES`, measured on parts of exactly that SM count under the same rule, in two jobs on different
 #: parts), at the token counts of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of
 #: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part.  Every other token count, every other SM count and every row
-#: without an entry keep the verdict of :data:`K1_SPLIT_RULES`.  No part has an entry: the one measured verdict, the
-#: 192-wide one-split program of ``4096 -> 1024`` FP32 on 216 SMs, lies inside the row's 216-SM entry of
-#: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` (from 961 tokens up), and the row runs the deterministic program at these token
-#: counts.
+#: without an entry keep the verdict of :data:`K1_SPLIT_RULES`.  On 216 SMs ``4096 -> 1024`` FP32 takes the 192-wide
+#: row-major program at one split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave next to a
+#: kernel holding 32 SMs), which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile; at 16231 and
+#: 16384 tokens the row runs the deterministic program (its entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`; 16384: a
+#: strict re-measurement on a 216-SM part), and at 16172 tokens the three-chain program of
+#: :data:`K1_CHAIN_RANGES_BY_SM`.
+# fmt: off
 K1_SPLIT_OVERRIDES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
-] = {}
+] = {
+    ("sm_107a", 216): {
+        ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
+    },
+}
+# fmt: on
 #: Token ranges at which a row runs this package's one-split program with several accumulation chains on the parts of
 #: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, chains)), ...)}`` (keys as in
 #: :data:`K1_SPLIT_RULES`): a token count from ``min_tokens`` to ``max_tokens`` runs the program of that tile width at
@@ -820,8 +850,8 @@ K1_SPLIT_OVERRIDES_BY_SM: dict[
 #: SMs, nor are ``4096 -> 512`` and ``4096 -> 1024`` at 16231 and 16384 tokens on 216 SMs; ``4096 -> 1024`` at 16384
 #: tokens on 212 SMs (in one of the two jobs) and ``5120 -> 1024`` at 32768 tokens on 216 SMs left the checkpointed step
 #: more than 1.3 % slower than the deterministic program.  Outside these ranges the rows keep the routing of the tables
-#: above (on 216 SMs and up the one-chain program up to 960 tokens and the deterministic program from 961 tokens
-#: up: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`).
+#: above (on 216 SMs the one-chain program up to 40960 tokens, on more SMs up to 960 tokens, except the token counts
+#: of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`).
 # fmt: off
 K1_CHAIN_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -1011,6 +1041,75 @@ def k1_block_n(N: int) -> int:
     :data:`K1_BLOCK_N_CHOICES` that pads ``N`` least (the wider tile on a tie)."""
     widths = [bn for bn in K1_BLOCK_N_CHOICES if bn not in K1_ROW_MAJOR_BLOCK_N]
     return min(widths, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
+
+
+#: The deterministic package's planner knobs of its single-CTA program for a forward row: one 128-row tile per CTA
+#: (``cta1``, no CTA pair), 128-wide column tiles and no TMA cache hints -- every output tile over the whole K, no
+#: split of K (the program ``kk_n128_c1`` of that package).
+K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
+    "cta1": True,
+    "block_n": 128,
+    "hints": ("none", "none"),
+}
+#: The K1 forward rows of ``deterministic=False`` that run another plan of the deterministic package's programs than
+#: its own plan of the row, ``(arch, sm_count) -> {(K, N, T): knobs}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`projection_forward` of ``X[T, K]`` and ``W[N, K]`` (both K-major) into a BF16 ``out`` of exactly these ``K``,
+#: ``N`` and ``T`` runs the program the deterministic planner gives the row with these knobs (:func:`k1_forward_knobs`);
+#: every other part, row, token count, layout and output dtype runs the deterministic plan.  On 152-SM ``sm_100a`` and
+#: ``sm_103a`` parts the deterministic plan of these rows splits K two ways over CTA pairs of 256-wide tiles (stream-K,
+#: the partials added in a fixed order); the single-CTA program (:data:`K1_FORWARD_SINGLE_CTA_KNOBS`) keeps every tile's
+#: whole K in one CTA, so a forward still repeats bit for bit and a recomputed forward reproduces its result, with other
+#: bits than ``deterministic=True`` (within the deterministic package's BF16 budget against FP64).  Measured at exactly
+#: these token counts (no other token count, SM count or row): the single op faster than the deterministic plan in every
+#: run (a one-sided paired sign test, p < 0.05, median ratio below 0.99, eager and CUDA graph), no more than 3 % slower
+#: than it next to a kernel holding 8, 16 or 32 SMs on another stream, and the training steps that contain the forward
+#: (forward + backward, 2 x forward + backward with an FP32 and with a BF16 weight gradient) no slower than with the
+#: deterministic plan: the median over every run of the paired step-time ratio at most 1.013, eager and CUDA graph
+#: separately, and no run above the largest ratio of the deterministic plan against itself in the same runs.
+#: Not in the table: ``4096 -> 512`` at 4096 tokens (next to a kernel holding 32 SMs it was up to 4.7 % slower), and
+#: ``4096 -> 512`` at 3072 tokens on both parts and ``5120 -> 512`` at 4096 tokens on ``sm_103a`` (in one run a training
+#: step with eager launches was further above the deterministic plan than that plan against itself).
+K1_FORWARD_RULES_BY_SM: dict[
+    tuple[str, int], dict[tuple[int, int, int], dict[str, Any]]
+] = {
+    ("sm_100a", 152): {
+        (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (5120, 512, 4096): K1_FORWARD_SINGLE_CTA_KNOBS,
+    },
+    ("sm_103a", 152): {
+        (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
+    },
+}
+
+
+def k1_forward_knobs(*, arch: str, sm_count: int, K: int, N: int, T: int) -> tuple:
+    """The deterministic package's planner knobs of the forward ``out[T, N] = X[T, K] @ W[N, K].T`` (both operands
+    K-major, BF16 ``out``) with ``deterministic=False`` on a device of exactly ``sm_count`` SMs: the row's entry in
+    the table of :data:`K1_FORWARD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens, as sorted
+    ``(name, value)`` pairs, or ``()`` -- the deterministic plan."""
+    knobs = K1_FORWARD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(K), int(N), int(T))
+    )
+    return tuple(sorted(knobs.items())) if knobs else ()
+
+
+def _k1_forward_knobs_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> tuple:
+    """:func:`k1_forward_knobs` of the forward call ``(X, W, out)`` on ``out``'s device; ``()`` (the deterministic
+    plan) without a row of :data:`K1_FORWARD_RULES_BY_SM` of the call's shape, for an operand that is not K-major and
+    for an ``out`` that is not BF16.  The device is read only for a shape of the table."""
+    if X.dim() != 2 or W.dim() != 2:
+        return ()
+    K, N, T = int(X.shape[1]), int(W.shape[0]), int(X.shape[0])
+    if not any((K, N, T) in rows for rows in K1_FORWARD_RULES_BY_SM.values()):
+        return ()
+    if X.stride(1) != 1 or W.stride(1) != 1 or out.dtype != torch.bfloat16:
+        return ()
+    facts = deterministic_backend().device_facts(out.device)
+    if facts.arch is None:
+        return ()
+    return k1_forward_knobs(arch=facts.arch, sm_count=facts.sm_count, K=K, N=N, T=T)
 
 
 def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
@@ -3155,6 +3254,13 @@ def _atomic_k2(
 # cached launch of ``_K2_SPLITK_CACHE`` / ``_K2_ATOMIC_CACHE`` that the entry point's path takes for the key and the
 # router-table memo and route it was routed under, so a call goes from its key to the bound launch.  After a launch
 # that did not complete, :func:`clear_convenience_caches` drops the arenas (fresh tickets on the next call).
+#
+# CUDA graphs.  A cached launch captured into a CUDA graph replays the workspace pointers it was bound with, so no
+# buffer of an arena is freed before :func:`clear_convenience_caches` (or :func:`use_deterministic_backend`) drops the
+# arenas: a growth retires the buffer it replaces into the arena (:class:`_AtomicArena`) instead of releasing it, and
+# an entry evicted from the caches leaves its arena in ``_ATOMIC_ARENAS``.  A captured graph therefore stays valid
+# until that call, which invalidates it.  The calls this path hands to the deterministic package's convenience path
+# keep that package's contract.
 
 #: workspace kind -> (dtype, zeroed when allocated)
 _ATOMIC_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
@@ -3180,14 +3286,22 @@ _ATOMIC_ARENA_MIN_ELEMS = 16
 @dataclass
 class _AtomicArena:
     """The workspace of every cached launch of this package on one (device index, raw stream): one buffer per kind
-    of ``_ATOMIC_ARENA_KINDS``, grown to the largest requirement seen and never shrunk (the deterministic package's
-    ``_Arena`` contract; a zeroed kind is allocated with ``torch.zeros`` on the current stream)."""
+    of ``_ATOMIC_ARENA_KINDS``, grown and never shrunk, as the deterministic package's ``_Arena`` (a zeroed kind is
+    allocated with ``torch.zeros`` on the current stream).
+
+    Unlike that arena, a growth retires the buffer it replaces (``retired``) instead of releasing it: a launch captured
+    into a CUDA graph replays the pointer it was bound with, and a launch in flight keeps using it, so every buffer of
+    the arena stays allocated until :func:`clear_convenience_caches` drops the arena.  A retired buffer keeps its zero
+    contract: the launches bound to it leave its tickets and counters zero.  A growth at least doubles the buffer, so
+    the buffers a kind retires hold fewer bytes than its live one, and a kind grows at most
+    ``ceil(log2(largest requirement / _ATOMIC_ARENA_MIN_ELEMS))`` times."""
 
     device: torch.device
     key: tuple[int, int]
     buffers: dict[str, torch.Tensor] = field(default_factory=dict, repr=False)
+    # the buffers growths replaced, kept for the launches (CUDA graphs) bound to them
+    retired: list[torch.Tensor] = field(default_factory=list, repr=False)
     version: int = 0
-    refs: int = 0
     lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -3196,24 +3310,32 @@ class _AtomicArena:
     stream_context: Any = field(default=None, repr=False, compare=False)
 
     def require(self, kind: str, numel: int) -> torch.Tensor:
-        """The buffer of ``kind`` with at least ``numel`` elements, grown when the present one is smaller (called
-        when an entry is planned, under ``_ATOMIC_PLAN_LOCK``); monotone."""
+        """The buffer of ``kind`` with at least ``numel`` elements, grown to at least twice the present one's when
+        that is smaller (called when an entry is planned, under ``_ATOMIC_PLAN_LOCK``; the replaced buffer is
+        retired); monotone."""
         buf = self.buffers.get(kind)
         numel = max(int(numel), _ATOMIC_ARENA_MIN_ELEMS)
         if buf is None or buf.numel() < numel:
+            if buf is not None:
+                numel = max(numel, 2 * buf.numel())
             dtype, zeroed = _ATOMIC_ARENA_KINDS[kind]
             new = (torch.zeros if zeroed else torch.empty)(
                 numel, device=self.device, dtype=dtype
             )
             buf = self.buffers.get(kind)
             if buf is None or buf.numel() < new.numel():
+                if buf is not None:
+                    self.retired.append(buf)
                 buf = self.buffers[kind] = new
             self.version += 1
         return buf
 
     def nbytes(self) -> int:
-        """Bytes the arena holds (every kind)."""
-        return sum(int(b.numel()) * b.element_size() for b in self.buffers.values())
+        """Bytes the arena holds (every kind, its live and its retired buffers)."""
+        return sum(
+            int(b.numel()) * b.element_size()
+            for b in (*self.buffers.values(), *self.retired)
+        )
 
 
 _ATOMIC_ARENAS: dict[tuple[int, int], _AtomicArena] = {}
@@ -3470,19 +3592,6 @@ class _CachedAtomic:
     memo: Any = field(default=None, repr=False)
 
 
-def _release_atomic_entry(
-    entry: Union[_CachedAtomic, _CachedSplitK2, _CachedDetK1, _CachedK2Entry],
-) -> None:
-    """``on_evict`` of the convenience caches: the arena of an evicted entry loses a reference and is released when
-    no cached entry uses it any more."""
-    arena = entry.arena
-    if arena is None:
-        return
-    arena.refs -= 1
-    if arena.refs <= 0 and _ATOMIC_ARENAS.get(arena.key) is arena:
-        del _ATOMIC_ARENAS[arena.key]
-
-
 #: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K2_ATOMIC_CACHE`,
 #: :data:`_K2_SPLITK_CACHE`, :data:`_K2_ENTRY_CACHE`).
 _CacheEntry = TypeVar(
@@ -3493,12 +3602,10 @@ _CacheEntry = TypeVar(
 def _cache_insert(
     cache: "OrderedDict[tuple, Any]", key: tuple, entry: _CacheEntry
 ) -> _CacheEntry:
+    """Insert ``entry`` under ``key`` (the deterministic package's ``_cache_put`` with its ``CONVENIENCE_CACHE_SIZE``
+    bound).  An evicted entry leaves its arena in ``_ATOMIC_ARENAS``: a CUDA graph may still replay its launch."""
     det = deterministic_backend()
-    if entry.arena is not None:
-        entry.arena.refs += 1
-    return det._cache_put(
-        cache, key, entry, det.CONVENIENCE_CACHE_SIZE, _release_atomic_entry
-    )
+    return det._cache_put(cache, key, entry, det.CONVENIENCE_CACHE_SIZE)
 
 
 def _k1_key(
@@ -4641,7 +4748,8 @@ def _k2_entry(
 
 def _drop_convenience_entries() -> None:
     """Drop this package's cached convenience-path launches, what the convenience path keeps from the router tables
-    (:func:`_router_memo`) and this package's workspace arenas."""
+    (:func:`_router_memo`) and this package's workspace arenas with their retired buffers: a CUDA graph that captured
+    a convenience-path launch of this package must not replay afterwards."""
     global _ROUTER_MEMO
     with _ATOMIC_PLAN_LOCK:
         _K1_ATOMIC_CACHE.clear()
@@ -4657,7 +4765,15 @@ def _drop_convenience_entries() -> None:
 def clear_convenience_caches() -> None:
     """Drop every cached convenience-path launch, what the convenience path keeps from the router tables
     (:func:`_router_memo`) and every workspace arena of both packages (this package's launches and the deterministic
-    package's)."""
+    package's).  This invalidates every CUDA graph that captured a convenience-path call: its replay would use freed
+    workspace, so capture such graphs again after it.  A captured ``deterministic=False`` convenience-path call that
+    this package launches from its arenas (its programs, and the deterministic programs it launches through its
+    binding) stays valid until then: its arena keeps every buffer a launch was bound to, through growths and cache
+    evictions.  A call this package hands to the deterministic package's convenience path (launch views its binding
+    cannot rebuild from the call's tensors, such as two operands that alias; a batched forward on that package's
+    swapped small-token program; ``torch.use_deterministic_algorithms(True, warn_only=True)``) follows that package's
+    rule: a CUDA graph captures its prepared launch, not its convenience path.  The graphs captured on one stream share
+    its arena: replay them one at a time, and not concurrently with calls on that stream."""
     _drop_convenience_entries()
     deterministic_backend().clear_convenience_caches()
 
@@ -4852,10 +4968,12 @@ def projection_forward(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic program in both modes (a
-    recomputed forward must reproduce its result; where the deterministic plan splits K across CTAs, it adds the
-    partials in a fixed order); with ``deterministic=False`` through this package's binding of it (:func:`_det_k1`: the
-    same plan, program and bits).
+    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic package's programs in both modes
+    (a recomputed forward must reproduce its result; where the deterministic plan splits K across CTAs, it adds the
+    partials in a fixed order); with ``deterministic=False`` through this package's binding of them (:func:`_det_k1`):
+    the deterministic plan, program and bits, except on a row of :data:`K1_FORWARD_RULES_BY_SM` for the device, which
+    runs the program the deterministic planner gives it with the table's knobs (:func:`k1_forward_knobs`; other bits,
+    still the same on every run).
     ``enable_pdl`` as for :func:`dense_projection_gemm`."""
     if _resolve_deterministic(deterministic, "projection_forward"):
         return _det_entry("projection_forward")(X, W, out, **_pdl_kw(enable_pdl))
@@ -4869,7 +4987,7 @@ def projection_forward(
     return _det_k1(
         (X, W, o),
         ("fwd",),
-        lambda: (X, W.t(), o, False, ()),
+        lambda: (X, W.t(), o, False, _k1_forward_knobs_of(X, W, o)),
         lambda: _det_entry("projection_forward")(X, W, o, **_pdl_kw(enable_pdl)),
         enable_pdl,
     )
