@@ -1685,3 +1685,394 @@ def test_paged_rejects_bad_slots(entry, bad):
             gated_delta_rule_decode_paged(
                 q, k, v, A_log, a, dt_bias, b, state_pool=pool, slots=slots, **tables
             )
+
+
+# ── SM120 state rows as element pairs ─────────────────────────────────────────
+#
+# On SM120 a slot call (``output_state_indices``, ``checkpoint_state_indices``
+# or ``prefix_lens``) reads the initial state and writes the final state and
+# the pool-row checkpoints of dense [H, V, K] rows as 2-element vector accesses
+# when every row is aligned to two elements or more (``checkpoint_row_align``
+# of the tensor, part of the compile key), and element by element otherwise.
+# Both give the same bits.
+
+_FP8_STATE_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
+# Relative error over a tensor of fp8 states (3 and 2 mantissa bits) and of
+# the outputs that read them.
+_FP8_REL_TOL = {torch.float8_e4m3fn: 0.1, torch.float8_e5m2: 0.2}
+
+
+def _skip_unless_sm120():
+    _skip_if_unsupported()
+    if get_compute_capability(torch.device("cuda"))[0] != 12:
+        pytest.skip(
+            "covers the SM120 choice of element-pair or element-wise state rows"
+        )
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (
+        a.dtype == b.dtype
+        and a.shape == b.shape
+        and torch.equal(
+            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+        )
+    )
+
+
+def _guard_value(dtype):
+    """``GUARD`` where the dtype holds it (float8_e4m3fn tops out at 448)."""
+    return 256.0 if dtype.itemsize == 1 else GUARD
+
+
+class AlignedPool:
+    """``rows`` state rows ``H * V * K + row_pad`` elements apart from a
+    16-byte aligned base: ``row_pad`` sets the alignment of every row
+    (``checkpoint_row_align``), 1, 2, 4, ... elements, or 16 bytes with
+    ``row_pad = 0``. The row padding and at least one row of elements before
+    and after the rows hold ``guard``."""
+
+    def __init__(self, rows, num_heads, dtype, row_pad, guard):
+        self.rows = rows
+        self.row = num_heads * HEAD_SIZE * HEAD_SIZE
+        self.stride = self.row + row_pad
+        self.guard = guard
+        per_16_bytes = 16 // dtype.itemsize
+        self.lead = -(-self.stride // per_16_bytes) * per_16_bytes
+        self.end = self.lead + rows * self.stride
+        self.storage = torch.full((self.end + self.stride,), guard, device="cuda").to(
+            dtype
+        )
+        self.pool = self.storage.as_strided(
+            (rows, num_heads, HEAD_SIZE, HEAD_SIZE),
+            (self.stride, HEAD_SIZE * HEAD_SIZE, HEAD_SIZE, 1),
+            self.lead,
+        )
+
+    def assert_guards(self):
+        rows = self.storage[self.lead : self.end].view(self.rows, self.stride)
+        for name, part in (
+            ("before row 0", self.storage[: self.lead]),
+            ("the row padding", rows[:, self.row :]),
+            ("past the last row", self.storage[self.end :]),
+        ):
+            full = torch.full(part.shape, self.guard, device="cuda").to(part.dtype)
+            assert _same_bits(part, full), f"wrote {name}"
+
+
+def _check_against_oracle(state_dtype, actual, expected, *, msg, output=False):
+    """Outputs at 1e-2 and states as ``_assert_state``, like the tests above.
+    With an fp8 state both are checked by their relative error over the
+    tensor: one rounding step of a 2- or 3-bit mantissa is larger than an
+    element-wise tolerance that still tells a wrong row from the right one."""
+    if state_dtype in _FP8_REL_TOL:
+        a, e = actual.float(), expected.float()
+        rel = ((a - e).norm() / e.norm()).item()
+        assert rel < _FP8_REL_TOL[state_dtype], f"{msg}: relative error {rel:.3e}"
+    elif output:
+        torch.testing.assert_close(
+            actual.float(),
+            expected.float(),
+            atol=1e-2,
+            rtol=1e-2,
+            msg=lambda m: f"{msg}: {m}",
+        )
+    else:
+        _assert_state(actual, expected, msg=msg)
+
+
+# Sequence 0 starts from zero (no prefix, read row -1), sequence 1 reads and
+# writes row 3 (a partial page updated in place), sequence 2 skips its final
+# state, sequence 3 has no new token (its write row 10 keeps its contents)
+# and sequence 4 ends on a 64-token boundary.
+_PAIR_PREFIX = [0, 70, 128, 50, 37]
+_PAIR_NEW = [130, 64, 200, 0, 91]
+_PAIR_READ = [-1, 3, 5, 8, 2]
+_PAIR_WRITE = [1, 3, -1, 10, 6]
+# 64-token checkpoints at absolute positions, 2 + 1 + 3 + 0 + 2 entries: the
+# first block of sequences 0, 2 and 4 stores one (sequence 1's is skipped),
+# the block runs of sequences 0 and 2 store the next ones, and the last block
+# of sequence 4 stores the one at token 128.
+_PAIR_CKPT = [0, 4, -1, 7, 9, 11, 12, 13]
+
+
+@pytest.mark.parametrize(
+    "state_dtype",
+    [torch.float32, torch.bfloat16, torch.float16, *_FP8_STATE_DTYPES],
+)
+def test_sm120_slot_state_rows_at_every_alignment(state_dtype):
+    """Slot calls on pools whose rows are aligned to every power of two from
+    one element to 16 bytes, in one process: element pairs and element-wise
+    access give the same bits for the initial state, the final state and the
+    pool-row checkpoints, also with initial, final and checkpoint pools of
+    different alignments. The last call returns to the first call's pools
+    (each alignment compiles its own kernel) and reproduces its result.
+    Then ``output_state_indices`` alone, at 16 bytes and at one element."""
+    from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
+        checkpoint_row_align,
+    )
+
+    _skip_unless_sm120()
+    random.seed(14)
+    torch.manual_seed(14)
+    prefix, new = _PAIR_PREFIX, _PAIR_NEW
+    totals = [p + n for p, n in zip(prefix, new, strict=True)]
+    streams = Streams(totals, 4, 4, 4, torch.bfloat16)
+    _, prefix_final, _ = _oracle(streams, prefix, state_dtype)
+    ref_out, ref_final, ref_ckpts = _oracle(streams, totals, state_dtype)
+    q, k, v, g, beta = streams.slices(prefix, totals)
+    counts = [(p + n) // CHUNK - p // CHUNK for p, n in zip(prefix, new, strict=True)]
+    # Rows written: final states (row -> sequence) and checkpoints (row ->
+    # (sequence, absolute position)).
+    finals = {row: b for b, row in enumerate(_PAIR_WRITE) if row >= 0 and new[b]}
+    entries = iter(_PAIR_CKPT)
+    ckpts = {}
+    for b, p in enumerate(prefix):
+        for j in range(counts[b]):
+            row = next(entries)
+            if row >= 0:
+                ckpts[row] = (b, (p // CHUNK + 1 + j) * CHUNK)
+
+    num_rows = 16
+    content = torch.randn(num_rows, 4, HEAD_SIZE, HEAD_SIZE, device="cuda").to(
+        state_dtype
+    )
+    for b, row in enumerate(_PAIR_READ):
+        if row >= 0:
+            content[row] = prefix_final[b]
+    guard = _guard_value(state_dtype)
+    max_align = 16 // state_dtype.itemsize
+
+    def call(aligns, one_pool, checkpoints=True):
+        """Initial, final and checkpoint pools with rows aligned to
+        ``aligns`` (one pool for all three: ``one_pool``)."""
+
+        def make_pool(align):
+            pool = AlignedPool(
+                num_rows, 4, state_dtype, 0 if align == max_align else align, guard
+            )
+            pool.pool.copy_(content)
+            assert checkpoint_row_align(pool.pool) == align
+            return pool
+
+        if one_pool:
+            init = out_pool = ckpt_pool = make_pool(aligns[0])
+        else:
+            init, out_pool, ckpt_pool = (make_pool(a) for a in aligns)
+        kwargs = {}
+        if checkpoints:
+            kwargs = dict(
+                state_checkpoints=ckpt_pool.pool,
+                checkpoint_cu_starts=_cu(counts, "cuda"),
+                checkpoint_every_n_tokens=CHUNK,
+                checkpoint_state_indices=_idx(_PAIR_CKPT, 32),
+                prefix_lens=_idx(prefix, 32),
+            )
+        guarded_out, out = _guarded_output(sum(new), 4, torch.bfloat16)
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            init.pool,
+            True,
+            _cu(new, "cuda"),
+            output_state=out_pool.pool,
+            state_indices=_idx(_PAIR_READ, 32),
+            output_state_indices=_idx(_PAIR_WRITE, 32),
+            output=out,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        label = f"{state_dtype} rows aligned to {aligns}" + (
+            " in one pool" if one_pool else ""
+        )
+        _assert_output_guard(guarded_out)
+        written = {}
+        for pool, rows in (
+            (init, ()),
+            (out_pool, finals),
+            (ckpt_pool, ckpts if checkpoints else ()),
+        ):
+            written.setdefault(id(pool), (pool, set()))[1].update(rows)
+        for pool, rows in written.values():
+            pool.assert_guards()
+            for row in range(num_rows):
+                if row not in rows:
+                    assert _same_bits(pool.pool[row], content[row]), (
+                        f"{label}: row {row} changed"
+                    )
+        # Every row holds its content, a final state or a checkpoint.
+        merged = content.clone()
+        for row in finals:
+            merged[row] = out_pool.pool[row]
+        if checkpoints:
+            for row in ckpts:
+                merged[row] = ckpt_pool.pool[row]
+        return out, merged, label
+
+    # Row alignments in elements: 16 bytes, then 1, 2, 4, ... below it.
+    aligns = [max_align] + [1 << i for i in range(max_align.bit_length() - 1)]
+    n = len(aligns)
+    layouts = (
+        [((max_align,) * 3, True), ((1,) * 3, True)]
+        # Each alignment once as the initial, final and checkpoint pool's.
+        + [(tuple(aligns[(i + j) % n] for j in range(3)), False) for i in range(n)]
+        + [((max_align,) * 3, True)]
+    )
+    first = None
+    for layout, one_pool in layouts:
+        out, merged, label = call(layout, one_pool)
+        if first is None:
+            first = out, merged
+            continue
+        assert _same_bits(out, first[0]), f"{label}: output"
+        assert _same_bits(merged, first[1]), f"{label}: states"
+
+    ref_rows = torch.cat(
+        [
+            torch.arange(s + p, s + t)
+            for s, p, t in zip(streams.starts[:-1], prefix, totals, strict=True)
+        ]
+    ).cuda()
+    out, merged = first
+    _check_against_oracle(
+        state_dtype, out, ref_out[ref_rows], msg="output", output=True
+    )
+    for row, b in finals.items():
+        _check_against_oracle(
+            state_dtype, merged[row], ref_final[b], msg=f"seq {b} final"
+        )
+    for row, (b, position) in ckpts.items():
+        _check_against_oracle(
+            state_dtype,
+            merged[row],
+            ref_ckpts[b][position // CHUNK - 1],
+            msg=f"seq {b} @{position}",
+        )
+
+    # output_state_indices alone (no checkpoints, no prefix_lens).
+    (out, merged, _), (out_1, merged_1, _) = (
+        call((align,) * 3, True, checkpoints=False) for align in (max_align, 1)
+    )
+    assert _same_bits(out_1, out), "output_state_indices alone: output"
+    assert _same_bits(merged_1, merged), "output_state_indices alone: states"
+    _check_against_oracle(
+        state_dtype, out, ref_out[ref_rows], msg="no checkpoints: output", output=True
+    )
+    for row, b in finals.items():
+        _check_against_oracle(
+            state_dtype, merged[row], ref_final[b], msg=f"no checkpoints: seq {b}"
+        )
+
+
+@pytest.mark.parametrize(
+    "state_dtype", [torch.bfloat16, torch.float16, *_FP8_STATE_DTYPES]
+)
+def test_sm120_packed_slot_states_match_pool_rows(state_dtype):
+    """``prefix_lens`` with packed per-sequence initial and final states of a
+    2- or 1-byte dtype (no ``state_indices``), whose rows SM120 reads and
+    writes as element pairs: against the oracle, and bit for bit against the
+    same call on pool rows aligned to one element (element by element).
+    Sequence 2 has no prefix; sequence 3 has no new token and keeps its final
+    state."""
+    from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
+        checkpoint_row_align,
+    )
+
+    _skip_unless_sm120()
+    random.seed(15)
+    torch.manual_seed(15)
+    prefix = [100, 64, 0, 37]
+    new = [200, 192, 130, 0]
+    totals = [p + n for p, n in zip(prefix, new, strict=True)]
+    num_seqs = len(prefix)
+    streams = Streams(totals, 4, 4, 4, torch.bfloat16)
+    _, prefix_final, _ = _oracle(streams, prefix, state_dtype)
+    ref_out, ref_final, ref_ckpts = _oracle(streams, totals, state_dtype)
+    q, k, v, g, beta = streams.slices(prefix, totals)
+    N = 128
+    counts = [(p + n) // N - p // N for p, n in zip(prefix, new, strict=True)]
+    filler = torch.randn(num_seqs, 4, HEAD_SIZE, HEAD_SIZE, device="cuda").to(
+        state_dtype
+    )
+    guard = _guard_value(state_dtype)
+    pool_rows = [4, 0, 2, 5]
+
+    def call(packed):
+        rows = list(range(num_seqs)) if packed else pool_rows
+        num_rows, row_pad = (num_seqs, 0) if packed else (6, 1)
+        init = AlignedPool(num_rows, 4, state_dtype, row_pad, guard)
+        final = AlignedPool(num_rows, 4, state_dtype, row_pad, guard)
+        for b, row in enumerate(rows):
+            init.pool[row] = prefix_final[b]
+            final.pool[row] = filler[b]
+        assert init.pool.is_contiguous() == packed
+        assert checkpoint_row_align(init.pool) == (
+            16 // state_dtype.itemsize if packed else 1
+        )
+        ckpts = torch.zeros(sum(counts), 4, HEAD_SIZE, HEAD_SIZE, device="cuda").to(
+            state_dtype
+        )
+        guarded_out, out = _guarded_output(sum(new), 4, torch.bfloat16)
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            init.pool,
+            True,
+            _cu(new, "cuda"),
+            output_state=final.pool,
+            state_checkpoints=ckpts,
+            checkpoint_cu_starts=_cu(counts, "cuda"),
+            checkpoint_every_n_tokens=N,
+            state_indices=None if packed else _idx(pool_rows, 32),
+            prefix_lens=_idx(prefix, 32),
+            output=out,
+        )
+        torch.cuda.synchronize()
+        _assert_output_guard(guarded_out)
+        init.assert_guards()
+        final.assert_guards()
+        for b, row in enumerate(rows):
+            assert _same_bits(init.pool[row], prefix_final[b]), f"seq {b} init"
+        return out, [final.pool[row].clone() for row in rows], ckpts
+
+    (out, finals, ckpts), (out_1, finals_1, ckpts_1) = call(True), call(False)
+    assert _same_bits(out_1, out), "output"
+    for b in range(num_seqs):
+        assert _same_bits(finals_1[b], finals[b]), f"seq {b} final"
+    assert _same_bits(ckpts_1, ckpts), "checkpoints"
+
+    ref_rows = torch.cat(
+        [
+            torch.arange(s + p, s + t)
+            for s, p, t in zip(streams.starts[:-1], prefix, totals, strict=True)
+        ]
+    ).cuda()
+    _check_against_oracle(
+        state_dtype, out, ref_out[ref_rows], msg="output", output=True
+    )
+    for b in range(num_seqs):
+        if new[b]:
+            _check_against_oracle(
+                state_dtype, finals[b], ref_final[b], msg=f"seq {b} final"
+            )
+        else:
+            assert _same_bits(finals[b], filler[b]), f"seq {b} final changed"
+    row = 0
+    for b in range(num_seqs):
+        for j in range(counts[b]):
+            position = (prefix[b] // N + 1 + j) * N
+            _check_against_oracle(
+                state_dtype,
+                ckpts[row],
+                ref_ckpts[b][position // CHUNK - 1],
+                msg=f"seq {b} @{position}",
+            )
+            row += 1

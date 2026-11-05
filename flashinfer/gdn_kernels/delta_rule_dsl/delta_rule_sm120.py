@@ -149,6 +149,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         checkpoint_state_indices_dtype: torch.dtype | None = None,
         prefix_lens_dtype: torch.dtype | None = None,
         checkpoint_row_align: int | None = None,
+        state_row_align: int | None = None,
+        init_state_row_align: int | None = None,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -174,6 +176,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             prefix_lens_dtype,
             checkpoint_row_align,
         )
+        # Alignment in elements of the dense [H, D, D] rows of the state and
+        # initial state of the slot paths (None: element-wise access).
+        self.state_row_align = state_row_align
+        self.init_state_row_align = init_state_row_align
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -200,6 +206,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             "state_inner_strides",
             "init_state_inner_strides",
             *self.SLOT_KEY_ATTRS,
+            "state_row_align",
+            "init_state_row_align",
             "inverse_dtype",
             "BLK_Q",
             "BLK_KV",
@@ -820,6 +828,69 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 v0, k0 = coords[2 * j]
                 v1, k1 = coords[2 * j + 1]
                 assert v1 == v0 and k1 == k0 + 1 and k0 % 2 == 0, (t, j)
+
+    @cute.jit
+    def kv_load_pairs(
+        self,
+        tKVrKV: cute.Tensor,
+        gKV: cute.Tensor,
+        kv_thr_mma,
+    ):
+        """``kv_load`` from a tile with the static layout (D, D):(1, D)
+        whose base is aligned to two elements: each fragment pair (see
+        ``kv_store_pairs``) is one vector load of the same two values."""
+        c_kv = cute.make_identity_tensor((self.D, self.D))
+        tKVcKV = kv_thr_mma.partition_C(c_kv)
+        dtype = gKV.element_type
+        load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=2 * dtype.width
+        )
+        pair = cute.make_rmem_tensor(2, dtype)
+        for j in cutlass.range_constexpr(cute.size(tKVrKV) // 2):
+            v_idx, k_idx = tKVcKV[2 * j]
+            src = cute.make_tensor(
+                cute.domain_offset((k_idx, v_idx), gKV).iterator.align(
+                    2 * dtype.width // 8
+                ),
+                cute.make_layout(2),
+            )
+            cute.copy(load_atom, src, pair)
+            tKVrKV[2 * j] = pair[0].to(self.acc_dtype)
+            tKVrKV[2 * j + 1] = pair[1].to(self.acc_dtype)
+
+    @property
+    def paired_state_rows(self) -> bool:
+        """The final state of the slot paths is written as pairs (dense
+        pool rows aligned to two elements or more)."""
+        return bool(
+            self.slot_mode
+            and self.state_row_align is not None
+            and self.state_row_align > 1
+        )
+
+    @property
+    def paired_init_state_rows(self) -> bool:
+        """The initial state of the slot paths is read as pairs (dense pool
+        rows aligned to two elements or more)."""
+        return bool(
+            self.slot_mode
+            and self.needs_init_state
+            and self.init_state_row_align is not None
+            and self.init_state_row_align > 1
+        )
+
+    def aligned_state_pool(
+        self, g_pool: cute.Tensor, row_align: int, num_sab_heads: cutlass.Int32
+    ):
+        """(D, D, H, rows) view of a pool (or packed state) of dense
+        [H, D, D] rows whose row stride and base are aligned to
+        ``row_align`` elements."""
+        row_stride = cute.assume(g_pool.stride[0], divby=row_align)
+        pool_layout = cute.make_layout(
+            (self.D, self.D, num_sab_heads, g_pool.shape[0]),
+            stride=(1, self.D, self.D * self.D, row_stride),
+        )
+        return cute.make_tensor(g_pool.iterator, pool_layout)
 
     @property
     def paired_row_checkpoints(self) -> bool:
@@ -1692,7 +1763,11 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             permutation_mnk=(self.D, self.D, self.BLK_KV),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
-        if cutlass.const_expr(self.paired_row_checkpoints):
+        if cutlass.const_expr(
+            self.paired_row_checkpoints
+            or self.paired_state_rows
+            or self.paired_init_state_rows
+        ):
             self.check_kv_pairs(kv_tiled_mma)
         tKVrKV = cute.make_rmem_tensor(
             kv_thr_mma.partition_shape_C((self.D, self.D)), self.acc_dtype
@@ -1735,7 +1810,17 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 # reads its state elements here, before it writes any
                 # checkpoint or final state, so read and write rows may alias.
                 if state_idx >= cutlass.Int32(0):
-                    self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
+                    if cutlass.const_expr(self.paired_init_state_rows):
+                        mInitPool = self.aligned_state_pool(
+                            g_init_state, self.init_state_row_align, num_sab_heads
+                        )
+                        self.kv_load_pairs(
+                            tKVrKV,
+                            mInitPool[None, None, o_head_idx, state_idx],
+                            kv_thr_mma,
+                        )
+                    else:
+                        self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
             else:
                 self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
@@ -1833,21 +1918,39 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 scale,
                 wg_idx,
             )
-        self.maybe_store_checkpoint(
-            tKVrKV,
-            g_state_checkpoints,
-            checkpoint_cu_starts,
-            checkpoint_every_n_tokens,
-            kv_thr_mma,
-            work_desc.seq_idx,
-            o_head_idx,
-            num_sab_heads,
-            total_checkpoints,
-            cutlass.Int32(self.BLK_KV),
-            work_desc.seq_len,
-            ckpt_key=ckpt_key,
-            row_pref=first_row,
-        )
+        if cutlass.const_expr(self.paired_row_checkpoints):
+            # Pool-row checkpoint of the first block as pairs too.
+            self.store_slot_checkpoint_run(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                ckpt_key,
+                first_row,
+            )
+        else:
+            self.maybe_store_checkpoint(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                ckpt_key=ckpt_key,
+                row_pref=first_row,
+            )
 
         if cutlass.const_expr(self.chunked_slot_checkpoints):
             # The blocks up to the next checkpoint position run as one inner
@@ -2053,24 +2156,50 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 scale,
                 wg_idx,
             )
-            self.maybe_store_checkpoint(
-                tKVrKV,
-                g_state_checkpoints,
-                checkpoint_cu_starts,
-                checkpoint_every_n_tokens,
-                kv_thr_mma,
-                work_desc.seq_idx,
-                o_head_idx,
-                num_sab_heads,
-                total_checkpoints,
-                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
-                work_desc.seq_len,
-                ckpt_key=ckpt_key,
-                row_pref=last_row,
-            )
+            if cutlass.const_expr(self.paired_row_checkpoints):
+                # Pool-row checkpoint of the last block as pairs too.
+                self.store_slot_checkpoint_run(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    ckpt_key,
+                    last_row,
+                )
+            else:
+                self.maybe_store_checkpoint(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    ckpt_key=ckpt_key,
+                    row_pref=last_row,
+                )
         if cutlass.const_expr(self.slot_mode):
             if write_idx >= cutlass.Int32(0):
-                self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+                if cutlass.const_expr(self.paired_state_rows):
+                    mPool = self.aligned_state_pool(
+                        g_state, self.state_row_align, num_sab_heads
+                    )
+                    self.kv_store_pairs(
+                        tKVrKV, mPool[None, None, o_head_idx, write_idx], kv_thr_mma
+                    )
+                else:
+                    self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
         else:
             self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
 
@@ -2639,6 +2768,8 @@ def _get_prefill_kernel(
     checkpoint_state_indices_dtype=None,
     prefix_lens_dtype=None,
     checkpoint_row_align=None,
+    state_row_align=None,
+    init_state_row_align=None,
 ):
     return _FullyFusedDeltaRuleSm120(
         needs_alpha,
@@ -2662,6 +2793,8 @@ def _get_prefill_kernel(
         checkpoint_state_indices_dtype=checkpoint_state_indices_dtype,
         prefix_lens_dtype=prefix_lens_dtype,
         checkpoint_row_align=checkpoint_row_align,
+        state_row_align=state_row_align,
+        init_state_row_align=init_state_row_align,
     )
 
 
@@ -2805,6 +2938,15 @@ def delta_rule_prefill_dsl(
         if use_checkpoint_state_indices
         else None
     )
+    # State rows of the slot paths (pool rows or packed per-sequence states)
+    # that are dense [H, D, D] blocks are read and written as element pairs
+    # when their alignment allows it.
+    state_row_align = init_state_row_align = None
+    if use_output_state_indices or use_checkpoint_state_indices or use_prefix_lens:
+        if tuple(state.stride()[1:]) == (D * D, D, 1):
+            state_row_align = checkpoint_row_align(state)
+        if needs_init_state and tuple(init_state.stride()[1:]) == (D * D, D, 1):
+            init_state_row_align = checkpoint_row_align(init_state)
     if use_checkpoint_state_indices or use_prefix_lens:
         check_checkpoint_key_range(
             checkpoint_state_indices.numel()
@@ -2869,6 +3011,8 @@ def delta_rule_prefill_dsl(
         ),
         prefix_lens_dtype=prefix_lens.dtype if use_prefix_lens else None,
         checkpoint_row_align=row_align,
+        state_row_align=state_row_align,
+        init_state_row_align=init_state_row_align,
     )
     # A checkpoint pool is addressed by its row stride (which may be padded),
     # so it is passed whole, never flattened through a copy.

@@ -525,6 +525,55 @@ def test_auto_backend_uses_logical_batch_size_for_packed_input(monkeypatch):
     )
 
 
+def test_auto_backend_keeps_indexed_state_off_small_bh(monkeypatch):
+    fallback = (object(), object())
+    monkeypatch.setattr(kda_api, "is_cute_dsl_available", lambda: True)
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_run_kda_prefill_cute_small_bh",
+        lambda **kwargs: pytest.fail("auto must not route indexed state to small-bh"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=16),
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill,
+        "_sm120_kda_prefill_is_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill_cute,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill_cute,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: fallback,
+    )
+
+    inputs = _small_bh_inputs(batch_size=2, num_heads=4)
+    assert (
+        recurrent_kda(
+            **inputs,
+            initial_state=torch.empty((3, 4, 128, 128), dtype=torch.bfloat16),
+            ssm_state_indices=torch.tensor([2, 0], dtype=torch.int32),
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            beta_is_logit=True,
+            backend="auto",
+        )
+        is fallback
+    )
+
+
 @pytest.mark.parametrize(
     ("small_bh_available", "expected_eligibility_calls", "expected_backend"),
     ((False, 0, "cake"), (True, 1, "cute-dsl")),
@@ -681,6 +730,35 @@ def test_small_bh_packed_runner_uses_flat_abi_and_padded_workspace(
     assert qd.shape == kd.shape == kr.shape == (131, 8, 128)
     assert mqk.shape == mkk.shape == (9, 8, 16, 16)
     assert gk.shape == (9, 8, 128)
+
+
+def test_small_bh_runner_forwards_state_indices_and_returns_pool(monkeypatch):
+    _mock_small_bh_cuda(monkeypatch)
+    calls = []
+
+    def implementation(*args, **kwargs):
+        calls.append((args, kwargs))
+        return kwargs["output"], kwargs["state_output"]
+
+    _mock_small_bh_kernel(monkeypatch, implementation)
+    inputs = _small_bh_inputs(batch_size=2, num_heads=4)
+    pool = torch.empty((5, 4, 128, 128), dtype=torch.bfloat16)
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+
+    result = small_bh_api._run_kda_prefill_cute_small_bh(
+        **_small_bh_run_kwargs(
+            inputs,
+            initial_state=pool,
+            output_final_state=True,
+            ssm_state_indices=state_indices,
+        )
+    )
+
+    assert result[1] is pool
+    _, kwargs = calls[0]
+    assert kwargs["state_input"] is pool
+    assert kwargs["state_output"] is pool
+    assert kwargs["state_indices"] is state_indices
 
 
 def test_small_bh_packed_max_sequence_length_reuses_warmed_metadata(monkeypatch):
@@ -6181,6 +6259,190 @@ def test_small_bh_prefill_cuda_graph_replay_matches_reference(small_bh_device):
     torch.testing.assert_close(
         replay_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
+
+
+def _small_bh_eligibility_kwargs(inputs, **overrides):
+    kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "seq_order": None,
+        "ssm_state_indices": None,
+        "num_spec_tokens": None,
+        "num_accepted_tokens": None,
+        "output": None,
+        "initial_state_source": None,
+        "initial_state_indices": None,
+        "state_checkpoints": None,
+        "checkpoint_cu_starts": None,
+        "checkpoint_every_n_tokens": 0,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+def test_small_bh_eligibility_accepts_indexed_state_pool(small_bh_device, packed):
+    inputs = _make_inputs(seq_lens=[33, 33], num_heads=4, packed=packed)
+    pool = _make_padded_state_pool(
+        slots=5, num_heads=4, dtype=torch.bfloat16, device=small_bh_device
+    )
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=small_bh_device)
+
+    assert small_bh_api._is_kda_prefill_cute_small_bh_eligible(
+        **_small_bh_eligibility_kwargs(
+            inputs, initial_state=pool, ssm_state_indices=state_indices
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "no_initial_state",
+        "int64_indices",
+        "wrong_length",
+        "noncontiguous_indices",
+        "fp32_pool",
+        "wrong_heads",
+    ),
+)
+def test_small_bh_eligibility_rejects_invalid_indexed_state(small_bh_device, case):
+    inputs = _make_inputs(seq_lens=[17, 33], num_heads=4, packed=True)
+    pool = _make_padded_state_pool(
+        slots=5, num_heads=4, dtype=torch.bfloat16, device=small_bh_device
+    )
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=small_bh_device)
+    if case == "no_initial_state":
+        pool = None
+    elif case == "int64_indices":
+        state_indices = state_indices.to(torch.int64)
+    elif case == "wrong_length":
+        state_indices = torch.tensor([3], dtype=torch.int32, device=small_bh_device)
+    elif case == "noncontiguous_indices":
+        state_indices = torch.tensor(
+            [3, 0, 1, 0], dtype=torch.int32, device=small_bh_device
+        )[::2]
+    elif case == "fp32_pool":
+        pool = _make_padded_state_pool(
+            slots=5, num_heads=4, dtype=torch.float32, device=small_bh_device
+        )
+    elif case == "wrong_heads":
+        pool = _make_padded_state_pool(
+            slots=5, num_heads=2, dtype=torch.bfloat16, device=small_bh_device
+        )
+
+    assert not small_bh_api._is_kda_prefill_cute_small_bh_eligible(
+        **_small_bh_eligibility_kwargs(
+            inputs, initial_state=pool, ssm_state_indices=state_indices
+        )
+    )
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("num_heads", [4, 12], ids=["h4", "h12"])
+def test_small_bh_indexed_state_pool_matches_compact_state(
+    small_bh_device, packed, num_heads
+):
+    """Pool slots selected by ssm_state_indices behave like compact state."""
+
+    inputs = _make_inputs(
+        seq_lens=[17, 33] if packed else [33, 33],
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        seed=3200 + num_heads + int(packed),
+    )
+    state_seed = inputs.pop("initial_state")
+    compact_state = state_seed.clone()
+    compact_output, compact_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": compact_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="small-bh",
+    )
+
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=small_bh_device)
+    pool = _make_padded_state_pool(
+        slots=5, num_heads=num_heads, dtype=torch.bfloat16, device=small_bh_device
+    )
+    pool.copy_(0.1 * torch.randn(pool.shape, device=small_bh_device))
+    pool.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    pool_before = pool.clone()
+    indexed_output, indexed_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": pool}),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="small-bh",
+    )
+
+    assert indexed_final is pool
+    assert torch.equal(indexed_output, compact_output)
+    assert torch.equal(
+        pool.index_select(0, state_indices.to(torch.int64)), compact_final
+    )
+    unselected = torch.tensor([0, 2, 4], dtype=torch.int64, device=small_bh_device)
+    assert torch.equal(
+        pool.index_select(0, unselected), pool_before.index_select(0, unselected)
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_stride", "slot"),
+    (
+        # The row stride itself does not fit in int32.
+        pytest.param(2**31 + 128 * 128, 1, id="large_pitch"),
+        # The row stride fits in int32 but slot * stride does not: the common
+        # serving-arena shape of a small pitch and a large slot index.
+        pytest.param(128 * 128 + 64, 131072, id="large_slot_index"),
+    ),
+)
+def test_small_bh_indexed_state_slot_beyond_int32_element_offset(
+    small_bh_device, row_stride, slot
+):
+    """A pool slot more than 2**31 elements from the pool base is addressed
+    with a 64-bit offset instead of wrapping."""
+
+    num_heads = 1
+    slot_numel = num_heads * 128 * 128
+    assert slot * row_stride >= 2**31
+    storage_numel = slot * row_stride + slot_numel
+    required_bytes = storage_numel * torch.bfloat16.itemsize
+    free_bytes, _ = torch.cuda.mem_get_info(small_bh_device)
+    if free_bytes < required_bytes + (1 << 30):
+        pytest.skip("needs about 5 GiB of free GPU memory")
+
+    inputs = _make_inputs(
+        seq_lens=[33], num_heads=num_heads, packed=True, initial_state=True, seed=3300
+    )
+    state_seed = inputs.pop("initial_state")
+    compact_state = state_seed.clone()
+    compact_output, compact_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": compact_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="small-bh",
+    )
+
+    storage = torch.zeros(storage_numel, dtype=torch.bfloat16, device=small_bh_device)
+    pool = storage.as_strided(
+        (slot + 1, num_heads, 128, 128), (row_stride, 128 * 128, 128, 1)
+    )
+    pool[slot].copy_(state_seed[0])
+    state_indices = torch.tensor([slot], dtype=torch.int32, device=small_bh_device)
+    indexed_output, _ = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": pool}),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="small-bh",
+    )
+    torch.cuda.synchronize(small_bh_device)
+
+    assert torch.equal(indexed_output, compact_output)
+    assert torch.equal(pool[slot], compact_final[0])
+    # Only the selected slot may change; a wrapped offset would land elsewhere.
+    pool[slot].zero_()
+    assert not storage.any()
 
 
 @pytest.mark.parametrize("packed", [False, True])

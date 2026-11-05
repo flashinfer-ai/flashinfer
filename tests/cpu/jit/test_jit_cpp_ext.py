@@ -366,6 +366,146 @@ def test_determine_attention_backend_respects_fa3_prefill_head_dim(
 
 
 @pytest.mark.cpu_only
+def test_xqa_mtp_decode_supports_hopper_q_len_two(monkeypatch):
+    monkeypatch.setattr(
+        flashinfer.decode, "get_compute_capability", lambda device: (9, 0)
+    )
+
+    def is_supported(**overrides):
+        kwargs = {
+            "device": torch.device("cuda"),
+            "backend": "fa2",
+            "use_tensor_cores": True,
+            "q_len_per_req": 2,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+            "head_dim": 128,
+            "page_size": 16,
+            "pos_encoding_mode": "NONE",
+            "logits_soft_cap": 0.0,
+            "fixed_split_size": -1,
+            "has_jit_module": False,
+        }
+        kwargs.update(overrides)
+        return flashinfer.decode._is_xqa_mtp_decode_supported(**kwargs)
+
+    assert is_supported()
+    assert not is_supported(use_tensor_cores=False)
+    assert not is_supported(backend="trtllm-gen")
+    assert not is_supported(q_len_per_req=1)
+    assert not is_supported(q_data_type=torch.float32)
+    assert not is_supported(kv_data_type=torch.float32)
+    assert not is_supported(head_dim=8)
+    assert not is_supported(head_dim=272)
+    assert not is_supported(page_size=8)
+    assert not is_supported(pos_encoding_mode="ROPE_LLAMA")
+    assert not is_supported(logits_soft_cap=1.0)
+    assert not is_supported(fixed_split_size=1)
+    assert not is_supported(has_jit_module=True)
+    assert not is_supported(uses_cudnn=True)
+    assert not is_supported(use_token_head_sf=True)
+    assert not is_supported(disable_split_kv=True)
+    assert is_supported(o_data_type=torch.bfloat16)
+    assert not is_supported(o_data_type=torch.float16)
+    assert not is_supported(o_data_type=torch.float8_e4m3fn)
+    monkeypatch.setattr(
+        flashinfer.decode, "get_compute_capability", lambda device: (8, 0)
+    )
+    assert not is_supported()
+
+
+@pytest.mark.cpu_only
+def test_xqa_mtp_fast_plan_refreshes_metadata():
+    calls = []
+
+    def plan_impl(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "refreshed"
+
+    wrapper = SimpleNamespace(
+        _backend="fa2",
+        _requested_backend="fa2",
+        _cudnn_auto=False,
+        _use_xqa_mtp_decode=True,
+        _plan_impl=plan_impl,
+    )
+    indptr = torch.tensor([0, 2], dtype=torch.int32)
+    indices = torch.tensor([0, 1], dtype=torch.int32)
+    last_page_len = torch.tensor([16], dtype=torch.int32)
+    result = flashinfer.decode.fast_decode_plan(
+        wrapper,
+        indptr,
+        indices,
+        last_page_len,
+        32,
+        8,
+        128,
+        16,
+        q_len_per_req=2,
+    )
+    assert result == "refreshed"
+    assert len(calls) == 1
+    assert calls[0][0][0] is indptr
+    assert calls[0][0][1] is indices
+    assert calls[0][0][2] is last_page_len
+    assert calls[0][1]["q_len_per_req"] == 2
+
+
+@pytest.mark.cpu_only
+def test_xqa_mtp_causal_mask_q_len_two():
+    mask = flashinfer.decode._make_xqa_mtp_causal_mask(1, 2, torch.device("cpu"))
+
+    assert mask.dtype == torch.uint16
+    assert mask.shape == (1, 2, 2)
+    assert mask.view(torch.uint32).squeeze(-1).tolist() == [[1, 3]]
+
+
+@pytest.mark.cpu_only
+def test_xqa_mtp_block_tables_from_indptr_preserves_offset():
+    indptr_host = torch.tensor([2, 4, 7], dtype=torch.int32)
+    indices = torch.arange(10, dtype=torch.int32)
+
+    block_tables = flashinfer.decode._make_block_tables_from_indptr(
+        indptr_host, indices, 2, torch.device("cpu")
+    )
+
+    assert block_tables.dtype == torch.int32
+    assert block_tables.tolist() == [[2, 3, 0], [4, 5, 6]]
+
+
+@pytest.mark.cpu_only
+def test_xqa_mtp_block_tables_replan_preserves_storage():
+    table = torch.full((2, 3), -1, dtype=torch.int32)
+    captured_pointer = table.data_ptr()
+    result = flashinfer.decode._make_block_tables_from_indptr(
+        torch.tensor([0, 2, 3], dtype=torch.int32),
+        torch.tensor([9, 8, 7], dtype=torch.int32),
+        2,
+        torch.device("cpu"),
+        block_tables=table,
+    )
+    assert result.data_ptr() == captured_pointer
+    assert result.tolist() == [[9, 8, 0], [7, 0, 0]]
+    result = flashinfer.decode._make_block_tables_from_indptr(
+        torch.tensor([0, 1, 3], dtype=torch.int32),
+        torch.tensor([6, 5, 4], dtype=torch.int32),
+        2,
+        torch.device("cpu"),
+        block_tables=table,
+    )
+    assert result.data_ptr() == captured_pointer
+    assert result.tolist() == [[6, 0, 0], [5, 4, 0]]
+    with pytest.raises(ValueError, match="cannot grow"):
+        flashinfer.decode._make_block_tables_from_indptr(
+            torch.tensor([0, 4, 4], dtype=torch.int32),
+            torch.arange(4, dtype=torch.int32),
+            2,
+            torch.device("cpu"),
+            block_tables=table,
+        )
+
+
+@pytest.mark.cpu_only
 def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     calls = []
 

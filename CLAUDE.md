@@ -43,11 +43,13 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
+| Disable SM107 fused routing tail masking (enabled by default; use a separate fill) | `export FLASHINFER_SM107_FUSED_TAIL_MASK=0` |
 | Log MegaMoE compilation and workspace diagnostics | `export FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC=1` |
 | Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
+| Plan cake_fmha small-M decode splits on the device's SM count without reading the launch stream (on by default: splits follow the stream's SM partition; turn it off only when no small-M launch runs on a green context; `flashinfer.green_ctx` helpers turn it back on) | `export FLASHINFER_CAKE_FMHA_SM_PARTITIONS=0` |
 | Configure NVFP4 4over6 quantization (preferred over the env vars) | `nvfp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(e4m3_max=256))` |
 
 The minimum Python version used by CI and build tooling is defined in
@@ -127,7 +129,7 @@ GitHub PR Test GPU jobs keep a different, per-runner cache: they set
 `ci/bash.sh` namespaces it by runner and the pulled image's immutable ID.
 `CI_COMPILE_CACHE_MODE=read-only` (the default) mounts a read-only seed and runs
 against a private writable copy, discarded even after test failures. The PR Test
-workflow selects `read-write` only for pushes to `main`. A stable per-runner lock
+workflow selects `read-write` only for scheduled runs on `main`. A stable per-runner lock
 protects maintenance and execution, including accidentally shared workspaces.
 Other `ci/bash.sh` callers leave caching unset and run cold.
 Before each trusted writable job its runner's cache is cleared when it exceeds
@@ -141,6 +143,22 @@ since a fresh checkout rebuilds nvcc modules anyway. Each test job's
 `scripts/summarize_jit_builds.py` in the job summary.
 See [`ci/COMPILE_CACHE.md`](ci/COMPILE_CACHE.md) for lifecycle tests and trust
 boundaries.
+
+A shared S3 layer sits under it (`ci/compile_cache_s3.sh`), so new EC2 leases and
+new runners do not start cold: one tarball per image ID, GPU and lane under
+`s3://<SCCACHE_BUCKET>/compile-cache/main/`, readable anonymously by every job.
+Pull request jobs keep a per-runner mirror of it (refreshed by ETag); the job's
+entrypoint copies the mirror first and fills its gaps from the seed, taking a
+CuTe-DSL module whole when absent and adding objects only when its `meta.json` is
+identical. Only scheduled runs on `main` write, through the OIDC role in the
+`COMPILE_CACHE_S3_ROLE_ARN` repository variable, whose IAM trust policy accepts
+only `refs/heads/main`; until it is set they update seeds as before. A writer
+retires its runner's seeds, compiles in a new `runner.temp` directory on top of
+the S3 tarball alone (without the shared pip cache), then uploads it as one
+object, so concurrent writers never interleave a module. It skips the upload when
+it built nothing new or its restore failed. A tarball over
+`CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to that job's own builds,
+dropping kernels it reused. Restore and upload failures only warn.
 
 ## cuDNN linear attention
 
@@ -227,6 +245,17 @@ Capacity reports include the serial floor from host-heavy and node-exclusive
 work. They remain optimistic about GPU contention because the estimator uses
 worker counts without GPU topology or measured memory capacity.
 
+Allocation telemetry defaults to a 5-second interval (`RESOURCE_MONITOR_INTERVAL`);
+per-batch sampling defaults to 2 seconds (`MEMORY_MONITOR_INTERVAL`).
+The sampler uses `resource_monitor.py`, with sampling, CSV persistence,
+and summary aggregation kept separate. Allocation and batch monitors share host
+CPU readers in `scripts/test_sharding/host_cpu.py`. Unavailable per-process GPU
+memory stays unknown in snapshots and marks source resource summaries partial.
+`memory_summary.csv` leaves GPU maxima blank when no valid observation exists.
+Host CSV rows are flushed before GPU queries; query costs are in `sampler.csv`.
+Nested runners reuse a sampler only while its exported owner PID is alive.
+Namespace-relative cgroup paths require membership evidence before attribution.
+
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
@@ -245,8 +274,9 @@ or torchrun worker; launcher exit 1 alone is not evidence of an assertion failur
 All local worker ranks must finish, and at least one test must execute, to allow
 publication. A completed run with assertion failures remains eligible, while
 crashes, timeouts, and unfinished invocations do not. With the variable unset,
-reporting is disabled. The CPU suite above covers this contract without GPU
-dependencies.
+reporting is disabled. Missing JUnit output and file timeouts still fail the
+wrapper when reporting is disabled. The CPU suite above covers this contract
+without GPU dependencies.
 
 ### Skipping Tests Based on CUDA Architecture
 
@@ -451,9 +481,10 @@ do not need one.
 internal CI: `/bot run tests/<dir-or-file> [tests/...]`. Targets are whitespace-separated paths under
 `tests/` (files or directories, no `::` selectors), written as real paths relative to the repo
 root, e.g. `tests/gemm/test_mm_fp4.py tests/utils/`; name the test files or directories the
-change touches. A bare `run` with no target starts the **full** suite, which
-is expensive. That is appropriate in select cases — a cross-cutting change, or a final
-pre-merge check — and the PR template has a checkbox to declare and justify it.
+change touches. Bare `run` asks AI for a recommendation; focused or inconclusive
+results only post advice. `run all` starts the expensive **full** suite, appropriate
+for a cross-cutting change or final pre-merge check. The PR template has a checkbox
+to declare and justify that full-suite request.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
@@ -657,6 +688,11 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
 7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
 
+For an init shared by multiple Const shapes, list the keyword-only parameters in
+`init._trace_init_const_axes` to bind their defaults to each dumped definition's
+resolved Const values. Test the exported snippet with only Var axes supplied so
+standalone replay does not depend on callers overriding Const defaults.
+
 **Example implementations:**
 - **Simple**: `flashinfer/norm/__init__.py` (RMSNorm) - no Jinja, good starting point
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
@@ -850,15 +886,16 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` | `0` | `flashinfer/dsa_sparse_attention.py` | Fallback of the `check_dst_map` keyword of `dsa_sparse_attention` / `dsa_sparse_attention_varlen` when it is `None`: unset, empty or `0` leaves the values of a caller-provided `dkv_dst_map` unchecked; any other value makes the backward validate them (every destination row in `[0, S_dst)` of `dkv_acc`) at the cost of one device synchronization and raise `ValueError` on a violation. The kernel itself does not range-check the map; the package backend reads no environment variable. |
 | `FLASHINFER_CAKE_DSA_DKV_DIRECT` | `auto` | `flashinfer/dsa_sparse_attention.py` | Fallback of the `dkv_direct` keyword of the two public entries when it is `None`, read on every call: `auto` -> `None` (the record's size rule: at least `dkv_direct.min_keys_per_query` keys per query token), `1` -> `True` (direct dK / dV accumulation whenever the natural-layout stages are registered), `0` -> `False` (the accumulate-and-cast path); any other value raises `ValueError`. The resolved value is part of the backend's binding key. |
 | `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/dsa_sparse_attention.py` | Capacity of the CAKE DSA training binding cache (`cake_backend.BINDING_CACHE`, least recently used first out): read once when `flashinfer.dsa_sparse_attention` is imported (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `BINDING_CACHE.configure(capacity=...)` when the wrapper first reaches the backend. Direct users of the package call `configure` themselves. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | unset | `flashinfer/chunked_lm_head.py` | Fallback of the `gemm_tuning` keyword of `chunked_lm_head_loss` / `chunked_lm_head_logprob` when it is `None`: a JSON object of explicit per-GEMM knobs, e.g. `{"dx": {"tile_n": 256, "k_slices": 2}}` (the package backend takes the same dict as a keyword and reads no environment variable). Unset / empty: the per-geometry rules choose. Invalid JSON or a non-object is a `ValueError`. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | unset | `flashinfer/chunked_lm_head.py` | Fallback of the `gemm_tuning` keyword of `chunked_lm_head_det_loss` / `chunked_lm_head_det_logprob` (and of the det-free `chunked_lm_head_loss` / `chunked_lm_head_logprob` in both `deterministic` modes; every row of this table applies to both packages) when it is `None`: a JSON object of explicit per-GEMM knobs, e.g. `{"dx": {"tile_n": 256, "k_slices": 2}}` (the package backend takes the same dict as a keyword and reads no environment variable). Unset / empty: the per-geometry rules choose. Invalid JSON or a non-object is a `ValueError`. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `fuse_dw_cast` keyword when it is `None`: `0` turns off the fused weight-gradient cast (every chunk then accumulates into the FP32 `dW_acc` and a separate kernel applies the upstream scale and the output cast). `dW` is bitwise the same either way. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `dx_finalize` keyword when it is `None`: `0` turns off the fused dX finalize (a K-sliced dX GEMM's FP32 slabs are then added by in-place `add_` launches and a compacted call's `dX` is cast, zero-filled and `index_copy_`-scattered on the host instead of by the `slab_sum` and `scale_cast_scatter_bf16` kernels). Bitwise the same `dX`; resolved once per forward. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `auto` | `flashinfer/chunked_lm_head.py` | Fallback of the `dw_stream` keyword when it is `None` (`0` / `false` / `off` / `no` -> never, `1` / `true` / `on` / `yes` -> every multi-chunk call, anything else -> `auto` = calls of three or more chunks): launches each chunk's weight-gradient accumulate GEMM on a per-device side stream (forked after the chunk's row gradients, joined before the chunk buffer is reused and before the call returns) so it overlaps the tail of the chunk's dX GEMM. Same kernels in the same per-kernel order; bitwise the same outputs. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `hidden_count` keyword when it is `None`: `0` turns off the hidden valid-row count of the eager entry points (served to calls of three or more chunks): a compacted call then counts its valid rows and forms their index on the host before its first launch instead of on the device with chunk 0's gather kernel and device-count logits GEMM queued ahead of the read-back. Bitwise the same outputs. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `compact_rows` keyword when it is `None`: `0` turns off valid-row compaction (the chunk loop then covers every row instead of only the rows whose label is not `-100`). |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure` when the wrapper first reaches the backend (the first call of either entry point): `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure` when the wrapper first reaches the backend (the first call of either entry point; the non-deterministic package `flashinfer.experimental.cake.cake_lm_head_loss` gets the same settings on its first `deterministic=False` call): `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache, read once at the same import (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `configure` on the same first use. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
+| `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES` | unset | `build_backend.py` (`_slim_wheel`) | `1` leaves the experimental packages' generated kernel sources (`flashinfer/experimental/*/csrc/**`, `csrc/experimental/**`) out of the built `flashinfer-python` wheel and adds `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`; the release workflow sets it so the PyPI wheel stays under PyPI's 100 MB file limit (#7977). Nightlies and source installs keep the sources. Experimental APIs still import; their first kernel load raises. Independent of the flag, every built wheel is re-deflated at level 9 and the vendored 3rdparty trees outside the header directories are dropped. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
@@ -902,6 +939,7 @@ per-unit memory telemetry excludes nvcc. Locally:
 | `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
 | `FLASHINFER_DISABLE_TINYGEMM2_SM100` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103 `tinygemm2` backend and force the dispatcher to fall back to the legacy implementation. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 | `FLASHINFER_DISABLE_TINYGEMM2_TCGEN05` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103/SM107 tcgen05 `tinygemm2` programs and let the existing `tinygemm2` routes handle eligible shapes. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
+| `FLASHINFER_DISABLE_TINYGEMM2_WGMMA` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM90 wgmma `tinygemm2` programs and keep the reference `tinygemm2` kernel for every shape. Useful as an escape hatch when debugging backend-selection or kernel issues on Hopper systems. |
 | `FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB` | `0` | `flashinfer/gemm/gemm_base.py` | Set to `1` to keep `bmm_bf16(..., backend="cake")` on its mma.sync dispatcher for every shape, instead of the generated SM100/SM103 tcgen05 swap-AB programs that serve the decode shapes of its route table. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 
 ##### API Dump / Logging Extensions
@@ -936,7 +974,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
-| `FLASHINFER_SM107_MEGA_CHECK_ROUTES` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` skips routing value checks for caller-validated inputs. Metadata checks and masked-score zeroing remain active. Set before warmup and graph capture; changing it requires recapturing graphs. |
+| `FLASHINFER_SM107_MEGA_CHECK_ROUTES` | `0` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `1` enables routing value checks. By default, the caller is responsible for valid routing. Metadata checks and staging remain active. Set before warmup and graph capture; changing it requires recapturing graphs. |
 | `FLASHINFER_SM107_FUSED_ROUTE_CHECK` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` uses Torch routing checks instead of the fused checker. When routing checks are enabled, both paths check expert IDs, duplicates, and finite scores, including during graph replay. |
 | `FLASHINFER_SM107_PREP_TVM_FFI` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/routing_validation.py` | `0` launches the fused routing checker through CuTe's DLPack bindings instead of TVM-FFI. Set before warmup; each mode needs its own compiled kernel. |
 | `FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC` | unset | `flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/shim/runtime.py` | Exactly `1` prints MegaMoE split-kernel compile choices, workspace memory diagnostics, and frontend compile/capture timings; other values leave these diagnostics off. |
@@ -968,7 +1006,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_combine_tail` keyword when it is `None`: `0` / `false` / `off` / `no` runs the vendored wait, reduce and ack combine-tail kernels with the per-round combine-inbox fill instead of the one-kernel fused tail. Bit-identical outputs; ranks may differ. The pre-reduced combine wires require the fused tail. |
 | `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_dispatch` keyword when it is `None`: `0` / `false` / `off` / `no` keeps the vendored three-kernel dispatch for small rounds instead of the single cooperative dispatch launch. Bit-identical outputs; ranks may differ. |
 | `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS` | `512` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_dispatch_max_tokens` keyword when it is `None`: dedup rounds with at most this many tokens per rank (and `T * top_k <= 4096`) use the fused dispatch launch. Must be in `[1, 512]`. |
-| `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS` | `513` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `grid_dispatch_min_tokens` keyword when it is `None`: dedup rounds with at least this many tokens per rank use the grid-strided single-launch dispatch instead of the vendored kernels; `0` disables it. Must be `>= 0`. Bit-identical outputs; ranks may differ. |
+| `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS` | unset (`512` at EP 8, `513` at other EP sizes) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `grid_dispatch_min_tokens` keyword when it is `None`: dedup rounds with at least this many tokens per rank use the grid-strided single-launch dispatch instead of the vendored kernels; `0` disables it. Must be `>= 0`. Bit-identical outputs; ranks may differ. |
 | `FLASHINFER_SM90_CAKE_BF16_PDL` | `6` (FC1 and FC2) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `pdl` keyword when it is `None`: which kernels of the round get a programmatic dependent launch. `0` / `false` / `off` / `no` none, `1` / `true` / `on` / `yes` all, or an integer mask of compact `1`, FC1 `2`, FC2 `4`, combine publish `8`, combine tail `16`. |
 | `FLASHINFER_SM90_CAKE_BF16_PDL_LATE` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `pdl_late` keyword when it is `None`: `1` lets the PDL dependents of the package's small kernels be scheduled only when those kernels exit; `0` / `false` / `off` / `no` triggers them right after their own grid-dependency wait. |
 | `FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `per_route_publish_pdl` keyword when it is `None`: with the per-route combine wire, `1` launches the combine publish with PDL as if bit `8` were in the `FLASHINFER_SM90_CAKE_BF16_PDL` mask; `0`, `false`, `off`, `no` or empty does not. Pipes on the pre-reduced wires are unaffected. |
@@ -977,13 +1015,14 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `publish_form` keyword when it is `None`: `1` the load-hoisted pre-reduced combine publish, `0` the route-serial publish. Both write the same bytes; other values raise `ValueError`. |
 | `FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS` | `128` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fc2_early_max_tokens` keyword when it is `None`: rounds with `0 < T <= value` tokens per rank start FC2 inside FC1's tail wave (FC1 releases per-m-tile readiness counters, FC2 claims ready tiles; same bits). `0` disables it. It is off when the layer has more than 1023 experts, when `min(hidden_size, intermediate_size) < 256`, or when the GEMM implementation does not support early start. |
 | `FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fc2_early_windows` keyword when it is `None`: `1` also starts FC2 inside FC1's tail wave in rounds whose token count per rank lies in the window `(lo, hi]` that `FC2_EARLY_WINDOWS` lists for the layer's (hidden size, intermediate size, total experts, top_k, EP size); `0`, `false`, `off`, `no` or empty keeps only the `FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS` window. Same bits; off under the same conditions as that window. |
+| `FLASHINFER_SM90_CAKE_BF16_WCX_MAX_TOKENS` | `0` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `wcx_max_tokens` keyword when it is `None` (an int in `[0, 128]`; unset or empty = `0`, off): early-start rounds with `0 < T <= value` tokens per rank read the layer's lossless compressed (WCX) expert-weight copies through the swap-AB FC1/FC2 pair; same bits. A non-zero value makes the backend attach the compressed copies (about 0.77x the bf16 expert bytes per layer and rank) and build the swap-AB modules. A non-zero value also makes rounds in the layer shape's `WCX_WINDOWS` window `(lo, hi]` above 128 tokens per rank read the copies through the swap-AB early-start pair. Off when the `FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS` window is off; a layer that cannot be encoded keeps the bf16 pair. |
 | `FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `prefix_form` keyword when it is `None`: `1` computes the receiver prefix with a whole-block integer scan in the grid dispatch and in the fused dispatch's small-route instance (`T * top_k <= 1024`); the large-route instance (`T * top_k > 1024`) walks the keys with one thread for both values. `0` walks the keys with one thread everywhere. Both write the same values; other values raise `ValueError`. |
 | `FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE` | unset (on at EP 8 and EP 4) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `direct_place` keyword when it is `None`; unset = the per-EP default `DIRECT_PLACE_DEFAULTS` (on at EP sizes 8 and 4, off at the others): `1` lets grid-dispatch rounds store each token's first row for a rank straight into that rank's (symmetric) activation matrix, so the compact copies only the token's later routes to the same rank. Effective only when every rank requests it and its pipe can run it (the AND over ranks; dedup dispatch, grid dispatch on, compact form `1`, at most 1024 (expert, rank) keys, a token capacity of at least the grid-dispatch bound and the direct-placement bound; otherwise the regular activation matrix); grid rounds only, and a round is direct only when every rank dispatches it that way. Bit-identical outputs. Values other than `0` / `1` raise `ValueError`. |
 | `FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS` | unset (per EP size and shape) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `direct_place_min_tokens` keyword when it is `None` (unset = at the EP sizes in `DIRECT_PLACE_DEFAULTS` the larger of the listed bound `513` and `ceil(DIRECT_PLACE_MIN_ROUTE_ELEMS / (top_k * hidden_size))` with `DIRECT_PLACE_MIN_ROUTE_ELEMS = 2**25`: `586` at hidden 7168 / top-k 8, `781` at 7168 / 6, `1366` at 4096 / 6; else the grid-dispatch bound `513`): the smallest local token count of a grid-dispatch round that takes the direct placement (with `FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`); a rank below it makes the whole round take the inbox path. Must be `>= 0`. Bit-identical outputs. |
 | `FLASHINFER_GDN_SM107_PREFILL_KERNEL` | `sm107` | `flashinfer/gdn_kernels/blackwell/gdn_prefill.py` | `sm100` makes `chunk_gated_delta_rule` on SM107 (Rubin) run the Blackwell chunked-prefill kernel class instead of the Rubin subclass. For A/B measurements and bisection. |
 | `FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Launch path of the fused QKV exchange session: `1` the producer with the folded cross-rank rendezvous (two launches per call), `0` the separate barrier kernel before the producer (three launches), `auto` the architecture default (folded on SM90 / SM100 / SM103 / SM107). The `fold_barrier` keyword takes precedence. Every rank of a group must use the same value. |
-| `FLASHINFER_QKV_EXCHANGE_SHAPE_GATES` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Row-count gates of the session's host plan: `auto` the per-(architecture, world size) default, `off` every gate off, or `gate=value` pairs over `words_capacity_small_m`, `reserved_sms_large_m`, `per_dest_large_m` and `pair_off_large_m` (`0` = never, `auto` = that gate's default, `all` = every row for `words_capacity_small_m`). The first three change the host plan only; `pair_off_large_m` (off everywhere) runs the rows it fires on with the single-CTA producer, which no delivered Blackwell route ships today; SM90 with 8 ranks ships `words_capacity_small_m=all`; no gate changes the stored bits. Every rank of a group must use the same value. |
-| `FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Producer build of the session: `auto` the per-(architecture, world size) default (`bulk_ow256` on SM100 with 8 ranks, `ow256` on SM100 with 4 ranks and on SM103 with 8 or 4 ranks, `bulk` on SM107 with 4 ranks, the baseline build otherwise), `shipped` the baseline build, or a delivered build name; a build that is not delivered for the session's tile width raises and names the delivered ones. Every build stores identical bits. Every rank of a group must use the same value. |
+| `FLASHINFER_QKV_EXCHANGE_SHAPE_GATES` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Row-count gates of the session's host plan: `auto` the per-(architecture, world size) default, `off` every gate off, or `gate=value` pairs over `words_capacity_small_m`, `reserved_sms_large_m`, `per_dest_large_m` and `pair_off_large_m` (`0` = never, `auto` = that gate's default, `all` = every row for `words_capacity_small_m`). The first three change the host plan only; `pair_off_large_m` (off everywhere) runs the rows it fires on with the single-CTA producer, which no delivered Blackwell route ships today; SM90 with 8 ranks and SM107 with 2 or 4 ranks ship `words_capacity_small_m=all`. `per_dest_k_table` (`0`, `1` or `auto`) switches the per-hidden-size `per_dest_large_m` thresholds of SM100 / SM103 (an explicit `per_dest_large_m` replaces them); `xband_min_m` (a row count or `auto`) sets the row count from which an eligible call runs the 256-column pair tile across band edges (SM100 and SM103 with 8 ranks ship 4096, `0` = off). No gate changes the stored bits. Every rank of a group must use the same value. |
+| `FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Producer build of the session: `auto` the per-(architecture, world size) default (`bulk_ow256_fma` on SM100 with 8 ranks, `ow256_fma` on SM100 with 4 ranks and on SM103 with 8 or 4 ranks, `fma` on SM100 and SM103 with 2 ranks, `bulk` on SM107 with 4 ranks, the baseline build otherwise), `shipped` the baseline build, or a delivered build name; a default build that is not delivered for the session's tile width runs the baseline build instead, a named build that is not delivered for it raises and names the delivered ones. The builds without the `fma` epilogue store identical bits; an `fma` build contracts the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so its stored bits can differ from theirs within the kernel's accuracy tolerance. Every rank of a group must use the same value. |
 | `FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Group scaling of the session's host plan: `auto` the per-(architecture, world size) default (`2` on SM100 with 4 or 2 ranks and on SM103, `1` otherwise), or `1` / `2` / `4`; applies to grouped rows with a hidden size of at least 6144 and changes the tile order only. Every rank of a group must use the same value. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
@@ -1096,6 +1135,7 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
   - `csrc` → `flashinfer/data/csrc`
   - `include` → `flashinfer/data/include`
 - **Version**: Generated in `flashinfer/_build_meta.py` from `version.txt`
+- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out; RECORD is regenerated. Covered by `tests/cpu/test_build_backend_slim_wheel.py`.
 
 ## External Integrations
 

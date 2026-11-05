@@ -1197,16 +1197,28 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
             assert runner._allocations_in_last_run == 0
         program = module._PROGRAMS[name]
         assert program.family == family, (arch, form, name)
-        # SM107's one-launch program takes the prologue form of its grid.
-        table_form = (
-            module.exactone_table_variant(
-                capability=module._ARCH_CAPABILITIES[arch],
-                variant="",
-                state_dtype=torch.bfloat16,
-                grid=grid,
-            )
-            if family == "exactone"
-            else ""
+        # SM107's one-launch program takes the prologue form of its grid,
+        # and its one-CTA-cluster twin where ``unit_cluster_variant`` admits
+        # the call (here the two-kernel ``exactpre`` program of the
+        # publishing form: 16 items).
+        table_form = module.unit_cluster_variant(
+            capability=module._ARCH_CAPABILITIES[arch],
+            family=family,
+            variant=(
+                module.exactone_table_variant(
+                    capability=module._ARCH_CAPABILITIES[arch],
+                    variant="",
+                    state_dtype=torch.bfloat16,
+                    grid=grid,
+                )
+                if family == "exactone"
+                else ""
+            ),
+            state_dtype=torch.bfloat16,
+            mode_varlen=True,
+            num_sequences=num_seqs,
+            nheads=8,
+            total_tokens=seqlen,
         )
         assert program.variant == table_form and program.cluster_dims == (1, 1, 1)
         assert not name.endswith("_tail")

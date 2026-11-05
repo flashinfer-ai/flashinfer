@@ -135,11 +135,13 @@ from .attn_scores import (
 )
 from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
 from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import FP8MQATopKWrapper as FP8MQATopKWrapper
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
     cudnn_frost_grouped_gemm1_swiglu,
     cudnn_frost_grouped_gemm1_swiglu_workspace_size,
+    deinterleave_gated_rows,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
@@ -168,7 +170,16 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 )
 
 
+# Compatibility module paths of the causal conv1d facade and its backend package; each
+# resolves on first attribute access and loads no KCP host module.
+_COMPAT_SUBMODULES = frozenset(
+    {"cake_causal_conv1d_train", "cake_causal_conv1d_train_backend"}
+)
+
+
 def __getattr__(name: str):
+    if name in _COMPAT_SUBMODULES:
+        return importlib.import_module(f"{__name__}.{name}")
     if name not in _PRIMS_TS_LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from . import fused_moe as _fused_moe
@@ -269,6 +280,20 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from .cake_rmsnorm_det_train import CakeRMSNormDetFunction as CakeRMSNormDetFunction
+from .cake_rmsnorm_det_train import cake_rmsnorm_det as cake_rmsnorm_det
+from .cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_backward as cake_rmsnorm_det_train_backward,
+)
+from .cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_backward_workspace_bytes as cake_rmsnorm_det_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
+)
+
+# The names before the det rename: the package with the deterministic default and the
+# opt-in non-deterministic weight gradient (``deterministic=False``).
 from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
 from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
 from .cake_rmsnorm_train import (
@@ -280,6 +305,26 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from . import cake_rmsnorm_train as cake_rmsnorm_train
+from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
+from .cake_rmsnorm_silu_gate_det_train import (
+    CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det as cake_rmsnorm_silu_gate_det,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det_train_backward as cake_rmsnorm_silu_gate_det_train_backward,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det_train_forward as cake_rmsnorm_silu_gate_det_train_forward,
+)
+
+# The names before the det rename: the package with the deterministic default and the
+# opt-in non-deterministic weight gradient (``deterministic=False``).
 from .cake_rmsnorm_silu_gate_train import (
     CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
 )
@@ -295,23 +340,88 @@ from .cake_rmsnorm_silu_gate_train import (
 from .cake_rmsnorm_silu_gate_train import (
     cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
 )
-from .cake_causal_conv1d_train import (
-    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
+from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
+from . import (
+    cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
 )
-from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
+from .cake_causal_conv1d_det_train import (
+    CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,
 )
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det as cake_causal_conv1d_det,
 )
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_det_train_backward,
 )
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_det_train_backward_workspace_bytes,
 )
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_det_train_forward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
+)
+
+# Use import aliases so strict JIT keys treat these as re-exports, not setup code.
+from .cake_causal_conv1d_det_train import (
+    CakeCausalConv1dDetFunction as CakeCausalConv1dFunction,
+)
+from .cake_causal_conv1d_det_train import cake_causal_conv1d_det as cake_causal_conv1d
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+)
+
+from .cake_mhc_det_train import (
+    CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
+)
+from .cake_mhc_det_train import (
+    CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction,
+)
+from .cake_mhc_det_train import (
+    CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_backward_finish as cake_mhc_det_train_backward_finish,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_backward_prepare as cake_mhc_det_train_backward_prepare,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_backward_workspace_bytes as cake_mhc_det_train_backward_workspace_bytes,
+)
+from .cake_mhc_det_train import cake_mhc_det_train_finish as cake_mhc_det_train_finish
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_finish as cake_mhc_det_train_forward_finish,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_prepare as cake_mhc_det_train_forward_prepare,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_stats as cake_mhc_det_train_forward_stats,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_workspace_bytes as cake_mhc_det_train_forward_workspace_bytes,
+)
+from .cake_mhc_det_train import cake_mhc_det_train_head as cake_mhc_det_train_head
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_head_backward as cake_mhc_det_train_head_backward,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
+)
+from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainHeadFunction as CakeMHCTrainHeadFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
 from .cake_mhc_train import (
     cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
@@ -334,6 +444,13 @@ from .cake_mhc_train import (
 )
 from .cake_mhc_train import (
     cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_head as cake_mhc_train_head
+from .cake_mhc_train import (
+    cake_mhc_train_head_backward as cake_mhc_train_head_backward,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_head_forward as cake_mhc_train_head_forward,
 )
 from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
 from .cake_gdp import (

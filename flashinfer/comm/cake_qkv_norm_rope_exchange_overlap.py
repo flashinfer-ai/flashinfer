@@ -48,16 +48,25 @@ per session by :func:`resolve_producer_variant`: the default of the session's
 architecture and world size unless ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT``
 overrides it -- ``auto``, ``shipped`` (the baseline build) or a delivered build
 name; rank-uniform, checked collectively): SM100 groups of 8 ranks run the
-``bulk_ow256`` build (wide operand loads, bulk row stores), SM100 groups of 4
-ranks and SM103 groups of 8 or 4 ranks the ``ow256`` build (wide operand loads),
-SM107 groups of 4 ranks the ``bulk`` build (bulk row stores), groups of 2 ranks
-and SM90 the baseline build.  Every build stores identical bits; the wide-load
-builds require 32-byte-aligned ``cos_sin`` and norm-weight bases
-(:meth:`CakeQkvExchangeSession._validate` refuses a misaligned view and names
-the opt-out).  Wherever a variant is the default, the baseline build of the
-same tile width is delivered too, so the opt-out always launches a delivered
-program; a build that is not delivered for the session's tile width raises and
-names the delivered ones.
+``bulk_ow256_fma`` build (wide operand loads, bulk row stores and the fused
+multiply-add epilogue), SM100 groups of 4 ranks and SM103 groups of 8 or 4 ranks
+the ``ow256_fma`` build (wide operand loads and the fused multiply-add
+epilogue), SM100 and SM103 groups of 2 ranks the ``fma`` build (the fused
+multiply-add epilogue), SM107 groups of 4 ranks the ``bulk`` build (bulk row
+stores), the other groups and SM90 the baseline build.  The builds without the
+fused multiply-add epilogue store identical bits; an ``fma`` build rounds the
+norm and RoPE multiply-adds once, so its stored bits can differ from theirs
+within the kernel's accuracy tolerance.  Every build requires ``cos_sin`` and
+the norm weights to start at 16-byte-aligned addresses (the Blackwell builds
+read them with 16-byte vector loads), the wide-load builds at 32-byte-aligned
+ones (:meth:`CakeQkvExchangeSession._validate` refuses a misaligned view; for
+the 32-byte bases it names the opt-out).  Wherever a variant is the
+default, the baseline build of the same tile width is delivered too, so the
+opt-out always launches a delivered program.  A default build that is not
+delivered for the session's tile width (the two-rank ``fma`` build at
+``block_n=128``) yields to the baseline build; a build named by the environment
+variable that is not delivered for the tile width raises and names the
+delivered ones.
 
 Group scaling (``plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``, resolved once per
 session by :func:`resolve_group_m_scale`: the default of the architecture and
@@ -73,7 +82,8 @@ and world size unless ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` overrides it --
 ``auto``, ``off`` or ``gate=value,...`` with ``0`` = never and ``all`` = every row
 for the small-row word gate; rank-uniform, checked collectively): a call with
 ``batch * s_local <= words_capacity_small_m`` rows publishes one readiness word
-per destination (``num_words = 1``; every call on SM90 with 8 ranks); a call
+per destination (``num_words = 1``; every call on SM90 with 8 ranks and on
+SM107); a call
 with ``batch * s_local >= reserved_sms_large_m`` rows runs the persistent
 producer grid over every SM (``reserved_sms = 0`` instead of
 ``plans.RESERVED_SMS``); a call with ``batch * s_local >= per_dest_large_m`` rows
@@ -88,8 +98,9 @@ no delivered Blackwell route ships it today, so the opt-in refuses at
 construction when a 256-column call can reach the gate (``max_tokens >= N``),
 naming the gate; SM90 builds no pair tile and refuses the gate).  SM100 / SM103
 ship ``4096`` / off / ``16384`` / off; SM90 ships ``4096`` / ``16384`` / off /
-off, with the word gate on every row (``all``) for an 8-rank group; the
-pair-tile gate ships nowhere.  The first three
+off, with the word gate on every row (``all``) for an 8-rank group; SM107 ships
+the word gate on every row (``all``) for its 2- and 4-rank groups and nothing
+else; the pair-tile gate ships nowhere.  The first three
 gates change the host plan only -- never the tile table or the stored bits; the
 pair-tile gate changes the producer program and the tile table (no lockstep
 pads) of the rows it selects; no gate changes the stored bits -- and
@@ -97,6 +108,20 @@ pads) of the rows it selects; no gate changes the stored bits -- and
 (``producer_variant``) and scale (``group_m_scale``), with every prepared row's
 verdict (``prepared_row_plans``, including its ``reserved_sms`` and
 ``part_grids``).
+
+On SM100 and SM103 the per-destination launch gate reads its threshold by the
+call's hidden size (``plans.SHAPE_GATE_K_TABLE``, resolved once per session by
+:func:`resolve_shape_gate_k_table`; ``per_dest_k_table=0`` in
+``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` restores the one-band threshold, an
+explicit ``per_dest_large_m`` replaces the table).  SM103 and SM100 groups of 8
+ranks ship the cross-destination-band gate (``plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``,
+:func:`resolve_xband_min_m`; ``xband_min_m=0`` switches it off): a call whose
+destination band is not a multiple of 256 columns while every Q / K / V group is
+(e.g. hidden 3072 over 8 ranks) runs the 256-column pair tile across band edges
+from ``4096`` rows on, as one persistent launch of the cross-destination-band
+build of the session's producer build (``loader.xband_variant``: its staged
+twin for a bulk build; its tiles carry both heads' destinations).  The default
+yields where that build is not delivered.  Neither changes the stored bits.
 
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words
@@ -169,32 +194,92 @@ def fold_barrier_from_env() -> Optional[bool]:
 
 
 # Row-count gate override read once per session: ``auto`` (or unset) = the (architecture, world size) default of
-# ``plans.default_shape_gates``; ``off`` / ``0`` = every gate off; ``gate=value[,gate=value]`` with ``gate`` in
-# ``plans.SHAPE_GATE_NAMES`` and ``value`` an int >= 0 (``0`` = never), ``auto`` = that gate's default or, for the
-# small-row word gate, ``all`` = every row.
+# ``plans.default_shape_gates``; ``off`` / ``0`` = every gate off (the K table and the cross-destination-band gate
+# included); ``gate=value[,gate=value]`` with ``gate`` in ``plans.SHAPE_GATE_NAMES`` and ``value`` an int >= 0 (``0`` =
+# never), ``auto`` = that gate's default or, for the small-row word gate, ``all`` = every row.  Two more keys:
+# ``per_dest_k_table`` = ``0`` / ``1`` / ``auto`` (the per-destination launch threshold by hidden size,
+# ``plans.SHAPE_GATE_K_TABLE``; an explicit ``per_dest_large_m`` replaces it) and ``xband_min_m`` = an int >= 0 or
+# ``auto`` (the cross-destination-band gate, ``plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``).
 SHAPE_GATES_ENV = "FLASHINFER_QKV_EXCHANGE_SHAPE_GATES"
+SHAPE_GATE_K_TABLE_KEY = "per_dest_k_table"
+XBAND_MIN_M_KEY = "xband_min_m"
+_SHAPE_GATE_EXTRA_KEYS: tuple[str, ...] = (SHAPE_GATE_K_TABLE_KEY, XBAND_MIN_M_KEY)
+_SHAPE_GATES_OFF_SPELLINGS: tuple[str, ...] = ("off", "0", "none")
 
 
-def shape_gates_from_env() -> Optional[dict[str, Optional[int]]]:
-    """The gate override of :data:`SHAPE_GATES_ENV`: ``None`` when unset or ``auto``; otherwise one entry per gate
-    (``None`` = keep the architecture default of that gate)."""
+def _shape_gates_env_items() -> Optional[list[tuple[str, str]]]:
+    """``(name, value)`` items of :data:`SHAPE_GATES_ENV` (``None`` when unset, ``auto`` or ``off``); a malformed item
+    or an unknown name is an error."""
 
     raw = os.environ.get(SHAPE_GATES_ENV, "").strip()
-    if not raw or raw.lower() == "auto":
+    if not raw or raw.lower() == "auto" or raw.lower() in _SHAPE_GATES_OFF_SPELLINGS:
         return None
-    if raw.lower() in ("off", "0", "none"):
-        return {name: plans.SHAPE_GATE_OFF for name in plans.SHAPE_GATE_NAMES}
-    override: dict[str, Optional[int]] = {name: None for name in plans.SHAPE_GATE_NAMES}
+    items: list[tuple[str, str]] = []
     for item in raw.replace(";", ",").split(","):
         item = item.strip()
         if not item:
             continue
         name, separator, value = item.partition("=")
         name, value = name.strip(), value.strip()
-        if not separator or name not in plans.SHAPE_GATE_NAMES:
+        if not separator or name not in (
+            *plans.SHAPE_GATE_NAMES,
+            *_SHAPE_GATE_EXTRA_KEYS,
+        ):
             raise ValueError(
-                f"{SHAPE_GATES_ENV} must be auto, off or gate=value pairs over {plans.SHAPE_GATE_NAMES}, got {raw!r}"
+                f"{SHAPE_GATES_ENV} must be auto, off or gate=value pairs over "
+                f"{(*plans.SHAPE_GATE_NAMES, *_SHAPE_GATE_EXTRA_KEYS)}, got {raw!r}"
             )
+        items.append((name, value))
+    return items
+
+
+def _shape_gates_env_off() -> bool:
+    return (
+        os.environ.get(SHAPE_GATES_ENV, "").strip().lower()
+        in _SHAPE_GATES_OFF_SPELLINGS
+    )
+
+
+def shape_gate_extras_from_env() -> dict[str, Optional[int]]:
+    """The ``per_dest_k_table`` / ``xband_min_m`` entries of :data:`SHAPE_GATES_ENV` (``None`` = unset or ``auto``;
+    ``off`` sets both to ``0``).  ``per_dest_k_table`` reads ``0`` or ``1``, ``xband_min_m`` an int >= 0."""
+
+    if _shape_gates_env_off():
+        return {name: 0 for name in _SHAPE_GATE_EXTRA_KEYS}
+    extras: dict[str, Optional[int]] = {name: None for name in _SHAPE_GATE_EXTRA_KEYS}
+    for name, value in _shape_gates_env_items() or ():
+        if name not in _SHAPE_GATE_EXTRA_KEYS or value.lower() == "auto":
+            continue
+        if name == SHAPE_GATE_K_TABLE_KEY and value not in ("0", "1"):
+            raise ValueError(
+                f"{SHAPE_GATES_ENV}: {name} must be 0, 1 or auto, got {value!r}"
+            )
+        if name == XBAND_MIN_M_KEY and not value.isdigit():
+            raise ValueError(
+                f"{SHAPE_GATES_ENV}: {name} must be an int >= 0 or auto, got {value!r}"
+            )
+        extras[name] = int(value)
+    return extras
+
+
+def shape_gates_from_env() -> Optional[dict[str, Optional[int]]]:
+    """The gate override of :data:`SHAPE_GATES_ENV`: ``None`` when unset or ``auto``; otherwise one entry per gate
+    (``None`` = keep the architecture default of that gate).  The ``per_dest_k_table`` / ``xband_min_m`` entries
+    are read by :func:`shape_gate_extras_from_env`."""
+
+    raw = os.environ.get(SHAPE_GATES_ENV, "").strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    if _shape_gates_env_off():
+        return {name: plans.SHAPE_GATE_OFF for name in plans.SHAPE_GATE_NAMES}
+    override: dict[str, Optional[int]] = {name: None for name in plans.SHAPE_GATE_NAMES}
+    items = _shape_gates_env_items() or []
+    if not any(name in plans.SHAPE_GATE_NAMES for name, _ in items):
+        # Only the K table / cross-destination-band keys: the four gates keep their default.
+        return None
+    for name, value in items:
+        if name not in plans.SHAPE_GATE_NAMES:
+            continue
         if value.lower() == "auto":
             override[name] = None
         elif value.lower() == "all":
@@ -242,6 +327,54 @@ def resolve_shape_gates(arch: str, world_size: int) -> tuple[dict[str, int], str
                     "switch off; drop the gate (0 or auto)"
                 )
     return checked, "env"
+
+
+def resolve_shape_gate_k_table(
+    arch: str, world_size: int
+) -> tuple[Optional[tuple[tuple[int, int], ...]], str]:
+    """The K table of the per-destination launch gate of a session on ``arch`` with ``world_size`` ranks
+    (``plans.default_shape_gate_k_table``; ``None`` = the one-band ``per_dest_large_m`` threshold).  Returns ``(table,
+    source)``: ``"default"``; ``"env"`` for ``per_dest_k_table=0`` / ``1`` (``1`` on a cell without a table is an
+    error) or ``off``; ``"per_dest_large_m"`` when an explicit ``per_dest_large_m`` in :data:`SHAPE_GATES_ENV`
+    decides the gate alone (beside an explicit ``per_dest_k_table=1`` that is an error)."""
+
+    default = plans.default_shape_gate_k_table(arch, world_size=world_size)
+    requested = shape_gate_extras_from_env()[SHAPE_GATE_K_TABLE_KEY]
+    override = shape_gates_from_env()
+    explicit_large = override is not None and override["per_dest_large_m"] is not None
+    if requested == 1:
+        if default is None:
+            raise ValueError(
+                f"{SHAPE_GATES_ENV}: {SHAPE_GATE_K_TABLE_KEY}=1 is refused on {arch} with {world_size} ranks: the "
+                "cell ships no K table (the one-band per_dest_large_m threshold); drop the key (0 or auto)"
+            )
+        if explicit_large and not _shape_gates_env_off():
+            raise ValueError(
+                f"{SHAPE_GATES_ENV}: {SHAPE_GATE_K_TABLE_KEY}=1 cannot be combined with an explicit per_dest_large_m: "
+                f"the K table sets that gate's threshold by hidden size; drop one of the two "
+                f"({SHAPE_GATE_K_TABLE_KEY}=0 is the one-band threshold)"
+            )
+        return default, "env"
+    if requested == 0:
+        return None, "env"
+    if explicit_large:
+        return None, "per_dest_large_m"
+    return default, "default"
+
+
+def resolve_xband_min_m(arch: str, world_size: int) -> tuple[int, str]:
+    """The cross-destination-band gate threshold of a session on ``arch`` with ``world_size`` ranks
+    (``plans.default_xband_min_m``; ``0`` = off) unless the ``xband_min_m`` key of :data:`SHAPE_GATES_ENV` sets it
+    (``off`` = ``0``).  Returns ``(threshold, source)`` with ``source`` ``"default"`` or ``"env"``; the session checks
+    that the cross-destination-band producer is delivered."""
+
+    requested = shape_gate_extras_from_env()[XBAND_MIN_M_KEY]
+    if requested is None:
+        return plans.default_xband_min_m(arch, world_size=world_size), "default"
+    try:
+        return plans.check_xband_min_m(arch, int(requested)), "env"
+    except ValueError as error:
+        raise ValueError(f"{SHAPE_GATES_ENV}: {error}") from None
 
 
 def resolve_fold_barrier(
@@ -301,9 +434,12 @@ def resolve_producer_variant(
     arch: str, world_size: int, block_n: int
 ) -> tuple[str, str]:
     """The producer build of a session on ``arch`` with ``world_size`` ranks and tile width ``block_n``: the
-    (architecture, world size) default unless :data:`PRODUCER_VARIANT_ENV` overrides it.  Returns ``(variant,
-    source)`` with ``source`` ``"default"`` or ``"env"``.  Fails closed when the build is delivered for neither pair
-    flag of the tile width, naming the environment variable, the ``shipped`` opt-out and the delivered builds."""
+    (architecture, world size) default unless :data:`PRODUCER_VARIANT_ENV` overrides it.  A default build that the
+    route table delivers for other tile widths only (the two-rank ``fma`` build at ``block_n=128``, for example)
+    yields to the baseline build, which is delivered beside every variant.  Returns ``(variant, source)`` with
+    ``source`` ``"default"`` or ``"env"``.  Fails closed when the build is delivered for neither pair flag of the
+    tile width (a build named by the environment variable, or a default build delivered for no tile width), naming
+    the environment variable, the ``shipped`` opt-out and the delivered builds."""
 
     override = producer_variant_from_env()
     if override is None:
@@ -314,6 +450,17 @@ def resolve_producer_variant(
         pair: loader.delivered_producer_variants(arch, block_n, pair)
         for pair in (False, True)
     }
+    if (
+        source == "default"
+        and not any(variant in names for names in delivered.values())
+        and any(loader.SHIPPED_VARIANT in names for names in delivered.values())
+        and any(
+            loader.has_producer(arch, other, pair, variant)
+            for other in plans.BLOCK_N_CHOICES
+            for pair in (False, True)
+        )
+    ):
+        variant = loader.SHIPPED_VARIANT
     if not any(variant in names for names in delivered.values()):
         raise ValueError(
             f"producer build {variant or PRODUCER_VARIANT_SHIPPED!r} ({source}) is not delivered for {arch} at "
@@ -535,6 +682,12 @@ class CakeQkvExchangeSession:
         self.shape_gates, self.shape_gates_source = resolve_shape_gates(
             arch, self.world_size
         )
+        self.k_table, self.k_table_source = resolve_shape_gate_k_table(
+            arch, self.world_size
+        )
+        self.xband_min_m, self.xband_min_m_source = resolve_xband_min_m(
+            arch, self.world_size
+        )
         if layout not in plans.LAYOUTS:
             raise ValueError(f"layout must be one of {plans.LAYOUTS}, got {layout!r}")
         if (
@@ -617,14 +770,55 @@ class CakeQkvExchangeSession:
         self._wait_name = loader.wait_program(self.arch)
         self._wait = loader.load(self._wait_name, self.arch)
         self._producers: dict[str, Any] = {}
-        per_dest_reachable = (
-            plans.gate_rows(
-                self.shape_gates, self.max_tokens, bn=self.bn
-            ).producer_launches
-            == "per_dest"
+        # Cross-destination-band gate: it can fire only on an eligible session (the band is not a multiple of 256
+        # columns while every Q / K / V group is) whose 128-column pair tile and cross-destination-band build of the
+        # session's producer build are delivered (both rendezvous phases on the folded path).  The default yields
+        # where they are not; an explicit threshold fails closed.
+        self.xband_eligible = plans.xband_eligible(capacity)
+        if self.xband_min_m and self.xband_eligible:
+            delivered = self.pair_available[self.bn] and loader.has_xband_producer(
+                self.arch, self.producer_variant, fold=self.fold_barrier
+            )
+            if not delivered:
+                if self.xband_min_m_source != "default":
+                    raise ValueError(
+                        f"{SHAPE_GATES_ENV}: {XBAND_MIN_M_KEY}={self.xband_min_m} needs the cross-destination-band "
+                        f"producer of build {self.producer_variant or PRODUCER_VARIANT_SHIPPED!r} on {self.arch}"
+                        f"{' with the folded rendezvous' if self.fold_barrier else ''}, which this delivery does not "
+                        f"ship; drop the key (0 or auto) on every rank"
+                    )
+                self.xband_min_m, self.xband_min_m_source = 0, "default_undelivered"
+        xband_reachable = bool(
+            self.xband_min_m
+            and self.xband_eligible
+            and self.max_tokens >= self.xband_min_m
+        )
+        top = plans.gate_rows(
+            self.shape_gates,
+            self.max_tokens,
+            bn=self.bn,
+            hidden=self.hidden,
+            k_table=self.k_table,
+        )
+        # A per-destination row exists below max_tokens unless every row the gate fires on runs the
+        # cross-destination-band plan (the gate takes precedence over it).
+        per_dest_threshold = (
+            top.per_dest_threshold
+            if top.per_dest_threshold is not None
+            else int(self.shape_gates["per_dest_large_m"])
+        )
+        per_dest_reachable = top.producer_launches == "per_dest" and not (
+            xband_reachable and per_dest_threshold >= self.xband_min_m
         )
         for pair in self._reachable_pairs():
             for name in self._launched_producers(pair, per_dest=per_dest_reachable):
+                self._producers[name] = loader.load(name, self.arch)
+        if xband_reachable:
+            for name in self._launched_producers(
+                True,
+                bn=plans.XBAND_BN,
+                variant=loader.xband_variant(self.producer_variant),
+            ):
                 self._producers[name] = loader.load(name, self.arch)
 
         # Symmetric memory: receive slots, readiness pad, barrier flags (rendezvous = collective).  The
@@ -723,33 +917,46 @@ class CakeQkvExchangeSession:
         )
 
     def _fold_producer_names(
-        self, pair: bool, variant: Optional[str] = None
+        self,
+        pair: bool,
+        variant: Optional[str] = None,
+        *,
+        bn: Optional[int] = None,
     ) -> tuple[str, ...]:
-        """Both rendezvous phases of the folded producer of this tile width and build (the session's build unless
-        ``variant`` names another delivered one; empty where it is not delivered)."""
+        """Both rendezvous phases of the folded producer of a tile width and build (the session's tile width and
+        build unless ``bn`` / ``variant`` name another delivered one; empty where it is not delivered)."""
 
         variant = self.producer_variant if variant is None else variant
-        if not loader.has_fold_producer(self.arch, self.bn, pair, variant):
+        bn = self.bn if bn is None else bn
+        if not loader.has_fold_producer(self.arch, bn, pair, variant):
             return ()
         return tuple(
-            loader.fold_producer_program(self.arch, self.bn, pair, phase, variant)
+            loader.fold_producer_program(self.arch, bn, pair, phase, variant)
             for phase in loader.FOLD_PHASES
         )
 
     def _launched_producers(
-        self, pair: bool, *, per_dest: bool = False
+        self,
+        pair: bool,
+        *,
+        per_dest: bool = False,
+        bn: Optional[int] = None,
+        variant: Optional[str] = None,
     ) -> tuple[str, ...]:
-        """Producer programs the resolved launch path launches for this tile width (the session's build); a
-        ``per_dest`` row on the folded path adds the plain producer (its second and later destination parts)."""
+        """Producer programs the resolved launch path launches for a tile width and build (the session's unless
+        ``bn`` / ``variant`` name the cross-destination-band build); a ``per_dest`` row on the folded path adds the
+        plain producer (its second and later destination parts)."""
 
-        plain = loader.producer_program(self.arch, self.bn, pair, self.producer_variant)
+        variant = self.producer_variant if variant is None else variant
+        bn = self.bn if bn is None else bn
+        plain = loader.producer_program(self.arch, bn, pair, variant)
         if not self.fold_barrier:
             return (plain,)
-        names = self._fold_producer_names(pair)
+        names = self._fold_producer_names(pair, variant, bn=bn)
         if not names:
             raise RuntimeError(
-                f"fold_barrier=True, but {self.arch} delivers no folded producer for block_n={self.bn}, "
-                f"pair={pair}, build {self.producer_variant or PRODUCER_VARIANT_SHIPPED!r}; pass fold_barrier=False"
+                f"fold_barrier=True, but {self.arch} delivers no folded producer for block_n={bn}, "
+                f"pair={pair}, build {variant or PRODUCER_VARIANT_SHIPPED!r}; pass fold_barrier=False"
             )
         return (*names, plain) if per_dest else names
 
@@ -771,6 +978,8 @@ class CakeQkvExchangeSession:
                 "error": local_error,
                 "fold_barrier": self.fold_barrier,
                 "shape_gates": dict(self.shape_gates),
+                "shape_gate_k_table": self.k_table,
+                "xband_min_m": self.xband_min_m,
                 "producer_variant": self.producer_variant,
                 "group_m_scale": self.group_m_scale,
             },
@@ -792,7 +1001,11 @@ class CakeQkvExchangeSession:
             )
         # The gates decide every rank's readiness words and launch count per row; they must agree before any launch.
         gates = {
-            int(v["rank"]): tuple(sorted((v.get("shape_gates") or {}).items()))
+            int(v["rank"]): (
+                tuple(sorted((v.get("shape_gates") or {}).items())),
+                v.get("shape_gate_k_table"),
+                v.get("xband_min_m"),
+            )
             for v in verdicts
         }
         if len(set(gates.values())) != 1:
@@ -846,32 +1059,36 @@ class CakeQkvExchangeSession:
             raise ValueError(
                 "row geometry exceeds the receive slot capacity of the session"
             )
-        # Row-count gates of this call (the session's gates on ``rows = batch * s_local`` and the session's tile
-        # width): one readiness word per destination for a small row, one producer launch per destination run for a
-        # large row, the single-CTA producer for a large 256-column row under the pair-tile gate.
-        verdict = plans.gate_rows(self.shape_gates, int(geometry.rows), bn=self.bn)
-        words_capacity = (
-            verdict.words_capacity_per_dest
-            if verdict.words_capacity_per_dest is not None
-            else self.words_cap
-        )
-        policy, plan = plans.plan_for(
+        # Row-count gates of this call (the session's gates on ``rows = batch * s_local``, the session's tile width
+        # and the call's hidden size): one readiness word per destination for a small row, one producer launch per
+        # destination run for a large row (threshold by hidden size where the K table applies), the single-CTA
+        # producer for a large 256-column row under the pair-tile gate, the cross-destination-band plan (one
+        # persistent launch of the 256-column pair tile) for a large eligible row.
+        verdict, policy, plan = plans.plan_row(
             geometry,
             self.layout,
             self.rank,
             arch=self.arch,
+            gates=self.shape_gates,
+            k_table=self.k_table,
+            xband_min_m=self.xband_min_m,
             pair_available=self.pair_available[self.bn],
-            words_capacity_per_dest=words_capacity,
+            words_capacity_per_dest=self.words_cap,
             group_m_scale=self.group_m_scale,
-            pair=verdict.pair,
         )
-        if plan.bn != self.bn or plan.num_words > self.words_cap:
+        expected_bn = plans.XBAND_BN if plan.xband else self.bn
+        if plan.bn != expected_bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
-        program = loader.producer_program(
-            self.arch, plan.bn, plan.pair, self.producer_variant
+        variant = (
+            loader.xband_variant(self.producer_variant)
+            if plan.xband
+            else self.producer_variant
         )
+        program = loader.producer_program(self.arch, plan.bn, plan.pair, variant)
         per_dest = verdict.producer_launches == "per_dest"
-        for name in self._launched_producers(plan.pair, per_dest=per_dest):
+        for name in self._launched_producers(
+            plan.pair, per_dest=per_dest, bn=plan.bn, variant=variant
+        ):
             if name not in self._producers:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
@@ -914,7 +1131,7 @@ class CakeQkvExchangeSession:
                 lockstep=plan.lockstep,
             ),
             program=program,
-            fold_programs=self._fold_producer_names(plan.pair),
+            fold_programs=self._fold_producer_names(plan.pair, variant, bn=plan.bn),
             verdict=verdict,
             parts=parts,
             reserved_sms=int(reserved_sms),
@@ -927,32 +1144,46 @@ class CakeQkvExchangeSession:
         the barrier programs, the plain producer of the session's build, its folded producers where delivered
         (``producer_fold0`` / ``producer_fold1``), the baseline build's three programs where the session's build
         is a variant (``producer_shipped``, ``producer_shipped_fold0`` / ``producer_shipped_fold1``: the
-        ``shipped`` opt-out path of this row) and the wait kernel -- six or nine names.  :meth:`describe` says
-        which of them a call launches (``launch_sequence``)."""
+        ``shipped`` opt-out path of this row) and the wait kernel -- six or nine names.  On a row that runs the
+        cross-destination-band plan the ``producer*`` names stay the programs of the session's tile width (the
+        ``xband_min_m=0`` path of the row) and ``producer_xband`` / ``producer_xband_fold0`` /
+        ``producer_xband_fold1`` name the cross-destination-band programs the call launches -- twelve names.
+        :meth:`describe` says which of them a call launches (``launch_sequence``)."""
 
         row = self.prepare_rows(batch, s_local)
+        pair = bool(row.policy.pair)
         bound = {
             "barrier_p0": self._barrier_names[0],
             "barrier_p1": self._barrier_names[1],
-            "producer": row.program,
+            "producer": loader.producer_program(
+                self.arch, self.bn, pair, self.producer_variant
+            ),
         }
-        if row.fold_programs:
-            for phase, name in zip(loader.FOLD_PHASES, row.fold_programs, strict=True):
+        folds = self._fold_producer_names(pair)
+        if folds:
+            for phase, name in zip(loader.FOLD_PHASES, folds, strict=True):
                 bound[f"producer_fold{phase}"] = name
         if self.producer_variant != loader.SHIPPED_VARIANT:
             bound["producer_shipped"] = loader.producer_program(
-                self.arch, row.plan.bn, row.plan.pair, loader.SHIPPED_VARIANT
+                self.arch, self.bn, pair, loader.SHIPPED_VARIANT
             )
-            shipped_folds = self._fold_producer_names(
-                row.plan.pair, loader.SHIPPED_VARIANT
-            )
+            shipped_folds = self._fold_producer_names(pair, loader.SHIPPED_VARIANT)
             if not shipped_folds:
                 raise RuntimeError(
-                    f"{self.arch} delivers the {self.producer_variant!r} build for block_n={row.plan.bn}, "
-                    f"pair={row.plan.pair} without the baseline build's folded producers"
+                    f"{self.arch} delivers the {self.producer_variant!r} build for block_n={self.bn}, "
+                    f"pair={pair} without the baseline build's folded producers"
                 )
             for phase, name in zip(loader.FOLD_PHASES, shipped_folds, strict=True):
                 bound[f"producer_shipped_fold{phase}"] = name
+        if row.plan.xband:
+            bound["producer_xband"] = row.program
+            if len(row.fold_programs) != len(loader.FOLD_PHASES):
+                raise RuntimeError(
+                    f"{self.arch} delivers the cross-destination-band producer {row.program!r} without its folded "
+                    "producers"
+                )
+            for phase, name in zip(loader.FOLD_PHASES, row.fold_programs, strict=True):
+                bound[f"producer_xband_fold{phase}"] = name
         bound["wait"] = self._wait_name
         return bound
 
@@ -1001,9 +1232,20 @@ class CakeQkvExchangeSession:
             raise ValueError(
                 f"batch * s_local = {rows} exceeds the session's max_tokens={self.max_tokens}"
             )
-        # The wide-operand-load builds read ``cos_sin`` and the norm weights through 32-byte-aligned bases (the
-        # rows are 512 B by the shape check above); a misaligned view of a larger tensor must be refused here, the
-        # kernel does not check it.
+        # Every build reads ``cos_sin`` and the norm weights through 16-byte-aligned bases (the Blackwell builds with
+        # 16-byte vector loads), the wide-operand-load builds through 32-byte-aligned bases (the rows are 512 B by
+        # the shape check above); a misaligned view of a larger tensor must be refused here, the kernel does not
+        # check it.
+        for name, tensor in (
+            ("cos_sin", cos_sin),
+            ("q_norm_weight", q_scale),
+            ("k_norm_weight", k_scale),
+        ):
+            if tensor.data_ptr() % 16:
+                raise ValueError(
+                    f"{name} must start at a 16-byte-aligned address (data_ptr % 16 = {tensor.data_ptr() % 16}); "
+                    "pass a contiguous tensor that starts at its allocation"
+                )
         if loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[self.producer_variant] == 256:
             for name, tensor in (
                 ("cos_sin", cos_sin),
@@ -1253,6 +1495,23 @@ class CakeQkvExchangeSession:
                     plans.default_shape_gates(self.arch, world_size=self.world_size)
                 ),
             },
+            "shape_gate_k_table": {
+                "value": None
+                if self.k_table is None
+                else [list(band) for band in self.k_table],
+                "source": self.k_table_source,
+                "env": SHAPE_GATES_ENV,
+                "key": SHAPE_GATE_K_TABLE_KEY,
+            },
+            "xband_min_m": {
+                "value": self.xband_min_m,
+                "source": self.xband_min_m_source,
+                "env": SHAPE_GATES_ENV,
+                "eligible": self.xband_eligible,
+                "default": plans.default_xband_min_m(
+                    self.arch, world_size=self.world_size
+                ),
+            },
             "producer_variant": {
                 "value": self.producer_variant,
                 "source": self.producer_variant_source,
@@ -1268,6 +1527,11 @@ class CakeQkvExchangeSession:
             "prepared_row_plans": {
                 f"{batch}x{s_local}": {
                     **row.verdict.summary(),
+                    **(
+                        {"xband": True, "block_n": row.plan.bn}
+                        if row.plan.xband
+                        else {}
+                    ),
                     "num_words": row.plan.num_words,
                     "producer_parts": row.launches_per_call,
                     "launches_per_call": row.launches_per_call
@@ -1318,7 +1582,9 @@ __all__ = [
     "PRODUCER_VARIANT_ENV",
     "PRODUCER_VARIANT_SHIPPED",
     "SHAPE_GATES_ENV",
+    "SHAPE_GATE_K_TABLE_KEY",
     "SUPPORTED_SYMMETRIC_MEMORY_BACKENDS",
+    "XBAND_MIN_M_KEY",
     "CakeQkvExchangeSession",
     "device_arch",
     "fold_barrier_from_env",
@@ -1327,7 +1593,10 @@ __all__ = [
     "resolve_fold_barrier",
     "resolve_group_m_scale",
     "resolve_producer_variant",
+    "resolve_shape_gate_k_table",
     "resolve_shape_gates",
+    "resolve_xband_min_m",
+    "shape_gate_extras_from_env",
     "shape_gates_from_env",
     "supports_symmetric_memory_backend",
     "symmetric_memory_backend",

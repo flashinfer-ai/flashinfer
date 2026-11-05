@@ -237,6 +237,7 @@ Utility Functions
 
     convert_to_block_layout
     reorder_rows_for_gated_act_gemm
+    interleave_cute_dsl_moe_weights
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
     preprocess_moe_weights_for_sm90_mixed_gemm_humming

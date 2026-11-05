@@ -214,7 +214,7 @@ class ThdLaunchSpec:
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots the native THD binder writes per call.
 _FILLED_AT_BUILD = frozenset(
-    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs o_partial_ptr "
+    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     # The bias / kv_mask slots of the sm107 f16 d128-file host (dense-only arms; a THD plan never requests them).
@@ -399,6 +399,9 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
     if s.origin_specs is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origins", False):
         raise NotImplementedError("physical THD origins require rebuilding the native extension")
+    if s.origin_specs is not None and "thd_origin_caps" in s.index and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origin_caps", False):
+        # The SM90 D512 host clamps origins into each port's own buffer; an older binder would leave the slot at None.
+        raise NotImplementedError("per-port physical THD origin capacities require rebuilding the native extension")
     if s.origin_specs is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_physical_origins", False):
         raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
     if (
@@ -591,7 +594,7 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots the native dense binder writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
-    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs o_partial_ptr "
+    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs thd_origin_caps o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()
@@ -728,6 +731,7 @@ class DenseLaunchSpec:
         # trim (``seq_q_present``).  The combine cannot tell a padded query row from a valid keyless one without them (the native binder appends the
         # bound Q-length address to the combine frame).
         "combine_q_lens",
+        "ragged_q_lens",
         "tile_n",
         "kv_tail_native",
         "causal",
@@ -879,6 +883,15 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.device_index = int(api.q_desc.device.index or 0)
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
+    # Standalone THD always requires Q lengths. Graph lowering may explicitly
+    # select the legacy offset-only form when the graph has no length operand.
+    s.ragged_q_lens = int(getattr(api, "_ragged_q_lens", 2 if getattr(api, "cu_seq_q_lens", False) else 1)) if s.ragged else 0
+    if s.ragged_q_lens:
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _pybind_module
+
+        if not getattr(_pybind_module._SdpaDenseBinder, "supports_ragged_q_lens", False):
+            raise NotImplementedError("ragged decode Q lengths require the matching native cuDNN Frontend extension")
+        s.seq_q_present = True
     s.ragged_divs = tuple(int(d) for d in getattr(api, "ragged_divisors", (1, 1, 1))) if s.ragged else (1, 1, 1)
     s.ragged_i64 = bool(getattr(api, "ragged_offsets_int64", False)) if s.ragged else False
     s.ragged_lse_head_major = bool(getattr(api, "thd_stats_head_major", False)) if s.ragged else False
@@ -910,6 +923,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             stats_log2=api.stats_log2,
             ragged=s.ragged,
             ragged_i64=s.ragged_i64,
+            ragged_q_lens=s.ragged_q_lens,
             quantized=s.quant is not None,
             has_amax=s.quant.has_amax if s.quant is not None else False,
             has_scale_o=api._split_scale_o() if s.quant is not None else False,
@@ -1337,7 +1351,7 @@ def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, 
         rule = (
             "contiguous, every live B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm90.dense_bind_strides)"
             if dense_flex
-            else "contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+            else "contiguous, every B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm100.dense_bind_strides)"
         )
         raise ValueError(
             f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be {rule}"
@@ -1486,12 +1500,13 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         if f is None:
             raise ValueError(f"cudnn.sdpa: {name} is required by this compiled specialization")
         _on_plan_device(spec, name, f)
-        if f.dtype != "int32" or not f.contiguous or f.numel < b:
-            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {b} elements; got {f.dtype} x {f.numel}")
+        count = b + int(name == "seq_q_lens" and getattr(spec, "ragged_q_lens", 0) == 2)
+        if f.dtype != "int32" or not f.contiguous or f.numel < count:
+            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {count} elements; got {f.dtype} x {f.numel}")
         if f.ptr % _ALIGN_F32:
             raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
-        if f.span >= 0 and f.span < b:
-            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
+        if f.span >= 0 and f.span < count:
+            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {count}")
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
@@ -1562,6 +1577,14 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
             raise ValueError("cudnn.sdpa: split output must match the declared (B, S_q)")
         o_ptr, o_strides = o.ptr, (*o.strides, 1)
         lse_ptr, lse_strides = _dense_lse(spec, facts.get("lse"), spec.b, spec.s_q_max, required=combine.has_stats)
+    if spec.quant is None:
+        workspace_end = workspace_ptr + combine.lse_offset + combine.lse.numel * 4
+        for name, fact in facts.items():
+            if fact is None or fact.numel == 0:
+                continue
+            span = fact.span if fact.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(fact.shape, fact.strides, strict=True))
+            if workspace_ptr < fact.ptr + span * _buffers.DTYPE_ITEMSIZE[fact.dtype] and fact.ptr < workspace_end:
+                raise ValueError(f"cudnn.sdpa: split workspace overlaps {name}")
     lse_partial_ptr = workspace_ptr + combine.lse_offset
     partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
     frame = bind_dense(spec, partials, stream, stream_int)
@@ -1576,6 +1599,7 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
         lse_strides,
         *ragged_args,
         stream,
+        *((facts["seq_q_lens"].ptr,) if getattr(spec, "ragged_q_lens", 0) else ()),
     )
     return frame, combine_args
 

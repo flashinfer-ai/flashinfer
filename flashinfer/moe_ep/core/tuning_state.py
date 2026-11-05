@@ -14,6 +14,7 @@ class AutoTuningState:
     tuned_identity: tuple | None = None
     lookup_scope: tuple | None = None
     graph_captured: bool = False
+    serving_generation: int | None = None
 
     def record_selection(
         self,

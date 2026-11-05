@@ -1283,6 +1283,7 @@ class SmemPResource(DecodeGenResourceBase):
             )
             if cutlass.const_expr(
                 not self.use_variable_seqlens_kv
+                and cfg.fixed_seqlen
                 and not cfg.uses_runtime_q_kv_union
                 and not cfg.use_split_kv
                 and cfg.has_odd_kv_tail

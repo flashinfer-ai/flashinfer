@@ -78,6 +78,8 @@ from . import gdn_decode_bf16_state as _generic
 from .cute_dsl_cache_naming import make_kernel_name
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
+from . import _softplus
+from ._softplus import softplus_fp32
 from .gdn_decode_bf16_state import (
     ELEMS_PER_LANE,
     ILP_ROWS,
@@ -374,15 +376,7 @@ def gdn_t1_rubin_kernel(
     r_a = cutlass.Float32(a[i_n, 0, i_hv])
     r_b = cutlass.Float32(b_gate[i_n, 0, i_hv])
     x = r_a + r_dt_bias
-    beta_x = softplus_beta * x
-    exp_beta_x = cute.exp(beta_x, fastmath=True)
-    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-        cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-    )
-    use_softplus = (
-        cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-    )
-    softplus_x = use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
+    softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
     r_g = cute.exp(-cute.exp(r_A_log, fastmath=True) * softplus_x, fastmath=True)
     r_beta = cutlass.Float32(1.0) / (
         cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
@@ -723,7 +717,7 @@ def _run_t1_rubin(
 
 _CUTE_DSL_MODULE = "gdn_decode_bf16_state_rubin"
 # Sources of the generated code: this file and the generic module it takes its constants from
-_KEY_FILES = (__file__, _generic.__file__)
+_KEY_FILES = (__file__, _generic.__file__, _softplus.__file__)
 
 # build key -> compiled kernel (TVM-FFI callable, built or loaded through the persistent JIT cache)
 _compiled_t1_rubin: dict = {}

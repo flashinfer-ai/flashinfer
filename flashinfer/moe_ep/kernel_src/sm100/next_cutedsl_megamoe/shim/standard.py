@@ -37,7 +37,7 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
 
     @property
     def hidden_alignment(self) -> int:
-        return 64
+        return 128 if self.quant_kind == "mxfp4_mxfp8" else 64
 
     @property
     def resolved_mma_tiler_mnk(self) -> tuple[int, int, int]:
@@ -71,10 +71,6 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
             )
         if self.kernel_variant != "inference":
             raise ValueError("Use Sm100GenphaseMoeConfig for GenPhase.")
-        if self.quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"):
-            raise ValueError(
-                "This adapter supports NVFP4 and MXFP8 standard inference."
-            )
 
 
 class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
@@ -82,6 +78,7 @@ class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
 
     _architecture = "sm_100"
     config: Sm100BlockScaledMoeConfig
+    fc1_activation_per_token_scale: torch.Tensor | None
 
     @staticmethod
     def _require_device() -> None:

@@ -38,13 +38,19 @@ MoKBackwardMXFP8 = kernels.MoKBackwardMXFP8
 MoKForwardMXFP8 = kernels.MoKForwardMXFP8
 MoKRecomputeMXFP8 = kernels.MoKRecomputeMXFP8
 quantize_mok_mxfp8_weights = api.quantize_mok_mxfp8_weights
+mxfp8 = cake_package("cake_mok_bf16", "mxfp8")
 
 LIMITS = pytest.mark.parametrize("swiglu_limit", [None, 0.75], ids=["plain", "clamped"])
 
 
 @pytest.fixture(autouse=True)
-def _exact_matmul(monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+def _exact_matmul():
+    # Save and restore by hand: monkeypatch's undo deletes this module attribute.
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_tf32
+    matmul.allow_tf32 = False
+    yield
+    matmul.allow_tf32 = previous
 
 
 def _setup(hidden, intermediate, seed, experts=4, tokens=512, topk=2):
@@ -143,6 +149,92 @@ def test_weight_quantizer_matches_recipe():
     assert torch.equal(backward_w[2][1], expected_down[3])
     rel = (dequantize(*expected[:2]) - up.float()).norm() / up.float().norm()
     assert rel.item() < 0.05
+
+
+def _flat(value):
+    return [t for v in value for t in (_flat(v) if isinstance(v, tuple) else [v])]
+
+
+@pytest.mark.parametrize("experts_per_chunk", [1, 2, 3])
+@pytest.mark.parametrize("use_gluon", [True, False], ids=["gluon", "triton"])
+def test_weight_quantizer_paths_are_bitwise(monkeypatch, use_gluon, experts_per_chunk):
+    """The Gluon kernel, the Triton kernels, the chunked PyTorch path and the
+    per-matrix reference produce the same bytes, NaN / infinity / zero blocks
+    included."""
+    require_gpu()
+    if use_gluon and mxfp8.gluon is None:
+        pytest.skip("Gluon is not available")
+    if not use_gluon:
+        monkeypatch.setattr(mxfp8, "gluon", None)
+    torch.manual_seed(23)
+    gate = torch.randn(5, 256, 512, device="cuda", dtype=torch.bfloat16)
+    gate[2, 9, 32:64] = float("nan")
+    gate[3, 1, :32] = float("inf")
+    gate[3, 7, 100] = -float("inf")
+    gate[4, 0, 64:96] = 0
+    gate[0, 5, :64] = 1e-30
+    gate[1, 200, 128:160] = 3.0e38
+    gate[1, 201, 160:192] = torch.tensor([448.0, 449.0, -464.0, 480.0] * 8)
+    up = torch.randn_like(gate) * 1e-3
+    down = torch.randn(5, 512, 256, device="cuda", dtype=torch.bfloat16) * 1e3
+    for matrix in (gate[1], gate[2], down[3]):
+        single = mxfp8.mxfp8_quantize(matrix)
+        assert all(
+            torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+            for a, b in zip(single, quantize(matrix), strict=True)
+        )
+    # One layout at a time runs the per-layout Triton kernel; both layouts run
+    # the Gluon kernel, or the Triton dual kernel without Gluon.
+    both = mxfp8.mxfp8_quantize(gate)
+    normal = mxfp8.mxfp8_quantize(gate, return_transposed=False)[:2]
+    transposed = mxfp8.mxfp8_quantize(gate, return_normal=False)[2:]
+    for a, b in zip(both, normal + transposed, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    fused = quantize_mok_mxfp8_weights(gate, up, down)
+    assert (mxfp8.gluon is not None) == use_gluon  # no fallback was taken
+    # Without Triton (and so without Gluon) the chunked PyTorch path runs.
+    monkeypatch.setattr(mxfp8, "triton", None)
+    monkeypatch.setattr(mxfp8, "gluon", None)
+    monkeypatch.setattr(mxfp8, "_CHUNK_BYTES", experts_per_chunk * 256 * 512 * 4)
+    for a, b in zip(both, mxfp8.mxfp8_quantize(gate), strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    chunked = quantize_mok_mxfp8_weights(gate, up, down)
+    pairs = list(zip(_flat(fused), _flat(chunked), strict=True))
+    assert len(pairs) == 16
+    for a, b in pairs:
+        assert a.shape == b.shape and a.dtype == b.dtype
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@pytest.mark.parametrize("comm", [4, 16])
+def test_mxfp8_forward_reruns_are_bitwise(comm):
+    """Fused MXFP8 forward reruns are bitwise over several macrobatches, also with
+    16 communication SMs, where the compute CTAs steal tiles and BF16 shared tiles
+    interleave with the routed MXFP8 tiles that read the block-scale ring."""
+    require_gpu()
+    hidden, intermediate, macro, mini = 1024, 256, 1024, 256
+    tokens, topk = 2048, 2
+    forward = MoKForwardMXFP8(False)
+    x, _, shared, routed, _, s = _setup(
+        hidden, intermediate, 7821, experts=5, tokens=tokens, topk=topk
+    )
+    routed_q = [quantize(w, transposed=False)[:2] for w in routed]
+    runs = []
+    for _ in range(3):
+        combine = torch.zeros(
+            tokens * topk, hidden, device="cuda", dtype=torch.bfloat16
+        )
+        values = forward(
+            x, [x.data_ptr()], combine, [combine.data_ptr()],
+            shared[0], routed_q[0], shared[1], routed_q[1], shared[2], routed_q[2],
+            s["peers"], s["schedule"], s["num_tokens"], s["counts"],
+            topk, None, comm, macro, mini,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        runs.append((combine.clone(), values[7].clone()))
+    for combine, y_shared in runs[1:]:
+        assert torch.equal(combine.view(torch.int16), runs[0][0].view(torch.int16))
+        assert torch.equal(y_shared.view(torch.int16), runs[0][1].view(torch.int16))
 
 
 @LIMITS

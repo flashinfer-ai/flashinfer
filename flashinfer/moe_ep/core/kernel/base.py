@@ -142,6 +142,19 @@ class MegaKernelBackend(ABC):
         self._profile_knobs: dict[tuple[int, int | None], dict] = {}
         self._autotune_winner: dict[str, Any] | None = None
 
+    @classmethod
+    def create(cls, config: Any) -> MegaKernelBackend:
+        """Construct a backend, including an opt-in variant selector."""
+        return cls(config)
+
+    def get_tuned_config(self, workspace: Any = None) -> Any:
+        """Return a fixed kernel config for the selected automatic result."""
+        import dataclasses
+
+        if not dataclasses.is_dataclass(self._config) or isinstance(self._config, type):
+            raise TypeError("this MegaMoE backend does not expose a dataclass config")
+        return dataclasses.replace(self._config, knobs=self.get_tuned_knobs(workspace))
+
     def get_tuned_knobs(self, workspace: Any = None) -> dict[str, Any]:
         """Return a copy of the last completed automatic tuning result."""
         if self._autotune_winner is None:

@@ -226,7 +226,7 @@ CUtensorMap EncodeTma_tmap_o(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compressed_kv, TensorView a_tmap_o, TensorView a_O, TensorView a_partial_lse, TensorView a_swa_indices, TensorView a_compressed_indices, TensorView a_sparse_topk_lens, TensorView a_seq_lens, TensorView a_cum_seq_lens_q, TensorView a_sinks, TensorView a_bmm1_scale, TensorView a_bmm2_scale, int64_t a_num_heads, int64_t a_swa_index_stride, int64_t a_compressed_index_stride, int64_t a_sparse_topk_lens_offset, int64_t a_num_query_tokens, int64_t a_sparse_topk, int64_t a_has_sinks, int64_t a_total_work_items, int64_t a_ragged_query, int64_t a_max_q_len, int64_t a_batch_size, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compressed_kv, TensorView a_tmap_o, TensorView a_O, TensorView a_partial_lse, TensorView a_swa_indices, TensorView a_compressed_indices, TensorView a_sparse_topk_lens, TensorView a_seq_lens, TensorView a_cum_seq_lens_q, TensorView a_sinks, TensorView a_bmm1_scale, TensorView a_bmm2_scale, int64_t a_num_heads, int64_t a_swa_index_stride, int64_t a_compressed_index_stride, int64_t a_sparse_topk_lens_offset, int64_t a_num_query_tokens, int64_t a_sparse_topk, int64_t a_has_sinks, int64_t a_total_work_items, int64_t a_ragged_query, int64_t a_max_q_len, int64_t a_batch_size, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_tmap_q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_tmap_q, "tmap_q");
@@ -318,6 +318,8 @@ void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compre
       << KERNEL_NAME << ": requires (sparse_topk >= 0)";
   TVM_FFI_CHECK((a_sparse_topk <= 1152LL), ValueError)
       << KERNEL_NAME << ": requires (sparse_topk <= 1152)";
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -367,15 +369,21 @@ void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compre
   config.blockDim = dim3(512, 1, 1);
   config.dynamicSmemBytes = 225280;
   config.stream = stream;
-  cudaLaunchAttribute attrs[2] = {};
+  cudaLaunchAttribute attrs[3] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;
   attrs[0].val.clusterDim.x = 2;
   attrs[0].val.clusterDim.y = 1;
   attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  int n = 2;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   config.attrs = attrs;
-  config.numAttrs = 2;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dsv4_009fa784c7206613d7b7), kernel_args),
             "cudaLaunchKernelExC");
 }

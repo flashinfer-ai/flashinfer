@@ -1110,9 +1110,10 @@ _TGV_CUTE_EXT_COMPILE_CACHE: dict = {}
 def _detect_leading_dim(t: torch.Tensor) -> int:
     """Return the index of the stride-1 dim. Used by ``_to_cute_swap`` so the
     integration layer auto-adapts to whichever of K-major / MN-major the
-    caller hands us. Falls back to the innermost dim if no stride-1 dim
-    exists (shouldn't happen for well-formed tensors)."""
-    for i, s in enumerate(t.stride()):
+    caller hands us. Skips the batch dim 0, which also has stride 1 for a
+    1x1 matrix (M = N = 1). Falls back to the innermost dim if no stride-1
+    dim exists (shouldn't happen for well-formed tensors)."""
+    for i, s in enumerate(t.stride()[1:], start=1):
         if s == 1:
             return i
     return t.dim() - 1

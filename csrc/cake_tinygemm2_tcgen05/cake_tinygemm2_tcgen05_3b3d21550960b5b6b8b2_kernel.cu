@@ -377,8 +377,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     if (s0m_5_0 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 512;
                         int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 256;
+#else
+                        int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 512;
+                        int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 256;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -414,8 +419,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc), "r"(1) : "memory");
                         if (n_groups_m > s0m_5_0 + 1) {
+#if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_2 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 512;
                             int _smem_desc_lo_3 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 256;
+#else
+                            int _smem_desc_lo_2 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 512;
+                            int _smem_desc_lo_3 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 256;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -459,8 +469,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     if (s0m_5_1 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_4 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 512;
                         int _smem_desc_lo_5 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 256;
+#else
+                        int _smem_desc_lo_4 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 512;
+                        int _smem_desc_lo_5 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 256;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -496,8 +511,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc), "r"(1) : "memory");
                         if (n_groups_m > s0m_5_1 + 1) {
+#if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_6 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 512;
                             int _smem_desc_lo_7 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 256;
+#else
+                            int _smem_desc_lo_6 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 512;
+                            int _smem_desc_lo_7 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 256;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -541,8 +561,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     if (s0m_5_2 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_8 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 512;
                         int _smem_desc_lo_9 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 256;
+#else
+                        int _smem_desc_lo_8 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 512;
+                        int _smem_desc_lo_9 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 256;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -578,8 +603,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_acc), "r"(1) : "memory");
                         if (n_groups_m > s0m_5_2 + 1) {
+#if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_10 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 512;
                             int _smem_desc_lo_11 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 256;
+#else
+                            int _smem_desc_lo_10 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 512;
+                            int _smem_desc_lo_11 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 256;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -623,8 +653,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     if (s0m_5_3 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_12 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 512;
                         int _smem_desc_lo_13 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2) * 256;
+#else
+                        int _smem_desc_lo_12 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 512;
+                        int _smem_desc_lo_13 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2) * 256;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -660,8 +695,13 @@ kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"(tmem_acc), "r"(1) : "memory");
                         if (n_groups_m > s0m_5_3 + 1) {
+#if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_14 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 512;
                             int _smem_desc_lo_15 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 256;
+#else
+                            int _smem_desc_lo_14 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 512;
+                            int _smem_desc_lo_15 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + 1) * 256;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"

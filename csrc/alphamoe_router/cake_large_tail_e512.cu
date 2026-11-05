@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_LOCAL_OFFSETS_OFF 0
 #define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
 #define SMEM_LOCAL_OFFSETS_STRIDE 4100
@@ -121,25 +120,25 @@ kernel_alpha_moe_fused_router_large_tail_e512_idle_padding(float* __restrict__ l
             scan_thread_total = scan_thread_total + padded_count_init;
         }
         int scan_thread_inclusive = scan_thread_total;
-        int scan_peer = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
         if (lane >= 1) {
-            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_4_0;
         }
-        int scan_peer_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
         if (lane >= 2) {
-            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_4_1;
         }
-        int scan_peer_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
         if (lane >= 4) {
-            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_4_2;
         }
-        int scan_peer_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
         if (lane >= 8) {
-            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_4_3;
         }
-        int scan_peer_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
         if (lane >= 16) {
-            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_4_4;
         }
         if (lane == 31) {
             scan_values[warp] = scan_thread_inclusive;
@@ -151,17 +150,17 @@ kernel_alpha_moe_fused_router_large_tail_e512_idle_padding(float* __restrict__ l
                 scan_warp_total = scan_values[lane];
             }
             int scan_warp_inclusive = scan_warp_total;
-            int scan_warp_peer = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer_2_0 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
             if (lane >= 1) {
-                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_2_0;
             }
-            int scan_warp_peer_0 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_2_1 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
             if (lane >= 2) {
-                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_2_1;
             }
-            int scan_warp_peer_1 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
+            int scan_warp_peer_2_2 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
             if (lane >= 4) {
-                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_1;
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_2_2;
             }
             if (lane < NUM_WARPS) {
                 scan_values[lane] = scan_warp_inclusive - scan_warp_total;

@@ -97,6 +97,14 @@ kernel_cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a(const __grid_constant__ CUte
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFB_packed))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&C_tma))) : "memory");
 
+#if __CUDA_ARCH__ == 1000
+    // EXIT-A: a batch whose 32 groups are all empty has no tile; every CTA leaves before any mbarrier, cluster or
+    // tensor-memory operation.  The decision reads only masked_m, so both CTAs of a cluster take the same branch.
+    if (__ballot_sync(0xffffffffu, masked_m[lane] != 0) == 0u) {
+        return;
+    }
+#endif
+
     // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 19 barriers)
     // Mbarriers at smem_raw[0..152)
 
@@ -135,6 +143,8 @@ kernel_cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a(const __grid_constant__ CUte
 
     __syncwarp();
 
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     // TMEM alloc (128 columns, 72 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 152);
     if (warp == 2) {
@@ -145,8 +155,6 @@ kernel_cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a(const __grid_constant__ CUte
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
