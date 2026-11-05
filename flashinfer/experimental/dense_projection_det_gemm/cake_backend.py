@@ -1596,6 +1596,11 @@ ROW_RULES: dict[tuple, dict] = {
     #      ragged rule's overlapped half-tail program), with the per-tile K partitions of the row's plan without it,
     #      measured on GB200 against that plan ----
     ('sm_100a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_100a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16384 (the half-tail
+    #      program with the tall epilogue released by row half and the column-grouped raster in 16-column-tile groups,
+    #      in place of the ragged rule's overlapped half-tail program in the same groups), with the per-tile K
+    #      partitions of the row's plan without it, measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1747,6 +1752,12 @@ ROW_RULES: dict[tuple, dict] = {
     #      partitions of the row's plan without them, measured on GB300 against that plan ----
     ('sm_103a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
     ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_103a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16231 / 16384 (the sm_100a
+    #      key's program: the half-tail program with the tall epilogue released by row half and the column-grouped
+    #      raster in 16-column-tile groups, in place of the ragged rule's overlapped half-tail program), with the
+    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
 }
 # fmt: on
 
