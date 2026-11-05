@@ -2314,27 +2314,28 @@ def test_top_k_page_table_transform_multi_cta_publishes_all_indices(
     device = "cuda"
     num_rows, max_len, k = 2 * num_sms, 131072, 2048
     generator = torch.Generator(device=device).manual_seed(0)
-    # Distinct scores: the top-k set is unique.
-    scores = torch.stack(
-        [
-            torch.randperm(max_len, device=device, generator=generator)
-            for _ in range(num_rows)
-        ]
+    # Four score levels: every selected index ties with the pivot, so all k slots are
+    # written in pass 2 (the == pivot pass).
+    scores = torch.randint(
+        0, 4, (num_rows, max_len), device=device, generator=generator
     ).to(torch.float32)
     # Odd page ids: an untranslated (stale) index shows up as an even value.
     src_page_table = (
         torch.arange(max_len, device=device, dtype=torch.int32) * 2 + 1
     ).repeat(num_rows, 1)
     lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
-    expected = (scores.topk(k, dim=-1).indices.to(torch.int32) * 2 + 1).sort(dim=-1)
-    expected = expected.values
+    kth = scores.topk(k, dim=-1).values[:, -1:]
 
     for _ in range(_RACE_REPEATS):
         out = torch.full((num_rows, k), -7, device=device, dtype=torch.int32)
         flashinfer.top_k_page_table_transform(
             scores, src_page_table, lengths, k, deterministic=deterministic, out=out
         )
-        torch.testing.assert_close(out.sort(dim=-1).values, expected, rtol=0, atol=0)
+        assert bool(((out % 2 == 1) & (out > 0) & (out < 2 * max_len)).all())
+        raw = ((out - 1) // 2).long()
+        assert bool((scores.gather(-1, raw) >= kth).all())
+        sorted_raw = raw.sort(dim=-1).values
+        assert bool((sorted_raw[:, 1:] != sorted_raw[:, :-1]).all())
 
 
 @pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
