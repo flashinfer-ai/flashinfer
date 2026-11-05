@@ -1,6 +1,6 @@
 {
  "captured": {
-  "base": "5632aa13a4741ad0b5c3465bf3cdf1a438cec34c",
+  "base": "9cdebfc5c7f654d1e87b9bbe1d94b381689fc294",
   "device": "cpu (no CUDA device)",
   "first_exported_arch": "sm_100a",
   "how": "_golden_view(_snapshot({})) executed on the base tree with this test file copied onto it",
