@@ -162,6 +162,16 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     return padded_row * padded_column
 
 
+def _check_mxfp8_cuda_capability(device: torch.device) -> None:
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
+                f"got SM{major}{minor}"
+            )
+
+
 @functools.cache
 def get_mxfp8_quantization_sm100_module():
     module = gen_mxfp8_quantization_sm100_module().build_and_load()
@@ -214,6 +224,7 @@ def get_mxfp8_quantization_sm100_module():
             )
             return out_val, out_sf
         else:
+            _check_mxfp8_cuda_capability(input.device)
             if enable_pdl is None:
                 enable_pdl = device_support_pdl(input.device)
             m = input.numel() // input.shape[-1]
@@ -480,13 +491,7 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
-        if input.device.type == "cuda":
-            major, minor = get_compute_capability(input.device)
-            if major < 10:
-                raise RuntimeError(
-                    "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
-                    f"got SM{major}{minor}"
-                )
+        _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(

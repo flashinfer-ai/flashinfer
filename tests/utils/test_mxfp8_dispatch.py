@@ -9,12 +9,63 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from flashinfer import mxfp8_quantize
 from flashinfer.quantization import fp8_quantization
+from flashinfer.fp8_quantization import get_mxfp8_quantization_sm100_module
 
 
 def _fake_cuda_input():
     # A genuine Tensor with a CUDA device, without allocating CUDA storage.
     with FakeTensorMode():
         return torch.empty((1, 32), dtype=torch.bfloat16, device="cuda:0")
+
+
+@pytest.fixture
+def direct_sm100_module(monkeypatch):
+    native = SimpleNamespace(mxfp8_quantize=Mock(), mxfp8_quantize_host=Mock())
+    monkeypatch.setattr(
+        fp8_quantization,
+        "gen_mxfp8_quantization_sm100_module",
+        lambda: SimpleNamespace(build_and_load=lambda: native),
+    )
+    # Exercise the real exported factory without caching this test's native stub.
+    return get_mxfp8_quantization_sm100_module.__wrapped__(), native
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
+def test_mxfp8_sm100_direct_rejects_unsupported_cuda(
+    monkeypatch, direct_sm100_module, capability
+):
+    module, native = direct_sm100_module
+    capability_query = Mock(return_value=capability)
+    pdl_query = Mock(return_value=False)
+    monkeypatch.setattr(fp8_quantization, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp8_quantization, "device_support_pdl", pdl_query)
+    with FakeTensorMode():
+        input = torch.empty((1, 32), dtype=torch.bfloat16, device="cuda:0")
+        with pytest.raises(RuntimeError, match="requires SM100 or newer"):
+            module.mxfp8_quantize_sm100(input)
+    capability_query.assert_called_once_with(input.device)
+    pdl_query.assert_not_called()
+    native.mxfp8_quantize.assert_not_called()
+
+
+def test_mxfp8_sm100_direct_keeps_supported_cuda(monkeypatch, direct_sm100_module):
+    module, native = direct_sm100_module
+    monkeypatch.setattr(fp8_quantization, "get_compute_capability", lambda _: (10, 0))
+    with FakeTensorMode():
+        input = torch.empty((1, 32), dtype=torch.bfloat16, device="cuda:0")
+        module.mxfp8_quantize_sm100(input, enable_pdl=False)
+    native.mxfp8_quantize.assert_called_once()
+    native.mxfp8_quantize_host.assert_not_called()
+
+
+def test_mxfp8_sm100_direct_keeps_cpu_host(monkeypatch, direct_sm100_module):
+    module, native = direct_sm100_module
+    capability_query = Mock(side_effect=AssertionError("CPU queried CUDA capability"))
+    monkeypatch.setattr(fp8_quantization, "get_compute_capability", capability_query)
+    module.mxfp8_quantize_sm100(torch.ones((1, 32), dtype=torch.float32))
+    capability_query.assert_not_called()
+    native.mxfp8_quantize_host.assert_called_once()
+    native.mxfp8_quantize.assert_not_called()
 
 
 @pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
