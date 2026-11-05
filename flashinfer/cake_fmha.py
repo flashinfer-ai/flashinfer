@@ -1791,14 +1791,25 @@ def _smallm_sm_count(device: torch.device) -> int:
     return count
 
 
-# CUDA context unique ID (``cuCtxGetId``) -> the SM count of that context: the
-# device's for the primary context, the partition's for a green context.  The
-# driver never reuses a context ID in a process, unlike a destroyed context's
-# (or stream's) handle, so a new green context never reads another one's count.
+# CUDA context unique ID (``cuCtxGetId``) -> the SM count of that context (a
+# green context's partition).  The driver never reuses a context ID in a
+# process, unlike a destroyed context's (or stream's) handle, so a new green
+# context never reads another one's count.
 _CONTEXT_SM_COUNTS: dict[int, int] = {}
+# CUDA device index -> the handle of its primary context, retained here for the
+# process (``0`` when the driver does not give it).  A retained context is never
+# destroyed, so no other context ever has its handle.
+_PRIMARY_CONTEXTS: dict[int, int] = {}
+# Primary context handle -> its SM count: a launch on a stream of the primary
+# context (every stream but a green context's) reads it with one driver call.
+_PRIMARY_SM_COUNTS: dict[int, int] = {}
+# Raw stream handle -> its ``CUstream``: a binding given a plain int builds a
+# new ``CUstream`` on every call.
+_CU_STREAMS: dict[int, Any] = {}
 # ``(cuStreamGetCtx, cuCtxGetCurrent, cuCtxGetId, cuCtxGetDevResource, SM
-# resource type)`` of ``cuda.bindings.driver`` once resolved; ``False`` without
-# them (then a launch is planned on the device's SM count).
+# resource type, CUstream, device index -> its retained primary context)`` of
+# ``cuda.bindings.driver`` once resolved; ``False`` without them (then a launch
+# is planned on the device's SM count).
 _CONTEXT_QUERIES: Any = None
 
 
@@ -1808,43 +1819,30 @@ def _context_queries() -> Any:
         try:
             from cuda.bindings import driver
 
+            def primary_context(index: int) -> tuple[Any, Any]:
+                err, device = driver.cuDeviceGet(index)
+                if int(err):
+                    return err, None
+                return driver.cuDevicePrimaryCtxRetain(device)
+
             _CONTEXT_QUERIES = (
                 driver.cuStreamGetCtx,
                 driver.cuCtxGetCurrent,
                 driver.cuCtxGetId,
                 driver.cuCtxGetDevResource,
                 driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+                driver.CUstream,
+                primary_context,
             )
         except (ImportError, AttributeError):
             _CONTEXT_QUERIES = False
     return _CONTEXT_QUERIES
 
 
-def _stream_context_sm_count(index: int) -> int | None:
-    """The SM count of the CUDA context of device ``index``'s current torch
-    stream (a green context's stream runs on its partition; the legacy and
-    per-thread default streams run on the thread's current context); ``None``
-    when the driver cannot tell.
+def _context_sm_count(queries: Any, context: Any) -> int | None:
+    """The SM count of CUDA ``context``, read once per context ID."""
 
-    Every launch resolves its stream's context (``cuStreamGetCtx``, else the
-    thread's current context, and ``cuCtxGetId``) and reads the count cached
-    per context ID.  The stream is not keyed by ``cuStreamGetId``: on a stream
-    being captured into a CUDA graph that query returns
-    ``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`` and invalidates the capture
-    (driver 580, in global and relaxed capture modes alike), while the context
-    queries are legal during a capture."""
-
-    queries = _CONTEXT_QUERIES
-    if queries is None:
-        queries = _context_queries()
-    if not queries:
-        return None
-    stream_context, get_current, context_id, context_resource, sm_type = queries
-    err, context = stream_context(torch._C._cuda_getCurrentRawStream(index))
-    if int(err) or not int(context):
-        err, context = get_current()
-        if int(err) or not int(context):
-            return None
+    _, _, context_id, context_resource, sm_type, _, _ = queries
     err, key = context_id(context)
     count = None if int(err) else _CONTEXT_SM_COUNTS.get(key)
     if count is None:
@@ -1854,6 +1852,57 @@ def _stream_context_sm_count(index: int) -> int | None:
         count = int(resource.sm.smCount)
         if not int(err):
             _CONTEXT_SM_COUNTS[key] = count
+    return count
+
+
+def _primary_context(queries: Any, index: int) -> int:
+    """The handle of device ``index``'s primary context (``0`` when the driver
+    does not give it), retained once."""
+
+    handle = _PRIMARY_CONTEXTS.get(index)
+    if handle is None:
+        err, context = queries[6](index)
+        handle = _PRIMARY_CONTEXTS[index] = 0 if int(err) else int(context)
+    return handle
+
+
+def _stream_context_sm_count(index: int) -> int | None:
+    """The SM count of the CUDA context of device ``index``'s current torch
+    stream (a green context's stream runs on its partition; the legacy and
+    per-thread default streams run on the thread's current context); ``None``
+    when the driver cannot tell.
+
+    Every launch resolves its stream's context (``cuStreamGetCtx``, else the
+    thread's current context).  The device's primary context is known by its
+    handle, so a launch on one of its streams makes no other driver call; any
+    other context's count is cached per context ID (``cuCtxGetId``).  The
+    stream is not keyed by ``cuStreamGetId``: on a stream being captured into
+    a CUDA graph that query returns ``CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED``
+    and invalidates the capture (driver 580, in global and relaxed capture
+    modes alike), while the context queries are legal during a capture."""
+
+    queries = _CONTEXT_QUERIES
+    if queries is None:
+        queries = _context_queries()
+    if not queries:
+        return None
+    stream = torch._C._cuda_getCurrentRawStream(index)
+    cu_stream = _CU_STREAMS.get(stream)
+    if cu_stream is None:
+        cu_stream = _CU_STREAMS[stream] = queries[5](stream)
+    err, context = queries[0](cu_stream)
+    handle = 0 if int(err) else int(context)
+    if not handle:
+        err, context = queries[1]()
+        handle = 0 if int(err) else int(context)
+        if not handle:
+            return None
+    count = _PRIMARY_SM_COUNTS.get(handle)
+    if count is not None:
+        return count
+    count = _context_sm_count(queries, context)
+    if count is not None and handle == _primary_context(queries, index):
+        _PRIMARY_SM_COUNTS[handle] = count
     return count
 
 

@@ -1308,8 +1308,9 @@ def _fake_context_queries(monkeypatch, state, calls):
     """Driver queries over ``state``: the current stream's handle, its
     context's handle, ID and SM count (``contexts`` overrides the ID and SM
     count per context handle, ``current`` is the thread's current context,
-    ``stream_err`` fails the stream's context query); ``calls`` logs each
-    context read."""
+    ``primary`` the device's primary context, ``stream_err`` fails the
+    stream's context query); ``calls`` logs each context read and
+    ``state["id_reads"]`` counts the context ID queries."""
 
     def context_of(context):
         return state.get("contexts", {}).get(
@@ -1321,6 +1322,7 @@ def _fake_context_queries(monkeypatch, state, calls):
         return state.get("stream_err", 0), state["handle"]
 
     def context_id(context):
+        state["id_reads"] = state.get("id_reads", 0) + 1
         return 0, context_of(context)[0]
 
     def context_resource(context, sm_type):
@@ -1331,7 +1333,13 @@ def _fake_context_queries(monkeypatch, state, calls):
     monkeypatch.setattr(
         torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
     )
-    monkeypatch.setattr(cake_api, "_CONTEXT_SM_COUNTS", {})
+    for cache in (
+        "_CONTEXT_SM_COUNTS",
+        "_PRIMARY_CONTEXTS",
+        "_PRIMARY_SM_COUNTS",
+        "_CU_STREAMS",
+    ):
+        monkeypatch.setattr(cake_api, cache, {})
     monkeypatch.setattr(
         cake_api,
         "_CONTEXT_QUERIES",
@@ -1341,6 +1349,8 @@ def _fake_context_queries(monkeypatch, state, calls):
             context_id,
             context_resource,
             "sm",
+            lambda stream: stream,
+            lambda index: (0, state.get("primary", 0)),
         ),
     )
 
@@ -1404,6 +1414,28 @@ def test_cake_fmha_smallm_partition_sm_count_of_a_failed_stream_query_is_the_cur
     assert cake_api._stream_context_sm_count(0) == 32
     assert cake_api._stream_context_sm_count(0) == 32
     assert calls == [5, 1]
+
+
+def test_cake_fmha_smallm_partition_sm_count_of_the_primary_context_is_one_query(
+    monkeypatch,
+) -> None:
+    """A launch on a stream of the device's primary context (retained, so its
+    handle is never another context's) reads its SM count once and then makes
+    no context ID query; a green context's stream still reads its own count."""
+
+    state = {"stream": 7, "handle": 0x10, "context_id": 1, "sms": 152}
+    state["primary"] = 0x10
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls)
+    assert cake_api._stream_context_sm_count(0) == 152
+    id_reads = state["id_reads"]
+    for _ in range(3):
+        assert cake_api._stream_context_sm_count(0) == 152
+    assert calls == [1] and state["id_reads"] == id_reads
+    state.update(stream=8, handle=0x30, context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2] and state["id_reads"] == id_reads + 2
 
 
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
