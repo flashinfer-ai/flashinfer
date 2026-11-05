@@ -413,24 +413,20 @@ def _validate_inputs(
     b_q,
     b_scale,
     m_indptr,
-    up_scale,
-    gate_scale,
+    weight_global_scale,
+    input_global_scale,
     global_scale,
     activation=ActivationType.Swiglu,
     token_map=None,
 ):
-    if gate_scale is None:
-        if activation is not ActivationType.Relu2:
-            raise TypeError("gate_scale is required for gated activations")
-        gate_scale = up_scale
     tensors = (
         a_q,
         a_scale,
         b_q,
         b_scale,
         m_indptr,
-        up_scale,
-        gate_scale,
+        weight_global_scale,
+        input_global_scale,
         global_scale,
     )
     if token_map is not None:
@@ -445,34 +441,45 @@ def _validate_inputs(
         raise TypeError("a_q and b_q must be uint8-packed FP4")
     if a_q.ndim != 2 or b_q.ndim != 3:
         raise ValueError("a_q must be 2D and b_q must be 3D")
-    if a_scale.dtype != torch.uint8 or b_scale.dtype != torch.uint8:
-        raise TypeError("a_scale and b_scale must be E4M3 bytes from fp4_quantize")
+    if a_scale.dtype != torch.uint8:
+        raise TypeError("a_scale must be E4M3 bytes from fp4_quantize")
+    if b_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError("b_scale must be canonical E4M3 weight scales")
     if m_indptr.dtype != torch.int32 or m_indptr.ndim != 1:
         raise TypeError("m_indptr must be a 1D int32 tensor")
     e, n2 = int(b_q.shape[0]), int(b_q.shape[1])
     if activation is not ActivationType.Relu2 and n2 % 2 != 0:
         raise ValueError("b_q projection extent must be even")
-    for name, scale in (("up_scale", up_scale), ("gate_scale", gate_scale)):
-        if scale.dtype != torch.float32 or tuple(scale.shape) != (e,):
-            raise TypeError(f"{name} must be float32[num_experts]")
-    if global_scale.dtype != torch.float32 or tuple(global_scale.shape) != (1,):
-        raise TypeError("global_scale must be float32[1]")
+    if weight_global_scale.dtype != torch.float32 or tuple(
+        weight_global_scale.shape
+    ) != (e,):
+        raise TypeError("weight_global_scale must be float32[num_experts]")
+    for name, scale in (
+        ("input_global_scale", input_global_scale),
+        ("global_scale", global_scale),
+    ):
+        if scale.dtype != torch.float32 or tuple(scale.shape) != (1,):
+            raise TypeError(f"{name} must be float32[1]")
     if int(m_indptr.shape[0]) != e + 1:
         raise ValueError("m_indptr length must equal num_experts + 1")
     if int(a_q.shape[1]) != int(b_q.shape[2]):
         raise ValueError("a_q and b_q K extents must match")
     m, packed_k = int(a_q.shape[0]), int(a_q.shape[1])
     k = packed_k * 2
+    if k % 64:
+        raise ValueError("canonical FP4 weight K must be divisible by 64")
+    cols = ceil_div(k, 16)
     want_a_scale = (
-        (m, ceil_div(k, 16))
-        if token_map is not None
-        else (compute_padded_offset(m, e, 128), ceil_div(k, 16))
+        (m, cols) if token_map is not None else (compute_padded_offset(m, e, 128), cols)
     )
-    want_b_scale = (e * align(n2, 128), ceil_div(k, 16))
+    want_b_scale = (
+        (e, ceil_div(n2, 128), ceil_div(cols, 4), 32, 16),
+        (e, align(n2, 128), cols),
+    )
     if tuple(a_scale.shape) != want_a_scale:
         raise ValueError(f"a_scale shape must be {want_a_scale}")
-    if tuple(b_scale.shape) != want_b_scale:
-        raise ValueError(f"b_scale shape must be {want_b_scale}")
+    if tuple(b_scale.shape) not in want_b_scale:
+        raise ValueError("b_scale must be a canonical 5D or 3D weight scale view")
     if token_map is not None:
         if n2 % (64 if activation is ActivationType.Relu2 else 256):
             raise ValueError(
@@ -501,8 +508,8 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
     b_q,
     b_scale,
     m_indptr,
-    up_scale,
-    gate_scale,
+    weight_global_scale,
+    input_global_scale,
     global_scale,
     out_dtype: torch.dtype = torch.uint8,
     tile=None,
@@ -526,14 +533,12 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         b_q,
         b_scale,
         m_indptr,
-        up_scale,
-        gate_scale,
+        weight_global_scale,
+        input_global_scale,
         global_scale,
         activation,
         token_map,
     )
-    if gate_scale is None:
-        gate_scale = up_scale
     swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
     n, k = (
         int(b_q.shape[1]) // (1 if activation is ActivationType.Relu2 else 2),
@@ -553,8 +558,8 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         b_q,
         b_scale,
         m_indptr,
-        up_scale,
-        gate_scale,
+        weight_global_scale,
+        input_global_scale,
         global_scale,
     )
     if gather:
@@ -640,8 +645,8 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         q,
         sf,
         m_indptr,
-        up_scale,
-        gate_scale,
+        weight_global_scale,
+        input_global_scale,
         global_scale,
         op.cfg.epi,
         op.cfg.TILE,
@@ -661,8 +666,7 @@ def cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
     b_q: torch.Tensor,
     b_scale: torch.Tensor,
     input_global_scale: torch.Tensor,
-    up_scale: torch.Tensor,
-    gate_scale: torch.Tensor | None,
+    weight_global_scale: torch.Tensor,
     global_scale: torch.Tensor,
     *,
     tile=None,
@@ -748,8 +752,7 @@ def cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
         b_q,
         b_scale,
         input_global_scale,
-        up_scale,
-        gate_scale,
+        weight_global_scale,
         global_scale,
         out_q,
         out_sf,
@@ -799,8 +802,8 @@ def cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
         b_q,
         b_scale,
         offsets,
-        up_scale,
-        gate_scale,
+        weight_global_scale,
+        input_global_scale,
         global_scale,
         tile=tile,
         epi=epi,
@@ -887,9 +890,16 @@ class _Fc1ActQ1Runner(TunableRunner):
         )
 
     def launch(self, inputs, out, tactic):
-        (a_q, a_scale, b_q, b_scale, m_indptr, up_scale, gate_scale, global_scale) = (
-            inputs[:8]
-        )
+        (
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            m_indptr,
+            weight_global_scale,
+            input_global_scale,
+            global_scale,
+        ) = inputs[:8]
         token_map = inputs[8] if len(inputs) == 9 else None
         gather = token_map is not None
         total_rows = token_map.numel() if gather else int(a_q.shape[0])
@@ -934,8 +944,8 @@ class _Fc1ActQ1Runner(TunableRunner):
             q,
             sf,
             m_indptr,
-            up_scale,
-            gate_scale,
+            weight_global_scale,
+            input_global_scale,
             global_scale,
             op.cfg.epi,
             op.cfg.TILE,

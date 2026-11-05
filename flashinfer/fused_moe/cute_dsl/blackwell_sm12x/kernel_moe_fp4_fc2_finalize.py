@@ -589,7 +589,8 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         gTok: cute.Tensor,
         gWt: cute.Tensor,
         offsets: cute.Tensor,
-        alpha: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         stream,
     ):
         cfg = self.cfg
@@ -716,7 +717,8 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
             gTok,
             gWt,
             offsets,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             a_smem,
             b_smem,
             sfa_smem,
@@ -748,7 +750,8 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         gTok: cute.Tensor,
         gWt: cute.Tensor,
         offsets: cute.Tensor,
-        alpha: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         a_smem,
         b_smem,
         sfa_smem,
@@ -974,7 +977,12 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                     rstage,
                     rphase,
                 )
-                acc.store(acc.load() * alpha[tile.group].to(cutlass.Float32))
+                acc.store(
+                    acc.load()
+                    * (weight_global_scale[tile.group] / input_global_scale[0]).to(
+                        cutlass.Float32
+                    )
+                )
                 moe_epilogue.store_wg_scatter(
                     acc,
                     thr_r2s,
@@ -1012,7 +1020,8 @@ class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
         gTok: cute.Tensor,
         gWt: cute.Tensor,
         offsets: cute.Tensor,
-        alpha: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         stream,
         worklist=None,
         workcount=None,
@@ -1095,7 +1104,8 @@ class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
             gTok,
             gWt,
             offsets,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             worklist,
             workcount,
             tiledmma,
@@ -1128,7 +1138,8 @@ class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
         gTok: cute.Tensor,
         gWt: cute.Tensor,
         offsets: cute.Tensor,
-        alpha: cute.Tensor,
+        weight_global_scale: cute.Tensor,
+        input_global_scale: cute.Tensor,
         worklist,
         workcount,
         tiledmma,
@@ -1196,7 +1207,12 @@ class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
                 tidx,
                 ceil_div(cute.size(gA_u8, mode=[1]), bk >> 1),
             )
-            acc.store(acc.load() * alpha[group].to(cutlass.Float32))
+            acc.store(
+                acc.load()
+                * (weight_global_scale[group] / input_global_scale[0]).to(
+                    cutlass.Float32
+                )
+            )
             sC = storage.sC.get_tensor(epi_smem.outer, swizzle=epi_smem.inner)[
                 None, None, 0
             ]
@@ -1237,7 +1253,8 @@ def make_args(
     src_token,
     pair_scales,
     m_indptr,
-    alpha,
+    weight_global_scale,
+    input_global_scale,
     epi_cfg,
     tile,
     *,
@@ -1256,6 +1273,9 @@ def make_args(
         )
     )
     assert (worklist is None) == (workcount is None)
+    b_scale = b_scale.view(torch.uint8).view(
+        int(b_q.shape[0]) * int(b_q.shape[1]), ceil_div(int(b_q.shape[2]) * 2, 16)
+    )
     args = (
         from_dlpack(a_q).mark_layout_dynamic(),
         from_dlpack(b_q).mark_layout_dynamic(),
@@ -1265,7 +1285,8 @@ def make_args(
         sf(src_token),
         sf(pair_scales),
         from_dlpack(m_indptr).mark_layout_dynamic(),
-        from_dlpack(alpha).mark_layout_dynamic(),
+        from_dlpack(weight_global_scale).mark_layout_dynamic(),
+        from_dlpack(input_global_scale).mark_layout_dynamic(),
         _stream(),
     )
     if worklist is not None:

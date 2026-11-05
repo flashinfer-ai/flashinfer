@@ -184,9 +184,28 @@ def _prepare_worklist(op, inputs, out, offsets, worklist=None, workcount=None):
 
 
 def _validate_inputs(
-    a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, alpha, num_tokens
+    a_q,
+    a_scale,
+    b_q,
+    b_scale,
+    m_indptr,
+    src_token,
+    pair_scales,
+    weight_global_scale,
+    input_global_scale,
+    num_tokens,
 ):
-    tensors = (a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, alpha)
+    tensors = (
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        m_indptr,
+        src_token,
+        pair_scales,
+        weight_global_scale,
+        input_global_scale,
+    )
     if any(t.device != a_q.device for t in tensors):
         raise ValueError("all inputs must be on the same device")
     if any(not t.is_cuda or not t.is_contiguous() for t in tensors):
@@ -195,14 +214,22 @@ def _validate_inputs(
         raise TypeError("a_q and b_q must be uint8-packed FP4")
     if a_q.ndim != 2 or b_q.ndim != 3:
         raise ValueError("a_q must be 2D and b_q must be 3D")
-    if a_scale.dtype != torch.uint8 or b_scale.dtype != torch.uint8:
-        raise TypeError("a_scale and b_scale must be E4M3 bytes from fp4_quantize")
+    if a_scale.dtype != torch.uint8:
+        raise TypeError("a_scale must be E4M3 bytes from fp4_quantize")
+    if b_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError("b_scale must be canonical E4M3 weight scales")
     if m_indptr.ndim != 1 or src_token.ndim != 1 or pair_scales.ndim != 1:
         raise ValueError("routing inputs must be 1D")
     m, packed_k = int(a_q.shape[0]), int(a_q.shape[1])
     e, n, b_packed_k = map(int, b_q.shape)
-    if alpha.dtype != torch.float32 or tuple(alpha.shape) != (e,):
-        raise TypeError("alpha must be float32[num_experts]")
+    if weight_global_scale.dtype != torch.float32 or tuple(
+        weight_global_scale.shape
+    ) != (e,):
+        raise TypeError("weight_global_scale must be float32[num_experts]")
+    if input_global_scale.dtype != torch.float32 or tuple(input_global_scale.shape) != (
+        1,
+    ):
+        raise TypeError("input_global_scale must be float32[1]")
     if packed_k != b_packed_k:
         raise ValueError("a_q and b_q K extents must match")
     if int(m_indptr.shape[0]) != e + 1:
@@ -212,12 +239,17 @@ def _validate_inputs(
     if num_tokens <= 0:
         raise ValueError("num_tokens must be positive")
     k = packed_k * 2
-    want_a_scale = (compute_padded_offset(m, e, 128), ceil_div(k, 16))
-    want_b_scale = (e * n, ceil_div(k, 16))
+    if n % 128 or k % 64:
+        raise ValueError(
+            "canonical FC2 requires N divisible by 128 and K divisible by 64"
+        )
+    cols = ceil_div(k, 16)
+    want_a_scale = (compute_padded_offset(m, e, 128), cols)
+    want_b_scale = ((e, ceil_div(n, 128), ceil_div(cols, 4), 32, 16), (e, n, cols))
     if tuple(a_scale.shape) != want_a_scale:
         raise ValueError(f"a_scale shape must be {want_a_scale}")
-    if tuple(b_scale.shape) != want_b_scale:
-        raise ValueError(f"b_scale shape must be {want_b_scale}")
+    if tuple(b_scale.shape) not in want_b_scale:
+        raise ValueError("b_scale must be a canonical 5D or 3D weight scale view")
 
 
 def cute_dsl_sm12x_fc2_finalize_nvfp4(
@@ -228,7 +260,8 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
     m_indptr,
     src_token,
     pair_scales,
-    alpha,
+    weight_global_scale,
+    input_global_scale,
     num_tokens: int,
     tile=None,
     epi: EpiMethod = DEFAULT_EPI,
@@ -239,13 +272,34 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
     worklist: torch.Tensor | None = None,
     workcount: torch.Tensor | None = None,
 ):
-    n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
     assert not enable_pdl or out is not None, "PDL requires caller-owned out"
     _validate_inputs(
-        a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, alpha, num_tokens
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        m_indptr,
+        src_token,
+        pair_scales,
+        weight_global_scale,
+        input_global_scale,
+        num_tokens,
     )
+    n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
     props = torch.cuda.get_device_properties(a_q.device)
     num_sms, sm_version = props.multi_processor_count, f"sm_{props.major}{props.minor}"
+    inputs = (
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        m_indptr,
+        src_token,
+        pair_scales,
+        weight_global_scale,
+        input_global_scale,
+        num_tokens,
+    )
     if tile is None and tune is not False:
         chosen = None
         if MOE_AUTOTUNE_ENABLED():
@@ -254,17 +308,7 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
                     "cute_dsl_sm12x_fc2_finalize_nvfp4",
                     [_Fc2FinalizeRunner(enable_pdl)],
                     TuningConfig(),
-                    [
-                        a_q,
-                        a_scale,
-                        b_q,
-                        b_scale,
-                        m_indptr,
-                        src_token,
-                        pair_scales,
-                        alpha,
-                        num_tokens,
-                    ],
+                    list(inputs),
                 )
             if tactic != -1:
                 chosen = tactic
@@ -291,12 +335,7 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         raise ValueError("out does not match the FC2 output contract")
     offsets = m_indptr.to(torch.int32)
     worklist, workcount = _prepare_worklist(
-        op,
-        (a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, alpha),
-        out,
-        offsets,
-        worklist,
-        workcount,
+        op, inputs[:-1], out, offsets, worklist, workcount
     )
     args = make_args(
         a_q,
@@ -307,7 +346,8 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         src_token.to(torch.int32),
         pair_scales.to(torch.float32),
         offsets,
-        alpha,
+        weight_global_scale,
+        input_global_scale,
         op.cfg.epi,
         op.cfg.TILE,
         worklist=worklist,
@@ -346,7 +386,8 @@ class _Fc2FinalizeRunner(TunableRunner):
             m_indptr,
             src_token,
             pair_scales,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             num_tokens,
         ) = inputs
         n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
@@ -367,7 +408,8 @@ class _Fc2FinalizeRunner(TunableRunner):
             m_indptr,
             src_token,
             pair_scales,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             num_tokens,
         ) = inputs
         n = int(b_q.shape[1])
@@ -382,7 +424,8 @@ class _Fc2FinalizeRunner(TunableRunner):
             m_indptr,
             src_token,
             pair_scales,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             num_tokens,
         ) = inputs
         n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
@@ -406,7 +449,7 @@ class _Fc2FinalizeRunner(TunableRunner):
         )
         grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
         offsets = m_indptr.to(torch.int32)
-        worklist, workcount = _prepare_worklist(op, inputs[:8], out, offsets)
+        worklist, workcount = _prepare_worklist(op, inputs[:-1], out, offsets)
         args = make_args(
             a_q,
             a_scale,
@@ -416,7 +459,8 @@ class _Fc2FinalizeRunner(TunableRunner):
             src_token.to(torch.int32),
             pair_scales.to(torch.float32),
             offsets,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             op.cfg.epi,
             op.cfg.TILE,
             worklist=worklist,
@@ -434,7 +478,8 @@ class _Fc2FinalizeRunner(TunableRunner):
             m_indptr,
             src_token,
             pair_scales,
-            alpha,
+            weight_global_scale,
+            input_global_scale,
             num_tokens,
         ) = inputs
         return (

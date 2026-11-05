@@ -443,8 +443,6 @@ class Fixture:
                     * self.router_weights[token, slot, None],
                 )
         self.reference, self.bf16_reference = reference.bfloat16(), bf16_reference
-        self.alpha1 = (self.g0 * weight_scale).reciprocal()
-        self.alpha2 = (self.g1 * weight_scale).reciprocal()
         self.out = torch.empty_like(self.x)
         self.q1 = torch.empty(
             tokens * topk, intermediate // 2, device="cuda", dtype=torch.uint8
@@ -502,18 +500,18 @@ class Fixture:
             activation=self.activation.name,
             swiglu_limit=self.limit,
         )
+        if self.gated:
+            self.main_w1 = torch.cat(
+                (self.w1[:, intermediate:], self.w1[:, :intermediate]), dim=1
+            ).contiguous()
+            self.main_sf1 = torch.cat(
+                (self.sf1[:, intermediate:], self.sf1[:, :intermediate]), dim=1
+            ).contiguous()
+        else:
+            self.main_w1, self.main_sf1 = self.w1, self.sf1
         if baseline is not None:
             if self.activation not in (ActivationType.Swiglu, ActivationType.Relu2):
                 raise ValueError("the baseline does not support SiTU")
-            if self.gated:
-                self.main_w1 = torch.cat(
-                    (self.w1[:, intermediate:], self.w1[:, :intermediate]), dim=1
-                ).contiguous()
-                self.main_sf1 = torch.cat(
-                    (self.sf1[:, intermediate:], self.sf1[:, :intermediate]), dim=1
-                ).contiguous()
-            else:
-                self.main_w1, self.main_sf1 = self.w1, self.sf1
             self.main_workspace = baseline.allocate_workspace(
                 tokens, h, intermediate, experts, topk, self.gated, self.x.device
             )
@@ -525,11 +523,10 @@ class Fixture:
                 self.x,
                 self.ids,
                 self.router_weights,
-                self.w1,
-                self.sf1.flatten(0, 1),
+                self.main_w1,
+                self.main_sf1.view(torch.float8_e4m3fn),
                 self.g0,
-                self.alpha1,
-                self.alpha1 if self.gated else None,
+                self.weight_dequant_scale,
                 self.g1,
                 activation=self.activation,
                 workspace=self.workspace,
@@ -555,11 +552,12 @@ class Fixture:
             q,
             sf,
             self.w2,
-            self.sf2.flatten(0, 1),
+            self.sf2.view(torch.float8_e4m3fn),
             offsets,
             token_map,
             weights,
-            self.alpha2,
+            self.weight_dequant_scale,
+            self.g1,
             self.x.shape[0],
             tune=False,
             enable_pdl=enable_pdl,
@@ -602,8 +600,6 @@ class Fixture:
             "sf2",
             "g0",
             "g1",
-            "alpha1",
-            "alpha2",
             "weight_dequant_scale",
             "main_w1",
             "main_sf1",
