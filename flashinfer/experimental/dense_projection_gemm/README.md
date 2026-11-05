@@ -28,7 +28,7 @@ deterministic already.*
 
 | operation | `deterministic=False` |
 |---|---|
-| K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles, or the deterministic plan's two-way split of K with the partials added in a fixed order; a recomputed forward reproduces its result) |
+| K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles, or the deterministic plan's two-way split of K with the partials added in a fixed order; a recomputed forward reproduces its result).  The rows of `K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM `sm_100a` / `sm_103a` parts, the K1 forward table below): the deterministic package's single-CTA program, every tile's whole K in one CTA -- other bits than `deterministic=True`, the same on every run |
 | K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles, or the deterministic plan's two-way split of K with the partials added in a fixed order) |
 | K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
 | K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row -- without a split count, while no router table gives the forward a verdict, without the per-call check of the row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
@@ -123,6 +123,7 @@ hold, the token count takes the next window that holds it.  The measured parts h
 | `K1_SPLIT_OVERRIDES_BY_SM` | `(arch, sm_count)` | verdicts (keys and values as in `K1_SPLIT_RULES`) that replace a row's `K1_SPLIT_RULES` verdict on parts of exactly `sm_count` SMs at or above the row's floor, at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; every other token count and SM count keeps the `K1_SPLIT_RULES` verdict (`sm_107a`: 216 SMs, `4096 -> 1024` FP32 (192, 1), the row-major-store program) |
 | `K1_CHAIN_RANGES_BY_SM` | `(arch, sm_count)`, then a key of `K1_SPLIT_RULES` | `((min_tokens, max_tokens, (block_n, chains)), ...)`: on a part of exactly `sm_count` SMs, a token count from `min_tokens` to `max_tokens` runs this package's one-split program of that tile width with that many accumulation chains (`k1_chain_plan`; the chain counts this package ships are `K1_CHAINS_CHOICES`), before every table above, `K1_TWO_SPLIT_RANGES_BY_SM` included (`sm_107a`: 212 and 216 SMs, the K1 accumulation-chain table below) |
 | `K1_ONE_SPLIT_RANGES_BY_SM` | `(arch, sm_count)`, then a key as in `K1_SPLIT_RULES` | `((min_tokens, max_tokens, block_n), ...)`: on a part of exactly `sm_count` SMs, a token count from `min_tokens` to `max_tokens` runs this package's one-split program of that tile width and one accumulation chain, at an even and an odd number of 64-token K blocks alike, before every table above except `K1_CHAIN_RANGES_BY_SM` (`sm_100a` / `sm_103a`: 152 SMs, the 152-SM one-split table below) |
+| `K1_FORWARD_RULES_BY_SM` | `(arch, sm_count)`, then `(K, N, T)` of the forward `out[T, N] = X[T, K] @ W[N, K].T` | the deterministic package's planner knobs of the row's program (`K1_FORWARD_SINGLE_CTA_KNOBS`), on a part of exactly `sm_count` SMs at exactly `T` tokens with both operands K-major and a BF16 `out` (`k1_forward_knobs`); every other part, row, token count, layout and output dtype runs the deterministic plan (`sm_100a` / `sm_103a`: 152 SMs, the K1 forward table below) |
 | `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`), `"nn_t"` (weight gradient, `hidden` = the launch's `M`) or `"kn"` (input gradient, `hidden` = the launch's `N`), `experts` = the launch's `N` (`K` of the input gradient) | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward and of the input gradient; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"`, a unit count (this package's stream-K program) or `"simt_n<tile_n>m<tile_m>s<slices>[<form>]"` (the exact-FP32 SIMT program of the row's layout, `router_simt`: plain without a form, compensated with `g<group>` or, on a weight-gradient row, `dot2`; the only spec of an input-gradient row) |
 | `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`; below a SIMT window too) or with a table of its own in `ROUTER_RULES_BY_SM` |
 | `ROUTER_RULES_BY_SM` | `(arch, sm_count)` | the router verdicts of the parts with exactly `sm_count` SMs (keys and values as in `ROUTER_RULES`; `router_rules` picks the table of a device); such a part takes its own table only: a row without an entry, and every token count outside its windows, runs the deterministic program (`sm_100a` / `sm_103a`: 148 SMs; `sm_107a`: 208 and 212 SMs) |
@@ -735,6 +736,39 @@ their output bit for bit, so the error follows from the order (each slice's prod
 reduction), not from the SM count: from about 100 tokens the weight gradient's error is about twice the deterministic
 program's, and at one token it is below it (each product rounded once).  The head/tail partitions split a tile's K
 range over more spans than the deterministic plan's six and add them with the TMA reduce-add.*
+
+The K1 forward rows of `K1_FORWARD_RULES_BY_SM` run, with `deterministic=False`, the deterministic package's
+single-CTA program (`K1_FORWARD_SINGLE_CTA_KNOBS`: one 128-row tile per CTA, 128-wide column tiles, no TMA cache hints;
+every tile's whole K in one CTA) in place of that package's plan of the row (CTA pairs of 256-wide tiles with the K
+range split two ways, the partials added in a fixed order).  The forward stays deterministic: it repeats bit for bit
+and a recomputed forward reproduces its result, with other bits than `deterministic=True`; both meet the BF16 budget
+against FP64 (10 seeds, 20 runs each, worst run).  A row is in the table only at a token count and SM count where it
+was measured and met this rule in every run: the forward alone faster than the deterministic plan (a one-sided paired
+sign test, p < 0.05, median ratio below 0.99, eager launches and CUDA graph replays) and no more than 3 % slower than
+it next to a kernel holding 8, 16 or 32 SMs on another stream (both launch orders); and the training steps that
+contain the forward -- forward + backward, 2 x forward + backward with an FP32 and with a BF16 weight gradient -- not
+slower than with the deterministic plan: the median over every run of the paired step-time ratio at most 1.013,
+eager launches and graph replays separately, and no run above the largest ratio of the deterministic plan against
+itself in the same runs.  The backward pass alone runs the same programs in both and is reported, not judged.
+Every other token count, SM count and row was not measured or missed, and runs the deterministic plan, as do the
+generic `dense_projection_gemm`, `prepare_dense_projection_gemm` and `plan_dense_projection_gemm` (their caller
+passes the planner knobs).
+
+| K1 forward row `d_in -> d_out` (BF16 out, both operands K-major) | 152 SMs: token counts (`K1_FORWARD_RULES_BY_SM`) | measured token counts outside them |
+|---|---|---|
+| `sm_100a` `4096 -> 512` | 2048 | 3072; 4096 |
+| `sm_100a` `5120 -> 512` | 1024, 4096 | -- |
+| `sm_103a` `4096 -> 512` | 2048 | 3072; 4096 |
+| `sm_103a` `5120 -> 512` | 1024 | 4096 |
+
+*Table: the K1 forward table (`K1_FORWARD_RULES_BY_SM` on `sm_100a` / `sm_103a` parts of exactly 152 SMs, GB200 and
+GB300).  `4096 -> 512` at 4096 tokens was up to 4.7 % slower than the deterministic plan next to a kernel holding 32
+SMs.  At 3072 tokens (`4096 -> 512`, both parts) and at 4096 tokens on `sm_103a` (`5120 -> 512`) the single op was
+faster and the step medians were below 1.000, but one run of a training step with eager launches was further above
+the deterministic plan than that plan against itself in the same runs: `sm_100a` `4096 -> 512` 2 x forward + backward
+with a BF16 weight gradient 1.007 (the deterministic plan against itself at most 1.002); `sm_103a` `4096 -> 512`
+forward + backward 1.015 (at most 1.013); `sm_103a` `5120 -> 512` 2 x forward + backward with an FP32 weight gradient
+1.015 (at most 1.012).*
 
 `prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
 forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the

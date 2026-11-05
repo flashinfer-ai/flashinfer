@@ -5171,6 +5171,133 @@ def test_k1_convenience_calls_cache_their_bindings(monkeypatch):
     assert atomic.det_plan is None and atomic.arena is not None
 
 
+#: The L2 size of the 152-SM GB200 and GB300 parts (``L2_cache_size``) the forward rows were measured on.
+GB_L2_BYTES = 135528448
+#: The rows of :data:`K1_FORWARD_RULES_BY_SM`, ``(arch, sm_count) -> {(K, N, T), ...}``: the forward of exactly these
+#: ``K -> N`` rows and token counts runs the single-CTA program on 152-SM sm_100a and sm_103a parts.
+K1_FORWARD_ROWS = {
+    ("sm_100a", 152): {(4096, 512, 2048), (5120, 512, 1024), (5120, 512, 4096)},
+    ("sm_103a", 152): {(4096, 512, 2048), (5120, 512, 1024)},
+}  # fmt: skip
+#: The forward rows measured on those parts that missed and keep the deterministic plan (keys as in K1_FORWARD_ROWS).
+K1_FORWARD_MISSED_ROWS = {
+    ("sm_100a", 152): {(4096, 512, 3072), (4096, 512, 4096)},
+    ("sm_103a", 152): {(4096, 512, 3072), (4096, 512, 4096), (5120, 512, 4096)},
+}  # fmt: skip
+#: The ``K -> N`` rows of the forward next to those of the table (and theirs) that the exact keys must leave alone.
+K1_FORWARD_NEAR_ROWS = ((4096, 512), (5120, 512), (4096, 128), (5120, 128), (4096, 1024), (6144, 512))  # fmt: skip
+
+
+def test_k1_forward_rules_by_sm():
+    """:data:`K1_FORWARD_RULES_BY_SM` holds the measured forward rows only, each with the single-CTA knobs, which the
+    deterministic planner turns into its single-CTA program (128 x 128 tiles over the whole K, no stream-K units) where
+    its own plan of the row runs CTA pairs of 256-wide tiles with stream-K units.  :func:`k1_forward_knobs` keys
+    exactly: every other architecture, SM count, row and token count (the measured rows that missed among them:
+    ``4096 -> 512`` at 3072 and 4096 tokens, ``5120 -> 512`` at 4096 tokens on ``sm_103a``) gets no knobs, i.e. the
+    deterministic plan."""
+    table = cake_backend.K1_FORWARD_RULES_BY_SM
+    single = cake_backend.K1_FORWARD_SINGLE_CTA_KNOBS
+    assert single == {"cta1": True, "block_n": 128, "hints": ("none", "none")}
+    assert {part: set(rows) for part, rows in table.items()} == K1_FORWARD_ROWS
+    assert all(knobs == single for rows in table.values() for knobs in rows.values())
+    bf16 = torch.bfloat16
+    for (arch, sms), rows in table.items():
+        for K, N, T in rows:
+            kw = dict(arch=arch, sm_count=sms, K=K, N=N, T=T)
+            knobs = cake_backend.k1_forward_knobs(**kw)
+            assert knobs == tuple(sorted(single.items())), kw
+            X, W = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16)
+            out = torch.empty(T, N, dtype=bf16)
+
+            def plan(**kw):
+                return det_backend.plan_dense_projection_det_gemm(
+                    X, W.t(), out, sm_count=sms, l2_bytes=GB_L2_BYTES, arch=arch, **kw
+                )[0]
+
+            own, default = plan(**dict(knobs)), plan()
+            assert own.template.endswith("_kk_n128_c1"), (arch, K, N, T, own.template)
+            assert int(own.sk_units) == 0, (arch, K, N, T)
+            assert tuple(own.grid) == ((T // 128) * (N // 128), 1, 1), (arch, K, N, T)
+            assert default.template.endswith("_kk_n256_pro7"), (arch, K, N, T)
+            assert int(default.sk_units) > 0, (arch, K, N, T)
+    near = (-64, -1, 0, 1, 64)
+    parts = (*K1_FORWARD_ROWS.values(), *K1_FORWARD_MISSED_ROWS.values())
+    Ts = {T + d for rows in parts for _, _, T in rows for d in near}
+    Ts |= {512, 4096, 8192, 16384}
+    routed = 0
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        for sms in (148, 150, 151, 152, 153, 160, 208, 212, 216):
+            for K, N in K1_FORWARD_NEAR_ROWS:
+                for T in sorted(Ts):
+                    kw = dict(arch=arch, sm_count=sms, K=K, N=N, T=T)
+                    got = cake_backend.k1_forward_knobs(**kw)
+                    held = (K, N, T) in K1_FORWARD_ROWS.get((arch, sms), set())
+                    assert bool(got) == held, (arch, sms, K, N, T)
+                    routed += held
+    assert routed == sum(len(v) for v in K1_FORWARD_ROWS.values())
+    for (arch, sms), rows in K1_FORWARD_MISSED_ROWS.items():
+        assert not rows & K1_FORWARD_ROWS[(arch, sms)], arch
+        for K, N, T in rows:
+            kw = dict(arch=arch, sm_count=sms, K=K, N=N, T=T)
+            assert cake_backend.k1_forward_knobs(**kw) == (), kw
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
+    """``projection_forward(deterministic=False)`` binds, for a row of :data:`K1_FORWARD_RULES_BY_SM` on its part
+    (BF16 ``out``, both operands K-major), the deterministic program the deterministic planner gives the row with the
+    table's knobs, and the deterministic plan for a token count, row or SM count outside the table; an FP32 ``out``
+    or an operand that is not K-major gets no knobs; ``deterministic=True`` calls the deterministic package."""
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16 = torch.bfloat16
+    single = tuple(sorted(cake_backend.K1_FORWARD_SINGLE_CTA_KNOBS.items()))
+
+    def bound_plan(X, W, out):
+        cake_backend._K1_DET_CACHE.clear()
+        assert cake_backend.projection_forward(X, W, out, deterministic=False) is out
+        ((key, entry),) = cake_backend._K1_DET_CACHE.items()
+        assert key[2] == (("fwd",), 1, False) and entry.k1 is not None
+        return entry.plan
+
+    def det_plan(X, W, out, knobs):
+        kw = dict(transposed_out=False, knobs=dict(knobs))
+        return det_backend._k1_plan(X, W.t(), out, **kw)[0]
+
+    rows = sorted(K1_FORWARD_ROWS[(arch, 152)])
+    others = sorted(K1_FORWARD_MISSED_ROWS[(arch, 152)])
+    others += [(4096, 512, 2049), (4096, 512, 2047), (5120, 512, 1023), (4096, 128, 2048), (5120, 1024, 1024)]  # fmt: skip
+    for K, N, T in rows + others:
+        X, W = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16)
+        out, what = torch.empty(T, N, dtype=bf16), (K, N, T)
+        knobs = single if (K, N, T) in rows else ()
+        assert cake_backend._k1_forward_knobs_of(X, W, out) == knobs, what
+        plan = bound_plan(X, W, out)
+        assert plan == det_plan(X, W, out, knobs), what
+        assert plan.template.endswith("_kk_n128_c1") == bool(knobs), what
+        f32 = torch.empty(T, N, dtype=torch.float32)
+        assert cake_backend._k1_forward_knobs_of(X, W, f32) == (), what
+    assert len(entry_fn.calls) == len(rows + others)
+    # an operand that is not K-major (the same shapes): no knobs, the deterministic plan
+    K, N, T = rows[0]
+    out = torch.empty(T, N, dtype=bf16)
+    Xmn = torch.empty(K, T, dtype=bf16).t()
+    Wmn = torch.empty(K, N, dtype=bf16).t()
+    X, W = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16)
+    assert cake_backend._k1_forward_knobs_of(Xmn, W, out) == ()
+    assert cake_backend._k1_forward_knobs_of(X, Wmn, out) == ()
+    # another SM count of the architecture: the deterministic plan
+    for sms in (148, 151, 153, 160):
+        facts = dataclasses.replace(det_backend.device_facts(), sm_count=sms)
+        monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+        assert cake_backend._k1_forward_knobs_of(X, W, out) == (), sms
+        assert bound_plan(X, W, out) == det_plan(X, W, out, ()), sms
+    # deterministic=True: the deterministic package's entry point, whatever the table says
+    det = _patch_det(monkeypatch, "projection_forward")
+    assert cake_backend.projection_forward(X, W, out) is det.result
+    assert det.calls == [((X, W, out), {})]
+
+
 def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
     """Once a key is bound, the K1 entry points with ``deterministic=False`` launch it straight from the key
     (``_k1_cached_launch``): neither ``_det_k1`` nor ``_atomic_k1`` runs, and the launch gets the arguments their
@@ -8702,6 +8829,48 @@ def test_gpu_k1_sm_count_overrides_run_their_programs():
             ran += 1
     print(
         f"K1_OVERRIDES {arch} sm_count={sm_count}: {ran} launches ran the override programs"
+    )
+    assert ran
+
+
+def test_gpu_k1_forward_rows_run_their_plan():
+    """On a part of exactly the SM count of a table of :data:`K1_FORWARD_RULES_BY_SM` (152-SM ``sm_100a`` /
+    ``sm_103a``): the forward of every row with ``deterministic=False`` binds the program the deterministic planner
+    gives the row with the table's knobs (the single-CTA program), meets the deterministic package's BF16 budget
+    against FP64, repeats bit for bit through the bound launch, and ``deterministic=True`` meets the budget too.  A
+    part of any other SM count skips."""
+    device = _det_device_or_skip()
+    facts = det_backend.device_facts(device)
+    rows = cake_backend.K1_FORWARD_RULES_BY_SM.get((facts.arch, facts.sm_count), {})
+    if not rows:
+        pytest.skip(f"no K1 forward row of {facts.arch} on {facts.sm_count} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 160)
+    ran = 0
+    for (K, N, T), knobs in sorted(rows.items()):
+        X, W = _bf16((T, K), device, g), _bf16((N, K), device, g)
+        ref = X.double() @ W.double().t()
+        cake_backend.clear_convenience_caches()
+        out = torch.full((T, N), float("nan"), device=device, dtype=torch.bfloat16)
+        assert cake_backend.projection_forward(X, W, out, deterministic=False) is out
+        torch.cuda.synchronize()
+        ((_, entry),) = cake_backend._K1_DET_CACHE.items()
+        want, *_ = det_backend._k1_plan(
+            X, W.t(), out, transposed_out=False, knobs=dict(knobs)
+        )
+        assert entry.plan == want and entry.k1 is not None, (K, N, T)
+        assert entry.plan.template.endswith("_kk_n128_c1"), (K, N, T)
+        _k1_check(out, ref, f"forward {K} {N} {T}")
+        again = torch.full_like(out, float("nan"))
+        cake_backend.projection_forward(X, W, again, deterministic=False)
+        torch.cuda.synchronize()
+        assert torch.equal(out, again), (K, N, T)
+        det_out = torch.full_like(out, float("nan"))
+        cake_backend.projection_forward(X, W, det_out)
+        torch.cuda.synchronize()
+        _k1_check(det_out, ref, f"deterministic forward {K} {N} {T}")
+        ran += 1
+    print(
+        f"K1_FORWARD_ROWS {facts.arch} sm_count={facts.sm_count}: {ran} rows ran their plan"
     )
     assert ran
 
