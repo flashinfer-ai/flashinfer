@@ -134,6 +134,12 @@ AUTO_LAUNCH_TILE_SIZE_KV = 128
 # crossover is 2,048 tokens: 16 KV128 tiles or 8 KV256 tiles.
 SPLIT_KV_MIN_TOKENS_PER_CTA = 2_048
 
+# Splitting a grid that already fills a wave only trims its partial final
+# wave, so each split must keep enough K/V work to repay the extra waves and
+# reduction. GB300 NVFP4 TileQ8 at B128/Hkv2: four splits lose 7% at 16K KV
+# tokens (4,096 per split), tie at 32K and win 4-8% at 64K.
+FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA = 8_192
+
 # Two interleaved K/V instances form the decode cadence: instance 0 is the
 # first K/P/V stream in each loop iteration and instance 1 is the second. These
 # integer tags are passed through TS work calls and used in constexpr branches.

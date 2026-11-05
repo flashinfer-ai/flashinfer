@@ -59,6 +59,7 @@ from .fmha_decode_constants import (
     FP8_P_PACKED_REGS_PER_Q_REPEAT,
     FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP16_P_PACKED_REGS_PER_Q_REPEAT,
+    FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA,
     KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
     KV_TILE_256_SHARED_FIFO_STAGES,
@@ -2869,7 +2870,7 @@ class FmhaDecodeConfig:
 
     @property
     def uses_guarded_grouped_swaps_output_rows(self) -> bool:
-        """Whether inactive wide NVFP4 Swaps rows skip score masking.
+        """Whether inactive transformed-NVFP4 Swaps rows skip score masking.
 
         As with grouped Keeps, every SwapsMmaAb Q row is an independent score
         column: its max/sum scratch slot, P column, O column and correction
@@ -2880,12 +2881,10 @@ class FmhaDecodeConfig:
         the D128 Q48 softmax, its bottleneck (GB300 B128/KV128K/sQ6: 1.18 ->
         1.03 ms, bitwise-identical output). D512 keeps the mask: its
         instruction-cache-bound Q64 schedule measured 1.5% slower without it.
-        Narrow profiles retain their existing masks: changing their softmax
-        predication can reduce throughput even when no rows are inactive.
         """
         return (
             self.headdim <= 256
-            and self.uses_large_q_swaps_tile
+            and not self.use_keeps_mma_ab
             and self.use_transform_kv
             and self.use_nvfp4_kv
             and self.use_fp8_q
@@ -4525,6 +4524,7 @@ def enumerate_auto_splits_kv(
     requested_splits_kv: int = -1,
     max_splits_kv: int | None = None,
     service_waves: int = 1,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> tuple[int, ...]:
     """Enumerate direct and useful split fanouts for the requested wave budget.
 
@@ -4534,6 +4534,7 @@ def enumerate_auto_splits_kv(
     A positive requested fanout is pinned, subject to the same KV-work cap.
     The default retains the one-wave policy. Q48+ transformed profiles can
     compare several waves to avoid a mostly empty final wave of a full grid.
+    ``min_loop_iters_per_split`` caps the fanout by the KV work per split.
     """
     if not split_kv:
         return (1,)
@@ -4546,6 +4547,7 @@ def enumerate_auto_splits_kv(
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
         max_splits_kv=max_splits_kv,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
     if requested_splits_kv > 0:
         return (max(1, min(requested_splits_kv, max_by_work)),)
@@ -5065,9 +5067,18 @@ def _resolve_grouped_q_launch_candidates(
     fills_wave = batch_size * num_heads_kv * candidate.q_tiles >= service_capacity
     # A full grid can still waste a partial final wave, so these profiles
     # also score multi-wave splits instead of forcing every full grid direct.
+    transformed_multi_wave = probe.use_nvfp4_kv and probe.use_fp8_pv
     multi_wave = (
-        probe.use_nvfp4_kv and probe.use_fp8_pv and candidate.tile_size_q >= 48
+        transformed_multi_wave and (candidate.tile_size_q >= 48 or fills_wave)
     ) or (probe.use_fp8_qkv and fills_wave)
+    min_loop_iters_per_split = MIN_LOOP_ITERS_PER_SPLIT
+    if transformed_multi_wave and candidate.tile_size_q < 48 and fills_wave:
+        # Narrow transformed tiles split a full grid only to trim its final
+        # wave; short splits cannot repay the extra waves.
+        min_loop_iters_per_split = -(
+            -FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA
+            // (cost_tile_size_kv * cost_num_insts_kv)
+        )
     if probe.use_keeps_mma_ab and probe.target_ctas_per_sm == 1:
         # A lone resident CTA cannot hide its K/V pipeline fill behind a
         # second CTA: extra waves of short splits lose until the direct grid
@@ -5089,6 +5100,7 @@ def _resolve_grouped_q_launch_candidates(
             requested_splits_kv=splits_kv,
             max_splits_kv=max_splits_kv,
             service_waves=8 if multi_wave else 1,
+            min_loop_iters_per_split=min_loop_iters_per_split,
         )
     )
     recipes = []
@@ -5167,10 +5179,19 @@ def _apply_auto_grouped_q_mma_config(
     """
     # TODO: Refine short-KV setup/epilogue costs. Wider dense Q tiles can
     # regress even when their current mainloop/reduction proxy scores lower.
+    # The SQ1 path never splits a grid that already fills a wave. Transformed
+    # NVFP4 K/V instead scores multi-wave splits that trim a partial final
+    # wave (D512 B128/Hkv2/KV128K: 3.83 -> 3.32 ms with four splits).
+    single_token_full_grid_transform = (
+        seq_len_q == 1
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_pv
+        and batch_size * num_heads_kv >= get_max_active_clusters_for_cluster_size(1)
+    )
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
-        or seq_len_q <= 1
+        or (seq_len_q <= 1 and not single_token_full_grid_transform)
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
         or (cfg.use_variable_seqlens_q and cfg.use_sliding_window_causal)
