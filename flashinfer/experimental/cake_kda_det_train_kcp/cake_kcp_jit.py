@@ -790,7 +790,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
         "library": "cake_kda_det_train_8ffd931ca0595948b608_kcp",
