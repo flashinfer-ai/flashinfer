@@ -48,11 +48,17 @@ every backend. The FlashKDA peer scopes keep the preallocated outputs
 while cuDNN allocates its final state and copies it back inside the timed scope.
 Metadata, sequence ordering, build/JIT, graph capture, and state-pool reset are
 outside the measured region.
+
+``--host-timing`` additionally measures eager host-call return latency and
+completed-call wall time on an idle device. These warm-cache measurements
+include Python dispatch and any internal synchronization, unlike CUPTI kernel
+time. State-pool reset stays outside the timed region.
 """
 
 import argparse
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import version
@@ -884,10 +890,44 @@ def _measure(
     return float(np.median(samples_ms)), samples_ms
 
 
+def _measure_host(
+    run: Callable[[], object],
+    *,
+    dry_run_iters: int,
+    repeat_iters: int,
+) -> dict:
+    for _ in range(dry_run_iters):
+        run()
+    torch.cuda.synchronize()
+    host_samples, completed_samples = [], []
+    for _ in range(repeat_iters):
+        start = time.perf_counter_ns()
+        run()
+        returned = time.perf_counter_ns()
+        torch.cuda.synchronize()
+        completed = time.perf_counter_ns()
+        host_samples.append((returned - start) / 1e6)
+        completed_samples.append((completed - start) / 1e6)
+    return {
+        "host_return_median_ms": float(np.median(host_samples)),
+        "host_return_samples_ms": host_samples,
+        "completed_call_median_ms": float(np.median(completed_samples)),
+        "completed_call_samples_ms": completed_samples,
+        "cold_l2": False,
+        "timing_scope": "eager_public_recurrent_kda_with_inplace_state_update",
+        "stateful_calls": dry_run_iters + repeat_iters,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run-iters", type=int, default=20)
     parser.add_argument("--repeat-iters", type=int, default=100)
+    parser.add_argument(
+        "--host-timing",
+        action="store_true",
+        help="Also report eager candidate host-return and completed-call latency.",
+    )
     parser.add_argument(
         "--cuda-graph",
         action="store_true",
@@ -958,6 +998,8 @@ def main() -> None:
 
     if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
         parser.error("--dry-run-iters and --repeat-iters must be positive")
+    if args.host_timing and args.cuda_graph:
+        parser.error("--host-timing measures eager calls; omit --cuda-graph")
     if args.state_rotations is not None and args.state_rotations <= 0:
         parser.error("--state-rotations must be positive")
     if args.flash_kda_peer != (args.flash_kda_source_dir is not None):
@@ -1192,6 +1234,21 @@ def main() -> None:
                 "timing_iteration_budget": timing_iteration_budget,
             }
         )
+        if args.host_timing:
+            prepared.reset_state_pools()
+            host_timing = _measure_host(
+                prepared.candidate_run,
+                dry_run_iters=dry_run_iters,
+                repeat_iters=repeat_iters,
+            )
+            if prepared.state_cursors["pr"][0] != host_timing["stateful_calls"]:
+                raise RuntimeError("Host timing exceeded its stateful call budget")
+            result["host_timing"] = host_timing
+            print(
+                f"{result['name']:<18} "
+                f"host return {host_timing['host_return_median_ms'] * 1000:.3f} us  "
+                f"completed {host_timing['completed_call_median_ms'] * 1000:.3f} us"
+            )
         results.append(result)
         if prepared.peer_raw_run is None:
             print(
