@@ -8479,9 +8479,12 @@ def _k1_with_chain_ranges(arch, sm_count, key, T, want):
 #: edge asserts the route only, and the accuracy rule runs at ``T'``, the nearest measured token count of the same
 #: range at which the deterministic program met the budget on every seed on the measured parts (``None``: none).
 K1_P1_EDGES = {
+    ("sm_100a", 148, ("sm_100a", 1, 4096, 64, "bf16"), 65535): 41985,
     ("sm_103a", 148, ("sm_103a", 1, 4096, 32, "bf16"), 65535): 45057,
     ("sm_103a", 148, ("sm_103a", 1, 5120, 48, "bf16"), 49152): None,
+    ("sm_103a", 148, ("sm_103a", 1, 5120, 64, "bf16"), 47104): 45057,
     ("sm_103a", 148, ("sm_103a", 1, 5120, 64, "bf16"), 49153): None,
+    ("sm_103a", 148, ("sm_103a", 1, 5120, 128, "bf16"), 65537): None,
 }
 
 
