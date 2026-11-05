@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -26,8 +28,9 @@ def stage_mega_moe_inputs(
 ) -> int:
     """bf16 ``hidden_states`` -> MXFP8 activation + E8M0 block scales.
 
-    Torch-composed staging (the ``next/`` drop has no fused staging kernel
-    yet). Returns the staged token count.
+    Supported BF16/E4M3 layouts use one fused launch. Set
+    ``FLASHINFER_MEGA_FUSED_STAGE=0`` to use the Torch reference path.
+    Other dtypes/layouts retain that path. Returns the staged token count.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Mxfp8BlockSize,
@@ -44,7 +47,7 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    q, sf = quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
+    data_dtype = _data_dtype(kind)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:
@@ -52,6 +55,55 @@ def stage_mega_moe_inputs(
             f"x_sf trailing dim ({x_sf.shape[1]}) is smaller than required "
             f"{hidden_sf_cols}."
         )
+
+    if (
+        os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and data_dtype == x_fp8.dtype == torch.float8_e4m3fn
+        and 0 < hidden <= 8192
+        and hidden % 32 == 0
+        and 0 < topk_ids.shape[1] <= 128
+        and num_tokens <= capacity
+        and topk_ids.shape == topk_weights.shape == (num_tokens, topk_ids.shape[1])
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_weights.dtype == torch.float32
+        and topk_idx_out.dtype == torch.int32
+        and topk_weights_out.dtype == torch.float32
+        and x_sf.dtype in (torch.uint8, torch.float8_e8m0fnu)
+        and x_sf.shape[0] >= capacity
+        and x_sf.shape[1] <= 1024
+        and x_fp8.shape[1] == hidden
+        and topk_idx_out.shape
+        == topk_weights_out.shape
+        == (capacity, topk_ids.shape[1])
+        and all(
+            t.is_contiguous() and t.device == hidden_states.device
+            for t in (
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                x_fp8,
+                x_sf,
+                topk_idx_out,
+                topk_weights_out,
+            )
+        )
+    ):
+        from ._fused_staging import fused_stage
+
+        fused_stage(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            x_fp8,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+        )
+        return num_tokens
+
+    q, sf = quantize_mxfp8_block32(hidden_states.to(torch.float32), data_dtype)
 
     x_fp8[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
     x_sf[:num_tokens].view(torch.uint8).zero_()
