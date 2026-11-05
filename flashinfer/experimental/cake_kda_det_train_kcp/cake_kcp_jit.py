@@ -164,27 +164,43 @@ PRECISION_MODES = (0, 1, 2)
 # CTAs per segment and head), ``tf32_hilo`` / ``bf16x3`` the test-only programs
 # of ``build.test.json`` (the TF32 hi/lo walk and the full-width BF16x3 form).
 TRANSFER_WALKS = ("bf16x3_hw64", "tf32_hilo", "bf16x3")
-# The ``walk_form`` test knob of the K1 / K2 state walks: ``auto`` the shipped
-# rule (:func:`walk_form`), ``full`` / ``split`` force the full-width or the
-# two-CTA record of every walk launch (the A/B record).
+# The ``walk_form`` test knob of the K1 / K2 state walks and the fused forward
+# walk: ``auto`` the shipped rule (:func:`walk_form`), ``full`` / ``split``
+# force the full-width or the two-CTA record of every walk launch (the A/B
+# record).
 WALK_FORMS = ("auto", "full", "split")
 # The shipped form rule per walk program: ``fit`` = the two-CTA record when the
 # launch list-schedules within its longest chain (:func:`walk_form`), else the
 # full-width one (the offset programs: two shipped records); ``split`` = the
 # two-CTA record on every launch (the tape programs, whose per-step tape stores
 # halve with the CTA's columns: their full-width records are test-only, under
-# ``walk_form="full"``); a mapping = one of those rules per architecture, both
-# records shipped (the fused forward walk: :data:`FWDH_O_FORM_RULE`).
-# The fused forward walk's rule per architecture, from cold-L2 CUPTI medians of
-# its two records on the same inputs (us, full-width / two-CTA; H = 64; walk
-# lists: the eight fragments of a W4 zigzag rank | two fragments of 222 chunks
-# | fourteen of 39 to 24 chunks | four of 60 to 48 chunks):
-#   sm_103a (GB300, 152 SMs): 300.1 / 315.1 | 514.1 / 549.5 | 473.1 / 500.8
-#     | 260.4 / 276.5 -> the full-width record on every list;
-#   sm_107a (an R200 board with 208 SMs): 222.3 / 211.5 | 620.8 / 445.9
-#     | 355.0 / 339.6 | 241.2 / 221.6 -> the two-CTA record on every list;
-#   sm_100a (GB200, 148 SMs): the rule of sm_103a until its lists are measured.
-FWDH_O_FORM_RULE = {"sm_100a": "full", "sm_103a": "full", "sm_107a": "split"}
+# ``walk_form="full"``); a mapping = one of those rules (or head-count bands of
+# them) per architecture, both records shipped (the fused forward walk:
+# :data:`FWDH_O_FORM_RULE`).
+# The fused forward walk's rule per architecture: a rule, or head-count bands
+# ``((bound, rule), ..., (None, rule))`` whose first ``bound >= num_heads``
+# names the rule.  From kernel medians of its two records on the same inputs
+# (us, back-to-back launches, full-width / two-CTA; walk lists: w4 = the eight
+# fragments of a W4 zigzag rank, 48 to 20 chunks | z2 = two of 222 | c14 =
+# fourteen of 39 to 24 | d4 = four of 60 to 48 | w2d = four of 192 to 80 | w1 =
+# three of 79, 47 and 13):
+#   sm_103a (GB300, 152 SMs), H = 64: w4 252.0 / 258.8 | z2 407.3 / 429.9 |
+#     c14 400.6 / 410.8 | d4 216.7 / 223.8 | w2d 519.9 / 513.0; H = 32: w4
+#     142.7 / 139.4 | z2 371.1 / 263.5 | w2d 337.4 / 294.7; H = 16: w4 93.9 /
+#     83.6 | z2 366.3 / 236.3 | w1 134.6 / 90.1; H = 8: w4 86.3 / 63.0; H = 4:
+#     w4 84.5 / 55.9 | z2 362.7 / 230.2 | w1 132.2 / 85.0 | w2d 314.8 / 200.5
+#     -> the two-CTA record up to 32 heads, the full-width one above;
+#   sm_100a (GB200, 152 SMs), H = 64: w4 302.9 / 319.4 | z2 518.7 / 556.7 |
+#     c14 477.0 / 506.4 | d4 262.9 / 280.2 -> the full-width record at 64
+#     heads; the bands of sm_103a (the same SM count) below;
+#   sm_107a (an R200 board with 208 SMs), H = 64: w4 222.3 / 211.5 | z2 620.8
+#     / 445.9 | c14 355.0 / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (its
+#     lead grows as the heads, and so the CTAs, get fewer).
+FWDH_O_FORM_RULE: dict[str, Any] = {
+    "sm_100a": ((32, "split"), (None, "full")),
+    "sm_103a": ((32, "split"), (None, "full")),
+    "sm_107a": "split",
+}
 WALK_FORM_RULES: dict[str, Any] = {
     "kcp_fwdh_offset": "fit",
     "kcp_fwdh_tape": "split",
@@ -1808,7 +1824,9 @@ def walk_form(
     and keeps the SMs busier.  Under the rule ``split`` (the tape programs,
     whose per-step tape stores halve with the CTA's columns) every launch takes
     the split form.  A per-architecture rule (a mapping: the fused forward walk)
-    applies its rule for ``arch``.  An empty list is ``"full"``.
+    applies its rule for ``arch``, either a rule or head-count bands
+    ``((bound, rule), ..., (None, rule))`` (the rule of the first ``bound >=
+    num_heads``).  An empty list is ``"full"``.
     """
     if knob not in WALK_FORMS:
         raise ValueError(f"walk_form must be one of {WALK_FORMS}, got {knob!r}")
@@ -1821,6 +1839,8 @@ def walk_form(
                 f"{program}: the walk form rule is per architecture ({sorted(rule)}), got arch={arch!r}"
             )
         rule = rule[arch]
+    if not isinstance(rule, str):  # head-count bands: the first bound >= num_heads
+        rule = next(r for bound, r in rule if bound is None or int(num_heads) <= bound)
     if rule != "fit":
         return rule
     steps = [int(c) for c in chains if int(c) > 0]

@@ -85,7 +85,10 @@ tape CTAs, which thrash when co-resident).  The test knob ``walk_form``
 the call's ``walk_form_log`` records ``(program, form, n_walk)`` per launch
 (``LAST_CALL[kind]["walk_forms"]`` keeps the copy).
 The tape programs' rule is ``split`` (their full-width records are test-only,
-under ``walk_form="full"``).  The rule's inputs are static per ``(ctx, H)``, so
+under ``walk_form="full"``).  The fused forward walk's rule is per architecture
+(``cake_kcp_jit.FWDH_O_FORM_RULE``, from kernel A/B medians): on sm_100a and
+sm_103a the two-CTA form up to 32 value heads and the full-width form above,
+on sm_107a the two-CTA form.  The rule's inputs are static per ``(ctx, H)``, so
 the form of each ``(program, walk list)`` is decided once per table set
 (``_Tables.walk_form``) and looked up on every later launch: the eager call
 carries no per-launch list scheduling.
@@ -4311,7 +4314,7 @@ class OptionsDetKcp:
     fused_walks: int = FUSED_WALKS_DEFAULT  # shipped 1: one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
     cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
     walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
-    walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
+    walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 and fused forward walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
     graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
     graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("node_attr" shipped | "none" the previous form of record | "capture_pref" rejected | "node_attr_post"); _kcp_test_knobs only
     host_trim: int = HOST_TRIM_DEFAULT  # shipped 1 = the trimmed host path of the eager call (same launches, bitwise); 0 = the previous path, _kcp_test_knobs only

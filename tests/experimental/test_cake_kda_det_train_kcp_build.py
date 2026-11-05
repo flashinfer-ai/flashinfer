@@ -455,8 +455,8 @@ def test_walk_form_rules_and_records() -> None:
         "kcp_fwdh_o": kcp_jit.FWDH_O_FORM_RULE,
     }
     assert kcp_jit.FWDH_O_FORM_RULE == {
-        "sm_100a": "full",
-        "sm_103a": "full",
+        "sm_100a": ((32, "split"), (None, "full")),
+        "sm_103a": ((32, "split"), (None, "full")),
         "sm_107a": "split",
     }
     assert set(kcp_jit.FWDH_O_FORM_RULE) == set(ARCHES)
@@ -473,13 +473,26 @@ def test_walk_form_rules_and_records() -> None:
     assert kcp_jit.walk_form("kcp_fwdh_offset", [64] * 7, 1, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [], 64, sms) == "full"
     assert kcp_jit.walk_form("kcp_fwdh_tape", [124, 124, 124], 64, sms) == "split"
-    # the fused forward walk: the architecture's rule on every launch (one wave or several), the knob's form where given
+    # the fused forward walk: the architecture's rule on every launch (one wave or several; on sm_100a / sm_103a the
+    # two-CTA record up to 32 heads, the full-width one above), the knob's form where given
     w4 = [48, 48, 32, 32, 28, 28, 20, 20]
-    for arch, form in kcp_jit.FWDH_O_FORM_RULE.items():
-        for chains, heads in ((w4, 64), (w4, 4), ([222, 222], 64)):
-            assert (
-                kcp_jit.walk_form("kcp_fwdh_o", chains, heads, sms, arch=arch) == form
-            )
+    by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "full",
+        64: "full",
+    }
+    for arch in ARCHES:
+        for heads, form in by_heads.items():
+            if arch == "sm_107a":
+                form = "split"
+            for chains in (w4, [222, 222], [48]):
+                assert (
+                    kcp_jit.walk_form("kcp_fwdh_o", chains, heads, sms, arch=arch)
+                    == form
+                )
         assert (
             kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="full", arch=arch)
             == "full"
