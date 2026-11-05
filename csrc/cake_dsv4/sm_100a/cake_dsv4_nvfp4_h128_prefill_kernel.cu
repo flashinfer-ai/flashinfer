@@ -852,18 +852,51 @@ kernel_cake_dsv4_nvfp4_h128_prefill_sm100a(const __grid_constant__ CUtensorMap t
                         int sf_base = smem_k_a_addr + (unsigned int)(p_stage * 45056) + 24576;
                         unsigned int sf_a[8];
                         unsigned int sf_b[8];
+                        int sf_par = lane >> 2 & 1;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 3]))
-                            : "r"(sf_base + sf_tok_a * 32));
+                            : "r"(sf_base + sf_tok_a * 32 + 16 * sf_par));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_a[4])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 3]))
-                            : "r"(sf_base + sf_tok_a * 32 + 16));
+                            : "r"(sf_base + sf_tok_a * 32 + (16 - 16 * sf_par)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_b[0])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 3]))
-                            : "r"(sf_base + sf_tok_b * 32));
+                            : "r"(sf_base + sf_tok_b * 32 + 16 * sf_par));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_b[4])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 3]))
-                            : "r"(sf_base + sf_tok_b * 32 + 16));
+                            : "r"(sf_base + sf_tok_b * 32 + (16 - 16 * sf_par)));
+                        unsigned int sf_a_lo_0 = sf_a[0];
+                        unsigned int sf_a_hi_0 = sf_a[4];
+                        sf_a[0] = ((sf_par != 0) ? sf_a_hi_0 : sf_a_lo_0);
+                        sf_a[4] = ((sf_par != 0) ? sf_a_lo_0 : sf_a_hi_0);
+                        unsigned int sf_b_lo_0 = sf_b[0];
+                        unsigned int sf_b_hi_0 = sf_b[4];
+                        sf_b[0] = ((sf_par != 0) ? sf_b_hi_0 : sf_b_lo_0);
+                        sf_b[4] = ((sf_par != 0) ? sf_b_lo_0 : sf_b_hi_0);
+                        unsigned int sf_a_lo_1 = sf_a[1];
+                        unsigned int sf_a_hi_1 = sf_a[5];
+                        sf_a[1] = ((sf_par != 0) ? sf_a_hi_1 : sf_a_lo_1);
+                        sf_a[5] = ((sf_par != 0) ? sf_a_lo_1 : sf_a_hi_1);
+                        unsigned int sf_b_lo_1 = sf_b[1];
+                        unsigned int sf_b_hi_1 = sf_b[5];
+                        sf_b[1] = ((sf_par != 0) ? sf_b_hi_1 : sf_b_lo_1);
+                        sf_b[5] = ((sf_par != 0) ? sf_b_lo_1 : sf_b_hi_1);
+                        unsigned int sf_a_lo_2 = sf_a[2];
+                        unsigned int sf_a_hi_2 = sf_a[6];
+                        sf_a[2] = ((sf_par != 0) ? sf_a_hi_2 : sf_a_lo_2);
+                        sf_a[6] = ((sf_par != 0) ? sf_a_lo_2 : sf_a_hi_2);
+                        unsigned int sf_b_lo_2 = sf_b[2];
+                        unsigned int sf_b_hi_2 = sf_b[6];
+                        sf_b[2] = ((sf_par != 0) ? sf_b_hi_2 : sf_b_lo_2);
+                        sf_b[6] = ((sf_par != 0) ? sf_b_lo_2 : sf_b_hi_2);
+                        unsigned int sf_a_lo_3 = sf_a[3];
+                        unsigned int sf_a_hi_3 = sf_a[7];
+                        sf_a[3] = ((sf_par != 0) ? sf_a_hi_3 : sf_a_lo_3);
+                        sf_a[7] = ((sf_par != 0) ? sf_a_lo_3 : sf_a_hi_3);
+                        unsigned int sf_b_lo_3 = sf_b[3];
+                        unsigned int sf_b_hi_3 = sf_b[7];
+                        sf_b[3] = ((sf_par != 0) ? sf_b_hi_3 : sf_b_lo_3);
+                        sf_b[7] = ((sf_par != 0) ? sf_b_lo_3 : sf_b_hi_3);
                         int _stage_k_empty = (int)((unsigned int)(tile_cursor + tile) % 2);
                         int _parity_k_empty = (int)((unsigned int)(tile_cursor + tile) / 2 % 2) ^ 1;
                         mbarrier_wait(k_empty_addr + (_stage_k_empty) * 8, _parity_k_empty);
@@ -924,9 +957,8 @@ kernel_cake_dsv4_nvfp4_h128_prefill_sm100a(const __grid_constant__ CUtensorMap t
                         int kexp = (int)k_lvl;
                         unsigned int kexp_u = (unsigned int)kexp;
                         unsigned int kexp_f16x2 = (15 - kexp_u << 10) * 65537;
+                        unsigned int kexp_bf16x2 = (127 - kexp_u << 7) * 65537;
                         int kexp_zero = (int)(kexp_u == 0);
-                        unsigned int kexp_f32_bits = 127 - kexp_u << 23;
-                        float kexp_scale = __uint_as_float(kexp_f32_bits);
                         int _stage_v_empty = (int)((unsigned int)(tile_cursor + tile) % 2);
                         int _parity_v_empty = (int)((unsigned int)(tile_cursor + tile) / 2 % 2) ^ 1;
                         mbarrier_wait(v_empty_addr + (_stage_v_empty) * 8, _parity_v_empty);
@@ -1050,25 +1082,35 @@ kernel_cake_dsv4_nvfp4_h128_prefill_sm100a(const __grid_constant__ CUtensorMap t
                                         : "r"(r_src_row + ((2 * r_u + r_half ^ v_swz) << 4)));
                                     #pragma unroll
                                     for (int r_w = 0; r_w < 2; r_w++) {
-                                        float _cvt_f32_bf16_14;
-                                        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_14) : "h"((uint16_t)(r_in[2 * r_w] & 65535)));
-                                        float r_lo0 = _cvt_f32_bf16_14 * kexp_scale;
-                                        float _cvt_f32_bf16_15;
-                                        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_15) : "h"((uint16_t)(r_in[2 * r_w] >> 16)));
-                                        float r_hi0 = _cvt_f32_bf16_15 * kexp_scale;
-                                        float _cvt_f32_bf16_16;
-                                        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_16) : "h"((uint16_t)(r_in[2 * r_w + 1] & 65535)));
-                                        float r_lo1 = _cvt_f32_bf16_16 * kexp_scale;
-                                        float _cvt_f32_bf16_17;
-                                        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_17) : "h"((uint16_t)(r_in[2 * r_w + 1] >> 16)));
-                                        float r_hi1 = _cvt_f32_bf16_17 * kexp_scale;
-                                        uint16_t _cvt_satfinite_e4m3x2_f32_19;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_19) : "f"(r_hi0), "f"(r_lo0));
-                                        uint16_t _cvt_satfinite_e4m3x2_f32_20;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_20) : "f"(r_hi1), "f"(r_lo1));
-                                        uint32_t _mov_b32_pack_u16x2_18;
-                                        asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_18) : "h"(_cvt_satfinite_e4m3x2_f32_19), "h"(_cvt_satfinite_e4m3x2_f32_20));
-                                        r_out[2 * r_half + r_w] = _mov_b32_pack_u16x2_18;
+                                        uint32_t r_s0;
+                                        asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(r_s0) : "r"(r_in[2 * r_w]), "r"(kexp_bf16x2));
+                                        uint32_t r_s1;
+                                        asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(r_s1) : "r"(r_in[2 * r_w + 1]), "r"(kexp_bf16x2));
+                                        uint16_t _cvt_satfinite_e4m3x2_bf16x2_15;
+                                        #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+                                        asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_15) : "r"(r_s0));
+                                        #else
+                                        {
+                                        const uint32_t _bf16x2 = (uint32_t)(r_s0);
+                                        const float _lo = __uint_as_float(_bf16x2 << 16);
+                                        const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
+                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_15) : "f"(_hi), "f"(_lo));
+                                        }
+                                        #endif
+                                        uint16_t _cvt_satfinite_e4m3x2_bf16x2_16;
+                                        #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+                                        asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_16) : "r"(r_s1));
+                                        #else
+                                        {
+                                        const uint32_t _bf16x2 = (uint32_t)(r_s1);
+                                        const float _lo = __uint_as_float(_bf16x2 << 16);
+                                        const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
+                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_16) : "f"(_hi), "f"(_lo));
+                                        }
+                                        #endif
+                                        uint32_t _mov_b32_pack_u16x2_14;
+                                        asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_14) : "h"(_cvt_satfinite_e4m3x2_bf16x2_15), "h"(_cvt_satfinite_e4m3x2_bf16x2_16));
+                                        r_out[2 * r_half + r_w] = _mov_b32_pack_u16x2_14;
                                     }
                                 }
                                 int r_o = 4 + r_u;
@@ -1162,19 +1204,19 @@ kernel_cake_dsv4_nvfp4_h128_prefill_sm100a(const __grid_constant__ CUtensorMap t
                         next_query_idx = source_work_z_1 * (unsigned int)max_q_len + (source_work_x_1 >> 1);
                         next_valid = next_query_idx < num_query_tokens;
                         if (next_valid != 0) {
-                            int _max_22 = ((sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) : (0));
-                            int _min_21 = ((_max_22) < (swa_width) ? (_max_22) : (swa_width));
-                            next_main_active = _min_21;
+                            int _max_18 = ((sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) : (0));
+                            int _min_17 = ((_max_18) < (swa_width) ? (_max_18) : (swa_width));
+                            next_main_active = _min_17;
                             next_extra_active = 0;
                             if (compressed_width > 0) {
-                                int _max_24 = ((extra_topk_lens[next_query_idx]) > (0) ? (extra_topk_lens[next_query_idx]) : (0));
-                                int _min_23 = ((_max_24) < (compressed_width) ? (_max_24) : (compressed_width));
-                                next_extra_active = _min_23;
+                                int _max_20 = ((extra_topk_lens[next_query_idx]) > (0) ? (extra_topk_lens[next_query_idx]) : (0));
+                                int _min_19 = ((_max_20) < (compressed_width) ? (_max_20) : (compressed_width));
+                                next_extra_active = _min_19;
                             }
                             next_n_main_tiles = (next_main_active + 128 - 1) / 128;
                             next_n_extra_tiles = (next_extra_active + 128 - 1) / 128;
-                            int _max_25 = ((next_n_main_tiles + next_n_extra_tiles) > (1) ? (next_n_main_tiles + next_n_extra_tiles) : (1));
-                            next_num_kv_tiles = _max_25;
+                            int _max_21 = ((next_n_main_tiles + next_n_extra_tiles) > (1) ? (next_n_main_tiles + next_n_extra_tiles) : (1));
+                            next_num_kv_tiles = _max_21;
                         }
                     }
                 } else {
@@ -1246,19 +1288,19 @@ kernel_cake_dsv4_nvfp4_h128_prefill_sm100a(const __grid_constant__ CUtensorMap t
                         next_query_idx = source_work_z_1 * (unsigned int)max_q_len + (source_work_x_1 >> 1);
                         next_valid = next_query_idx < num_query_tokens;
                         if (next_valid != 0) {
-                            int _max_27 = ((sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) : (0));
-                            int _min_26 = ((_max_27) < (swa_width) ? (_max_27) : (swa_width));
-                            next_main_active = _min_26;
+                            int _max_23 = ((sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[next_query_idx] + sparse_topk_lens_offset) : (0));
+                            int _min_22 = ((_max_23) < (swa_width) ? (_max_23) : (swa_width));
+                            next_main_active = _min_22;
                             next_extra_active = 0;
                             if (compressed_width > 0) {
-                                int _max_29 = ((extra_topk_lens[next_query_idx]) > (0) ? (extra_topk_lens[next_query_idx]) : (0));
-                                int _min_28 = ((_max_29) < (compressed_width) ? (_max_29) : (compressed_width));
-                                next_extra_active = _min_28;
+                                int _max_25 = ((extra_topk_lens[next_query_idx]) > (0) ? (extra_topk_lens[next_query_idx]) : (0));
+                                int _min_24 = ((_max_25) < (compressed_width) ? (_max_25) : (compressed_width));
+                                next_extra_active = _min_24;
                             }
                             next_n_main_tiles = (next_main_active + 128 - 1) / 128;
                             next_n_extra_tiles = (next_extra_active + 128 - 1) / 128;
-                            int _max_30 = ((next_n_main_tiles + next_n_extra_tiles) > (1) ? (next_n_main_tiles + next_n_extra_tiles) : (1));
-                            next_num_kv_tiles = _max_30;
+                            int _max_26 = ((next_n_main_tiles + next_n_extra_tiles) > (1) ? (next_n_main_tiles + next_n_extra_tiles) : (1));
+                            next_num_kv_tiles = _max_26;
                         }
                     }
                 }

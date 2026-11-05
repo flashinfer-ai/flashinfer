@@ -2264,18 +2264,51 @@ kernel_cake_dsv4_nvfp4_qb_h32_late_claim_prefill(const __grid_constant__ CUtenso
                         if (x_grp == 0) {
                             unsigned int sf_a[8];
                             unsigned int sf_b[8];
+                            int sf_par = lane >> 2 & 1;
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&sf_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 3]))
-                                : "r"(sf_base + lane * 32));
+                                : "r"(sf_base + lane * 32 + 16 * sf_par));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&sf_a[4])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 3]))
-                                : "r"(sf_base + lane * 32 + 16));
+                                : "r"(sf_base + lane * 32 + (16 - 16 * sf_par)));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&sf_b[0])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 3]))
-                                : "r"(sf_base + (lane + 32) * 32));
+                                : "r"(sf_base + (lane + 32) * 32 + 16 * sf_par));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&sf_b[4])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 3]))
-                                : "r"(sf_base + (lane + 32) * 32 + 16));
+                                : "r"(sf_base + (lane + 32) * 32 + (16 - 16 * sf_par)));
+                            unsigned int sf_a_lo_0 = sf_a[0];
+                            unsigned int sf_a_hi_0 = sf_a[4];
+                            sf_a[0] = ((sf_par != 0) ? sf_a_hi_0 : sf_a_lo_0);
+                            sf_a[4] = ((sf_par != 0) ? sf_a_lo_0 : sf_a_hi_0);
+                            unsigned int sf_b_lo_0 = sf_b[0];
+                            unsigned int sf_b_hi_0 = sf_b[4];
+                            sf_b[0] = ((sf_par != 0) ? sf_b_hi_0 : sf_b_lo_0);
+                            sf_b[4] = ((sf_par != 0) ? sf_b_lo_0 : sf_b_hi_0);
+                            unsigned int sf_a_lo_1 = sf_a[1];
+                            unsigned int sf_a_hi_1 = sf_a[5];
+                            sf_a[1] = ((sf_par != 0) ? sf_a_hi_1 : sf_a_lo_1);
+                            sf_a[5] = ((sf_par != 0) ? sf_a_lo_1 : sf_a_hi_1);
+                            unsigned int sf_b_lo_1 = sf_b[1];
+                            unsigned int sf_b_hi_1 = sf_b[5];
+                            sf_b[1] = ((sf_par != 0) ? sf_b_hi_1 : sf_b_lo_1);
+                            sf_b[5] = ((sf_par != 0) ? sf_b_lo_1 : sf_b_hi_1);
+                            unsigned int sf_a_lo_2 = sf_a[2];
+                            unsigned int sf_a_hi_2 = sf_a[6];
+                            sf_a[2] = ((sf_par != 0) ? sf_a_hi_2 : sf_a_lo_2);
+                            sf_a[6] = ((sf_par != 0) ? sf_a_lo_2 : sf_a_hi_2);
+                            unsigned int sf_b_lo_2 = sf_b[2];
+                            unsigned int sf_b_hi_2 = sf_b[6];
+                            sf_b[2] = ((sf_par != 0) ? sf_b_hi_2 : sf_b_lo_2);
+                            sf_b[6] = ((sf_par != 0) ? sf_b_lo_2 : sf_b_hi_2);
+                            unsigned int sf_a_lo_3 = sf_a[3];
+                            unsigned int sf_a_hi_3 = sf_a[7];
+                            sf_a[3] = ((sf_par != 0) ? sf_a_hi_3 : sf_a_lo_3);
+                            sf_a[7] = ((sf_par != 0) ? sf_a_lo_3 : sf_a_hi_3);
+                            unsigned int sf_b_lo_3 = sf_b[3];
+                            unsigned int sf_b_hi_3 = sf_b[7];
+                            sf_b[3] = ((sf_par != 0) ? sf_b_hi_3 : sf_b_lo_3);
+                            sf_b[7] = ((sf_par != 0) ? sf_b_lo_3 : sf_b_hi_3);
                             int _stage_k_empty = (int)((unsigned int)(ld_tile_cursor + ld_tile + 1) % 3);
                             int _parity_k_empty = (int)((unsigned int)(ld_tile_cursor + ld_tile + 1) / 3 % 2) ^ 1;
                             mbarrier_wait(k_empty_addr + (_stage_k_empty) * 8, _parity_k_empty);

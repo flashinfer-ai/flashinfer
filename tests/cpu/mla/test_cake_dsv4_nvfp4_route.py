@@ -326,9 +326,13 @@ def test_nvfp4_variant_names():
         assert cake._nvfp4_variant_name(member) == f"nvfp4_decode_{member}"
     with pytest.raises(ValueError, match="unknown NVFP4 family member"):
         cake._nvfp4_variant_name("merge")
-    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 18
-    for arch in ("sm_100a", "sm_103a"):
-        assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS[arch]["variants"])
+    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 19
+    sm103_only = {"nvfp4_h128_v_unit_pairs_prefill"}
+    assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS["sm_103a"]["variants"])
+    assert set(_NVFP4_VARIANTS) - sm103_only <= set(
+        _ARCH_REGISTRATIONS["sm_100a"]["variants"]
+    )
+    assert not sm103_only & set(_ARCH_REGISTRATIONS["sm_100a"]["variants"])
 
 
 @pytest.mark.cpu_only
@@ -421,8 +425,14 @@ def test_workspace_layout_lse_region_is_opt_in():
         (64, 2048, 128, 0, 128, ("nvfp4_h64_q_prefetch_prefill", 2048)),
         (64, 2048, 512, 0, 512, ("nvfp4_h64_o_boxes_prefill", 2048)),
         (64, 2048, 128, 128, 128, ("nvfp4_h64_o_boxes_prefill", 2048)),
-        # 128 heads: one two-CTA cluster per token.
+        # 128 heads: one two-CTA cluster per token; v_unit_pairs past 256 selected keys (sm_103a).
         (128, 512, 128, 0, 128, ("nvfp4_h128_prefill", 1024)),
+        (128, 512, 128, 128, 128, ("nvfp4_h128_prefill", 1024)),  # C128-16K
+        (128, 512, 128, 129, 128, ("nvfp4_h128_v_unit_pairs_prefill", 1024)),
+        (128, 2048, 128, 512, 128, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+        (128, 2048, 128, 1024, 128, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+        (128, 2048, 128, 2048, 128, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
+        (128, 2048, 512, 0, 512, ("nvfp4_h128_v_unit_pairs_prefill", 4096)),
     ],
 )
 def test_nvfp4_prefill_route(heads, tokens, main_width, extra_width, stride, expected):
@@ -438,6 +448,19 @@ def test_nvfp4_prefill_route(heads, tokens, main_width, extra_width, stride, exp
         == expected
     )
     assert expected[0] in _NVFP4_VARIANTS
+
+
+def test_nvfp4_prefill_route_keeps_sm100a_on_the_persistent_h128_build():
+    route = cake._nvfp4_prefill_route(
+        num_heads=128,
+        num_query_tokens=2048,
+        main_width=128,
+        extra_width=1024,
+        main_index_stride=128,
+        sm_count=148,
+        arch="sm_100a",
+    )
+    assert route == ("nvfp4_h128_prefill", 4096)
 
 
 def test_nvfp4_prefill_flat_index_rows_keep_the_storage():

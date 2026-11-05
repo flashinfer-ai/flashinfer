@@ -140,6 +140,47 @@ def _window_selection(
     return table, lens
 
 
+def _layer_tables(gen, q_lens, ctx: int, ratio: int, extra_topk: int):
+    """DSv4 layer tables as SGLang builds them, for requests whose last query
+    token sits at KV position ``ctx - 1``: the SWA window newest first (column
+    ``j`` holds position ``pos - j``, length ``min(pos + 1, 128)``) over a main
+    pool holding each request's ``ctx`` tokens in order, and for ``ratio`` 4 /
+    128 the compressed table over an extra pool holding each request's
+    ``ctx // ratio`` rows: C128 every causal row in order (growing length
+    ``max((pos + 1) // 128, 1)``, ``-1`` past it), C4 the causal rows in order
+    while they fit ``extra_topk`` and a random unsorted ``extra_topk`` of them
+    after (length ``min(max((pos + 1) // 4, 1), extra_topk)``)."""
+    rows = sum(q_lens)
+    main = torch.full((rows, 128), -1, dtype=torch.int32)
+    main_lens = torch.zeros((rows,), dtype=torch.int32)
+    extra = torch.full((rows, max(extra_topk, 1)), -1, dtype=torch.int32)
+    extra_lens = torch.ones((rows,), dtype=torch.int32)
+    cpu = torch.Generator().manual_seed(
+        int(torch.randint(1 << 30, (1,), generator=gen, device="cuda"))
+    )
+    row = 0
+    for b, q_len in enumerate(q_lens):
+        for q in range(q_len):
+            pos = ctx - q_len + q
+            n = min(pos + 1, 128)
+            main[row, :n] = b * ctx + torch.arange(pos, pos - n, -1, dtype=torch.int32)
+            main_lens[row] = n
+            if ratio:
+                causal = (pos + 1) // ratio
+                base = b * (ctx // ratio)
+                if causal <= extra_topk:
+                    extra[row, :causal] = base + torch.arange(causal, dtype=torch.int32)
+                else:
+                    pick = torch.randperm(causal, generator=cpu)[:extra_topk]
+                    extra[row] = base + pick.to(torch.int32)
+                extra_lens[row] = min(max(causal, 1), extra_topk)
+            row += 1
+    out = [main.cuda(), main_lens.cuda()]
+    if ratio:
+        out += [extra.cuda(), extra_lens.cuda()]
+    return out
+
+
 def _case(
     *,
     heads: int,
@@ -154,11 +195,22 @@ def _case(
     pool_pages: int = 48,
     seed: int = 0,
     drop_key: bool = False,
+    layer=None,
 ):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     rows = sum(q_lens)
+    if layer is not None:
+        # (kind, ctx): an SGLang-order DSv4 layer, see _layer_tables.
+        kind, ctx = layer
+        ratio = {"swa": 0, "c4": 4, "c128": 128}[kind]
+        extra_page_size = 2 if kind == "c128" else 64
+        pool_pages = -(-len(q_lens) * ctx // page_size)
     main_cache, main_rows = _pool(gen, pool_pages, page_size, layout, -0.05)
-    if lens_rule in ("window", "fresh_window", "newest_window"):
+    if layer is not None:
+        tables = _layer_tables(gen, q_lens, ctx, ratio, extra_topk)
+        main_idx, main_lens = tables[:2]
+        topk = 128
+    elif lens_rule in ("window", "fresh_window", "newest_window"):
         main_idx, main_lens = _window_selection(
             q_lens,
             topk,
@@ -170,7 +222,11 @@ def _case(
     else:
         main_idx, main_lens = _selection(gen, rows, topk, main_rows.shape[0], lens_rule)
     extra_cache = extra_idx = extra_lens = extra_rows = None
-    if extra_topk:
+    if layer is not None and ratio:
+        extra_pages = -(-len(q_lens) * (ctx // ratio) // extra_page_size)
+        extra_cache, extra_rows = _pool(gen, extra_pages, extra_page_size, layout, 0.05)
+        extra_idx, extra_lens = tables[2:]
+    elif extra_topk:
         extra_pages = max(pool_pages * page_size // extra_page_size, 2)
         extra_cache, extra_rows = _pool(gen, extra_pages, extra_page_size, layout, 0.05)
         extra_idx, extra_lens = _selection(
@@ -618,6 +674,100 @@ _ROUTE_GRID = [
         id="h128-window-512",
     ),
 ]
+
+
+# DSv4 layers with SGLang's tables (newest-first SWA window; C4 top-k; C128 every
+# causal row, growing lengths), at the heads each model shards to.
+_LAYER_GRID = [
+    pytest.param(
+        dict(heads=16, layer=("swa", 4096), q_lens=(683, 1365)),
+        "nvfp4_qb_h16_prefill",
+        id="h16-swa",
+    ),
+    pytest.param(
+        dict(heads=32, layer=("swa", 4096), q_lens=(171, 341)),
+        "nvfp4_qb_h32_late_claim_prefill",
+        id="h32-swa-512",
+    ),
+    pytest.param(
+        dict(heads=8, layer=("swa", 4096), q_lens=(171, 341)),
+        "nvfp4_h64_tmem_v_prefill",
+        id="h8-swa",
+    ),
+    pytest.param(
+        dict(heads=64, layer=("swa", 4096), q_lens=(171, 341)),
+        "nvfp4_h64_q_prefetch_prefill",
+        id="h64-swa",
+    ),
+    pytest.param(
+        dict(heads=128, layer=("swa", 4096), q_lens=(171, 341)),
+        "nvfp4_h128_prefill",
+        id="h128-swa",
+    ),
+    pytest.param(
+        dict(heads=64, layer=("c4", 4096), extra_topk=512, q_lens=(171, 341)),
+        "nvfp4_h64_o_boxes_prefill",
+        id="h64-c4flash",
+    ),
+    pytest.param(
+        dict(heads=16, layer=("c4", 4096), extra_topk=512, q_lens=(171, 341)),
+        "nvfp4_h64_tmem_v_prefill",
+        id="h16-c4flash",
+    ),
+    pytest.param(
+        dict(heads=128, layer=("c4", 8192), extra_topk=1024, q_lens=(171, 341)),
+        "nvfp4_h128_v_unit_pairs_prefill",
+        id="h128-c4pro",
+    ),
+    pytest.param(
+        dict(heads=64, layer=("c4", 8192), extra_topk=1024, q_lens=(43, 85)),
+        "nvfp4_h64_early_gather_prefill",
+        id="h64-c4pro-128",
+    ),
+    pytest.param(
+        dict(heads=64, layer=("c128", 16384), extra_topk=128, q_lens=(171, 341)),
+        "nvfp4_h64_o_boxes_prefill",
+        id="h64-c128-16k",
+    ),
+    pytest.param(
+        dict(heads=128, layer=("c128", 16384), extra_topk=128, q_lens=(171, 341)),
+        "nvfp4_h128_prefill",
+        id="h128-c128-16k",
+    ),
+    pytest.param(
+        dict(heads=128, layer=("c128", 65536), extra_topk=512, q_lens=(171, 341)),
+        "nvfp4_h128_v_unit_pairs_prefill",
+        id="h128-c128-64k",
+    ),
+    pytest.param(
+        dict(heads=32, layer=("c128", 65536), extra_topk=512, q_lens=(171, 341)),
+        "nvfp4_h64_tmem_v_prefill",
+        id="h32-c128-64k",
+    ),
+    pytest.param(
+        dict(heads=64, layer=("c128", 262144), extra_topk=2048, q_lens=(43, 85)),
+        "nvfp4_h64_early_gather_prefill",
+        id="h64-c128-256k-128",
+    ),
+]
+
+
+@pytest.mark.parametrize("spec, variant", _LAYER_GRID)
+def test_nvfp4_prefill_dsv4_layers_match_the_oracle(spec, variant, monkeypatch):
+    """Real DSv4 layer shapes with SGLang-order tables, each on the build the
+    route sends it to."""
+    _require_cake_arch()
+    from flashinfer.utils import get_compute_capability as _cc
+
+    if variant == "nvfp4_h128_v_unit_pairs_prefill" and tuple(
+        _cc(torch.device("cuda"))
+    ) != (10, 3):
+        variant = "nvfp4_h128_prefill"
+    calls = _routed(monkeypatch)
+    case = _case(seed=21, topk=128, **spec)
+    out = _run(case)
+    assert calls == [variant]
+    _check(case, out)
 
 
 @pytest.mark.parametrize("spec, variant", _ROUTE_GRID)

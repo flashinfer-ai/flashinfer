@@ -1962,18 +1962,51 @@ kernel_cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill(const __grid_constant__ C
                         int sf_base = smem_k_sf_addr + (unsigned int)(k_stage * 26624);
                         unsigned int sf_a[8];
                         unsigned int sf_b[8];
+                        int sf_par = lane >> 2 & 1;
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(0) + 3]))
-                            : "r"(sf_base + lane * 32));
+                            : "r"(sf_base + lane * 32 + 16 * sf_par));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_a[4])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_a[(4) + 3]))
-                            : "r"(sf_base + lane * 32 + 16));
+                            : "r"(sf_base + lane * 32 + (16 - 16 * sf_par)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_b[0])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(0) + 3]))
-                            : "r"(sf_base + (lane + 32) * 32));
+                            : "r"(sf_base + (lane + 32) * 32 + 16 * sf_par));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sf_b[4])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&sf_b[(4) + 3]))
-                            : "r"(sf_base + (lane + 32) * 32 + 16));
+                            : "r"(sf_base + (lane + 32) * 32 + (16 - 16 * sf_par)));
+                        unsigned int sf_a_lo_0 = sf_a[0];
+                        unsigned int sf_a_hi_0 = sf_a[4];
+                        sf_a[0] = ((sf_par != 0) ? sf_a_hi_0 : sf_a_lo_0);
+                        sf_a[4] = ((sf_par != 0) ? sf_a_lo_0 : sf_a_hi_0);
+                        unsigned int sf_b_lo_0 = sf_b[0];
+                        unsigned int sf_b_hi_0 = sf_b[4];
+                        sf_b[0] = ((sf_par != 0) ? sf_b_hi_0 : sf_b_lo_0);
+                        sf_b[4] = ((sf_par != 0) ? sf_b_lo_0 : sf_b_hi_0);
+                        unsigned int sf_a_lo_1 = sf_a[1];
+                        unsigned int sf_a_hi_1 = sf_a[5];
+                        sf_a[1] = ((sf_par != 0) ? sf_a_hi_1 : sf_a_lo_1);
+                        sf_a[5] = ((sf_par != 0) ? sf_a_lo_1 : sf_a_hi_1);
+                        unsigned int sf_b_lo_1 = sf_b[1];
+                        unsigned int sf_b_hi_1 = sf_b[5];
+                        sf_b[1] = ((sf_par != 0) ? sf_b_hi_1 : sf_b_lo_1);
+                        sf_b[5] = ((sf_par != 0) ? sf_b_lo_1 : sf_b_hi_1);
+                        unsigned int sf_a_lo_2 = sf_a[2];
+                        unsigned int sf_a_hi_2 = sf_a[6];
+                        sf_a[2] = ((sf_par != 0) ? sf_a_hi_2 : sf_a_lo_2);
+                        sf_a[6] = ((sf_par != 0) ? sf_a_lo_2 : sf_a_hi_2);
+                        unsigned int sf_b_lo_2 = sf_b[2];
+                        unsigned int sf_b_hi_2 = sf_b[6];
+                        sf_b[2] = ((sf_par != 0) ? sf_b_hi_2 : sf_b_lo_2);
+                        sf_b[6] = ((sf_par != 0) ? sf_b_lo_2 : sf_b_hi_2);
+                        unsigned int sf_a_lo_3 = sf_a[3];
+                        unsigned int sf_a_hi_3 = sf_a[7];
+                        sf_a[3] = ((sf_par != 0) ? sf_a_hi_3 : sf_a_lo_3);
+                        sf_a[7] = ((sf_par != 0) ? sf_a_lo_3 : sf_a_hi_3);
+                        unsigned int sf_b_lo_3 = sf_b[3];
+                        unsigned int sf_b_hi_3 = sf_b[7];
+                        sf_b[3] = ((sf_par != 0) ? sf_b_hi_3 : sf_b_lo_3);
+                        sf_b[7] = ((sf_par != 0) ? sf_b_lo_3 : sf_b_hi_3);
                         int _stage_k_empty = (int)((unsigned int)(ld_tile_cursor + ld_tile + 3) % 5);
                         int _parity_k_empty = (int)((unsigned int)(ld_tile_cursor + ld_tile + 3) / 5 % 2) ^ 1;
                         mbarrier_wait(k_empty_addr + (_stage_k_empty) * 8, _parity_k_empty);
@@ -1992,20 +2025,25 @@ kernel_cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill(const __grid_constant__ C
                             " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                             :: "r"(taddr + (unsigned int)sfb_col + (unsigned int)(ld_row_base << 16)), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[0])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[1])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[2])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[3])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[4])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[5])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[6])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[7])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[8])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[9])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[10])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[11])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[12])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[13])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[14])), "r"(*reinterpret_cast<const uint32_t*>(&sfb_regs[15])));
                         unsigned int k68 = 0;
-                        unsigned int k70 = 0;
-                        unsigned int k78 = 0;
                         #pragma unroll
                         for (int sf_s_1 = 0; sf_s_1 < 7; sf_s_1++) {
                             k68 = k68 | sf_a[sf_s_1] + 404232216 | sf_b[sf_s_1] + 404232216;
-                            k70 = k70 | sf_a[sf_s_1] + 269488144 | sf_b[sf_s_1] + 269488144;
-                            k78 = k78 | sf_a[sf_s_1] + 134744072 | sf_b[sf_s_1] + 134744072;
                         }
                         int _warp_vote_6 = __any_sync(0xFFFFFFFF, (k68 & 2155905152u) != 0);
-                        int _warp_vote_7 = __any_sync(0xFFFFFFFF, (k70 & 2155905152u) != 0);
-                        int _warp_vote_8 = __any_sync(0xFFFFFFFF, (k78 & 2155905152u) != 0);
-                        unsigned int kexp_u = (unsigned int)(_warp_vote_6 != 0) + (unsigned int)(_warp_vote_7 != 0) + (unsigned int)(_warp_vote_8 != 0);
+                        unsigned int kexp_u = (unsigned int)(_warp_vote_6 != 0);
+                        if (kexp_u != 0) {
+                            unsigned int k70 = 0;
+                            unsigned int k78 = 0;
+                            #pragma unroll
+                            for (int sf_s_2 = 0; sf_s_2 < 7; sf_s_2++) {
+                                k70 = k70 | sf_a[sf_s_2] + 269488144 | sf_b[sf_s_2] + 269488144;
+                                k78 = k78 | sf_a[sf_s_2] + 134744072 | sf_b[sf_s_2] + 134744072;
+                            }
+                            int _warp_vote_7 = __any_sync(0xFFFFFFFF, (k70 & 2155905152u) != 0);
+                            int _warp_vote_8 = __any_sync(0xFFFFFFFF, (k78 & 2155905152u) != 0);
+                            kexp_u = 1 + (unsigned int)(_warp_vote_7 != 0) + (unsigned int)(_warp_vote_8 != 0);
+                        }
                         unsigned int kexp_f16x2 = (15 - kexp_u << 10) * 65537;
-                        float kexp_scale = __uint_as_float(127 - kexp_u << 23);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
@@ -3317,7 +3355,6 @@ kernel_cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill(const __grid_constant__ C
                         mbarrier_wait(kexp_full_addr + (_stage_kexp_full_1) * 8, _parity_kexp_full_1);
                         unsigned int x_kexp = smem_kexp[x_stage * 4];
                         unsigned int x_kexp_f16x2 = (15 - x_kexp << 10) * 65537;
-                        float x_kexp_scale = __uint_as_float(127 - x_kexp << 23);
                         const int vx_warp = warp - 20;
                         unsigned int x_kexp_bf16x2 = (127 - x_kexp << 7) * 65537;
                         unsigned int x_stage_base = smem_k_a_addr + (unsigned int)(xk_stage * 26624);

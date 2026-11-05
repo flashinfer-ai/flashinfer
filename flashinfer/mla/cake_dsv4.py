@@ -279,6 +279,12 @@ _NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL = "nvfp4_h64_early_gather_prefill"
 _NVFP4_VARIANT_H64_O_BOXES_PREFILL = "nvfp4_h64_o_boxes_prefill"
 _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL = "nvfp4_h64_q_prefetch_prefill"
 _NVFP4_VARIANT_H128_PREFILL = "nvfp4_h128_prefill"
+# The two-CTA body's build for items of more than two 128-key tiles (sparse_topk above 256, e.g. C4 and
+# C128 past 16K context): its loaders transform two NoPE units per trip from one shared scale word.
+# It is built for sm_103a; sm_100a keeps the persistent build.
+_NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL = "nvfp4_h128_v_unit_pairs_prefill"
+_NVFP4_H128_V_UNIT_PAIRS_MIN_TOPK = 257
+_NVFP4_H128_V_UNIT_PAIRS_ARCHES = ("sm_103a",)
 # Query-block bodies (16 / 32 heads, window-only rows: no extra table, a main table of at most 128
 # keys on a row stride of at least 128): one CTA item per block of 64 / H consecutive query tokens,
 # whose shifted windows are gathered and transformed once (window tables oldest or newest key first,
@@ -306,6 +312,7 @@ _NVFP4_PREFILL_VARIANTS = (
     _NVFP4_VARIANT_H64_O_BOXES_PREFILL,
     _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL,
     _NVFP4_VARIANT_H128_PREFILL,
+    _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL,
 )
 _NVFP4_H64_PREFILL_MAX_HEADS = 64
 _NVFP4_TMEM_V_MAX_HEADS = 32
@@ -3203,14 +3210,20 @@ def run_cake_dsv4_nvfp4(
     sink_tensor = sinks if sinks is not None else scale1
     lse_scale = float(lse_scale)
 
-    plan = _nvfp4_plan(
-        num_query_tokens=num_query_tokens,
-        num_heads=num_heads,
-        sparse_topk=main_width,
-        extra_topk=extra_width,
-        sm_count=_nvfp4_sm_count(device),
+    # The decode family's split plan (its candidate tiles are capped); the
+    # prefill bodies take any table width and run one split.
+    plan = (
+        None
+        if packed_query
+        else _nvfp4_plan(
+            num_query_tokens=num_query_tokens,
+            num_heads=num_heads,
+            sparse_topk=main_width,
+            extra_topk=extra_width,
+            sm_count=_nvfp4_sm_count(device),
+        )
     )
-    num_splits = plan.num_splits
+    num_splits = 1 if plan is None else plan.num_splits
 
     if workspace_buffer.device != device:
         raise ValueError(
@@ -3229,7 +3242,7 @@ def run_cake_dsv4_nvfp4(
     layout = cake_dsv4_workspace_layout(
         num_query_tokens,
         num_heads,
-        1 if prefill else num_splits,
+        num_splits,
         with_lse=True,
         with_prefill=prefill,
     )
@@ -3276,6 +3289,7 @@ def run_cake_dsv4_nvfp4(
             num_query_tokens, num_heads, num_splits, _HEAD_DIM
         )
 
+    assert plan is not None  # a BF16 query runs the decode family
     _require_nvfp4_variant(plan.variant, arch=arch)
     if num_splits > 1:
         _require_nvfp4_variant(_NVFP4_VARIANT_MERGE, arch=arch)
@@ -3463,6 +3477,7 @@ def _nvfp4_prefill(
         extra_width=extra_width,
         main_index_stride=int(main_indices.stride(0)),
         sm_count=_device_sm_count(query_rows.device),
+        arch=arch,
     )
     _require_nvfp4_variant(variant, arch=arch)
 
@@ -3556,10 +3571,15 @@ def _nvfp4_prefill_route(
     extra_width: int,
     main_index_stride: int,
     sm_count: int,
+    arch: str = "sm_103a",
 ) -> tuple[str, int]:
     """The NVFP4 prefill variant of one call and its grid (CTAs along x).
 
-    * 128 heads: the two-CTA body, one cluster per query token.
+    * 128 heads: the two-CTA body, one cluster per query token; on sm_103a its
+      ``v_unit_pairs`` build once the row selects more than 256 keys (items of
+      more than two tiles: C4 and long-context C128 layers), the persistent
+      build otherwise (SWA and C128 up to 16K context, within 2 % of each other
+      there).
     * 16 / 32 heads on window-only rows (no extra table, a main table of at
       most 128 keys on a row stride of at least 128) with more query tokens
       than SMs: the query-block bodies, one item per block of 64 / H tokens.
@@ -3576,6 +3596,11 @@ def _nvfp4_prefill_route(
     """
     tokens = num_query_tokens
     if num_heads > _NVFP4_H64_PREFILL_MAX_HEADS:
+        if (
+            main_width + extra_width >= _NVFP4_H128_V_UNIT_PAIRS_MIN_TOPK
+            and arch in _NVFP4_H128_V_UNIT_PAIRS_ARCHES
+        ):
+            return _NVFP4_VARIANT_H128_V_UNIT_PAIRS_PREFILL, 2 * tokens
         return _NVFP4_VARIANT_H128_PREFILL, 2 * tokens
     window_only = extra_width == 0 and main_width <= _NVFP4_QB_WINDOW
     one_item_per_cta = tokens <= sm_count
