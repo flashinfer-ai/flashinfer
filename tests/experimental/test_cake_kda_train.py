@@ -699,17 +699,11 @@ def test_registry_records_are_well_formed() -> None:
     assert cake_jit.GATE_STAGES == GATE_STAGES and tuple(cake_jit.GATES) == GATES
     assert tuple(cake_jit.L2N_MODES) == L2N_MODES
     assert frozenset(cake_jit.L2N_STAGES) == L2N_STAGES
-    assert (
-        set(cake_jit.MODULES)
-        == (set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED)
-        | set(S1_RECORDS)
-        | TWIN_RECORDS
-        | TAPE_WY_RECORDS
-        | set(RAW_DQKG)
-        | R1C_RECORDS
-        | set(L2N_DQKG)
-        | set(L2N_PARAM)
-    )
+    assert set(cake_jit.MODULES) == (
+        set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED
+    ) | set(S1_RECORDS) | TWIN_RECORDS | TAPE_WY_RECORDS | set(
+        RAW_DQKG
+    ) | R1C_RECORDS | set(L2N_DQKG) | set(L2N_PARAM)
     assert len(cake_jit.MODULES) == MODULE_COUNT == 122
     assert (
         len({r["library"] for r in cake_jit.MODULES.values()})
@@ -1504,7 +1498,10 @@ def test_the_raw_class_is_the_deterministic_raw_class() -> None:
     } <= raw
     checked = 0
     for name in sorted((raw - R1C_RECORDS) | {"gate_epilogue"}):
-        record, twin = cake_jit.MODULES[name], det_jit.MODULES[DET_SOURCE.get(name, name)]
+        record, twin = (
+            cake_jit.MODULES[name],
+            det_jit.MODULES[DET_SOURCE.get(name, name)],
+        )
         assert record["library"] == twin["library"].replace(
             "cake_kda_det_train_", "cake_kda_train_"
         ), name
@@ -1526,7 +1523,9 @@ def test_the_raw_class_is_the_deterministic_raw_class() -> None:
             key: value for key, value in record.items() if key not in renamed
         } == expected, name
         checked += 1
-    assert checked == len(raw) - len(R1C_RECORDS) + 1 > len(R1C_NARROWED) + len(L2N_PARAM)
+    assert (
+        checked == len(raw) - len(R1C_RECORDS) + 1 > len(R1C_NARROWED) + len(L2N_PARAM)
+    )
     # the narrowed forms, spelled out
     assert cake_jit.MODULES["glm_intra_raw"]["select_rule"] == {
         "kind": "arch_in",

@@ -991,12 +991,14 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
                         else 0
                     )
                     # the R1c accumulators: the flag-off raw backward alone
-                    assert (acc > 0) == (
-                        gate == "raw" and backward and l2n == "off"
-                    ), (kw, acc)
-                    assert cake_backend.workspace_bytes(
-                        S, N, H, **kw
-                    ) == det_backend.workspace_bytes(S, N, H, **kw) + acc, kw
+                    assert (acc > 0) == (gate == "raw" and backward and l2n == "off"), (
+                        kw,
+                        acc,
+                    )
+                    assert (
+                        cake_backend.workspace_bytes(S, N, H, **kw)
+                        == det_backend.workspace_bytes(S, N, H, **kw) + acc
+                    ), kw
                     compared += 1
             assert cake_backend.output_bytes(
                 S, H, backward=True, gate=gate, l2n=l2n

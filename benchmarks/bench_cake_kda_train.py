@@ -1026,7 +1026,11 @@ def combine_orders(by_order: dict[str, dict]) -> dict:
         if all(r["ratio_det_over_nd"].get(name, 1.0) < 1.0 for r in by_order.values())
     ]
     # the A/A figures of the means: the band covers both orders' bands and the means' det2 / det
-    row["ratio_det2_over_det"], row["aa_band"], row["det_over_nd_beyond_aa"] = {}, {}, {}
+    row["ratio_det2_over_det"], row["aa_band"], row["det_over_nd_beyond_aa"] = (
+        {},
+        {},
+        {},
+    )
     for name, det_ms in ms.get("det", {}).items():
         bands = [r["aa_band"].get(name) for r in by_order.values()]
         if name not in ms.get(AA_ARM, {}) or None in bands:

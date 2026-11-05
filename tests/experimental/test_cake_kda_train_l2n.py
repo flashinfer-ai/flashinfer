@@ -753,7 +753,9 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
     checked = 0
     for H in (1, 4, 16, 31, 32, 64):
         for mode in L2N_ON:
-            glm = "glm_intra_raw_l2n" if mode == "fused" else "glm_intra_raw_l2n_capture"
+            glm = (
+                "glm_intra_raw_l2n" if mode == "fused" else "glm_intra_raw_l2n_capture"
+            )
             p = cake_backend.plan(5000, 3, H, 148, arch, gate="raw", l2n=mode)
             dp = det_backend.plan(5000, 3, H, 148, arch, gate="raw", l2n=mode)
             assert cake_backend._r1c_stripes(p) is None, (H, mode)
@@ -780,8 +782,14 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
     assert cake_backend._r1c_alert_due(arch, 16, 148) is (arch != "sm_107a")
     for mode in L2N_ON:
         glm = "glm_intra_raw_l2n" if mode == "fused" else "glm_intra_raw_l2n_capture"
-        base = {"dqkg": "dqkg_raw", "glm_intra": glm, "param_finalize": "param_finalize_l2n"}
-        cake_backend._check_pairs({"light": base}, arch=arch, H=16, gate="raw", l2n=mode)
+        base = {
+            "dqkg": "dqkg_raw",
+            "glm_intra": glm,
+            "param_finalize": "param_finalize_l2n",
+        }
+        cake_backend._check_pairs(
+            {"light": base}, arch=arch, H=16, gate="raw", l2n=mode
+        )
         with pytest.raises(ValueError, match="it must be 'param_finalize_l2n'"):
             cake_backend._check_pairs(
                 {"light": {**base, "param_finalize": "param_finalize"}},
@@ -793,7 +801,10 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
         for pair in (
             {"param_finalize": "param_finalize_cast"},
             {"glm_intra": "glm_intra_v20c", "param_finalize": "param_finalize_cast"},
-            {"glm_intra": "glm_intra_v20c_r8", "param_finalize": "param_finalize_cast_r8"},
+            {
+                "glm_intra": "glm_intra_v20c_r8",
+                "param_finalize": "param_finalize_cast_r8",
+            },
         ):
             with pytest.raises(ValueError, match=f"R1c record.*l2n mode {mode!r}"):
                 cake_backend._check_pairs(
