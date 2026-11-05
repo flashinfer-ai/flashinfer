@@ -16,6 +16,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _fake_cuda(shape=(2, 32), dtype=torch.bfloat16, step=1):
+    """Create CUDA shape/stride metadata without allocating GPU storage."""
     with FakeTensorMode():
         if step == 1:
             return torch.empty(shape, dtype=dtype, device="cuda:1")
@@ -50,6 +51,7 @@ def test_preflight_accepts_call_arguments_without_execution(monkeypatch):
 
 @pytest.mark.parametrize("kwargs", [{}, {"backend": "cuda"}])
 def test_native_dtype_rejection_is_shared_with_execution(monkeypatch, kwargs):
+    """The CPU dtype error must precede JIT through both public entry points."""
     x = torch.empty((2, 32), dtype=torch.float16)
     loader = Mock(side_effect=AssertionError("invalid input reached JIT"))
     monkeypatch.setattr(fp8, "get_mxfp8_quantization_sm100_module", loader)
@@ -76,7 +78,11 @@ def test_native_cuda_checks_the_input_device(monkeypatch):
     assert mxfp8_quantize.check_inputs(x) is None
 
 
-def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(monkeypatch):
+@pytest.mark.parametrize("sf_layout", list(SfLayout))
+def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(
+    monkeypatch, sf_layout
+):
+    """All scale layouts retain copyable FP32 inputs without architecture narrowing."""
     from flashinfer import cute_dsl
 
     x = _fake_cuda((2, 64), torch.float32, step=2)
@@ -86,11 +92,14 @@ def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(monkey
     monkeypatch.setattr(fp8, "device_support_pdl", unexpected)
     # CuTe prepares this layout itself and supports fp32. Do not impose the
     # native CUDA backend's SM100 or contiguous-input restrictions here.
-    assert mxfp8_quantize.check_inputs(x, backend="cute-dsl") is None
+    assert (
+        mxfp8_quantize.check_inputs(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
+        is None
+    )
     dependency_probe = Mock(side_effect=RuntimeError("reached CuTe dependency probe"))
     monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", dependency_probe)
     with pytest.raises(RuntimeError, match="reached CuTe dependency probe"):
-        mxfp8_quantize(x, backend="cute-dsl")
+        mxfp8_quantize(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
     dependency_probe.assert_called_once_with()
     unexpected.assert_not_called()
 
@@ -104,6 +113,7 @@ def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(monkey
     ],
 )
 def test_cute_rejects_inputs_before_runtime_setup(monkeypatch, shape, layout, message):
+    """Reject sparse and zero-width CuTe input before dependencies or allocation."""
     from flashinfer import cute_dsl
 
     with FakeTensorMode():
@@ -126,7 +136,46 @@ def test_native_cuda_rejects_inputs_that_require_a_copy():
         mxfp8_quantize.check_inputs(x, backend="cuda")
 
 
+def test_cute_rejects_invalid_scale_layout_before_runtime_setup(monkeypatch):
+    """An invalid enum must not silently select the 128x4 CuTe scale layout."""
+    from flashinfer import cute_dsl
+
+    x = _fake_cuda()
+    unexpected = Mock(side_effect=AssertionError("invalid scale layout reached setup"))
+    monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", unexpected)
+    monkeypatch.setattr(torch, "empty", unexpected)
+    for call in (mxfp8_quantize.check_inputs, mxfp8_quantize):
+        with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
+            call(x, backend="cute-dsl", sf_swizzle_layout=999)
+    unexpected.assert_not_called()
+
+
+def test_batch_invariant_rejects_sparse_input_before_preparation(monkeypatch):
+    """Sparse metadata must fail with the batch-invariant unsupported-input error."""
+    from flashinfer.batch_invariant import support
+    from flashinfer.batch_invariant.quantization import mx_api
+    from flashinfer.cute_dsl import availability
+
+    with FakeTensorMode():
+        x = torch.empty(
+            (2, 32), dtype=torch.bfloat16, device="cuda:1", layout=torch.sparse_coo
+        )
+    monkeypatch.setattr(utils, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(availability, "is_cute_dsl_available", lambda: True)
+    monkeypatch.setattr(availability, "is_cute_dsl_arch_supported", lambda *cc: True)
+    unexpected = Mock(side_effect=AssertionError("sparse input reached preparation"))
+    monkeypatch.setattr(mx_api, "_rows", unexpected)
+    monkeypatch.setattr(utils, "device_support_pdl", unexpected)
+    monkeypatch.setattr(torch, "empty", unexpected)
+    monkeypatch.setattr(torch, "zeros", unexpected)
+    for call in (mxfp8_quantize.check_inputs, mxfp8_quantize):
+        with pytest.raises(support.BatchInvariantUnsupportedError, match="strided"):
+            call(x, batch_invariant=True)
+    unexpected.assert_not_called()
+
+
 def test_batch_invariant_reuses_its_runtime_validation(monkeypatch):
+    """Share row-size rejection while retaining the supported one-dimensional input."""
     from flashinfer.batch_invariant import support
     from flashinfer.batch_invariant.quantization import mx_api
     from flashinfer.cute_dsl import availability

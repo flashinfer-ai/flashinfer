@@ -364,6 +364,16 @@ def _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout):
     return SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
 
 
+def _check_mxfp8_scale_layout(sf_swizzle_layout):
+    """Reject unknown scale layouts before mapping them to backend flags."""
+    if sf_swizzle_layout not in (
+        SfLayout.layout_linear,
+        SfLayout.layout_128x4,
+        SfLayout.layout_8x4,
+    ):
+        raise ValueError(f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}")
+
+
 def _check_mxfp8_backend(input, backend, batch_invariant):
     """Apply the public backend selection constraints in their original order."""
     if batch_invariant:
@@ -415,12 +425,7 @@ def _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment):
         raise ValueError(
             "mxfp8_quantize with backend='cuda' requires CPU or CUDA input"
         )
-    if sf_swizzle_layout not in (
-        SfLayout.layout_linear,
-        SfLayout.layout_128x4,
-        SfLayout.layout_8x4,
-    ):
-        raise ValueError(f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}")
+    _check_mxfp8_scale_layout(sf_swizzle_layout)
 
 
 def _check_mxfp8_cute_dsl_inputs(input, alignment):
@@ -478,6 +483,7 @@ def _check_mxfp8_quantize_inputs(
         )
     elif backend == "cute-dsl":
         _check_mxfp8_cute_dsl_inputs(input, alignment)
+        _check_mxfp8_scale_layout(sf_swizzle_layout)
     else:
         _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment)
         _check_block_scale_quantization_support(input.device, "mxfp8_quantize")
@@ -588,6 +594,7 @@ def mxfp8_quantize(
 
     if backend == "cute-dsl":
         _check_mxfp8_cute_dsl_inputs(input, alignment)
+        _check_mxfp8_scale_layout(sf_swizzle_layout)
         from ..cute_dsl import is_cute_dsl_available
 
         if not is_cute_dsl_available():
