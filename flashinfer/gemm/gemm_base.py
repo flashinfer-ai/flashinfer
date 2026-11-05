@@ -10090,6 +10090,7 @@ def mm_fp4(
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
+    *,
     batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM FP4

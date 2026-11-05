@@ -437,6 +437,31 @@ def test_flag_bypasses_the_operator_backend_selection():
     )
 
 
+def test_runner_shape_matches_the_dispatcher_for_every_api():
+    """The autotuner's runner recovers the real (M, N, K) from its inputs for every API (K in elements: the 4-bit operands
+    are byte-packed, the others are not), so its default tactic is the dispatcher's own pick at the real shape."""
+    M, N, K = 300, 4096, 4096
+    a16 = torch.zeros(M, K, dtype=torch.bfloat16)
+    b16 = torch.zeros(K, N, dtype=torch.bfloat16)
+    a8, b8 = a16.to(torch.float8_e4m3fn), b16.to(torch.float8_e4m3fn)
+    a4 = torch.zeros(M, K // 2, dtype=torch.uint8)
+    b4 = torch.zeros(K // 2, N, dtype=torch.uint8)
+    sf = torch.zeros(1, dtype=torch.uint8)
+    cases = [
+        ("mm_bf16", "bf16", "n", [a16, b16, None, None]),
+        ("bmm_fp8", "e4m3", "k", [a8[None], b8[None], None, None, None]),
+        ("mm_mxfp8", "mxfp8", "k", [a8, b8, sf, sf, None]),
+        ("mm_fp4", "nvfp4", "k", [a4, b4, sf, sf, None, None]),
+        ("mm_fp4", "mxfp4", "k", [a4, b4, sf, sf, None, None]),
+    ]
+    for api, fmt, lay, inputs in cases:
+        runner = tuning.BatchInvariantGemmRunner(api, fmt, lay, 1, 148, "sm_100")
+        assert runner._shape(inputs) == (M, N, K), api
+        assert runner.config_for(inputs, -1) == default_config(
+            M, N, K, 1, lay, 148, "sm_100", fmt
+        ), api
+
+
 def test_unsupported_device_raises_before_any_kernel():
     a = torch.zeros(4, 64, dtype=torch.uint8)
     w = torch.zeros(128, 64, dtype=torch.uint8).t()
@@ -623,7 +648,7 @@ def test_batch_invariance_along_rows(nv):
     b, sfb, _ = weight(N, K, 32, nv)
     alpha = alpha_of(0.9)
     full = bits(bi_mm(a, b, sfa, sfb, alpha, nv))
-    for M in (1, 2, 7, 16, 32, 37, 64, 128, 256, 512, 1000, 2049):
+    for M in (1, 2, 7, 16, 32, 37, 63, 64, 65, 128, 256, 512, 1000, 2049):
         sub = a[:M].contiguous()
         assert torch.equal(
             bits(bi_mm(sub, b, swizzle_sf(ra[:M]), sfb, alpha, nv)), full[:M]
@@ -945,6 +970,11 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         direct(a.view(torch.int8), b, sfa, sfb, alpha, nv)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="uint8"):
         direct(a, b, sfa.view(torch.int8), sfb, alpha, nv)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="uint8"):
+        # e4m3-typed scales are NVFP4's; for MXFP4 they would be read as UE8M0 exponents, so they are a typed error there
+        mm_fp4_batch_invariant(
+            a, b, sfa.view(E4), sfb.view(E4), alpha, use_nvfp4=False, block_size=32
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="at least"):
         direct(a, b, sfa, sfb[:-512], alpha, nv)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="on A's device"):

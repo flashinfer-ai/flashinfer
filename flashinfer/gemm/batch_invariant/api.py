@@ -359,6 +359,31 @@ def _overlaps(x: torch.Tensor, y: torch.Tensor) -> bool:
     return a0 < b1 and b0 < a1
 
 
+def _require_disjoint(cls: str, writes, reads) -> None:
+    """The one aliasing policy of every launch path, applied before the first launch: every buffer a launch writes (the
+    output; the workspace of the split) is disjoint from every buffer it reads (the operands, the scales, the bias, alpha)
+    and from the other written buffers. A read overlapping a write makes the bits depend on which CTA runs first.
+    ``writes`` / ``reads`` are ``(tensor, name)`` pairs; byte spans, so a buffer inside a strided tensor's gaps counts as
+    overlapping (conservative)."""
+    for i, (w, wname) in enumerate(writes):
+        for r, rname in reads:
+            if _overlaps(w, r):
+                raise unsupported(
+                    cls,
+                    f"{rname} overlapping {wname}",
+                    f"{rname} disjoint from {wname}, which the launch writes while it reads {rname} (byte spans: a buffer "
+                    "inside a strided tensor's gaps is rejected too)",
+                )
+        for w2, w2name in writes[i + 1 :]:
+            if _overlaps(w, w2):
+                raise unsupported(
+                    cls,
+                    f"{w2name} overlapping {wname}",
+                    f"{w2name} disjoint from {wname} (the partials are written to the workspace before the fixup reads them "
+                    "and writes the output)",
+                )
+
+
 def _check_scale(
     s: torch.Tensor, name: str, device: torch.device, cls: str
 ) -> torch.Tensor:
@@ -891,10 +916,14 @@ def _flat_sf(
     """The scale-factor storage of a ``(rows, K)`` operand as a flat uint8 view (no copy): a contiguous buffer, or the
     transposed view of one, holding at least the bytes of the 128x4 swizzled layout (``spec.sf_bytes``), 16-byte aligned,
     on the operands' device. Only the layout and the extent are checked; the bytes are inputs."""
-    if isinstance(sf, torch.Tensor) and sf.dtype == torch.float8_e4m3fn:
+    if (
+        isinstance(sf, torch.Tensor)
+        and sf.dtype == torch.float8_e4m3fn
+        and in_fmt in NVFP4_FMTS
+    ):
         sf = sf.view(
             torch.uint8
-        )  # the NVFP4 scales as the quantizer may type them: the same bytes
+        )  # the NVFP4 scales as the quantizer may type them: the same bytes (e4m3)
     if not isinstance(sf, torch.Tensor) or sf.dtype != torch.uint8:
         raise unsupported(
             cls,
@@ -1108,6 +1137,12 @@ def _run_mx(
     if config.swap_ab:
         # the decode specialisation: C^T = B^T A^T with the operands exchanged; the kernel's A is the weight (N rows), its B
         # the tokens (any count, one tile), its C the M-major (N, M) view of the output
+        _require_disjoint(
+            cls,
+            [(out, "the output")],
+            [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
+            + ([(alpha, "alpha")] if alpha is not None else []),
+        )
         kernel(
             b_nk.as_strided((N, Kb, 1), (b_nk.stride(0), 1, Kb)),
             a.as_strided((M, Kb, 1), (a.stride(0), 1, Kb)),
@@ -1124,7 +1159,11 @@ def _run_mx(
     KL = Kb // L
     a3 = a.as_strided((M, KL, L), (a.stride(0), 1, KL))
     b3 = b_nk.as_strided((N, KL, L), (b_nk.stride(0), 1, KL))
+    reads = [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
+    if alpha is not None:
+        reads.append((alpha, "alpha"))
     if C == 1 or config.cta_chunks or config.cluster_k > 1:
+        _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, sfa, sfb, c3, *extra)  # the chain in the epilogue
         return out
@@ -1132,23 +1171,10 @@ def _run_mx(
     # applied there, once)
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
+        _require_disjoint(cls, [(out, "the output")], reads)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        for t, what in (
-            (a, "A"),
-            (b_nk, "B"),
-            (sfa, "A's scales"),
-            (sfb, "B's scales"),
-            (out, "the output"),
-            *(((alpha, "alpha"),) if alpha is not None else ()),
-        ):
-            if _overlaps(t, ws):
-                raise unsupported(
-                    cls,
-                    f"{what} overlapping the workspace",
-                    "a workspace disjoint from the operands, their scales, the output and alpha (the partials are "
-                    "written there while the operands are read and before the fixup reads them)",
-                )
+        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, sfa, sfb, ws)  # the unscaled body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)

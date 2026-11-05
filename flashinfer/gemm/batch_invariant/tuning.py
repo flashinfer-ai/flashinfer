@@ -133,7 +133,9 @@ def _tuning_config(
     is the caller's."""
     constraints = [ConstraintSpec(out_index, -2, lambda shapes: shapes[0][-2])]
     if sf_index is not None:
-        per_unit = 8 // ELEM_BITS_OF[in_fmt]  # elements per unit of a's last mode
+        per_unit = (
+            2 if ELEM_BITS_OF[in_fmt] == 4 else 1
+        )  # elements per unit of a's last mode (byte-packed 4-bit formats)
 
         def _sf(shapes, fmt: str = in_fmt, per_unit: int = per_unit) -> int:
             return sf_bytes(shapes[0][-2], per_unit * shapes[0][-1], fmt)
@@ -200,8 +202,8 @@ class BatchInvariantGemmRunner(TunableRunner):
     def _shape(self, inputs: List[torch.Tensor]) -> tuple:
         a, b = inputs[0], inputs[1]
         per_unit = (
-            8 // ELEM_BITS_OF[self.in_fmt]
-        )  # elements per unit of a's K mode (2 per byte for the 4-bit formats)
+            2 if ELEM_BITS_OF[self.in_fmt] == 4 else 1
+        )  # the 4-bit formats arrive byte-packed: two elements per unit of a's K mode; every other format, one
         return a.shape[-2], b.shape[-1], per_unit * a.shape[-1]
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
