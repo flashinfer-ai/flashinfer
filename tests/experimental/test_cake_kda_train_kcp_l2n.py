@@ -3112,12 +3112,30 @@ RECORD_KEYS = ("sequence", "n_launches", "n_collectives", "n_walks", "n_merges",
                "workspace_bytes", "pool_bytes", "fresh_bytes", "exchange", "P", "NSEG")  # fmt: skip
 
 
+@contextlib.contextmanager
+def _snapshot_threads(pin: bool):
+    """The CPU intra-op thread count of the snapshot protocol's inputs (``pin``: a capture or a baseline):
+    ``make_inputs``'s CPU arithmetic depends on it, so a capture and its baseline make them on one thread
+    (``OMP_NUM_THREADS=1`` alike), whatever the environment of either run."""
+    if not pin:
+        yield
+        return
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(threads)
+
+
 def test_gpu_l2n_flag_off_identity_w1() -> None:
     """On one device, the omitted keyword and an explicit ``False`` give bitwise the same outputs and gradients, the
     same saved-set tensors (member, shape, strides, dtype, in order), flags and meta, and the same launch inventory
     (sequence and counters); with ``ND_KCP_L2N_FLAG_OFF_CAPTURE`` / ``_BASELINE`` the omitted form's record (suffix
-    ``.gpu.json``) and its outputs (``.gpu.pt``) are written on the base or compared with it."""
+    ``.gpu.json``) and its outputs (``.gpu.pt``) are written on the base or compared with it, from inputs made on one
+    CPU thread (:func:`_snapshot_threads`)."""
     _skip_unless_runnable(1, gate=None)
+    capture, baseline = os.environ.get(ENV_CAPTURE), os.environ.get(ENV_BASELINE)
     device = torch.device("cuda", torch.cuda.current_device())
     rows = (((100, 640, 77, 1000, 129), 4), ((700, 1, 1300, 999), 64))
     record: dict = {}
@@ -3125,7 +3143,8 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
     for lengths, H in rows:
         part, cu = _partition(lengths, 1, "contiguous")
         ctx = cake_kcp_plan.build_context_kcp(part, None, 0, device)
-        glob = make_inputs(lengths, H, device)
+        with _snapshot_threads(bool(capture or baseline)):
+            glob = make_inputs(lengths, H, device)
         q, k, v, g, beta, dout = (glob[n] for n in ("q", "k", "v", "g", "beta", "dout"))
         got = {}
         for tag, kw in (("omitted", {}), ("explicit", OFF)):
@@ -3158,7 +3177,6 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
         key = f"s{'_'.join(map(str, lengths))}-h{H}"
         record[key] = a["record"]
         tensors_of[key] = {n: t.detach().cpu() for n, t in a["tensors"].items()}
-    capture, baseline = os.environ.get(ENV_CAPTURE), os.environ.get(ENV_BASELINE)
     snap = json.loads(json.dumps(record))
     if capture:
         with open(capture + ".gpu.json", "w") as fh:
