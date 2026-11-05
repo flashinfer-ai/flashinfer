@@ -2107,10 +2107,10 @@ _RENDERED_MODULES = {
         ],
         "arches": ["sm_103a"],
     },
-    "cake_kda_prefill_46f060dd1ef1364317b3": {
+    "cake_kda_prefill_4864c64f7e75b9376fe3": {
         "sources": [
-            "csrc/kda/prefill/cake_kda_prefill_46f060dd1ef1364317b3_kernel.cu",
-            "csrc/kda/prefill/cake_kda_prefill_46f060dd1ef1364317b3_binding.cu",
+            "csrc/kda/prefill/cake_kda_prefill_4864c64f7e75b9376fe3_kernel.cu",
+            "csrc/kda/prefill/cake_kda_prefill_4864c64f7e75b9376fe3_binding.cu",
         ],
         "ffi_entry": "run",
         "compile_flags": ["--use_fast_math"],
@@ -5277,7 +5277,7 @@ _RENDERED_ROUTES = {
         "cake_kda_bf16_4ab394a09c63f264d7bd": "cake_kda_prefill_2b73eb595d98471e3dc5",
         "cake_kda_bf16_4e7e4609dadc8f6bcdfe": "cake_kda_prefill_cecd42adc9f960dab210",
         "cake_kda_bf16_50c0f288f4c8d7ca03a8": "cake_kda_prefill_dafc8ce62e0bc2e0f2f7",
-        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_46f060dd1ef1364317b3",
+        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_4864c64f7e75b9376fe3",
         "cake_kda_bf16_5535e79c76a18330f6f1": "cake_kda_prefill_95a598073020cb89a9e1",
         "cake_kda_bf16_5639519f5c942ed86e4f": "cake_kda_prefill_f50fae66d709dd89bc40",
         "cake_kda_bf16_5be344cbddc29563f1ee": "cake_kda_prefill_12c2268a5bbd46fcb341",
@@ -5301,7 +5301,7 @@ _RENDERED_ROUTES = {
         "cake_kda_bf16_4ab394a09c63f264d7bd": "cake_kda_prefill_f5d72724e2d84f61f5b9",
         "cake_kda_bf16_4e7e4609dadc8f6bcdfe": "cake_kda_prefill_cecd42adc9f960dab210",
         "cake_kda_bf16_50c0f288f4c8d7ca03a8": "cake_kda_prefill_4ef977be571a2b8f6aa5",
-        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_46f060dd1ef1364317b3",
+        "cake_kda_bf16_51e813006f17147a02a5": "cake_kda_prefill_4864c64f7e75b9376fe3",
         "cake_kda_bf16_5535e79c76a18330f6f1": "cake_kda_prefill_3cd00348e988fb1477d0",
         "cake_kda_bf16_5639519f5c942ed86e4f": "cake_kda_prefill_a3472ee8c82d3e2053ac",
         "cake_kda_bf16_5be344cbddc29563f1ee": "cake_kda_prefill_38c63863d6ae0019425c",
