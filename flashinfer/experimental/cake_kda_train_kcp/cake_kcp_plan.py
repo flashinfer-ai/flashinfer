@@ -3330,6 +3330,41 @@ def qk_l2norm_twin(record: str) -> bool:
     return list(cake_jit.MODULES[record].get("l2n", ("off",))) == ["fused"]
 
 
+# The saved-rstd twins of the existing backend's records: a launch that reads the saved rstd (``read_rstd = 1``, the
+# first q / k reader of a saved-mode backward) runs the twin in the record's place (:func:`saved_rstd_record`).  The
+# twin's selection rule admits no problem, so no plan selects it.
+SAVED_RSTD_TWINS: dict[str, str] = {
+    "bwd_prep_g8_replay_l2n": "bwd_prep_g8_replay_saved_l2n"
+}
+
+
+@functools.cache
+def saved_rstd_record(record: str, arch: str | None) -> str:
+    """The record a launch that reads the saved rstd runs in place of ``record`` on architecture ``arch``: the twin of
+    :data:`SAVED_RSTD_TWINS` where the existing backend's registry has it as an ``_l2n`` twin of the same stage
+    (:func:`qk_l2norm_twin`) delivered for ``arch`` with a ``build.json`` library, else ``record`` (another record,
+    another architecture, a registry or build without the twin).  The twin takes the record's arguments and keeps
+    its place as the replay's first q / k reader, so the capability check of the mode holds for it too.  Read once
+    per record and architecture (the registry and the build are fixed per process)."""
+    twin = SAVED_RSTD_TWINS.get(record)
+    if twin is None or arch is None:
+        return record
+    from ..cake.cake_kda_train import cake_build, cake_jit
+
+    try:
+        entry = cake_jit.MODULES[twin]
+    except KeyError:
+        return record
+    if (
+        entry.get("stage") != cake_jit.MODULES[record].get("stage")
+        or not qk_l2norm_twin(twin)
+        or arch not in entry.get("arches", ())
+        or cake_jit.library_name(twin, arch) not in cake_build.libraries_by_name()
+    ):
+        return record
+    return twin
+
+
 def _qk_l2norm_problem(
     mode: str,
     modes: dict[str, Any],

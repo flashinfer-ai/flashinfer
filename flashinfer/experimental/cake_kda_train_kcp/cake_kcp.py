@@ -316,7 +316,10 @@ The mode runs on the replay local arena (``local_arena="lean"`` is refused).
 The local programs of the mode are the single-rank backend's (its plan mode
 ``l2n``: ``"fused"`` for the flag; ``"fallback"``, the separate normalization
 and pullback programs, through a test workspace); the records select them,
-:mod:`.cake_kcp_plan` lists the ones this route needs.  Until the single-rank
+:mod:`.cake_kcp_plan` lists the ones this route needs.  The first q / k reader
+of a saved-mode backward, which reads the saved rstd, runs the record's
+saved-rstd twin where one ships for the device's architecture
+(:func:`cake_kcp_plan.saved_rstd_record`).  Until the single-rank
 registry serves them on the device's architecture with an exported library
 and its layouts carry the normalized slot views
 (:func:`cake_kcp_plan.qk_l2norm_missing`), a call, a workspace or a byte query
@@ -1123,8 +1126,15 @@ class KernelBackend(Backend):
         values: dict[str, Any],
     ) -> None:
         """A record of the existing backend's registry on the local arena: the trimmed launch, or the arena's
-        launcher (a diagnostics launcher keeps the base path)."""
+        launcher (a diagnostics launcher keeps the base path).  A launch that reads the saved rstd (``read_rstd =
+        1``) runs the record's saved-rstd twin where it ships for the arena's architecture
+        (:func:`cake_kcp_plan.saved_rstd_record`)."""
         local = call.local
+        if values.get("read_rstd") and record in cake_kcp_plan.SAVED_RSTD_TWINS:
+            twin = cake_kcp_plan.saved_rstd_record(record, local.arch)
+            if twin != record:
+                call.scratch["l2n_twin"] = (record, twin)
+                record = twin
         if call.host_trim and local.launcher is cake_jit.run_module:
             _launch_record_trim(local, record, grid, values)
         else:
@@ -4898,6 +4908,8 @@ def _record(kind: str, call: CallKcp) -> None:
         # without local stages of the mode, as on a rank without tokens)
         LAST_CALL[kind]["l2n"] = call.l2n_mode
         LAST_CALL[kind]["l2n_rstd"] = call.scratch.get("l2n_rstd")
+        # (record, saved-rstd twin) where this call's launches ran the twin in the record's place, else None
+        LAST_CALL[kind]["l2n_twin"] = call.scratch.get("l2n_twin")
     CACHE_CONFIG_STATS[LAST_CALL[kind]["cache_config"]] += 1
     handoff = call.scratch.get("checkpoint_handoff")
     if handoff is not None:
