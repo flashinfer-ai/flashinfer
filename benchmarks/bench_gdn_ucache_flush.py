@@ -90,6 +90,9 @@ ARMS = {
     # UMMA (tcgen05 / TMEM) drop-in for the fp16_state arm: same tensors and contract
     # (flashinfer/gdn_kernels/gdn_replay_mtp_umma.py)
     "umma": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    # ... the opt-in ring-64 variant: 64-slot rings, 32-row window, its own default flush_min
+    # (flashinfer/gdn_kernels/gdn_replay_mtp_umma_ring64.py, backend="umma_ring64")
+    "umma_ring64": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
     # ... with an fp16 u ring (vLLM's u-cache dtype; the k ring stays bf16)
     "umma_u16": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
     # ... with stochastic rounding of the flushed state (fixed seed; the bits do not
@@ -100,6 +103,7 @@ ARMS = {
 }
 _UMMA_SR = {
     "umma": {},
+    "umma_ring64": {},
     "umma_u16": {},
     "umma_ph5": dict(stochastic_rounding="philox", philox_rounds=5),
     "umma_ph10": dict(stochastic_rounding="philox", philox_rounds=10),
@@ -145,11 +149,14 @@ _FLUSH_PATH = str(
 def load_flush(arm):
     io_env, state_env, ring_env, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     if arm in _UMMA_SR:
-        from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
-            gated_delta_rule_mtp_ucache_flush_umma,
-        )
-
-        fn = gated_delta_rule_mtp_ucache_flush_umma
+        if arm == "umma_ring64":
+            from flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 import (
+                gated_delta_rule_mtp_ucache_flush_umma_ring64 as fn,
+            )
+        else:
+            from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
+                gated_delta_rule_mtp_ucache_flush_umma as fn,
+            )
         if _UMMA_SR[arm]:
             seed = torch.tensor([0x5EED], dtype=torch.int64, device=DEV)
             fn = functools.partial(fn, rand_seed=seed, **_UMMA_SR[arm])
@@ -357,7 +364,7 @@ def kernel_us_read_flush(runner, iters):
 
 
 def main():
-    global T, FLUSH_MIN, P_VERIFY, HV
+    global T, W, RING, FLUSH_MIN, P_VERIFY, HV
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--T", type=int, default=4, help="draft tokens (flush_min = 17 - T)"
@@ -390,8 +397,14 @@ def main():
         choices=list(ARMS),
         default="bf16",
         help="dtype config: bf16 | fp16_state | fp16_io | ring_fp16 | fp16_state_cache | umma (UMMA kernel, "
-        "fp16 state) | umma_u16 (UMMA, fp16 u ring) | umma_ph5 / umma_ph10 / umma_lcg (UMMA with "
-        "stochastic rounding)",
+        "fp16 state) | umma_u16 (UMMA, fp16 u ring) | umma_ring64 (opt-in ring-64 UMMA, 64-slot rings) | umma_ph5 / "
+        "umma_ph10 / umma_lcg (UMMA with stochastic rounding)",
+    )
+    ap.add_argument(
+        "--flush-min",
+        type=int,
+        default=None,
+        help="override flush_min (default: 17 - T; the umma_ring64 arm's default is its ring-safe nu - T + 1)",
     )
     ap.add_argument(
         "--no-commit",
@@ -423,7 +436,18 @@ def main():
     ROW_ORDER = args.row_order
     T = args.T
     HV = args.hv
-    FLUSH_MIN = W - T + 1
+    if args.arm == "umma_ring64":
+        # the ring-64 kernel's own window / ring size and its default flush_min (nu - T + 1; 16 at T = 1)
+        from flashinfer.gdn_kernels import gdn_replay_mtp_umma_ring64 as _r64
+
+        W, RING = _r64.W_RING, _r64.RING_SLOTS
+        FLUSH_MIN = min(W, RING - T) - T + 1
+        if T == 1:
+            FLUSH_MIN = min(FLUSH_MIN, 16)
+    else:
+        FLUSH_MIN = W - T + 1
+    if args.flush_min is not None:
+        FLUSH_MIN = args.flush_min
     P_VERIFY = {"full": FLUSH_MIN - 1, "mid": (FLUSH_MIN - 1) // 2, "zero": 0}[
         args.hist
     ]
