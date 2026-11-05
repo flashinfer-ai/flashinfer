@@ -5,7 +5,8 @@ packed variable-Q / MTP (cum_seq_lens_q) and incremental prefill on the paged FP
 reuse, ragged KV), plus CUDA-Graph replay with a changed page table, row-strided query / cache
 views on a row-tile route and on the wide route, the route selection and the split planners,
 and the extended programs (LSE output, non-causal masking, cyclic decode context parallelism)
-against an FP64 reference.
+against an FP64 reference (rows over at most FEW_KEYS visible keys against the default programs
+and an E4M3-probability reference).
 """
 
 import math
@@ -1007,6 +1008,190 @@ def _check_lse(lse, ref, *, atol):
     torch.testing.assert_close(lse[~empty], ref[~empty], atol=atol, rtol=0)
 
 
+# Visible-key bound of the FP64 output check of the extended programs.  Every program rounds the
+# probabilities p = 2^(x - max x + 7.807355) to E4M3 before P.V and divides by the FP32 sum of the
+# unrounded p, so a row over few keys keeps the E4M3 rounding of its weights: the shipped default
+# programs put rows with 2 to 128 visible keys outside atol = rtol = 1e-2 of the FP64 reference
+# (bit for bit the same outputs as the extended programs), and none above 128 (largest error
+# 4.4e-3).  The bound is the smallest multiple of the 128-key tile that covers every visible-key
+# count at which a default row fails, with every default row above it within half the tolerance.
+# Rows at or below it are checked against the default programs bit for bit and against the
+# E4M3-probability reference within its rounding bound (_fp8p_reference).
+FEW_KEYS = 128
+# log2 of the largest stored probability (224 = 1.75 * 2^7 in E4M3)
+P_SHIFT = 7.807355
+
+
+def _row_visibility(
+    case, *, seq_lens=None, causal=True, causal_seqs=None, cp_world=1, cp_rank=0
+):
+    """Visible local keys of every packed query row: local key ``j`` is global position
+    ``j * cp_world + cp_rank``, seen by token ``t`` of a ``q_len``-token request of global length
+    ``G`` iff it is below ``G - q_len + t + 1`` (causal) or ``G``; always a prefix of the local
+    keys."""
+    local = (case["seq_lens"] if seq_lens is None else seq_lens).tolist()
+    glob = local if causal_seqs is None else causal_seqs.tolist()
+    visible = []
+    for b, q_len in enumerate(case["q_lens"]):
+        for t in range(q_len):
+            bound = glob[b] - q_len + t + 1 if causal else glob[b]
+            n = 0 if bound <= cp_rank else (bound - cp_rank + cp_world - 1) // cp_world
+            visible.append(min(max(n, 0), local[b]))
+    return visible
+
+
+def _local_rows(kv_cache, block_tables, seq_lens):
+    rows = []
+    for b, n in enumerate(seq_lens.tolist()):
+        pages = block_tables[b, : max((n + PAGE - 1) // PAGE, 1)].long()
+        rows.append(kv_cache[pages].reshape(-1, QK_DIM)[:n])
+    return rows
+
+
+def _fp8p_reference(query, keys, scale):
+    """Output of one query row (``[H, 576]``) over its visible keys (``[v, 576]``) with the
+    kernels' probability rounding, in FP64, and the per-element bound of its distance to the
+    kernels' BF16 output.  ``O = sum_k E4M3(p_k) V_k / sum_k p_k``.  The bound lets every
+    probability whose E4M3 rounding the score error can change round either way: the score
+    error is that of an MMA accumulator rounded toward zero to 14 mantissa bits after each
+    32-element K step (the pessimistic model of the LSE tolerance study), plus the FP32 scaling
+    and the ex2 approximation; it adds the matching relative change of the sum, the P.V
+    accumulation under the same model and two BF16 roundings of the output."""
+    q, k = query.double(), keys.double()
+    parts = torch.einsum("hcd,kcd->hkc", q.reshape(-1, 18, 32), k.reshape(-1, 18, 32))
+    log2_scale = scale / math.log(2.0)
+    x = parts.sum(-1) * log2_scale
+    dx = (
+        parts.cumsum(-1).abs().sum(-1) * 2.0**-13 * log2_scale
+        + (x.abs() + 2 * P_SHIFT) * 2.0**-22
+        + 2.0**-20
+    )
+    shift = x.max(dim=1, keepdim=True).values
+    d = dx + dx.max(dim=1, keepdim=True).values
+    p = torch.exp2(x - shift + P_SHIFT)
+
+    def e4m3(t):
+        return t.to(torch.float8_e4m3fn).double()
+
+    rounded = e4m3(p)
+    spread = e4m3(p * torch.exp2(d)) - e4m3(p * torch.exp2(-d))
+    values = k[:, :LATENT]
+    total = p.sum(dim=1, keepdim=True)
+    out = rounded @ values / total
+    magnitude = rounded @ values.abs() / total
+    steps = (keys.shape[0] + 31) // 32
+    bound = (
+        spread @ values.abs() / (total * torch.exp2(-d.max()))
+        + out.abs() * (torch.exp2(d.max()) - 1 + 2.0**-8)
+        + magnitude * steps * 2.0**-13
+    )
+    return out, bound
+
+
+def _default_equivalent(case, out, visible, *, kv_cache, block_tables, seq_lens):
+    """Rows of an extended launch with 1 <= v <= FEW_KEYS visible keys against the default
+    programs on the same keys, bit for bit.  For token ``t`` one default launch keeps the batch,
+    its token counts, heads and table width (hence the plan) and gives each request its first
+    ``v`` local keys followed by ``q_len - 1 - t`` copies of its first key, so the default
+    causal bound of token ``t`` is exactly those ``v`` keys.  Returns the rows compared."""
+    rows = [r.view(torch.uint8) for r in _local_rows(kv_cache, block_tables, seq_lens)]
+    width = block_tables.shape[1]
+    starts = case["q_indptr"].tolist()
+    device = out.device
+    compared = 0
+    for t in range(max(case["q_lens"])):
+        new_rows, pick = [], []
+        for b, q_len in enumerate(case["q_lens"]):
+            r = starts[b] + t
+            v = visible[r] if t < q_len else 0
+            pad = q_len - 1 - t
+            if 1 <= v <= FEW_KEYS and v + pad <= width * PAGE:
+                keys = torch.cat([rows[b][:v], rows[b][:1].expand(pad, -1)])
+                pick.append(r)
+            else:  # a filler request whose every token sees a key; its rows are not compared
+                keys = rows[b] if rows[b].shape[0] >= q_len else None
+                if keys is None:
+                    keys = torch.zeros(
+                        (q_len, QK_DIM), dtype=torch.uint8, device=device
+                    )
+            new_rows.append(keys.view(torch.float8_e4m3fn))
+        if not pick:
+            continue
+        cache, table = _paged_from_rows(new_rows, seed=7900 + t, device=device)
+        table = torch.nn.functional.pad(table, (0, width - table.shape[1]))
+        lens = torch.tensor(
+            [k.shape[0] for k in new_rows], dtype=torch.int32, device=device
+        )
+        default = _run(dict(case, kv_cache=cache, block_tables=table, seq_lens=lens))
+        index = torch.tensor(pick, device=device)
+        assert torch.equal(
+            out[index].view(torch.int16), default[index].view(torch.int16)
+        ), pick
+        compared += len(pick)
+    return compared
+
+
+def _check_ext(
+    out,
+    ref,
+    case,
+    *,
+    kv_cache=None,
+    block_tables=None,
+    seq_lens=None,
+    causal=True,
+    causal_seqs=None,
+    cp_world=1,
+    cp_rank=0,
+    atol=1e-2,
+    rtol=1e-2,
+):
+    """The output of an extended launch, by each row's visible-key count ``v``: above FEW_KEYS
+    the FP64 reference within ``atol`` / ``rtol``; from 1 to FEW_KEYS the default programs on the
+    same keys bit for bit (_default_equivalent) and the E4M3-probability reference within its
+    bound (_fp8p_reference); 0 exactly zero."""
+    kv_cache = case["kv_cache"] if kv_cache is None else kv_cache
+    block_tables = case["block_tables"] if block_tables is None else block_tables
+    seq_lens = case["seq_lens"] if seq_lens is None else seq_lens
+    visible = _row_visibility(
+        case,
+        seq_lens=seq_lens,
+        causal=causal,
+        causal_seqs=causal_seqs,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+    )
+    assert torch.isfinite(out.float()).all()
+    v = torch.tensor(visible, device=out.device)
+    many, none = v > FEW_KEYS, v == 0
+    torch.testing.assert_close(
+        out[many].float(), ref[many].float(), atol=atol, rtol=rtol
+    )
+    assert torch.equal(out[none].float(), torch.zeros_like(out[none].float()))
+    if not bool(((v >= 1) & (v <= FEW_KEYS)).any()):
+        return
+    rows = _local_rows(kv_cache, block_tables, seq_lens)
+    starts = case["q_indptr"].tolist()
+    for b, q_len in enumerate(case["q_lens"]):
+        for t in range(q_len):
+            r = starts[b] + t
+            if 1 <= visible[r] <= FEW_KEYS:
+                ref8, bound = _fp8p_reference(
+                    case["query"][r], rows[b][: visible[r]], case["bmm1_scale"]
+                )
+                err = (out[r].double() - ref8 * case["bmm2_scale"]).abs()
+                excess = err - bound * case["bmm2_scale"]
+                assert bool((excess <= 0).all()), (r, visible[r], excess.max().item())
+    _default_equivalent(
+        case,
+        out,
+        visible,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+    )
+
+
 # The (num_heads, q_len) cells of the route census: H12 q1 -> rt16, H12 q2 / q4 / q5 -> rt32 /
 # rt48 / rt64 (the multi-token verify of 12 heads; eight 2-token requests take the late-trigger
 # tile), H12 q6 -> rt96, H16 q1 / H48 q1 at 65536 keys -> the 16- / 48-row late-trigger tiles with
@@ -1038,7 +1223,7 @@ def test_lse_matches_fp64_reference(num_heads, q_len, kv_lens, lse_base):
     attention, out, lse = _launch(case, lse_base=lse_base)
     assert attention.route_metadata["ext"]
     ref_out, ref_lse = _reference64(case)
-    _check(out, ref_out, atol=1e-2, rtol=1e-2)
+    _check_ext(out, ref_out, case)
     scale = 1.0 if lse_base == "e" else 1.0 / math.log(2.0)
     _check_lse(lse, ref_lse * scale, atol=LSE_ATOL * scale)
 
@@ -1067,7 +1252,7 @@ def test_non_causal(num_heads, q_len, kv_lens):
     )
     _, out, lse = _launch(case, causal=False)
     ref_out, ref_lse = _reference64(case, causal=False)
-    _check(out, ref_out, atol=1e-2, rtol=1e-2)
+    _check_ext(out, ref_out, case, causal=False)
     _check_lse(lse, ref_lse, atol=LSE_ATOL)
 
 
@@ -1126,7 +1311,7 @@ def test_dcp8_every_residue(kv_lens, q_len, causal):
         states.append((out, lse))
     merged_out, merged_lse = _merge(states)
     ref_out, ref_lse = _reference64(case, causal=causal)
-    _check(single_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check_ext(single_out, ref_out, case, causal=causal)
     _check_lse(single_lse, ref_lse, atol=LSE_ATOL)
     _check_dcp(merged_out, single_out, ref_out)
     _check_lse(merged_lse, ref_lse, atol=LSE_ATOL)
@@ -1154,7 +1339,7 @@ def test_persistent_route_ext(batch, q_len, num_heads, kv):
     )
     assert torch.equal(out.view(torch.int16), _run(case).view(torch.int16))
     ref_out, ref_lse = _reference64(case)
-    _check(out, ref_out, atol=1e-2, rtol=2e-2)
+    _check_ext(out, ref_out, case, rtol=2e-2)
     _check_lse(lse, ref_lse, atol=LSE_ATOL)
 
 
@@ -1187,7 +1372,7 @@ def test_dcp8_merge_matches_single_rank(num_heads, q_len, kv_lens):
         states.append((out, lse))
     merged_out, merged_lse = _merge(states)
     ref_out, ref_lse = _reference64(case)
-    _check(single_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check_ext(single_out, ref_out, case)
     _check_dcp(merged_out, single_out, ref_out)
     _check_lse(merged_lse, ref_lse, atol=LSE_ATOL)
     # Both are within LSE_ATOL of the reference.
@@ -1207,7 +1392,7 @@ def test_rows_without_visible_keys_are_finite():
             assert attention.plan.wide == (kv_lens[1] > 8192)
             ref_out, ref_lse = _reference64(case)
             assert torch.isneginf(ref_lse[:3]).all()
-            _check(out, ref_out, atol=1e-2, rtol=1e-2)
+            _check_ext(out, ref_out, case)
             assert torch.equal(out[:3].float(), torch.zeros_like(out[:3].float()))
             _check_lse(lse, ref_lse, atol=LSE_ATOL)
         # Global length 5 on 8 ranks: ranks 5..7 hold no key, ranks 0..4 one key each.
@@ -1297,7 +1482,17 @@ def test_cuda_graph_replay_with_changed_lengths(num_heads, q_len, kv_lens):
         case, q_lens=new_q_lens, kv_lens=[int(n) for n in local_lens.tolist()]
     )
     ref_out, ref_lse = _reference64_shard(shard_case, rows, new_global, rank)
-    _check(out, ref_out, atol=1e-2, rtol=1e-2)
+    _check_ext(
+        out,
+        ref_out,
+        shard_case,
+        kv_cache=cache,
+        block_tables=table,
+        seq_lens=local_lens,
+        causal_seqs=global_lens,
+        cp_world=DCP_WORLD,
+        cp_rank=rank,
+    )
     _check_lse(lse, ref_lse, atol=LSE_ATOL)
 
 
