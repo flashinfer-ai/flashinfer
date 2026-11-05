@@ -674,8 +674,8 @@ def test_cake_rejects_inline_formats(sm12x):
         )
 
 
-def test_inline_prefill_probability_quant_group(monkeypatch, sm12x):
-    """Quantization extent is selectable and retained by a captured graph."""
+def test_inline_prefill_matches_reference(sm12x):
+    """The default prefill arithmetic stays within FP8 error bounds."""
     from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1
 
     footer, _ = _caches("none", 32, 64, seed=128)
@@ -691,36 +691,11 @@ def test_inline_prefill_probability_quant_group(monkeypatch, sm12x):
         kv_scale_format="ue8m0_g32_inline", compute_precision="fp8"
     )
     out = torch.empty_like(q)
-
-    def run():
-        return wrapper.run(q, cache, indices, out, 512**-0.5, return_lse=True)
-
-    env = "FLASHINFER_SM120_PREFILL_P_QUANT_GROUP"
-    snapshots, graphs = {}, {}
-    for group in (32, 64):
-        monkeypatch.setenv(env, str(group))
-        lse = run()
-        snapshots[group] = out.clone(), lse.clone()
-        assert ((out.double() - reference).norm() / reference.norm()).item() < 0.07
-        torch.testing.assert_close(
-            lse.double(),
-            torch.logsumexp(scores, -1) * 1.4426950408889634,
-            atol=0.06,
-            rtol=0,
-        )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-        graphs[group] = graph
-    monkeypatch.delenv(env)
-    lse = run()
-    torch.testing.assert_close(out, snapshots[32][0], atol=0, rtol=0)
-    torch.testing.assert_close(lse, snapshots[32][1], atol=0, rtol=0)
-    assert not torch.equal(snapshots[32][0], snapshots[64][0])
-    for group, graph in graphs.items():
-        graph.replay()
-        torch.testing.assert_close(out, snapshots[group][0], atol=0, rtol=0)
-        torch.testing.assert_close(lse, snapshots[group][1], atol=0, rtol=0)
-    monkeypatch.setenv(env, "16")
-    with pytest.raises(Exception, match="must be 32 or 64"):
-        run()
+    lse = wrapper.run(q, cache, indices, out, 512**-0.5, return_lse=True)
+    assert ((out.double() - reference).norm() / reference.norm()).item() < 0.07
+    torch.testing.assert_close(
+        lse.double(),
+        torch.logsumexp(scores, -1) * 1.4426950408889634,
+        atol=0.06,
+        rtol=0,
+    )

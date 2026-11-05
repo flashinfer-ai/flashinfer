@@ -34,6 +34,11 @@ using MicroTransposed = decltype(composition(Swizzle<3, 4, 3>{},
 // Express the row-bit permutation as a hierarchical row layout, then apply one swizzle.
 // Compatible with both QK 2-float stores and PV 4-float loads.
 // Named barriers: 1 QK-local; 2/3 S-ready; 4/5 S-free.
+// Development harnesses may instantiate PQuantGroup=64 to compare rounding
+// and throughput. Production dispatch uses 32; there is no runtime selector.
+// The 64-candidate load tile and shared-memory footprint do not change.
+// BF16-output and fused output share this arithmetic; FP32 reduction ordering
+// can still differ from the original 32-candidate softmax loop by a few ULPs.
 template <bool Mega, int PQuantGroup = 32>
 __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   static_assert(PQuantGroup == 32 || PQuantGroup == 64);

@@ -13,8 +13,7 @@
 
 #include "attention_descriptor.h"
 #include "attention_dispatch.h"
-#include "attention_validation.h"
-#include "mega_validation.h"
+#include "input_validation.h"
 
 using tvm::ffi::Optional;
 
@@ -493,7 +492,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                            sink, extra_cache, extra_indices, extra_lengths, lse_scale, {});
 }
 
-void ExecuteMegaAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
+void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorView cache,
                               TensorView indices, TensorView mid, TensorView mlse,
                               TensorView output, TensorView lse, double scale,
                               Optional<TensorView> lengths, Optional<TensorView> sink,
@@ -508,7 +507,8 @@ void ExecuteMegaAttentionPlan(ffi::Module descriptor, TensorView q, TensorView c
   TVM_FFI_ICHECK(plan.numeric != execution::NumericRoute::FullBF16 &&
                  plan.implementation != execution::Implementation::SwapAB)
       << "mega does not support full-BF16 or swapAB plans";
-  const auto mega = check_mega_tensors(q, positions, cos_sin, fp8_output, output_scales);
+  const auto mega =
+      check_attention_rope_fp8_inputs(q, positions, cos_sin, fp8_output, output_scales);
   ExecuteAttentionPlanImpl(descriptor, q, cache, indices, mid, mlse, output, lse, scale, lengths,
                            sink, extra_cache, extra_indices, extra_lengths, lse_scale, mega);
 }
@@ -526,5 +526,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv4,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv3_2,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv3_2);
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(execute_mega_attention,
-                              flashinfer::sparse_mla_sm120::ExecuteMegaAttentionPlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(execute_attention_rope_fp8,
+                              flashinfer::sparse_mla_sm120::ExecuteAttentionRopeFp8Plan);

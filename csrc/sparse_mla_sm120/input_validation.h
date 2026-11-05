@@ -5,9 +5,9 @@
 
 #include "attention_validation.h"
 namespace flashinfer::sparse_mla_sm120 {
-inline SparseMlaMegaParams check_mega_tensors(TensorView q, TensorView positions,
-                                              TensorView cos_sin, TensorView fp8_output,
-                                              TensorView output_scales) {
+inline SparseMlaMegaParams check_attention_rope_fp8_inputs(
+    TensorView q, TensorView positions, TensorView cos_sin, TensorView fp8_output,
+    TensorView output_scales) {
   for (const auto& tensor : {positions, cos_sin, fp8_output, output_scales}) {
     check_attention_device(q, tensor, "mega tensor");
     TVM_FFI_ICHECK(tensor.IsContiguous()) << "mega tensors must be contiguous";

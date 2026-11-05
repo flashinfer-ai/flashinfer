@@ -3,6 +3,10 @@
 #pragma once
 #include "../arch/common.cuh"
 
+// FlashMLA RoPE contract (395cb3af, fused_norm_rope_attn_rope_cast_fwd):
+// int32 positions, FP32 cache [position, (cos=32, sin=32)], adjacent pairs
+// in the final 64 features. Q uses +sin; O uses -sin (conjugate rotation).
+// See core_attn/kernel.h:27-31 and kernel.cuh:553-562, 730-750.
 // Contiguous [T,H,512] output, with one UE8M0 scale per 32 values.
 // Device positions remain live inputs during graph replay. The caller guarantees
 // positions are in [0, cos_sin_rows); no host readback is needed.

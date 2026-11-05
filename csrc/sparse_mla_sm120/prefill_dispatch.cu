@@ -3,9 +3,6 @@
 #include <flashinfer/attention/sparse_mla_sm120/execution/prefill_launch.cuh>
 
 #include "attention_dispatch.h"
-#include <cstdlib>
-#include <stdexcept>
-#include <string>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/prefill.cuh>
 
 namespace flashinfer::sparse_mla_sm120 {
@@ -47,29 +44,15 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     a.tokens = m.tokens; a.heads = m.heads; a.topk = m.topk; a.extra_topk = m.extra_topk;
     a.kv_stride = m.row_stride_bytes; a.extra_stride = m.extra_row_stride_bytes;
     a.sm_scale = p.sm_scale; a.lse_stride = m.lse_stride; a.lse_scale = p.lse_scale;
-    const char* group_env = std::getenv("FLASHINFER_SM120_PREFILL_P_QUANT_GROUP");
-    int p_quant_group = 32;
-    if (group_env) {
-      const std::string value(group_env);
-      if (value == "64") p_quant_group = 64;
-      else if (value != "32")
-        throw std::invalid_argument("FLASHINFER_SM120_PREFILL_P_QUANT_GROUP must be 32 or 64");
-    }
-    auto launch = [&](auto fused, auto quant_group) -> PrefillLaunchResult {
+    auto launch = [&](auto fused) -> PrefillLaunchResult {
       constexpr bool Mega = decltype(fused)::value;
-      constexpr int PQuantGroup = decltype(quant_group)::value;
       static bool configured[32] = {};
-      auto status = configure_dynamic_smem_per_device(prefill<Mega, PQuantGroup>, sizeof(Shared), configured);
+      auto status = configure_dynamic_smem_per_device(prefill<Mega>, sizeof(Shared), configured);
       if (!status.supported || status.error != cudaSuccess) return status;
-      prefill<Mega, PQuantGroup><<<m.tokens * ((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
+      prefill<Mega><<<m.tokens * ((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
       return {cudaGetLastError(), "CuTe sparse prefill"};
     };
-    auto dispatch_group = [&](auto quant_group) {
-      return p.mega.output ? launch(std::true_type{}, quant_group)
-                           : launch(std::false_type{}, quant_group);
-    };
-    return p_quant_group == 64 ? dispatch_group(std::integral_constant<int, 64>{})
-                              : dispatch_group(std::integral_constant<int, 32>{});
+    return p.mega.output ? launch(std::true_type{}) : launch(std::false_type{});
   }
   PrefillColdParams cold{p.sm_scale,          m.tokens,
                          m.page_stride_bytes, m.extra_page_stride_bytes,

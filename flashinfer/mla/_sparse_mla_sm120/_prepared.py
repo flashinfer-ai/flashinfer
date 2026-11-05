@@ -465,9 +465,9 @@ def wrapper_run(
     if mega is not None:
         module = get_sparse_mla_sm120_module()
         execute = (
-            module.dsv4_nvfp4_execute_mega_attention
+            module.dsv4_nvfp4_execute_attention_rope_fp8
             if is_dsv4_nvfp4
-            else module.execute_mega_attention
+            else module.execute_attention_rope_fp8
         )
         execute(
             current.plan,

@@ -261,31 +261,22 @@ PageAttention for MLA
 .. note::
 
     Experimental ``SparseMLASm120Wrapper.run_mega`` with ``backend="sparse"``
-    fuses query GPT-J RoPE, sparse attention, inverse output RoPE, and per-32
-    FP8 E4M3 output quantization. It supports native V4 FP8 and NVFP4 caches,
-    and V4.1 FP8 routes with optional FP4 compressed caches. Query shape is
-    BF16 ``[T,H,512]``; the final 64 coordinates are rotated. Pass int32
-    ``positions[T]``, FP32 ``cos_sin[max_position,64]`` (cosine then sine),
-    FP8 ``output[T,H,512]``, and uint8 ``output_scales[T,H,16]`` (UE8M0).
+    fuses query RoPE, sparse attention, inverse output RoPE, and per-32-value
+    FP8 E4M3 output quantization. It accepts BF16 ``q[T,H,512]``, int32
+    ``positions[T]``, contiguous FP32 ``cos_sin[num_positions,64]``, FP8
+    ``output[T,H,512]``, and uint8 ``output_scales[T,H,16]`` (UE8M0).
+
+    RoPE follows FlashMLA's non-NeoX convention: adjacent pairs in the final
+    64 features are rotated; each cache row contains 32 cosines followed by
+    32 sines. Query rotation uses the forward angle and output rotation its
+    conjugate, both indexed by the query token's position. See FlashMLA's
+    `RoPE parameters <https://github.com/deepseek-ai/FlashMLA/blob/395cb3afbb331fef7b1b21e9340861b9436b42d8/csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h#L27-L31>`_.
     Positions must be in bounds and input/output storage must not overlap.
+    Query normalization, KV cache construction, and sparse selection are
+    caller responsibilities. Output retains ordinary head-major layout;
+    FlashMLA's projection-specific output permutation is not applied.
     Warm up before CUDA graph capture. Other attention keywords follow
     ``run`` semantics, including sparse lengths, the second cache and LSE.
-
-    This route preserves the native attention arithmetic and BF16 context
-    rounding, but does not materialize the rotated query or BF16 context in
-    global memory. Split decode still uses its existing partial-output
-    workspace; inverse RoPE and quantization run after the final merge.
-    V4 FP8-cache prefill retains its hybrid BF16-QK/FP8-PV computation.
-    Full-BF16 attention plans are rejected. Output uses ordinary head-major
-    layout, not FlashMLA's GEMM-permuted layout. Query normalization, cache
-    insertion, sparse selection, and learned projections remain outside.
-
-    CuTe FP8 prefill uses 32-candidate probability quantization groups by
-    default, independently of its 64-candidate memory tile. Set
-    ``FLASHINFER_SM120_PREFILL_P_QUANT_GROUP=64`` to use a single group per
-    tile, or ``32`` for the default. This changes FP8 rounding before PV;
-    it applies to both mega and BF16-output specializations. The choice is
-    made at launch; CUDA graphs retain the choice made during capture.
 
     The CuTe FP8 prefill path has unresolved async-copy racecheck reports;
     this development route is not yet ready for production use.
