@@ -20,7 +20,8 @@ Without a device: the registry (one record per stage and architecture, the argum
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
 library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
 entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule, the split pass-2 rule on the campaign rows and
-the #7074 packs and the two-stream groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103 / SM107: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
+the #7074 packs, the serial-scan rule on those rows (and its cached decision in the chunk tables) and the two-stream
+groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103 / SM107: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
 packed layouts (host and device table routes, FP32 and BF16 ``beta``, every register-scan configuration, the serial
 and segment-parallel scans, both adjoint scans, both preps, the fused tails of a value-head group of two and of three
 and the unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
@@ -42,7 +43,8 @@ workspaces poisoned (serial, with an empty sequence, a split pass 2, and one of 
 ``dhu_tc2_wavefront_split``), repeated calls, the shipped rule on
 the device's architecture (serial plans, and split pass 2s below and above the split side's work floor), the rows the
 rule leaves alone launching exactly what the rule turned off launches, a CUDA graph capture (the separate launches),
-accumulated gradients, strided views and a checkpointed call.  The
+accumulated gradients, strided views and a checkpointed call.  The serial-scan rule on its campaign rows: one adjoint
+scan over whole sequences, the forward's launches and ``o`` / ``dq`` bitwise those of the split plan, two runs bitwise.  The
 training-loop contracts: the head pairs (16, 48), (8, 24),
 (4, 12), (16, 32) and (8, 16) on their fused tails (the groups of three also with the split pass 2 on two streams
 and the serial adjoint scan on one),
@@ -706,6 +708,106 @@ def test_sdt_rule_on_the_split_rows(arch, monkeypatch) -> None:
             selected.add(row)
     assert split == SDT_SPLIT[arch]
     assert selected == SDT_SELECTED[arch]
+
+
+# The split adjoint plans the serial-scan rule makes serial (dhu_tc2 over whole sequences), on every SM count of the
+# architecture: on R200 the 8 x 4096 and the 4 x 4096 16-head layouts; none on B200 and GB300 (not the rule's
+# architectures).  The other split plans keep the planner's (the four sequences of 8 heads price slower serial; the
+# 16384-token sequences and the #7074 packs far slower; A16, a value-head group of three, is not the rule's).
+SERIAL_SCAN_DEVICES = {
+    "sm_100a": (148,),
+    "sm_103a": (152,),
+    "sm_107a": (208, 212, 216),
+}
+SERIAL_SCAN_SELECTED = {
+    "sm_100a": set(),
+    "sm_103a": set(),
+    "sm_107a": {"r03", "r08"},
+}
+_GROUP_OF_THREE = ("issue", "P3", "P1", "A16")
+
+
+@pytest.mark.parametrize("arch", sorted(SERIAL_SCAN_DEVICES))
+def test_serial_scan_rule_on_the_split_rows(arch, monkeypatch) -> None:
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    for sm_count in SERIAL_SCAN_DEVICES[arch]:
+        monkeypatch.setattr(
+            cake_chain, "_device_props", lambda _index, n=sm_count: (n, 232448, 10)
+        )
+        selected = set()
+        for row, seq_lens, num_v_heads in SDT_ROWS:
+            num_heads = num_v_heads // (3 if row in _GROUP_OF_THREE else 2)
+            plans = cake_chain.scan_plans(
+                sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+            )
+            options = cake_chain.make_options()
+            got = cake_chain._serial_adjoint_plan(
+                tuple(seq_lens), plans, num_heads, num_v_heads, 0, options
+            )
+            assert got[0] == plans[0], (sm_count, row)
+            if got != plans:
+                assert got[1] == cake_chain.ScanPlan(plans[1].config, 0), (
+                    sm_count,
+                    row,
+                    got,
+                )
+                chunks = tuple(-(-n // 64) for n in seq_lens)
+                rec = cake_chain.serial_scan_pricing(chunks, plans[1], num_v_heads, 0)
+                assert rec["select"] and rec["serial_tc"], (sm_count, row, rec)
+                assert rec["T_ser"] <= rec["T_cur"], (
+                    sm_count,
+                    row,
+                    rec,
+                )
+                selected.add(row)
+            # a plan pin and an unknown head group keep the planner's plans
+            for pins in (
+                {"segment_chunks": plans[1].segment_len},
+                {"scan_config": (64, 1)},
+                {"dhu_scan": "tc"},
+            ):
+                pinned = cake_chain.make_options(**pins)
+                assert cake_chain._serial_adjoint_plan(tuple(seq_lens), plans, num_heads, num_v_heads, 0,
+                                                       pinned) == plans, (row, pins)  # fmt: skip
+            assert (
+                cake_chain._serial_adjoint_plan(
+                    tuple(seq_lens), plans, None, num_v_heads, 0, options
+                )
+                == plans
+            )
+        assert selected == SERIAL_SCAN_SELECTED[arch], (sm_count, selected)
+
+
+def test_serial_scan_rule_is_cached_with_the_chunk_tables(monkeypatch) -> None:
+    # the decision is made once per layout with the tables (a hit prices nothing) and keyed by the key heads too
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_107a")
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: (216, 232448, 10))
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    monkeypatch.setattr(cake_chain, "_host_chunk_meta", lambda seq_lens, plans, _index, lpt: cake_chain.build_chunk_meta(
+        seq_lens, "cpu", scan_plans=plans, lpt=lpt))  # fmt: skip
+    priced = []
+    pricing = cake_chain.serial_scan_pricing
+    monkeypatch.setattr(
+        cake_chain,
+        "serial_scan_pricing",
+        lambda *a, **k: priced.append(a) or pricing(*a, **k),
+    )
+    seq_lens = (4096,) * 8
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+    options = cake_chain.make_options()
+    meta = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, 16, options, num_heads=8)
+    assert meta.bwd_segments.num_segments == meta.num_seqs == 8
+    assert meta.bwd_segments.segment_len == 0
+    assert len(priced) == 1
+    assert (
+        cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, 16, options, num_heads=8)
+        is meta
+    )
+    assert len(priced) == 1
+    split = cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, 16, options)
+    assert split.bwd_segments.num_segments > split.num_seqs
+    assert split.fwd_segments.segment_len == meta.fwd_segments.segment_len
+    assert len(priced) == 1
 
 
 def test_two_stream_split_rule() -> None:
@@ -1992,6 +2094,55 @@ def test_wavefront_shipped_rule_on_the_device(row, device, monkeypatch) -> None:
     if not engaged:
         assert calls[:n] == calls[n:], (arch, row)
     _assert_bitwise(got, off, OUTPUT_NAMES)
+
+
+# The serial-scan rule on its campaign rows, the planner told the row's SM count: the adjoint scan is one launch over
+# the sequences (dhu_tc2, or the wavefront pair's scan where it takes at most half the SMs) and no backward pre-scan;
+# against the rule turned off (the planner's split plan) the forward launches and o / dq are the same, the other
+# gradients agree within the accuracy gate, and two runs are bitwise.
+SERIAL_SCAN_DEVICE_ROWS = {
+    "sm_107a": (216, (((4096,) * 8, (8, 16)), ((4096,) * 4, (16, 32)))),
+}
+_BACKWARD_STAGES = ("dhu", "dv_local", "tail", "dqkwg", "wy_bwd", "finalize", "stitch")
+
+
+@pytest.mark.parametrize("case", (0, 1))
+def test_serial_scan_rule_on_the_device(case, device, monkeypatch) -> None:
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if arch not in SERIAL_SCAN_DEVICE_ROWS or case >= len(
+        SERIAL_SCAN_DEVICE_ROWS[arch][1]
+    ):
+        pytest.skip(f"no serial-scan row {case} on {arch}")
+    sm_count, rows = SERIAL_SCAN_DEVICE_ROWS[arch]
+    seq_lens, heads = rows[case]
+    _small_device(monkeypatch, device, sm_count)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=581)
+    calls = _record_calls(monkeypatch)
+    got = _run(inputs, seq_lens)
+    n = len(calls)
+    _assert_bitwise(got, _run(inputs, seq_lens), OUTPUT_NAMES)
+    on = calls[:n]
+    assert not any(c[0].startswith("dhu_pre") for c in on), on
+    scans = [c for c in on if c[0].startswith("dhu_tc2")]
+    assert len(scans) == 1 and scans[0][0] in ("dhu_tc2", "dhu_tc2_wavefront"), scans
+    assert scans[0][1][:2] == (len(seq_lens), heads[1]), scans
+    monkeypatch.setattr(
+        cake_chain, "_serial_adjoint_plan", lambda _seq_lens, plans, *_args: plans
+    )
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    m = len(calls)
+    off = _run(inputs, seq_lens)
+    assert any(c[0].startswith("dhu_pre") for c in calls[m:]), calls[m:]
+
+    def forward(cs):
+        return [c for c in cs if not c[0].startswith(_BACKWARD_STAGES)]
+
+    assert forward(on) == forward(calls[m:])
+    _assert_bitwise(got, off, ("o", "dq"))
+    for name in ("dk", "dv", "dg", "dbeta"):
+        metrics = _metrics(got[name], off[name])
+        assert metrics["finite"] and metrics["rel_rms"] <= REL_RMS_MAX, (name, metrics)
+        assert metrics["max_abs"] <= MAX_ABS_REL * metrics["max_ref"], (name, metrics)
 
 
 # rows the wavefront rule keeps on the separate launches although every architecture and value-head count is allowed:
