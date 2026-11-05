@@ -17,6 +17,22 @@ from flashinfer.testing import bench_gpu_time
 from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
 
 
+def checked_relative_error(output, reference):
+    error = (
+        output.float() - reference.float()
+    ).norm() / reference.float().norm().clamp_min(1e-8)
+    error = error.item()
+    if not (
+        torch.isfinite(output).all()
+        and torch.isfinite(reference).all()
+        and error < 0.03
+    ):
+        raise RuntimeError(
+            "Output check requires finite tensors and relative error below 0.03"
+        )
+    return error
+
+
 def compare_planners(args):
     """Static metadata, shared operands; host planning stays outside Graphs."""
     from flashinfer.experimental.xqa_decode_buckets.jit import get_module
@@ -209,12 +225,7 @@ def compare_planners(args):
         stream.synchronize()
         errors = []
         for _, _, _, outputs, workspaces in bank:
-            error = (outputs["host"].float() - outputs["gpu"].float()).norm() / outputs[
-                "gpu"
-            ].float().norm().clamp_min(1e-8)
-            errors.append(error.item())
-            if not torch.isfinite(outputs["host"]).all() or errors[-1] >= 0.03:
-                raise RuntimeError("Host/GPU output check failed")
+            errors.append(checked_relative_error(outputs["host"], outputs["gpu"]))
             if any(workspace.semaphores.any() for workspace in workspaces.values()):
                 raise RuntimeError("Counter reset check failed")
         record = dict(
@@ -535,7 +546,7 @@ def main(argv=None):
     if capacity < max(lengths):
         parser.error("--capacity-length must cover every live length")
     result = run_case(args, lengths, capacity)
-    if args.compare_compile and args.output_json:
+    if args.output_json:
         atomic_json(Path(args.output_json), dict(complete=True, result=result))
     return result
 
@@ -681,15 +692,8 @@ def run_case(args, lengths, capacity, *, suite=False):
     def check_outputs(selected_bank=bank):
         errors = []
         for _, _, _, _, _, out, native_out, workspace, _ in selected_bank:
-            error = (
-                out.float() - native_out.float()
-            ).norm() / native_out.float().norm().clamp_min(1e-8)
-            errors.append(error.item())
-            if (
-                not torch.isfinite(out).all()
-                or errors[-1] >= 0.03
-                or workspace.semaphores.any()
-            ):
+            errors.append(checked_relative_error(out, native_out))
+            if workspace.semaphores.any():
                 raise RuntimeError("Module output/counter check failed")
         return errors
 

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <cmath>
+#include <limits>
+
 #include "bucket.cuh"
 #include "tvm_ffi_utils.h"
 
@@ -188,7 +191,10 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
   TVM_FFI_ICHECK(
       k.stride(0) % sizeof(GMemCacheHead) == 0 && k.stride(1) % sizeof(GMemCacheHead) == 0 &&
       ks.stride(0) % sizeof(GMemCacheHeadSf) == 0 && ks.stride(1) % sizeof(GMemCacheHeadSf) == 0);
-  TVM_FFI_ICHECK(std::isfinite(bmm1_scale) && std::isfinite(bmm2_scale));
+  TVM_FFI_ICHECK(std::isfinite(bmm1_scale) && std::isfinite(bmm2_scale) &&
+                 std::abs(bmm1_scale) <= std::numeric_limits<float>::max() &&
+                 std::abs(bmm2_scale) <= std::numeric_limits<float>::max())
+      << "BMM1 and BMM2 scales must be finite float32 values";
   buckets::ComputeParams p{plan,
                            static_cast<const __nv_bfloat16*>(q.data_ptr()),
                            static_cast<const uint8_t*>(k.data_ptr()),

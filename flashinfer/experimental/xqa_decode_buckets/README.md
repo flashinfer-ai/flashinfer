@@ -32,12 +32,15 @@ use it and retain their native fallback.
 | Page size P | 16, 32 or 64 tokens |
 | Metadata | Contiguous CUDA int32 page table `[B,width]` and lengths `[B]` |
 | Query tile | 16 rows (default), or explicit 32 rows for T>1 |
-| Effective scales | Independent finite `bmm1_scale` for QK and `bmm2_scale` for V/output |
+| Effective scales | Independent finite float32-representable `bmm1_scale` for QK and `bmm2_scale` for V/output |
 
 Packed heads are contiguous; native page/token/head byte strides are retained,
 including separate or interleaved K/V storage. Q, cache, scales, output and
-scratch require 16-byte aligned addresses. Output must not share storage with
-query, cache, metadata or workspace tensors. Unsupported cases stay with the
+scratch require 16-byte aligned addresses. Output, scratch and semaphores must
+have disjoint byte spans from each other and all read operands. Disjoint views
+of one allocation are allowed; span checks conservatively include gaps in
+strided views. Read-only K/V and scales may share interleaved backing storage.
+Unsupported cases stay with the
 caller's native path. Sinks, sliding windows, soft caps, ragged queries,
 arbitrary tree masks and FP8 output are outside this backend's contract.
 

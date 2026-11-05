@@ -3,12 +3,21 @@
 
 import json
 from dataclasses import replace
+import importlib.util
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from test_xqa_decode_buckets import _assert_output, _case, _reference, _require_sm120
+from test_xqa_decode_buckets import (
+    _assert_output,
+    _case,
+    _check_changed_graph,
+    _reference,
+    _require_sm120,
+)
 
 
 def _fixture(*, direct=False, mode="persistent", planner="gpu", layers=1):
@@ -213,6 +222,343 @@ def _compile_check(
         flush=True,
     )
     print(explanation.graphs[0].code, flush=True)
+
+
+class BucketReviewCPUTests(unittest.TestCase):
+    @staticmethod
+    def _operands():
+        return {
+            name: torch.empty(64, dtype=torch.uint8, device="cpu")
+            for name in (
+                "q",
+                "k",
+                "v",
+                "ks",
+                "vs",
+                "table",
+                "lengths",
+                "tasks",
+                "requests",
+                "spans",
+                "header",
+                "causal_mask",
+                "output",
+                "scratch",
+                "semaphores",
+            )
+        }
+
+    @staticmethod
+    def _example():
+        path = Path(__file__).resolve().parents[2] / "examples/xqa_decode_buckets.py"
+        spec = importlib.util.spec_from_file_location("xqa_bucket_example", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_external_storage_overlap(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+
+        operands = self._operands()
+        backing = torch.empty(256, dtype=torch.uint8, device="cpu").numpy()
+        operands["q"] = torch.from_numpy(backing[32:128]).view(torch.bfloat16)
+        operands["output"] = torch.from_numpy(backing[96:192]).view(torch.bfloat16)
+        self.assertNotEqual(
+            operands["q"].untyped_storage().data_ptr(),
+            operands["output"].untyped_storage().data_ptr(),
+        )
+        with self.assertRaisesRegex(ValueError, "out.*alias"):
+            backend._storage_checks(**operands)
+
+    def test_writable_buffer_overlaps(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+
+        readonly = (
+            "q",
+            "k",
+            "v",
+            "ks",
+            "vs",
+            "table",
+            "lengths",
+            "tasks",
+            "requests",
+            "spans",
+            "header",
+            "causal_mask",
+        )
+        for writable in ("output", "scratch", "semaphores"):
+            for source in readonly:
+                with self.subTest(writable=writable, source=source):
+                    operands = self._operands()
+                    backing = torch.empty(128, dtype=torch.uint8, device="cpu")
+                    operands[source] = backing[:64]
+                    operands[writable] = backing[32:96]
+                    with self.assertRaisesRegex(ValueError, "alias"):
+                        backend._storage_checks(**operands)
+        for first, second in (
+            ("output", "scratch"),
+            ("output", "semaphores"),
+            ("scratch", "semaphores"),
+        ):
+            with self.subTest(first=first, second=second):
+                operands = self._operands()
+                backing = torch.empty(128, dtype=torch.uint8, device="cpu")
+                operands[first], operands[second] = backing[:64], backing[32:96]
+                with self.assertRaisesRegex(ValueError, "alias"):
+                    backend._storage_checks(**operands)
+
+    def test_disjoint_subregions_and_empty_descriptors(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+
+        operands = self._operands()
+        backing = torch.empty(256, dtype=torch.uint8, device="cpu")
+        operands.update(
+            q=backing[:64],
+            output=backing[64:128],
+            scratch=backing[128:192],
+            semaphores=backing[192:],
+        )
+        for name in ("tasks", "requests", "spans", "header", "causal_mask"):
+            operands[name] = backing[:0]
+        cache = torch.empty((4, 2, 16), dtype=torch.uint8, device="cpu")
+        operands.update(k=cache[:, 0], v=cache[:, 1], ks=cache[:, 0], vs=cache[:, 1])
+        backend._storage_checks(**operands)
+
+    def test_strided_input_extent(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+
+        operands = self._operands()
+        backing = torch.empty(256, dtype=torch.uint8, device="cpu")
+        operands["k"] = backing.as_strided((4, 16), (64, 1))
+        operands["output"] = torch.from_numpy(backing.numpy()[192:256])
+        with self.assertRaisesRegex(ValueError, "out.*alias"):
+            backend._storage_checks(**operands)
+
+    def test_scale_validation(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+
+        maximum = torch.finfo(torch.float32).max
+        backend._check_scales(maximum, -maximum)
+        backend._check_scales(0.0, 1.3)
+        for invalid in (1e300, -1e300, float("inf"), -float("inf"), float("nan")):
+            for scales in ((invalid, 1.0), (1.0, invalid)):
+                with (
+                    self.subTest(scales=scales),
+                    self.assertRaisesRegex(ValueError, "finite float32"),
+                ):
+                    backend._compute(
+                        **self._operands(),
+                        ctas=1,
+                        aligned=False,
+                        bmm1_scale=scales[0],
+                        bmm2_scale=scales[1],
+                        enable_pdl=False,
+                        page_size=32,
+                        head_group_ratio=6,
+                        q_len_per_req=1,
+                        query_tile=16,
+                    )
+
+    def test_single_case_json(self):
+        example = self._example()
+        result = dict(relative_error=[0.01])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "single.json"
+            with patch.object(example, "run_case", return_value=result) as run:
+                self.assertEqual(
+                    example.main(["--lengths", "32", "--output-json", str(target)]),
+                    result,
+                )
+            run.assert_called_once()
+            self.assertEqual(
+                json.loads(target.read_text()), dict(complete=True, result=result)
+            )
+            self.assertFalse(target.with_suffix(".json.partial").exists())
+
+    def test_nonfinite_output_and_reference(self):
+        example = self._example()
+        reference = torch.ones(4, device="cpu")
+        self.assertLess(
+            example.checked_relative_error(reference * 1.02, reference), 0.03
+        )
+        for invalid in (float("nan"), float("inf"), -float("inf")):
+            value = torch.full_like(reference, invalid)
+            for output, expected in ((value, reference), (reference, value)):
+                with (
+                    self.subTest(invalid=invalid),
+                    self.assertRaisesRegex(RuntimeError, "finite"),
+                ):
+                    example.checked_relative_error(output, expected)
+        # Finite inputs can still produce a NaN error through overflowing norms.
+        huge = torch.full_like(reference, 1e38)
+        with self.assertRaisesRegex(RuntimeError, "relative error"):
+            example.checked_relative_error(-huge, huge)
+        with self.assertRaisesRegex(RuntimeError, "relative error"):
+            example.checked_relative_error(reference * 1.04, reference)
+
+    def test_small_sm_direct_fixture_skips_before_allocation(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+
+        with (
+            patch("test_xqa_decode_buckets._require_sm120"),
+            patch(
+                "test_xqa_decode_buckets._case",
+                side_effect=AssertionError("fixture allocated"),
+            ),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(backend, "get_device_sm_count", return_value=1),
+            self.assertRaisesRegex(
+                unittest.SkipTest, "Direct fixture exceeds SM budget"
+            ),
+        ):
+            _check_changed_graph(
+                "aligned",
+                False,
+                direct=True,
+                direct_batch=4,
+                capacity_length=512,
+                num_kv_heads=4,
+                q_len_per_req=3,
+                query_tile=32,
+            )
+
+
+class BucketReviewSM120Tests(unittest.TestCase):
+    def test_default_cuda_device_host_plan_and_interleaved_graph(self):
+        _require_sm120()
+        from flashinfer.experimental.xqa_decode_buckets import jit
+        from flashinfer.xqa import (
+            create_xqa_decode_bucket_plan,
+            xqa_decode_with_buckets,
+        )
+
+        lengths = [257, 512, 3, 0]
+        queries, data, scales, table, lens = _case(
+            lengths,
+            capacity_length=8193,
+            interleaved=True,
+            num_kv_heads=4,
+            q_len_per_req=3,
+        )
+        host_lengths = torch.tensor(lengths, dtype=torch.int32, device="cpu")
+        previous = torch.get_default_device()
+        try:
+            torch.set_default_device(lens.device)
+            jit.get_module.cache_clear()  # Exercise cold configure's CPU resources.
+            with patch.object(torch, "tensor", wraps=torch.tensor) as tensor_factory:
+                plan = create_xqa_decode_bucket_plan(
+                    lens,
+                    page_table_width=table.shape[1],
+                    planner="host",
+                    host_seq_lens=host_lengths,
+                    mode="aligned",
+                    num_kv_heads=4,
+                    q_len_per_req=3,
+                    query_tile=32,
+                )
+            tensor_factory.assert_any_call((1, 3, 7), dtype=torch.int32, device="cpu")
+            self.assertFalse(plan.direct)
+            self.assertEqual(plan._host_descriptors.device.type, "cpu")
+            self.assertTrue(plan._host_descriptors.is_pinned())
+            self.assertEqual(plan.causal_mask.device, lens.device)
+            self.assertEqual(len(plan.resources), 4)
+            workspace = plan.create_workspace()
+            output = torch.empty_like(queries[0])
+
+            def compute():
+                return xqa_decode_with_buckets(
+                    queries[0],
+                    *data,
+                    *scales,
+                    table,
+                    plan,
+                    workspace,
+                    bmm1_scale=0.7 / 16,
+                    bmm2_scale=1.3,
+                    out=output,
+                )
+
+            compute()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                compute()
+            graph.replay()
+            torch.cuda.synchronize()
+            _assert_output(
+                output,
+                _reference(queries[0], data, scales, table, lengths, 0.7 / 16, 1.3),
+            )
+            self.assertFalse(workspace.semaphores.any())
+        finally:
+            torch.set_default_device(previous)
+
+    def test_scale_overflow_public_registered_and_native(self):
+        from flashinfer.experimental.xqa_decode_buckets import backend
+        from flashinfer.xqa import xqa_decode_with_buckets
+
+        plan, workspaces, banks, args, _, _, _ = _fixture(direct=True)
+        workspace = workspaces[0]
+        q, k, v, ks, vs, output = banks[0]
+        prefix = (
+            q,
+            k,
+            v,
+            ks,
+            vs,
+            args[0],
+            plan.lengths,
+            plan.tasks,
+            plan.requests,
+            plan.spans,
+            plan.header,
+            plan.causal_mask,
+            workspace.semaphores,
+            workspace.scratch,
+            output,
+            plan.ctas,
+            plan.mode == "aligned",
+        )
+        module, _ = backend.get_module(False, q.device, direct=True)
+        for invalid in (1e300, -1e300, float("inf"), float("nan")):
+            for scales in ((invalid, 1.0), (1.0, invalid)):
+                with self.subTest(scales=scales):
+                    with patch.object(
+                        backend,
+                        "get_module",
+                        side_effect=AssertionError("invalid scale reached JIT"),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "finite float32"):
+                            xqa_decode_with_buckets(
+                                q,
+                                k,
+                                v,
+                                ks,
+                                vs,
+                                args[0],
+                                plan,
+                                workspace,
+                                bmm1_scale=scales[0],
+                                bmm2_scale=scales[1],
+                                out=output,
+                            )
+                        with self.assertRaisesRegex(ValueError, "finite float32"):
+                            backend._compute_op(
+                                *prefix,
+                                *scales,
+                                plan.enable_pdl,
+                                plan.page_size,
+                                plan.head_group_ratio,
+                                plan.q_len_per_req,
+                                plan.query_tile,
+                            )
+                    with self.assertRaisesRegex(
+                        (ValueError, RuntimeError), "finite float32"
+                    ):
+                        module.run(
+                            *prefix, *scales, plan.enable_pdl, plan.q_len_per_req
+                        )
 
 
 class BucketCompileTests(unittest.TestCase):

@@ -33,6 +33,21 @@ def _tensor(tensor, name, *, dtype, shape, device, contiguous=True):
         raise ValueError(f"{name} must be contiguous")
 
 
+def _byte_span(tensor):
+    if not tensor.numel():
+        return None
+    # data_ptr() already includes the storage offset. Bound every addressed
+    # element, conservatively including gaps in strided cache views.
+    lower = upper = 0
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        offset = (size - 1) * stride
+        lower += min(0, offset)
+        upper += max(0, offset)
+    start = tensor.data_ptr()
+    itemsize = tensor.element_size()
+    return start + lower * itemsize, start + (upper + 1) * itemsize
+
+
 def _storage_checks(
     q,
     k,
@@ -63,10 +78,9 @@ def _storage_checks(
     ):
         if tensor.data_ptr() % 16:
             raise ValueError(f"{name} must have 16-byte aligned storage")
-    output_storage = output.untyped_storage().data_ptr()
-    if any(
-        t.numel() and output_storage == t.untyped_storage().data_ptr()
-        for t in (
+    readonly = [
+        _byte_span(tensor)
+        for tensor in (
             q,
             k,
             v,
@@ -79,13 +93,35 @@ def _storage_checks(
             spans,
             header,
             causal_mask,
-            semaphores,
-            scratch,
         )
+    ]
+    writable = [
+        (name, _byte_span(tensor))
+        for name, tensor in (
+            ("out", output),
+            ("scratch", scratch),
+            ("semaphores", semaphores),
+        )
+    ]
+    for index, (name, span) in enumerate(writable):
+        if span is None:
+            continue
+        if any(
+            other is not None and span[0] < other[1] and other[0] < span[1]
+            for other in readonly + [other for _, other in writable[index + 1 :]]
+        ):
+            raise ValueError(
+                f"{name} must not alias query, cache, metadata or other writable buffers"
+            )
+
+
+def _check_scales(bmm1_scale, bmm2_scale):
+    if not all(
+        math.isfinite(float(scale))
+        and abs(float(scale)) <= torch.finfo(torch.float32).max
+        for scale in (bmm1_scale, bmm2_scale)
     ):
-        raise ValueError(
-            "out must not alias query, cache, metadata or workspace storage"
-        )
+        raise ValueError("BMM1 and BMM2 scales must be finite float32 values")
 
 
 def _host_lengths(lengths, batch):
@@ -176,6 +212,7 @@ def _compute(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
+    _check_scales(bmm1_scale, bmm2_scale)
     _storage_checks(
         q,
         k,
@@ -489,7 +526,9 @@ def create_plan(
     if q_len_per_req > 1:
         # Cold constant suffix mask, packed exactly like native XQA. No mask
         # generation or length readback is part of prepare/compute/replay.
-        causal_mask = torch.tensor(causal_mask_words(q_len_per_req), dtype=torch.int32)
+        causal_mask = torch.tensor(
+            causal_mask_words(q_len_per_req), dtype=torch.int32, device="cpu"
+        )
         causal_mask = (
             causal_mask.repeat(batch, 1)
             .view(torch.uint16)
@@ -501,7 +540,9 @@ def create_plan(
     host_descriptors = device_descriptors = copy_done = None
     if planner == "host" and not direct:
         words = 6 * (ctas + batch)
-        host_descriptors = torch.empty(words, dtype=torch.int32, pin_memory=True)
+        host_descriptors = torch.empty(
+            words, dtype=torch.int32, device="cpu", pin_memory=True
+        )
         device_descriptors = torch.empty(words, dtype=torch.int32, device=device)
         tasks, requests, spans, header = _descriptor_views(
             device_descriptors, batch, ctas
@@ -619,8 +660,7 @@ def run(
         shape=(batch * plan.num_groups,),
         device=device,
     )
-    if not all(math.isfinite(float(s)) for s in (bmm1_scale, bmm2_scale)):
-        raise ValueError("BMM1 and BMM2 scales must be finite")
+    _check_scales(bmm1_scale, bmm2_scale)
     if out is None:
         out = torch.empty_like(query)
     _tensor(out, "out", dtype=torch.bfloat16, shape=shape, device=device)

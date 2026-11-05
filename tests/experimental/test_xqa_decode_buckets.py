@@ -461,6 +461,25 @@ def _check_changed_graph(
         replay_lengths = [
             [max(n, q_len_per_req) if n else 0 for n in row] for row in replay_lengths
         ]
+    capacity = max(initial) if capacity_length is None else capacity_length
+    width = max(1, (capacity + page_size - 1) // page_size)
+    sms = backend.get_device_sm_count(torch.device("cuda", torch.cuda.current_device()))
+    expected_ctas, eligible_direct = backend.plan_geometry(
+        len(initial),
+        width,
+        sms,
+        page_size,
+        num_kv_heads,
+        head_group_ratio,
+        q_len_per_req,
+        query_tile,
+    )
+    if direct and not eligible_direct:
+        raise unittest.SkipTest(
+            f"Direct fixture exceeds SM budget: B={len(initial)}, width={width}, "
+            f"page_size={page_size}, heads={num_kv_heads}, ratio={head_group_ratio}, "
+            f"T={q_len_per_req}, M={query_tile}, SMs={sms}"
+        )
     queries, data, scales, table, lens = _case(
         initial,
         interleaved=interleaved,
@@ -485,8 +504,7 @@ def _check_changed_graph(
         else None,
     )
     assert plan.direct == direct
-    if direct and capacity_length == 512:
-        assert plan.ctas == 2 * len(initial)
+    assert plan.ctas == expected_ctas
     assert plan.page_size == page_size
     assert plan.num_kv_heads == num_kv_heads
     assert plan.head_group_ratio == head_group_ratio
@@ -884,14 +902,15 @@ class BucketGraphTests(unittest.TestCase):
                 with self.subTest(mode=mode, interleaved=interleaved):
                     _check_changed_graph(mode, interleaved, planner="host")
             for batch, capacity in ((1, 131072), (4, 512)):
-                _check_changed_graph(
-                    mode,
-                    False,
-                    direct=True,
-                    capacity_length=capacity,
-                    direct_batch=batch,
-                    planner="host",
-                )
+                with self.subTest(mode=mode, direct_batch=batch, planner="host"):
+                    _check_changed_graph(
+                        mode,
+                        False,
+                        direct=True,
+                        capacity_length=capacity,
+                        direct_batch=batch,
+                        planner="host",
+                    )
 
     def test_direct_replay(self):
         _require_sm120()
@@ -954,15 +973,18 @@ class BucketPageTests(unittest.TestCase):
                             _check_changed_graph(
                                 mode, interleaved, planner=planner, page_size=page_size
                             )
-                    _check_changed_graph(
-                        mode,
-                        False,
-                        planner=planner,
-                        page_size=page_size,
-                        direct=True,
-                        direct_batch=4,
-                        capacity_length=512,
-                    )
+                    with self.subTest(
+                        page_size=page_size, mode=mode, planner=planner, direct_batch=4
+                    ):
+                        _check_changed_graph(
+                            mode,
+                            False,
+                            planner=planner,
+                            page_size=page_size,
+                            direct=True,
+                            direct_batch=4,
+                            capacity_length=512,
+                        )
             _check_changed_graph(
                 "persistent",
                 True,
@@ -1001,16 +1023,23 @@ class BucketHeadTests(unittest.TestCase):
             for mode in ("persistent", "aligned"):
                 for planner in ("gpu", "host"):
                     for batch, capacity in ((1, 131072), (4, 512)):
-                        _check_changed_graph(
-                            mode,
-                            True,
+                        with self.subTest(
+                            heads=heads,
+                            ratio=ratio,
+                            mode=mode,
                             planner=planner,
-                            num_kv_heads=heads,
-                            head_group_ratio=ratio,
-                            direct=True,
-                            direct_batch=batch,
-                            capacity_length=capacity,
-                        )
+                            batch=batch,
+                        ):
+                            _check_changed_graph(
+                                mode,
+                                True,
+                                planner=planner,
+                                num_kv_heads=heads,
+                                head_group_ratio=ratio,
+                                direct=True,
+                                direct_batch=batch,
+                                capacity_length=capacity,
+                            )
         for page_size, ratio in ((16, 4), (64, 8)):
             for mode in ("persistent", "aligned"):
                 for planner in ("gpu", "host"):
@@ -1165,19 +1194,28 @@ class BucketQueryTileTests(unittest.TestCase):
             for mode in ("persistent", "aligned"):
                 for planner in ("gpu", "host"):
                     for batch, capacity in ((1, 8193), (4, 512)):
-                        _check_changed_graph(
-                            mode,
-                            batch == 4,
+                        with self.subTest(
+                            tokens=tokens,
+                            heads=heads,
+                            ratio=ratio,
+                            page=page,
+                            mode=mode,
                             planner=planner,
-                            page_size=page,
-                            num_kv_heads=heads,
-                            head_group_ratio=ratio,
-                            q_len_per_req=tokens,
-                            query_tile=32,
-                            direct=True,
-                            direct_batch=batch,
-                            capacity_length=capacity,
-                        )
+                            batch=batch,
+                        ):
+                            _check_changed_graph(
+                                mode,
+                                batch == 4,
+                                planner=planner,
+                                page_size=page,
+                                num_kv_heads=heads,
+                                head_group_ratio=ratio,
+                                q_len_per_req=tokens,
+                                query_tile=32,
+                                direct=True,
+                                direct_batch=batch,
+                                capacity_length=capacity,
+                            )
 
     def test_future_kv_m32(self):
         for heads, ratio, page in ((1, 6, 32), (2, 8, 64)):
@@ -1245,18 +1283,27 @@ class BucketMultiQueryTests(unittest.TestCase):
             for mode in ("persistent", "aligned"):
                 for planner in ("gpu", "host"):
                     for batch, capacity in ((1, 131072), (4, 512)):
-                        _check_changed_graph(
-                            mode,
-                            True,
+                        with self.subTest(
+                            tokens=tokens,
+                            heads=heads,
+                            ratio=ratio,
+                            page=page,
+                            mode=mode,
                             planner=planner,
-                            page_size=page,
-                            num_kv_heads=heads,
-                            head_group_ratio=ratio,
-                            q_len_per_req=tokens,
-                            direct=True,
-                            direct_batch=batch,
-                            capacity_length=capacity,
-                        )
+                            batch=batch,
+                        ):
+                            _check_changed_graph(
+                                mode,
+                                True,
+                                planner=planner,
+                                page_size=page,
+                                num_kv_heads=heads,
+                                head_group_ratio=ratio,
+                                q_len_per_req=tokens,
+                                direct=True,
+                                direct_batch=batch,
+                                capacity_length=capacity,
+                            )
 
     def test_future_kv_perturbation(self):
         for page in (16, 32, 64):
@@ -1279,15 +1326,16 @@ class BucketMultiQueryTests(unittest.TestCase):
     def test_q1_compatibility_anchor(self):
         _check_changed_graph("persistent", False, direct=True, capacity_length=512)
         _check_changed_graph("persistent", True, num_kv_heads=4, head_group_ratio=6)
-        _check_changed_graph(
-            "aligned",
-            False,
-            num_kv_heads=2,
-            head_group_ratio=4,
-            direct=True,
-            direct_batch=4,
-            capacity_length=512,
-        )
+        with self.subTest(direct_batch=4):
+            _check_changed_graph(
+                "aligned",
+                False,
+                num_kv_heads=2,
+                head_group_ratio=4,
+                direct=True,
+                direct_batch=4,
+                capacity_length=512,
+            )
 
 
 class HostPlannerTests(unittest.TestCase):

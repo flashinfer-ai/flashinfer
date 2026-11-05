@@ -77,6 +77,6 @@ def get_module(
             multi_query=multi_query,
             query_tile=query_tile,
         ).build_and_load()
-        resources = torch.empty(4, dtype=torch.int64)
+        resources = torch.empty(4, dtype=torch.int64, device="cpu")
         module.configure(resources)
     return module, tuple(resources.tolist())
