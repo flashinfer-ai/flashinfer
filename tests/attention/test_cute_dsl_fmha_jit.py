@@ -35,10 +35,10 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32
 
-from flashinfer.cute_dsl.attention.fmha.fmha import (
+from flashinfer.cute_dsl.attention.fmha.sm100.fmha import (
     BlackwellFusedMultiHeadAttentionForward,
 )
-from flashinfer.cute_dsl.attention.fmha.fmha_blockscaled import (
+from flashinfer.cute_dsl.attention.fmha.sm100.fmha_blockscaled import (
     BlackwellFusedMultiHeadBlockScaledAttentionForward,
     compact_fp4_data,
     create_scale_factor_tensor,
@@ -106,6 +106,7 @@ def _ref_attention(
     cum_k=None,
     q_sf5=None,
     k_sf5=None,
+    sink=None,
 ):
     """float32 attention reference over 5D tensors (b, s, h_k, {h_r|1}, d).
 
@@ -141,10 +142,13 @@ def _ref_attention(
             kc = torch.arange(sk, device=q5.device).view(1, -1)
             masked = kc > (qc + (sk - sq))  # bottom-right aligned
             s = s.masked_fill(masked.view(sq, sk, 1, 1), float("-inf"))
-        p = torch.softmax(s, dim=1)
+        row_lse = torch.logsumexp(s, dim=1)
+        if sink is not None:
+            row_lse = torch.logaddexp(row_lse, sink.reshape(1, h_k, h_r))
+        p = (s - row_lse[:, None]).exp()
         o = torch.einsum("qkhr,khrd->qhrd", p, cv) * scale_output
         o_ref[bq, qo : qo + sq] = o
-        lse_ref[bq, qo : qo + sq] = torch.logsumexp(s, dim=1) * LOG2_E
+        lse_ref[bq, qo : qo + sq] = row_lse * LOG2_E
     return o_ref, lse_ref
 
 
@@ -307,6 +311,120 @@ def test_cute_dsl_fmha_jit(mode, causal):
     torch.testing.assert_close(o, o_ref.cpu(), atol=atol, rtol=atol)
 
 
+@pytest.mark.parametrize("mode", ["bf16", "fp8", "split", "fp16"])
+@pytest.mark.parametrize("use_pdl", [False, True])
+def test_cute_dsl_fmha_jit_ragged_features(mode, use_pdl):
+    """Exercise the FFI ABI with GQA, partial tiles, a window, sink and LSE."""
+    from flashinfer.attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
+    from flashinfer.cute_dsl.attention.fmha.compile import (
+        compile_cute_dsl_fmha_kernel,
+    )
+
+    torch.manual_seed(42)
+    q_lens, k_lens = [17, 259, 65], [33, 273, 97]
+    hq, hk, dim = 8, 2, 64
+    q_dtype = {
+        "bf16": torch.bfloat16,
+        "fp8": torch.float8_e4m3fn,
+        "split": torch.bfloat16,
+        "fp16": torch.float16,
+    }[mode]
+    v_dtype = torch.float8_e4m3fn if mode in ("fp8", "split") else q_dtype
+    q = torch.randn(sum(q_lens), hq, dim, device=DEVICE).to(q_dtype)
+    k = torch.randn(sum(k_lens), hk, dim, device=DEVICE).to(q_dtype)
+    v = torch.randn(sum(k_lens), hk, dim, device=DEVICE).to(v_dtype)
+    o = torch.empty(sum(q_lens), hq, dim, device=DEVICE, dtype=torch.bfloat16)
+    lse = torch.empty(sum(q_lens), hq, device=DEVICE, dtype=torch.float32)
+    sinks = torch.linspace(-1, 3, hq, device=DEVICE)
+    qo = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device=DEVICE, dtype=torch.int32
+    )
+    kv = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device=DEVICE, dtype=torch.int32
+    )
+    kernel = compile_cute_dsl_fmha_kernel(
+        q_dtype,
+        v_dtype,
+        o.dtype,
+        hq,
+        hk,
+        dim,
+        dim,
+        True,
+        True,
+        True,
+        True,
+        q.device,
+        has_window_left=True,
+    )
+
+    def run():
+        cute_dsl_fmha_ragged_prefill(
+            q,
+            k,
+            v,
+            o,
+            qo,
+            kv,
+            is_causal=True,
+            window_left=31,
+            lse=lse,
+            attention_sinks=sinks,
+            skip_softmax_threshold_scale_factor=2**-20,
+            enable_tvm_ffi=True,
+            enable_pdl=use_pdl,
+            max_qo_len=max(q_lens),
+            max_kv_len=max(k_lens),
+            kernel_fn=kernel,
+        )
+
+    def check():
+        q_begin = k_begin = 0
+        for sq, sk in zip(q_lens, k_lens, strict=True):
+            qi = q[q_begin : q_begin + sq].float().transpose(0, 1)
+            ki = (
+                k[k_begin : k_begin + sk]
+                .float()
+                .repeat_interleave(hq // hk, 1)
+                .transpose(0, 1)
+            )
+            vi = (
+                v[k_begin : k_begin + sk]
+                .float()
+                .repeat_interleave(hq // hk, 1)
+                .transpose(0, 1)
+            )
+            logits = qi @ ki.transpose(-1, -2) / math.sqrt(dim)
+            row = torch.arange(sq, device=DEVICE)[:, None] + sk - sq
+            col = torch.arange(sk, device=DEVICE)[None, :]
+            logits.masked_fill_((col > row) | (col < row - 31), -math.inf)
+            logits_sink = torch.cat(
+                [logits, sinks[:, None, None].expand(-1, sq, 1)], -1
+            )
+            ref_lse = logits_sink.logsumexp(-1)
+            probabilities = (logits - ref_lse[:, :, None]).exp()
+            ref_o = (probabilities @ vi).transpose(0, 1)
+            tol = 0.04 if v_dtype == torch.float8_e4m3fn else 0.01
+            torch.testing.assert_close(
+                o[q_begin : q_begin + sq].float(), ref_o, atol=tol, rtol=tol
+            )
+            torch.testing.assert_close(
+                lse[q_begin : q_begin + sq], ref_lse.T * LOG2_E, atol=0.01, rtol=0.003
+            )
+            q_begin += sq
+            k_begin += sk
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    q.copy_((q.float() * 0.5).to(q_dtype))
+    o.fill_(math.nan)
+    graph.replay()
+    check()
+
+
 # =============================================================================
 # Block-scaled: MXFP8 / NVFP4 (non-varlen, h_r = 1)
 # =============================================================================
@@ -328,7 +446,9 @@ def _sf_ref_5d(ref_flat, s, b, h_k, h_r, d):
 @pytest.mark.parametrize("qk_mode", list(_BS_MODES))
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("with_lse", [False, True])
-def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("v_dtype", [cutlass.BFloat16, cutlass.Float8E4M3FN])
+def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse, with_sink, v_dtype):
     """Block-scaled (MXFP8 / NVFP4) non-varlen prefill, JIT-compiled."""
     torch.manual_seed(0)
     qk_dt, sf_dt, sf_vec = _BS_MODES[qk_mode]
@@ -339,7 +459,7 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
 
     q_ref, q_cute = _make_cute((b, s_q, h_k, h_r, d), qk_dt)
     k_ref, k_cute = _make_cute((b, s_k, h_k, 1, d), qk_dt)
-    v_ref, v_cute = _make_cute((b, s_k, h_k, 1, dv), cutlass.Float8E4M3FN)
+    v_ref, v_cute = _make_cute((b, s_k, h_k, 1, dv), v_dtype)
     _, o_cute = _make_cute((b, s_q, h_k, h_r, dv), cutlass.Float8E4M3FN, zero_out=True)
 
     q_sf_flat, q_sf_cute = create_scale_factor_tensor(s_q, d, b * h_q, sf_vec, sf_dt)
@@ -350,6 +470,9 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
     lse_cute = None
     if with_lse:
         _, lse_cute = _make_cute((b, s_q, h_k, h_r), cutlass.Float32, zero_out=True)
+    sink_ref = sink_cute = None
+    if with_sink:
+        sink_ref, sink_cute = _make_cute((h_q,), cutlass.Float32)
 
     problem_size = (b, s_q, s_q, s_k, h_q, h_k, d, dv)
     scale_softmax = 1.0 / math.sqrt(d)
@@ -370,6 +493,8 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
         enable_ex2_emulation=ENABLE_EX2,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
+        # Prescaling P must also prescale the sink's denominator contribution.
+        rescale_threshold=2**-8 if with_sink else 8.0,
         use_tma_store=True,  # non-varlen
     )
     stream = _default_stream()
@@ -384,7 +509,7 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
         None,
         None,
         lse_cute,
-        None,
+        sink_cute,
     )
     compiled = cute.compile(
         fmha,
@@ -430,6 +555,7 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
         causal=causal,
         q_sf5=q_sf5,
         k_sf5=k_sf5,
+        sink=sink_ref,
     )
     # Compare like the kernel refcheck: round the reference through E4M3.
     o_ref_q = o_ref.to(torch.float8_e4m3fn).float().cpu()
