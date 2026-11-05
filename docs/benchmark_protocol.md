@@ -326,4 +326,3 @@ specializations reported zero spill loads/stores.
 Historical setup failures and superseded intermediate timing are retained in
 Git/evidence history. No intermediate result is substituted for the matched
 controls above. Framework/model integration has a separate timing boundary.
-

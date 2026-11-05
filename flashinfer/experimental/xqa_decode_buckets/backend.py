@@ -656,4 +656,3 @@ def run(
         plan.query_tile,
     )
     return out
-

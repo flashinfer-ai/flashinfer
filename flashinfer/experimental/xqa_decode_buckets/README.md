@@ -198,4 +198,3 @@ M32 R6/P32 persistent/aligned use 219/228 registers with a 112-byte stack.
 Retained compiler qualification reports zero spill loads/stores. The plan's
 `resources` tuple reports registers, shared bytes, local bytes and resident CTAs
 for the actual compiled kernel; local-byte counts alone do not establish spills.
-
