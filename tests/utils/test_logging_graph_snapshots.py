@@ -178,6 +178,33 @@ def test_graph_snapshot_aliases_cpu(snapshot_logging, monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_eager_snapshot_aliases_safetensors_cpu(snapshot_logging, monkeypatch):
+    safetensors = pytest.importorskip("safetensors.torch")
+    logging, root = snapshot_logging
+    monkeypatch.setattr(logging, "_DUMP_SAFETENSORS", True)
+    logged_op = logging.flashinfer_api(inspect.unwrap(_graph_snapshot_alias_op))
+    x = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    before = x.clone()
+    assert logged_op(x, x, x[:, ::2], x[:, 1::2]) is None
+    after = x.clone()
+    call = _calls(root, "_graph_snapshot_alias_op")[0]
+    inputs = safetensors.load_file(str(call / "inputs.safetensors"))
+    outputs = safetensors.load_file(str(call / "outputs.safetensors"))
+    assert _metadata(call)["execution_status"] == "completed"
+    torch.testing.assert_close(inputs["arg_0"], before, rtol=0, atol=0)
+    torch.testing.assert_close(outputs["mutated_input__arg_0"], after, rtol=0, atol=0)
+    _assert_none_replay(logging, call, "cpu")
+    outputs["mutated_input__arg_0"].add_(10)
+    safetensors.save_file(outputs, str(call / "outputs.safetensors"))
+    replay = logging.replay_from_dump(
+        str(call), device="cpu", run=True, compare_outputs=True
+    )
+    assert "execution_error" not in replay, replay.get("execution_error")
+    assert "execution_result" in replay and replay["execution_result"] is None
+    assert replay["comparison_match"] is False
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("snapshot_logging", [False], indirect=True)
 def test_graph_snapshot_default_off_cpu(snapshot_logging, monkeypatch):
     """Opt-out keeps legacy references and never allocates snapshot buffers."""
