@@ -190,6 +190,11 @@ _FP8_ONE_PARTITION_MAX_WIDTH = 384
 # The M64 bindings take items of at most 1152 sparse slots (SWA 128 + 1024);
 # mirrors their ``sparse_topk <= 1152`` check.
 _FP8_M64_MAX_WIDTH = 1152
+# The FP8 low-head prefill producer stages an item's sparse indices in a
+# shared-memory buffer of 1152 slots (nine tiles of 128).  A wider item
+# writes past that buffer and past the dynamic shared memory, and its
+# binding does not check the width.
+_FP8_LOWHEAD_PREFILL_MAX_WIDTH = 1152
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 # Workspaces whose split-merge counter region is known to be zero:
@@ -1275,10 +1280,15 @@ def _route(
                 # 1152 and 2048 x 128 / 640 / 1152: 1.87-4.66x (one
                 # 257-token request at width 128: 10.50 -> 5.61 us; two
                 # 1024-token requests at width 1152: 318.4 -> 68.4 us), with
-                # the same oracle.  Wider items, which the M64 bindings
-                # reject, and other architectures (unmeasured there) keep the
-                # low-head prefill producer for 8-head prefill rows.
+                # the same oracle.  Other architectures (unmeasured there)
+                # keep the low-head prefill producer for 8-head prefill rows.
                 return _fp8_h64_m64_program(sparse_topk)
+            if sparse_topk > _FP8_LOWHEAD_PREFILL_MAX_WIDTH:
+                raise ValueError(
+                    f"backend='cake' has no FP8 kernel for {num_heads} heads "
+                    f"with sparse_topk {sparse_topk} > "
+                    f"{_FP8_LOWHEAD_PREFILL_MAX_WIDTH} at max_q_len >= 257"
+                )
             return "fp8_lowhead_prefill"
         if (
             num_heads in (8, 16)
