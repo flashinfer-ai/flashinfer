@@ -4272,6 +4272,7 @@ def make_plan(
                     f"gemm_tuning dx split={explicit_f}: the split-tail form runs 1 .. W of a chunk's W wide dX items "
                     f"as half items; the chunk of {rows_c} rows has W = {wide}"
                 )
+
     def variants_of(slices_: tuple[int, ...]) -> tuple[ChunkVariants, ...]:
         if arch is None and not tuning:
             return ()

@@ -7256,7 +7256,9 @@ def test_counted_plan_runs_no_one_slice_dx_chunk():
                 assert 1 not in plan.dx_slices, case
             else:
                 assert plan.dx_slices == plain.dx_slices, case
-            raised[arch] += sum(x != y for x, y in zip(plan.dx_slices, plain.dx_slices))
+            raised[arch] += sum(
+                x != y for x, y in zip(plan.dx_slices, plain.dx_slices, strict=True)
+            )
     assert raised["sm_100a"] and raised["sm_103a"] and not raised["sm_107a"], raised
     problem = _keep_problem(8117, GLM_H, GLM_V, 4096, entry="logprob")
     tiny_g = b.Geometry.from_record({"geometry": {"hidden": GLM_H, "vocab": g.k_block}})
@@ -7397,8 +7399,7 @@ def test_plan_counts_the_short_last_chunk_of_a_long_call():
         )
         assert old.variants[:-1] == plan.variants[:-1]
         assert (
-            dataclasses.replace(old.variants[-1], dw_cast_tma=True)
-            == plan.variants[-1]
+            dataclasses.replace(old.variants[-1], dw_cast_tma=True) == plan.variants[-1]
         )
         assert old.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
         assert set(old.stages) == (
