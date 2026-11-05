@@ -328,7 +328,11 @@ kernel_cake_gdn_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, __nv_
         if (warp == 0) {
             uint32_t _elected_1 = elect_sync();
             asm volatile("{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %0, 0;\n\t@leader tcgen05.fence::after_thread_sync;\n\t}\n" :: "r"(_elected_1));
+#if __CUDA_ARCH__ == 1070
+            int _mma_kn_lo = ((s_kn_addr) >> 4) & 0x7FFF;
+#else
             int _mma_kn_lo = ((s_kn_addr) >> 4) & 0x3FFF;
+#endif
             asm volatile(
             "{\n\t"
             ".reg .pred leader, p0, p1;\n\t"
@@ -3591,8 +3595,13 @@ kernel_cake_gdn_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, __nv_
     if (warp == 1) {
         uint32_t _elected_83 = elect_sync();
         asm volatile("{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %0, 0;\n\t@leader tcgen05.fence::after_thread_sync;\n\t}\n" :: "r"(_elected_83));
+#if __CUDA_ARCH__ == 1070
+        int _mma_a_lo = ((s_a_addr) >> 4) & 0x7FFF;
+        int _smem_desc_lo_84 = (((s_knT0_addr) >> 4) & 0x7FFF) | 0x2000000;
+#else
         int _mma_a_lo = ((s_a_addr) >> 4) & 0x3FFF;
         int _smem_desc_lo_84 = (((s_knT0_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
         asm volatile(
             "{\n\t"
             ".reg .pred leader, p0, p1;\n\t"
@@ -3627,7 +3636,11 @@ kernel_cake_gdn_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, __nv_
             "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo), "r"(_smem_desc_lo_84), "r"(tmem_acc_cols), "r"(0), "r"(_elected_83) : "memory");
+#if __CUDA_ARCH__ == 1070
+        int _smem_desc_lo_85 = (((s_knT1_addr) >> 4) & 0x7FFF) | 0x2000000;
+#else
         int _smem_desc_lo_85 = (((s_knT1_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
         asm volatile(
             "{\n\t"
             ".reg .pred leader, p0, p1;\n\t"
@@ -4022,8 +4035,13 @@ kernel_cake_gdn_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, __nv_
     if (warp == 2) {
         uint32_t _elected_95 = elect_sync();
         asm volatile("{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %0, 0;\n\t@leader tcgen05.fence::after_thread_sync;\n\t}\n" :: "r"(_elected_95));
+#if __CUDA_ARCH__ == 1070
+        int _mma_a_lo_1 = ((s_a_addr) >> 4) & 0x7FFF;
+        int _smem_desc_lo_96 = (((s_vT0_addr) >> 4) & 0x7FFF) | 0x2000000;
+#else
         int _mma_a_lo_1 = ((s_a_addr) >> 4) & 0x3FFF;
         int _smem_desc_lo_96 = (((s_vT0_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
         asm volatile(
             "{\n\t"
             ".reg .pred leader, p0, p1;\n\t"
@@ -4058,7 +4076,11 @@ kernel_cake_gdn_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, __nv_
             "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_1), "r"(_smem_desc_lo_96), "r"(tmem_acc_cols), "r"(0), "r"(_elected_95) : "memory");
+#if __CUDA_ARCH__ == 1070
+        int _smem_desc_lo_97 = (((s_vT1_addr) >> 4) & 0x7FFF) | 0x2000000;
+#else
         int _smem_desc_lo_97 = (((s_vT1_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
         asm volatile(
             "{\n\t"
             ".reg .pred leader, p0, p1;\n\t"

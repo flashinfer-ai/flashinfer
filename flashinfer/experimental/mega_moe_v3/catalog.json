@@ -2102,7 +2102,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "4ba351596bba85fad6438186e2f2e11b3ce16fd7893d4f0b90481cfc0f204255",
+   "closure_sha256": "cea538117465720d322885a8300791e5ae8f735e61da9be2a53f7b7dab47c03e",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a",
@@ -2357,7 +2357,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "fc2a5bb5ae1202309c53995d61db923a9faa9a50984bd11c9828e83b8bf3a315",
+   "closure_sha256": "05458da70b6d493b4b8db02c8e9e48c9958dcc8f31ad409e73132038d380b287",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a",
@@ -3887,7 +3887,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "2bb09f47b495079a750b9fd1cd3f5a15935bfd86adf54c1bf2e061b9855af118",
+   "closure_sha256": "eb2d7b63ba6fded6cd565c7f10c115806d9cf577962ae8325c812c13530aeda5",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -4140,7 +4140,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "378739973b51e5dfdae011d54aa7351b355e7a2547a015ef14aa59092a816036",
+   "closure_sha256": "f87649f9aa9b7ebc06cfbf88bf64735620ad806a0d91a3ec0499dae622a0fb83",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a",
@@ -4395,7 +4395,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "82c51ca327bd55131140a7a7f0f87bae67dc73ed557860e5661dea96bc7b312b",
+   "closure_sha256": "990cdd0be58bb80fca6bfc7c1f7fdb96bec729b689ceb73ce5c194099251226a",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -8474,7 +8474,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "3beaf467a11cc27f1a40c53916af9abe6e838efded6efb20ff3ed6bfdc2dc9b7",
+   "closure_sha256": "c839493873a72c9f42e961c5ae264833392727597987ce64b7f6b9f06dc5db60",
    "compile_flags": [
     "--use_fast_math"
    ],

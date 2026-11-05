@@ -27,6 +27,7 @@ from typing import (
     Dict,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -479,6 +480,203 @@ def is_trtllm_moe_supported(
     ]:
         return False
     return True
+
+
+_TRTLLM_MOE_PAD_HIDDEN_ALIGNMENT = 512
+_TRTLLM_MOE_PAD_INTERMEDIATE_ALIGNMENT = 128
+
+
+class TrtllmMoePaddedWeights(NamedTuple):
+    """Result of :func:`pad_trtllm_moe_weights`.
+
+    ``hidden_size`` and ``intermediate_size`` are the padded sizes the tensors
+    now have (pad the activations to ``hidden_size`` and pass
+    ``intermediate_size`` to the MoE op); ``valid_hidden_size`` and
+    ``valid_intermediate_size`` are the original sizes to pass as the op's
+    ``valid_hidden_size`` / ``valid_intermediate_size``.
+    """
+
+    gemm1_weights: torch.Tensor
+    gemm1_weights_scale: torch.Tensor
+    gemm2_weights: torch.Tensor
+    gemm2_weights_scale: torch.Tensor
+    hidden_size: int
+    intermediate_size: int
+    valid_hidden_size: int
+    valid_intermediate_size: int
+
+
+def _pad_bytes(t: torch.Tensor, dim: int, size: int, fill: int) -> torch.Tensor:
+    u8 = t.view(torch.uint8)
+    pad = size - u8.shape[dim]
+    if pad < 0:
+        raise ValueError(f"cannot pad dim {dim} of {tuple(t.shape)} down to {size}")
+    if pad == 0:
+        return t
+    shape = list(u8.shape)
+    shape[dim] = pad
+    tail = torch.full(shape, fill, dtype=torch.uint8, device=t.device)
+    return torch.cat([u8, tail], dim=dim).view(t.dtype)
+
+
+def pad_trtllm_moe_weights(
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    *,
+    is_gated_act: bool = True,
+    hidden_alignment: int = _TRTLLM_MOE_PAD_HIDDEN_ALIGNMENT,
+    intermediate_alignment: int = _TRTLLM_MOE_PAD_INTERMEDIATE_ALIGNMENT,
+) -> TrtllmMoePaddedWeights:
+    r"""Zero-pad block-scaled MoE expert weights to the sizes the trtllm-gen kernels accept.
+
+    The trtllm-gen fused MoE kernels (:func:`trtllm_fp8_block_scale_moe` with
+    MxFP8, :func:`trtllm_fp4_block_scale_moe` with NVFP4 or MxFP4) need
+    ``intermediate_size`` to be a multiple of 128 and ``hidden_size`` to be a
+    multiple of the GEMM1 K tile.  Models whose expert dimensions are not
+    (Nemotron Nano: hidden 2688, intermediate 1856, or 928 at TP2) pad their
+    weights and declare the real sizes through ``valid_hidden_size`` and
+    ``valid_intermediate_size``; GEMM2 then computes ``roundUp(hidden, 128)``
+    columns and the finalized output is cropped to the valid width.  This helper
+    performs that padding on already quantized weights and their block scales.
+
+    Weights are padded with zeros and block scales with the neutral scale of
+    their format (E8M0 ``127`` = 1.0 for the 32-element MX blocks, E4M3 ``1.0``
+    for the 16-element NVFP4 blocks), so a padded element dequantizes to zero.
+    The kernels read each padded dimension only up to ``roundUp(valid, 128)``,
+    so that stretch of the pad must dequantize to zero and the rest is never read.
+    For gated activations the gate and up halves of ``gemm1_weights`` are
+    padded independently, so the padded tensor is still
+    ``[gate (intermediate_size rows); up (intermediate_size rows)]`` with the
+    padded ``intermediate_size``.  Pass the result through the usual shuffle
+    helpers (:func:`reorder_rows_for_gated_act_gemm`,
+    :func:`~flashinfer.shuffle_matrix_a`, :func:`~flashinfer.shuffle_matrix_sf_a`
+    or the permute-index helpers) exactly as you would unpadded weights.
+
+    Parameters
+    ----------
+    gemm1_weights : torch.Tensor
+        FC1 weights ``[num_experts, F * intermediate_size, hidden_size / elems_per_byte]``
+        in row-major (unshuffled) layout, one byte per element (``float8_e4m3fn``
+        or ``uint8``); packed FP4 holds two elements per byte.  ``F`` is 2 for
+        gated activations and 1 otherwise.
+    gemm1_weights_scale : torch.Tensor
+        FC1 block scales ``[num_experts, F * intermediate_size, hidden_size / sf_vec_size]``
+        in linear (non-interleaved) layout, one byte per scale.
+    gemm2_weights : torch.Tensor
+        FC2 weights ``[num_experts, hidden_size, intermediate_size / elems_per_byte]``.
+    gemm2_weights_scale : torch.Tensor
+        FC2 block scales ``[num_experts, hidden_size, intermediate_size / sf_vec_size]``.
+    hidden_size : int
+        The model's (unpadded) hidden size.  Must be a multiple of ``sf_vec_size``.
+    intermediate_size : int
+        The model's (unpadded) per-rank intermediate size.  Must be a multiple of
+        ``sf_vec_size``.
+    is_gated_act : bool
+        Whether FC1 holds gate and up projections (``F = 2``).  Default ``True``.
+    hidden_alignment : int
+        Alignment of the padded hidden size (GEMM1's K).  Default ``512``.  Must
+        be a multiple of 256 for MxFP8 and NVFP4 (128 is rejected or gives
+        wrong results).
+    intermediate_alignment : int
+        Alignment of the padded intermediate size.  Default ``128``.
+
+    Returns
+    -------
+    TrtllmMoePaddedWeights
+        The padded tensors plus the padded and valid sizes.  ``gemm2_weights``
+        and ``gemm2_weights_scale`` have ``roundUp(hidden_size, 128)`` rows, which
+        is GEMM2's N when ``valid_hidden_size`` is given; ``gemm1_weights`` has
+        ``roundUp(hidden_size, hidden_alignment)`` columns, which is the width
+        to zero-pad the activations to.
+    """
+    if hidden_alignment % 128 or intermediate_alignment % 128:
+        raise ValueError(
+            "hidden_alignment and intermediate_alignment must be multiples of 128"
+        )
+    for name, t in (
+        ("gemm1_weights", gemm1_weights),
+        ("gemm1_weights_scale", gemm1_weights_scale),
+        ("gemm2_weights", gemm2_weights),
+        ("gemm2_weights_scale", gemm2_weights_scale),
+    ):
+        if t.dim() != 3 or t.element_size() != 1:
+            raise ValueError(
+                f"{name} must be a 3-D tensor with one byte per element, got {t.shape} {t.dtype}"
+            )
+    factor = 2 if is_gated_act else 1
+    num_experts, rows1, cols1 = gemm1_weights.shape
+    if rows1 != factor * intermediate_size:
+        raise ValueError(
+            f"gemm1_weights has {rows1} rows, expected {factor} * {intermediate_size}"
+        )
+    if hidden_size % cols1 or hidden_size // cols1 not in (1, 2):
+        raise ValueError(
+            f"gemm1_weights has {cols1} columns for hidden_size {hidden_size}; expected 1 or 2 elements per byte"
+        )
+    elems_per_byte = hidden_size // cols1
+    sf_cols1 = gemm1_weights_scale.shape[2]
+    if hidden_size % sf_cols1 or hidden_size // sf_cols1 not in (16, 32):
+        raise ValueError(
+            f"gemm1_weights_scale has {sf_cols1} columns for hidden_size {hidden_size}; expected 16 or 32 elements per scale"
+        )
+    sf_vec_size = hidden_size // sf_cols1
+    if intermediate_size % sf_vec_size or intermediate_size % elems_per_byte:
+        raise ValueError(
+            f"intermediate_size {intermediate_size} must be a multiple of the scale block {sf_vec_size}"
+        )
+    if tuple(gemm1_weights_scale.shape[:2]) != (num_experts, rows1):
+        raise ValueError(
+            f"gemm1_weights_scale {tuple(gemm1_weights_scale.shape)} does not match gemm1_weights {tuple(gemm1_weights.shape)}"
+        )
+    if tuple(gemm2_weights.shape) != (
+        num_experts,
+        hidden_size,
+        intermediate_size // elems_per_byte,
+    ):
+        raise ValueError(
+            f"gemm2_weights must be [{num_experts}, {hidden_size}, {intermediate_size // elems_per_byte}], got {tuple(gemm2_weights.shape)}"
+        )
+    if tuple(gemm2_weights_scale.shape) != (
+        num_experts,
+        hidden_size,
+        intermediate_size // sf_vec_size,
+    ):
+        raise ValueError(
+            f"gemm2_weights_scale must be [{num_experts}, {hidden_size}, {intermediate_size // sf_vec_size}], got {tuple(gemm2_weights_scale.shape)}"
+        )
+
+    # E8M0 127 and E4M3 0x38 both encode 1.0.
+    neutral_scale = 127 if sf_vec_size == 32 else 0x38
+    padded_hidden = _round_up(hidden_size, hidden_alignment)
+    gemm2_rows = _round_up(hidden_size, _TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT)
+    padded_intermediate = _round_up(intermediate_size, intermediate_alignment)
+
+    def pad_fc1(t: torch.Tensor, cols: int, fill: int) -> torch.Tensor:
+        halves = torch.chunk(t, factor, dim=1)
+        halves = [_pad_bytes(h, 1, padded_intermediate, fill) for h in halves]
+        return _pad_bytes(torch.cat(halves, dim=1), 2, cols, fill)
+
+    def pad_fc2(t: torch.Tensor, cols: int, fill: int) -> torch.Tensor:
+        return _pad_bytes(_pad_bytes(t, 1, gemm2_rows, fill), 2, cols, fill)
+
+    return TrtllmMoePaddedWeights(
+        gemm1_weights=pad_fc1(gemm1_weights, padded_hidden // elems_per_byte, 0),
+        gemm1_weights_scale=pad_fc1(
+            gemm1_weights_scale, padded_hidden // sf_vec_size, neutral_scale
+        ),
+        gemm2_weights=pad_fc2(gemm2_weights, padded_intermediate // elems_per_byte, 0),
+        gemm2_weights_scale=pad_fc2(
+            gemm2_weights_scale, padded_intermediate // sf_vec_size, neutral_scale
+        ),
+        hidden_size=padded_hidden,
+        intermediate_size=padded_intermediate,
+        valid_hidden_size=hidden_size,
+        valid_intermediate_size=intermediate_size,
+    )
 
 
 def _maybe_get_cached_w3_w1_permute_indices(
@@ -1320,7 +1518,7 @@ def cutlass_fused_moe(
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
-    use_fused_finalize: bool = True,
+    use_fused_finalize: Optional[bool] = None,
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     *,
@@ -1478,11 +1676,15 @@ def cutlass_fused_moe(
         communication where the scaling factors are received in linear (non-swizzled) format.
         Only relevant when input_sf is not None.
 
-    use_fused_finalize : bool = True
+    use_fused_finalize : Optional[bool]
         Whether to fuse the top-k expert reduction ("finalize") into the GEMM2 epilogue.
-        Defaults to True for best performance. The fused epilogue reduces expert outputs via
-        non-associative atomics, so results are not deterministic run-to-run. Set to
-        False to use the non-fused, deterministic finalize path.
+        The fused epilogue reduces expert outputs via non-associative atomics, so results
+        are not deterministic run-to-run. Set to False to use the non-fused, deterministic
+        finalize path. When ``None`` (default) the fused path is used unless
+        ``torch.are_deterministic_algorithms_enabled()`` is true, in which case the
+        autotuner never offers or replays a fused-finalize GEMM2 tactic. An explicit
+        True or False always wins. The flag is part of the autotune cache key, so pass the
+        same resolved value to :func:`cutlass_fused_moe_workspace_size`.
 
     profile_ids : Optional[List[int]]
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
@@ -1547,6 +1749,8 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    if use_fused_finalize is None:
+        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     # Reject an unhonorable pinned recipe before any device work. The NVFP4
     # test mirrors the binding's isNvfp4Quant() plus the W4A16 flag.
     is_nvfp4 = (
@@ -1720,7 +1924,7 @@ def cutlass_fused_moe_workspace_size(
     use_deepseek_fp8_block_scale: bool = False,
     use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
-    use_fused_finalize: bool = True,
+    use_fused_finalize: Optional[bool] = None,
     use_packed_weights: bool = False,
     use_wfp4afp8_humming: bool = False,
     device: Optional[torch.device] = None,
@@ -1754,6 +1958,10 @@ def cutlass_fused_moe_workspace_size(
         Input and weight dtypes, used to select the kernel runner.
     output_dtype : torch.dtype, optional
         Output dtype (default: ``torch.bfloat16``).
+    use_fused_finalize : Optional[bool]
+        Must match the value :func:`cutlass_fused_moe` resolves to. ``None``
+        (default) follows the same rule: fused unless
+        ``torch.are_deterministic_algorithms_enabled()`` is true.
     device : torch.device, optional
         CUDA device on which the workspace will be used. Defaults to the
         current CUDA device.
@@ -1767,6 +1975,8 @@ def cutlass_fused_moe_workspace_size(
         ``"cake"`` returns the prepared SiTU scratch size using host metadata
         only. It requires BF16/uint8, TP8, SiTU and the documented fixed geometry.
     """
+    if use_fused_finalize is None:
+        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 
@@ -6206,12 +6416,27 @@ def trtllm_fp8_block_scale_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For MxFP8 the padded
+        ``hidden_size`` must be a multiple of 256 (128 is rejected).  Default
+        ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+
+        The kernels tile expert weights in 128-row blocks, so
+        ``intermediate_size`` (and with it the FC1 row count ``M``) must be a
+        multiple of ``128``; a model dimension that is not (``1856``, ``928``)
+        is supported by padding and declaring, not by passing it directly.
+        Zero-pad the weights to a multiple of ``128`` (the gate and up halves
+        of FC1 separately, so the rows stay ``[gate; up]`` at the padded
+        size), fill the padded block scales with a neutral finite value
+        (E8M0 ``127``, i.e. ``2**0``, for MXFP8; ``1.0`` for the ``float32``
+        DeepSeek scales), pass the padded size as ``intermediate_size`` and
+        the real one here.  The kernel reads the ``[valid, roundUp(valid, 128))``
+        stretch of the padding and never reads the rest, so it must hold zeros and
+        finite scales.  ``hidden_size`` follows the same rule through
+        ``valid_hidden_size``.
     gemm1_bias : Optional[torch.Tensor]
         Optional FC1 bias, float32 (keyword-only).  Shape is
         ``[local_num_experts, 2 * intermediate_size]`` for gated activations
@@ -6486,8 +6711,9 @@ def trtllm_fp8_block_scale_routed_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For MxFP8 the padded
+        ``hidden_size`` must be a multiple of 256 (128 is rejected).  Default
+        ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
@@ -6800,12 +7026,27 @@ def trtllm_fp4_block_scale_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For NVFP4 the padded
+        ``hidden_size`` must be a multiple of 256 (128 gives wrong results).
+        Default ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+
+        The kernels tile expert weights in 128-row blocks, so
+        ``intermediate_size`` (and with it the FC1 row count ``M``) must be a
+        multiple of ``128``; a model dimension that is not (``1856``, ``928``)
+        is supported by padding and declaring, not by passing it directly.
+        Zero-pad the weights to a multiple of ``128`` (the gate and up halves
+        of FC1 separately, so the rows stay ``[gate; up]`` at the padded
+        size), fill the padded block scales with a neutral finite value
+        (E8M0 ``127``, i.e. ``2**0``, for MXFP4; E4M3 ``1.0`` for NVFP4),
+        pass the padded size as ``intermediate_size`` and the real one here.
+        The kernel reads the ``[valid, roundUp(valid, 128))``
+        stretch of the padding and never reads the rest, so it must hold zeros and
+        finite scales.  ``hidden_size`` follows the same rule through
+        ``valid_hidden_size``.
     workspace_buffer : Optional[torch.Tensor]
         Caller-owned 1-D ``uint8`` CUDA buffer of at least
         :func:`trtllm_fused_moe_workspace_size` bytes. When given, the launch
@@ -7090,8 +7331,9 @@ def trtllm_fp4_block_scale_routed_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For NVFP4 the padded
+        ``hidden_size`` must be a multiple of 256 (128 gives wrong results).
+        Default ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is

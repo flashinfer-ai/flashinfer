@@ -26,7 +26,9 @@ limitations under the License.
 # Every entry point takes ``deterministic: bool = True`` and raises
 # ``ValueError`` unless it is ``False``.  The forward pass, the activation
 # gradient and the 256-wide k tile's weight gradient run copies of the
-# deterministic programs (the same bits); the 512-wide k tile's weight
+# deterministic programs, but for the sm_100a activation gradient's L2
+# evict-first twin, this package's own build of the deterministic wide tile
+# (all of them the same bits); the 512-wide k tile's weight
 # gradient adds its split tail in place with unordered fp32 reductions, so its
 # ``dW`` is not bitwise reproducible run to run (``cake_backend``, numerical
 # mode).  Under ``torch.use_deterministic_algorithms(True)`` the weight
@@ -139,8 +141,9 @@ def grouped_gemm_dgrad(
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  ``deterministic`` must be ``False``; the
-    programs are copies of the deterministic package's and give its bits.  See
-    ``grouped_gemm_fwd`` for the prepared form.
+    programs are copies of the deterministic package's, but for the sm_100a
+    evict-first twin, this package's own build of the deterministic wide tile,
+    and all give its bits.  See ``grouped_gemm_fwd`` for the prepared form.
     """
     from .cake_backend import _require_deterministic_false, prepare_grouped_gemm_dgrad
 

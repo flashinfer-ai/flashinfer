@@ -17,7 +17,10 @@ from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
     supported_nk,
 )
 from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
+    _SM107A_CELLS,
     _TABLE,
+    _cell_tag,
+    _em4,
     PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
@@ -419,6 +422,114 @@ def test_out_of_band_problems_raise():
         )
 
 
+# The 256-byte L2 promotion of the N=4096, K=7168 band on sm_103a, scoped to problems of at most two M tiles per group:
+# arch -> (promoted program, the band's program, in-class (groups, m, expected_m), just outside).
+_L2_SCOPE = {
+    "sm_103a": (
+        "cake_batch_deepgemm_fp8_d5517b631a2ffbb3e9eb",
+        "cake_batch_deepgemm_fp8_0db53ce746a8da419343",
+        ((4, 768, 192), (12, 768, 192)),
+        ((2, 1024, 512),),
+    ),
+}
+
+
+def test_l2_promotion_takes_only_problems_of_at_most_two_m_tiles():
+    device = torch.device("cuda")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = device_arch(index)
+    sm_count = device_sm_count(index)
+    if arch not in _L2_SCOPE:
+        pytest.skip(f"no L2-promoted band program on {arch}")
+    promoted, band, inside, outside = _L2_SCOPE[arch]
+    for groups, m, expected_m in inside + outside:
+        plan = select_route(arch, sm_count, groups, m, 4096, 7168, expected_m)
+        want = promoted if (groups, m, expected_m) in inside else band
+        assert plan is not None and [s.program for s in plan.stages] == [want], (
+            groups,
+            m,
+            expected_m,
+        )
+        a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+            groups, m, 4096, 7168, seed=926, device=device, masked=[expected_m] * groups
+        )
+        prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, masked_m, expected_m
+        )
+        assert prepared.programs == (want,)
+        out = prepared.launch()
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(
+            out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+        )
+
+
+# The swap-AB BLOCK_M 128 points: arch -> (the program they take, the (B, M, N, K) points). On SM100a the build that
+# prefetches masked_m into L2 at entry; on SM103a the build without it.
+_SWAP_BM_POINTS = {
+    "sm_100a": (
+        "cake_batch_deepgemm_fp8_c65607eda6318e4ba622",
+        (
+            (1, 1024, 7168, 2048),
+            (4, 128, 7168, 2048),
+            (4, 256, 7168, 2048),
+            (8, 128, 4096, 7168),
+            (8, 128, 7168, 2048),
+            (8, 256, 4096, 7168),
+            (64, 128, 4096, 7168),
+            (64, 256, 4096, 7168),
+            (64, 256, 7168, 2048),
+            (128, 128, 4096, 7168),
+            (128, 128, 7168, 2048),
+        ),
+    ),
+    "sm_103a": (
+        "cake_batch_deepgemm_fp8_f239d5b14db9706be968",
+        (
+            (1, 8192, 4096, 7168),
+            (8, 128, 4096, 7168),
+            (8, 256, 7168, 2048),
+            (64, 256, 4096, 7168),
+            (64, 256, 7168, 2048),
+        ),
+    ),
+}
+
+
+def test_swap_bm_points_take_the_architecture_program():
+    device = torch.device("cuda")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = device_arch(index)
+    sm_count = device_sm_count(index)
+    if arch not in _SWAP_BM_POINTS:
+        pytest.skip(f"no swap-AB BLOCK_M 128 point on {arch}")
+    program, points = _SWAP_BM_POINTS[arch]
+    assert arch in PROGRAMS[program]["arches"]
+    for groups, m, n, k in points:
+        for expected_m in (1, m // 2, m):
+            plan = select_route(arch, sm_count, groups, m, n, k, expected_m)
+            assert plan is not None and [s.program for s in plan.stages] == [program], (
+                groups,
+                m,
+                n,
+                k,
+                expected_m,
+            )
+    groups, m, n, k = points[0]
+    a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(
+        groups, m, n, k, seed=937, device=device
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.programs == (program,)
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+
+
 def test_route_chain_covers_inventory_with_registered_programs():
     device = torch.device("cuda")
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -452,7 +563,8 @@ def _band_points(row):
     ids=lambda row: row.route,
 )
 def test_sm107a_band_boundaries_match_reference(row):
-    """Every end of every SM107a BLOCK_N band selects that band's program and matches the reference."""
+    """Every end of every SM107a BLOCK_N band selects that band's program, or the
+    (B, em4) cell that takes the problem first, and matches the reference."""
     if _arch() != "sm_107a":
         pytest.skip("the SM107a bands run on SM107a")
     device = torch.device("cuda")
@@ -467,8 +579,15 @@ def test_sm107a_band_boundaries_match_reference(row):
         prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, masked_m, rows
         )
-        assert prepared.route == row.route, (cta, prepared.route)
-        assert prepared.programs == (row.stages[0][0],)
+        tag = _cell_tag(n, k, 1, rows)
+        if tag is None:
+            assert prepared.route == row.route, (cta, prepared.route)
+            assert prepared.programs == (row.stages[0][0],)
+        else:
+            assert prepared.route == f"seed_masked_bn__n{n}_k{k}_cell_{tag}", (
+                cta,
+                prepared.route,
+            )
         out = prepared.launch()
         torch.cuda.synchronize()
         _assert_valid_rows_close(
@@ -476,3 +595,62 @@ def test_sm107a_band_boundaries_match_reference(row):
         )
         del a, b, out
         torch.cuda.empty_cache()
+
+
+def _cell_problem(nk, tag):
+    """The (B, expected_m) of the cell of ``tag`` with the fewest rows in all (B * em4),
+    with the smallest expected_m that falls in its em4 bin."""
+    groups, em4 = min(_SM107A_CELLS[nk][tag], key=lambda c: (c[0] * c[1], c))
+    expected_m = next(e for e in range(max(1, em4 - 2), em4 + 4) if _em4(e) == em4)
+    return groups, expected_m
+
+
+@pytest.mark.parametrize(
+    "row",
+    [row for row in _TABLE.get("sm_107a", ()) if row.form == "cell"],
+    ids=lambda row: row.route,
+)
+def test_sm107a_cells_match_reference(row):
+    """One cell of every SM107a (B, em4) cell row selects that row's program and matches the reference."""
+    if _arch() != "sm_107a":
+        pytest.skip("the SM107a cells run on SM107a")
+    device = torch.device("cuda")
+    nk, tag = row.where["nk"], row.where["tag"]
+    n, k = nk
+    groups, expected_m = _cell_problem(nk, tag)
+    m = 128 * ((expected_m + 127) // 128)
+    # Every group but the last holds expected_m rows; the last holds all M rows.
+    masked = [expected_m] * (groups - 1) + [m]
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=950, device=device, masked=masked
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.route == row.route, (groups, expected_m, prepared.route)
+    assert prepared.programs == (row.stages[0][0],)
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+
+
+def test_sm107a_cell_keys_and_nearest_fallback():
+    """Each cell key selects its tag; a key without a cell takes the nearest cell on
+    N=128 K=512 and N=512 K=128 and no cell on N=7168 K=2048."""
+    for nk, cells in _SM107A_CELLS.items():
+        for tag, keys in cells.items():
+            for groups, em4 in keys:
+                expected_m = next(
+                    e for e in range(max(1, em4 - 2), em4 + 4) if _em4(e) == em4
+                )
+                assert _cell_tag(*nk, groups, expected_m) == tag, (nk, groups, em4)
+    # (64, 1024) is as near (64, 128) as (8, 1024) with the same B * em4: the larger B wins.
+    assert (64, 1024) not in {
+        key for keys in _SM107A_CELLS[(128, 512)].values() for key in keys
+    }
+    assert _cell_tag(128, 512, 64, 1024) == _cell_tag(128, 512, 64, 128)
+    assert _cell_tag(128, 512, 1000, 1) is not None
+    assert _cell_tag(7168, 2048, 1000, 1) is None
+    assert _cell_tag(4096, 7168, 1, 128) is None

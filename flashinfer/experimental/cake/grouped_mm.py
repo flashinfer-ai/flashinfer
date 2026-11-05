@@ -35,7 +35,9 @@ Every entry point takes ``deterministic: bool = True``:
 
 Numerical contract of ``deterministic=False``: only the run-to-run bitwise
 reproducibility of the weight gradient ``dW`` is relaxed.  ``Y`` and ``dX`` are
-bitwise the deterministic package's (copies of the same programs), and so is
+bitwise the deterministic package's (copies of the same programs; on sm_100a the
+data gradient's L2 evict-first twin is the package's own build of the
+deterministic wide program, whose cache policy changes no arithmetic), and so is
 ``dW`` wherever the 256-wide k tile runs or the 512-wide k tile does not split
 its tail.  Every whole tile of ``dW`` is reduced by one CTA pair over the
 group's rows in a fixed order; only the units of a split tail tile are added
@@ -257,8 +259,10 @@ def grouped_gemm_dgrad(
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.
     ``K % 256 == 0`` and ``N % 64 == 0`` are required.  ``deterministic=True``
     (default) runs the deterministic package; ``False`` the non-deterministic
-    package's copy of the same programs (bitwise the same ``dX``); torch's
-    deterministic mode turns ``False`` into ``True`` with a one-time warning.
+    package's copy of the same programs (on sm_100a, where the evict-first rule
+    holds, its own build of the deterministic wide program with L2 evict-first
+    loads and stores; bitwise the same ``dX``); torch's deterministic mode turns
+    ``False`` into ``True`` with a one-time warning.
     """
     if _deterministic(deterministic, "grouped_gemm_dgrad"):
         from ..cake_moe_grouped_det_gemm import grouped_det_gemm_dgrad
