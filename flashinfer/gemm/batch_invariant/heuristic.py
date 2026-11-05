@@ -73,8 +73,17 @@ FAMILY_OF_CC = {(10, 0): "sm_100", (10, 3): "sm_103", (10, 7): "sm_107"}
 
 
 def family_of(cc: Tuple[int, int]) -> str:
-    """The architecture family of a compute capability; the API passes the operand device's."""
-    return FAMILY_OF_CC.get((int(cc[0]), int(cc[1])), "sm_107")
+    """The architecture family of a compute capability; the API passes the operand device's. The family selects the
+    block-scaled classes' instruction (`schedule.mx_class_for`), hence the bits, so an unlisted capability raises instead
+    of borrowing a family."""
+    from ...batch_invariant.support import BatchInvariantUnsupportedError
+
+    key = (int(cc[0]), int(cc[1]))
+    if key not in FAMILY_OF_CC:
+        raise BatchInvariantUnsupportedError(
+            f"batch_invariant: compute capability {key} is not a part of the mode; the parts are {sorted(FAMILY_OF_CC)}"
+        )
+    return FAMILY_OF_CC[key]
 
 
 # the co-resident cluster counts a device reported at run time, keyed (family, SM count); device-free callers use the table

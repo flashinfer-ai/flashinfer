@@ -1121,7 +1121,10 @@ def blockscaled_cluster_epilogue_loop(
                 apply_chain_pre_cvt(chain, tTR_rAcc, alpha)
                 acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                 tRS_rC.store(acc_vec.to(st.c_dtype))
-                c_buffer = s % st.num_c_stage
+                # the owner stores every C-th subtile (s = rank, rank + C, ...): the staging buffer follows its own store
+                # count, as the pipeline's stage does, not the global subtile index (which would map every store of this
+                # CTA to one buffer whenever C and the stage count share a factor, under a store still in flight)
+                c_buffer = (s // C) % st.num_c_stage
                 cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
                 cute.arch.fence_proxy("async.shared", space="cta")
                 sync.arrive_and_wait()
