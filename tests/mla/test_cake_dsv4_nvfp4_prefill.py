@@ -103,13 +103,21 @@ def _selection(gen, rows: int, width: int, pool_tokens: int, lens_rule: str):
 
 
 def _window_selection(
-    q_lens, width: int, pool_tokens: int, *, fresh: bool, drop_key: bool
+    q_lens,
+    width: int,
+    pool_tokens: int,
+    *,
+    fresh: bool,
+    drop_key: bool,
+    newest_first: bool = False,
 ):
     """Prefill sliding windows: request ``b`` holds pool rows ``[base_b, base_b + S_b)`` in KV
     order and its query ``q`` attends over the ``width`` positions ending at ``S_b - q_len + q``,
-    oldest first, so a token's window is the previous one shifted by one key. ``fresh`` prefills
-    from KV position 0 (windows grow over a request's first ``width`` tokens, -1 past the
-    length); ``drop_key`` masks one key in every window that holds it (a -1 inside the span)."""
+    oldest first, so a token's window is the previous one shifted by one key; ``newest_first``
+    holds the same keys newest first, as SGLang builds the table (column ``j`` holds position
+    ``pos - j``). ``fresh`` prefills from KV position 0 (windows grow over a request's first
+    ``width`` tokens, -1 past the length); ``drop_key`` masks one key in every window that holds
+    it (a -1 inside the span)."""
     rows = sum(q_lens)
     table = torch.full((rows, width), -1, dtype=torch.int32, device="cuda")
     lens = torch.zeros((rows,), dtype=torch.int32, device="cuda")
@@ -123,7 +131,7 @@ def _window_selection(
             keys = torch.arange(
                 base + first, base + pos + 1, device="cuda", dtype=torch.int32
             )
-            table[row, : keys.numel()] = keys
+            table[row, : keys.numel()] = keys.flip(0) if newest_first else keys
             lens[row] = keys.numel()
             row += 1
         base += seq_len
@@ -150,13 +158,14 @@ def _case(
     gen = torch.Generator(device="cuda").manual_seed(seed)
     rows = sum(q_lens)
     main_cache, main_rows = _pool(gen, pool_pages, page_size, layout, -0.05)
-    if lens_rule in ("window", "fresh_window"):
+    if lens_rule in ("window", "fresh_window", "newest_window"):
         main_idx, main_lens = _window_selection(
             q_lens,
             topk,
             main_rows.shape[0],
             fresh=lens_rule == "fresh_window",
             drop_key=drop_key,
+            newest_first=lens_rule == "newest_window",
         )
     else:
         main_idx, main_lens = _selection(gen, rows, topk, main_rows.shape[0], lens_rule)
@@ -517,6 +526,51 @@ _ROUTE_GRID = [
         dict(heads=32, topk=128, q_lens=(171, 341), lens_rule="window", pool_pages=32),
         "nvfp4_qb_h32_late_claim_prefill",
         id="h32-window-512-late-claim",
+    ),
+    pytest.param(
+        dict(
+            heads=16,
+            topk=128,
+            q_lens=(171, 341),
+            lens_rule="newest_window",
+            pool_pages=32,
+        ),
+        "nvfp4_qb_h16_breaks_prefill",
+        id="h16-newest-window-512-breaks",
+    ),
+    pytest.param(
+        dict(
+            heads=16,
+            topk=128,
+            q_lens=(683, 1365),
+            lens_rule="newest_window",
+            drop_key=True,
+            pool_pages=48,
+        ),
+        "nvfp4_qb_h16_prefill",
+        id="h16-newest-window-2048-dropped-key-qb",
+    ),
+    pytest.param(
+        dict(
+            heads=32,
+            topk=128,
+            q_lens=(149, 299),
+            lens_rule="newest_window",
+            pool_pages=32,
+        ),
+        "nvfp4_qb_h32_late_claim_prefill",
+        id="h32-newest-window-448-late-claim",
+    ),
+    pytest.param(
+        dict(
+            heads=32,
+            topk=128,
+            q_lens=(129, 257),
+            lens_rule="newest_window",
+            pool_pages=32,
+        ),
+        "nvfp4_qb_h32_prefill",
+        id="h32-newest-window-386-qb",
     ),
     pytest.param(
         dict(heads=32, topk=128, q_lens=(683, 1365), lens_rule="window", pool_pages=48),

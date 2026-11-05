@@ -281,15 +281,19 @@ _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL = "nvfp4_h64_q_prefetch_prefill"
 _NVFP4_VARIANT_H128_PREFILL = "nvfp4_h128_prefill"
 # Query-block bodies (16 / 32 heads, window-only rows: no extra table, a main table of at most 128
 # keys on a row stride of at least 128): one CTA item per block of 64 / H consecutive query tokens,
-# whose shifted windows are gathered and transformed once. ``breaks`` (16 heads) splits a block at a
-# sequence boundary through extra group items; ``late_claim`` (32 heads) holds back the next claim of
-# a CTA whose first block cannot share. Each serves the rows of at most the token count below.
+# whose shifted windows are gathered and transformed once (window tables oldest or newest key first,
+# as SGLang builds them). ``breaks`` (16 heads) splits a block at a sequence boundary through extra
+# group items, up to the token count below. ``late_claim`` (32 heads) holds back the next claim of a
+# CTA whose first block cannot share; it pays only while most CTAs take a second block, so it serves
+# the rows of at most the token count below whose blocks exceed 11 / 8 of the SMs (on GB300's 152
+# SMs: 420 to 512 tokens; the default build is 1-3 % faster on either side).
 _NVFP4_VARIANT_QB_H16_PREFILL = "nvfp4_qb_h16_prefill"
 _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL = "nvfp4_qb_h16_breaks_prefill"
 _NVFP4_VARIANT_QB_H32_PREFILL = "nvfp4_qb_h32_prefill"
 _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL = "nvfp4_qb_h32_late_claim_prefill"
 _NVFP4_QB_BREAKS_MAX_TOKENS = 1024
 _NVFP4_QB_LATE_CLAIM_MAX_TOKENS = 512
+_NVFP4_QB_LATE_CLAIM_MIN_BLOCKS_PER_SM = (11, 8)
 _NVFP4_QB_WINDOW = 128
 _NVFP4_PREFILL_VARIANTS = (
     _NVFP4_VARIANT_QB_H16_PREFILL,
@@ -3560,8 +3564,9 @@ def _nvfp4_prefill_route(
       most 128 keys on a row stride of at least 128) with more query tokens
       than SMs: the query-block bodies, one item per block of 64 / H tokens.
       16 heads take the ``breaks`` build up to 1024 tokens (plus its group
-      items), 32 heads the ``late_claim`` build up to 512 tokens, the default
-      build above. With at most as many tokens as SMs the blocks would leave
+      items), the default build above. 32 heads take the ``late_claim`` build
+      up to 512 tokens once their blocks exceed 11 / 8 of the SMs, the default
+      build otherwise. With at most as many tokens as SMs the blocks would leave
       most SMs idle, and the per-token body is faster.
     * Every other row of at most 32 heads: the per-token body's ``tmem_v``
       build, with ``early_gather`` at most as many tokens as SMs.
@@ -3589,7 +3594,11 @@ def _nvfp4_prefill_route(
                         blocks + _nvfp4_qb_group_ids(blocks),
                     )
                 return _NVFP4_VARIANT_QB_H16_PREFILL, blocks
-            if tokens <= _NVFP4_QB_LATE_CLAIM_MAX_TOKENS:
+            num, den = _NVFP4_QB_LATE_CLAIM_MIN_BLOCKS_PER_SM
+            if (
+                den * blocks > num * sm_count
+                and tokens <= _NVFP4_QB_LATE_CLAIM_MAX_TOKENS
+            ):
                 return _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL, blocks
             return _NVFP4_VARIANT_QB_H32_PREFILL, blocks
         if one_item_per_cta:

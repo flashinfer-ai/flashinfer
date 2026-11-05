@@ -402,8 +402,11 @@ def test_workspace_layout_lse_region_is_opt_in():
         (16, 200, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 50 + 7)),
         (16, 1025, 128, 0, 128, ("nvfp4_qb_h16_prefill", 257)),
         (16, 8192, 128, 0, 128, ("nvfp4_qb_h16_prefill", 2048)),
-        # 32 heads, window-only: late_claim to 512, then the block body.
+        # 32 heads, window-only: late_claim from 11 / 8 blocks per SM to 512 tokens, else the block body.
         (32, 128, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (32, 384, 128, 0, 128, ("nvfp4_qb_h32_prefill", 192)),
+        (32, 406, 128, 0, 128, ("nvfp4_qb_h32_prefill", 203)),
+        (32, 408, 128, 0, 128, ("nvfp4_qb_h32_late_claim_prefill", 204)),
         (32, 512, 128, 0, 128, ("nvfp4_qb_h32_late_claim_prefill", 256)),
         (32, 513, 128, 0, 128, ("nvfp4_qb_h32_prefill", 257)),
         (32, 2048, 128, 0, 128, ("nvfp4_qb_h32_prefill", 1024)),

@@ -597,7 +597,9 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                     int rest = smem_indices[(int)sm_index_stage * 528 + 512] > 1;
                     int tiles = ((smem_indices[(int)sm_index_stage * 528 + 512] > 1) ? 3 + 2 * (nb - smem_indices[(int)sm_index_stage * 528 + 512]) : 2 * nb);
                     int sm_lo = smem_indices[(int)sm_index_stage * 528 + 512 + (2 + 2 * (sm_head >> 4))];
-                    int sm_hi = sm_lo + smem_indices[(int)sm_index_stage * 528 + 512 + (3 + 2 * (sm_head >> 4))];
+                    int sm_span = smem_indices[(int)sm_index_stage * 528 + 512 + (3 + 2 * (sm_head >> 4))];
+                    int sm_hi = sm_lo + (sm_span & 65535);
+                    int sm_shift = sm_span >> 16;
                     int _parity_q_load_full = (int)((unsigned int)sm_item % 2);
                     mbarrier_wait(q_load_full_addr, _parity_q_load_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -671,9 +673,10 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(s_empty_addr + ((int)((unsigned int)(sm_tile_cursor + sm_tile) % 2)) * 8);
+                        int sm_c0 = sm_col0 - ((sm_tile >= 2) ? sm_shift : 0);
                         uint32_t _thresh_mask_0;
                         {
-                            int _lim_1 = sm_hi - sm_col0;
+                            int _lim_1 = sm_hi - sm_c0;
                             if (_lim_1 <= 0) { _thresh_mask_0 = 0u; }
                             else if (_lim_1 >= 32) { _thresh_mask_0 = 0xFFFFFFFFu; }
                             else {
@@ -686,7 +689,7 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                         }
                         uint32_t _thresh_mask_2;
                         {
-                            int _lim_3 = sm_lo - sm_col0;
+                            int _lim_3 = sm_lo - sm_c0;
                             if (_lim_3 <= 0) { _thresh_mask_2 = 0u; }
                             else if (_lim_3 >= 32) { _thresh_mask_2 = 0xFFFFFFFFu; }
                             else {
@@ -1633,7 +1636,7 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                         int bk_p1 = __shfl_up_sync(0xFFFFFFFF, bk_row[1], 1, 32);
                         int _min_6 = ((ix_b1 - ix_gb) < (8) ? (ix_b1 - ix_gb) : (8));
                         int _min_5 = ((_min_6 * 4) < (num_query_tokens - ix_gb * 4) ? (_min_6 * 4) : (num_query_tokens - ix_gb * 4));
-                        int bk_brk = (lane & 3) != 0 && lane < _min_5 && (int)(bk_len == 128 && bk_plen == 128 && bk_row[0] == bk_p1 || bk_plen < 128 && bk_row[0] == bk_p0) == 0;
+                        int bk_brk = (lane & 3) != 0 && lane < _min_5 && (int)(bk_len == 128 && bk_plen == 128 && bk_row[0] == bk_p1 || bk_plen < 128 && bk_row[0] == bk_p0 || (bk_plen < 128 || bk_len == 128) && bk_row[1] == bk_p0) == 0;
                         unsigned int ix_brk = __ballot_sync(0xFFFFFFFF, bk_brk != 0);
                         if (ix_brk != 0) {
                             int _find_msb_7;
@@ -1717,17 +1720,17 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                     int ix_cut_at = ix_n;
                     if ((ix_block & (int)((int)gridDim.x - (num_query_tokens + 3 >> 2) > 0)) != 0) {
                         if (3 < ix_n) {
-                            if ((int)(ix_len[3] == 128 && ix_len[2] == 128 && ix_rows[12] == ix_rows[9] || ix_len[2] < 128 && ix_rows[12] == ix_rows[8]) == 0) {
+                            if ((int)(ix_len[3] == 128 && ix_len[2] == 128 && ix_rows[12] == ix_rows[9] || ix_len[2] < 128 && ix_rows[12] == ix_rows[8] || (ix_len[2] < 128 || ix_len[3] == 128) && ix_rows[13] == ix_rows[8]) == 0) {
                                 ix_cut_at = 3;
                             }
                         }
                         if (2 < ix_n) {
-                            if ((int)(ix_len[2] == 128 && ix_len[1] == 128 && ix_rows[8] == ix_rows[5] || ix_len[1] < 128 && ix_rows[8] == ix_rows[4]) == 0) {
+                            if ((int)(ix_len[2] == 128 && ix_len[1] == 128 && ix_rows[8] == ix_rows[5] || ix_len[1] < 128 && ix_rows[8] == ix_rows[4] || (ix_len[1] < 128 || ix_len[2] == 128) && ix_rows[9] == ix_rows[4]) == 0) {
                                 ix_cut_at = 2;
                             }
                         }
                         if (1 < ix_n) {
-                            if ((int)(ix_len[1] == 128 && ix_len[0] == 128 && ix_rows[4] == ix_rows[1] || ix_len[0] < 128 && ix_rows[4] == ix_rows[0]) == 0) {
+                            if ((int)(ix_len[1] == 128 && ix_len[0] == 128 && ix_rows[4] == ix_rows[1] || ix_len[0] < 128 && ix_rows[4] == ix_rows[0] || (ix_len[0] < 128 || ix_len[1] == 128) && ix_rows[5] == ix_rows[0]) == 0) {
                                 ix_cut_at = 1;
                             }
                         }
@@ -1746,114 +1749,339 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                     if (3 >= ix_nb) {
                         ix_len[3] = 0;
                     }
-                    mbarrier_wait(index_empty_addr + (ix_stage) * 8, _phase_index_empty);
-                    unsigned int ix_stage_base = smem_indices_addr + ix_stage * 2112;
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(lane * 16)), "r"(ix_rows[0]), "r"(ix_rows[1]), "r"(ix_rows[2]), "r"(ix_rows[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(512 + lane * 16)), "r"(-1), "r"(-1), "r"(-1), "r"(-1) : "memory");
-                    __syncwarp();
-                    if (lane == 31) {
-                        smem_indices[(int)ix_stage * 528 + 127 + 1] = ((1 < ix_nb) ? ix_rows[7] : -1);
-                        smem_indices[(int)ix_stage * 528 + 127 + 2] = ((2 < ix_nb) ? ix_rows[11] : -1);
-                        smem_indices[(int)ix_stage * 528 + 127 + 3] = ((3 < ix_nb) ? ix_rows[15] : -1);
-                    }
-                    __syncwarp();
-                    int ix_bad = ix_len[0] != 128;
-                    int ix_bad0 = __any_sync(0xFFFFFFFF, ix_bad != 0);
-                    int ix_shared = ((ix_bad0 != 0) ? 1 : ix_nb);
-                    int ix_bad_i_0 = ix_len[3] != 128;
-                    #pragma unroll
-                    for (int ix_j_0 = 0; ix_j_0 < 4; ix_j_0++) {
-                        if (ix_rows[12 + ix_j_0] != smem_indices[(int)ix_stage * 528 + 3 + lane * 4 + ix_j_0]) {
+                    int ix_nf = __shfl_sync(0xFFFFFFFF, (int)(ix_rows[5] == ix_rows[0] && ix_rows[4] != ix_rows[1]), 0);
+                    if (ix_nf == 0) {
+                        mbarrier_wait(index_empty_addr + (ix_stage) * 8, _phase_index_empty);
+                        unsigned int ix_stage_base = smem_indices_addr + ix_stage * 2112;
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(lane * 16)), "r"(ix_rows[0]), "r"(ix_rows[1]), "r"(ix_rows[2]), "r"(ix_rows[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(512 + lane * 16)), "r"(-1), "r"(-1), "r"(-1), "r"(-1) : "memory");
+                        __syncwarp();
+                        if (lane == 31) {
+                            smem_indices[(int)ix_stage * 528 + 127 + 1] = ((1 < ix_nb) ? ix_rows[7] : -1);
+                            smem_indices[(int)ix_stage * 528 + 127 + 2] = ((2 < ix_nb) ? ix_rows[11] : -1);
+                            smem_indices[(int)ix_stage * 528 + 127 + 3] = ((3 < ix_nb) ? ix_rows[15] : -1);
+                        }
+                        __syncwarp();
+                        int ix_bad = ix_len[0] != 128;
+                        int ix_bad0 = __any_sync(0xFFFFFFFF, ix_bad != 0);
+                        int ix_shared = ((ix_bad0 != 0) ? 1 : ix_nb);
+                        int ix_bad_i_0 = ix_len[3] != 128;
+                        int ix_want = smem_indices[(int)ix_stage * 528 + 3 + lane * 4];
+                        if (!(ix_rows[12] == ix_want)) {
                             ix_bad_i_0 = 1;
                         }
-                    }
-                    int ix_vote_i_0 = __any_sync(0xFFFFFFFF, ix_bad_i_0 != 0);
-                    if (3 < ix_shared && ix_vote_i_0 != 0) {
-                        ix_shared = 3;
-                    }
-                    int ix_bad_i_1 = ix_len[2] != 128;
-                    #pragma unroll
-                    for (int ix_j_1 = 0; ix_j_1 < 4; ix_j_1++) {
-                        if (ix_rows[8 + ix_j_1] != smem_indices[(int)ix_stage * 528 + 2 + lane * 4 + ix_j_1]) {
+                        int ix_want_0 = smem_indices[(int)ix_stage * 528 + 3 + lane * 4 + 1];
+                        if (!(ix_rows[13] == ix_want_0)) {
+                            ix_bad_i_0 = 1;
+                        }
+                        int ix_want_1 = smem_indices[(int)ix_stage * 528 + 3 + lane * 4 + 2];
+                        if (!(ix_rows[14] == ix_want_1)) {
+                            ix_bad_i_0 = 1;
+                        }
+                        int ix_want_2 = smem_indices[(int)ix_stage * 528 + 3 + lane * 4 + 3];
+                        if (!(ix_rows[15] == ix_want_2)) {
+                            ix_bad_i_0 = 1;
+                        }
+                        int ix_vote_i_0 = __any_sync(0xFFFFFFFF, ix_bad_i_0 != 0);
+                        if (3 < ix_shared && ix_vote_i_0 != 0) {
+                            ix_shared = 3;
+                        }
+                        int ix_bad_i_1 = ix_len[2] != 128;
+                        int ix_want_3 = smem_indices[(int)ix_stage * 528 + 2 + lane * 4];
+                        if (!(ix_rows[8] == ix_want_3)) {
                             ix_bad_i_1 = 1;
                         }
-                    }
-                    int ix_vote_i_1 = __any_sync(0xFFFFFFFF, ix_bad_i_1 != 0);
-                    if (2 < ix_shared && ix_vote_i_1 != 0) {
-                        ix_shared = 2;
-                    }
-                    int ix_bad_i_2 = ix_len[1] != 128;
-                    #pragma unroll
-                    for (int ix_j_2 = 0; ix_j_2 < 4; ix_j_2++) {
-                        if (ix_rows[4 + ix_j_2] != smem_indices[(int)ix_stage * 528 + 1 + lane * 4 + ix_j_2]) {
+                        int ix_want_4 = smem_indices[(int)ix_stage * 528 + 2 + lane * 4 + 1];
+                        if (!(ix_rows[9] == ix_want_4)) {
+                            ix_bad_i_1 = 1;
+                        }
+                        int ix_want_5 = smem_indices[(int)ix_stage * 528 + 2 + lane * 4 + 2];
+                        if (!(ix_rows[10] == ix_want_5)) {
+                            ix_bad_i_1 = 1;
+                        }
+                        int ix_want_6 = smem_indices[(int)ix_stage * 528 + 2 + lane * 4 + 3];
+                        if (!(ix_rows[11] == ix_want_6)) {
+                            ix_bad_i_1 = 1;
+                        }
+                        int ix_vote_i_1 = __any_sync(0xFFFFFFFF, ix_bad_i_1 != 0);
+                        if (2 < ix_shared && ix_vote_i_1 != 0) {
+                            ix_shared = 2;
+                        }
+                        int ix_bad_i_2 = ix_len[1] != 128;
+                        int ix_want_7 = smem_indices[(int)ix_stage * 528 + 1 + lane * 4];
+                        if (!(ix_rows[4] == ix_want_7)) {
                             ix_bad_i_2 = 1;
                         }
-                    }
-                    int ix_vote_i_2 = __any_sync(0xFFFFFFFF, ix_bad_i_2 != 0);
-                    if (1 < ix_shared && ix_vote_i_2 != 0) {
-                        ix_shared = 1;
-                    }
-                    int ix_off_stride = ((ix_shared > 1) ? 128 : 0);
-                    int ix_off_base = ((ix_shared > 1) ? 192 - 128 * ix_shared : 0);
-                    if (ix_shared < ix_nb) {
+                        int ix_want_8 = smem_indices[(int)ix_stage * 528 + 1 + lane * 4 + 1];
+                        if (!(ix_rows[5] == ix_want_8)) {
+                            ix_bad_i_2 = 1;
+                        }
+                        int ix_want_9 = smem_indices[(int)ix_stage * 528 + 1 + lane * 4 + 2];
+                        if (!(ix_rows[6] == ix_want_9)) {
+                            ix_bad_i_2 = 1;
+                        }
+                        int ix_want_10 = smem_indices[(int)ix_stage * 528 + 1 + lane * 4 + 3];
+                        if (!(ix_rows[7] == ix_want_10)) {
+                            ix_bad_i_2 = 1;
+                        }
+                        int ix_vote_i_2 = __any_sync(0xFFFFFFFF, ix_bad_i_2 != 0);
+                        if (1 < ix_shared && ix_vote_i_2 != 0) {
+                            ix_shared = 1;
+                        }
+                        int ix_off_stride = ((ix_shared > 1) ? 128 : 0);
+                        int ix_off_base = ((ix_shared > 1) ? 192 - 128 * ix_shared : 0);
+                        if (ix_shared < ix_nb) {
+                            __syncwarp();
+                            if (ix_shared > 1 && lane == 31) {
+                                if (1 >= ix_shared) {
+                                    smem_indices[(int)ix_stage * 528 + 127 + 1] = -1;
+                                }
+                                if (2 >= ix_shared) {
+                                    smem_indices[(int)ix_stage * 528 + 127 + 2] = -1;
+                                }
+                                if (3 >= ix_shared) {
+                                    smem_indices[(int)ix_stage * 528 + 127 + 3] = -1;
+                                }
+                            }
+                            if (0 >= ix_shared || ix_shared == 1) {
+                                int ix_own[4];
+                                #pragma unroll
+                                for (int ix_j_1 = 0; ix_j_1 < 4; ix_j_1++) {
+                                    ix_own[ix_j_1] = ((lane * 4 + ix_j_1 < ix_len[0]) ? ix_rows[ix_j_1] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base : 0) + lane * 16)), "r"(ix_own[0]), "r"(ix_own[1]), "r"(ix_own[2]), "r"(ix_own[3]) : "memory");
+                            }
+                            if (1 >= ix_shared || ix_shared == 1) {
+                                int ix_own_1[4];
+                                #pragma unroll
+                                for (int ix_j_2 = 0; ix_j_2 < 4; ix_j_2++) {
+                                    ix_own_1[ix_j_2] = ((lane * 4 + ix_j_2 < ix_len[1]) ? ix_rows[4 + ix_j_2] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base + ix_off_stride : 128) + lane * 16)), "r"(ix_own_1[0]), "r"(ix_own_1[1]), "r"(ix_own_1[2]), "r"(ix_own_1[3]) : "memory");
+                            }
+                            if (2 >= ix_shared || ix_shared == 1) {
+                                int ix_own_2[4];
+                                #pragma unroll
+                                for (int ix_j_3 = 0; ix_j_3 < 4; ix_j_3++) {
+                                    ix_own_2[ix_j_3] = ((lane * 4 + ix_j_3 < ix_len[2]) ? ix_rows[8 + ix_j_3] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base + 2 * ix_off_stride : 256) + lane * 16)), "r"(ix_own_2[0]), "r"(ix_own_2[1]), "r"(ix_own_2[2]), "r"(ix_own_2[3]) : "memory");
+                            }
+                            if (3 >= ix_shared || ix_shared == 1) {
+                                int ix_own_3[4];
+                                #pragma unroll
+                                for (int ix_j_4 = 0; ix_j_4 < 4; ix_j_4++) {
+                                    ix_own_3[ix_j_4] = ((lane * 4 + ix_j_4 < ix_len[3]) ? ix_rows[12 + ix_j_4] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base + 3 * ix_off_stride : 384) + lane * 16)), "r"(ix_own_3[0]), "r"(ix_own_3[1]), "r"(ix_own_3[2]), "r"(ix_own_3[3]) : "memory");
+                            }
+                        }
+                        if (lane == 0) {
+                            smem_indices[(int)ix_stage * 528 + 512] = ix_shared;
+                            smem_indices[(int)ix_stage * 528 + 512 + 15] = ix_query;
+                            smem_indices[(int)ix_stage * 528 + 512 + 12] = ix_t0;
+                            smem_indices[(int)ix_stage * 528 + 512 + 13] = ix_nb;
+                            int ix_lo_0 = ((ix_shared > 1) ? ((0 < ix_shared) ? 0 : ix_off_base) : 0);
+                            int ix_span_0 = ix_len[0];
+                            smem_indices[(int)ix_stage * 528 + 512 + 2] = ix_lo_0;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3] = ix_span_0;
+                            int ix_lo_1 = ((ix_shared > 1) ? ((1 < ix_shared) ? 1 : ix_off_base + ix_off_stride) : 128);
+                            int ix_span_1 = ix_len[1];
+                            smem_indices[(int)ix_stage * 528 + 512 + 2 + 2] = ix_lo_1;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3 + 2] = ix_span_1;
+                            int ix_lo_2 = ((ix_shared > 1) ? ((2 < ix_shared) ? 2 : ix_off_base + 2 * ix_off_stride) : 256);
+                            int ix_span_2 = ix_len[2];
+                            smem_indices[(int)ix_stage * 528 + 512 + 2 + 4] = ix_lo_2;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3 + 4] = ix_span_2;
+                            int ix_lo_3 = ((ix_shared > 1) ? ((3 < ix_shared) ? 3 : ix_off_base + 3 * ix_off_stride) : 384);
+                            int ix_span_3 = ix_len[3];
+                            smem_indices[(int)ix_stage * 528 + 512 + 2 + 6] = ix_lo_3;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3 + 6] = ix_span_3;
+                        }
+                    } else {
+                        mbarrier_wait(index_empty_addr + (ix_stage) * 8, _phase_index_empty);
+                        unsigned int ix_stage_base_1 = smem_indices_addr + ix_stage * 2112;
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base_1 + (unsigned int)(lane * 16)), "r"(ix_rows[0]), "r"(ix_rows[1]), "r"(ix_rows[2]), "r"(ix_rows[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base_1 + (unsigned int)(512 + lane * 16)), "r"(-1), "r"(-1), "r"(-1), "r"(-1) : "memory");
                         __syncwarp();
-                        if (ix_shared > 1 && lane == 31) {
-                            if (1 >= ix_shared) {
-                                smem_indices[(int)ix_stage * 528 + 127 + 1] = -1;
+                        if (lane == 0) {
+                            smem_indices[(int)ix_stage * 528 + 127 + 1] = ((1 < ix_nb) ? ix_rows[4] : -1);
+                            smem_indices[(int)ix_stage * 528 + 127 + 2] = ((2 < ix_nb) ? ix_rows[8] : -1);
+                            smem_indices[(int)ix_stage * 528 + 127 + 3] = ((3 < ix_nb) ? ix_rows[12] : -1);
+                        }
+                        __syncwarp();
+                        int ix_bad_1 = ix_len[0] != 128;
+                        int ix_bad0_1 = __any_sync(0xFFFFFFFF, ix_bad_1 != 0);
+                        int ix_shared_1 = ((ix_bad0_1 != 0) ? 1 : ix_nb);
+                        int ix_bad_i_3 = ix_len[3] != 128;
+                        int _max_30 = ((lane * 4 + -3) > (0) ? (lane * 4 + -3) : (0));
+                        int ix_want_11 = smem_indices[(int)ix_stage * 528 + _max_30];
+                        if (lane == 0) {
+                            ix_want_11 = ix_rows[12];
+                        }
+                        if (!(ix_rows[12] == ix_want_11)) {
+                            ix_bad_i_3 = 1;
+                        }
+                        int _max_31 = ((lane * 4 + -2) > (0) ? (lane * 4 + -2) : (0));
+                        int ix_want_11_1 = smem_indices[(int)ix_stage * 528 + _max_31];
+                        if (lane == 0) {
+                            ix_want_11_1 = ix_rows[8];
+                        }
+                        if (!(ix_rows[13] == ix_want_11_1)) {
+                            ix_bad_i_3 = 1;
+                        }
+                        int _max_32 = ((lane * 4 + -1) > (0) ? (lane * 4 + -1) : (0));
+                        int ix_want_12 = smem_indices[(int)ix_stage * 528 + _max_32];
+                        if (lane == 0) {
+                            ix_want_12 = ix_rows[4];
+                        }
+                        if (!(ix_rows[14] == ix_want_12)) {
+                            ix_bad_i_3 = 1;
+                        }
+                        int ix_want_13 = smem_indices[(int)ix_stage * 528 + -3 + lane * 4 + 3];
+                        if (!(ix_rows[15] == ix_want_13)) {
+                            ix_bad_i_3 = 1;
+                        }
+                        int ix_vote_i_3 = __any_sync(0xFFFFFFFF, ix_bad_i_3 != 0);
+                        if (3 < ix_shared_1 && ix_vote_i_3 != 0) {
+                            ix_shared_1 = 3;
+                        }
+                        int ix_bad_i_4 = ix_len[2] != 128;
+                        int _max_33 = ((lane * 4 + -2) > (0) ? (lane * 4 + -2) : (0));
+                        int ix_want_14 = smem_indices[(int)ix_stage * 528 + _max_33];
+                        if (lane == 0) {
+                            ix_want_14 = ix_rows[8];
+                        }
+                        if (!(ix_rows[8] == ix_want_14)) {
+                            ix_bad_i_4 = 1;
+                        }
+                        int _max_34 = ((lane * 4 + -1) > (0) ? (lane * 4 + -1) : (0));
+                        int ix_want_15 = smem_indices[(int)ix_stage * 528 + _max_34];
+                        if (lane == 0) {
+                            ix_want_15 = ix_rows[4];
+                        }
+                        if (!(ix_rows[9] == ix_want_15)) {
+                            ix_bad_i_4 = 1;
+                        }
+                        int ix_want_16 = smem_indices[(int)ix_stage * 528 + -2 + lane * 4 + 2];
+                        if (!(ix_rows[10] == ix_want_16)) {
+                            ix_bad_i_4 = 1;
+                        }
+                        int ix_want_17 = smem_indices[(int)ix_stage * 528 + -2 + lane * 4 + 3];
+                        if (!(ix_rows[11] == ix_want_17)) {
+                            ix_bad_i_4 = 1;
+                        }
+                        int ix_vote_i_4 = __any_sync(0xFFFFFFFF, ix_bad_i_4 != 0);
+                        if (2 < ix_shared_1 && ix_vote_i_4 != 0) {
+                            ix_shared_1 = 2;
+                        }
+                        int ix_bad_i_5 = ix_len[1] != 128;
+                        int _max_35 = ((lane * 4 + -1) > (0) ? (lane * 4 + -1) : (0));
+                        int ix_want_18 = smem_indices[(int)ix_stage * 528 + _max_35];
+                        if (lane == 0) {
+                            ix_want_18 = ix_rows[4];
+                        }
+                        if (!(ix_rows[4] == ix_want_18)) {
+                            ix_bad_i_5 = 1;
+                        }
+                        int ix_want_19 = smem_indices[(int)ix_stage * 528 + -1 + lane * 4 + 1];
+                        if (!(ix_rows[5] == ix_want_19)) {
+                            ix_bad_i_5 = 1;
+                        }
+                        int ix_want_20 = smem_indices[(int)ix_stage * 528 + -1 + lane * 4 + 2];
+                        if (!(ix_rows[6] == ix_want_20)) {
+                            ix_bad_i_5 = 1;
+                        }
+                        int ix_want_21 = smem_indices[(int)ix_stage * 528 + -1 + lane * 4 + 3];
+                        if (!(ix_rows[7] == ix_want_21)) {
+                            ix_bad_i_5 = 1;
+                        }
+                        int ix_vote_i_5 = __any_sync(0xFFFFFFFF, ix_bad_i_5 != 0);
+                        if (1 < ix_shared_1 && ix_vote_i_5 != 0) {
+                            ix_shared_1 = 1;
+                        }
+                        int ix_off_stride_1 = ((ix_shared_1 > 1) ? 128 : 0);
+                        int ix_off_base_1 = ((ix_shared_1 > 1) ? 192 - 128 * ix_shared_1 : 0);
+                        if (ix_shared_1 < ix_nb) {
+                            __syncwarp();
+                            if (ix_shared_1 > 1 && lane == 0) {
+                                if (1 >= ix_shared_1) {
+                                    smem_indices[(int)ix_stage * 528 + 127 + 1] = -1;
+                                }
+                                if (2 >= ix_shared_1) {
+                                    smem_indices[(int)ix_stage * 528 + 127 + 2] = -1;
+                                }
+                                if (3 >= ix_shared_1) {
+                                    smem_indices[(int)ix_stage * 528 + 127 + 3] = -1;
+                                }
                             }
-                            if (2 >= ix_shared) {
-                                smem_indices[(int)ix_stage * 528 + 127 + 2] = -1;
+                            if (0 >= ix_shared_1 || ix_shared_1 == 1) {
+                                int ix_own_4[4];
+                                #pragma unroll
+                                for (int ix_j_5 = 0; ix_j_5 < 4; ix_j_5++) {
+                                    ix_own_4[ix_j_5] = ((lane * 4 + ix_j_5 < ix_len[0]) ? ix_rows[ix_j_5] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base_1 + (unsigned int)(4 * ((ix_shared_1 > 1) ? ix_off_base_1 : 0) + lane * 16)), "r"(ix_own_4[0]), "r"(ix_own_4[1]), "r"(ix_own_4[2]), "r"(ix_own_4[3]) : "memory");
                             }
-                            if (3 >= ix_shared) {
-                                smem_indices[(int)ix_stage * 528 + 127 + 3] = -1;
+                            if (1 >= ix_shared_1 || ix_shared_1 == 1) {
+                                int ix_own_5[4];
+                                #pragma unroll
+                                for (int ix_j_6 = 0; ix_j_6 < 4; ix_j_6++) {
+                                    ix_own_5[ix_j_6] = ((lane * 4 + ix_j_6 < ix_len[1]) ? ix_rows[4 + ix_j_6] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base_1 + (unsigned int)(4 * ((ix_shared_1 > 1) ? ix_off_base_1 + ix_off_stride_1 : 128) + lane * 16)), "r"(ix_own_5[0]), "r"(ix_own_5[1]), "r"(ix_own_5[2]), "r"(ix_own_5[3]) : "memory");
+                            }
+                            if (2 >= ix_shared_1 || ix_shared_1 == 1) {
+                                int ix_own_6[4];
+                                #pragma unroll
+                                for (int ix_j_7 = 0; ix_j_7 < 4; ix_j_7++) {
+                                    ix_own_6[ix_j_7] = ((lane * 4 + ix_j_7 < ix_len[2]) ? ix_rows[8 + ix_j_7] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base_1 + (unsigned int)(4 * ((ix_shared_1 > 1) ? ix_off_base_1 + 2 * ix_off_stride_1 : 256) + lane * 16)), "r"(ix_own_6[0]), "r"(ix_own_6[1]), "r"(ix_own_6[2]), "r"(ix_own_6[3]) : "memory");
+                            }
+                            if (3 >= ix_shared_1 || ix_shared_1 == 1) {
+                                int ix_own_7[4];
+                                #pragma unroll
+                                for (int ix_j_8 = 0; ix_j_8 < 4; ix_j_8++) {
+                                    ix_own_7[ix_j_8] = ((lane * 4 + ix_j_8 < ix_len[3]) ? ix_rows[12 + ix_j_8] : -1);
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base_1 + (unsigned int)(4 * ((ix_shared_1 > 1) ? ix_off_base_1 + 3 * ix_off_stride_1 : 384) + lane * 16)), "r"(ix_own_7[0]), "r"(ix_own_7[1]), "r"(ix_own_7[2]), "r"(ix_own_7[3]) : "memory");
                             }
                         }
-                        if (0 >= ix_shared || ix_shared == 1) {
-                            int ix_own[4];
-                            #pragma unroll
-                            for (int ix_j_3 = 0; ix_j_3 < 4; ix_j_3++) {
-                                ix_own[ix_j_3] = ((lane * 4 + ix_j_3 < ix_len[0]) ? ix_rows[ix_j_3] : -1);
+                        if (lane == 0) {
+                            smem_indices[(int)ix_stage * 528 + 512] = ix_shared_1;
+                            smem_indices[(int)ix_stage * 528 + 512 + 15] = ix_query;
+                            smem_indices[(int)ix_stage * 528 + 512 + 12] = ix_t0;
+                            smem_indices[(int)ix_stage * 528 + 512 + 13] = ix_nb;
+                            int ix_lo_4 = ((ix_shared_1 > 1) ? ((0 < ix_shared_1) ? 0 : ix_off_base_1) : 0);
+                            int ix_span_4 = ix_len[0];
+                            smem_indices[(int)ix_stage * 528 + 512 + 2] = ix_lo_4;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3] = ix_span_4;
+                            int ix_lo_5 = ((ix_shared_1 > 1) ? ((1 < ix_shared_1) ? 1 : ix_off_base_1 + ix_off_stride_1) : 128);
+                            int ix_span_5 = ix_len[1];
+                            if (1 < ix_shared_1 && ix_shared_1 > 1) {
+                                ix_lo_5 = 0;
+                                ix_span_5 = 131199;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base : 0) + lane * 16)), "r"(ix_own[0]), "r"(ix_own[1]), "r"(ix_own[2]), "r"(ix_own[3]) : "memory");
-                        }
-                        if (1 >= ix_shared || ix_shared == 1) {
-                            int ix_own_1[4];
-                            #pragma unroll
-                            for (int ix_j_4 = 0; ix_j_4 < 4; ix_j_4++) {
-                                ix_own_1[ix_j_4] = ((lane * 4 + ix_j_4 < ix_len[1]) ? ix_rows[4 + ix_j_4] : -1);
+                            smem_indices[(int)ix_stage * 528 + 512 + 2 + 2] = ix_lo_5;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3 + 2] = ix_span_5;
+                            int ix_lo_6 = ((ix_shared_1 > 1) ? ((2 < ix_shared_1) ? 2 : ix_off_base_1 + 2 * ix_off_stride_1) : 256);
+                            int ix_span_6 = ix_len[2];
+                            if (2 < ix_shared_1 && ix_shared_1 > 1) {
+                                ix_lo_6 = 0;
+                                ix_span_6 = 262270;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base + ix_off_stride : 128) + lane * 16)), "r"(ix_own_1[0]), "r"(ix_own_1[1]), "r"(ix_own_1[2]), "r"(ix_own_1[3]) : "memory");
-                        }
-                        if (2 >= ix_shared || ix_shared == 1) {
-                            int ix_own_2[4];
-                            #pragma unroll
-                            for (int ix_j_5 = 0; ix_j_5 < 4; ix_j_5++) {
-                                ix_own_2[ix_j_5] = ((lane * 4 + ix_j_5 < ix_len[2]) ? ix_rows[8 + ix_j_5] : -1);
+                            smem_indices[(int)ix_stage * 528 + 512 + 2 + 4] = ix_lo_6;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3 + 4] = ix_span_6;
+                            int ix_lo_7 = ((ix_shared_1 > 1) ? ((3 < ix_shared_1) ? 3 : ix_off_base_1 + 3 * ix_off_stride_1) : 384);
+                            int ix_span_7 = ix_len[3];
+                            if (3 < ix_shared_1 && ix_shared_1 > 1) {
+                                ix_lo_7 = 0;
+                                ix_span_7 = 393341;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base + 2 * ix_off_stride : 256) + lane * 16)), "r"(ix_own_2[0]), "r"(ix_own_2[1]), "r"(ix_own_2[2]), "r"(ix_own_2[3]) : "memory");
+                            smem_indices[(int)ix_stage * 528 + 512 + 2 + 6] = ix_lo_7;
+                            smem_indices[(int)ix_stage * 528 + 512 + 3 + 6] = ix_span_7;
                         }
-                        if (3 >= ix_shared || ix_shared == 1) {
-                            int ix_own_3[4];
-                            #pragma unroll
-                            for (int ix_j_6 = 0; ix_j_6 < 4; ix_j_6++) {
-                                ix_own_3[ix_j_6] = ((lane * 4 + ix_j_6 < ix_len[3]) ? ix_rows[12 + ix_j_6] : -1);
-                            }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ix_stage_base + (unsigned int)(4 * ((ix_shared > 1) ? ix_off_base + 3 * ix_off_stride : 384) + lane * 16)), "r"(ix_own_3[0]), "r"(ix_own_3[1]), "r"(ix_own_3[2]), "r"(ix_own_3[3]) : "memory");
-                        }
-                    }
-                    if (lane == 0) {
-                        smem_indices[(int)ix_stage * 528 + 512] = ix_shared;
-                        smem_indices[(int)ix_stage * 528 + 512 + 15] = ix_query;
-                        smem_indices[(int)ix_stage * 528 + 512 + 12] = ix_t0;
-                        smem_indices[(int)ix_stage * 528 + 512 + 13] = ix_nb;
-                        smem_indices[(int)ix_stage * 528 + 512 + 2] = ((ix_shared > 1) ? ((0 < ix_shared) ? 0 : ix_off_base) : 0);
-                        smem_indices[(int)ix_stage * 528 + 512 + 3] = ix_len[0];
-                        smem_indices[(int)ix_stage * 528 + 512 + 2 + 2] = ((ix_shared > 1) ? ((1 < ix_shared) ? 1 : ix_off_base + ix_off_stride) : 128);
-                        smem_indices[(int)ix_stage * 528 + 512 + 3 + 2] = ix_len[1];
-                        smem_indices[(int)ix_stage * 528 + 512 + 2 + 4] = ((ix_shared > 1) ? ((2 < ix_shared) ? 2 : ix_off_base + 2 * ix_off_stride) : 256);
-                        smem_indices[(int)ix_stage * 528 + 512 + 3 + 4] = ix_len[2];
-                        smem_indices[(int)ix_stage * 528 + 512 + 2 + 6] = ((ix_shared > 1) ? ((3 < ix_shared) ? 3 : ix_off_base + 3 * ix_off_stride) : 384);
-                        smem_indices[(int)ix_stage * 528 + 512 + 3 + 6] = ix_len[3];
                     }
                     mbarrier_arrive(index_full_addr + (ix_stage) * 8);
                     ix_stage += 1;
