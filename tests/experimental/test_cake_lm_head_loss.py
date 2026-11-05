@@ -7585,7 +7585,7 @@ def _one_chunk_skip_inputs(W, T, kind, tau):
     return inp, zero
 
 
-@pytest.mark.parametrize("slices", ["one", "default"])
+@pytest.mark.parametrize("slices", ["one", "default", "raised"])
 @pytest.mark.parametrize("warm", [1, 2])
 @pytest.mark.parametrize("tau", [None, "distinct"])
 def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
@@ -7597,8 +7597,9 @@ def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
     second after two -- replays with other ``dlogp`` values written into the captured input
     (other zero rows and live counts, none, a single live row and every row zero) and gives the eager backward's bits
     on those values: ``dW`` bitwise; ``dX`` bitwise with one dX slice pinned and, with the default slices (an
-    unordered split-K reduction), exact ``+0`` on the zero and ignored rows and the eager values within the reduction
-    order on the live rows.  The replays leave the forward's ``lse`` bits unchanged, and every captured and eager call
+    unordered split-K reduction) or ``"raised"`` ones (the chunk below the K-sliced reduction's row floor, so the slice
+    rule gives it one slice and the counted plan the architecture's ``DX_COUNTED_MIN_SLICES_BY_ARCH`` count), exact
+    ``+0`` on the zero and ignored rows and the eager values within the reduction order on the live rows.  The replays leave the forward's ``lse`` bits unchanged, and every captured and eager call
     ran the partition over every valid row."""
     _require_zero_dlogp_skip()
     if tau is not None:
@@ -7619,6 +7620,8 @@ def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
         extra = dict(temperature=form, temperature_rows=fr.temperature_rows)
     if slices == "one":
         extra.update(_TAU_ONE)
+    if slices == "raised":
+        monkeypatch.setitem(cake_backend._DX_RED_MIN_ROWS, "rows", 4097)
     torch.cuda.synchronize()
     assert fr.row_index is not None
     lse_bits = _bits(fr.lse).clone()
@@ -7670,6 +7673,10 @@ def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
     ]
     assert len(bindings) == 1
     assert bindings[0].holds_no_tensor()
+    if slices == "raised":
+        _module_name, record = cake_backend.record_for(CUDA)
+        least = cake_backend.DX_COUNTED_MIN_SLICES_BY_ARCH.get(record["arch"], 1)
+        assert bindings[0].plan.dx_slices == (least,), bindings[0].plan.dx_slices
     assert torch.equal(_bits(fr.lse), lse_bits)
 
 
@@ -8108,6 +8115,97 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
         f"\nzero-dlogp skip on {record['arch']}, z = 0, last chunk {last} rows: "
         f"cast {skip_plan.dw_cast_stage} (skip off: {shipped.dw_cast_stage}); "
         f"dW and logp bitwise equal, max |dX - skip off| {dx_diff:.3g}"
+    )
+
+
+# Backwards whose plan without the skip has one-slice dX chunks: "forced" puts every chunk below the K-sliced
+# reduction's row floor (``set_dx_red_min_rows(T)``: one slice on every chunk, any architecture and SM count), "rule"
+# keeps the slice rule.
+ZERO_DLOGP_RAISED_CASES = [
+    ("forced", 4097, ("random", 0.5)),
+    ("forced", 8117, "none"),
+    ("forced", 8117, ("random", 0.166)),
+    ("forced", 12289, ("group", 0.5)),
+    ("forced", 12289, "last"),
+    ("forced", 12289, "all"),
+    ("rule", 8117, ("random", 0.5)),
+    ("rule", 13500, ("random", 0.5)),
+]
+
+
+@pytest.mark.parametrize("mode, T, kind", ZERO_DLOGP_RAISED_CASES, ids=str)
+def test_device_zero_dlogp_raised_dx_slices(glm_weight, mode, T, kind):
+    """Under the skip the backward's plan runs each dX chunk at the architecture's counted slice count at least
+    (``DX_COUNTED_MIN_SLICES_BY_ARCH``: two on sm_100a and sm_103a; sm_107a keeps the slice rule's counts) and the
+    backward without the skip the slice rule's counts; every chunk of more than one slice launches its counted form.
+    The results pass the skip suite's checks on the binding and the remembered binding: ``logp`` the bits of the
+    backward without the skip; the zero and ignored rows' ``dX`` exact ``+0``; the live rows' ``dX`` within one BF16
+    rounding of the backward without the skip; ``dW`` bitwise without zero rows (the forward's row order); the
+    deterministic suite's gates against the FP64 oracle.  Every valid row zero: zero gradients."""
+    _require_zero_dlogp_skip()
+    _module_name, record = cake_backend.record_for(CUDA)
+    least = cake_backend.DX_COUNTED_MIN_SLICES_BY_ARCH.get(record["arch"], 1)
+    base = _device_inputs(T, "ce", W=glm_weight)
+    dlogp = base.dlogp
+    base = dataclasses.replace(
+        base, dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous()
+    )
+    zero = _zero_dlogp_set(base, kind)
+    inp = _with_zero_dlogp(base, zero)
+    case = (mode, T, kind)
+    previous = cake_backend.set_dx_red_min_rows(T) if mode == "forced" else None
+    try:
+        cake_backend.BINDING_CACHE.clear()
+        with _zero_dlogp_floor(0):
+            nd = _logprob_call(inp)
+            again = _logprob_call(inp)
+        with _zero_dlogp_floor(None):
+            plain = _logprob_call(inp)
+        (skip_plan, skip_run), (shipped, _) = _logprob_bwd_plans()
+    finally:
+        if previous is not None:
+            cake_backend.set_dx_red_min_rows(previous)
+    assert skip_plan.dcnt and not shipped.dcnt, case
+    assert skip_plan.chunks == shipped.chunks, case
+    if mode == "forced":
+        assert shipped.dx_slices == (1,) * shipped.num_chunks, (case, shipped.dx_slices)
+    assert skip_plan.dx_slices == tuple(max(s, least) for s in shipped.dx_slices), (
+        case,
+        skip_plan.dx_slices,
+        shipped.dx_slices,
+    )
+    dx_run = sorted(k[0] for k in skip_run if k[0].startswith("gemm_dx"))
+    assert dx_run == sorted(
+        skip_plan.dx_stage_of(i) for i in range(skip_plan.num_chunks)
+    ), (case, dx_run)
+    for i in range(skip_plan.num_chunks):
+        assert skip_plan.dx_stage_of(i).endswith("_dcnt") == (
+            skip_plan.dx_slices_of(i) > 1
+        ), (case, i)
+    valid = inp.labels >= 0
+    live = valid & ~zero
+    for run in (nd, again):
+        assert _same_bits(run["logp"], plain["logp"]), case
+        assert not bool(_bits(run["dX"][zero | ~valid]).any()), case
+    if not bool(live.any()):
+        for run in (nd, again):
+            assert not bool(_bits(run["dX"]).any()), case
+            assert not bool(run["dW"].float().any()), case
+        return
+    if not bool(zero.any()):
+        assert _same_bits(nd["dW"], plain["dW"]), case
+    scale = float(plain["dX"][live].float().abs().max())
+    dx_diff = 0.0
+    for run in (nd, again):
+        diff = float((run["dX"][live].float() - plain["dX"][live].float()).abs().max())
+        assert diff <= scale * 2**-7, (case, diff, scale)
+        dx_diff = max(dx_diff, diff)
+        _check_against_references(run, inp, entry="logprob", ceiling=True)
+    dw_rel = float(rel_l2(nd["dW"].float(), plain["dW"].float()))
+    print(
+        f"\nzero-dlogp raised dX slices {case} on {record['arch']}: slices {skip_plan.dx_slices} (skip off "
+        f"{shipped.dx_slices}), zero {int(zero.sum())}/{int(valid.sum())}: dW rel-L2 vs no skip {dw_rel:.2e}, "
+        f"dX max|skip - no skip| {dx_diff:.2e}"
     )
 
 
