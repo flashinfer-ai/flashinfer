@@ -868,7 +868,9 @@ def test_repeated_launches_against_fp64_and_det(
 # H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE, the
 # deterministic package's compensated det pair (compensated per-chunk dw sums)
 # from there up to H5120_ACCURACY_EDGE, and the FP64-accumulating single kernel
-# (on sm_103a and sm_107a its kblock form) above it; a single kernel also runs
+# (on sm_103a its kblock form up to T 393216 (BF16 weight) or T 196608 (FP32
+# weight) and a TwoSum single kernel above that, on sm_107a its kblock form)
+# above it; a single kernel also runs
 # from T 1 up to T 22 with FP32 weight on sm_100a and with both weight dtypes on
 # sm_103a, up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
 # weight up to T 896 on sm_100a.  The plain
