@@ -14079,6 +14079,10 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                 tmem_ld_x16(&_tmem_load_1[0], up_addr);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 float act[16];
+#if __CUDA_ARCH__ == 1030
+#else
+                float lane_act_scales[16];
+#endif
                 #pragma unroll
                 for (int token_slot_act = 0; token_slot_act < 16; token_slot_act++) {
                     float gate = _tmem_load_0[token_slot_act] * gate_scale_scalar_c;
@@ -14095,15 +14099,31 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                     group_max = max_noftz(group_max, _shfl_xor_sync_8);
                     float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, group_max, 8);
                     group_max = max_noftz(group_max, _shfl_xor_sync_9);
+#if __CUDA_ARCH__ == 1030
+#else
+                    float lane_scale_value;
+                    asm("max.f32 %0, %1, %2;" : "=f"(lane_scale_value) : "f"(group_max * 0.16666667f), "f"(1e-08f));
+                    lane_act_scales[token_slot_act] = lane_scale_value;
+#endif
                     if (lane % 16 == 0) {
+#if __CUDA_ARCH__ == 1030
                         float scale_value;
                         asm("max.f32 %0, %1, %2;" : "=f"(scale_value) : "f"(group_max * 0.16666667f), "f"(1e-08f));
                         smem_act_scale[token_slot_act * 8 + physical_feature / 16] = scale_value;
+#else
+                        smem_act_scale[token_slot_act * 8 + physical_feature / 16] = lane_scale_value;
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1030
                 asm volatile("barrier.sync 15, 128;" ::: "memory");
                 unsigned int nibble_shift = (unsigned int)(lane % 8 * 4);
+#else
+                unsigned int nibble_shift_ilp = (unsigned int)(lane % 8 * 4);
+                unsigned int fp4_words[16];
+#endif
                 #pragma unroll
+#if __CUDA_ARCH__ == 1030
                 for (int token_slot_quant = 0; token_slot_quant < 16; token_slot_quant++) {
                     float act_scale = smem_act_scale[token_slot_quant * 8 + physical_feature / 16];
                     float rounded_act_scale = 0.0f;
@@ -14113,6 +14133,15 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                     scale_pack_src[2] = 0.0f;
                     scale_pack_src[3] = 0.0f;
                     unsigned int scale_pack_dst[1];
+#else
+                for (int token_slot_word = 0; token_slot_word < 16; token_slot_word++) {
+                    float word_scale_src[4];
+                    word_scale_src[0] = lane_act_scales[token_slot_word];
+                    word_scale_src[1] = 0.0f;
+                    word_scale_src[2] = 0.0f;
+                    word_scale_src[3] = 0.0f;
+                    unsigned int word_scale_dst[1];
+#endif
                     {
                         uint32_t _packed;
                         asm volatile("{\n\t"
@@ -14122,10 +14151,17 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
+#if __CUDA_ARCH__ == 1030
                             : "=r"(_packed) : "f"(scale_pack_src[0]), "f"(scale_pack_src[1]),
                                                "f"(scale_pack_src[2]), "f"(scale_pack_src[3]));
                         scale_pack_dst[0] = _packed;
+#else
+                            : "=r"(_packed) : "f"(word_scale_src[0]), "f"(word_scale_src[1]),
+                                               "f"(word_scale_src[2]), "f"(word_scale_src[3]));
+                        word_scale_dst[0] = _packed;
+#endif
                     }
+#if __CUDA_ARCH__ == 1030
                     unsigned int scale_code = scale_pack_dst[0] & 127;
                     unsigned int scale_exp = scale_code >> 3 & 15;
                     unsigned int scale_mant = scale_code & 7;
@@ -14137,7 +14173,19 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                     }
                     float safe_act_scale = ((rounded_act_scale == 0.0f) ? 1.0f : rounded_act_scale);
                     float inv_safe_act_scale = approx_rcp(safe_act_scale);
+#else
+                    unsigned int word_scale_code = word_scale_dst[0] & 127;
+                    unsigned int word_scale_exp = word_scale_code >> 3 & 15;
+                    unsigned int word_scale_mant = word_scale_code & 7;
+                    float subnormal_scale = (float)word_scale_mant * 0.001953125f;
+                    float _exp2_10 = approx_exp2((float)word_scale_exp - 7.0f);
+                    float normal_scale = _exp2_10 * (1.0f + (float)word_scale_mant * 0.125f);
+                    float word_rounded_scale = ((word_scale_exp == 0) ? subnormal_scale : normal_scale);
+                    float word_safe_scale = ((word_rounded_scale == 0.0f) ? 1.0f : word_rounded_scale);
+                    float word_inv_scale = approx_rcp(word_safe_scale);
+#endif
                     uint32_t _fp4_e2m1_pack_pair_11;
+#if __CUDA_ARCH__ == 1030
                     asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_e2m1_pack_pair_11) : "f"(act[token_slot_quant] * inv_safe_act_scale), "f"(0.0f));
                     unsigned int fp4_word = (_fp4_e2m1_pack_pair_11 & 15) << nibble_shift;
                     unsigned int _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, fp4_word, 1);
@@ -14146,10 +14194,32 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                     fp4_word = fp4_word | _shfl_xor_sync_13;
                     unsigned int _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, fp4_word, 4);
                     fp4_word = fp4_word | _shfl_xor_sync_14;
+#else
+                    asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_e2m1_pack_pair_11) : "f"(act[token_slot_word] * word_inv_scale), "f"(0.0f));
+                    unsigned int fp4_word_ilp = (_fp4_e2m1_pack_pair_11 & 15) << nibble_shift_ilp;
+                    unsigned int _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, fp4_word_ilp, 1);
+                    fp4_word_ilp = fp4_word_ilp | _shfl_xor_sync_12;
+                    unsigned int _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, fp4_word_ilp, 2);
+                    fp4_word_ilp = fp4_word_ilp | _shfl_xor_sync_13;
+                    unsigned int _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, fp4_word_ilp, 4);
+                    fp4_word_ilp = fp4_word_ilp | _shfl_xor_sync_14;
+                    fp4_words[token_slot_word] = fp4_word_ilp;
+                }
+                #pragma unroll
+                for (int token_slot_store = 0; token_slot_store < 16; token_slot_store++) {
+#endif
                     if (lane % 8 == 0) {
+#if __CUDA_ARCH__ == 1030
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_act_addr + (unsigned int)(token_slot_quant * 64 + physical_feature / 2 ^ (token_slot_quant * 64 + physical_feature / 2 >> 7 & 3) << 4))), "r"(fp4_word) : "memory");
+#else
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_act_addr + (unsigned int)(token_slot_store * 64 + physical_feature / 2 ^ (token_slot_store * 64 + physical_feature / 2 >> 7 & 3) << 4))), "r"(fp4_words[token_slot_store]) : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1030
+#else
+                asm volatile("barrier.sync 15, 128;" ::: "memory");
+#endif
                 int sf_c_act = physical_feature % 32 / 8;
                 int sf_d_act = physical_feature % 8;
                 int sf_g_act = physical_feature / 32;
