@@ -22,15 +22,19 @@ def _cpu_sm_count(monkeypatch):
     monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM_COUNT)
 
 
-# The K=64 sibling gate as the host defines it; the tests of the gate call it.
+# The K=64 and four-stage sibling gates as the host defines them; the tests of
+# the gates call them.
 _K64_SIBLING_LAUNCHABLE = cake._k64_sibling_launchable
+_KV4_SIBLING_LAUNCHABLE = cake._kv4_sibling_launchable
 
 
 @pytest.fixture(autouse=True)
-def _launchable_k64_siblings(monkeypatch):
-    """The K=64 gate probes the process's CUDA runtime and the device; these
-    CPU tests route as in a process that can launch every K=64 sibling."""
+def _launchable_siblings(monkeypatch):
+    """The sibling gates probe the process's CUDA runtime and the device; these
+    CPU tests route as in a process that can launch every K=64 and four-stage
+    sibling."""
     monkeypatch.setattr(cake, "_k64_sibling_launchable", lambda arch, device: True)
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", lambda arch, device: True)
 
 
 # Both cache layouts and sink settings retain the same physical selection.
@@ -1323,6 +1327,7 @@ def test_sm107a_registers_the_fp8_decode_route_only():
         "fp8_h128_prefill_source_persistent_uniform_k64",
         "fp8_h64_prefill_source_persistent_m64",
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4",
         "fp8_lowhead_prefill",
     }
     for spec in _ARCH_REGISTRATIONS["sm_107a"]["variants"].values():
@@ -3087,7 +3092,9 @@ def test_fp8_h64_m64_program_is_selected_by_the_item_width(
 )
 def test_fp8_h64_m64_programs_launch_one_cta_per_token(arch, route):
     tokens = 192
-    L = _RecordingLauncher(arch, num_query_tokens=tokens, num_heads=64, sparse_topk=388)
+    L = _RecordingLauncher(
+        arch, Q=torch.empty(0), num_query_tokens=tokens, num_heads=64, sparse_topk=388
+    )
     cake._dispatch_route(route, L)
     assert L.calls == [
         (route, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
@@ -3386,15 +3393,28 @@ _UNIFORM_ROUTE = "fp8_h128_prefill_source_persistent_uniform"
 
 
 @pytest.fixture
-def k64_gate():
-    """The host's K=64 gate, its per-device cache empty before and after."""
-    _K64_SIBLING_LAUNCHABLE.cache_clear()
-    yield _K64_SIBLING_LAUNCHABLE
-    _K64_SIBLING_LAUNCHABLE.cache_clear()
+def oversized_check():
+    """The host's oversized launch check (both sibling gates ask it), its cache
+    per shared-memory size and device empty before and after."""
+    cake._oversized_smem_launchable.cache_clear()
+    yield cake._oversized_smem_launchable
+    cake._oversized_smem_launchable.cache_clear()
 
 
-def _stub_k64_gate_probes(monkeypatch, *, toolkit, runtime, ceiling):
-    """Stub the gate's probes: the CUDA toolkit (nvcc) version, the version of
+@pytest.fixture
+def k64_gate(oversized_check):
+    """The host's K=64 gate over an empty launch-check cache."""
+    return _K64_SIBLING_LAUNCHABLE
+
+
+@pytest.fixture
+def kv4_gate(oversized_check):
+    """The host's four-stage gate over an empty launch-check cache."""
+    return _KV4_SIBLING_LAUNCHABLE
+
+
+def _stub_gate_probes(monkeypatch, *, toolkit, runtime, ceiling):
+    """Stub the gates' probes: the CUDA toolkit (nvcc) version, the version of
     the process's runtime and the device's oversized ceiling (one value, or a
     dict by device index).  Returns the probe calls."""
     from packaging.version import Version
@@ -3447,7 +3467,7 @@ def test_k64_gate_needs_cuda_13_4_and_the_oversized_ceiling(
     runtime is asked by the toolkit's major (the JIT modules' soname)."""
     from packaging.version import Version
 
-    asked = _stub_k64_gate_probes(
+    asked = _stub_gate_probes(
         monkeypatch, toolkit=toolkit, runtime=runtime, ceiling=ceiling
     )
     device = torch.device("cuda", 0)
@@ -3462,9 +3482,9 @@ def test_k64_gate_needs_cuda_13_4_and_the_oversized_ceiling(
 
 @pytest.mark.cpu_only
 def test_k64_gate_probes_each_device_once(monkeypatch, k64_gate):
-    """The gate is cached per architecture and device: the probes run once per
+    """The gate's launch check is cached per device: the probes run once per
     device, and an architecture without an oversized sibling needs none."""
-    asked = _stub_k64_gate_probes(
+    asked = _stub_gate_probes(
         monkeypatch, toolkit="13.4", runtime=13040, ceiling={0: 272512, 1: 232448}
     )
     first, second = torch.device("cuda", 0), torch.device("cuda", 1)
@@ -3614,20 +3634,25 @@ def test_sm107a_uniform_launch_follows_the_process_runtime(
 
 
 @pytest.mark.cpu_only
-def test_k64_gate_knows_every_oversized_binding():
+def test_sibling_gates_know_every_oversized_binding():
     """The programs whose generated bindings launch in CUDA 13.4's oversized
-    shared-memory mode are exactly the K=64 siblings the gate holds, each with
-    the dynamic shared memory the gate compares with the device's oversized
-    ceiling; every other program, including those the gate falls back to,
-    launches in the standard mode."""
+    shared-memory mode are exactly the K=64 and four-stage siblings the gates
+    hold, each with the dynamic shared memory its gate compares with the
+    device's oversized ceiling; every other program, including those the gates
+    fall back to, launches in the standard mode."""
     import re
 
     from flashinfer.jit.cake_dsv4 import VARIANTS, _get_csrc_dir
 
+    siblings = (
+        ("_k64", cake._K64_SIBLING_ROUTES, cake._K64_SIBLING_OVERSIZED_SMEM_BYTES),
+        ("_kv4", cake._KV4_SIBLING_ROUTES, cake._KV4_SIBLING_OVERSIZED_SMEM_BYTES),
+    )
     gated = {
-        VARIANTS[arch][f"{route}_k64"]: smem
-        for arch, smem in cake._K64_SIBLING_OVERSIZED_SMEM_BYTES.items()
-        for route in cake._K64_SIBLING_ROUTES
+        VARIANTS[arch][f"{route}{suffix}"]: smem
+        for suffix, routes, smem_by_arch in siblings
+        for arch, smem in smem_by_arch.items()
+        for route in routes
     }
     oversized = {}
     for path in sorted(_get_csrc_dir().glob("*/*_binding.cu")):
@@ -3636,6 +3661,216 @@ def test_k64_gate_knows_every_oversized_binding():
             (smem,) = re.findall(r"config\.dynamicSmemBytes = (\d+);", text)
             oversized[path.name.removesuffix("_binding.cu")] = int(smem)
     assert oversized == gated
+
+
+# --------------------------------------------------------------------------- #
+# Four-stage sibling: SM107's multi-tile M64 program in the oversized mode    #
+# --------------------------------------------------------------------------- #
+
+_M64_MULTI_TILE_ROUTE = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_m64_multi_tile_launches_take_the_kv4_sibling(arch):
+    """SM107 routes the multi-tile M64 route's four-stage sibling to a program
+    of its own, with the route's arguments, and runs it on every launch; SM100
+    and SM103 route the sibling to the route's program and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {_M64_MULTI_TILE_ROUTE} == cake._KV4_SIBLING_ROUTES
+    assert cake._KV4_SIBLING_OVERSIZED_SMEM_BYTES == {"sm_107a": 322688}
+    for route in sorted(cake._KV4_SIBLING_ROUTES):
+        sibling = f"{route}_kv4"
+        own = arch == "sm_107a"
+        assert (VARIANTS[arch][sibling] != VARIANTS[arch][route]) == own
+        expected = sibling if own else route
+        assert cake._kv4_variant(route, arch=arch, device=_DEVICE) == expected
+        assert (
+            get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+            == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+        )
+    for other in (
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_lowhead_prefill",
+    ):
+        assert cake._kv4_variant(other, arch=arch, device=_DEVICE) == other
+
+
+@pytest.mark.cpu_only
+def test_kv4_variant_needs_a_sibling_program_of_its_own(monkeypatch):
+    """A launch takes the four-stage sibling only where its architecture routes
+    the sibling to a program other than the route's: a table without the
+    sibling, one that routes it to the route's program and one of another
+    architecture run the route without asking the gate."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    asked = []
+
+    def gate(arch, device):
+        asked.append((arch, device))
+        return True
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    route, sibling = _M64_MULTI_TILE_ROUTE, f"{_M64_MULTI_TILE_ROUTE}_kv4"
+    two, four = "cake_dsv4_two_stage", "cake_dsv4_four_stage"
+    for table, expected in (
+        ({"sm_107a": {route: two, sibling: four}}, sibling),
+        ({"sm_107a": {route: two}}, route),
+        ({"sm_107a": {route: two, sibling: two}}, route),
+        ({"sm_103a": {route: two, sibling: four}}, route),
+    ):
+        monkeypatch.setattr(jit, "VARIANTS", table)
+        assert cake._kv4_variant(route, arch="sm_107a", device=_DEVICE) == expected
+    assert asked == [("sm_107a", _DEVICE)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize(
+    "route", ["fp8_h64_prefill_source_persistent_m64", _M64_MULTI_TILE_ROUTE]
+)
+@pytest.mark.parametrize("tokens", [1, 64, 208, 4096])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("launchable", [True, False])
+def test_fp8_h64_m64_launch_takes_the_kv4_sibling(
+    monkeypatch, arch, route, tokens, enable_pdl, launchable
+):
+    """SM107 runs every multi-tile M64 launch on its four-stage sibling over
+    the same grid and partials.  Where the process cannot launch the sibling
+    on the query's device (the gate is asked only there), the route's program
+    runs; the single-tile program and SM100 and SM103 launch the route."""
+    asked = []
+
+    def gate(gate_arch, device):
+        asked.append((gate_arch, device))
+        return launchable
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    L = _RecordingLauncher(
+        arch,
+        Q=torch.empty(0),
+        num_query_tokens=tokens,
+        num_heads=64,
+        sparse_topk=388,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    sibling = arch == "sm_107a" and route == _M64_MULTI_TILE_ROUTE
+    program = f"{route}_kv4" if sibling and launchable else route
+    assert L.calls == [
+        (program, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
+    ]
+    assert asked == ([("sm_107a", _DEVICE)] if sibling else [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "toolkit,runtime,ceiling,launchable",
+    [
+        # SM107's oversized ceiling, and one that holds exactly 322688 B.
+        ("13.4", 13040, 334848, True),
+        ("13.5", 13050, 334848, True),
+        ("13.4", 13040, 322688, True),
+        # The ceiling holds the K=64 sibling's 272512 B but not 322688 B.
+        ("13.4", 13040, 322687, False),
+        ("13.4", 13040, 272512, False),
+        # The driver does not report the ceiling: it has no oversized mode.
+        ("13.4", 13040, None, False),
+        # A 13.0 runtime wheel next to a 13.4 toolkit.
+        ("13.4", 13000, 334848, False),
+        # The runtime the JIT modules link does not load.
+        ("13.4", None, 334848, False),
+        # The binding needs a 13.4 toolkit to build.
+        ("13.3", 13040, 334848, False),
+    ],
+)
+def test_kv4_gate_needs_cuda_13_4_and_the_oversized_ceiling(
+    monkeypatch, kv4_gate, toolkit, runtime, ceiling, launchable
+):
+    """SM107's four-stage sibling launches under the K=64 sibling's conditions
+    with an oversized ceiling of at least its 322688 B; the probes run as for
+    the K=64 sibling."""
+    from packaging.version import Version
+
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit=toolkit, runtime=runtime, ceiling=ceiling
+    )
+    device = torch.device("cuda", 0)
+    assert kv4_gate("sm_107a", device) is launchable
+    built = Version(toolkit) >= Version("13.4")
+    loaded = built and runtime is not None and runtime >= 13040
+    assert asked == {
+        "runtime": [13] if built else [],
+        "ceiling": [device] if loaded else [],
+    }
+
+
+@pytest.mark.cpu_only
+def test_sibling_gates_share_the_launch_check(monkeypatch, k64_gate, kv4_gate):
+    """Both gates ask the one launch check, cached per shared-memory size and
+    device: a ceiling that holds the K=64 sibling's 272512 B but not the
+    four-stage sibling's 322688 B launches only the former, each size probes
+    each device once, and SM100 and SM103 need no probe."""
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit="13.4", runtime=13040, ceiling={0: 334848, 1: 300000}
+    )
+    first, second = torch.device("cuda", 0), torch.device("cuda", 1)
+    for _ in range(3):
+        assert k64_gate("sm_107a", first) and kv4_gate("sm_107a", first)
+        assert k64_gate("sm_107a", second) and not kv4_gate("sm_107a", second)
+    assert kv4_gate("sm_100a", first) and kv4_gate("sm_103a", second)
+    assert asked == {"runtime": [13] * 4, "ceiling": [first, first, second, second]}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "runtime,ceiling,program",
+    [
+        (13040, 334848, "_kv4"),
+        # A 13.0 runtime wheel next to a 13.4 toolkit.
+        (13000, 334848, ""),
+        # A ceiling that holds the K=64 sibling but not the four-stage one.
+        (13040, 300000, ""),
+    ],
+)
+def test_sm107a_m64_multi_tile_launch_follows_the_process_runtime(
+    monkeypatch, kv4_gate, runtime, ceiling, program
+):
+    """With a 13.4 toolkit, SM107's multi-tile M64 launches run the four-stage
+    sibling where the process runtime is at least 13.4 and the device's
+    oversized ceiling holds its 322688 B, and the route's two-stage program
+    otherwise instead of failing in the sibling's binding.  The probes run
+    once."""
+    from types import SimpleNamespace
+
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", kv4_gate)
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("13.4"))
+    cudart, libcuda = _FakeCudart(runtime), _FakeLibcuda(ceiling)
+    libraries = {"libcudart.so.13": cudart, "libcuda.so.1": libcuda}
+    monkeypatch.setattr(cake, "_shared_library", libraries.get)
+    for _ in range(2):
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=SimpleNamespace(device=torch.device("cuda", 0)),
+            num_query_tokens=208,
+            num_heads=64,
+            sparse_topk=388,
+            max_q_len=4,
+        )
+        cake._dispatch_route(_M64_MULTI_TILE_ROUTE, L)
+        assert L.calls == [
+            (
+                f"{_M64_MULTI_TILE_ROUTE}{program}",
+                {"grid": (208, 1, 1), "total_work_items": 208, **L.partials(1)},
+            )
+        ]
+    assert libcuda.asked == ([(150, 100)] if runtime >= 13040 else [])
 
 
 # --------------------------------------------------------------------------- CAKE-957 / CAKE-939: query layout, route plan, row tiling
