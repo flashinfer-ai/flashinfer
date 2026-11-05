@@ -1100,14 +1100,20 @@ def _ensure_jit_submodules() -> None:
     the submodule trees travel inside the sdist as plain directories.
     """
     in_git_repo = (_root / ".git").exists()
-    _JIT_SUBMODULES = ("cutlass", "cccl", "spdlog")
-    for name in _JIT_SUBMODULES:
+    # A header from each JIT include path. A partial checkout, for example one
+    # left by an interrupted update, lacks it and is not treated as complete.
+    _JIT_SUBMODULES = {
+        "cutlass": "include/cutlass/arch/arch.h",
+        "cccl": "cub/cub/cub.cuh",
+        "spdlog": "include/spdlog/spdlog.h",
+    }
+    for name, marker in _JIT_SUBMODULES.items():
         submod = _root / "3rdparty" / name
-        if submod.exists() and any(submod.iterdir()):
+        if (submod / marker).exists():
             continue
         if not in_git_repo:
             print(
-                f"[flashinfer] WARNING: 3rdparty/{name} is empty and this is "
+                f"[flashinfer] WARNING: 3rdparty/{name} is empty or incomplete and this is "
                 f"not a git checkout.  SM120 JIT compilation will fail.  "
                 f"Install from a git clone with --recurse-submodules, or "
                 f"symlink the {name} headers into "
@@ -1131,6 +1137,13 @@ def _ensure_jit_submodules() -> None:
                 f"Timed out initializing 3rdparty/{name}. "
                 "Check Git remote access and retry."
             ) from exc
+        # `git submodule update` does nothing when the submodule is already at
+        # the recorded commit, so it cannot repair a partial checkout.
+        if not (submod / marker).exists():
+            raise RuntimeError(
+                f"3rdparty/{name} is incomplete ({marker} is missing). Run "
+                f"`git submodule update --init --force 3rdparty/{name}` and retry."
+            )
 
 
 def _create_data_dir(use_symlinks=True):
