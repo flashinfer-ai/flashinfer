@@ -913,6 +913,10 @@ class CakeArm(Arm):
     def __call__(self):
         return self.runner()
 
+    def outputs(self, out):
+        """None: the runner writes into ``indices`` / ``scores`` allocated before the measured call."""
+        return ()
+
 
 class ChunkedPipelineArm(Arm):
     name = "chunked_pipeline"
