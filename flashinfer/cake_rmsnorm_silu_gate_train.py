@@ -74,7 +74,22 @@ dispatches on it here:
   ``grad_out`` makes its columns' weight gradient infinite or ``NaN``:
   ``NaN`` where the infinite term is in the last row and the last row block
   is partial (its padding rows reread that row and multiply it by zero), as
-  in the deterministic backward.  Up to 256 rows the backward is one
+  in the deterministic backward.  On SM103 from 700 rows per SM up to 12000
+  (from 12000 the backward above), each thread keeps its folded FP32 runs,
+  and each CTA its column sums over its row groups, as FP32 two-sum pairs
+  (a sum and its error term) instead of FP64, and converts a column's pair
+  to FP64 once for the atomic add.  The error that fold itself adds to a
+  CTA's column sum ``S`` of its FP32 runs is at most
+  ``C(k) * 2^-48 * A + 2^-53 * |S|`` (``k`` the folds of a thread, ``A``
+  the sum of the runs' magnitudes, ``C(k) = (k - 1)(k - 2) + 16 (k + 14)``;
+  the FP64 fold's is ``(k + 14) * 2^-53 * A``): a bound on the fold alone,
+  not on the weight gradient's error, which the bound above states.  A
+  column whose pair sum is not finite takes the FP64 value of the sum
+  alone, so an infinite or ``NaN`` term gives the column the class the FP64
+  fold gives it.  With finite terms whose FP32 pair sum in a thread or in a
+  CTA's column passes the FP32 range, the weight gradient can be ``+-inf``
+  or ``NaN`` where the deterministic backward returns a finite value.  Up to
+  256 rows the backward is one
   thread-block cluster of 16 CTAs with the same row arithmetic, which adds
   the CTAs' FP32 partials of each column in a fixed order in FP64 and rounds
   the sum the same way: there the weight gradient is the same bits on every
@@ -113,8 +128,8 @@ that anything else wrote into, must be zeroed with
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
 per device, stream and backward kernel (one per weight-gradient dtype, two
-from 1024 rows per SM on SM107 and from 1280 on SM100 and SM103), kept for
-later calls; the
+from 1024 rows per SM on SM107 and from 1280 on SM100, and on SM103 two from
+700 rows per SM and three from 12000), kept for later calls; the
 autograd node retains nothing else.  They also keep a reserve of 64
 zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
 capture): a call during CUDA Graph capture takes one per capture and capture
@@ -144,9 +159,10 @@ CTA, no shared memory and the default, the maximum-L1 or the maximum-shared
 carveout (B200 and GB300).  On SM107 it waits for such a kernel with the default
 or the maximum-L1 carveout, as the other backwards do, and starts beside it with
 the maximum-shared carveout (R200).  The non-deterministic backward launches at
-most one wave of CTAs, or on SM100 and SM103 from 1280 rows per SM 5 CTAs per
-SM, a quarter more than an SM holds at once.  When the grid has a CTA for every
-row block, CTA ``c`` takes block ``c``; past one wave the CTAs claim every block
+most one wave of CTAs, or on SM100 from 1280 rows per SM and on SM103 from 700
+5 CTAs per SM, a quarter more than an SM holds at once.  When the grid has a
+CTA for every row block, CTA ``c`` takes block ``c``; past one wave the CTAs
+claim every block
 in chunks from the workspace's claim counter, each CTA its next chunk as the
 last block of its current one starts, so a CTA that starts late takes fewer
 blocks (none when every chunk was claimed before it started).
@@ -548,7 +564,11 @@ def cake_rmsnorm_silu_gate_train_backward(
         can differ between calls, always within the deterministic backward's
         error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column while the
         gate, the terms and the sums are FP32 normal numbers or zero (subnormal
-        values and infinities: see the module documentation).  Up to 256 rows
+        values and infinities: see the module documentation).  On SM103 from
+        700 rows per SM up to 12000 the runs are folded, and a CTA's column
+        sums kept, as FP32 two-sum pairs, converted to FP64 once per column
+        (that fold's own error bound and its finite-overflow case: see the
+        module documentation).  Up to 256 rows
         one cluster of 16 CTAs runs instead: the
         CTAs' FP32 partials of a column are added in a fixed order in FP64, so
         ``dw`` is the same bits on every call (within the same bound), and the

@@ -317,7 +317,8 @@ gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None
     gives the kept-tape figure, in which they are the recompute forward's hand-off tensors outside the workspace
     (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as `backward_transient`);
     `save_for_backward=False` with `backward=False`: a `chunk_gdn_det_fwd_kcp` forward without a saved set, which binds
-    `c1_recv` / `stage_m` from the workspace and, with the norm, the arena `r` at #1 of the fused form (`fwd.qk_rstd`)
+    `c1_recv` / `stage_m` from the workspace and, with the norm, the arena `r` at #1 of the fused form (`fwd.qk_rstd`);
+    under `save_mode="full"` it also binds the split form's tapes there (only a saved set holds fresh `"full"` tapes)
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on
@@ -464,9 +465,12 @@ not the whole grid.
   fragment as one chain when its cost model prefers that); a partition beyond
   a cap is refused at context build.
 * The output walk serves the light, saved-boundary forward only: under
-  `save_mode="full"` or `boundary_mode="replay"`, in a forward that hands its
-  tapes to the kept-tape backward and in the backward's replayed forward the
-  output program runs after the tape walk.
+  `save_mode="full"` or `boundary_mode="replay"` and in a forward that hands
+  its tapes to the kept-tape backward the output program runs after the tape
+  walk.  Under the default `recompute_output="auto"` a hand-off forward that is
+  the checkpoint recompute closing its region launches no output program (with
+  the default `reuse_recompute_tapes="auto"` every hand-off forward is one), and
+  the backward's replay of the forward runs no output program.
 * The causal-convolution halo backward is the conv package's program; its
   launch form is that package's.
 

@@ -57,6 +57,7 @@ DispatchPolicy = cake_policy.DispatchPolicy
 fp8_policy_record = cake_policy.fp8_policy_record
 fp8_program_choice = cake_policy.fp8_program_choice
 fp8_scan_programs = cake_policy.fp8_scan_programs
+sample_class_for = cake_policy.sample_class_for
 scan_key = cake_policy.scan_key
 scan_key_fields = cake_policy.scan_key_fields
 scan_key_form = cake_policy.scan_key_form
@@ -210,6 +211,11 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         "sm_103a": [],
         "sm_107a": ["l6", "narrow", "split_narrow"],
     }
+    # the FP8 records' own rules: sm_107a keeps no split-fit rule (no FP8 split program is measured under one)
+    assert {
+        arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
+        for arch, fields in cake_jit.POLICY_FP8.items()
+    } == {"sm_100a": {}, "sm_103a": {}, "sm_107a": {"split_fit_rule": None}}
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
     with pytest.raises(ValueError, match="static_scan_kinds"):
         fp8_policy_record(cake_jit.POLICY["sm_107a"], {})
@@ -316,17 +322,17 @@ def test_fp8_program_choice_follows_the_key():
     _registries(),
     ids=lambda v: v if isinstance(v, str) else None,
 )
-def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
+def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_fp8_key(
     label, arch, keys, fp8_keys
 ):
     """The FP8 dispatch runs the BF16 decision procedure under the FP8 record and maps its kind to a registered FP8
     kind (``FP8_KIND_FALLBACK``); on a geometry grid every program it selects is an FP8 key of the registry, never a
-    CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow the BF16 decision where an
-    FP8 program carries them, and every FP8 key is selected by some call."""
+    CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow that decision where an
+    FP8 program carries them, the sampled first threshold and the check period are those of the kind that runs, and
+    every FP8 key is selected by some call."""
     if not fp8_keys:
         pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
     policy = _fp8_policy(arch)
-    bf16_policy = DispatchPolicy.from_record(cake_jit.POLICY[arch])
     programs = fp8_scan_programs(keys)
     fp8_kinds = {kind for kind, _lsf in programs}
     reached = set()
@@ -345,7 +351,7 @@ def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
                     max_seqlen_k=bound,
                     scan_keys=keys,
                 )
-                decided = select_program(bf16_policy, **call)
+                decided = select_program(policy, **call)
                 c = select_fp8_program(policy, fp8_programs=programs, **call)
                 where = (arch, grid, T, Tkv, S, ratio, top_k, bound, sample)
                 assert c.scan_key in fp8_keys, (*where, c.scan_key)
@@ -363,10 +369,140 @@ def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
                     if decided.tile_unroll in unrolls
                     else min(unrolls)
                 ), where
+                tiles = (
+                    policy.sample_tiles_for(T, Tkv, S, ratio)
+                    if sample is None
+                    else sample
+                )
+                assert (
+                    c.sample_tiles_max,
+                    c.sample_shift_permille,
+                ) == sample_class_for(
+                    policy,
+                    physical,
+                    T,
+                    Tkv,
+                    S,
+                    ratio,
+                    tiles,
+                    policy.sample_shift_for(top_k),
+                    tiles_knob=sample is not None,
+                    shift_knob=False,
+                ), where
+                assert c.check_period == policy.check_period_for(
+                    top_k, c.cand_cap, c.kind
+                ), where
+                if physical == decided.physical_kind:
+                    assert (
+                        c.sample_tiles_max,
+                        c.sample_shift_permille,
+                        c.check_period,
+                    ) == (
+                        decided.sample_tiles_max,
+                        decided.sample_shift_permille,
+                        decided.check_period,
+                    ), where
                 if arch == "sm_107a":
                     assert not c.lsf, where
                 reached.add(c.scan_key)
     assert reached == fp8_keys, sorted(fp8_keys - reached)
+
+
+@pytest.mark.parametrize(
+    "arch, grid", [("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)]
+)
+def test_fp8_wide_call_runs_the_l6_program(arch, grid):
+    """s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 record plans a wide unit, and the
+    FP8 form, which has no wide program, runs its l6 program (``FP8_KIND_FALLBACK``), unpaired and unsplit, rather than
+    the narrow one."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get(arch) or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
+    call = dict(
+        num_queries=8192,
+        num_keys=73728,
+        num_segments=1,
+        ratio=1,
+        top_k=2048,
+        grid=grid,
+        scan_keys=keys,
+    )
+    bf16 = select_program(DispatchPolicy.from_record(cake_jit.POLICY[arch]), **call)
+    assert bf16.physical_kind in ("wide", "pair_wide"), bf16.scan_key
+    fp8 = select_fp8_program(_fp8_policy(arch), **call)
+    assert fp8.scan_key == "scan:l6:u1:s0:f1:fp8", fp8.scan_key
+    assert (fp8.block_q, fp8.pair, fp8.n_split, fp8.grid_ctas) == (6, False, 1, grid)
+
+
+def test_fp8_wide_fallback_takes_the_sampling_class_of_l6():
+    """s2_4x2k_packed on sm_100a (four segments of 2048 queries over 229376 keys, the longest 100352): the BF16 record
+    plans a wide unit with the wide-unit sample shift of ``sample_class_rule``; the FP8 l6 program that runs instead
+    takes the l6 kind's shift, as an l6 decision of the call would (sm_100a's record keys no check period on the kind:
+    the next test covers sm_103a's).  Explicit knobs stay."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_100a") or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip("this checkout registers no FP8 scan program for sm_100a")
+    policy = _fp8_policy("sm_100a")
+    call = dict(
+        num_queries=8192,
+        num_keys=229376,
+        num_segments=4,
+        ratio=1,
+        top_k=2048,
+        grid=148,
+        max_seqlen_k=100352,
+        scan_keys=keys,
+    )
+    decided = select_program(policy, **call)
+    assert decided.physical_kind == "wide", decided.scan_key
+    assert decided.sample_shift_permille == policy.sample_class_rule[1]
+    c = select_fp8_program(policy, **call)
+    assert c.scan_key == "scan:l6:u1:s0:f1:fp8:lsf", c.scan_key
+    assert c.sample_shift_permille == policy.sample_shift_for(2048)
+    assert c.sample_tiles_max == decided.sample_tiles_max
+    assert c.check_period == policy.check_period_for(2048, c.cand_cap, "l6")
+    knobbed = select_fp8_program(
+        policy, sample_shift_permille=500, check_period=8, **call
+    )
+    assert (knobbed.sample_shift_permille, knobbed.check_period) == (500, 8)
+
+
+def test_fp8_wide_fallback_takes_the_check_period_of_l6_on_sm103a():
+    """sm_103a's record overrides the wide kind's check period (``check_period_kind_overrides``): the FP8 l6 program
+    run for a wide decision takes the l6 period instead.  The unsampled wide decisions of the geometry grid whose two
+    periods differ must exist, and each one runs with the l6 period."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_103a") or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip("this checkout registers no FP8 scan program for sm_103a")
+    policy = _fp8_policy("sm_103a")
+    programs = fp8_scan_programs(keys)
+    seen = 0
+    for T, Tkv, S, ratio, top_k in _geometries(policy):
+        call = dict(
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=ratio,
+            top_k=top_k,
+            grid=152,
+            sample_tiles_max=0,
+            scan_keys=keys,
+        )
+        decided = select_program(policy, **call)
+        if decided.physical_kind not in ("wide", "pair_wide"):
+            continue
+        wide = policy.check_period_for(top_k, decided.cand_cap, decided.kind)
+        l6 = policy.check_period_for(top_k, decided.cand_cap, "l6")
+        if wide == l6:
+            continue
+        c = select_fp8_program(policy, fp8_programs=programs, **call)
+        where = (T, Tkv, S, ratio, top_k)
+        assert decided.check_period == wide, where
+        assert (c.physical_kind, c.check_period) == ("l6", l6), where
+        seen += 1
+    assert seen, (
+        "no unsampled wide decision of the grid has a check period other than l6's"
+    )
 
 
 def test_bf16_plans_and_workspace_bounds_are_the_unchanged_procedure():
@@ -868,7 +1004,10 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
         pytest.skip(f"{arch} accumulates in K = 64 steps: no bitwise DeepGEMM claim")
     if importlib.util.find_spec("deep_gemm") is None:
         pytest.skip("deep_gemm is not installed")
-    import deep_gemm
+    try:
+        import deep_gemm
+    except (ImportError, OSError) as exc:  # installed, but its extension does not load
+        pytest.skip(f"deep_gemm does not import: {exc}")
 
     inputs = ref.make_fp8_inputs([512], [8192], top_k=2048, seed=67, device="cuda")
     indices, scores = _run(inputs)

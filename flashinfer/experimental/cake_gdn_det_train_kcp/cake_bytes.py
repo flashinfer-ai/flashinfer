@@ -469,9 +469,11 @@ def gdn_det_workspace_layout_kcp(
       tapes; that form's
       recompute forward keeps every tape in the arena until the hand-off (``bwd.recompute_forward``) and counts as a
       phase too.  ``"auto"`` reports the replay form (the bound the workspace may reach when a later operation of the
-      checkpointed region saves a tensor).  ``save_mode="full"`` saves the forward tapes as fresh tensors: none is
-      workspace in either lifetime.  ``backward_transient`` = the backward's phase maximum with the hand-off tensors
-      added (the memory a backward needs besides the saved set; the same figure in both forms).
+      checkpointed region saves a tensor).  ``save_mode="full"`` saves the forward tapes as fresh tensors when the
+      forward keeps a saved set: none is workspace in either lifetime.  A ``"full"`` forward without one
+      (``save_for_backward=False``, or ``boundary_mode="replay"``) binds them in the arena like the light split
+      forward, and the replay backward re-creates the ten.  ``backward_transient`` = the backward's phase maximum with
+      the hand-off tensors added (the memory a backward needs besides the saved set; the same figure in both forms).
     * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in the forward's tape walk, in every backward phase of the
       replay and ``save_mode="full"`` forms (``qk_apply`` writes them there) and in the kept form's recompute
       forward, which hands them over with the ten tapes: in the kept-tape backward they are hand-off tensors
@@ -510,6 +512,9 @@ def gdn_det_workspace_layout_kcp(
     # the forward keeps a saved set (cake_kcp._fwd_entry: save)
     keep = saved and keep_set
     full = save_mode == "full"
+    # the forward tapes are saved-set tensors only when the forward keeps a saved set (cake_kcp._forward binds fresh
+    # tapes under keep only): a "full" forward without one binds them in the arena as the light split forward does
+    full_saved = full and keep
     kept = kept_form and not full  # the kept-tape backward is the light form's
     # the shipped forward folds #5 into its tape walks (cake_kcp._fuse_o_enabled with test knob fused_o = 1)
     fused = (not full) and saved and _fwdh_out_shipped()
@@ -525,7 +530,7 @@ def gdn_det_workspace_layout_kcp(
     fwd_staging = plane + (0 if (keep and (save_transfer or full)) else plane)
     carry = (ctx.n_frag * (P - 1) * s) if P > 1 else 0
     # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
-    # in the backward; in "full" they are saved-set bytes (gdn_det_saved_layout_kcp), not workspace
+    # in the backward; in "full" with a saved set they are saved-set bytes (gdn_det_saved_layout_kcp), not workspace
     light_tapes = {
         "w": R * HV * ROW_BF16_128,
         "u": R * HV * ROW_BF16_128,
@@ -553,7 +558,7 @@ def gdn_det_workspace_layout_kcp(
     # (FWD_TAPES_DEAD_AFTER_PREP); the fused forward's peak is #1 (no h / v_new tape at any moment)
     split_tapes = (
         {}
-        if full
+        if full_saved
         else {
             k: v for k, v in light_tapes.items() if k not in FWD_TAPES_DEAD_AFTER_PREP
         }
@@ -601,9 +606,10 @@ def gdn_det_workspace_layout_kcp(
         )
     # the forward tapes the backward's arena holds: the replay re-creates all ten; the kept form none (the hand-off
     # tensors) until #8, then the four an eager forward leaves bound return to the arena; "full" binds saved tensors
+    # (without a saved set, i.e. boundary_mode="replay", the backward replays the ten into the arena)
     bwd_fwd_tapes: dict[str, int]
     bwd_fwd_tapes_end: dict[str, int]
-    if full:
+    if full_saved:
         bwd_fwd_tapes, bwd_fwd_tapes_end = {}, {}
     elif kept:
         bwd_fwd_tapes = {}

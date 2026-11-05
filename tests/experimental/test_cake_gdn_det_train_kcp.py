@@ -1479,7 +1479,8 @@ def test_byte_queries(W) -> None:
                             - ws["fwd.akk"]
                             - ws["fwd.gcum"]
                         )
-                    elif save_mode == "light":
+                    elif save_mode == "light" or boundary_mode == "replay":
+                        # a replay boundary keeps no saved set: "full" binds the light replay's tapes
                         assert (
                             ws["fwd.h_tape"] == ctx.NC_pad * HV * 32768
                             and ws["bwd.h_tape"] == ws["fwd.h_tape"]
@@ -4558,6 +4559,78 @@ def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
         gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **o
         )
+
+
+@pytest.mark.parametrize("segments", (1, 2))
+def test_workspace_layout_of_a_full_forward_without_a_saved_set(segments) -> None:
+    """``save_mode="full"`` saves the forward tapes as fresh tensors only when the forward keeps a saved set.  Without
+    one (``save_for_backward=False``; every forward of ``boundary_mode="replay"``) the tapes are the arena's, as in the
+    light split forward (a ``"full"`` forward never runs the output walk): the forward's peak is the layout's
+    ``forward`` (= ``forward_split``, the light split figure) at either ``fused_o``, the forward leaves the light
+    split forward's tapes bound, and the replay boundary's layout and backward peak are the light replay's."""
+    kcp, ctx, ops = _ckpt_setup()
+    gb = _package("cake_bytes")
+    H_qk, HV = 2, 6
+    leaves = [ops[n] for n in LEAVES]
+    for l2n in (False, True):
+        o = dict(P=segments, use_qk_l2norm_in_kernel=l2n)
+        nosave = dict(backward=False, save_for_backward=False, **o)
+        layout = gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", **nosave
+        )
+        light = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **nosave)
+        assert layout["forward"] == layout["forward_split"] == light["forward_split"]
+        saved_full = gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", **o
+        )
+        assert layout["forward"] > saved_full["forward"], (layout, saved_full)
+        for fused in (1, 0):
+            ws = _PeakWorkspace(kcp)
+            _out, saved = kcp.chunk_gdn_det_fwd_kcp(
+                *leaves,
+                ctx,
+                workspace=ws,
+                backend="fake",
+                save_mode="full",
+                save_for_backward=False,
+                segments=segments,
+                test_knobs={"fused_o": fused},
+                use_qk_l2norm_in_kernel=l2n,
+            )
+            assert saved is None
+            assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+            assert kcp.LAST_CALL["fwd"]["P"] == segments
+            assert ws.peak == layout["forward"], (l2n, fused, ws.peak, layout)
+            left = set(ws._tapes) & set(kcp.FWD_TAPES)
+            assert left == set(kcp.FWD_TAPES_ARENA_AFTER_FWD), (l2n, fused, left)
+        # the replay boundary keeps no saved set: "full" is the light replay, forward and backward
+        replay = dict(boundary_mode="replay", **o)
+        layout = gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", **replay
+        )
+        assert layout == gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, **replay
+        )
+        ws = _PeakWorkspace(kcp)
+        grads = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        out = kcp.chunk_gdn_det_kcp(
+            *grads,
+            ctx,
+            workspace=ws,
+            backend="fake",
+            save_mode="full",
+            boundary_mode="replay",
+            segments=segments,
+            use_qk_l2norm_in_kernel=l2n,
+        )
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert ws.peak == layout["forward"], (l2n, ws.peak, layout["forward"])
+        ws.peak = 0
+        out.backward(ops["dout"])
+        assert ws.peak == layout["backward"], (l2n, ws.peak, layout["backward"])
 
 
 # --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"
