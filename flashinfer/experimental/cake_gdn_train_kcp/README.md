@@ -6,8 +6,10 @@ checkpoint replay over a process group whose ranks each hold fragments of the
 documents of one packed batch, with precise (FP32 / TF32x3-class) cross-rank
 passing of the per-document recurrent state.  Tokens never move between ranks;
 only affine summaries of the state do.  The deterministic twin of this package is
-`flashinfer.experimental.cake_gdn_det_train_kcp`: the same contract and the
-same accuracy budgets, bitwise reproducible.  This package's results stay
+`flashinfer.experimental.cake_gdn_det_train_kcp`: the same entry points and
+the same accuracy budgets, bitwise reproducible; it does not take this
+package's non-deterministic-only `save_mode` values (`"light_akk"`, see
+"Options").  This package's results stay
 within the deterministic route's accuracy budgets and are not bitwise equal
 to its results; today they are run-to-run reproducible for a fixed plan and
 partition, and later versions may use unordered reductions
@@ -266,7 +268,7 @@ eager calls too.
 
 | option | values | meaning |
 |---|---|---|
-| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
+| `save_mode` | **`"light"`**, `"light_akk"`, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"light_akk"` (opt-in, `use_qk_l2norm_in_kernel=True` only) is `"light"` plus the chunk preparation's BF16 `Akk` tape (6,144 B per padded token row at `HV = 48`): the light replay then runs `fwd_prep_replay_l2n`, the chunk preparation reading that tape instead of forming it (no `K K^T` Gram, no block inverse; every other output bitwise the same), and under `torch.utils.checkpoint(use_reentrant=False)` it saves as `"light"`; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
 | `boundary_mode` | **`"saved"`**, `"replay"` | whether the cross-rank boundary states (`S_in`, the owner's received summaries) are kept in the saved set or recomputed (exchange included) in the backward; `"replay"` keeps no tape and no `qk_rstd` either: `save_mode="full"` there runs the same backward as `"light"` (the whole-forward replay) |
 | `exchange` | **`"a2a"`**, `"ring"` | the collective schedule; `"ring"` only when every document crosses at most 3 ranks (`n_d_max - 1 <= 2`) and `save_transfer=False` |
 | `save_transfer` | **`True`**, `False` | keep the received summary pairs for the backward (`False` re-sends the transposed transfers) |
@@ -308,10 +310,13 @@ bytes per padded token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
 | `qk_rstd` (`use_qk_l2norm_in_kernel=True`; `boundary_mode="saved"` only) FP32 | yes | yes | `8 * T_r * H_qk` |
 
+`save_mode="light_akk"` is the `"light"` column plus `Akk` (BF16
+`[R, HV, 64]`, 6,144 B per padded token row at `HV = 48`).
+
 With `boundary_mode="replay"` the saved set keeps no boundary state, no
-`M_seg`, no tape and no `qk_rstd` in either `save_mode`: the backward replays
-the whole forward, and `save_mode="full"` runs the same backward as
-`"light"`.
+`M_seg`, no tape and no `qk_rstd` in any `save_mode`: the backward replays
+the whole forward, and `save_mode="full"` / `"light_akk"` run the same
+backward as `"light"`.
 
 Everything is attached through the autograd `save_for_backward` only, so a
 `torch.utils.checkpoint(use_reentrant=False)` forward retains 0 B per entry
@@ -334,7 +339,8 @@ Two replays exist, and they differ:
   unless `reuse_recompute_tapes` keeps the recompute's tapes for it; with
   `recompute_output="auto"` the re-run may leave the output program out).
   Under `boundary_mode="replay"` the backward itself replays the whole forward
-  in either `save_mode`; it is the minimum-memory option.
+  in any `save_mode` (`save_mode="full"` / `"light_akk"` there run the same
+  backward as `"light"`); it is the minimum-memory option.
 
 Both replays give bitwise the gradients of the saved-set backward.
 
@@ -493,7 +499,10 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     pools take the larger split form; a backward on a caller-held workspace also sizes the forward exchange pools
     (c1_send, c2_send, c1_recv unless saved); with_conv=True (default) adds the layer convolution's halo rows, which
     the entry points do not allocate (with_conv=False: what a call binds); boundary_mode="replay" gives the same
-    figures for both save_mode values
+    figures for every save_mode value (the light replay form).  save_mode="light_akk" (use_qk_l2norm_in_kernel=True)
+    gives the light figures without Akk in the arena (the forward writes it into the saved set, the backward binds
+    it from there) for a call outside a checkpoint; under torch.utils.checkpoint(use_reentrant=False) the call runs
+    as save_mode="light" and binds the light figure: size a checkpointed light_akk layer with save_mode="light"
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on
@@ -525,7 +534,7 @@ other reader (#2, #3, #5, #2+5, #2+5t, #7) is the unchanged program bound to `qn
 | path | `qn` / `kn` from | `r` the pullback reads | dropped |
 |---|---|---|---|
 | forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a fused forward: both after its output walks; a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
-| light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
+| light backward | the replay's `fwd_prep_l2n` (`save_mode="light_akk"`: `fwd_prep_replay_l2n`) | saved | after #8 |
 | kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
 | `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
 | `boundary_mode="replay"` | the replayed forward's `fwd_prep_l2n` | arena | after #8 |
@@ -592,6 +601,7 @@ with the `_kcp` suffix; its 20-hex digests equal that package's):
 | # | program | role |
 |---|---|---|
 | 1 | `fwd_prep` | per chunk: cumulative gate, `gamma`, the WY representation (`w`, `u`), `Aqk`, `Akk` |
+| 1r | `fwd_prep_replay_l2n` | the light replay of `save_mode="light_akk"` (in-kernel norm): `fwd_prep_l2n` reading the forward's saved `Akk` tape into the WY operand instead of forming it (no `K K^T` Gram, no block inverse, no `Akk` store); every other output bitwise `fwd_prep_l2n`'s; this package's own program (no deterministic twin) |
 | 2 | `kcp_fwdh` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the forward state walk over the rank's segments: from zero for the summary offset `B_f`, from `S_in` for the `h` / `v_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) runs when `n_walk × HV ≤ SM count` or when its two-CTA grid finishes within the longest walked segment (LPT over two CTAs per SM) and writes bitwise-identical results |
 | 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |

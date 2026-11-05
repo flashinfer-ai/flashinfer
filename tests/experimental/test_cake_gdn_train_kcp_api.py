@@ -1193,6 +1193,69 @@ def test_facade_routes_by_mode(monkeypatch) -> None:
         facade.is_gdn_train_kcp_supported("cpu", deterministic=None)
 
 
+def test_facade_refuses_non_deterministic_only_save_modes_on_the_deterministic_route(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``ND_ONLY_SAVE_MODES`` are the save_mode values of this package that the twin does not take; the
+    deterministic route (the default, ``deterministic=True``, and ``deterministic=False`` under torch's
+    deterministic algorithms) refuses each one before the twin is reached, on every compute entry and in the saved /
+    workspace byte queries, as a keyword, a knob, an options mapping or an options instance, with an error naming
+    ``deterministic=False``; the non-deterministic route passes it on unchanged."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    assert facade.ND_ONLY_SAVE_MODES == ("light_akk",)
+    assert set(facade.ND_ONLY_SAVE_MODES) == set(opt.SAVE_MODES) - set(
+        det_opt.SAVE_MODES
+    )
+    seen = _route_recorders(monkeypatch)
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    calls = _facade_calls(facade)
+    entries = (
+        "chunk_gdn_kcp",
+        "chunk_gdn_fwd_kcp",
+        "chunk_gdn_bwd_kcp",
+        "gdn_workspace_bytes_kcp",
+        "gdn_saved_bytes_kcp",
+    )
+    for mode in facade.ND_ONLY_SAVE_MODES:
+        forms = [
+            {"save_mode": mode},
+            {"options": {"save_mode": mode}},
+            {"options": OptionsKcp(save_mode=mode, use_qk_l2norm_in_kernel=True)},
+        ]
+        for deterministic_mode in (False, True):
+            torch.use_deterministic_algorithms(deterministic_mode)
+            routes = (
+                ({"deterministic": False},)
+                if deterministic_mode
+                else ({}, {"deterministic": True})
+            )
+            for entry in entries:
+                for form in forms:
+                    for kw in routes:
+                        seen.clear()
+                        with pytest.raises(
+                            ValueError,
+                            match=f"{entry}: save_mode='{mode}' .*needs deterministic=False",
+                        ):
+                            calls[entry](**form, **kw)
+                        assert seen == [], (entry, form, kw)
+        torch.use_deterministic_algorithms(False)
+        for entry in entries:
+            for form in forms:
+                seen.clear()
+                assert calls[entry](**form, deterministic=False) == f"nondet:{entry}"
+                sent = seen[-1][1]
+                got = sent.get("options") if "options" in form else sent
+                got = got if isinstance(got, dict) else dataclasses.asdict(got)
+                assert got["save_mode"] == mode, (entry, form, sent)
+    # the twin's own values pass on the deterministic route
+    for entry in entries:
+        for mode in det_opt.SAVE_MODES:
+            seen.clear()
+            assert calls[entry](save_mode=mode).startswith("det:"), (entry, mode)
+
+
 def test_facade_imports_each_route_once(monkeypatch) -> None:
     """The facade imports each routed module on first use only: later calls on either route run no import and reach
     the same module objects."""
@@ -1743,6 +1806,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "fwd_prep_l2n",
         "bwd_dqkg_l2n",
         "qk_apply",
+        "fwd_prep_replay_l2n",
     )
     # the in-kernel Q / K L2 norm (use_qk_l2norm_in_kernel): #1 / #8 siblings and the backward's qk_apply
     assert kcp.L2N_PROGRAMS == ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
@@ -1759,8 +1823,24 @@ def test_program_vocabulary_is_the_design_list() -> None:
     # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
     assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
     assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
+    # save_mode="light_akk": the solve-free light replay of #1_l2n (this package's own module; a local program,
+    # launched only in place of fwd_prep_l2n when the saved set holds the Akk tape)
+    assert (
+        kcp.TART_MODULE_OF["fwd_prep_replay_l2n"]
+        == "gdn_chunk_train_fwd_prep_replay_l2n_v1"
+    )
+    assert kcp.AKK_REPLAY_OF == {"fwd_prep_l2n": "fwd_prep_replay_l2n"}
+    assert kcp.AKK_REPLAY_PROGRAMS == ("fwd_prep_replay_l2n",)
+    assert set(kcp.AKK_REPLAY_PROGRAMS) <= set(kcp.LOCAL_PROGRAMS)
+    assert kcp.PROGRAM_ARGS["fwd_prep_replay_l2n"] == kcp.PROGRAM_ARGS["fwd_prep_l2n"]
+    own = (
+        "kcp_affine_merge",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+        "fwd_prep_replay_l2n",
+    )
     for name, module in kcp.TART_MODULE_OF.items():
-        if name not in ("kcp_affine_merge", "kcp_fwdh_out", "kcp_fwdh_out_tape"):
+        if name not in own:
             # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
             # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)

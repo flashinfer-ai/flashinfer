@@ -32,8 +32,11 @@ contiguous operands with their hooks and ``retain_grad`` and the gradient layout
 CUDA-graph replay alternating the packed and plain views keeps each its own layout), and the explicit forward /
 backward entries against autograd (output order ``dq, dk, dv, dbeta, dg``,
 saved-context against replay), two caller streams with cached workspaces, and the fused output walk against the split
-forward on the same build (test knob ``fused_o`` 1 / 0, bitwise), and ``save_mode="full"`` without ``save_transfer`` at
-``P = 2`` under NaN-filled allocations against the light form (bitwise).  The multi-rank rows and the
+forward on the same build (test knob ``fused_o`` 1 / 0, bitwise), ``save_mode="full"`` without ``save_transfer`` at
+``P = 2`` under NaN-filled allocations against the light form (bitwise), and ``save_mode="light_akk"`` (the light
+replay reads the forward's ``Akk`` tape: ``fwd_prep_replay_l2n``) under NaN-filled allocations within the budgets of
+the light form and, on the smaller packs, of the FP64 reference (with its launch census and saved bytes, at the plan's
+``P`` and ``P = 2``; its bits against the light form are recorded as data, not gated) and in ``graph="replay"`` steps.  The multi-rank rows and the
 runtime contracts live in ``test_cake_gdn_train_kcp_dist.py``; the CPU plan, table, byte-query and fake-backend tests in
 ``test_cake_gdn_train_kcp.py``.  Every test needs a CUDA device the package supports and the rendered ``build.json``
 (skipped otherwise).
@@ -147,6 +150,22 @@ def _inputs(cu: list[int], heads: tuple[int, int], regime: str) -> dict:
                 gate_sum,
             )
     return inputs
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
 
 
 def _rendered() -> bool:
@@ -1470,6 +1489,258 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
         for n in light:
             assert torch.equal(full[n], light[n]), (i, n)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# save_mode="light_akk": the light set plus #1_l2n's BF16 Akk tape; the light replay runs fwd_prep_replay_l2n
+
+AKK_FORMS = (
+    # id, document lengths, (H_qk, HV), options
+    ("2x6", (100, 640, 77, 1000, 129), (2, 6), {}),
+    (
+        "2x6-no-save-transfer",
+        (100, 640, 77, 1000, 129),
+        (2, 6),
+        {"save_transfer": False},
+    ),
+    ("16x48-P2", (11000, 12000, 9768), (16, 48), {"segments": 2}),
+    (
+        "16x48-P2-no-save-transfer",
+        (11000, 12000, 9768),
+        (16, 48),
+        {"segments": 2, "save_transfer": False},
+    ),
+)
+
+
+def _akk_or_skip(kcp):
+    """The replay's program name; skips while the registry does not ship the norm programs or the replay."""
+    if not kcp.l2n_records_shipped():
+        pytest.skip("the in-kernel L2 norm programs are not rendered")
+    jit = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_jit")
+    replay = kcp.AKK_REPLAY_OF["fwd_prep_l2n"]
+    if not jit.records_of_program(replay):
+        pytest.skip(f"{replay} is not rendered")
+    return jit, replay
+
+
+@pytest.mark.parametrize("form", AKK_FORMS, ids=[f[0] for f in AKK_FORMS])
+def test_light_akk_is_within_budget_of_light_on_poisoned_memory(
+    device, monkeypatch, record_property, form
+) -> None:
+    """``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel=True``) on the device programs with every tensor the
+    package allocates filled with NaN bytes: out and the five gradients are finite and within the deterministic
+    route's budgets of ``"light"`` (the same programs on the same states but #1_l2n's block inverse, whose ``Akk``
+    the replay reads from the saved set) through the explicit entries, through autograd (the saved set through
+    ``save_for_backward``) and under a non-reentrant checkpoint (where the mode saves as ``"light"``); on the two
+    smaller packs the autograd arms are also within the budgets of the FP64 reference (``out`` / ``dv`` / ``dg`` /
+    ``dbeta``; the norm's pullback of ``dq`` / ``dk`` is judged against ``"light"``).  The backward launches
+    ``fwd_prep_replay_l2n`` once per light replay of ``fwd_prep_l2n`` and no ``fwd_prep_l2n``, on the same grids; the
+    forward launches light's programs; the saved set gains the ``Akk`` tape (``128 R HV`` bytes; on the rows of the
+    real chunks within the budget of the full set's ``Akk``; the pad chunks' rows are written by no program).  Bitwise
+    equality with ``"light"`` is recorded (``*_bitwise``), never gated: the package has no bit contract."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    jit, replay = _akk_or_skip(kcp)
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = real_alloc(shape, dtype, dev)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+
+    def judge(arm: dict, partner: dict, key: str) -> None:
+        for n in TENSORS:
+            _within_budget(arm[n], partner[n], f"{key} vs light {n}", elementwise=False)
+            record_property(
+                f"{key}_{n}_bitwise",
+                bool(torch.equal(_bits(arm[n]), _bits(partner[n]))),
+            )
+
+    _name, lengths, (H, HV), opts = form
+    cu = _cu(lengths)
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    o = {"use_qk_l2norm_in_kernel": True, **opts}
+    q, k, v, g, beta = (inputs[n].to(device)[0] for n in OPERANDS)
+    dout = inputs["dout"].to(device)[0]
+
+    def saved_pass(**kw) -> dict:
+        out, saved = kcp.chunk_gdn_fwd_kcp(
+            q, k, v, g, beta, ctx, deterministic=False, **o, **kw
+        )
+        fwd = dict(kcp.LAST_CALL["fwd"])
+        grads = kcp.chunk_gdn_bwd_kcp(
+            q, k, v, g, beta, ctx, dout, saved=saved, deterministic=False, **o, **kw
+        )
+        torch.cuda.synchronize(device)
+        return {
+            "out": out,
+            **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), grads, strict=True)),
+            "saved": saved,
+            "fwd": fwd,
+            "bwd": dict(kcp.LAST_CALL["bwd"]),
+        }
+
+    def autograd(ckpt: bool, **kw) -> dict:
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+
+        def fn(*a):
+            return gdn_api.chunk_gdn_kcp(*a, ctx, deterministic=False, **o, **kw)
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, use_reentrant=False)
+        else:
+            out = fn(*leaves)
+        out.backward(inputs["dout"].to(device))
+        torch.cuda.synchronize(device)
+        res = {"out": out.detach()[0]}
+        res.update({n: lf.grad[0] for n, lf in zip(GRAD_NAMES, leaves, strict=True)})
+        return res
+
+    light = saved_pass()
+    if "segments" in opts:
+        assert light["fwd"]["P"] == opts["segments"]
+    for n in TENSORS:
+        assert bool(torch.isfinite(light[n].float()).all()), ("light", n)
+    got = saved_pass(save_mode="light_akk")
+    judge(got, light, "explicit")
+    lb, ab = light["bwd"], got["bwd"]
+    assert ab["akk_source"] == "saved" and lb["akk_source"] is None
+    assert ab["save_mode"] == "light_akk" and ab["tapes_source"] == lb["tapes_source"]
+    assert got["fwd"]["sequence"] == light["fwd"]["sequence"]
+    n_l2n = lb["sequence"].count("fwd_prep_l2n")
+    assert n_l2n >= 1 and "fwd_prep_l2n" not in ab["sequence"]
+    assert ab["sequence"] == [
+        replay if p == "fwd_prep_l2n" else p for p in lb["sequence"]
+    ]
+    replay_records = set(jit.records_of_program(replay))
+    l2n_records = set(jit.records_of_program("fwd_prep_l2n"))
+    assert sum(r in replay_records for r, _ in ab["records"]) == n_l2n
+    assert sum(r in l2n_records for r, _ in lb["records"]) == n_l2n
+    assert not any(r in l2n_records for r, _ in ab["records"])
+    assert [gr for _, gr in ab["records"]] == [gr for _, gr in lb["records"]]
+    tape = int(ctx.R) * HV * 128
+    akk = got["saved"].tape("akk")
+    assert got["saved"].bytes - light["saved"].bytes == tape == akk.numel() * 2
+    _, full_saved = kcp.chunk_gdn_fwd_kcp(
+        q, k, v, g, beta, ctx, save_mode="full", deterministic=False, **o
+    )
+    torch.cuda.synchronize(device)
+    full_akk = full_saved.tape("akk")
+    # pad-row rule: the 64 rows of each pad chunk (chunk_len 0; NC_pad - NC of them)
+    # are written and read by no program (NaN bytes here, in both modes); the rows of
+    # the NC real chunks are finite in both tapes and within the budget
+    rows_per_chunk = akk.shape[0] // len(ctx.chunk_len)
+    assert rows_per_chunk * len(ctx.chunk_len) == akk.shape[0] == int(ctx.R)
+    real = torch.tensor([n > 0 for n in ctx.chunk_len], device=akk.device)
+    real = real.repeat_interleave(rows_per_chunk)
+    assert int(real.sum()) == rows_per_chunk * int(ctx.NC)
+    assert bool(torch.isfinite(full_akk[real].float()).all())
+    _within_budget(
+        akk[real],
+        full_akk[real],
+        "akk tape (real chunk rows): light_akk vs full",
+        elementwise=False,
+    )
+    for tag, t in (("light_akk", akk), ("full", full_akk)):
+        bad = ~torch.isfinite(t.float())
+        record_property(f"akk_tape_{tag}_nonfinite_real_rows", int(bad[real].sum()))
+        record_property(f"akk_tape_{tag}_nonfinite_pad_rows", int(bad[~real].sum()))
+    record_property("akk_tape_bitwise", bool(torch.equal(_bits(akk), _bits(full_akk))))
+    del full_saved, full_akk, akk, real, bad
+    a_light = autograd(False)
+    a_akk = autograd(False, save_mode="light_akk")
+    assert kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
+    a_ckpt = autograd(True, save_mode="light_akk")
+    assert kcp.LAST_CALL["bwd"]["save_mode"] == "light"
+    assert replay not in kcp.LAST_CALL["bwd"]["sequence"]
+    judge(a_akk, a_light, "autograd")
+    judge(a_ckpt, a_light, "checkpoint")
+    if cu[-1] <= 4096:
+        ref, _ = reference_pack(inputs, device)
+        _arms_within_budget(
+            {"light": a_light, "light_akk": a_akk, "light_akk checkpoint": a_ckpt},
+            ref,
+            ("out", "dv", "dg", "dbeta"),
+            "light_akk autograd",
+            elementwise=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_graph_replay_light_akk_steps_are_within_budget_of_the_eager_light_step(
+    device, record_property, lengths, heads
+) -> None:
+    """Forward + backward steps of ``save_mode="light_akk"`` under ``graph="replay"`` on one caller-held workspace
+    whose arena still holds an eager ``"light"`` step's tapes, with pointer-stable operands: the steady state replays
+    both graphs, every step's out and five gradients are finite and within the deterministic route's budgets of the
+    eager ``"light"`` step (bitwise equality recorded, never gated), and every backward launches the replay in place
+    of ``fwd_prep_l2n`` (``akk_source="saved"``)."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    _jit, replay = _akk_or_skip(kcp)
+    H, HV = heads
+    cu = _cu(lengths)
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    base = [inputs[n].to(device) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    ws = kcp.WorkspaceKcp()
+
+    def step(mode: str, graph: str):
+        leaves = [t.detach().requires_grad_(True) for t in base]
+        out = gdn_api.chunk_gdn_kcp(
+            *leaves,
+            ctx,
+            workspace=ws,
+            deterministic=False,
+            save_mode=mode,
+            graph=graph,
+            use_qk_l2norm_in_kernel=True,
+        )
+        fwd = dict(kcp.LAST_CALL["fwd"])
+        res = {"out": out.detach()[0].clone()}
+        out.backward(dout)
+        res.update(
+            {
+                n: lf.grad.detach()[0].clone()
+                for n, lf in zip(GRAD_NAMES, leaves, strict=True)
+            }
+        )
+        return res, fwd, dict(kcp.LAST_CALL["bwd"])
+
+    kcp.graph_cache_clear()
+    try:
+        eager, _eager_fwd, eager_bwd = step("light", "off")
+        steps = [step("light_akk", "replay") for _ in range(5)]
+        torch.cuda.synchronize(device)
+    finally:
+        kcp.graph_cache_clear()
+    events = [(f["graph_event"], b["graph_event"]) for _, f, b in steps]
+    assert events[-2:] == [("replay", "replay")] * 2, events
+    swap = [replay if p == "fwd_prep_l2n" else p for p in eager_bwd["sequence"]]
+    assert eager_bwd["sequence"].count("fwd_prep_l2n") >= 1
+    for i, (res, _f, b) in enumerate(steps):
+        assert b["akk_source"] == "saved" and b["sequence"] == swap, (i, b["sequence"])
+        for n in TENSORS:
+            _within_budget(
+                res[n],
+                eager[n],
+                f"graph step {i} vs eager light {n}",
+                elementwise=False,
+            )
+            record_property(
+                f"step{i}_{n}_bitwise",
+                bool(torch.equal(_bits(res[n]), _bits(eager[n]))),
+            )
 
 
 # --------------------------------------------------------------------------- checkpoint under graph="replay"
