@@ -480,22 +480,41 @@ def _check_lse(lse, ref_lse, *, atol=0.01):
 # ---------------------------------------------------------------------------
 
 
+# The #7163 reproducer's cache: a latent of standard deviation 0.05 under a unit
+# global scale, whose block scale bytes lie below 0x20.  The old wide route decoded
+# its V rows to zero; the narrow routes served it.
+REPRODUCER_SIGMA = 0.05
+
+
+def _latent(sigma):
+    """``_make_case`` arguments: the calibrated normal latent for ``None``, else a
+    latent of standard deviation ``sigma`` under a unit global scale."""
+    return {} if sigma is None else dict(values="fixed", sigma=sigma)
+
+
+def _route(num_heads, max_q_len):
+    rows = max_q_len * num_heads
+    return "main_wide" if use_wide_route(rows) else f"main_rt{rt_for_rows(rows)[0]}"
+
+
+@pytest.mark.parametrize("sigma", [None, REPRODUCER_SIGMA])
 @pytest.mark.parametrize("num_heads", [12, 96])
 @pytest.mark.parametrize(
     "kv_lens", [[1, 65, 700], [4095, 777, 129], [20000, 16384, 17001]]
 )
-def test_decode_q1(num_heads, kv_lens):
+def test_decode_q1(num_heads, kv_lens, sigma):
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _make_case(
-        [1] * len(kv_lens), kv_lens, num_heads, seed=625001, device=device
+        [1] * len(kv_lens),
+        kv_lens,
+        num_heads,
+        seed=625001,
+        device=device,
+        **_latent(sigma),
     )
     out, _, runner = _run(case, dense_q_len=1)
-    assert runner.plan.main_kind == (
-        "main_wide"
-        if use_wide_route(num_heads)
-        else f"main_rt{rt_for_rows(num_heads)[0]}"
-    )
+    assert runner.plan.main_kind == _route(num_heads, 1)
     ref, _ = _reference(case)
     _check(out, ref)
 
@@ -503,19 +522,27 @@ def test_decode_q1(num_heads, kv_lens):
 @pytest.mark.parametrize(
     "num_heads,q_lens,kv_lens",
     [
-        (12, [1, 4, 8], [300, 4096, 777]),  # 96 packed rows: two 48-row tiles
-        (24, [2, 1], [4100, 999]),  # 48 rows per request
+        (12, [1, 4, 8], [300, 4096, 777]),  # 96 packed rows: the wide route
+        (24, [2, 1], [4100, 999]),  # 48 rows per request: the 48-row tile
         (96, [4, 4], [2048, 3001]),
         (128, [1, 1, 1], [100, 3000, 6001]),  # DeepSeek-V3 TP1 head count
     ],
 )
-def test_packed_variable_query(num_heads, q_lens, kv_lens):
+@pytest.mark.parametrize("sigma", [None, REPRODUCER_SIGMA])
+def test_packed_variable_query(num_heads, q_lens, kv_lens, sigma):
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _make_case(
-        q_lens, kv_lens, num_heads, seed=625003, device=device, return_lse=True
+        q_lens,
+        kv_lens,
+        num_heads,
+        seed=625003,
+        device=device,
+        return_lse=True,
+        **_latent(sigma),
     )
-    out, lse, _ = _run(case)
+    out, lse, runner = _run(case)
+    assert runner.plan.main_kind == _route(num_heads, max(q_lens))
     ref, ref_lse = _reference(case)
     _check(out, ref)
     _check_lse(lse, ref_lse)
@@ -643,6 +670,19 @@ def test_warp_reducer_instantiations(warps, num_heads, q_lens, kv_lens, num_spli
 WIDE_SIGMAS = (0.01, 0.03, 0.05, 0.1, 0.3, 1.0)
 
 
+def _wide_scale_shifts(case):
+    """The wide route's shift of every key: the smallest k in 0..3 with
+    6 x max(sf) x 2^-k <= 448 over the key's 32 block scales."""
+    page_size = case["page_size"]
+    sf_max = case["ckv_sf_cache"].float().amax(dim=-1)
+    shifts = []
+    for b, kv in enumerate(case["kv_lens"]):
+        pages = case["block_tables"][b, : (kv + page_size - 1) // page_size].long()
+        m = sf_max[pages].reshape(-1)[:kv]
+        shifts.append(sum((E2M1_MAX * m > E4M3_MAX * 2**j).long() for j in range(3)))
+    return torch.cat(shifts)
+
+
 @pytest.mark.parametrize("sigma", WIDE_SIGMAS)
 @pytest.mark.parametrize("num_heads", [96, 128])
 @pytest.mark.parametrize(
@@ -708,6 +748,7 @@ def test_wide_route_per_token_scale_shifts(num_heads, kv_lens, num_split):
         global_scale=2.0**-9,
         return_lse=True,
     )
+    assert set(_wide_scale_shifts(case).tolist()) == {0, 1, 2, 3}
     out, lse, runner = _run(case, dense_q_len=1, num_split=num_split)
     assert runner.plan.main_kind == "main_wide"
     ref, ref_lse = _reference(case)
