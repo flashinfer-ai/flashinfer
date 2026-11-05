@@ -187,6 +187,110 @@ _PLAN_NVFP4_SWAP = _PLAN_NVFP4_TILE + (
 )
 _PLAN_NVFP4_TILE_OC = _PLAN_NVFP4_TILE + (("parameter", "o_chunks"),)
 _PLAN_NVFP4_PV = _PLAN_NVFP4_G4 + (("parameter", "tile_n"),)
+# NVFP4 prefill bodies: the caller-packed NVFP4 query through two tensor maps (data and scale rows),
+# the pools through 32-byte-pitch row views (data and footer rows); all write the final O and the
+# base-2 LSE directly. The query-block bodies (16 / 32 heads, window-only rows) store O through the
+# ``tmap_o`` map alone (a 16-row box map is encoded from the same tensor); the per-token H <= 64 body
+# takes ``O`` as a pointer and, last, the ``tmap_o`` map its box builds store through; the two-CTA
+# H128 body takes both.
+_PLAN_NVFP4_QB_PREFILL = (
+    ("tma_buffer", "tmap_q"),
+    ("tma_buffer", "tmap_q_sf"),
+    ("tma_buffer", "tmap_swa_kv"),
+    ("tma_buffer", "tmap_compressed_kv"),
+    ("tma_buffer", "tmap_swa_sf"),
+    ("tma_buffer", "tmap_compressed_sf"),
+    ("tma_buffer", "tmap_o"),
+    ("buffer", "LSE"),
+    ("buffer", "swa_indices"),
+    ("buffer", "compressed_indices"),
+    ("buffer", "sparse_topk_lens"),
+    ("buffer", "sinks"),
+    ("buffer", "bmm1_scale"),
+    ("buffer", "bmm2_scale"),
+    ("parameter", "num_heads"),
+    ("parameter", "swa_index_stride"),
+    ("parameter", "compressed_index_stride"),
+    ("parameter", "sparse_topk_lens_offset"),
+    ("parameter", "num_query_tokens"),
+    ("parameter", "has_sinks"),
+    ("parameter", "swa_page_log2"),
+    ("parameter", "swa_pitch_units"),
+    ("parameter", "swa_footer_units"),
+    ("parameter", "compressed_page_log2"),
+    ("parameter", "compressed_pitch_units"),
+    ("parameter", "compressed_footer_units"),
+    ("parameter", "swa_width"),
+    ("parameter", "compressed_width"),
+    ("buffer", "extra_topk_lens"),
+)
+_PLAN_NVFP4_H64_PREFILL = (
+    ("tma_buffer", "tmap_q"),
+    ("tma_buffer", "tmap_q_sf"),
+    ("tma_buffer", "tmap_swa_kv"),
+    ("tma_buffer", "tmap_compressed_kv"),
+    ("tma_buffer", "tmap_swa_sf"),
+    ("tma_buffer", "tmap_compressed_sf"),
+    ("buffer", "O"),
+    ("buffer", "LSE"),
+    ("buffer", "swa_indices"),
+    ("buffer", "compressed_indices"),
+    ("buffer", "sparse_topk_lens"),
+    ("buffer", "sinks"),
+    ("buffer", "bmm1_scale"),
+    ("buffer", "bmm2_scale"),
+    ("parameter", "num_heads"),
+    ("parameter", "swa_index_stride"),
+    ("parameter", "compressed_index_stride"),
+    ("parameter", "sparse_topk_lens_offset"),
+    ("parameter", "num_query_tokens"),
+    ("parameter", "has_sinks"),
+    ("parameter", "swa_page_log2"),
+    ("parameter", "swa_pitch_units"),
+    ("parameter", "swa_footer_units"),
+    ("parameter", "compressed_page_log2"),
+    ("parameter", "compressed_pitch_units"),
+    ("parameter", "compressed_footer_units"),
+    ("parameter", "swa_width"),
+    ("parameter", "compressed_width"),
+    ("buffer", "extra_topk_lens"),
+    ("tma_buffer", "tmap_o"),
+)
+_PLAN_NVFP4_H128_PREFILL = (
+    ("tma_buffer", "tmap_q"),
+    ("tma_buffer", "tmap_q_sf"),
+    ("tma_buffer", "tmap_swa_kv"),
+    ("tma_buffer", "tmap_compressed_kv"),
+    ("tma_buffer", "tmap_swa_sf"),
+    ("tma_buffer", "tmap_compressed_sf"),
+    ("tma_buffer", "tmap_o"),
+    ("buffer", "O"),
+    ("buffer", "LSE"),
+    ("buffer", "swa_indices"),
+    ("buffer", "compressed_indices"),
+    ("buffer", "sparse_topk_lens"),
+    ("buffer", "sinks"),
+    ("buffer", "bmm1_scale"),
+    ("buffer", "bmm2_scale"),
+    ("parameter", "num_heads"),
+    ("parameter", "swa_index_stride"),
+    ("parameter", "compressed_index_stride"),
+    ("parameter", "sparse_topk_lens_offset"),
+    ("parameter", "num_query_tokens"),
+    ("parameter", "sparse_topk"),
+    ("parameter", "has_sinks"),
+    ("parameter", "total_work_items"),
+    ("parameter", "max_q_len"),
+    ("parameter", "swa_page_log2"),
+    ("parameter", "swa_pitch_units"),
+    ("parameter", "swa_footer_units"),
+    ("parameter", "compressed_page_log2"),
+    ("parameter", "compressed_pitch_units"),
+    ("parameter", "compressed_footer_units"),
+    ("parameter", "swa_width"),
+    ("parameter", "compressed_width"),
+    ("buffer", "extra_topk_lens"),
+)
 
 # NVFP4 decode family: one record per member, shared by both architectures (their
 # registrations differ only in the identity that names the JIT module). The templated
@@ -273,10 +377,210 @@ _NVFP4_IDENTITIES = {
     },
 }
 
+# NVFP4 prefill family (Cake ``cake_dsv4_nvfp4_query_block_prefill`` and
+# ``flashinfer_blackwell_trtllm_sparse_mla_dsv4_nvfp4_{h64,h128}_prefill_source_v1``): every
+# query-block and per-token build is one source for both architectures; the two-CTA H128 body
+# traces a different schedule per architecture (score reduction), so each has its own.
+_NVFP4_PREFILL_RECORDS = {
+    "sm_100a": {
+        "nvfp4_h128_prefill": {
+            "arg_plan": _PLAN_NVFP4_H128_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "d274e122d47196a326694c4029c317a7c7ef5511bbc1f0d26bd741942e96f818",
+            "sources": [
+                "sm_100a/cake_dsv4_nvfp4_h128_prefill_kernel.cu",
+                "sm_100a/cake_dsv4_nvfp4_h128_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_early_gather_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "5f8bf65e4ee48dccb8075b575d8d5b5afba7a88b988e728f1c59e99d1644d209",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_early_gather_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_early_gather_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_o_boxes_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "334950df8fa71d834bc63b134fe8fda8e006e577eef4d21e447f4caa6be17e3f",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_o_boxes_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_o_boxes_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_q_prefetch_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "31c39fd7028d454021cd8fb7448f266a0cf9ee6eb576547dbec95362b302d452",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_q_prefetch_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_q_prefetch_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_tmem_v_early_gather_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "e088e1cd137868f4f9918e53e349abd67b0d00fb778e5fc0b9e36fa61a79b802",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_tmem_v_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "8f44805b46ca8eab70ba67d9a8b7ccebc7992fa42b1bfc5db947c5b604acae40",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_tmem_v_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_tmem_v_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h16_breaks_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "3dc76e9741876defe00c794e8d13e67da682194a0ffdb56e08c03b44be27de6f",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h16_breaks_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h16_breaks_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h16_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "4a91e246cd958c8be9889538ade592ab27d8d5927a01ab65b3c29a495744c176",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h16_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h16_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h32_late_claim_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "d9203869bbc18c44376f4d122f23c824725c36c10264acaf3a8b3db96d8bd0e4",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h32_late_claim_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h32_late_claim_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h32_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "276d2888199f80656f5292c8c6fd9301fd3c52abbebded52db269c26f850632b",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h32_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h32_prefill_binding.cu",
+            ],
+        },
+    },
+    "sm_103a": {
+        "nvfp4_h128_prefill": {
+            "arg_plan": _PLAN_NVFP4_H128_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "66e72fa9def936e28f3daf124e1704c6c4a5047c217f723c85098711e508f1f2",
+            "sources": [
+                "sm_103a/cake_dsv4_nvfp4_h128_prefill_kernel.cu",
+                "sm_103a/cake_dsv4_nvfp4_h128_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h128_v_unit_pairs_prefill": {
+            "arg_plan": _PLAN_NVFP4_H128_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "dbf233d8b5e74f61ae3ce9218bd82dff077fea6ac0818957c8a02579ef69ac31",
+            "sources": [
+                "sm_103a/cake_dsv4_nvfp4_h128_v_unit_pairs_prefill_kernel.cu",
+                "sm_103a/cake_dsv4_nvfp4_h128_v_unit_pairs_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_early_gather_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "5f8bf65e4ee48dccb8075b575d8d5b5afba7a88b988e728f1c59e99d1644d209",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_early_gather_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_early_gather_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_o_boxes_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "334950df8fa71d834bc63b134fe8fda8e006e577eef4d21e447f4caa6be17e3f",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_o_boxes_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_o_boxes_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_q_prefetch_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "31c39fd7028d454021cd8fb7448f266a0cf9ee6eb576547dbec95362b302d452",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_q_prefetch_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_q_prefetch_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_tmem_v_early_gather_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "e088e1cd137868f4f9918e53e349abd67b0d00fb778e5fc0b9e36fa61a79b802",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_tmem_v_early_gather_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h64_tmem_v_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "8f44805b46ca8eab70ba67d9a8b7ccebc7992fa42b1bfc5db947c5b604acae40",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_tmem_v_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_tmem_v_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h16_breaks_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "3dc76e9741876defe00c794e8d13e67da682194a0ffdb56e08c03b44be27de6f",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h16_breaks_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h16_breaks_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h16_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "4a91e246cd958c8be9889538ade592ab27d8d5927a01ab65b3c29a495744c176",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h16_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h16_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h32_late_claim_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "d9203869bbc18c44376f4d122f23c824725c36c10264acaf3a8b3db96d8bd0e4",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h32_late_claim_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h32_late_claim_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_qb_h32_prefill": {
+            "arg_plan": _PLAN_NVFP4_QB_PREFILL + _GRID,
+            "compile_flags": ["--use_fast_math"],
+            "identity": "276d2888199f80656f5292c8c6fd9301fd3c52abbebded52db269c26f850632b",
+            "sources": [
+                "common/cake_dsv4_nvfp4_qb_h32_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_qb_h32_prefill_binding.cu",
+            ],
+        },
+    },
+}
+
 
 def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
     """The NVFP4 records of one architecture (CUDA 13.4: PTX ISA 9.4 QMUL4)."""
-    return {
+    variants: dict[str, dict[str, object]] = {
         variant: {
             **record,
             "compile_flags": ["--use_fast_math"],
@@ -285,6 +589,9 @@ def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
         }
         for variant, record in _NVFP4_RECORDS.items()
     }
+    for variant, record in _NVFP4_PREFILL_RECORDS[arch].items():
+        variants[variant] = {**record, "min_cuda_version": "13.4"}
+    return variants
 
 
 # The BF16 / FP8 argument plans, programs and variant routes (see the module
