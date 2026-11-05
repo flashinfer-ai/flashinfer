@@ -18,7 +18,9 @@ limitations under the License.
 # the forward projection ``Y = X @ W[e].T`` with the activation gradient
 # ``dX = G @ W[e]`` and the weight gradient ``dW[e] = G[e].T @ X[e]`` in
 # ``backward``.  The forward and the activation gradient run this package's
-# copies of the deterministic programs (the deterministic bits; a
+# copies of the deterministic programs, but for the sm_100a activation
+# gradient's L2 evict-first twin, this package's own build of the
+# deterministic wide tile (the deterministic bits; a
 # non-reentrant activation-checkpoint replay of the forward gives the same
 # ``Y``); the weight gradient may add its split tail with unordered fp32
 # reductions (``cake_backend``, numerical mode).  ``CakeGroupedMm`` calls the

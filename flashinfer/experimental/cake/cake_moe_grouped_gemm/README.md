@@ -48,11 +48,11 @@ points do not alert: they give the deterministic bits.
 What changes with `deterministic=False`:
 
 - `fwd`, `dgrad` and the weight gradient with the 256-wide k tile run this
-  package's copies of the deterministic programs, with the same host plan:
-  bitwise the deterministic outputs. The 256-wide k tile's `main_wave`
-  program is the same kernel rendered from a newer source: it takes two more
-  buffer arguments (`A_rows`, `B_rows`) that its sm_100a / sm_103a builds
-  never read, and it has no sm_107a build.
+  package's copies of the deterministic programs and host plan (but for the
+  sm_100a `dgrad` evict-first twin below): bitwise the deterministic outputs.
+  The 256-wide k tile's `main_wave` program is the same kernel rendered from a
+  newer source: it takes two more buffer arguments (`A_rows`, `B_rows`) that
+  its sm_100a / sm_103a builds never read, and it has no sm_107a build.
 - On sm_100a the data gradient also has an L2 evict-first twin of its wide
   tile (`main_wide_ef`), this package's own build: the deterministic
   package's sm_100a wide domain-scheduled program with the G loads and the
