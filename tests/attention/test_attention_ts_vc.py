@@ -741,9 +741,22 @@ def test_vc_preprocessor_step_schedule():
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
     ).transpose(1, 2)
+    rng_state = torch.cuda.get_rng_state()
     step0 = prep.prepare(k, v, denoise_step=(0, 40))
     assert step0.demean
     perm0 = step0.perm.clone()
+    # The k-means leaves the caller's generator untouched.
+    assert torch.equal(torch.cuda.get_rng_state(), rng_state)
+    # Step 0 cold-starts every generation from the same seed. The grouping
+    # depends neither on the generation before it nor on the other batch
+    # elements.
+    assert torch.equal(
+        VCAttentionPreprocessor().prepare(k, v, denoise_step=(0, 40)).perm, perm0
+    )
+    batched = VCAttentionPreprocessor().prepare(
+        torch.cat([k, k.flip(1)]), torch.cat([v, v.flip(1)]), denoise_step=(0, 40)
+    )
+    assert torch.equal(batched.perm[:1], perm0)
     out = wrapper.run(q, step0.k, step0.v, vc=step0.params)
     assert (
         _relative_error(out.float(), vca.vc_reference(q, step0, sm_scale=sm_scale))
@@ -759,6 +772,52 @@ def test_vc_preprocessor_step_schedule():
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
+    # A later generation that begins before the last refresh starts cold, as
+    # for a sampler that starts late. The grouping matches a fresh
+    # preprocessor's.
+    prep.prepare(k, v.flip(1), denoise_step=(8, 40))
+    assert torch.equal(prep.prepare(k, v, denoise_step=(4, 40)).perm, perm0)
+    # The same holds after the previous generation ran past the smooth window
+    # and the new one begins at a step that is not a refresh step.
+    prep.prepare(k, v.flip(1), denoise_step=(20, 40))
+    assert torch.equal(prep.prepare(k, v, denoise_step=(1, 16)).perm, perm0)
+    # Outside the smooth window a new generation runs in input order instead of
+    # on the previous generation's permutation.
+    prep.prepare(k, v, denoise_step=(20, 40))
+    stale = prep.prepare(k, v, denoise_step=(19, 40))
+    assert not stale.demean
+    assert torch.equal(stale.perm, torch.arange(1024).to(stale.perm).expand(1, 2, -1))
+    # A CUDA graph runner names the step kind in place of a step. There is no
+    # step bookkeeping and a missing grouping starts cold. The cold graph
+    # replays the fixed seed rows and matches the eager grouping.
+    runner_prep = VCAttentionPreprocessor()
+    assert torch.equal(runner_prep.prepare(k, v, mode="keep").perm, perm0)
+    warm = runner_prep.prepare(k, v.flip(1), mode="warm")
+    assert warm.demean and not torch.equal(warm.perm, perm0)
+    plain = runner_prep.prepare(k, v, mode="plain")
+    assert not plain.demean and torch.equal(plain.perm, warm.perm)
+    assert torch.equal(runner_prep.prepare(k, v, mode="cold").perm, perm0)
+    assert runner_prep._last_step is None
+    static_v = v.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            runner_prep.prepare(k, static_v, mode="cold")
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner_prep.prepare(k, static_v, mode="cold")
+    static_v.copy_(v.flip(1))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        captured.perm, VCAttentionPreprocessor().prepare(k, v.flip(1), mode="cold").perm
+    )
+    static_v.copy_(v)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured.perm, perm0)
     wrapper_late = BatchPrefillTSWrapper()
     _plan(
         wrapper_late,

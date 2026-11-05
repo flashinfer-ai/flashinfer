@@ -668,7 +668,13 @@ group of 16 tiles, so the row-max correction covers them. `VCAttentionPreprocess
 turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
 schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
 denoising steps, the permutation is refreshed every `perm_refresh_every` steps
-inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
+inside that window and kept afterwards. A new generation cold-starts the k-means
+from fixed seed rows. The rows are one host draw from `VC_KMEANS_SEED` and every
+batch element and head shares them. A generation depends neither on the previous
+one nor on the other elements of the batch. The caller's global generator is
+untouched. A CUDA graph runner that replays one graph per step kind passes
+`prepare(..., mode=...)` with `cold`, `warm`, `keep` or `plain` in place of a
+step. `vc_quantize` and `vc_quantize_fp8` are
 the two preparations (bf16/fp16 inputs with `head_dim=128`). QK16 plans require
 bf16 Q/K; QK8 preparation accepts bf16 or fp16 inputs and produces E4M3 Q/K.
 The quantizers live in
