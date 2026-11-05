@@ -61,8 +61,10 @@ def _decode_inputs(
     device="cuda",
     seed=0,
     packed=True,
+    seqlen_q=1,
 ):
-    """One decode token per sequence against a paged, block-sparse fp8 KV cache.
+    """``seqlen_q`` decode tokens per sequence (one by default) against a paged,
+    block-sparse fp8 KV cache.
 
     Mirrors the shapes the SM90 decode schedule is built for: q is bf16, the KV
     cache is fp8 e4m3 with K and V interleaved in one buffer, and q2k_indices are
@@ -71,7 +73,7 @@ def _decode_inputs(
     """
     torch.manual_seed(seed)
     npages = max_k_tiles * batch
-    total_q = batch
+    total_q = batch * seqlen_q
     base = (
         torch.randn(npages, num_kv_heads, BLK_KV, 2 * HEAD_DIM, device=device) / 4
     ).to(torch.float8_e4m3fn)
@@ -258,6 +260,70 @@ def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
     assert out.dtype == q.dtype
     # one query per sequence: the prefill oracle with unit query lengths
     cu_q = torch.arange(q.shape[0] + 1, dtype=torch.int32, device="cuda")
+    ref = _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "batch,seqlen_q,num_qo_heads,num_kv_heads,max_k_tiles,route_at_132_sms",
+    [
+        pytest.param(
+            67, 1, 64, 4, 16, "decode_v5:nc16:s2:st2:evict_first:main", id="q1-s2"
+        ),
+        pytest.param(
+            42, 2, 64, 4, 65, "decode_v5:nc16:s1:st2:evict_first:main", id="q2-s1"
+        ),
+    ],
+)
+def test_sparse_decode_serves_the_nc16_bands_planned_at_three_stages(
+    batch, seqlen_q, num_qo_heads, num_kv_heads, max_k_tiles, route_at_132_sms
+):
+    """#7222: on 132-SM parts the decode cost model picks three ring stages for
+    these GQA-16 bands (265-330 items at q-len 1 with 11+ pages, 332-396 items
+    at q-len 2 with 65+ pages; items = batch * seqlen_q * KV heads), and the
+    export delivered those nc16 coordinates at two stages only, so
+    ``route_program`` raised ``KeyError`` from ``_decode_template``.  The
+    planner now serves the band with the two-stage ring of the same split
+    count; this checks that output against the FP32 oracle.  On other SM counts
+    the model picks a delivered route and this is an ordinary reference check.
+    """
+    from flashinfer.jit.cake_hopper_msa import ROUTES
+    from flashinfer.msa_ops import cake_hopper_sm90 as ch
+
+    total_q = batch * seqlen_q
+    num_sms = ch._num_sms(0)
+    plan = ch.plan_sparse_decode(
+        total_q=total_q,
+        num_q_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        num_sms=num_sms,
+        seqlen_q=seqlen_q,
+        max_pages=max_k_tiles,
+    )
+    assert plan.route in ROUTES, plan.route
+    if num_sms == 132 and route_at_132_sms.replace(":st2:", ":st3:") not in ROUTES:
+        # the model's three-stage pick is still undelivered: the band runs on the fallback
+        assert plan.route == route_at_132_sms
+
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(
+        batch=batch,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        max_k_tiles=max_k_tiles,
+        seqlen_q=seqlen_q,
+    )
+    out = msa_sparse_decode_attention(
+        q,
+        k,
+        v,
+        idx,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        seqlen_q=seqlen_q,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    cu_q = torch.arange(0, total_q + 1, seqlen_q, dtype=torch.int32, device="cuda")
     ref = _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k)
     torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
 

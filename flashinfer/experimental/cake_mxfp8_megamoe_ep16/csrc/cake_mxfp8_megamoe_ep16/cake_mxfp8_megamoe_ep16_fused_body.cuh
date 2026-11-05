@@ -414,6 +414,8 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
 
     __syncwarp();
 
+    asm volatile("barrier.cluster.arrive.release.aligned;");
+    asm volatile("barrier.cluster.wait.acquire.aligned;");
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 448);
     if (warp == 0) {
@@ -422,8 +424,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
+    __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     const int taddr = tmem_addr_storage[0];

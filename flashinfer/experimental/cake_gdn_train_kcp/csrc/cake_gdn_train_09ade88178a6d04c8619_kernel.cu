@@ -47,61 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_OFFSET 0
-#define NUM_VRING_STAGES 2
-#define NUM_ONE_STAGES 1
-#define SMEM_Q_P_OFF 1024
-#define SMEM_Q_P_STAGE_BYTES 16384
-#define SMEM_Q_P_STRIDE 16384
-#define SMEM_K_P_OFF 17408
-#define SMEM_K_P_STAGE_BYTES 16384
-#define SMEM_K_P_STRIDE 16384
-#define SMEM_V_P_OFF 33792
-#define SMEM_V_P_STAGE_BYTES 16384
-#define SMEM_V_P_STRIDE 16384
-#define SMEM_Q_K_OFF 1024
-#define SMEM_Q_K_STAGE_BYTES 16384
-#define SMEM_Q_K_STRIDE 16384
-#define SMEM_K_K_OFF 17408
-#define SMEM_K_K_STAGE_BYTES 16384
-#define SMEM_K_K_STRIDE 16384
-#define SMEM_KB_MN_OFF 1024
-#define SMEM_KB_MN_STAGE_BYTES 16384
-#define SMEM_KB_MN_STRIDE 16384
-#define SMEM_V_T_OFF 33792
-#define SMEM_V_T_STAGE_BYTES 16384
-#define SMEM_V_T_STRIDE 16384
-#define SMEM_V_MN_OFF 33792
-#define SMEM_V_MN_STAGE_BYTES 16384
-#define SMEM_V_MN_STRIDE 16384
-#define SMEM_AKK_T_OFF 105472
-#define SMEM_AKK_T_STAGE_BYTES 8192
-#define SMEM_AKK_T_STRIDE 8192
-#define SMEM_L_S_OFF 66560
-#define SMEM_L_S_STAGE_BYTES 17408
-#define SMEM_L_S_STRIDE 17408
-#define SMEM_A_S_OFF 83968
-#define SMEM_A_S_STAGE_BYTES 17408
-#define SMEM_A_S_STRIDE 17408
-#define SMEM_X_S_OFF 101376
-#define SMEM_X_S_STAGE_BYTES 3072
-#define SMEM_X_S_STRIDE 3072
-#define SMEM_GS_S_OFF 104448
-#define SMEM_GS_S_STAGE_BYTES 256
-#define SMEM_GS_S_STRIDE 256
-#define SMEM_GC_S_OFF 104704
-#define SMEM_GC_S_STAGE_BYTES 256
-#define SMEM_GC_S_STRIDE 256
-#define SMEM_EG_S_OFF 104960
-#define SMEM_EG_S_STAGE_BYTES 256
-#define SMEM_EG_S_STRIDE 256
-#define SMEM_BETA_S_OFF 105216
-#define SMEM_BETA_S_STAGE_BYTES 256
-#define SMEM_BETA_S_STRIDE 256
-#define SMEM_TOTAL 113664
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -235,7 +180,7 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* q_p = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_p_addr = smem + 1024;
     __nv_bfloat16* k_p = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -268,14 +213,15 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
     const int eg_s_addr = smem + 104960;
     float* beta_s = reinterpret_cast<float*>(smem_raw + 105216);
     const int beta_s_addr = smem + 105216;
+
+    // Kernel setup ops
     int chunk = blockIdx.x;
     int hq = blockIdx.y;
     int ext0 = chunk_bos[chunk];
     int clen = chunk_len[chunk];
     int group = num_heads / num_qk_heads;
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 9 barriers)
-    // Mbarriers at smem_raw[0..72)
+    // Mbarrier init (9 barriers at smem_raw[0..72))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -317,10 +263,8 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // ---- Role: compute ----
     if (warp <= 3) {
@@ -5908,7 +5852,7 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_337 = reinterpret_cast<const unsigned*>(packed);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128))), "r"(_raw_stv8_337[0]), "r"(_raw_stv8_337[1]), "r"(_raw_stv8_337[2]), "r"(_raw_stv8_337[3]), "r"(_raw_stv8_337[4]), "r"(_raw_stv8_337[5]), "r"(_raw_stv8_337[6]), "r"(_raw_stv8_337[7]) : "memory");
+                                :: "l"((void*)(w_out + rbase * 128)), "r"(_raw_stv8_337[0]), "r"(_raw_stv8_337[1]), "r"(_raw_stv8_337[2]), "r"(_raw_stv8_337[3]), "r"(_raw_stv8_337[4]), "r"(_raw_stv8_337[5]), "r"(_raw_stv8_337[6]), "r"(_raw_stv8_337[7]) : "memory");
                         }
                         unsigned int packed_0[8];
                         #pragma unroll
@@ -5955,7 +5899,7 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_338 = reinterpret_cast<const unsigned*>(packed_0);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128))), "r"(_raw_stv8_338[0]), "r"(_raw_stv8_338[1]), "r"(_raw_stv8_338[2]), "r"(_raw_stv8_338[3]), "r"(_raw_stv8_338[4]), "r"(_raw_stv8_338[5]), "r"(_raw_stv8_338[6]), "r"(_raw_stv8_338[7]) : "memory");
+                                :: "l"((void*)(u_out + rbase * 128)), "r"(_raw_stv8_338[0]), "r"(_raw_stv8_338[1]), "r"(_raw_stv8_338[2]), "r"(_raw_stv8_338[3]), "r"(_raw_stv8_338[4]), "r"(_raw_stv8_338[5]), "r"(_raw_stv8_338[6]), "r"(_raw_stv8_338[7]) : "memory");
                         }
                         unsigned int packed_1[8];
                         #pragma unroll
@@ -6660,7 +6604,7 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_353 = reinterpret_cast<const unsigned*>(packed_15);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(aqk_out + (rbase * 64))), "r"(_raw_stv8_353[0]), "r"(_raw_stv8_353[1]), "r"(_raw_stv8_353[2]), "r"(_raw_stv8_353[3]), "r"(_raw_stv8_353[4]), "r"(_raw_stv8_353[5]), "r"(_raw_stv8_353[6]), "r"(_raw_stv8_353[7]) : "memory");
+                                :: "l"((void*)(aqk_out + rbase * 64)), "r"(_raw_stv8_353[0]), "r"(_raw_stv8_353[1]), "r"(_raw_stv8_353[2]), "r"(_raw_stv8_353[3]), "r"(_raw_stv8_353[4]), "r"(_raw_stv8_353[5]), "r"(_raw_stv8_353[6]), "r"(_raw_stv8_353[7]) : "memory");
                         }
                         unsigned int packed_16[8];
                         #pragma unroll
@@ -6707,7 +6651,7 @@ kernel_cake_gdn_train_09ade88178a6d04c8619(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_354 = reinterpret_cast<const unsigned*>(packed_16);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(akk_out + (rbase * 64))), "r"(_raw_stv8_354[0]), "r"(_raw_stv8_354[1]), "r"(_raw_stv8_354[2]), "r"(_raw_stv8_354[3]), "r"(_raw_stv8_354[4]), "r"(_raw_stv8_354[5]), "r"(_raw_stv8_354[6]), "r"(_raw_stv8_354[7]) : "memory");
+                                :: "l"((void*)(akk_out + rbase * 64)), "r"(_raw_stv8_354[0]), "r"(_raw_stv8_354[1]), "r"(_raw_stv8_354[2]), "r"(_raw_stv8_354[3]), "r"(_raw_stv8_354[4]), "r"(_raw_stv8_354[5]), "r"(_raw_stv8_354[6]), "r"(_raw_stv8_354[7]) : "memory");
                         }
                         unsigned int packed_17[8];
                         #pragma unroll

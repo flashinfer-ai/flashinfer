@@ -380,7 +380,7 @@ def _launch(
     device_index: int,
     bwd_grid_mult: int = 1,
 ) -> tuple[dict[str, int], tuple[int, int, int]]:
-    """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
+    """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit`` on the record's route).
 
     CTA ``b`` owns channel tile ``b % n_ch_tiles``, so every channel tile needs
     a CTA of the launched program's grid on the device: a ``C`` beyond ``grid
@@ -397,6 +397,7 @@ def _launch(
         num_docs,
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
+        route=_loader.record_route(record, _loader.device_arch(device_index)),
     )
     if bwd_grid_mult == 1:
         grid = launch_grid(record, device_index=device_index, C=C, S=S)
@@ -419,7 +420,10 @@ def _workspace_bytes(
     if bwd_grid_mult == 1:
         return int(layout["total_bytes"])
     _, _, n_ch_tiles = _loader.channel_split(
-        C, geometry=owner["grid_rule"]["geometry"], role=owner["role"]
+        C,
+        geometry=owner["grid_rule"]["geometry"],
+        role=owner["role"],
+        route=_loader.record_route(owner, _loader.device_arch(device_index)),
     )
     rows = partial_rows(int(layout["grid"]) * bwd_grid_mult, n_ch_tiles)
     return partial_bytes(owner, C, rows)

@@ -32,14 +32,20 @@ rows).  Arms per row:
 * ``cublas``: ``torch.matmul`` / ``torch.mm`` / ``torch.bmm`` (cuBLAS heuristic) on the same views; the FP32-output
   gradient rows with ``out_dtype=torch.float32`` (BF16 inputs, FP32 accumulation; a torch without it falls back to a
   BF16 GEMM + cast, marked ``cublas_note``); the router rows as SGEMM with TF32 off.
-* ``cublaslt`` (K1 rows): a bounded cuBLASLt sweep -- the heuristic's top ``--lt-algos`` algorithms for the same
-  BF16 inputs, FP32 compute, BF16 or FP32 output and layout, each checked against the ``cublas`` result and timed like
-  the other arms once; the arm is the fastest.
+* ``cublaslt``: a bounded cuBLASLt sweep -- the heuristic's top ``--lt-algos`` algorithms for the same inputs (K1:
+  BF16; router: FP32), ``CUBLAS_COMPUTE_32F`` (no TF32), the row's output dtype and layout, each timed like the other
+  arms once; the arm is the fastest correct one (K1: against the ``cublas`` result; router: the router budget below).
 * ``bf16x9`` (router rows): ``cublasSgemm`` in ``CUBLAS_FP32_EMULATED_BF16X9_MATH`` (eager strategy), cuBLAS's
   FP32-accurate tensor-core path (TF32 and BF16 do not meet the router's accuracy budget).
+* ``cublaslt_bf16x9`` (router rows): the same bounded cuBLASLt sweep in ``CUBLAS_COMPUTE_32F_EMULATED_16BFX9``
+  (FP32 inputs, eager emulation strategy where cuBLASLt has the emulation descriptor), each algorithm checked against
+  the router budget.
 
-The non-Cake SOTA latency of a row is its fastest of ``cublas`` and ``cublaslt`` (K1) or ``bf16x9`` (router; plain
-SGEMM reported beside it).
+The non-Cake SOTA latency of a row is its fastest of ``cublas`` and ``cublaslt`` (K1), or of ``cublas``, ``cublaslt``,
+``bf16x9`` and ``cublaslt_bf16x9`` among those that meet the router budget on the row (router: FP64 reference of the
+same operands, relative Frobenius error <= 2e-6, finite, and for the forward the top-8 experts of every row equal;
+plain FP32 can be the fastest at small token counts and miss the budget at large ones).  ``sota_arm`` names the arm
+that won, and ``sota_budget`` holds each router candidate's error.
 
 Timing: ``flashinfer.testing.bench_gpu_time`` with CUPTI activity tracing and a cold L2 before every iteration (the
 GPU span of every kernel and memset of an iteration: the router's ``out.zero_()`` and BF16x3 split are inside), in two
@@ -53,7 +59,8 @@ Options: ``--accuracy`` (each arm against an FP64 reference of the same operands
 ``--acc-reruns`` launches into a NaN-poisoned output; router forward top-8 agreement), ``--memory`` (retained and peak
 temporary device memory of the prepared launch and of the convenience path of each mode), ``--composite`` (the
 checkpointed training step ``2 x forward + input gradient + weight gradient`` of a projection or router row, both
-modes, both timing modes), ``--resident`` (each arm re-timed with CUDA events while a kernel on another stream holds
+modes and the non-Cake sequence (router: each library arm that meets the budget on all three operations), both timing
+modes), ``--resident`` (each arm re-timed with CUDA events while a kernel on another stream holds
 ``--resident-sms`` SMs for ``--resident-us`` from just before every launch: the slowdown of a launch whose grid assumes
 the whole device), ``--host-overhead`` (host time per prepared call), ``--exclusive`` (before and after every row,
 ``nvidia-smi`` must show no other process on the GPU; a row that sees one waits up to ``--exclusive-wait`` seconds and
@@ -342,6 +349,7 @@ def plan_record(prepared):
         record.update(
             block_n=p.block_n,
             splits=p.splits,
+            chains=p.chains,
             out_t=p.out_t,
             tiles=p.tiles,
             swapped=p.swapped,
@@ -357,6 +365,13 @@ def plan_record(prepared):
         )
     elif isinstance(prepared, cake_backend.PreparedAtomicRouterGemm):
         p = prepared.plan
+        # the rule key's (hidden, experts) of the launched GEMM, as _router_rule_spec reads them
+        if p.layout == "kk":
+            hidden, experts = p.K, p.N
+        elif p.layout == "kn":
+            hidden, experts = p.N, p.K
+        else:
+            hidden, experts = p.M, p.N
         record.update(
             units=p.units,
             head_spans=p.head_spans,
@@ -365,14 +380,16 @@ def plan_record(prepared):
             k_iters=p.k_iters,
             part_tiles=p.part_tiles,
             reproducible=p.reproducible,
-            rule_key=[
-                prepared.arch,
-                p.layout,
-                p.K if p.layout == "kk" else p.M,
-                p.N,
-            ],
+            rule_key=[prepared.arch, p.layout, hidden, experts],
             rule_value=p.units,
         )
+        if getattr(p, "simt", None) is not None:
+            # the SIMT program: one CTA per output tile (m_tiles x n_tiles), the window spec of its tile
+            record.update(
+                simt=list(p.simt),
+                tiles=p.m_tiles * p.n_tiles,
+                rule_value="simt_n{}m{}s{}".format(*p.simt),
+            )
     elif hasattr(prepared, "splits"):
         record["splits"] = prepared.splits
     return record
@@ -522,6 +539,10 @@ def _check(status, what):
 
 # cuBLASLt enums (cublasLt.h, cublas_api.h, library_types.h)
 CUBLAS_COMPUTE_32F = 68
+CUBLAS_COMPUTE_32F_EMULATED_16BFX9 = 78
+CUBLAS_EMULATION_STRATEGY_EAGER = 2
+CUBLASLT_MATMUL_DESC_EMULATION_DESCRIPTOR = 38
+CUBLASLT_EMULATION_DESC_STRATEGY = 0
 CUDA_R_32F, CUDA_R_16BF = 0, 14
 CUBLASLT_MATMUL_DESC_TRANSA, CUBLASLT_MATMUL_DESC_TRANSB = 3, 4
 CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT = 5
@@ -540,9 +561,10 @@ class _LtHeuristic(ctypes.Structure):
 
 
 class CublasLt:
-    """A bounded cuBLASLt sweep: the heuristic's top algorithms for one BF16 GEMM ``out[L, M, N] = A[L, M, K] @
-    B[L, K, N]`` (FP32 compute and scale, BF16 or FP32 output, the views' strides and batch offsets), each a
-    callable on torch's current stream."""
+    """A bounded cuBLASLt sweep: the heuristic's top algorithms for one BF16 or FP32 GEMM ``out[L, M, N] = A[L, M,
+    K] @ B[L, K, N]`` (``CUBLAS_COMPUTE_32F`` and FP32 scale -- no TF32 for FP32 inputs --, or, with ``bf16x9``,
+    ``CUBLAS_COMPUTE_32F_EMULATED_16BFX9`` for FP32 inputs; BF16 or FP32 output, the views' strides and batch
+    offsets), each a callable on torch's current stream."""
 
     def __init__(
         self, sonames=("libcublasLt.so.13", "libcublasLt.so.12"), workspace_mib=32
@@ -568,6 +590,13 @@ class CublasLt:
         lib.cublasLtMatmul.argtypes = [
             vp, vp, vp, vp, vp, vp, vp, vp, vp, vp, vp, vp, vp, vp, c.c_size_t, vp,
         ]  # fmt: skip
+        # the emulation descriptor (cuBLASLt 13): the eager strategy, as the ``bf16x9`` arm
+        self.has_emulation_desc = hasattr(lib, "cublasLtEmulationDescCreate")
+        if self.has_emulation_desc:
+            lib.cublasLtEmulationDescCreate.argtypes = [c.POINTER(vp)]
+            lib.cublasLtEmulationDescSetAttribute.argtypes = [
+                vp, c.c_int, vp, c.c_size_t,
+            ]  # fmt: skip
         self.handle = vp()
         _check(lib.cublasLtCreate(c.byref(self.handle)), "cublasLtCreate")
         self.version = int(lib.cublasLtGetVersion())
@@ -598,9 +627,9 @@ class CublasLt:
             )  # fmt: skip
         return layout
 
-    def algos(self, A, B, out, top):
+    def algos(self, A, B, out, top, bf16x9=False):
         """``[(index, run), ...]``: callables of the heuristic's first ``top`` algorithms (an empty list when cuBLASLt
-        offers none for the layout)."""
+        offers none for the layout); ``bf16x9``: in ``CUBLAS_COMPUTE_32F_EMULATED_16BFX9`` (FP32 inputs)."""
         c = ctypes
         A3 = A if A.dim() == 3 else A.unsqueeze(0)
         B3 = B if B.dim() == 3 else B.unsqueeze(0)
@@ -626,14 +655,38 @@ class CublasLt:
             op_b, b_layout = CUBLAS_OP_T, (M, K, A3.stride(2))
         else:
             raise ValueError("cuBLASLt arm: A needs a unit stride on m or k")
+        if A.dtype != B.dtype or A.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("cuBLASLt arm: A and B need one dtype, BF16 or FP32")
+        if bf16x9 and A.dtype != torch.float32:
+            raise ValueError("cuBLASLt BF16x9 arm: A and B need FP32")
+        in_type = CUDA_R_32F if A.dtype == torch.float32 else CUDA_R_16BF
         out_type = CUDA_R_32F if out.dtype == torch.float32 else CUDA_R_16BF
+        compute = CUBLAS_COMPUTE_32F_EMULATED_16BFX9 if bf16x9 else CUBLAS_COMPUTE_32F
         desc = c.c_void_p()
         _check(
-            self.lib.cublasLtMatmulDescCreate(
-                c.byref(desc), CUBLAS_COMPUTE_32F, CUDA_R_32F
-            ),
+            self.lib.cublasLtMatmulDescCreate(c.byref(desc), compute, CUDA_R_32F),
             "cublasLtMatmulDescCreate",
         )
+        emulation = c.c_void_p()
+        if bf16x9 and self.has_emulation_desc:
+            _check(
+                self.lib.cublasLtEmulationDescCreate(c.byref(emulation)),
+                "cublasLtEmulationDescCreate",
+            )
+            strategy = c.c_int32(CUBLAS_EMULATION_STRATEGY_EAGER)
+            _check(
+                self.lib.cublasLtEmulationDescSetAttribute(
+                    emulation, CUBLASLT_EMULATION_DESC_STRATEGY, c.byref(strategy), 4
+                ),
+                "cublasLtEmulationDescSetAttribute",
+            )
+            _check(
+                self.lib.cublasLtMatmulDescSetAttribute(
+                    desc, CUBLASLT_MATMUL_DESC_EMULATION_DESCRIPTOR,
+                    c.byref(emulation), c.sizeof(emulation),
+                ),
+                "cublasLtMatmulDescSetAttribute",
+            )  # fmt: skip
         for attr, value in (
             (CUBLASLT_MATMUL_DESC_TRANSA, op_a),
             (CUBLASLT_MATMUL_DESC_TRANSB, op_b),
@@ -643,8 +696,8 @@ class CublasLt:
                 self.lib.cublasLtMatmulDescSetAttribute(desc, attr, c.byref(v), 4),
                 "cublasLtMatmulDescSetAttribute",
             )
-        la = self._layout(CUDA_R_16BF, *a_layout, L, B3.stride(0))
-        lb = self._layout(CUDA_R_16BF, *b_layout, L, A3.stride(0))
+        la = self._layout(in_type, *a_layout, L, B3.stride(0))
+        lb = self._layout(in_type, *b_layout, L, A3.stride(0))
         ld = self._layout(out_type, N, M, O3.stride(1), L, O3.stride(0))
         pref = c.c_void_p()
         _check(
@@ -665,7 +718,7 @@ class CublasLt:
         )
         if status != 0:
             return []
-        keep = (desc, la, lb, ld, pref, results)
+        keep = (desc, la, lb, ld, pref, results, emulation)
         runs = []
         for i in range(int(found.value)):
             if results[i].state != 0:
@@ -909,12 +962,17 @@ def summarize(medians, samples, errors):
     return out
 
 
-def sota_choice(spec, ms):
-    """The non-Cake SOTA arm of a row: the router's BF16x9 (the FP32-accurate class; plain SGEMM is reported beside
-    it), else the fastest of the cuBLAS heuristic and the cuBLASLt sweep."""
-    if spec["family"] == "router":
-        return "bf16x9" if "bf16x9" in ms else None
-    present = [n for n in ("cublas", "cublaslt") if n in ms]
+# The router's non-Cake SOTA candidates: plain FP32 (torch.mm with TF32 off; the cuBLASLt FP32 sweep) and BF16x9
+# (cublasSgemm; the cuBLASLt sweep in CUBLAS_COMPUTE_32F_EMULATED_16BFX9).
+ROUTER_SOTA_ARMS = ("cublas", "cublaslt", "bf16x9", "cublaslt_bf16x9")
+
+
+def sota_choice(spec, ms, eligible=None):
+    """The non-Cake SOTA arm of a row: the fastest of the cuBLAS heuristic and the cuBLASLt sweep (K1), or of
+    ``ROUTER_SOTA_ARMS`` (router); ``eligible``, when given, limits the choice to the arms that meet the router
+    budget on the row."""
+    names = ROUTER_SOTA_ARMS if spec["family"] == "router" else ("cublas", "cublaslt")
+    present = [n for n in names if n in ms and (eligible is None or n in eligible)]
     return min(present, key=lambda n: ms[n]) if present else None
 
 
@@ -1003,14 +1061,18 @@ def host_us_per_call(fn, steps):
     return host / steps * 1e6
 
 
-def lt_sweep(lt, spec, inp, reference, top, steps):
+def lt_sweep(lt, spec, inp, reference, top, steps, ref=None, bf16x9=False):
     """The fastest correct cuBLASLt algorithm of the row (eager CUPTI median, one pass): ``(run, record, out)``
-    (``run`` None when no algorithm qualifies; ``record`` says why)."""
+    (``run`` None when no algorithm qualifies; ``record`` says why).  Correct: K1, within the tolerance of
+    ``reference`` (the ``cublas`` result); router, the router budget against ``ref`` (FP64 of the operands).
+    ``bf16x9``: the sweep in ``CUBLAS_COMPUTE_32F_EMULATED_16BFX9`` (router)."""
     out = fresh_out(inp["out"])
     record = dict(algos=[], top=top)
+    if bf16x9:
+        record["emulation_strategy"] = "eager" if lt.has_emulation_desc else "default"
     best = None
     try:
-        runs = lt.algos(inp["A"], inp["B"], out, top)
+        runs = lt.algos(inp["A"], inp["B"], out, top, bf16x9)
     except Exception as exc:  # noqa: BLE001 - a layout cuBLASLt does not take is recorded
         record["unsupported"] = f"{type(exc).__name__}: {exc}"[:300]
         return None, record, None
@@ -1023,13 +1085,20 @@ def lt_sweep(lt, spec, inp, reference, top, steps):
             out.fill_(float("nan"))
             run()
             torch.cuda.synchronize()
-            err = float(
-                (out.double() - reference.double()).norm()
-                / max(float(reference.double().norm()), 1e-300)
-            )
-            entry["rel_vs_cublas"] = err
-            if not math.isfinite(err) or err > tol:
-                entry["rejected"] = "result differs from torch.matmul"
+            if spec["family"] == "router":
+                acc = accuracy(spec, inp, out, ref)
+                entry["rel_fro"] = acc["rel_fro"]
+                ok, why = acc["pass"], "misses the router budget"
+            else:
+                err = float(
+                    (out.double() - reference.double()).norm()
+                    / max(float(reference.double().norm()), 1e-300)
+                )
+                entry["rel_vs_cublas"] = err
+                ok = math.isfinite(err) and err <= tol
+                why = "result differs from torch.matmul"
+            if not ok:
+                entry["rejected"] = why
             else:
                 entry["ms"] = float(statistics.median(timed(run, steps, False)))
                 if best is None or entry["ms"] < best[1]:
@@ -1122,44 +1191,70 @@ def wait_exclusive(args, uuid):
 
 def composite(spec, args, libs):
     """``2 x forward + input gradient + weight gradient`` of the row's projection or router (the forward recomputed
-    under activation checkpointing; prepared launches): ``det``, ``atomic`` and the non-Cake sequence (``cublas``:
-    ``torch.matmul`` per operation; the router: ``bf16x9`` per operation)."""
+    under activation checkpointing; prepared launches): ``det``, ``atomic`` and the non-Cake sequences (``cublas``:
+    ``torch.matmul`` per operation; the router: each of ``ROUTER_SOTA_ARMS`` -- ``cublaslt`` and ``cublaslt_bf16x9``
+    with the sweep's arm per operation -- that meets the router budget on all three operations).  Returns
+    ``(arms, budget)``: ``budget`` maps each router candidate to its per-operation errors (None for a projection
+    row)."""
     if spec["family"] == "mla" or spec["op"] != "wgrad":
-        return None
+        return None, None
     device = args.device
-    fwd_dt = "f32" if spec["family"] == "router" else "bf16"
+    router = spec["family"] == "router"
+    fwd_dt = "f32" if router else "bf16"
     steps = [
         dict(spec, op="fwd", out_dtype=fwd_dt),
         dict(spec, op="dgrad", out_dtype=fwd_dt),
         dict(spec, op="wgrad"),
     ]
     inputs = [make_inputs(s, SEED, device) for s in steps]
-    library = (
-        "bf16x9"
-        if spec["family"] == "router" and libs.get("bf16x9") is not None
-        else "cublas"
-    )
-    arms = {}
-    for mode in ("det", "atomic", library):
-        launches = []
-        for s, inp in zip(steps, inputs, strict=True):
+    libraries = ["cublas"]
+    if router:
+        if libs.get("lt") is not None and not args.no_lt:
+            libraries.append("cublaslt")
+        if libs.get("bf16x9") is not None:
+            libraries.append("bf16x9")
+        if libs.get("lt") is not None and not args.no_lt:
+            libraries.append("cublaslt_bf16x9")
+    launches = {mode: [] for mode in ("det", "atomic", *libraries)}
+    budget = {} if router else None
+    for s, inp in zip(steps, inputs, strict=True):
+        ref = torch.matmul(inp["A"].double(), inp["B"].double()) if router else None
+        for mode, seq in launches.items():
             o = fresh_out(inp["out"])
             if mode == "det":
-                launches.append(prepare_det(s, inp, o).launch)
+                fn = prepare_det(s, inp, o).launch
             elif mode == "atomic":
-                launches.append(prepare_atomic(s, inp, o).launch)
+                fn = prepare_atomic(s, inp, o).launch
             elif mode == "bf16x9":
-                launches.append(libs["bf16x9"].arm(inp["A"], inp["B"], o))
+                fn = libs["bf16x9"].arm(inp["A"], inp["B"], o)
+            elif mode in ("cublaslt", "cublaslt_bf16x9"):
+                fn, _, o = lt_sweep(
+                    libs["lt"], s, inp, None, args.lt_algos, args.steps, ref,
+                    bf16x9=mode == "cublaslt_bf16x9",
+                )  # fmt: skip
             else:
-                launches.append(torch_arm(s, inp, o)[0])
-        seq = [launches[0], launches[0], launches[1], launches[2]]
+                fn = torch_arm(s, inp, o)[0]
+            if router and mode in ROUTER_SOTA_ARMS:
+                budget.setdefault(mode, {})[s["op"]] = (
+                    {"unsupported": "no correct algorithm", "pass": False}
+                    if fn is None
+                    else worst_accuracy(s, inp, fn, o, 1, ref)
+                )
+            seq.append(fn)
+        del ref
+    arms = {}
+    for mode, seq in launches.items():
+        if router and mode in budget:
+            if not all(r["pass"] for r in budget[mode].values()):
+                continue
+        seq = [seq[0], seq[0], seq[1], seq[2]]
 
         def run(seq=seq):
             for fn in seq:
                 fn()
 
         arms[mode] = run
-    return arms
+    return arms, budget
 
 
 def measure_row(label, spec, args, libs, resident, uuid):
@@ -1176,10 +1271,20 @@ def measure_row(label, spec, args, libs, resident, uuid):
     return entry
 
 
-def _add_sota(spec, modes):
+def _add_sota(spec, modes, eligible=None):
     for rec in modes.values():
-        choice = sota_choice(spec, rec["ms"])
+        choice = sota_choice(spec, rec["ms"], eligible)
         rec["sota_arm"], rec["sota_ms"] = choice, rec["ms"].get(choice)
+
+
+def router_budget(spec, inp, arms, outs, ref):
+    """``{arm: error record}`` of the router's non-Cake SOTA candidates present in ``arms`` (one launch each into a
+    NaN-poisoned output, against ``ref``, FP64 of the operands); an arm may be the row's SOTA only if it passes."""
+    return {
+        name: worst_accuracy(spec, inp, arms[name], outs[name], 1, ref)
+        for name in ROUTER_SOTA_ARMS
+        if name in arms
+    }
 
 
 def _measure_row(entry, spec, args, libs, resident, uuid):
@@ -1196,26 +1301,41 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
     for fn in arms.values():
         fn()
     torch.cuda.synchronize()
-    if k1_family(spec) and libs.get("lt") is not None and not args.no_lt:
+    router = spec["family"] == "router"
+    ref = torch.matmul(inp["A"].double(), inp["B"].double()) if router else None
+    if (k1_family(spec) or router) and libs.get("lt") is not None and not args.no_lt:
         run, record, lt_out = lt_sweep(
-            libs["lt"], spec, inp, outs["cublas"], args.lt_algos, args.steps
+            libs["lt"], spec, inp, outs["cublas"], args.lt_algos, args.steps, ref
         )
         entry["cublaslt_sweep"] = record
         if run is not None:
             arms["cublaslt"], outs["cublaslt"] = run, lt_out
-    elif k1_family(spec):
+        if router:
+            run, record, lt_out = lt_sweep(
+                libs["lt"], spec, inp, None, args.lt_algos, args.steps, ref,
+                bf16x9=True,
+            )  # fmt: skip
+            entry["cublaslt_bf16x9_sweep"] = record
+            if run is not None:
+                arms["cublaslt_bf16x9"], outs["cublaslt_bf16x9"] = run, lt_out
+    elif k1_family(spec) or router:
         entry["cublaslt_sweep"] = dict(
             unsupported=libs.get("lt_error", "skipped (--no-lt)")
         )
+    eligible = None
+    if router:
+        entry["sota_budget"] = router_budget(spec, inp, arms, outs, ref)
+        eligible = {n for n, r in entry["sota_budget"].items() if r["pass"]}
     if args.accuracy:
-        ref = torch.matmul(inp["A"].double(), inp["B"].double())
+        if ref is None:
+            ref = torch.matmul(inp["A"].double(), inp["B"].double())
         acc = {}
         for name, fn in arms.items():
             reruns = args.acc_reruns if name.startswith("atomic") else 1
             acc[name] = worst_accuracy(spec, inp, fn, outs[name], reruns, ref)
         entry["accuracy"] = acc
         entry["atomic_equals_det"] = bool(torch.equal(outs["atomic"], outs["det"]))
-        del ref
+    del ref
     if args.memory:
         mem = {}
         mem["det_prepared_retained"], mem["det_prepared_peak_temp"] = memory_of(
@@ -1239,18 +1359,20 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
         }
     medians, samples, errors = paired_groups(arms, args.groups, args.steps, args.modes)
     entry["modes"] = summarize(medians, samples, errors)
-    _add_sota(spec, entry["modes"])
+    _add_sota(spec, entry["modes"], eligible)
     verdicts = [
         entry["modes"][m].get("atomic_over_det", {}).get("accept", False)
         for m in args.modes
     ]
     entry["accept"] = bool(entry["atomic_program"] and all(verdicts))
     if args.composite:
-        comp = composite(spec, args, libs)
+        comp, comp_budget = composite(spec, args, libs)
         if comp is not None:
             entry["composite"] = summarize(
                 *paired_groups(comp, args.groups, args.steps, args.modes)
             )
+            if comp_budget is not None:
+                entry["composite_sota_budget"] = comp_budget
             _add_sota(spec, entry["composite"])
             del comp
     if resident is not None:
@@ -1302,7 +1424,8 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
 
 CSV_FIELDS = (
     "row", "mode", "atomic_program", "accept", "det_template", "atomic_template", "atomic_splits", "atomic_units",
-    "det_ms", "atomic_ms", "atomic_p1_ms", "cublas_ms", "cublaslt_ms", "bf16x9_ms", "sota_arm", "sota_ms",
+    "det_ms", "atomic_ms", "atomic_p1_ms", "cublas_ms", "cublaslt_ms", "bf16x9_ms", "cublaslt_bf16x9_ms", "sota_arm",
+    "sota_ms",
     "det_p5_ms", "det_p95_ms", "atomic_p5_ms", "atomic_p95_ms", "atomic_over_det_median", "atomic_wins", "groups",
     "sign_test_p", "atomic_p1_over_det_median", "det_over_atomic", "sota_over_atomic", "contended", "error",
 )  # fmt: skip
@@ -1334,7 +1457,7 @@ def csv_rows(entry, modes):
             contended=entry.get("contended", ""),
             error=entry.get("error", ""),
         )
-        for name in ("det", "atomic", "atomic_p1", "cublas", "cublaslt", "bf16x9"):
+        for name in ("det", "atomic", "atomic_p1", *ROUTER_SOTA_ARMS):
             row[f"{name}_ms"] = ms.get(name, "")
         for name in ("det", "atomic"):
             row[f"{name}_p5_ms"] = rec.get("p5_ms", {}).get(name, "")
@@ -1397,6 +1520,8 @@ def markdown(results, modes):
         reason = entry.get("bf16x9_unsupported") or entry.get("cublaslt_sweep", {}).get(
             "unsupported"
         )
+        if entry.get("sota_budget") is not None:
+            reason = "no non-Cake arm meets the router budget"
         for mode in modes:
             rec = entry["modes"].get(mode)
             if rec:
@@ -1422,7 +1547,11 @@ def markdown(results, modes):
         "iterations (CUPTI GPU time of every kernel and memset of a call, cold L2), [p5, p95] of all iterations; "
         "eager = launched per iteration, graph = replayed CUDA graph. Non-Cake SOTA: the faster of the cuBLAS "
         "heuristic (torch.matmul) and the fastest correct of the cuBLASLt heuristic's top "
-        f"{results.get('lt_algos')} algorithms; router: cuBLAS FP32 with CUBLAS_FP32_EMULATED_BF16X9_MATH. "
+        f"{results.get('lt_algos')} algorithms; router: the fastest of torch.mm FP32 (TF32 off), the cuBLASLt "
+        "sweep with FP32 inputs and CUBLAS_COMPUTE_32F, cuBLAS FP32 with CUBLAS_FP32_EMULATED_BF16X9_MATH and "
+        "the cuBLASLt sweep in CUBLAS_COMPUTE_32F_EMULATED_16BFX9 among those that meet the router budget (FP64 "
+        "relative Frobenius error <= 2e-6, forward top-8 equal), "
+        "named in each cell. "
         "Speedups = baseline latency / new latency (above 1 = faster)."
     )
     return "\n".join(lines) + "\n"

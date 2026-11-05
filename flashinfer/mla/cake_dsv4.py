@@ -1,4 +1,5 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103.
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103, and
+for the FP8 decode route on SM107.
 
 Host contract (flashinfer#4671 hardening)
 -----------------------------------------
@@ -186,6 +187,9 @@ _BF16_TOPK128X_MAX_WIDTH = 388
 # One FP8 low-head producer partition owns up to three sparse tiles; mirrors
 # the producer's FP8_ONE_PARTITION_MAX_TILES = 3.
 _FP8_ONE_PARTITION_MAX_WIDTH = 384
+# The M64 bindings take items of at most 1152 sparse slots (SWA 128 + 1024);
+# mirrors their ``sparse_topk <= 1152`` check.
+_FP8_M64_MAX_WIDTH = 1152
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 # Workspaces whose split-merge counter region is known to be zero:
@@ -264,6 +268,11 @@ def _bf16_h128_prefill_uses_snake_feed(
     if (int(sparse_topk) + _TILE_KV - 1) // _TILE_KV < 2:
         return False
     return 2 * (tokens % clusters) > clusters
+
+
+@functools.lru_cache(maxsize=None)
+def _device_sm_count(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 @functools.lru_cache(maxsize=None)
@@ -901,6 +910,9 @@ _SCALAR_VALUE_NAMES = frozenset(
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
+# The per-call launch argument of the programs that leave programmatic dependent
+# launch to each call (``["launch", "enable_pdl"]`` in their plan, 0 or 1).
+_LAUNCH_NAMES = ("enable_pdl",)
 # Producers whose generated ABI reads request boundaries from cum_seq_lens_q
 # only; run_cake_dsv4 synthesizes the dense offsets for them.
 _RAGGED_ONLY_ROUTES = frozenset(
@@ -916,25 +928,86 @@ _RAGGED_ONLY_ROUTES = frozenset(
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
 
+# Per architecture, (fewest query rows, longest request, topk4x items only)
+# entries: launches that reach an entry's row count and whose requests hold at
+# most its query rows keep the uniform-gather route past the lane-gather floor.
+# On SM107 that route runs its K=64 sibling, which led the lane-issued program
+# on these short-query decode launches (VR200, one process, eight calls per
+# CUDA graph).  It trailed it at almost every measured row count on topk4x and
+# topk128x prefill, with 16 or more query rows per request on topk4x items (8
+# at 160 rows), with 8 or more on topk128x items, and with 4 on topk128x items
+# 1152 wide (2 at 160 rows); it was mixed with 4 query rows on narrower
+# topk128x and on SWA-only items.
+_FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
+    "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True)),
+}
 
-def _fp8_persistent_program(num_query_tokens: int) -> str:
+
+def _fp8_persistent_program(
+    num_query_tokens: int,
+    *,
+    max_q_len: Optional[int] = None,
+    topk4x: bool = False,
+    arch: Optional[str] = None,
+) -> str:
     if num_query_tokens < _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+        return "fp8_h128_prefill_source_persistent_uniform"
+    entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
+    if max_q_len is not None and any(
+        num_query_tokens >= rows and max_q_len <= longest and (topk4x or not only4x)
+        for rows, longest, only4x in entries
+    ):
         return "fp8_h128_prefill_source_persistent_uniform"
     return "fp8_h128_prefill_source_persistent"
 
 
-# Mirrors the Cake seed's H64_M64_MIN_TOKENS
-# (portfolio_v34.persistent_program): FP8/H64 rows admitted to the persistent
-# body with at least this many tokens run the H64-specific single-CTA M64 body.
-_FP8_H64_M64_MIN_TOKENS = 128
-
-
 def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
-    """FP8/H64 persistent-body rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+    """FP8/H64 rows that run the FP8/H128 persistent body while it fits one wave
+    (Cake seed ``portfolio_v34.uses_persistent_body``)."""
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
-    return full_tiles >= 2 or num_query_tokens >= 128
+    return full_tiles >= 2
+
+
+# SM107: the M64 body (K=64 QK) takes the FP8/H64 decode rows of two to four
+# sparse tiles before the half wave.  Per tile count ``ceil(sparse_topk / 128)``,
+# ``(num, den)``: the M64 body from ``den * tokens > num * sm_count`` on.
+_FP8_H64_M64_EARLY_WAVE = {
+    "sm_107a": {2: (1, 8), 3: (1, 4), 4: (3, 10)},
+}
+
+
+def _fp8_h64_uses_m64_body(
+    num_query_tokens: int,
+    sm_count: int,
+    *,
+    sparse_topk: Optional[int] = None,
+    arch: Optional[str] = None,
+) -> bool:
+    """FP8/H64 decode rows (``max_q_len < 257``) whose two-CTA-per-token bodies
+    no longer fit one wave.
+
+    The FP8/H128 persistent body, the SWA producer and the H64 cluster body
+    launch two CTAs per token; once ``2 * tokens`` exceeds the SM count their
+    second wave costs more than the single-CTA M64 body (one CTA per token)
+    saves by running each token on one SM.  GB300 (152 SMs), q_len 4,
+    DSv4-Flash widths: 84-120 tokens SWA-only 11.2-11.9 -> 7.0-7.5 us, topk4x
+    640 14.2-15.9 -> 14.3-14.8 us; 128-512 tokens the M64 body led already.
+
+    On SM107 the M64 body wins earlier on the rows of two to four sparse tiles
+    (``_FP8_H64_M64_EARLY_WAVE``).  VR200 (208 and 216 SMs), q_len 1, 2 and 4,
+    persistent body -> M64 body over the rows each tile count adds: two tiles
+    5.79-7.79 -> 5.54-6.24 us, three tiles 7.33-8.76 -> 7.06-7.92 us, four
+    tiles 8.76-9.54 -> 8.23-9.09 us (0.99-1.25x).  Five tiles and up stay on
+    the persistent body below the half wave (M64 0.83-1.02x there).
+    """
+    if 2 * num_query_tokens > sm_count:
+        return True
+    if sparse_topk is None:
+        return False
+    early = _FP8_H64_M64_EARLY_WAVE.get(arch, {}).get(_ceil_div(sparse_topk, _TILE_KV))
+    return early is not None and early[1] * num_query_tokens > early[0] * sm_count
 
 
 # Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
@@ -948,6 +1021,55 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     if sparse_topk == _TILE_KV:
         return "fp8_h64_prefill_source_persistent_m64"
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
+
+
+# Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
+# registers no program for it.
+_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
+
+
+def _fp8_h64_uses_cluster_body(
+    sparse_topk: int, num_query_tokens: int, arch: Optional[str]
+) -> bool:
+    """FP8/H64 decode rows of at most 12 tokens with two complete sparse tiles
+    and a partial third (widths 260-380), which the persistent body leaves (it
+    needs three complete tiles at <= 12 tokens): the H64 cluster body (two CTAs
+    per token, one wave) beats the M64 body there (1-12 tokens, widths
+    260-380, both cache layouts: B200 9.5-10.3 us vs 10.0-11.1 us, GB300
+    9.1-10.0 us vs 9.4-10.7 us).  Width 256 (no partial tile: B200 8.8-9.4 us
+    vs 7.6-8.9 us, GB300 8.5-9.2 us vs 7.2-8.3 us) and rows with one complete
+    tile keep the M64 body; so does ``arch=None`` (unknown device)."""
+    return (
+        arch in _FP8_LOWHEAD_H64_ARCHES
+        and num_query_tokens <= 12
+        and 2 * _TILE_KV < sparse_topk < 3 * _TILE_KV
+    )
+
+
+# Architectures where two more kinds of FP8 rows leave the low-head prefill
+# producer for the single-CTA M64 body: the 8-head prefill rows (``_route``)
+# and the 8/16/32-head SWA-only decode rows past one wave
+# (``_fp8_lowhead_swa_uses_m64_body``).  Measured on SM107 only; SM100, SM103
+# and ``arch=None`` keep the producer on those rows.
+_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_107a"})
+
+
+def _fp8_lowhead_swa_uses_m64_body(
+    num_query_tokens: int, sm_count: int, arch: Optional[str]
+) -> bool:
+    """FP8 SWA-only decode rows (``max_q_len < 257``) of 8, 16 or 32 heads
+    whose low-head prefill producer no longer fits one wave.
+
+    The producer launches two CTAs per token (one per work item); once
+    ``2 * tokens`` exceeds the SM count its second wave costs more than the
+    single-CTA M64 body (one CTA per token) saves.  R200 (sm_107a, 216 SMs),
+    q_len 4, CUDA graph + PDL, per call: 112-256 tokens 6.71-10.45 us ->
+    4.06-5.69 us (1.56-1.85x) at 8, 16 and 32 heads; 96 and 108 tokens (one
+    wave) 0.98-1.01x, which keep the producer.  A rule of its own, kept apart
+    from the 64-head one (``_fp8_h64_uses_m64_body``), and on the
+    architectures of ``_FP8_LOWHEAD_M64_ARCHES`` only.
+    """
+    return arch in _FP8_LOWHEAD_M64_ARCHES and 2 * num_query_tokens > sm_count
 
 
 def canonical_arg_name(kind: str, name: str) -> str:
@@ -968,6 +1090,8 @@ def is_bindable_arg(kind: str, name: str) -> bool:
         return canonical in _SCALAR_VALUE_NAMES
     if kind == "grid":
         return name in _GRID_NAMES
+    if kind == "launch":
+        return name in _LAUNCH_NAMES
     return False
 
 
@@ -985,6 +1109,12 @@ def _bind_argument(
                 f"CAKE DSv4 {variant} has an unknown grid argument: {name}"
             )
         return grid[name]
+    if kind == "launch":
+        if name not in _LAUNCH_NAMES:
+            raise ValueError(
+                f"CAKE DSv4 {variant} has an unknown launch argument: {name}"
+            )
+        return int(bool(values.get(name, False)))
     if kind not in ("buffer", "tma_buffer", "parameter"):
         raise ValueError(
             f"CAKE DSv4 {variant} has an unknown argument kind {kind!r} for {name}"
@@ -1096,7 +1226,14 @@ def _route(
     batch_size: int,
     compressed_page_size: int,
     num_query_tokens: int,
+    sm_count: int,
+    arch: Optional[str] = None,
 ) -> str:
+    """The variant one call runs; ``sm_count`` is the device's SM count (the
+    FP8/H64 decode rows, and on SM107 the FP8 8/16/32-head SWA-only decode
+    rows, pick their body by the waves of its grid) and ``arch`` its
+    ``sm_XYa`` target (``None``: the architecture-independent choice, which
+    SM107 may not build: it has no BF16 programs)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1108,7 +1245,9 @@ def _route(
             # work feed over T x 2 CTAs, runtime q_lens) matched or beat the
             # former per-(token, split) cluster producer on the 12-token
             # decode rows and beat trtllm-gen 1.12-1.75x on the MTP rows.
-            return _fp8_persistent_program(num_query_tokens)
+            return _fp8_persistent_program(
+                num_query_tokens, max_q_len=max_q_len, topk4x=is_topk4x, arch=arch
+            )
         if num_heads not in (8, 16, 32, 64):
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
         if (
@@ -1129,6 +1268,17 @@ def _route(
                 # (widths 128-1024, single and dual caches), with the same
                 # oracle.  Two programs, selected by the item width.
                 return _fp8_h64_m64_program(sparse_topk)
+            if arch in _FP8_LOWHEAD_M64_ARCHES and sparse_topk <= _FP8_M64_MAX_WIDTH:
+                # 8-head prefill rows take the same M64 body on SM107: R200
+                # (sm_107a, 216 SMs), CUDA graph + PDL, per call, measured at
+                # (tokens x width) 257 x 128, 386 x 640, 1024 x 128 / 640 /
+                # 1152 and 2048 x 128 / 640 / 1152: 1.87-4.66x (one
+                # 257-token request at width 128: 10.50 -> 5.61 us; two
+                # 1024-token requests at width 1152: 318.4 -> 68.4 us), with
+                # the same oracle.  Wider items, which the M64 bindings
+                # reject, and other architectures (unmeasured there) keep the
+                # low-head prefill producer for 8-head prefill rows.
+                return _fp8_h64_m64_program(sparse_topk)
             return "fp8_lowhead_prefill"
         if (
             num_heads in (8, 16)
@@ -1147,29 +1297,34 @@ def _route(
             # 1.24-1.25x, width-260 rows 56/59/68/71 GB300 1.38-1.49x /
             # B200 1.33-1.43x (one-partition producer 0.99-1.27x).
             return "fp8_h8_h16_source_exact"
-        if num_heads == 64 and _fp8_h64_uses_persistent_body(
-            sparse_topk, num_query_tokens
-        ):
-            # Mirrors the Cake seed's H64_PERSISTENT_* rule:
-            # 12-token rows with >= 3 complete sparse tiles; every many-token
-            # compressed row (>= 2 complete tiles); SWA-only rows from 128
-            # tokens.  Same persistent FP8 body as FP8/H128 (heads >= num_heads
-            # predicated): GB300 1.23-1.26x / B200 1.15x on the 12-token rows,
-            # 1.02-1.92x on the 16-128-token hardening rows where the
-            # per-token cluster body and the SWA producer sat at 0.6-0.87x.
-            # Evaluated before the SWA-only test on purpose.
-            if num_query_tokens >= _FP8_H64_M64_MIN_TOKENS:
-                # H64-specific single-CTA M64 persistent body (one
-                # CTA per token, unified 128-row KV stage, no V gathers): GB300
-                # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
-                # the FP8/H128 body sat at 0.81-1.13x.  Two exported programs,
-                # selected by the item width.
-                return _fp8_h64_m64_program(sparse_topk)
-            return _fp8_persistent_program(num_query_tokens)
-        if is_swa:
-            return "fp8_lowhead_prefill"
         if num_heads == 64:
-            return "fp8_lowhead_h64"
+            if _fp8_h64_uses_m64_body(
+                num_query_tokens, sm_count, sparse_topk=sparse_topk, arch=arch
+            ):
+                # H64-specific single-CTA M64 persistent body (one CTA per
+                # token, unified 128-row KV stage, no V gathers).  Two exported
+                # programs, selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
+            if _fp8_h64_uses_persistent_body(sparse_topk, num_query_tokens):
+                # Same persistent FP8 body as FP8/H128 (heads >= num_heads
+                # predicated) for the multi-tile rows of one wave: GB300 10.5-12.0
+                # us vs 13.4-14.1 us for the M64 body on the 1-72-token topk4x
+                # 640 rows.
+                return _fp8_persistent_program(num_query_tokens)
+            if is_swa:
+                return "fp8_lowhead_prefill"
+            if _fp8_h64_uses_cluster_body(sparse_topk, num_query_tokens, arch):
+                return "fp8_lowhead_h64"
+            # Rows with one complete tile (and width 256): the M64 body beats
+            # the H64 cluster body at every token count (GB300, topk128x widths
+            # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
+            return _fp8_h64_m64_program(sparse_topk)
+        if is_swa:
+            if _fp8_lowhead_swa_uses_m64_body(num_query_tokens, sm_count, arch):
+                # 8/16/32-head SWA-only rows past one wave of the low-head
+                # prefill producer: the single-tile M64 program (width 128).
+                return _fp8_h64_m64_program(sparse_topk)
+            return "fp8_lowhead_prefill"
         # One producer partition owns up to three sparse tiles (widths up to
         # 384) and writes final O directly (one partition measured 1.18-1.26x
         # on the width-260 rows).  No two-partition producer is exported for
@@ -1447,17 +1602,29 @@ def cake_dsv4_workspace_requirement(
     max_q_len: int,
     batch_size: int,
     ragged: bool,
+    sm_count: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkspaceRequirement:
-    """Route and exact workspace requirement of one call, without device access.
+    """Route and exact workspace requirement of one call.
 
     The arguments are the route inputs of :func:`run_cake_dsv4`:
     ``num_query_tokens`` = metadata rows, ``sparse_topk`` = combined table
     width, ``compressed_page_size`` = ``compressed_kv_cache.shape[-2]``
     (irrelevant for SWA-only calls), ``max_q_len`` = dense per-request query
     length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
-    ``ragged`` = ``cum_seq_lens_q is not None``. Raises ``ValueError`` for a
-    shape ``backend="cake"`` has no kernel for.
+    ``ragged`` = ``cum_seq_lens_q is not None``, ``sm_count`` = the SM count
+    of the device the call runs on (``None``: the current CUDA device's; the
+    workspace numbers do not depend on it, the route name may), ``arch`` = its
+    ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
+    available, else the architecture-independent route, which SM107 may not
+    build: it has no BF16 programs; the workspace numbers do not depend on it
+    either). Raises ``ValueError`` for a shape
+    ``backend="cake"`` has no kernel for.
     """
+    if sm_count is None:
+        sm_count = _device_sm_count(torch.device("cuda", torch.cuda.current_device()))
+    if arch is None and torch.cuda.is_available():
+        arch = _target_arch(torch.device("cuda", torch.cuda.current_device()))
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     batch = _positive_int(batch_size, "batch_size")
@@ -1471,6 +1638,8 @@ def cake_dsv4_workspace_requirement(
         batch_size=batch,
         compressed_page_size=int(compressed_page_size),
         num_query_tokens=tokens,
+        sm_count=_positive_int(sm_count, "sm_count"),
+        arch=arch,
     )
     plan = _route_plan(
         route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
@@ -1528,6 +1697,44 @@ _OUT_PHASE_BY_ROUTE: dict[str, int] = {
     #   bf16_h128_topk128x: hardening-000025 / -000031 -0.74 / -0.70 us GB300, the
     #   other rows of the route flat (|d| <= 0.03 us).
     "bf16_h128_topk128x": 0x800,
+}
+
+
+# Alignment of O that each route's program needs beyond the 2 bytes a
+# contiguous bf16 view guarantees, the widest O store of its kernels over every
+# architecture that runs the route: 32 = ``st.global.v8.b32`` at 16-element
+# offsets, 16 = ``int4`` stores at 8-element offsets or an O tensor map (TMA
+# store; its binding rejects an address off 16 bytes).  bf16_h128_topk4x_v52
+# writes O from its split-5 reducer (``int4`` on sm_103a, ``int2`` on sm_100a);
+# bf16_h128_topk128x from the split reducer (``int2``) or, above 16 tokens, the
+# row-first owners (``st.global.v8.b32``); bf16_h64_compressed_q8_v38 from the
+# H64 reducer (``int2``) or, with one split, the producer
+# (``st.global.v8.b32``).  A caller ``out`` off that alignment (a contiguous
+# view at +2 or +16 bytes) runs into an aligned staging buffer that is then
+# copied into ``out``: the same program, the same bits.  An aligned ``out``
+# (every allocation, every phase of ``_OUT_PHASE_BY_ROUTE``) takes no staging.
+_OUT_ALIGN_BY_ROUTE: dict[str, int] = {
+    "bf16_h128_prefill_v42": 32,
+    "bf16_h128_swa128": 16,
+    "bf16_h128_topk128x": 32,
+    "bf16_h128_topk4x_v52": 16,
+    "bf16_h16_h32_swa128_v44": 16,
+    "bf16_h32_topk128x_early_v47": 16,
+    "bf16_h64_compressed_q8_v38": 32,
+    "bf16_h64_guard_q_tma_batch_r25": 16,
+    "bf16_h64_prefill": 32,
+    "bf16_h8_h16_source_exact": 16,
+    "bf16_h8_swa128_v43": 16,
+    "bf16_swa128_single_cta": 16,
+    "fp8_h128_prefill_source_persistent": 16,
+    "fp8_h128_prefill_source_persistent_uniform": 16,
+    "fp8_h64_prefill_source_persistent_m64": 32,
+    "fp8_h64_prefill_source_persistent_m64_multi_tile": 32,
+    "fp8_h64_source_exact": 32,
+    "fp8_h8_h16_source_exact": 16,
+    "fp8_lowhead_h64": 32,
+    "fp8_lowhead_one_partition": 32,
+    "fp8_lowhead_prefill": 32,
 }
 
 
@@ -1655,6 +1862,90 @@ def _int32_vector(
     return flat
 
 
+# The routes whose programs leave PDL to each call and may route a PDL-free
+# twin ``<route>_no_pdl``: the same kernel without its two griddepcontrol
+# instructions, which a call that does not ask for PDL launches instead
+# (without the attribute the grid starts after its predecessor completes, so
+# it reads what the PDL program reads after its wait).  SM100 and SM103 route
+# the twin to programs of their own.
+_NO_PDL_TWIN_ROUTES = frozenset({"fp8_h128_prefill_source_persistent"})
+
+# The fewest query rows a launch needs to take the twin, per architecture.
+# GB300 without PDL: the twin beat the PDL program by 64-192 ns from 386 rows
+# on (2 x 257-token prefill, 64 x 8 MTP) but trailed it by up to 64 ns at 256
+# rows (64 x 4 MTP).
+_NO_PDL_TWIN_MIN_TOKENS = {"sm_103a": 384}
+
+# The fewest query tokens the call's longest request needs for its launches to
+# take the twin, per architecture.  B200 without PDL: the twin led the PDL
+# program by 32-128 ns (median 64 ns) on 2 x 257-token prefill launches but
+# tied or trailed it by up to 32 ns on 2- to 8-token MTP launches.
+_NO_PDL_TWIN_MIN_QUERY_LEN = {"sm_100a": 257}
+
+
+# The routes with a K=64 sibling ``<route>_k64`` on an architecture whose FP8
+# MMA runs at K=64 only as a one-CTA M128 tile (SM107): a program whose every
+# MMA is that tile, where the route's pair-M128 MMAs run at K=32, with the
+# route's arguments, grid and launch.
+_K64_SIBLING_ROUTES = frozenset({"fp8_h128_prefill_source_persistent_uniform"})
+
+# The fewest query rows a launch needs to take the K=64 sibling, per
+# architecture.  VR200, eight back-to-back calls per CUDA graph: the sibling
+# led the K=32 program from 48 rows on (FP8/H128 and FP8/H64, widths 128-1152)
+# and trailed it by up to 4 % below.
+_K64_SIBLING_MIN_TOKENS = {"sm_107a": 48}
+
+
+def _k64_variant(route: str, *, arch: str, num_query_tokens: int) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows runs:
+    its K=64 sibling when ``arch`` has a floor in ``_K64_SIBLING_MIN_TOKENS``,
+    the launch meets it and ``arch`` routes the sibling to a program other than
+    the route's, else ``route``."""
+    if route not in _K64_SIBLING_ROUTES:
+        return route
+    min_tokens = _K64_SIBLING_MIN_TOKENS.get(arch)
+    if min_tokens is None or num_query_tokens < min_tokens:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{route}_k64"
+    if programs.get(sibling, programs.get(route)) == programs.get(route):
+        return route
+    return sibling
+
+
+def _pdl_variant(
+    route: str,
+    *,
+    arch: str,
+    enable_pdl: bool,
+    num_query_tokens: int,
+    max_q_len: int,
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows of a
+    call whose longest request has ``max_q_len`` tokens runs: its PDL-free twin
+    when the call does not ask for PDL, ``arch`` has a floor in
+    ``_NO_PDL_TWIN_MIN_TOKENS`` or ``_NO_PDL_TWIN_MIN_QUERY_LEN``, the launch
+    meets each floor ``arch`` has and ``arch`` routes the twin to a program
+    other than the route's, else ``route``."""
+    if enable_pdl or route not in _NO_PDL_TWIN_ROUTES:
+        return route
+    min_tokens = _NO_PDL_TWIN_MIN_TOKENS.get(arch)
+    min_q_len = _NO_PDL_TWIN_MIN_QUERY_LEN.get(arch)
+    if min_tokens is None and min_q_len is None:
+        return route
+    if num_query_tokens < (min_tokens or 0) or max_q_len < (min_q_len or 0):
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    twin = f"{route}_no_pdl"
+    if programs.get(twin, programs.get(route)) == programs.get(route):
+        return route
+    return twin
+
+
 class _Launcher:
     """Per-call launch context: shared values plus per-variant overrides."""
 
@@ -1745,8 +2036,17 @@ def run_cake_dsv4(
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
     out_shape: Optional[tuple[int, ...]] = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
+
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent,
+    M64, low-head prefill and H64 cluster bodies) as programmatic dependents of the previous kernel on the
+    stream; they wait for it before their first global read.  The other
+    programs launch without the attribute.  Without ``enable_pdl`` the FP8
+    H128 persistent route launches its PDL-free twin on SM103 from 384 query
+    rows per launch and on SM100 when the longest request has at least 257
+    query tokens (``_pdl_variant``).
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -1757,7 +2057,9 @@ def run_cake_dsv4(
     the dense per-request query length (``query.shape[1]`` of the caller's
     ``[B, Q, H, 512]``) or the ragged maximum; ``seq_lens`` has one entry per
     request and ``cum_seq_lens_q`` (ragged only) ``batch_size + 1`` offsets.
-    Apart from the ``out=None`` output no device memory is allocated here
+    Apart from the ``out=None`` output and the staging buffer of a caller
+    ``out`` off its route's store alignment (``_OUT_ALIGN_BY_ROUTE``; an
+    aligned ``out`` takes none) no device memory is allocated here
     (the dense request offsets of the ragged-only producers and of row-tiled
     dense launches are process-lifetime constants, created on first use:
     warm such shapes up eagerly before a capture); see the module docstring
@@ -1847,6 +2149,8 @@ def run_cake_dsv4(
         batch_size=batch_size,
         compressed_page_size=compressed_kv_cache.shape[-2],
         num_query_tokens=meta.num_query_tokens,
+        sm_count=_device_sm_count(device),
+        arch=arch,
     )
 
     if out is None:
@@ -1864,6 +2168,11 @@ def run_cake_dsv4(
                 f"out_shape {tuple(out.shape)} holds fewer than {num_query_tokens} rows"
             )
     out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+    staged_out: Optional[torch.Tensor] = None
+    out_align = _OUT_ALIGN_BY_ROUTE.get(route)
+    if out_align is not None and out_rows.data_ptr() % out_align:
+        staged_out = out_rows
+        out_rows = torch.empty_like(out_rows)
 
     if not ragged and batch_size * max_q_len < num_query_tokens:
         raise ValueError(
@@ -1906,6 +2215,7 @@ def run_cake_dsv4(
         "ragged_query": int(ragged),
         "num_splits": 1,
         "total_work_items": num_query_tokens,
+        "enable_pdl": bool(enable_pdl),
     }
     plan = _route_plan(
         route,
@@ -1947,6 +2257,8 @@ def run_cake_dsv4(
             rows_per_launch=rows_per_launch,
             request_offsets=request_offsets,
         )
+    if staged_out is not None:
+        staged_out.copy_(out_rows)
     return out
 
 
@@ -2153,7 +2465,14 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "fp8_h128_prefill_source_persistent_uniform",
     ):
         parts = L.partials(1)
-        L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
+        program = _pdl_variant(
+            _k64_variant(route, arch=L.arch, num_query_tokens=T),
+            arch=L.arch,
+            enable_pdl=v["enable_pdl"],
+            num_query_tokens=T,
+            max_q_len=v["max_q_len"],
+        )
+        L.run(L.variant(program, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
@@ -2165,7 +2484,14 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # caller-owned workspace), grid = tokens.  Both M64 programs share the
         # kernel ABI; _fp8_h64_m64_program picks one by the item width.
         parts = L.partials(1)
-        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
+        program = _pdl_variant(
+            route,
+            arch=L.arch,
+            enable_pdl=v["enable_pdl"],
+            num_query_tokens=T,
+            max_q_len=v["max_q_len"],
+        )
+        L.run(L.variant(program, grid=(T, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (

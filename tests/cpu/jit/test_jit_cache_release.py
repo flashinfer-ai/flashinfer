@@ -243,3 +243,44 @@ def test_wheel_index_recognizes_provider_distributions(
         "version": filename.split("-")[1],
         "cuda": "130" if "+cu130" in filename else "134",
     }
+
+
+def _workflow(name: str) -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load((REPO_ROOT / ".github" / "workflows" / name).read_text())
+
+
+@pytest.mark.parametrize("caller", ["release.yml", "nightly-release.yml"])
+def test_release_workflows_share_build_pipeline(caller):
+    """The wheel build lives once in release-build.yml; callers only publish."""
+    jobs = _workflow(caller)["jobs"]
+    shared = "./.github/workflows/release-build.yml"
+
+    assert jobs["build"]["uses"] == shared
+    # Builds moved into the shared workflow must not be redefined in a caller.
+    assert not any(name.startswith("build-flashinfer") for name in jobs)
+    assert "validate-flashinfer-jit-cache-providers" not in jobs
+    assert "build" in jobs["create-release"]["needs"]
+
+
+def test_release_build_workflow_defines_expected_jobs():
+    workflow = _workflow("release-build.yml")
+    # PyYAML parses the bare `on:` key as boolean True.
+    inputs = workflow.get("on", workflow.get(True))["workflow_call"]["inputs"]
+
+    assert {"ref", "repository", "dev_suffix", "wheel_version"} <= set(inputs)
+    assert set(workflow["jobs"]) == {
+        "setup",
+        "build-flashinfer-python",
+        "build-flashinfer-cubin",
+        "build-flashinfer-jit-cache-provider",
+        "build-flashinfer-jit-cache-shim",
+        "validate-flashinfer-jit-cache-providers",
+    }
+
+
+def test_release_pr_dry_run_watches_shared_workflow():
+    release = _workflow("release.yml")
+    paths = release.get("on", release.get(True))["pull_request"]["paths"]
+
+    assert ".github/workflows/release-build.yml" in paths

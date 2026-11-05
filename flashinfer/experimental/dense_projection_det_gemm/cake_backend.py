@@ -53,6 +53,14 @@ partial wave whose halves fit the CTA pairs and K has at least 16 steps;
 multi-wave problems stay data-parallel) and binds the argument plan of the
 registered module (``cake_jit.MODULES`` / ``cake_jit.KERNELS``).  The result
 is bitwise identical to the Cake launcher's on the same device.
+The convenience path runs a batched forward of at most 256 tokens on the
+swapped program instead (the weight rows in the MMA's M, at most two waves of
+single-CTA tiles over the caller's strided views; :func:`swap_ab_template`).
+Every K1 program launches as a programmatic dependent launch under
+``enable_pdl`` (default: the device supports it, which every architecture the
+package serves does): each CTA lets the next kernel launch at entry, and the
+planner's programs wait for the preceding kernel before their first global
+access (operands, output and workspace), so their prologue overlaps its tail.
 
 K2 -- FP32 router GEMM through split-BF16x3 emulation
 ----------------------------------------------------
@@ -284,6 +292,15 @@ def device_facts(device: Any = None) -> DeviceFacts:
             l2_bytes=int(l2),
         )
     return facts
+
+
+def pdl_enabled(enable_pdl: Optional[bool], device: Any = None) -> bool:
+    """``enable_pdl`` resolved for a launch on ``device``: as given, or, when ``None``, whether the device supports
+    programmatic dependent launch (compute capability 9.0 or newer: every architecture the package serves, so a
+    device :func:`device_facts` resolves an architecture for)."""
+    if enable_pdl is not None:
+        return bool(enable_pdl)
+    return device_facts(device).arch is not None
 
 
 def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
@@ -1223,7 +1240,9 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
 # (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); a ragged rule leaves the
 # token count out (M = None for forward / input gradients, K = None for weight gradients), and an exact key names
-# one token count (the 216-SM tranche's sm_107a T-exact weight-gradient rules at K = 16231 and 16384).
+# one token count (the 216-SM tranche's sm_107a T-exact weight-gradient rules at K = 16231 and 16384; the GB
+# T-exact forward / input-gradient rules of sm_100a and sm_103a at M = 16172, 16231 or 16384; the GB T-exact
+# weight-gradient rules of sm_100a and sm_103a at K = 16172, 16231 or 16384).
 # The round-2 to round-33 rules mirror the former launcher's row table; the shapes tranche below them (sm_100a and
 # sm_103a) was measured with this package's planner and extends it per architecture (three round-33 sm_100a keys were
 # re-measured and re-valued there).  An architecture-wide default (``ARCH_RULE_DEFAULTS``, round 33) sits under every rule
@@ -1246,7 +1265,9 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # the one with the early accumulator release (``_w8r``).  Each measured faster than the row's program above the pair
 # spread at both T on GB200, except 4096 -> 64, 5120 -> 64 and the kv_a, where the form measured at least as fast as the
 # row's program there; the knobs after the form are the row's program where the form yields, and the raster group is the
-# row's measured launch parameter.
+# row's measured launch parameter.  The two sm_100a 4096 -> 48 input-gradient T-exact keys (T 16231 and 16384, the GB
+# T-exact rules) carry ``w8r`` too: the eight-warp program with the early accumulator release, whole tiles through the
+# one-slot TMA store (the ragged 4096 -> 48 rule keeps its half-tail program at every other T).
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1426,6 +1447,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 48, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, False, False, 4096, 16384, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, False, False, 4096, 16384, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
     ('sm_107a', True, True, True, True, False, 32, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 48, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
@@ -1515,6 +1537,65 @@ ROW_RULES: dict[tuple, dict] = {
     #      program or launch parameter, measured on GB200 at T 16231 / 16384 against cuBLAS (rows not listed keep the
     #      tranche's rule above) ----
     ('sm_100a', True, True, False, False, False, 4096, None, 1024): {"block_n": 224, "pro": 15, "hints": ('none', 'evict_first'), "cgrp": True},
+    # ---- sm_100a: the GB T-exact rules - forward / input-gradient rows whose program measured faster at one token count
+    #      (M = T), each key applying at that T alone with the per-tile K partitions of the row's plan without it (every
+    #      output bitwise equal to that plan's), measured on GB200 against that plan: the 4096 -> 48 input gradient (the
+    #      eight-warp program with the early accumulator release; the ragged rule's half-tail program elsewhere), the
+    #      4096 -> 512 forward, the 6144 x 2048 input gradient (q_a / shared_gate_up) and the 2048 -> 6144 shared_down
+    #      forward (the half-tail column-grouped program) ----
+    ('sm_100a', False, True, False, False, False, 4096, 48, 16231): {"block_n": 256, "cta_rows": 128, "epi": 'tma', "form": 'w8r', "pro": 0, "slots": 1},
+    ('sm_100a', False, True, False, False, False, 4096, 48, 16384): {"block_n": 256, "cta_rows": 128, "epi": 'tma', "form": 'w8r', "pro": 0, "slots": 1},
+    ('sm_100a', False, False, False, False, False, 512, 4096, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_100a', False, False, False, False, False, 512, 4096, 16384): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_100a', False, False, False, False, False, 6144, 2048, 16172): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_100a', False, False, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_100a', False, True, False, False, False, 6144, 2048, 16172): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
+    ('sm_100a', False, True, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
+    # ---- sm_100a: the GB T-exact rules of round 2 - the q_b 2048 x 16384 input gradient (the ragged rule's overlapped
+    #      half-tail program with the column-grouped raster: 8-column-tile groups at T 16172, 16-column-tile groups at T 16231) and the
+    #      17408 -> 5120 weight gradient in its direct orientation (the half-tail program through the one-slot TMA store,
+    #      12-row raster groups, at T 16231 / 16384), each with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 2048, 16384, 16172): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_100a', False, True, False, False, False, 2048, 16384, 16231): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_100a', True, True, False, False, False, 17408, 16231, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_100a', True, True, False, False, False, 17408, 16384, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 3 - the indexer_q 2048 -> 4096 weight gradient at T 16172 / 16231
+    #      in its direct orientation: the ragged rule's synchronised two-partial stream-K program with its
+    #      bf16 tiles through the one-slot TMA store, with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', True, True, False, False, False, 2048, 16172, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    ('sm_100a', True, True, False, False, False, 2048, 16231, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 4 - the 5120 -> 17408 input gradient at T 16231 / 16384 (the
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's row-half program), with the bf16 tiles through the one-slot TMA store and the per-tile K partitions of
+    #      the row's plan without it, measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    ('sm_100a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 5 - the 12288 -> 4096 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 8-column-tile groups), with the bf16 tiles
+    #      through the one-slot TMA store and the per-tile K partitions of the row's plan without them, measured on
+    #      GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's 8; round 8 at T 16231 / 16384: the tall epilogue released by row half in place of the column-chunk
+    #      one, measured against the round-6 program), with the per-tile K partitions of the row's plan without them,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 7 - the 5120 -> 17408 weight gradient at T 16231 / 16384 in its direct
+    #      orientation (the half-tail program through the one-slot TMA store, 12-row raster groups: the sm_103a
+    #      keys' rule of the row), with the per-tile K partitions of the row's plan without them, measured on
+    #      GB200 against that plan ----
+    ('sm_100a', True, True, False, False, False, 5120, 16231, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_100a', True, True, False, False, False, 5120, 16384, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the half-tail program with
+    #      the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups, in place of the
+    #      ragged rule's overlapped half-tail program), with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1614,6 +1695,51 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', True, True, True, False, False, 12288, None, 4096): {"cta_rows": 256, "pro": 7, "sk_parts": 4},
     ('sm_103a', True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 3},
     ('sm_103a', True, True, True, True, False, 512, None, 4096): {"cta_rows": 64, "pro": 15, "hints": ('evict_first', 'none')},
+    # ---- sm_103a: the GB T-exact rules - the 4096 -> 512 and 5120 -> 512 forwards (the half-tail column-grouped
+    #      program), measured on GB300 at T 16231 / 16384 like the sm_100a GB T-exact rules above, and the sm_100a
+    #      6144 x 2048 keys restated (T 16172 / 16231, measured on GB300 through the parent lookup) so that these rows
+    #      keep them without it ----
+    ('sm_103a', False, False, False, False, False, 512, 4096, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 512, 4096, 16384): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 512, 5120, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 512, 5120, 16384): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 6144, 2048, 16172): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
+    ('sm_103a', False, True, False, False, False, 6144, 2048, 16172): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
+    ('sm_103a', False, True, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
+    # ---- sm_103a: the GB T-exact rules of round 2 - the q_b 2048 x 16384 input gradient (the column-grouped raster
+    #      in 16-column-tile groups at T 16172 / 16231) and the 5120 -> 17408 / 17408 -> 5120 weight gradients at
+    #      T 16231 / 16384 (the half-tail program through the one-slot TMA store, 12-row raster groups: the sm_100a key's
+    #      program on the 17408 -> 5120 row, restated here), measured on GB300 like the sm_100a rules above ----
+    ('sm_103a', False, True, False, False, False, 2048, 16384, 16172): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', False, True, False, False, False, 2048, 16384, 16231): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', True, True, False, False, False, 5120, 16231, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 5120, 16384, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 17408, 16231, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 17408, 16384, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_103a: the GB T-exact rules of round 3 - the indexer_q 2048 -> 4096 weight gradient at T 16172 / 16231
+    #      in its direct orientation: the synchronised two-partial stream-K program of the sm_100a ragged rule
+    #      (which this row inherits) with its bf16 tiles through the one-slot TMA store, with the per-tile K
+    #      partitions of the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', True, True, False, False, False, 2048, 16172, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    ('sm_103a', True, True, False, False, False, 2048, 16231, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    # ---- sm_103a: the GB T-exact rules of round 4 - the 5120 -> 17408 input gradient at T 16231 / 16384 (the
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's row-half program), with the bf16 tiles through the one-slot TMA store and the per-tile K partitions of
+    #      the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    # ---- sm_103a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's 8), with the per-tile K partitions of the row's plan without them, measured on GB300 against
+    #      that plan ----
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
+    # ---- sm_103a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the sm_100a key's program:
+    #      the half-tail program with the tall epilogue released by row half and the column-grouped raster in
+    #      8-column-tile groups, in place of the inherited sm_100a ragged rule's overlapped half-tail program), with the
+    #      per-tile K partitions of the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
 }
 # fmt: on
 
@@ -2335,7 +2461,15 @@ def plan_dense_projection_det_gemm(
     waves (74 pairs of a 148-SM part: the 4096 x 4096 weight gradient's 152 tiles are 2.05 waves against 1.73, the
     4096 x 1024 row's 76 tiles 1.03 against 0.86) the rule's BLOCK_N yields to the default tile; the rule's other knobs
     stay, a caller-forced ``block_n`` is never touched, and the plan is the launcher's wherever the fit is exact or both
-    tiles need the same waves (152 and 160 SMs)."""
+    tiles need the same waves (152 and 160 SMs).
+
+    A third FlashInfer-only deviation, the synchronised TMA-store gate (:func:`_serves`): the synchronised stream-K
+    programs that store their bf16 tiles through the TMA store (``_tma<slots>_sks``) were generated for measured
+    rows whose rule names ``epi="tma"``; a ragged synchronised row whose short K (``K_TMA_BF16``) turns the bf16
+    epilogue default to the TMA store plans the same symbol unmeasured, so the registry does not serve it there and
+    the row runs the registry fallback above (as before those programs were generated); a caller-forced ``epi``
+    is served, and the fp32-output programs (``_f32_tma<slots>_sks``: the TMA store by default at every K) are
+    served as before."""
     _caller_knobs: dict[str, Any] = dict(
         transposed_out=transposed_out,
         sk=sk,
@@ -3006,7 +3140,7 @@ def plan_dense_projection_det_gemm(
         wave_fallback=wave_fallback,
     )
     check_stream_k_plan(plan, arch)
-    if _fallback and plan.template not in KERNELS.get(arch, {}):
+    if _fallback and not _serves(arch, plan, _caller_knobs["epi"], _use_rules):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
         for allow_swap, use_rules in ((False, True), (True, False), (False, False)):
             if (allow_swap, use_rules) == (_allow_swap, _use_rules):
@@ -3024,7 +3158,7 @@ def plan_dense_projection_det_gemm(
                 _use_rules=use_rules,
                 **_caller_knobs,
             )
-            if candidate[0].template in KERNELS.get(arch, {}):
+            if _serves(arch, candidate[0], _caller_knobs["epi"], use_rules):
                 return candidate
         # last resort: the nearest registered knob variant of the same layout / output kind (every knob set
         # computes the same GEMM; only the tile walk and the store path differ): the hand-ordered variants first
@@ -3072,12 +3206,47 @@ def plan_dense_projection_det_gemm(
                     )
                 except ValueError:
                     continue  # a knob the row cannot take (e.g. epi="tma" with a transposed store)
-                if candidate[0].template in KERNELS.get(arch, {}):
+                if _serves(arch, candidate[0], merged.get("epi"), False):
                     return (
                         dataclasses.replace(candidate[0], knob_fallback=True),
                         *candidate[1:],
                     )
     return plan, a_desc, b_desc, O3
+
+
+def _serves(arch: str, plan, caller_epi: Optional[str], use_rules: bool) -> bool:
+    """Whether the registry of ``arch`` serves ``plan`` as planned (FlashInfer-only, see
+    ``plan_dense_projection_det_gemm``): its program is generated, and a synchronised stream-K plan that stores its
+    bf16 tiles through the TMA store (``_tma<slots>_sks``) has its epilogue named by the caller (``caller_epi``) or by
+    the row's rule (``use_rules``: the merged row rule; else the architecture default).  Those bf16 programs were
+    generated for the measured T-exact rows whose rule names ``epi="tma"``; a ragged row whose short K
+    (``K_TMA_BF16``) turns the bf16 epilogue default to the TMA store plans the same symbol unmeasured and keeps the
+    registry fallback.  The fp32-output programs (``_f32_tma<slots>_sks``) take the TMA store by default at every K
+    and are served as before."""
+    if plan.template not in KERNELS.get(arch, {}):
+        return False
+    if (
+        not (plan.sk_sync and plan.epi == "tma")
+        or plan.out_f32
+        or caller_epi is not None
+    ):
+        return True
+    rule = (
+        row_rule(
+            arch,
+            plan.a_mn,
+            plan.b_mn,
+            plan.out_f32,
+            plan.transposed_out,
+            plan.L > 1,
+            plan.N,
+            plan.K,
+            plan.M,
+        )
+        if use_rules
+        else ARCH_RULE_DEFAULTS.get(arch, {})
+    )
+    return "epi" in rule
 
 
 # Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_det_gemm``): the plain TMA L2
@@ -3978,11 +4147,13 @@ def _k1_values(
     counters: Any,
     ldo: int,
     out_l: int,
+    enable_pdl: Any,
 ) -> dict[str, Any]:
     """The keyword arguments of a K1 launch (:func:`bind_launch` orders them by the module's plan).  ``A`` /
     ``B`` / ``out3`` / ``o_alias`` are the operand views and ``ws`` / ``counters`` the workspace -- or
     :class:`_Slot` markers for a cached launch that rebinds the views on every call and resolves the workspace
-    out of its arena; the plan decides which of the operands the instance dereferences."""
+    out of its arena; the plan decides which of the operands the instance dereferences.  ``enable_pdl`` is the
+    launch's PDL flag (0 or 1), or a :class:`_Slot` a cached launch fills per call."""
     dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
     tma_out, out_f32 = plan.tma_out, plan.out_f32
     return dict(
@@ -4015,6 +4186,7 @@ def _k1_values(
         fd_tiles_g=plan.group_m * plan.n_tiles,
         fd_group=plan.group_m,
         fd_last=plan.m_tiles % plan.group_m or plan.group_m,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -4057,10 +4229,13 @@ def prepare_dense_projection_det_gemm(
     stt: Optional[bool] = None,
     pro: Optional[int] = None,
     form: Optional[str] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedDetGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
-    knobs default to the Cake launcher's choices."""
+    knobs default to the Cake launcher's choices.  ``enable_pdl`` (default: the device supports it) makes every
+    ``launch()`` a programmatic dependent launch: the program waits for the preceding kernel before its first global
+    access and lets the next one launch at its entry."""
     knobs: dict[str, Any] = dict(
         sk=sk,
         block_n=block_n,
@@ -4117,6 +4292,7 @@ def prepare_dense_projection_det_gemm(
         counters=counters,
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=int(pdl_enabled(enable_pdl, device)),
     )
     launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedDetGemm(
@@ -4233,6 +4409,7 @@ def _prepare_cached_gemm(
         counters=_Slot("counters"),
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=_Slot("enable_pdl"),
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
     # the workspace is a slot: grow the arena only once the module and the grid are known to be good
@@ -4250,11 +4427,13 @@ def _launch_cached_gemm(
     out: torch.Tensor,
     *,
     transposed_out: bool = False,
+    enable_pdl: Optional[bool] = None,
     **knobs: Any,
 ) -> torch.Tensor:
     """The convenience path of K1: plan on the first call for a (device, stream, geometry, knobs) key; rebind
     the caller's views, resolve the workspace out of the arena of the device and stream and launch on every
-    call (no planning, no device query, no allocation)."""
+    call (no planning, no device query, no allocation), as a programmatic dependent launch under ``enable_pdl``
+    (default: the device supports it)."""
     device = _same_cuda_device(A, B, out)
     index = _cuda_index(device)
     stream = _current_raw_stream(index)
@@ -4277,7 +4456,13 @@ def _launch_cached_gemm(
     if operands is None:
         operands = _k1_views(A, B, out, swapped=cached.swapped)
     a_desc, b_desc, O3 = operands
-    views = dict(A=a_desc, B=b_desc, out3=O3, o_alias=flat_alias(O3))
+    views = dict(
+        A=a_desc,
+        B=b_desc,
+        out3=O3,
+        o_alias=flat_alias(O3),
+        enable_pdl=int(pdl_enabled(enable_pdl, index)),
+    )
     views.update(_entry_views(cached))
     arguments = _resolve_arguments(cached.template, views)
     with _ffi_stream_context(index, stream):
@@ -4285,24 +4470,242 @@ def _launch_cached_gemm(
     return out
 
 
+# --- the swapped small-token forward -------------------------------------------------------
+#
+# A batched forward row the planner would swap (:func:`swap_small_m`: few tokens against many weight rows) runs on a
+# program that puts the weight rows in the MMA's M and the tokens in its N (``swap_ab_<tile>`` templates): the
+# weights stream through a deep TMA ring, at most two waves of single-CTA tiles, and every output element is the one FP32 sum
+# of its whole K, rounded once (no split, so the bits do not depend on the tile).  The program reads ``A`` and the
+# K-major ``B`` through tensor maps over the caller's views and stores into ``out`` at
+# ``l * out_l + m * ldo + n``, so token-major views run without a copy.  Under ``enable_pdl`` the default programs
+# wait for the predecessor grid before any operand load; with ``weights_static=True`` (the caller states that no
+# kernel still in flight on the stream writes ``B``) the ``_we`` programs run instead, whose weight loads start ahead
+# of the wait (only the token loads wait), so the weight stream overlaps the predecessor's tail.
+SWAP_TILE_T = 64  # tokens per CTA of the swapped programs
+#: Weight rows per CTA -> the template serving them, in preference order: the narrow tile while its CTAs fit one
+#: wave (more CTAs streaming the weights), the wide one otherwise.
+SWAP_TEMPLATES: Tuple[Tuple[int, str], ...] = (
+    (64, "swap_ab_w64_t64_s12"),
+    (128, "swap_ab_w128_t64_s8"),
+)
+#: The same tiles whose weight loads run ahead of the PDL wait (``weights_static=True``).
+SWAP_TEMPLATES_WEIGHTS_STATIC: Tuple[Tuple[int, str], ...] = tuple(
+    (tile_w, f"{template}_we") for tile_w, template in SWAP_TEMPLATES
+)
+#: The most waves of single-CTA tiles a swapped forward runs in.  Its CTAs each stream their weight rows once; past
+#: two waves the planner's pair tiles stream them faster (GB300: 8 x 4096 x 1024 at 64 tokens, 256 CTAs, 17.0 us
+#: against 20.5 us; at 128 tokens, 512 CTAs, 25.1 us against 21.7 us).
+SWAP_MAX_WAVES = 2
+
+
+@dataclass(frozen=True)
+class _SwapLaunch:
+    """A routed swapped forward: the module entry, its grid and the scalars of its argument plan."""
+
+    module_name: str
+    entry: Callable[..., Any] = field(repr=False)
+    grid: Tuple[int, int, int]
+    M: int
+    N: int
+    K: int
+    L: int
+    ldo: int
+    out_l: int
+
+
+def _aligned_view(t: torch.Tensor) -> bool:
+    """A ``[L, rows, K]`` K-major view the swapped program's tensor maps take: unit K stride, row and batch strides
+    in whole 16-byte units, a 16-byte aligned start."""
+    return (
+        t.stride(2) == 1
+        and t.stride(1) % 8 == 0
+        and t.stride(0) % 8 == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def swap_ab_template(
+    L: int, M: int, N: int, sm_count: int, arch: str, weights_static: bool = False
+) -> Optional[str]:
+    """The ``swap_ab_<tile>`` template a swapped forward of ``L`` batches of ``M`` tokens against ``N`` weight rows
+    runs on ``arch``: the first of :data:`SWAP_TEMPLATES` (:data:`SWAP_TEMPLATES_WEIGHTS_STATIC` with
+    ``weights_static``) whose CTAs fit one wave of the device's SMs, else the widest; ``None`` when that one needs more than :data:`SWAP_MAX_WAVES` waves (the planner's program is faster
+    there) or ``arch`` registers none of them."""
+    table = KERNELS.get(arch, {})
+    templates = SWAP_TEMPLATES_WEIGHTS_STATIC if weights_static else SWAP_TEMPLATES
+    registered = [(w, t) for w, t in templates if t in table]
+    if not registered:
+        return None
+    m_tiles = -(-M // SWAP_TILE_T)
+    for tile_w, template in registered:
+        if -(-N // tile_w) * m_tiles * L <= sm_count:
+            return template
+    tile_w, template = registered[-1]
+    if -(-N // tile_w) * m_tiles * L > SWAP_MAX_WAVES * sm_count:
+        return None
+    return template
+
+
+def _swap_ab_launch(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    transposed_out: bool,
+    weights_static: bool = False,
+) -> Optional[_SwapLaunch]:
+    """The swapped launch of a K1 call, or ``None`` when the call stays on the planner: a batched forward
+    (``A`` K-major, ``B`` K-major, BF16 out, no transposed store) that :func:`swap_small_m` selects, with ``K`` a
+    multiple of 64, the views' strides and starts in 16-byte units and a registered swapped program."""
+    if (
+        transposed_out
+        or out.dtype != torch.bfloat16
+        or A.dtype != torch.bfloat16
+        or B.dtype != torch.bfloat16
+        or A.dim() != 3
+        or B.dim() != 3
+        or out.dim() != 3
+    ):
+        return None
+    L, M, K = (int(s) for s in A.shape)
+    N = int(B.shape[2])
+    if (
+        tuple(B.shape) != (L, K, N)
+        or tuple(out.shape) != (L, M, N)
+        or not swap_small_m(L, M, N, transposed_out)
+        or K % BLOCK_K != 0
+        or N % 8 != 0
+    ):
+        return None
+    W = B.transpose(1, 2)
+    if not (_aligned_view(A) and _aligned_view(W)):
+        return None
+    ldo = int(out.stride(1)) if M > 1 else N
+    out_l = int(out.stride(0))
+    if (
+        out.stride(2) != 1
+        or ldo % 8 != 0
+        or ldo < N
+        or out_l % 8 != 0
+        or out.data_ptr() % 16 != 0
+        or max(ldo, out_l) > 2**31 - 1
+    ):
+        return None
+    device = _same_cuda_device(A, B, out)
+    facts = device_facts(device)
+    if facts.arch is None:
+        return None
+    template = swap_ab_template(L, M, N, facts.sm_count, facts.arch, weights_static)
+    if template is None:
+        return None
+    module_name = select_module(facts.arch, template)
+    tile_w = dict((t, w) for w, t in SWAP_TEMPLATES + SWAP_TEMPLATES_WEIGHTS_STATIC)[
+        template
+    ]
+    grid = (-(-N // tile_w), -(-M // SWAP_TILE_T), L)
+    module = load_cake_dense_projection_det_gemm_module(module_name, facts.arch)
+    entry = getattr(module, MODULES[module_name]["ffi_entry"])
+    return _SwapLaunch(module_name, entry, grid, M, N, K, L, ldo, out_l)
+
+
+_SWAP_CACHE: "OrderedDict[tuple, Union[_SwapLaunch, bool]]" = OrderedDict()
+
+
+def _swap_ab_cached(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    transposed_out: bool,
+    weights_static: bool = False,
+) -> Optional[_SwapLaunch]:
+    """:func:`_swap_ab_launch` cached by the device, ``weights_static`` and the geometry of the views (a routed
+    launch, or ``False`` for a row that stays on the planner) in a least-recently-used cache of
+    ``CONVENIENCE_CACHE_SIZE`` entries."""
+    if not (A.is_cuda and B.is_cuda and out.is_cuda):
+        return None
+    key = convenience_key(
+        _cuda_index(out.device),
+        0,
+        (bool(transposed_out), bool(weights_static)),
+        A,
+        B,
+        out,
+    )
+    hit = _cache_get(_SWAP_CACHE, key)
+    if hit is None:
+        launch = _swap_ab_launch(A, B, out, transposed_out, weights_static)
+        with _PLAN_LOCK:
+            hit = _cache_put(_SWAP_CACHE, key, launch if launch is not None else False)
+    return hit or None
+
+
+def _run_swap_ab(
+    launch: _SwapLaunch,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    index = _cuda_index(out.device)
+    with _ffi_stream_context(index):
+        launch.entry(
+            B.transpose(1, 2),
+            A,
+            flat_alias(out).view(torch.uint8),
+            launch.M,
+            launch.N,
+            launch.K,
+            launch.L,
+            launch.ldo,
+            launch.out_l,
+            int(bool(enable_pdl)),
+            *launch.grid,
+        )
+    return out
+
+
 def dense_projection_det_gemm(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, transposed_out: bool = False
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool = False,
+    enable_pdl: Optional[bool] = None,
+    weights_static: bool = False,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path:
-    planned once per device, stream and view geometry, then rebound and launched)."""
-    return _launch_cached_gemm(A, B, out, transposed_out=transposed_out)
+    planned once per device, stream and view geometry, then rebound and launched).
+
+    A batched forward row of few tokens (:func:`swap_small_m`) runs the swapped program (:func:`swap_ab_template`),
+    every other row the planner's program.  ``enable_pdl`` (default: the device supports it) launches either as a
+    programmatic dependent launch: every CTA lets the next kernel launch at its entry and waits for the preceding
+    kernel before its first global access.  ``weights_static=True`` states that no kernel still in flight on the
+    stream writes ``B`` (a weight of the model between updates): the swapped program then starts its weight loads
+    before the wait, so the weight stream overlaps the preceding kernel's tail, and only its token loads wait.  The
+    default never reads ``B`` before the preceding kernel completes."""
+    pdl = pdl_enabled(enable_pdl, out.device)
+    swap = _swap_ab_cached(A, B, out, transposed_out, bool(weights_static) and pdl)
+    if swap is not None:
+        return _run_swap_ab(swap, A, B, out, pdl)
+    return _launch_cached_gemm(
+        A, B, out, transposed_out=transposed_out, enable_pdl=enable_pdl
+    )
 
 
 # --- the training operations as thin wrappers (the Cake entry points) ---------------------
 
 
 def projection_det_forward(
-    X: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None
+    X: torch.Tensor,
+    W: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default)."""
+    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default); ``enable_pdl`` as for
+    :func:`dense_projection_det_gemm`."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
-    return dense_projection_det_gemm(X, W.t(), out)
+    return dense_projection_det_gemm(X, W.t(), out, enable_pdl=enable_pdl)
 
 
 def projection_det_dgrad(
@@ -4311,13 +4714,14 @@ def projection_det_dgrad(
     out: Optional[torch.Tensor] = None,
     *,
     out_dtype=None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, K] = G[T, N] @ W[N, K]``."""
+    """``out[T, K] = G[T, N] @ W[N, K]``; ``enable_pdl`` as for :func:`dense_projection_det_gemm`."""
     if out is None:
         out = torch.empty(
             G.shape[0], W.shape[1], device=G.device, dtype=out_dtype or torch.bfloat16
         )
-    return dense_projection_det_gemm(G, W, out)
+    return dense_projection_det_gemm(G, W, out, enable_pdl=enable_pdl)
 
 
 def wgrad_views(
@@ -4382,14 +4786,22 @@ def prepare_projection_det_wgrad(
     *,
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedDetGemm:
     """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``; the orientation follows the row's measured rule, else the
-    small-``N`` swap rule of the Cake launcher (``wgrad_swapped``)."""
+    small-``N`` swap rule of the Cake launcher (``wgrad_swapped``); ``enable_pdl`` as for
+    :func:`prepare_dense_projection_det_gemm`."""
     A, B, transposed = wgrad_views(
         G, X, arch=arch_for(out.device), out_f32=out.dtype == torch.float32
     )
     return prepare_dense_projection_det_gemm(
-        A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
+        A,
+        B,
+        out,
+        transposed_out=transposed,
+        sk=sk,
+        cta_rows=cta_rows,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -4401,8 +4813,10 @@ def projection_det_wgrad(
     out_dtype=None,
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``); see :func:`wgrad_views`."""
+    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``); see :func:`wgrad_views`;
+    ``enable_pdl`` as for :func:`dense_projection_det_gemm`."""
     N, K = int(G.shape[1]), int(X.shape[1])
     if out is None:
         out = torch.empty(N, K, device=G.device, dtype=out_dtype or torch.bfloat16)
@@ -4410,7 +4824,13 @@ def projection_det_wgrad(
         G, X, arch=arch_for(out.device), out_f32=out.dtype == torch.float32
     )
     return _launch_cached_gemm(
-        A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
+        A,
+        B,
+        out,
+        transposed_out=transposed,
+        enable_pdl=enable_pdl,
+        sk=sk,
+        cta_rows=cta_rows,
     )
 
 
@@ -4624,11 +5044,11 @@ def _fused_split_for(arch: str, split_src: torch.Tensor) -> Optional[str]:
     return fused_split_module(arch)
 
 
-def _split_values(src: Any, parts: Any, n: int) -> dict[str, Any]:
-    """The keyword arguments of a fused split launch -- the fp32 source, the ``[3, *src.shape]`` BF16 stack and
-    the element count -- ordered by the module's argument plan in :func:`_bind`.  The one place the program's
-    binding names live."""
-    return dict(src=src, parts=parts, n=int(n))
+def _split_values(src: Any, parts: Any, n: int, enable_pdl: Any = 0) -> dict[str, Any]:
+    """The keyword arguments of a fused split launch -- the fp32 source, the ``[3, *src.shape]`` BF16 stack,
+    the element count and the PDL flag -- ordered by the module's argument plan in :func:`_bind`.  The one place
+    the program's binding names live."""
+    return dict(src=src, parts=parts, n=int(n), enable_pdl=enable_pdl)
 
 
 def _split_grid(n: int) -> tuple[int, int, int]:
@@ -4775,9 +5195,10 @@ def _k2_values(
     out32: Any,
     ldo: int,
     out_l: int,
+    enable_pdl: Any,
 ) -> dict[str, Any]:
     """The keyword arguments of a K2 launch; ``A`` / ``parts`` / ``out32`` are views or :class:`_Slot`
-    markers."""
+    markers, ``enable_pdl`` the launch's PDL flag (0 or 1) or a :class:`_Slot`."""
     return dict(
         A=A,
         B=parts,
@@ -4790,6 +5211,7 @@ def _k2_values(
         ldo=ldo,
         out_l=out_l,
         num_cluster_tiles=plan.num_cluster_tiles,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -4799,10 +5221,13 @@ def prepare_router_fp32_det_gemm(
     out: torch.Tensor,
     *,
     splits: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedRouterDetGemm:
     """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
     K2 backend: the BF16x3 stack, the fp32 residual scratch of the torch-chain split and the
-    split-K workspace)."""
+    split-K workspace).  ``enable_pdl`` (default: the device supports it) launches the fused split and the
+    router as programmatic dependent launches, each waiting for the preceding kernel before its first global
+    access."""
     plan, _, _, arch, module_name = _k2_plan(A, B, out, splits=splits)
     device = out.device
     a_view, split_src = _k2_views(A, B, plan)
@@ -4818,13 +5243,16 @@ def prepare_router_fp32_det_gemm(
         out32, ldo, out_l = workspace, *_k2_workspace_strides(workspace)
     else:
         out32, ldo, out_l = _k2_out32(out), int(out.stride(0)), 0
-    values = _k2_values(plan, A=a_view, parts=parts, out32=out32, ldo=ldo, out_l=out_l)
+    pdl = int(pdl_enabled(enable_pdl, device))
+    values = _k2_values(
+        plan, A=a_view, parts=parts, out32=out32, ldo=ldo, out_l=out_l, enable_pdl=pdl
+    )
     launch = bind_launch(module_name, values, plan.grid, arch)
     split_launch = None
     if split_module is not None:
         n = split_src.numel()
         split_launch = bind_launch(
-            split_module, _split_values(split_src, parts, n), _split_grid(n), arch
+            split_module, _split_values(split_src, parts, n, pdl), _split_grid(n), arch
         )
     return PreparedRouterDetGemm(
         module_name=module_name,
@@ -4880,6 +5308,7 @@ def clear_convenience_caches() -> None:
     with _PLAN_LOCK:
         _K1_CACHE.clear()
         _K2_CACHE.clear()
+        _SWAP_CACHE.clear()
         _ARENAS.clear()
 
 
@@ -4912,13 +5341,14 @@ def _prepare_cached_router(
         out32=_Slot("out32"),
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=_Slot("enable_pdl"),
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
     split = None
     if split_module is not None:
         split = _bind(
             split_module,
-            _split_values(_Slot("src"), _Slot("parts"), n),
+            _split_values(_Slot("src"), _Slot("parts"), n, _Slot("enable_pdl")),
             _split_grid(n),
             arch,
         )
@@ -4943,7 +5373,12 @@ def _prepare_cached_router(
 
 
 def _launch_cached_router(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    splits: Optional[int],
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """The convenience path of K2: plan on the first call for a (device, stream, geometry, splits) key; on every
     call re-split the second operand into the BF16x3 stack carved out of the arena of the device and stream (one
@@ -4982,6 +5417,7 @@ def _launch_cached_router(
             parts=ws["parts"],
             out32=_k2_out32(out) if workspace is None else workspace,
             src=split_src,
+            enable_pdl=int(pdl_enabled(enable_pdl, index)),
         )
         with _ffi_stream_context(index, stream):
             if cached.split is not None:
@@ -4996,11 +5432,17 @@ def _launch_cached_router(
 
 
 def router_fp32_det_gemm(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int] = None
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    splits: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the emulation (the cached convenience
-    path: planned once per device, stream, view geometry and split count, then re-split and launched)."""
-    return _launch_cached_router(A, B, out, splits=splits)
+    path: planned once per device, stream, view geometry and split count, then re-split and launched).
+    ``enable_pdl`` as for :func:`prepare_router_fp32_det_gemm`."""
+    return _launch_cached_router(A, B, out, splits=splits, enable_pdl=enable_pdl)
 
 
 def router_det_forward(
@@ -5009,20 +5451,25 @@ def router_det_forward(
     out: Optional[torch.Tensor] = None,
     *,
     splits: int = 4,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
-    return router_fp32_det_gemm(X, W.t(), out, splits=splits)
+    return router_fp32_det_gemm(X, W.t(), out, splits=splits, enable_pdl=enable_pdl)
 
 
 def router_det_dgrad(
-    G: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None
+    G: torch.Tensor,
+    W: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]`` in FP32 through the emulation."""
     if out is None:
         out = torch.empty(G.shape[0], W.shape[1], device=G.device, dtype=torch.float32)
-    return router_fp32_det_gemm(G, W, out, splits=1)
+    return router_fp32_det_gemm(G, W, out, splits=1, enable_pdl=enable_pdl)
 
 
 def router_det_wgrad(
@@ -5031,11 +5478,12 @@ def router_det_wgrad(
     out: Optional[torch.Tensor] = None,
     *,
     splits: int = 6,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
-    return router_fp32_det_gemm(G.t(), X, out, splits=splits)
+    return router_fp32_det_gemm(G.t(), X, out, splits=splits, enable_pdl=enable_pdl)
 
 
 # --- the former public names (before the det rename), aliases of the canonical objects -----------------------

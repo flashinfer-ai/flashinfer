@@ -760,11 +760,12 @@ def _split_view_pass(ctx, ops, form: str, *, ckpt: bool, **o) -> dict:
 @pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
 def test_plain_split_views_keep_hooks_and_bitwise_gradients(norm, ckpt) -> None:
     """Issue #8367 (fake backend): plain ``split`` / ``view`` head views of one packed QKV row take torch's own
-    autograd path (the split backward concatenates the GDN backward's packed ``dq`` / ``dk`` / ``dv`` views): tensor
-    hooks and ``retain_grad`` on ``q`` / ``k`` / ``v`` and on the split outputs fire once with the contiguous call's
-    gradients, and the row gradient, ``dg``, ``dbeta`` and ``out`` are bitwise those of contiguous operands and of
-    :func:`packed_qkv_views_kcp` views.  Only the packed views' split hands the packed row on; hooks on the packed
-    views fire too, and a hook that replaces a gradient makes that split concatenate (same values)."""
+    autograd path (the GDN backward writes three contiguous ``dq`` / ``dk`` / ``dv``, the split backward concatenates
+    them): tensor hooks and ``retain_grad`` on ``q`` / ``k`` / ``v`` and on the split outputs fire once with the
+    contiguous call's gradients, and the row gradient, ``dg``, ``dbeta`` and ``out`` are bitwise those of contiguous
+    operands and of :func:`packed_qkv_views_kcp` views.  Only the packed views get one packed dQKV row, which their
+    split hands on; hooks on the packed views fire too, and a hook that replaces a gradient makes that split
+    concatenate (same values)."""
     ctx, ops = _setup()
     if not norm:
         # unit-norm Q / K rows: valid operands with the norm off (the raw rows are the norm-on operands)
@@ -788,8 +789,9 @@ def test_plain_split_views_keep_hooks_and_bitwise_gradients(norm, ckpt) -> None:
         assert torch.equal(got["dg"], ref["dg"]) and torch.equal(
             got["dbeta"], ref["dbeta"]
         ), form
-        # the GDN backward writes one packed dQKV row for packed operands in every form
-        assert got["grad_layout"] == "packed", form
+        # the GDN backward writes one packed dQKV row only for the packed views (whose split hands it on, or
+        # concatenates it after a replacing hook); plain views get three contiguous gradients
+        assert got["grad_layout"] == ("separate" if form == "plain" else "packed"), form
         assert got["split"] == split, form
         assert sorted(got["fired"]) == sorted(got["views"]), form
         for i, n in enumerate(("q", "k", "v")):
@@ -949,10 +951,14 @@ def test_norm_tapes_are_not_retained() -> None:
     )  # norm-off layout unchanged
 
 
-def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o() -> None:
-    """The arena at #5 holds ``qn`` but no ``kn`` (the tape walks were its last readers); ``qn`` goes after #5."""
+@pytest.mark.parametrize("fused_o", (0, 1))
+def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o(fused_o: int) -> None:
+    """The arena at #5 holds ``qn`` but no ``kn`` (the tape walks were its last readers); ``qn`` goes after #5.  The
+    fused forward (``fused_o`` = 1, the shipped form) reads both rows in its output walks and drops both after them;
+    either form leaves neither row in the arena."""
     ctx, ops = _setup()
     seen = {}
+    ws = kcp.WorkspaceKcp()
 
     class Recording(kcp.FakeBackend):
         def run(self, name, args):
@@ -967,8 +973,9 @@ def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o() -> None:
             *_ops(ops),
             ctx,
             backend="fake",
-            workspace=kcp.WorkspaceKcp(),
+            workspace=ws,
             use_qk_l2norm_in_kernel=True,
+            test_knobs={"fused_o": fused_o},
             deterministic=False,
         )
     finally:
@@ -977,8 +984,59 @@ def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o() -> None:
         "kn",
         "qn",
     ]  # the saved r is a fresh tensor, never the arena's
-    assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
-    assert seen["fwd_o"] == ["qn"]
+    if fused_o and kcp.fused_o_shipped():
+        assert seen["kcp_fwdh_out"] == ["kn", "qn"]
+        assert "kcp_fwdh_tape" not in seen and "fwd_o" not in seen
+    else:
+        assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
+        assert seen["fwd_o"] == ["qn"]
+        assert "kcp_fwdh_out" not in seen
+    assert not {"qn", "kn"} & set(ws._tapes)
+
+
+@pytest.mark.parametrize("fused_o_tape", (0, 1))
+def test_full_forward_reads_both_rows_in_the_tape_and_output_walk(
+    fused_o_tape: int,
+) -> None:
+    """``save_mode="full"``: the shipped forward (``fused_o_tape`` = 1) reads ``qn`` and ``kn`` in its tape-and-output
+    walks and drops both after them; the split form (0) reads both in the tape walk and ``qn`` in #5.  Either form
+    leaves neither row in the arena (the saved ``r`` is a fresh tensor)."""
+    ctx, ops = _setup()
+    seen = {}
+    ws = kcp.WorkspaceKcp()
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            call = args["_call"]
+            if not call.backward:
+                seen[name] = sorted(set(call.ws._tapes) & {"qn", "kn", kcp.QK_RSTD})
+            super().run(name, args)
+
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        kcp.chunk_gdn_fwd_kcp(
+            *_ops(ops),
+            ctx,
+            backend="fake",
+            workspace=ws,
+            save_mode="full",
+            use_qk_l2norm_in_kernel=True,
+            test_knobs={"fused_o_tape": fused_o_tape},
+            deterministic=False,
+        )
+    finally:
+        kcp.set_backend("fake", previous)
+    assert seen["fwd_prep_l2n"] == ["kn", "qn"]
+    if fused_o_tape and kcp.fused_o_tape_shipped():
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "fused_tape"
+        assert seen["kcp_fwdh_out_tape"] == ["kn", "qn"]
+        assert not {"kcp_fwdh_tape", "kcp_fwdh_out", "fwd_o"} & set(seen)
+    else:
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
+        assert seen["fwd_o"] == ["qn"]
+        assert not {"kcp_fwdh_out", "kcp_fwdh_out_tape"} & set(seen)
+    assert not {"qn", "kn"} & set(ws._tapes)
 
 
 def test_saved_count_and_the_recompute_output_skip() -> None:

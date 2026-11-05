@@ -847,6 +847,42 @@ def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
     )
 
 
+@pytest.mark.parametrize("hidden_size", [768])
+def test_mxfp4_mxfp8_prims_ts_unpadded_scale_row(hidden_size, cache_permute_indices):
+    """Compact MXFP8 activation scales whose row (hidden_size // 32) is not a
+    multiple of 16 bytes go through the flat Prims-TS op correctly."""
+    intermediate_size = 512
+    run_moe_test(
+        num_tokens=32,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+        routing_config={
+            "num_experts": 8,
+            "top_k": 2,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [intermediate_size],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
 def test_mxfp4_mxfp8_kimi_k3_situ_reference(moe_gemm_backend, cache_permute_indices):
     """Kimi K3 SiTU matches the dequantized reference on both backends."""
     num_tokens = 32
@@ -1075,6 +1111,66 @@ def test_bf16_prims_ts_identity_activation(cache_permute_indices):
         routing_logits_dtype=torch.bfloat16,
         moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
     )
+
+
+@pytest.mark.parametrize("entry", ["logits", "routed"])
+def test_bf16_prims_ts_rejects_noncontiguous_hidden_states(entry):
+    """A row-strided hidden_states view must be rejected, not read as packed rows."""
+    from flashinfer.fused_moe import prims_ts_bf16_moe, prims_ts_bf16_routed_moe
+    from flashinfer.prims_ts.utils import is_prims_ts_available
+
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("Prims-TS BF16 MoE requires SM100 or SM103")
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, hidden_size, intermediate_size = 64, 1024, 512
+    num_experts, top_k = 8, 2
+    gemm1_weights = 0.05 * torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.bfloat16)
+    gemm2_weights = 0.05 * torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.bfloat16)
+    routing_logits = torch.randn(num_tokens, num_experts, device=device)
+    topk_logits, topk_indices = routing_logits.topk(top_k, dim=-1)
+    packed_topk_ids = pack_topk_for_routed_moe(
+        topk_indices, torch.softmax(topk_logits, dim=-1)
+    )
+
+    def run(hidden_states):
+        common = dict(
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routing_method_type=RoutingMethodType.Renormalize,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK,
+        )
+        if entry == "logits":
+            return prims_ts_bf16_moe(
+                routing_logits, None, hidden_states=hidden_states, **common
+            )
+        return prims_ts_bf16_routed_moe(
+            packed_topk_ids, hidden_states=hidden_states, **common
+        )
+
+    # x[:, :H] of a [T, 2H] buffer: row stride is 2H, not H.
+    wide = torch.randn(num_tokens, 2 * hidden_size, device=device).to(torch.bfloat16)
+    hidden_states = wide[:, :hidden_size]
+    assert not hidden_states.is_contiguous()
+
+    run(hidden_states.contiguous())
+    with pytest.raises(ValueError, match="hidden_states must be contiguous"):
+        run(hidden_states)
 
 
 @pytest.mark.parametrize("num_tokens", [32])
@@ -3035,6 +3131,95 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
         assert mismatch_pct < 10, (
             f"{weights.dtype} unpacked mismatch percentage is {mismatch_pct:.2f}%"
         )
+
+
+@pytest.mark.parametrize(
+    "routing_method_type", [RoutingMethodType.Renormalize, RoutingMethodType.DeepSeekV3]
+)
+@pytest.mark.parametrize("num_tokens", [1, 300])
+def test_mxfp8_block_scale_moe_routing_replay_out(routing_method_type, num_tokens):
+    """MXFP8 block-scale MoE writes the selected experts into routing_replay_out."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    hidden_size = 512
+    intermediate_size = 512
+    num_experts = 128
+    top_k = 6
+    is_dsv3 = routing_method_type == RoutingMethodType.DeepSeekV3
+
+    planted = torch.rand((num_tokens, num_experts), device=device).argsort(dim=-1)[
+        :, :top_k
+    ]
+    routing_logits = 0.1 * torch.randn((num_tokens, num_experts), device=device)
+    routing_logits.scatter_add_(
+        -1, planted, torch.full(planted.shape, 10.0, device=device)
+    )
+    routing_logits = routing_logits.to(torch.float32 if is_dsv3 else torch.bfloat16)
+    routing_bias = (
+        torch.zeros(num_experts, device=device, dtype=torch.bfloat16)
+        if is_dsv3
+        else None
+    )
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    gemm1_weights = torch.randn(
+        (num_experts, intermediate_size, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
+    quant_weights = quant_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    quant_inputs = quant_impl.quantize_inputs(hidden_states)
+
+    routing_replay_out = torch.full(
+        (num_tokens, top_k), -1, device=device, dtype=torch.int16
+    )
+    output = trtllm_fp8_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=quant_inputs["hidden_states"],
+        hidden_states_scale=quant_inputs["hidden_states_scale"],
+        gemm1_weights=quant_weights["gemm1_weights"],
+        gemm1_weights_scale=quant_weights["gemm1_scales"],
+        gemm2_weights=quant_weights["gemm2_weights"],
+        gemm2_weights_scale=quant_weights["gemm2_scales"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=1 if is_dsv3 else None,
+        topk_group=1 if is_dsv3 else None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=2.5 if is_dsv3 else None,
+        routing_method_type=routing_method_type.value,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.MajorK.value,
+        enable_pdl=True,
+        fp8_quantization_type=Fp8QuantizationType.MxFp8,
+        activation_type=ActivationType.Relu2.value,
+        routing_replay_out=routing_replay_out,
+    )
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        routing_replay_out.long().sort(dim=-1).values,
+        planted.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():

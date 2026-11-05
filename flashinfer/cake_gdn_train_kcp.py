@@ -34,7 +34,10 @@ The mode is never stored in the context: a context, a partition and the byte
 queries of either route describe the same plan.  A saved set is read only by
 the backward of the route that produced it, and an options instance is
 converted to the routed package's options type (mappings and keywords work for
-both).  Thin experimental entry points: the partition / context plan, the host
+both; on the deterministic route an ``OptionsKcp`` with the default
+``reuse_recompute_tapes="auto"`` takes that route's own default for the call's
+final ``graph``: ``False`` under replay, whether replay comes from the instance,
+the ``graph`` keyword or a knob).  Thin experimental entry points: the partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
 live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
@@ -132,13 +135,24 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
     (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
-    routes take every field, ``use_qk_l2norm_in_kernel`` included."""
+    routes take every field, ``use_qk_l2norm_in_kernel`` included.  On the deterministic route a non-deterministic
+    instance whose ``reuse_recompute_tapes`` is the default ``"auto"`` maps that field to ``None`` whatever its own
+    ``graph`` field says: the deterministic package resolves it to its own default with the call's final ``graph``
+    (the instance's, the ``graph`` keyword's or a knob's): ``"auto"`` under ``"off"``, ``False`` under replay.  An
+    explicit ``True`` passes and is refused there under replay."""
     if options is None or isinstance(options, dict):
         return options
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
     if isinstance(options, own) or not dataclasses.is_dataclass(options):
         return options
-    return {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    fields = {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    if (
+        det
+        and isinstance(fields.get("reuse_recompute_tapes"), str)
+        and fields["reuse_recompute_tapes"] == "auto"
+    ):
+        fields["reuse_recompute_tapes"] = None
+    return fields
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -267,8 +281,8 @@ def chunk_gdn_fwd_kcp(
         Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
-        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (``False`` with ``graph="replay"``; see
-        :func:`chunk_gdn_kcp`),
+        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (the deterministic route: ``False`` with
+        ``graph="replay"``; see :func:`chunk_gdn_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
 
@@ -425,8 +439,15 @@ def chunk_gdn_kcp(
     ``recompute_output``) and takes the replay form otherwise -- a region this node closes keeps today's speed and
     memory; ``True`` always keeps them, ``False`` never (the replay form).  One kept set is
     live at a time: in a checkpoint segment holding several GDN layers only the last layer skips the replay (the
-    earlier layers replay as before).  Not available with ``graph="replay"``: there the default resolves to
-    ``False`` and an explicit ``True`` / ``"auto"`` is refused.
+    earlier layers replay as before).  On the deterministic route it is not available with ``graph="replay"`` (the
+    default resolves to ``False``, so does an ``OptionsKcp``'s default ``"auto"``, and an explicit ``True`` /
+    ``"auto"`` is refused); on the non-deterministic route a caller-held workspace keeps its own tapes under
+    ``graph="replay"`` and the backward binds them only while the workspace made no other call in between (else the
+    replay form); the kept tapes add no memory there, while the recompute's own hand-off graph holds its static
+    results like every graph key (one more saved set per checkpointed layer and, when that recompute launches the
+    output program -- ``recompute_output="always"``, or ``True`` with a later saver -- a full static output); there
+    ``"auto"`` decides only from ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per rank (a smaller
+    recompute replays the original forward's graph: its host-bound step gains nothing from the hand-off).
 
     ``recompute_output`` (keyword-only, ``"auto"`` default | ``"always"``): torch's recompute of a checkpointed
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
@@ -435,9 +456,11 @@ def chunk_gdn_kcp(
     early stop is on, and the torch release -- ``torch.__version__`` without its local ``+cuNNN`` build tag -- is one
     of the package's verified releases, ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
     of the region that saves the output (another layer, a norm), a reentrant checkpoint, a forward outside a
-    recompute, a non-executable node, another torch build (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]`` records the
-    decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
-    unconditional launch.
+    recompute, a non-executable node, another torch build, and under ``graph="replay"`` with the default
+    ``reuse_recompute_tapes="auto"`` a rank below ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` (reason ``"small"``; an
+    explicit ``True`` / ``False`` reads the proof at every size) (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]``
+    records the decision and its reason).  The gradients and the retained bytes are unchanged either way;
+    ``"always"`` is the unconditional launch.
 
     ``recompute_handle`` (keyword-only, default ``None``; a :class:`RecomputeHandleKcp`): the checkpoint recompute
     of this forward runs without cross-rank communication.  The original forward exchanges as always and stores
@@ -466,12 +489,13 @@ def chunk_gdn_kcp(
     ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
     output) get the full backward speed as the views of
     ``flashinfer.experimental.cake_gdn_train_kcp.packed_qkv_views_kcp`` or
-    ``flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp``: both packages take the packed gradient layout
-    from the operands' pointers and strides, and both helpers' split nodes pass a packed gradient row on without a
-    copy.  Plain ``split`` / ``view`` views of the row give the same results, but torch's split backward
-    concatenates ``dq`` / ``dk`` / ``dv`` into a new row: on the non-deterministic route, about 1.1-1.2 ms
-    (33-37 %) more backward per call at ``(16, 48)`` and 32,768 tokens on B200 and GB300, with the in-kernel norm
-    off or on (``flashinfer/experimental/cake_gdn_train_kcp/README.md``, "Packed Q/K/V").
+    ``flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp``: both helpers' split nodes pass a packed gradient
+    row on without a copy.  The non-deterministic package writes that row only for the outputs of either helper, the
+    deterministic one whenever the operands' pointers and strides are those of one row.  Plain ``split`` / ``view``
+    views of the row give the same results, but torch's split backward concatenates ``dq`` / ``dk`` / ``dv`` into a
+    new row: on the non-deterministic route, about 0.2 ms (6-7 %) more backward per call at ``(16, 48)`` and 32,768
+    tokens on B200 and GB300 and 0.17 ms (7-8 %) on R200, with the in-kernel norm off or on
+    (``flashinfer/experimental/cake_gdn_train_kcp/README.md``, "Packed Q/K/V").
 
     ``deterministic`` (default ``True``) selects the route (see the module docstring); the checkpoint recompute of a
     forward runs the forward's route as long as the torch deterministic-algorithms setting does not change in between.

@@ -1514,8 +1514,9 @@ def test_the_auto_rule(monkeypatch) -> None:
     """Host only: ``"on"`` engages on every plan and ``"off"`` on none; ``"auto"`` at a ``HANDOFF_HEADS`` head count
     on a ``HANDOFF_VERIFIED`` (architecture, SM count, toolkit) device, counting ``unverified`` at those head counts
     on another architecture, SM count or toolkit (also one that cannot be read).  The node makes no ``"auto"``
-    request at other head counts, before it reads any torch state.  The shipped devices name exported
-    architectures and ``major.minor`` toolkits; the head counts start at two (one head is host-bound)."""
+    request at other head counts, before it reads any torch state.  A plan of the raw gate mode (``gate="raw"``)
+    engages in no mode and counts nothing.  The shipped devices name exported architectures and ``major.minor``
+    toolkits; the head counts start at two (one head is host-bound)."""
     for arch, sms, toolkit in cake_backend.HANDOFF_VERIFIED:
         assert arch in ARCHES and sms > 0, (arch, sms, toolkit)
         assert re.fullmatch(r"\d+\.\d+", toolkit), (arch, sms, toolkit)
@@ -1542,10 +1543,16 @@ def test_the_auto_rule(monkeypatch) -> None:
     unverified = 0
     for mode, arch_, sms, toolkit, H, want, counted in cases:
         monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a, t=toolkit: t)
-        p = types.SimpleNamespace(arch=arch_, sm_count=sms, H=H)
+        p = types.SimpleNamespace(arch=arch_, sm_count=sms, H=H, gate="g")
         assert cake_backend._handoff_engages(p, mode, 0) is want, (mode, p, toolkit)
         unverified += counted
         assert cake_backend._handoff_stats(0)["unverified"] == unverified, (mode, p)
+    monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a: "9.9")
+    for mode in ("on", "auto", "off"):
+        for sms in (152, 148):
+            p = types.SimpleNamespace(arch=arch, sm_count=sms, H=heads, gate="raw")
+            assert cake_backend._handoff_engages(p, mode, 0) is False, (mode, sms)
+    assert cake_backend._handoff_stats(0)["unverified"] == unverified
 
     def read_torch_state():
         raise RuntimeError("the request read torch state")

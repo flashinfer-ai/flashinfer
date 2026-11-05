@@ -136,9 +136,6 @@ from .attn_scores import (
 from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
 from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
-from .attn_scores import (
-    single_head_paged_mqa_logits as single_head_paged_mqa_logits,
-)
 from .fused_moe import (
     cutlass_fused_moe,
     cudnn_frost_grouped_gemm1_swiglu,
@@ -365,16 +362,22 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
 )
 
-# Compatibility names of the causal conv1d entry points, bound to the same objects as the det names.
-CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
-cake_causal_conv1d = cake_causal_conv1d_det
-cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
-cake_causal_conv1d_train_backward_workspace_bytes = (
-    cake_causal_conv1d_det_train_backward_workspace_bytes
+# Use import aliases so strict JIT keys treat these as re-exports, not setup code.
+from .cake_causal_conv1d_det_train import (
+    CakeCausalConv1dDetFunction as CakeCausalConv1dFunction,
 )
-cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
-cake_causal_conv1d_train_forward_workspace_bytes = (
-    cake_causal_conv1d_det_train_forward_workspace_bytes
+from .cake_causal_conv1d_det_train import cake_causal_conv1d_det as cake_causal_conv1d
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
 
 from .cake_mhc_det_train import (

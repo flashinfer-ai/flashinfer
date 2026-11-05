@@ -44,8 +44,7 @@ CUDA Graph capture / replay and through the autograd entry (plain and checkpoint
 The narrower channel tiles of ``TILE_OVERRIDES``: one row per architecture (``OVERRIDE_CASES``) launches the row's
 tiles, on a caller-owned workspace of the public size and on the package's, with ``dx`` bitwise the deterministic
 package's, the gradients within budget of the reference and of the deterministic package, and the workspace zero
-after the call.  On an architecture whose rows the package withholds (``WITHHELD_OVERRIDE_ARCHES``) the case has no
-override and launches ``channel_split``'s tiles, under the same checks.
+after the call.
 
 This suite names its package once, through ``tests.test_helpers.cake_package`` (key
 ``cake.cake_causal_conv1d_train``), and the deterministic package for the parity checks through the same table;
@@ -123,15 +122,11 @@ REPEAT_CASES = (
 )
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
 # One row of ``TILE_OVERRIDES`` per architecture (route, S, C): the backward runs its narrower channel tiles there.
-# On an architecture of ``WITHHELD_OVERRIDE_ARCHES`` the package carries no rows: the case plans ``channel_split``.
 OVERRIDE_CASES = {
     "sm_100a": ("bwd_bias_fp32g", 62585, 2048),
     "sm_103a": ("bwd", 62585, 1536),
     "sm_107a": ("bwd_dt", 62585, 768),
 }
-# The architectures whose ``TILE_OVERRIDES`` rows the package withholds (an empty table): sm_107a's rows wait for
-# timing on its 216-SM boards.
-WITHHELD_OVERRIDE_ARCHES = frozenset({"sm_107a"})
 # Wide channel counts on every route: C = 4096 (four documents, one empty) and C = 10240 (a packed q / k / v
 # projection width), at small S.
 WIDE_CASES = ((4097, 4096, (1000, 0, 3, 3094)), (2048, 10240, "perf"))
@@ -907,35 +902,27 @@ def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
     (``ct_vec``, ``threads // ct_vec`` sub-tiles, ``ceil(C / vec / ct_vec)`` tiles) on a caller-owned workspace of
     the public size, or the package's: ``dx`` within budget of the reference and bitwise the deterministic package's
     (when importable), ``dweight`` / ``dbias`` within the route's budget of the reference and of the deterministic
-    package, the workspace zero after the call.  On an architecture of ``WITHHELD_OVERRIDE_ARCHES`` the case has no
-    override (``tile_override`` is ``None``) and launches ``channel_split``'s tiles, under the same checks."""
+    package, the workspace zero after the call."""
 
     arch, device = _arch(), _device()
     kind, S, C = OVERRIDE_CASES[arch]
     _require_route(kind)
     ct_vec = loader.tile_override(arch, kind, C, S)
+    assert ct_vec is not None, f"{arch} {kind} C={C} S={S} is no TILE_OVERRIDES row"
     (name,) = loader.selected_modules(arch, kind, C=C, S=S)
     geometry = loader.MODULES[name]["grid_rule"]["geometry"]
-    split = dict(
+    wanted = {
+        "ct_vec": ct_vec,
+        "n_sub": geometry["threads"] // ct_vec,
+        "n_ch_tiles": -(-(C // geometry["vec"]) // ct_vec),
+    }
+    assert wanted != dict(
         zip(
             ("ct_vec", "n_sub", "n_ch_tiles"),
             loader.channel_split(C, geometry=geometry, role="bwd"),
             strict=True,
         )
-    )
-    if arch in WITHHELD_OVERRIDE_ARCHES:
-        assert ct_vec is None, (
-            f"{arch} {kind} C={C} S={S}: the package withholds {arch}'s TILE_OVERRIDES rows, yet plans ct_vec={ct_vec}"
-        )
-        wanted = split
-    else:
-        assert ct_vec is not None, f"{arch} {kind} C={C} S={S} is no TILE_OVERRIDES row"
-        wanted = {
-            "ct_vec": ct_vec,
-            "n_sub": geometry["threads"] // ct_vec,
-            "n_ch_tiles": -(-(C // geometry["vec"]) // ct_vec),
-        }
-        assert wanted != split, "the row must differ from the default split"
+    ), "the row must differ from the default split"
     seen = []
     launch = pkg.run_module
 
@@ -944,7 +931,7 @@ def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
         return launch(name, values, device_index=device_index, grid=grid)
 
     monkeypatch.setattr(pkg, "run_module", record_launch)
-    label = f"{arch} {kind} S={S} C={C} ct_vec={wanted['ct_vec']}"
+    label = f"{arch} {kind} S={S} C={C} ct_vec={ct_vec}"
     x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=9)
     workspace = (
         pkg.cake_causal_conv1d_train_backward_workspace(
@@ -1544,7 +1531,14 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         assert name == loader.selected_modules(arch, kind, C=C, S=S)[0]
         record = loader.MODULES[name]
         assert "reduce" not in record and record["launch"]["cooperative"] is False
-        assert grid == loader.launch_grid(record, device_index=device.index, C=C, S=S)
+        assert grid == pkg._one_sm_trim(
+            record,
+            values["n_ch_tiles"],
+            loader.launch_grid(record, device_index=device.index, C=C, S=S),
+            device_index=device.index,
+            arch=arch,
+            bwd_grid_mult=1,
+        )
         assert grid[0] >= values["n_ch_tiles"]
         layout = loader.accumulator_layout(record, C, values["n_ch_tiles"])
         acc_dtype = torch.float64 if "fp32g" in kind else torch.float32
@@ -1572,10 +1566,12 @@ def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
     device = _device()
     arch = _arch()
     launched = []
+    tiles = []
     run_module = pkg.run_module
 
     def record_launch(name, values, *, device_index, grid=None):
         launched.append((name, grid))
+        tiles.append(values["n_ch_tiles"])
         return run_module(name, values, device_index=device_index, grid=grid)
 
     monkeypatch.setattr(pkg, "run_module", record_launch)
@@ -1590,13 +1586,99 @@ def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
         untrimmed = loader.launch_grid(record, device_index=device.index)
         for mult in pkg.BWD_GRID_MULTS:
             launched.clear()
+            tiles.clear()
             _backward(x, w, cu, dy, b, policy, bwd_grid_mult=mult)
             expected = (
-                loader.launch_grid(record, device_index=device.index, C=C, S=S)
+                pkg._one_sm_trim(
+                    record,
+                    tiles[0],
+                    loader.launch_grid(record, device_index=device.index, C=C, S=S),
+                    device_index=device.index,
+                    arch=arch,
+                    bwd_grid_mult=1,
+                )
                 if mult == 1
                 else (untrimmed[0] * mult, 1, 1)
             )
             assert launched == [(name, expected)], (kind, S, C, mult, launched)
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
+    kind, monkeypatch
+) -> None:
+    """FlashInfer issue #8365: on the ``bwd`` and ``bwd_fp32g`` routes a default-grid backward launches ``ctas_per_sm
+    x SM count`` CTAs less ``ctas_per_sm`` when the last channel-tile rank of that grid holds at least
+    ``ctas_per_sm`` CTAs (so a kernel on another stream that keeps one SM's shared memory leaves the launch one
+    wave), else the whole grid; the other backward routes launch ``launch_grid``'s grid.  The trimmed launch's
+    ``dx`` is bitwise the whole grid's, both gradients are within budget of the reference and the workspace reads
+    back zero."""
+
+    _require_route(kind)
+    device = _device()
+    arch = _arch()
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    S, docs = 4097, (1000, 0, 3, 3094)
+    launched = []
+    run_module = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append(grid)
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    rows = {}
+    for C in range(1024, 16385, 1024):
+        name = loader.selected_modules(arch, kind, C=C, S=S)[0]
+        record = loader.MODULES[name]
+        rule = record["grid_rule"]
+        k = int(rule["ctas_per_sm"])
+        full = loader.grid_mult(record, arch) * k * sms
+        n = loader.plan(
+            S,
+            C,
+            len(docs),
+            geometry=rule["geometry"],
+            role=record["role"],
+            arch=arch,
+            route=loader.record_route(record, arch),
+        )["n_ch_tiles"]
+        trims = (
+            rule["kind"] == "occupancy"
+            and loader.grid_mult(record, arch) == 1
+            and full % n >= k
+        )
+        rows.setdefault(trims, (C, full, k))
+    assert set(rows) == {True, False}, rows
+    for trims, (C, full, k) in sorted(rows.items()):
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=41)
+        refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
+        launched.clear()
+        dx, dw, db = _backward(x, w, cu, dy, b, policy)
+        torch.cuda.synchronize(device)
+        cut = trims and kind in ("bwd", "bwd_fp32g")
+        assert launched == [(full - k if cut else full, 1, 1)], (kind, C, launched)
+        _check_grads(dx, dw, db, refs, policy=policy, label=f"{kind} C={C}")
+        held = _stream_workspace(device)
+        assert held is None or int(torch.count_nonzero(held)) == 0, (kind, C)
+        if cut:
+            with monkeypatch.context() as m:
+                m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
+                pkg.plan_cache_clear()
+                launched.clear()
+                dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
+                torch.cuda.synchronize(device)
+            pkg.plan_cache_clear()
+            assert launched == [(full, 1, 1)], (kind, C, launched)
+            assert torch.equal(dx, dx_full), (kind, C)
+            _check_grads(
+                dx_full,
+                dw_full,
+                db_full,
+                refs,
+                policy=policy,
+                label=f"{kind} C={C} whole grid",
+            )
 
 
 @pytest.mark.parametrize("kind", ("bwd_fp32g", "bwd_bias_fp32g"))

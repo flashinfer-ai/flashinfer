@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 256
-#define SMEM_PARTIALS_STRIDE 256
-#define SMEM_TOTAL 256
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -79,7 +72,7 @@ kernel_cake_lm_head_loss_48134805ead9ce0f7416(float* __restrict__ term, double* 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     double* partials = reinterpret_cast<double*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 

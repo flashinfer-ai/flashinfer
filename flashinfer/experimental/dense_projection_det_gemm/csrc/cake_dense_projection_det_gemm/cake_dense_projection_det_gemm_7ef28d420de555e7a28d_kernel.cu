@@ -47,30 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 5
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_A_H_OFF 1024
-#define SMEM_SMEM_A_H_STAGE_BYTES 8192
-#define SMEM_SMEM_A_H_STRIDE 32768
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_SMEM_OUT_OFF 164864
-#define SMEM_SMEM_OUT_STAGE_BYTES 4096
-#define SMEM_SMEM_OUT_STRIDE 4096
-#define SMEM_WORK_RESPONSE_OFF 230400
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 230528
-#define THREADS 320
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -220,6 +196,7 @@ kernel_cake_dense_projection_det_gemm_7ef28d420de555e7a28d(const __grid_constant
     const int smem_out_addr = smem + 164864;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int work_response_addr = smem + 230400;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 23 barriers)
     // Mbarriers at smem_raw[0..184)
@@ -282,6 +259,7 @@ kernel_cake_dense_projection_det_gemm_7ef28d420de555e7a28d(const __grid_constant
         asm volatile("tcgen05.fence::after_thread_sync;");
     }
     const int taddr = (warp >= 1 && warp <= 9) ? tmem_addr_storage[0] : 0;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
