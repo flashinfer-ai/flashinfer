@@ -260,6 +260,29 @@ def test_megamoe_mxfp4_sm120_hidden_widths(hidden):
     _run(_args(hidden=hidden, tokens=[1, 20, 64]))
 
 
+@pytest.mark.parametrize("ep", [4, 8])
+@pytest.mark.parametrize(
+    "hidden,intermediate,experts,topk",
+    [(5120, 2304, 384, 6), (4096, 2048, 288, 8)],
+    ids=["dsv41_flash", "glm53_flash"],
+)
+def test_megamoe_mxfp4_sm120_model_shapes(ep, hidden, intermediate, experts, topk):
+    """DeepSeek-V4.1-Flash and GLM-5.3-Flash routed experts at EP4 and EP8."""
+    if not _sm120_gpus(ep):
+        pytest.skip(f"requires {ep} SM120 GPUs")
+    _run(
+        _args(
+            ep=ep,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            capacity=256,
+            tokens=[1, 16, 64, 256],
+        )
+    )
+
+
 def test_megamoe_mxfp4_sm120_production_shape():
     """DeepSeek-V4-Flash routed experts (H4096, I2048, 256 experts, top-6), EP4, up to the 256 tokens/rank cap."""
     if not _sm120_gpus(4):
