@@ -138,12 +138,11 @@ kernel_cake_rmsnorm_det_train_40210950f2e7ee48bc3e(__nv_bfloat16* __restrict__ x
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* ring = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int ring_addr = smem + 1024;
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (8 barriers at smem_raw[0..64))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
