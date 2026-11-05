@@ -14,7 +14,7 @@ SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
 built for `sm_107a`, with SM103's GEMM tile rule tables except the long chunks'
 3-deep dX operand ring; its zero-gradient row skip keeps the generic 4097-row
-floor).  The feature does not participate in automatic
+floor and the slice rule's dX slice counts).  The feature does not participate in automatic
 backend selection, autotuning or trace-apply.  Its libraries are loaded
 prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").
@@ -363,6 +363,17 @@ it handles these rows on the device, without a host synchronization:
   same set of launches for every `dlogp` and a CUDA graph capture of the
   backward replays for other `dlogp` values.  A chunk with no live row runs
   its launches without their GEMM work.
+* The one-slice dX plain store has no counted form, so on the architectures
+  of `DX_COUNTED_MIN_SLICES_BY_ARCH` (sm_100a and sm_103a: two slices) the
+  call's plan runs every dX chunk the slice rule gives one slice as a
+  two-slice K-sliced reduction in its counted form
+  (`cake_backend.counted_dx_slices`): the chunk computes no row past its
+  count.  The chunks, the other chunks' slices and the other GEMMs' forms do
+  not change.  Not raised: an
+  explicit dX `k_slices` in `gemm_tuning`, a record that serves one slice, a
+  vocabulary of one K step, and a plan whose two-slice forms would have no
+  counted form (it keeps the slice rule's counts).  sm_107a keeps the slice
+  rule's counts.
 * The fused dX finalize writes exact `+0` rows for the zero-gradient rows (as
   for an ignored row); `dX` of a live row is the same mathematics as without
   the skip.  `dW` sums the same nonzero products over the live rows in the new
@@ -420,8 +431,8 @@ Not applied: `compact_rows=False`, a backward that recounts its valid rows,
 the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
 reference backend.  A call with a temperature takes the skip with its own
 plan (above): the counted temperature form of the dz arm and the counted dX /
-dW GEMMs.  The one-slice dX chunks (the plain store) compute every row of the
-chunk.
+dW GEMMs.  A one-slice dX chunk (the plain store; on sm_107a, or pinned
+with `gemm_tuning`) computes every row of the chunk.
 
 ## Kernel structure of one token chunk
 

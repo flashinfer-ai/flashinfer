@@ -1970,6 +1970,38 @@ def plan_dx_slices(
     return ()
 
 
+# Under the zero-gradient row skip (:data:`DCNT_BASES`) the smallest dX slice count of a chunk, per architecture (an
+# architecture not listed keeps the slice rule's counts).  The one-slice plain store has no counted form: it computes
+# every row of its chunk, a chunk past the live rows included, while the K-sliced reduction's counted form skips the
+# work items past the chunk's count.  So a counted plan runs its one-slice chunks as two-slice reductions
+# (:func:`counted_dx_slices`).  sm_107a keeps the slice rule's counts until measured.
+DX_COUNTED_MIN_SLICES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 2}
+
+
+def counted_dx_slices(
+    slices: tuple[int, ...],
+    *,
+    arch: Optional[str],
+    dx_max_slices: int,
+    k_iters: int,
+    tuning: dict[str, dict[str, Any]],
+) -> tuple[int, ...]:
+    """The per-chunk dX slice counts of a plan under the zero-gradient row skip: ``slices`` (:func:`plan_dx_slices`)
+    with every count below ``arch``'s :data:`DX_COUNTED_MIN_SLICES_BY_ARCH` entry raised to it.  ``slices`` itself
+    when ``arch`` has no entry, when the record serves fewer slices (``dx_max_slices``), when that many slices do not
+    all hold one of the ``k_iters`` K steps (:func:`dx_slices_fit`) or when ``tuning`` pins the dX slice count."""
+    least = DX_COUNTED_MIN_SLICES_BY_ARCH.get(arch, 1) if arch is not None else 1
+    if (
+        least <= 1
+        or not slices
+        or "k_slices" in tuning.get("dx", {})
+        or int(dx_max_slices) < least
+        or dx_slices_fit(least, k_iters) != least
+    ):
+        return slices
+    return tuple(max(int(s), least) for s in slices)
+
+
 def _dx_fill(values: dict[str, Any]) -> None:
     """Fill the rows of ``dX_acc`` the call's K-sliced reduction launches add into with :data:`DX_FILL_VALUE` (host side,
     one ``fill_`` launch on the caller's stream: capturable, no allocation)."""
@@ -4194,7 +4226,9 @@ def make_plan(
     ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
     program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
-    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), the
+    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), each
+    chunk's dX at the architecture's counted slice count at least (:func:`counted_dx_slices`; the slice rule's counts
+    when the plan with those would have no counted forms), the
     last chunk's bf16 fused cast in the TMA epilogue's counted form where :func:`dw_cast_tma_rule` takes the TMA
     epilogue (``counted_tma_cast=False``, a record without that form: the shipped cast's counted form instead); off when
     a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
@@ -4238,14 +4272,16 @@ def make_plan(
                     f"gemm_tuning dx split={explicit_f}: the split-tail form runs 1 .. W of a chunk's W wide dX items "
                     f"as half items; the chunk of {rows_c} rows has W = {wide}"
                 )
-    variants: tuple[ChunkVariants, ...] = ()
-    if arch is not None or tuning:
-        variants = tuple(
+
+    def variants_of(slices_: tuple[int, ...]) -> tuple[ChunkVariants, ...]:
+        if arch is None and not tuning:
+            return ()
+        return tuple(
             chunk_variants(
                 rows_c,
                 problem.hidden,
                 num_sms,
-                slices[i] if slices else 1,
+                slices_[i] if slices_ else 1,
                 geometry,
                 arch,
                 tuning,
@@ -4254,8 +4290,15 @@ def make_plan(
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
-    # the zero-gradient row skip's counted forms: none for an explicitly pinned swapped dX tile or weight-gradient TMA
-    # epilogue (the swap rule itself serves the cross-entropy loss only)
+
+    def has_counted_forms(variants_: tuple[ChunkVariants, ...]) -> bool:
+        # none for an explicitly pinned swapped dX tile or weight-gradient TMA epilogue (the swap rule itself serves
+        # the cross-entropy loss only)
+        return not any(
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants_
+        )
+
+    # the zero-gradient row skip's counted forms
     dcnt = bool(
         dcnt
         and arch is not None
@@ -4263,10 +4306,25 @@ def make_plan(
         and logprob_dz
         and not logprob_keep
         and not hidden_count
-        and not any(
-            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants
-        )
     )
+    variants: Optional[tuple[ChunkVariants, ...]] = None
+    if dcnt:
+        # the counted plan's slices (:data:`DX_COUNTED_MIN_SLICES_BY_ARCH`) when that plan keeps the counted forms,
+        # else the slice rule's
+        raised = counted_dx_slices(
+            slices,
+            arch=arch,
+            dx_max_slices=dx_max_slices,
+            k_iters=int(problem.vocab) // int(geometry.k_block),
+            tuning=tuning,
+        )
+        if raised != slices:
+            raised_variants = variants_of(raised)
+            if has_counted_forms(raised_variants):
+                slices, variants = raised, raised_variants
+    if variants is None:
+        variants = variants_of(slices)
+    dcnt = dcnt and has_counted_forms(variants)
     if (
         variants
         and (not dcnt or counted_tma_cast)
