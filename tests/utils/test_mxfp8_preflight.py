@@ -77,6 +77,8 @@ def test_native_cuda_checks_the_input_device(monkeypatch):
 
 
 def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(monkeypatch):
+    from flashinfer import cute_dsl
+
     x = _fake_cuda((2, 64), torch.float32, step=2)
     assert not x.is_contiguous()
     unexpected = Mock(side_effect=AssertionError("unexpected runtime detection"))
@@ -85,6 +87,36 @@ def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(monkey
     # CuTe prepares this layout itself and supports fp32. Do not impose the
     # native CUDA backend's SM100 or contiguous-input restrictions here.
     assert mxfp8_quantize.check_inputs(x, backend="cute-dsl") is None
+    dependency_probe = Mock(side_effect=RuntimeError("reached CuTe dependency probe"))
+    monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", dependency_probe)
+    with pytest.raises(RuntimeError, match="reached CuTe dependency probe"):
+        mxfp8_quantize(x, backend="cute-dsl")
+    dependency_probe.assert_called_once_with()
+    unexpected.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "shape,layout,message",
+    [
+        ((2, 32), torch.sparse_coo, "strided layout"),
+        ((2, 0), torch.strided, "nonempty last dimension"),
+        ((2, 3, 0), torch.strided, "nonempty last dimension"),
+    ],
+)
+def test_cute_rejects_inputs_before_runtime_setup(monkeypatch, shape, layout, message):
+    from flashinfer import cute_dsl
+
+    with FakeTensorMode():
+        x = torch.empty(shape, dtype=torch.bfloat16, device="cuda:1", layout=layout)
+    unexpected = Mock(side_effect=AssertionError("invalid input reached runtime setup"))
+    monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", unexpected)
+    monkeypatch.setattr(utils, "device_support_pdl", unexpected)
+    monkeypatch.setattr(fp8, "get_mxfp8_quantization_sm100_module", unexpected)
+    monkeypatch.setattr(torch, "empty", unexpected)
+    monkeypatch.setattr(torch, "zeros", unexpected)
+    for call in (mxfp8_quantize.check_inputs, mxfp8_quantize):
+        with pytest.raises(ValueError, match=message):
+            call(x, backend="cute-dsl")
     unexpected.assert_not_called()
 
 
