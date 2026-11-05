@@ -22,7 +22,7 @@ S = S @ diag(g_exp) + beta * outer(v - S @ k, k)
 Output: o = S @ q
 
 Inputs:  q,k [B,T,H,K]  v,g [B,T,HV,K]  beta [B,T,HV]
-State:   [N,HV,V,K] bf16, updated in-place with optional separate initial source
+State:   [N,HV,V,K] bf16 or fp32, updated in-place with optional separate initial source
 Output:  o [B,T,HV,V]
 
 Supports GQA (H != HV), cu_seqlens for variable-length batches, and

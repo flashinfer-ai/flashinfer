@@ -177,3 +177,29 @@ def test_fp32_state_spec_decode_matches_bf16_kernel(num_spec_tokens):
         rtol=5e-2,
     )
     assert torch.equal(pools[torch.float32][N * T :], pool32[N * T :])
+
+
+@pytest.mark.parametrize("B", [1, 8])
+def test_bf16_then_fp32_same_process_uses_separate_specializations(B):
+    ref = {}
+    for dt in (torch.bfloat16, torch.float32, torch.bfloat16):
+        p = _make(B, 64, 64, "packed", dt, seed=3)
+        p["idx"] = torch.arange(B, dtype=torch.int32).cuda()
+        recurrent_kda(
+            p["q"],
+            p["k"],
+            p["v"],
+            p["g"],
+            p["beta"],
+            initial_state=p["pool"],
+            ssm_state_indices=p["idx"],
+            cu_seqlens=torch.arange(B + 1, dtype=torch.int32, device="cuda"),
+            use_qk_l2norm_in_kernel=True,
+        )
+        torch.cuda.synchronize()
+        assert p["pool"].dtype == dt
+        ref.setdefault(dt, []).append(p["pool"][:B].float().clone())
+    torch.testing.assert_close(ref[torch.bfloat16][0], ref[torch.bfloat16][1])
+    torch.testing.assert_close(
+        ref[torch.float32][0], ref[torch.bfloat16][0], atol=5e-2, rtol=5e-2
+    )
