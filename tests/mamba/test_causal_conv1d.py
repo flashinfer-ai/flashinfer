@@ -374,11 +374,18 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
 
 
 @pytest.mark.parametrize(
-    "layout,channels,history",
-    [("sd", 256, 7), ("sd", 129, 7), ("ds", 129, 7), ("sd", 256, 19), ("ds", 129, 19)],
+    "layout,channels,history,tokens",
+    [
+        ("sd", 256, 7, 6),
+        ("sd", 129, 7, 6),
+        ("ds", 129, 7, 6),
+        ("sd", 256, 19, 18),
+        ("ds", 129, 19, 18),
+        ("sd", 256, 7, 11),
+        ("ds", 129, 7, 11),
+    ],
 )
-def test_speculative_overflow_preserves_state_bounds(layout, channels, history):
-    tokens = history - 1
+def test_speculative_overflow_preserves_state_bounds(layout, channels, history, tokens):
     x = torch.randn(tokens, channels, device="cuda", dtype=torch.bfloat16) * 0.1
     w = torch.randn(channels, 4, device="cuda") * 0.1
     state = _state(3, channels, history, layout, padding=16)

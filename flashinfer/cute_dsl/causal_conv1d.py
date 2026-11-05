@@ -132,6 +132,8 @@ def _token_tile(
         state[slot, channel, 0] = prior1
         state[slot, channel, 1] = prior2
 
+    return h0, h1, h2
+
 
 @cute.jit
 def _store_state_tile(
@@ -380,13 +382,12 @@ def _conv(
                         state[slot, channel, 1] = tail1.to(cutlass.BFloat16)
                         state[slot, channel, 2] = x[end - 1, channel]
                 elif cutlass.const_expr(speculative and max_tokens > 0):
-                    if stop - start <= max_tokens:
-                        if cutlass.const_expr(vector_state):
-                            state_tile[0, tid] = h1.to(cutlass.BFloat16)
-                            state_tile[1, tid] = h2.to(cutlass.BFloat16)
-                        elif cutlass.const_expr(not defer_state):
-                            state[slot, channel, 0] = h1.to(cutlass.BFloat16)
-                            state[slot, channel, 1] = h2.to(cutlass.BFloat16)
+                    if cutlass.const_expr(vector_state):
+                        state_tile[0, tid] = h1.to(cutlass.BFloat16)
+                        state_tile[1, tid] = h2.to(cutlass.BFloat16)
+                    elif cutlass.const_expr(not defer_state):
+                        state[slot, channel, 0] = h1.to(cutlass.BFloat16)
+                        state[slot, channel, 1] = h2.to(cutlass.BFloat16)
                 taps = cute.make_rmem_tensor((4,), weight.element_type)
                 source = cute.make_tensor(
                     weight.iterator + cute.assume(channel * 4, divby=4),
@@ -400,69 +401,48 @@ def _conv(
                 b = cutlass.Float32(0.0)
                 if cutlass.const_expr(has_bias):
                     b = bias[channel].to(cutlass.Float32)
-                if cutlass.const_expr(prefill or max_tokens > 0):
-                    tile = block_t if cutlass.const_expr(prefill) else max_tokens
-                    if prefill or stop - start <= tile:
-                        if full_tile and stop - start == tile:
-                            _token_tile(
-                                x,
-                                out,
-                                state,
-                                slot,
-                                channel,
-                                start,
-                                stop,
-                                h0,
-                                h1,
-                                h2,
-                                w0,
-                                w1,
-                                w2,
-                                w3,
-                                b,
-                                tile,
-                                speculative,
-                                True,
-                                state_tile,
-                                vector_state,
-                                defer_state,
-                            )
-                        else:
-                            _token_tile(
-                                x,
-                                out,
-                                state,
-                                slot,
-                                channel,
-                                start,
-                                stop,
-                                h0,
-                                h1,
-                                h2,
-                                w0,
-                                w1,
-                                w2,
-                                w3,
-                                b,
-                                tile,
-                                speculative,
-                                False,
-                                state_tile,
-                                vector_state,
-                                defer_state,
-                            )
-                        if cutlass.const_expr(vector_state):
-                            _store_state_tile(
-                                state,
-                                state_tile,
-                                slot,
-                                cutlass.Int64(channel_tile) * block_c,
-                                stop - start,
-                                max_tokens,
-                                block_c,
-                            )
-                    else:
-                        _token_loop(
+                if cutlass.const_expr(speculative and max_tokens > 0):
+                    h0, h1, h2 = _token_tile(
+                        x,
+                        out,
+                        state,
+                        slot,
+                        channel,
+                        start,
+                        stop,
+                        h0,
+                        h1,
+                        h2,
+                        w0,
+                        w1,
+                        w2,
+                        w3,
+                        b,
+                        max_tokens,
+                        True,
+                        False,
+                        state_tile,
+                        vector_state,
+                        defer_state,
+                    )
+                    for token in cutlass.range(start + max_tokens, stop):
+                        current = x[token, channel].to(cutlass.Float32)
+                        value = _step(h0, h1, h2, current, w0, w1, w2, w3, b)
+                        out[token, channel] = value.to(cutlass.BFloat16)
+                        h0, h1, h2 = h1, h2, current
+                    if cutlass.const_expr(vector_state):
+                        _store_state_tile(
+                            state,
+                            state_tile,
+                            slot,
+                            cutlass.Int64(channel_tile) * block_c,
+                            stop - start,
+                            max_tokens,
+                            block_c,
+                        )
+                elif cutlass.const_expr(prefill):
+                    if full_tile and stop - start == block_t:
+                        _token_tile(
                             x,
                             out,
                             state,
@@ -478,7 +458,36 @@ def _conv(
                             w2,
                             w3,
                             b,
-                            speculative,
+                            block_t,
+                            False,
+                            True,
+                            state_tile,
+                            vector_state,
+                            defer_state,
+                        )
+                    else:
+                        _token_tile(
+                            x,
+                            out,
+                            state,
+                            slot,
+                            channel,
+                            start,
+                            stop,
+                            h0,
+                            h1,
+                            h2,
+                            w0,
+                            w1,
+                            w2,
+                            w3,
+                            b,
+                            block_t,
+                            False,
+                            False,
+                            state_tile,
+                            vector_state,
+                            defer_state,
                         )
                 else:
                     _token_loop(
