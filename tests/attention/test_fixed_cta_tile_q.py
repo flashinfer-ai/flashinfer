@@ -17,12 +17,9 @@ import torch
 import flashinfer
 
 
-@pytest.mark.parametrize("tile", [16, 64, 128])
-@pytest.mark.parametrize("cache", ["paged", "ragged"])
-def test_fixed_tile_mixed_batch_and_prefix_tail(tile, cache):
-    """Cross the automatic 128/64/16 thresholds without changing a request's bits."""
-    if torch.cuda.get_device_capability()[0] < 8:
-        pytest.skip("bf16 regression requires SM80 or newer")
+def _prefix_tail_runner(tile, cache):
+    """Return run(mate_lengths, prefix) -> (out, lse) of a 372-token causal request,
+    optionally batched with mates or restricted to the query tail after a prefix."""
     torch.manual_seed(42)
     device, dtype = "cuda", torch.bfloat16
     q = torch.randn(372, 16, 128, device=device, dtype=dtype)
@@ -67,7 +64,7 @@ def test_fixed_tile_mixed_batch_and_prefix_tail(tile, cache):
                 ]
             )
             wrapper.plan(qo_indptr, kv_indptr, 16, 8, 128, **plan_kwargs)
-            result = wrapper.run(query, key, value)
+            out, lse = wrapper.run(query, key, value, return_lse=True)
         else:
             page_size = 16
             page_counts = [(n + page_size - 1) // page_size for n in kv_lengths]
@@ -102,14 +99,54 @@ def test_fixed_tile_mixed_batch_and_prefix_tail(tile, cache):
                 page_size,
                 **plan_kwargs,
             )
-            result = wrapper.run(query, kv)
+            out, lse = wrapper.run(query, kv, return_lse=True)
         assert wrapper._plan_info[3] == tile
-        return result[: q_lengths[0]]
+        return out[: q_lengths[0]], lse[: q_lengths[0]]
 
+    return run
+
+
+def _assert_bit_equal(actual, expected):
+    for a, e in zip(actual, expected, strict=True):
+        assert torch.equal(a, e)
+
+
+@pytest.mark.parametrize("tile", [16, 64, 128])
+@pytest.mark.parametrize("cache", ["paged", "ragged"])
+def test_fixed_tile_mixed_batch_and_prefix_tail(tile, cache):
+    """Cross the automatic 128/64/16 thresholds without changing a request's bits."""
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("bf16 regression requires SM80 or newer")
+    run = _prefix_tail_runner(tile, cache)
     alone = run()
-    assert torch.equal(alone, run([12] * 27))
-    assert torch.equal(alone, run([1] * 63))
-    assert torch.equal(alone[256:], run(prefix=256))
+    _assert_bit_equal(run([12] * 27), alone)
+    _assert_bit_equal(run([1] * 63), alone)
+    # With GQA group 2, prefix 256 starts the tail at packed row 512, a multiple
+    # of every tile, so each tile covers the same rows as in the full request.
+    out, lse = alone
+    _assert_bit_equal(run(prefix=256), (out[256:], lse[256:]))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="flashinfer-ai/flashinfer#6907: the FMA-contracted online-softmax "
+    "rescale changes the last bits of a prefix tail whose packed start is not "
+    "a multiple of the tile",
+)
+@pytest.mark.parametrize("tile", [16, 64, 128])
+@pytest.mark.parametrize("cache", ["paged", "ragged"])
+def test_fixed_tile_misaligned_prefix_tail(tile, cache):
+    """Prefix 250 starts the tail at packed row 500, off every tile boundary.
+
+    A fixed tile alone does not make this tail bit-exact: rows land in tiles that
+    run a different number of rescale steps. Remove the xfail once the rescale
+    fix lands (flashinfer-ai/flashinfer#6908 or #7191).
+    """
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("bf16 regression requires SM80 or newer")
+    run = _prefix_tail_runner(tile, cache)
+    out, lse = run()
+    _assert_bit_equal(run(prefix=250), (out[250:], lse[250:]))
 
 
 @pytest.mark.parametrize("tile", [16, 64, 128])
