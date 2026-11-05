@@ -3254,7 +3254,11 @@ def test_router_148_sm_simt_windows_plan_their_registered_programs(arch):
                         assert plan is None or plan.simt is None, (layout, hidden, T)
                     else:
                         assert len(want) == 3, (layout, hidden, T, want)
-                        assert plan is not None and plan.simt == want, (layout, hidden, T)
+                        assert plan is not None and plan.simt == want, (
+                            layout,
+                            hidden,
+                            T,
+                        )
                         plain += 1
                     planned += 1
             past = windows[-1][1] + 1
