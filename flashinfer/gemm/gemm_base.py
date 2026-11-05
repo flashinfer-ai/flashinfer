@@ -7051,6 +7051,21 @@ def _sm107_low_m_split_k(
     return 1
 
 
+# Autotune cache-key extra of the mm_mxfp8 cute-dsl runners that can win an M
+# bucket above the low-M split-K range, under FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1.
+# A winner is cached under the key of the runner that won, so a set that offers
+# the mid-M split-K tactics must not share the default set's keys: a winner
+# tuned without them would otherwise hide them.
+_MM_MXFP8_MIDM_SPLIT_K_KEY = ("midm_split_k",)
+
+
+def _mm_mxfp8_midm_split_k() -> bool:
+    """``FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1``: the SM100 runner of
+    mm_mxfp8(backend="cute-dsl") also offers split-K tactics above the low-M
+    range to the autotuner (read on every call)."""
+    return os.environ.get("FLASHINFER_MM_MXFP8_MIDM_SPLIT_K", "0") == "1"
+
+
 @functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
@@ -7059,8 +7074,15 @@ def _cute_dsl_gemm_mxfp8_runner(
     out_dtype: torch.dtype,
     warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
     low_m_only: bool = False,
+    midm_split_k: bool = False,
 ):
-    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107)."""
+    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107).
+
+    ``midm_split_k``: also offer the split-K tactics of
+    ``Sm100BlockScaledSplitKMidMGemmKernel`` above the low-M range (with
+    ``low_m_only`` too), under ``FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1``; the
+    runner then has its own autotune cache keys. Untuned calls are unaffected.
+    """
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -7069,8 +7091,12 @@ def _cute_dsl_gemm_mxfp8_runner(
     from .kernels.dense_blockscaled_gemm_sm100_splitk import (
         Sm100BlockScaledSplitKGemmKernel,
     )
+    from .kernels.dense_blockscaled_gemm_sm100_splitk_midm import (
+        Sm100BlockScaledSplitKMidMGemmKernel,
+    )
 
     split_k_kernel_cls = Sm100BlockScaledSplitKGemmKernel
+    midm_split_k_kernel_cls = Sm100BlockScaledSplitKMidMGemmKernel
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -7088,10 +7114,33 @@ def _cute_dsl_gemm_mxfp8_runner(
     c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
     _ = sm_major, sm_minor
 
+    def midm_split_k_tactics(m: int, n: int, real_k: int) -> list:
+        """Mid-M split-K tactics offered for a contiguous out of (m, n, real_k).
+
+        Offered only while the K-clusters fit in one wave: past that the kernel,
+        one output tile per cluster, runs a second wave instead of splitting K
+        across idle SMs.
+        """
+        from ..cute_dsl.utils import get_max_active_clusters
+
+        if n % 8 != 0:
+            return []
+        tactics = []
+        for mma_tiler_mn in midm_split_k_kernel_cls.SUPPORTED_MMA_TILER_MN:
+            for split_k_slices in midm_split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
+                if midm_split_k_kernel_cls.is_valid_tactic(
+                    m, real_k, cutlass.Float8E4M3FN, mma_tiler_mn, split_k_slices
+                ) and midm_split_k_kernel_cls.num_clusters(
+                    m, n, mma_tiler_mn
+                ) <= get_max_active_clusters(split_k_slices):
+                    tactics.append((mma_tiler_mn, (1, 1), True, False, split_k_slices))
+        return tactics
+
     class CuteDSLMxfp8GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype), enable_pdl)
+            extras: tuple = (str(out.dtype), enable_pdl)
+            return extras + _MM_MXFP8_MIDM_SPLIT_K_KEY if midm_split_k else extras
 
         def get_valid_tactics(
             self,
@@ -7103,7 +7152,10 @@ def _cute_dsl_gemm_mxfp8_runner(
             n = b.shape[1]
             real_k = a.shape[1]
             if low_m_only and not split_k_kernel_cls.supports_m(m):
-                return []  # wide tiles are the SM107 kernel's job
+                # Unsplit wide tiles are the SM107 kernel's job.
+                if midm_split_k and out.is_contiguous():
+                    return midm_split_k_tactics(m, n, real_k)
+                return []
             warp_serves = warp_splitk_supports is not None and warp_splitk_supports(
                 inputs
             )
@@ -7152,6 +7204,8 @@ def _cute_dsl_gemm_mxfp8_runner(
                             split_k_slices,
                         )
                     )
+            if midm_split_k:
+                valid_tactics += midm_split_k_tactics(m, n, real_k)
             return valid_tactics
 
         def forward(
@@ -7213,6 +7267,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             if split_k_slices < 1:
                 raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
             is_split_k = split_k_slices > 1
+            is_midm_split_k = False
 
             if is_split_k:
                 structurally_invalid = (
@@ -7221,20 +7276,39 @@ def _cute_dsl_gemm_mxfp8_runner(
                 if structurally_invalid:
                     raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
 
-                shape_valid = (
-                    out.is_contiguous()
-                    and split_k_kernel_cls.is_valid_tactic(
-                        m,
-                        real_k,
-                        cutlass.Float8E4M3FN,
-                        split_k_slices,
+                if (
+                    tuple(mma_tiler_mn)
+                    in midm_split_k_kernel_cls.SUPPORTED_MMA_TILER_MN
+                ):
+                    mma_tiler_mn = tuple(mma_tiler_mn)
+                    is_midm_split_k = True
+                    shape_valid = (
+                        out.is_contiguous()
+                        and n % 8 == 0
+                        and midm_split_k_kernel_cls.is_valid_tactic(
+                            m,
+                            real_k,
+                            cutlass.Float8E4M3FN,
+                            mma_tiler_mn,
+                            split_k_slices,
+                        )
                     )
-                    and mma_tiler_mn == split_k_kernel_cls.mma_tiler_mn_for_m(m)
-                )
+                else:
+                    shape_valid = (
+                        out.is_contiguous()
+                        and split_k_kernel_cls.is_valid_tactic(
+                            m,
+                            real_k,
+                            cutlass.Float8E4M3FN,
+                            split_k_slices,
+                        )
+                        and mma_tiler_mn == split_k_kernel_cls.mma_tiler_mn_for_m(m)
+                    )
                 if not shape_valid:
                     # Autotune cache entries are bucketed by M. A tactic selected
                     # for a low-M bucket can therefore be reused by a runtime shape
-                    # that the split-K kernel cannot implement. Keep the runner's
+                    # that the split-K kernel cannot implement (likewise a mid-M
+                    # split-K tactic at a low-M runtime shape). Keep the runner's
                     # fallback contract instead of turning a stale optimization
                     # into a serving failure.
                     tactic = fallback_tactic
@@ -7246,6 +7320,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                         split_k_slices,
                     ) = tactic
                     is_split_k = False
+                    is_midm_split_k = False
 
             # Re-check whatever is about to launch against the narrow-tile
             # envelope (Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok):
@@ -7265,6 +7340,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     split_k_slices,
                 ) = tactic
                 is_split_k = False
+                is_midm_split_k = False
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -7282,7 +7358,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = (
+            cache_key: tuple = (
                 sf_vec_size,
                 mma_tiler_mn,
                 cluster_shape_mn,
@@ -7292,10 +7368,19 @@ def _cute_dsl_gemm_mxfp8_runner(
                 out_dtype,
                 split_k_slices,
             )
+            if is_midm_split_k:
+                cache_key += ("midm_split_k",)
 
             make_kernel: Callable[[], object]
             kernel_cache = _CUTE_DSL_MM_MXFP8_KERNEL_CACHE
-            if is_split_k:
+            if is_midm_split_k:
+                make_kernel = lambda: midm_split_k_kernel_cls(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    split_k_slices,
+                    enable_pdl,
+                )
+            elif is_split_k:
                 make_kernel = lambda: split_k_kernel_cls(
                     sf_vec_size,
                     mma_tiler_mn,
@@ -7385,11 +7470,15 @@ def _use_sm107_mxfp8_cute_dsl(
 _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, tuple] = {}
 
 
-def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
+def _cute_dsl_gemm_mxfp8_sm107_runner(
+    out_dtype: torch.dtype, midm_split_k: bool = False
+):
     """CuTe-DSL mm_mxfp8 runner for Sm107BlockScaledPersistentDenseGemmKernel.
 
     Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m). The
     kernel has no PDL support, so unlike the SM100 runner it takes no enable_pdl.
+    ``midm_split_k``: part of the set built under
+    ``FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1``; only its cache keys differ.
     """
     import cutlass
 
@@ -7406,7 +7495,8 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
     class CuteDSLMxfp8Sm107GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype),)
+            extras: tuple = (str(out.dtype),)
+            return extras + _MM_MXFP8_MIDM_SPLIT_K_KEY if midm_split_k else extras
 
         def get_valid_tactics(
             self,
@@ -7588,24 +7678,40 @@ def _cute_dsl_mxfp8_runners(
     out_dtype: torch.dtype,
     inputs: List[torch.Tensor],
 ) -> List[TunableRunner]:
-    """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default."""
+    """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default.
+
+    ``FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1`` adds the mid-M split-K tactics to the
+    block-scaled runner; the untuned order and default tactics stay the same.
+    """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
+    midm_split_k = _mm_mxfp8_midm_split_k()
     # Older DSLs lack cutlass.experimental; only the block-scaled runner remains.
     if not is_cute_dsl_experimental_available():
-        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
+        return [
+            _cute_dsl_gemm_mxfp8_runner(
+                sm_major, sm_minor, enable_pdl, out_dtype, midm_split_k=midm_split_k
+            )
+        ]
+    # The warp runner offers tactics only at M <= 16, below every bucket the
+    # mid-M split-K tactics can win, so its cache keys stay the same.
     warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl)
     # One autotune call profiles every M bucket with these runners, so whether the
     # warp runner is registered must not depend on M; per profile it offers
     # tactics only for the M it serves.
     if not warp.supports_inputs(inputs, check_m=False):
-        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
+        return [
+            _cute_dsl_gemm_mxfp8_runner(
+                sm_major, sm_minor, enable_pdl, out_dtype, midm_split_k=midm_split_k
+            )
+        ]
     cluster_splitk = _cute_dsl_gemm_mxfp8_runner(
         sm_major,
         sm_minor,
         enable_pdl,
         out_dtype,
         warp_splitk_supports=warp.supports_inputs,
+        midm_split_k=midm_split_k,
     )
     a, b = inputs[0], inputs[1]
     # Untuned, warp split-K runs first only while its 16-wide output tiles fit in
@@ -7621,11 +7727,19 @@ def _cute_dsl_mxfp8_runners(
 def _cute_dsl_mxfp8_runners_sm107(
     out_dtype: torch.dtype, inputs: List[torch.Tensor]
 ) -> List[TunableRunner]:
-    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default."""
+    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default.
+
+    The SM100 runner offers only its M <= 32 tactics here, plus the mid-M
+    split-K tactics above that under ``FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1``
+    (which does not change the untuned order below).
+    """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
-    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
-    low_m = _cute_dsl_gemm_mxfp8_runner(10, 7, True, out_dtype, low_m_only=True)
+    midm_split_k = _mm_mxfp8_midm_split_k()
+    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype, midm_split_k=midm_split_k)
+    low_m = _cute_dsl_gemm_mxfp8_runner(
+        10, 7, True, out_dtype, low_m_only=True, midm_split_k=midm_split_k
+    )
     a, b, _, _, _, out, _ = inputs
     m, k = a.shape
     n = b.shape[1]
@@ -7892,7 +8006,14 @@ def mm_mxfp8(
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
-          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``). Its split-K
+          tactics are autotuned at M <= 32 only;
+          ``FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1`` also autotunes split-K tactics
+          with 64- and 128-token tiles above that (contiguous ``out``, ``K``
+          divisible by 256 or 512, every cluster in one wave). They sum the K
+          slices in a fixed order, so results are reproducible run to run but can
+          differ in the last bit from unsplit tactics. The untuned default stays
+          the same.
         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -754,6 +756,320 @@ def test_mm_mxfp8_cute_dsl_stale_narrow_tile_tactic_falls_back(m, tile_n):
     torch.cuda.synchronize()
 
     _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+# (mma_tiler_mn, split_k_slices) of every mid-M split-K tactic.
+_MIDM_SPLIT_K_TACTICS = {
+    ((128, 64), 2),
+    ((128, 64), 4),
+    ((128, 128), 2),
+    ((128, 128), 4),
+}
+
+
+def _midm_split_k_tactics(tactics):
+    """The (mma_tiler_mn, split_k_slices) of the mid-M split-K tactics in ``tactics``."""
+    midm = {(tuple(t[0]), t[4]) for t in tactics if t[4] > 1 and t[0][1] >= 64}
+    # Every split-K tactic is swap-AB on a (1, 1) cluster without prefetch.
+    assert all(t[1:4] == ((1, 1), True, False) for t in tactics if t[4] > 1), tactics
+    return midm
+
+
+def _mxfp8_shape_only_inputs(m, n, k, out=None):
+    """CPU mm_mxfp8 runner inputs that only carry shapes, for tactic enumeration."""
+    return [
+        torch.empty((m, k), dtype=torch.float8_e4m3fn),
+        torch.empty((n, k), dtype=torch.float8_e4m3fn).T,
+        torch.empty((max(m, 128) * k // 32,), dtype=torch.uint8),
+        torch.empty((max(n, 128) * k // 32,), dtype=torch.uint8),
+        torch.bfloat16,
+        torch.empty((m, n), dtype=torch.bfloat16) if out is None else out,
+        None,
+    ]
+
+
+def _fake_device_occupancy(monkeypatch, sm_count=148):
+    """No GPU: fix the SM count and the cluster occupancy the runners read
+    (``sm_count // cluster_size`` clusters fit in one wave)."""
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    monkeypatch.setattr(gemm_base, "get_device_sm_count", lambda device: sm_count)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=sm_count),
+    )
+    monkeypatch.setattr(
+        cute_dsl_utils,
+        "get_max_active_clusters",
+        lambda cluster_size: sm_count // cluster_size,
+    )
+
+
+@pytest.mark.cpu_only
+def test_midm_split_k_kernel_valid_tactics():
+    """CPU-only: the problems the mid-M split-K kernel accepts."""
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk_midm import (
+        Sm100BlockScaledSplitKMidMGemmKernel as Kernel,
+    )
+
+    fp8 = cutlass.Float8E4M3FN
+    # M <= 32 belongs to the low-M split-K kernel.
+    assert not Kernel.is_valid_tactic(32, 4096, fp8, (128, 64), 2)
+    assert Kernel.is_valid_tactic(33, 4096, fp8, (128, 64), 2)
+    assert Kernel.is_valid_tactic(4096, 4096, fp8, (128, 128), 4)
+    # Each K slice is a whole number of 128-wide K blocks.
+    assert Kernel.is_valid_tactic(64, 256, fp8, (128, 128), 2)
+    assert not Kernel.is_valid_tactic(64, 256, fp8, (128, 128), 4)
+    assert not Kernel.is_valid_tactic(64, 384, fp8, (128, 64), 2)
+    # Narrow tiles, other split counts and FP4 are not this kernel's.
+    assert not Kernel.is_valid_tactic(64, 4096, fp8, (128, 32), 2)
+    assert not Kernel.is_valid_tactic(64, 4096, fp8, (128, 64), 3)
+    assert not Kernel.is_valid_tactic(64, 4096, fp8, (128, 64), 1)
+    assert not Kernel.is_valid_tactic(64, 4096, cutlass.Float4E2M1FN, (128, 64), 2)
+    # Swap-AB: N in 128-row tiles times M in tile_n-token tiles.
+    assert Kernel.num_clusters(33, 2048, (128, 64)) == 16
+    assert Kernel.num_clusters(129, 2049, (128, 128)) == 34
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("midm_split_k", [False, True])
+def test_mm_mxfp8_cute_dsl_midm_split_k_tactics(midm_split_k, monkeypatch):
+    """CPU-only: the split-K tactics FLASHINFER_MM_MXFP8_MIDM_SPLIT_K adds to the
+    SM100 cute-dsl runner above M = 32, and its cache keys. Without the flag
+    the runner and its keys are unchanged."""
+    pytest.importorskip("cutlass")
+    _fake_device_occupancy(monkeypatch)
+    if midm_split_k:
+        monkeypatch.setenv("FLASHINFER_MM_MXFP8_MIDM_SPLIT_K", "1")
+    else:
+        monkeypatch.delenv("FLASHINFER_MM_MXFP8_MIDM_SPLIT_K", raising=False)
+
+    def block_scaled_runner(inputs):
+        runners = gemm_base._cute_dsl_mxfp8_runners(  # pyright: ignore[reportPrivateUsage]
+            10, 0, True, torch.bfloat16, inputs
+        )
+        (runner,) = [r for r in runners if type(r).__name__ == "CuteDSLMxfp8GemmRunner"]
+        return runner
+
+    def offered(m, n, k, out=None):
+        inputs = _mxfp8_shape_only_inputs(m, n, k, out)
+        tactics = block_scaled_runner(inputs).get_valid_tactics(inputs, None)
+        return _midm_split_k_tactics(tactics)
+
+    inputs = _mxfp8_shape_only_inputs(256, 2048, 4096)
+    extras = block_scaled_runner(inputs).get_cache_key_extras(inputs)
+    if not midm_split_k:
+        assert extras == ("torch.bfloat16", True)
+        for m, n, k in ((33, 2048, 4096), (256, 2048, 4096), (1024, 1024, 8192)):
+            assert offered(m, n, k) == set(), (m, n, k)
+        return
+    assert extras == ("torch.bfloat16", True, "midm_split_k")
+    # 16 x 4 clusters at tile N 64 and 16 x 2 at tile N 128; 74 (148 // 2) or
+    # 37 (148 // 4) fit in one wave.
+    assert offered(256, 2048, 4096) == {
+        ((128, 64), 2),
+        ((128, 128), 2),
+        ((128, 128), 4),
+    }
+    assert offered(33, 2048, 4096) == _MIDM_SPLIT_K_TACTICS
+    # K = 2304 splits in two 128-wide multiples, not in four.
+    assert offered(33, 2048, 2304) == {((128, 64), 2), ((128, 128), 2)}
+    # No cluster count fits in one wave.
+    assert offered(256, 8192, 4096) == set()
+    # M <= 32 stays with the low-M split-K kernel.
+    assert offered(32, 2048, 4096) == set()
+    # A strided out (the split-K kernels store a contiguous one) or an N that
+    # breaks the 16-byte output row alignment gets none.
+    strided_out = torch.empty((2048, 64), dtype=torch.bfloat16).T
+    assert offered(64, 2048, 4096, out=strided_out) == set()
+    assert offered(64, 2044, 4096) == set()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("midm_split_k", [False, True])
+def test_mm_mxfp8_cute_dsl_sm107_runner_set_midm_split_k(midm_split_k, monkeypatch):
+    """CPU-only: in the SM107 cute-dsl runner set, the SM100 runner offers nothing
+    above M = 32 by default and only the mid-M split-K tactics under
+    FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1. The untuned order is the same in both
+    modes; only the flag's set marks the block-scaled runners' cache keys."""
+    pytest.importorskip("cutlass")
+    _fake_device_occupancy(monkeypatch)
+    if midm_split_k:
+        monkeypatch.setenv("FLASHINFER_MM_MXFP8_MIDM_SPLIT_K", "1")
+    else:
+        monkeypatch.delenv("FLASHINFER_MM_MXFP8_MIDM_SPLIT_K", raising=False)
+    inputs = _mxfp8_shape_only_inputs(256, 2048, 4096)
+
+    runners = gemm_base._cute_dsl_mxfp8_runners_sm107(torch.bfloat16, inputs)  # pyright: ignore[reportPrivateUsage]
+
+    # Above M = 16 the SM107 kernel is the untuned default in both modes.
+    sm107, sm100 = runners[:2]
+    assert type(sm107).__name__ == "CuteDSLMxfp8Sm107GemmRunner"
+    assert type(sm100).__name__ == "CuteDSLMxfp8GemmRunner"
+    tactics = sm100.get_valid_tactics(inputs, None)
+    keys = [runner.get_cache_key_extras(inputs) for runner in (sm107, sm100)]
+    if not midm_split_k:
+        assert tactics == []
+        assert keys == [("torch.bfloat16",), ("torch.bfloat16", True)]
+        return
+    assert len(tactics) == len(_midm_split_k_tactics(tactics)), tactics
+    assert _midm_split_k_tactics(tactics) == {
+        ((128, 64), 2),
+        ((128, 128), 2),
+        ((128, 128), 4),
+    }
+    assert keys == [
+        ("torch.bfloat16", "midm_split_k"),
+        ("torch.bfloat16", True, "midm_split_k"),
+    ]
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (33, 2048, 4096),
+        (100, 2048, 4096),  # partial token tile
+        (256, 1536, 2048),
+        (513, 4096, 1024),  # more clusters than one wave holds
+    ],
+)
+def test_mm_mxfp8_cute_dsl_midm_split_k(m, n, k, out_dtype):
+    """Every mid-M split-K tactic matches the reference and is bitwise
+    reproducible run to run."""
+    _skip_if_unsupported("cute-dsl")
+    import cutlass
+
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk_midm import (
+        Sm100BlockScaledSplitKMidMGemmKernel as Kernel,
+    )
+
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    reference = torch.mm(input, weight.T)
+    out = torch.empty([m, n], device="cuda", dtype=out_dtype)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    inputs = [
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        out_dtype,
+        out,
+        workspace,
+    ]
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, out_dtype, midm_split_k=True
+    )
+
+    tactics = [
+        (mma_tiler_mn, (1, 1), True, False, split_k_slices)
+        for mma_tiler_mn, split_k_slices in sorted(_MIDM_SPLIT_K_TACTICS)
+        if Kernel.is_valid_tactic(
+            m, k, cutlass.Float8E4M3FN, mma_tiler_mn, split_k_slices
+        )
+    ]
+    assert tactics
+    for tactic in tactics:
+        out.fill_(float("nan"))
+        runner(inputs, tactic=tactic)
+        first = out.clone()
+        _assert_cosine_similarity(
+            reference, first, use_float=True, context=f"tactic {tactic}"
+        )
+        out.fill_(float("nan"))
+        runner(inputs, tactic=tactic)
+        torch.testing.assert_close(
+            out.view(torch.int16), first.view(torch.int16), rtol=0, atol=0
+        )
+
+
+def test_mm_mxfp8_cute_dsl_stale_midm_split_k_tactic_falls_back():
+    """A mid-M split-K tactic replayed at a low-M runtime shape falls back."""
+    _skip_if_unsupported("cute-dsl")
+
+    m, n, k = 16, 2048, 4096
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        tactic=((128, 64), (1, 1), True, False, 2),
+    )
+
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_mm_mxfp8_cute_dsl_midm_split_k_autotune(auto_tuning, monkeypatch):
+    """Under FLASHINFER_MM_MXFP8_MIDM_SPLIT_K=1 autotuning profiles the mid-M
+    split-K tactics (on SM107 through the SM100 runner of its set), and untuned
+    calls never launch them."""
+    _skip_if_unsupported("cute-dsl")
+    monkeypatch.setenv("FLASHINFER_MM_MXFP8_MIDM_SPLIT_K", "1")
+
+    tactics_run = []
+    make_runner = gemm_base._cute_dsl_gemm_mxfp8_runner  # pyright: ignore[reportPrivateUsage]
+    recorded = set()
+
+    def recording_runner(*args, **kwargs):
+        runner = make_runner(*args, **kwargs)
+        # The factory is cached: wrap each runner once.
+        if kwargs.get("midm_split_k") and id(runner) not in recorded:
+            recorded.add(id(runner))
+            forward = runner.forward
+
+            def recording_forward(inputs, tactic=None, **forward_kwargs):
+                tactics_run.append(tactic)
+                return forward(inputs, tactic=tactic, **forward_kwargs)
+
+            # monkeypatch undoes this on the cached runner after the test.
+            monkeypatch.setattr(runner, "forward", recording_forward)
+        return runner
+
+    monkeypatch.setattr(gemm_base, "_cute_dsl_gemm_mxfp8_runner", recording_runner)
+    # Untuned: a cached winner would replace the default. Tuned: profile afresh.
+    AutoTuner.get().clear_cache()
+    _run_mm_mxfp8(
+        128,
+        2048,
+        4096,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=auto_tuning,
+        provide_out=True,
+    )
+
+    midm_run = _midm_split_k_tactics(
+        [t for t in tactics_run if isinstance(t, (tuple, list))]
+    )
+    if auto_tuning:
+        assert midm_run, tactics_run
+    else:
+        assert midm_run == set(), tactics_run
 
 
 @pytest.mark.parametrize(
