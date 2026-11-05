@@ -114,8 +114,10 @@ and 100352 keys) and ``s3_cold16k`` (16384 over 16384), top-k 2048, causal.
 Arms: ``cake_fp8`` (this backend's FP8 form; ``cake_fp8_aa`` /
 ``cake_fp8_nosample`` as above), ``cake`` (the BF16 form on the same data
 dequantized to BF16: ``q`` exactly, ``bf16(k * k_scale)``, the same ``w``,
-``softmax_scale = 1``), ``deepgemm_topk`` (stock ``deep_gemm.fp8_mqa_logits``
-with ``clean_logits=True``, then ``flashinfer.top_k(deterministic=True,
+``softmax_scale = 1``), ``deepgemm_topk`` (stock DeepGEMM FP8 MQA logits with
+FP32 per-key scales and FP32 logits: ``deep_gemm.fp8_mqa_logits``, or
+``fp8_fp4_mqa_logits(..., logits_dtype=torch.float32)`` in builds without it;
+``clean_logits=True``, then ``flashinfer.top_k(deterministic=True,
 tie_break=LARGE)``) and ``deepgemm_ragged_topk`` (``fp8_mqa_logits`` with
 ``clean_logits=False``, then ``flashinfer.top_k_ragged_transform(
 deterministic=True, tie_break=LARGE)`` over each row's visible keys); the
@@ -932,8 +934,36 @@ class MaterializedArm(Arm):
         return materialized_fp32(self.inputs)
 
 
+def deep_gemm_fp8_mqa_logits(deep_gemm):
+    """DeepGEMM's FP8 MQA logits with FP32 per-key scales and FP32 logits as ``f(q, (k, k_scale), w, starts, ends, *,
+    clean_logits)``: ``fp8_mqa_logits`` where the build has it, else ``fp8_fp4_mqa_logits`` with an FP8 ``q`` (no
+    scale factors) and ``logits_dtype=torch.float32``.  A build whose call does not take these arguments (one that needs
+    block scale factors for FP8) fails at the arm's first call, which reports the arm unavailable."""
+    if hasattr(deep_gemm, "fp8_mqa_logits"):
+        return deep_gemm.fp8_mqa_logits
+    if not hasattr(deep_gemm, "fp8_fp4_mqa_logits"):
+        raise AttributeError(
+            "deep_gemm has neither fp8_mqa_logits nor fp8_fp4_mqa_logits"
+        )
+
+    def logits(q, kv, w, starts, ends, *, clean_logits):
+        return deep_gemm.fp8_fp4_mqa_logits(
+            q=(q, None),
+            kv=kv,
+            weights=w,
+            cu_seq_len_k_start=starts,
+            cu_seq_len_k_end=ends,
+            clean_logits=clean_logits,
+            max_seqlen_k=0,
+            logits_dtype=torch.float32,
+        )
+
+    return logits
+
+
 class DeepGemmArm(Arm):
-    """Stock DeepGEMM ``fp8_mqa_logits`` per segment, then a FlashInfer exact deterministic top-k (FP8 inputs only).
+    """Stock DeepGEMM FP8 MQA logits (:func:`deep_gemm_fp8_mqa_logits`) per segment, then a FlashInfer exact
+    deterministic top-k (FP8 inputs only).
 
     The timed call returns the raw per-segment outputs; :meth:`finish` converts them to the contract's ascending
     segment-local ids with aligned scores and padding outside the timed span.  A first call in the constructor makes a
@@ -957,7 +987,7 @@ class DeepGemmArm(Arm):
             )
         import deep_gemm
 
-        self.logits = deep_gemm.fp8_mqa_logits
+        self.logits = deep_gemm_fp8_mqa_logits(deep_gemm)
         visible = ref.visible_rows(inputs).to(torch.int32)
         self.segments = []
         for q0, lq, k0, lk, _visible, _visible_cpu in _segments(inputs):
@@ -1032,7 +1062,7 @@ class DeepGemmArm(Arm):
 
 
 class DeepGemmRaggedArm(DeepGemmArm):
-    """``fp8_mqa_logits`` without the logits clean, then ``top_k_ragged_transform`` over each row's visible keys (ids
+    """The DeepGEMM logits without the logits clean, then ``top_k_ragged_transform`` over each row's visible keys (ids
     only: the scores are gathered from the logits in :meth:`finish`)."""
 
     name = "deepgemm_ragged_topk"

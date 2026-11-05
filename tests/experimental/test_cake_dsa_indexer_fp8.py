@@ -866,6 +866,8 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
         pytest.skip("deep_gemm is not installed")
     import deep_gemm
 
+    if not hasattr(deep_gemm, "fp8_mqa_logits"):
+        pytest.skip("this deep_gemm build has no fp8_mqa_logits")
     inputs = ref.make_fp8_inputs([512], [8192], top_k=2048, seed=67, device="cuda")
     indices, scores = _run(inputs)
     visible = ref.visible_rows(inputs).to(torch.int32)
