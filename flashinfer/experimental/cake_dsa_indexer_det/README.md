@@ -135,7 +135,9 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   `scan:<kind>:u<n>:s0:f1:fp8[:lsf]`.  The merge and finalize programs are
   the BF16 form's.  Launches are non-PDL and non-cooperative, like BF16.
 * **Dispatch**: the architecture's FP8 record is its BF16 `POLICY` record with
-  `cake_policy.FP8_POLICY_OVERRIDES` applied (`cake_policy.fp8_policy_record`).
+  the fields of `cake_jit.POLICY_FP8[arch]` replaced
+  (`cake_policy.fp8_policy_record`); `POLICY_FP8` names every architecture's
+  FP8 `static_scan_kinds` itself.
   `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
   and maps the decided kind to a registered FP8 kind
   (`FP8_KIND_FALLBACK`: `wide` -> `narrow`, `pair_l6` -> `l6`, `pair_narrow` /
@@ -281,8 +283,9 @@ that writes the registry verifies the record against them before it is frozen.
   launch, in the same host call (none on a static call:
   where the shape alone bounds the work units by the grid,
   `cake_policy.ticket_static_path`, the scan never touches the ticket word;
-  none for a program of the record's `static_scan_kinds`, the sm_107a l6
-  programs, which keep the static unit enumeration on every call);
+  none for a program of the `static_scan_kinds` of its form's record, which
+  keeps the static unit enumeration on every call: on `sm_107a` the BF16 l6
+  and CTA-pair l6 programs and every FP8 program);
   the prepared runner (`cake_backend.prepare_dsa_indexer_det_topk`) allocates nothing at launch
   and is CUDA-graph capturable.
 * **Launch structure**: scan, optional merge, finalize (see above).  No

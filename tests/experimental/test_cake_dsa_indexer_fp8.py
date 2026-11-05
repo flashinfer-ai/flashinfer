@@ -101,7 +101,9 @@ def _registries():
 
 
 def _fp8_policy(arch: str) -> DispatchPolicy:
-    return DispatchPolicy.from_record(fp8_policy_record(arch, cake_jit.POLICY[arch]))
+    return DispatchPolicy.from_record(
+        fp8_policy_record(cake_jit.POLICY[arch], cake_jit.POLICY_FP8[arch])
+    )
 
 
 def _geometries(policy, *, steps_t=16, steps_m=14):
@@ -178,27 +180,43 @@ def test_fp8_scan_programs_index_the_fp8_keys_only():
     assert fp8_scan_programs({k for k in keys if scan_key_form(k) != FP8}) == {}
 
 
-def test_fp8_record_replaces_only_its_overrides_and_leaves_the_bf16_record():
+def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
+    """``POLICY_FP8`` covers the architectures of ``POLICY``, each naming its own ``static_scan_kinds``; the FP8 record
+    is the BF16 record with exactly those fields replaced, and neither registry table changes."""
     if not cake_jit.POLICY:
         pytest.skip("placeholder registry")
-    assert set(cake_policy.FP8_POLICY_OVERRIDES) == set(
-        SUPPORTED_COMPUTE_CAPABILITIES.values()
+    assert (
+        set(cake_jit.POLICY_FP8)
+        == set(cake_jit.POLICY)
+        == set(SUPPORTED_COMPUTE_CAPABILITIES.values())
     )
-    before = copy.deepcopy(cake_jit.POLICY)
+    before = copy.deepcopy((cake_jit.POLICY, cake_jit.POLICY_FP8))
     for arch, record in cake_jit.POLICY.items():
-        fp8 = fp8_policy_record(arch, record)
+        fields = cake_jit.POLICY_FP8[arch]
+        assert "static_scan_kinds" in fields and set(fields) <= set(POLICY_FIELDS), arch
+        fp8 = fp8_policy_record(record, fields)
         assert tuple(fp8) == tuple(record) == POLICY_FIELDS
-        changed = {f for f in POLICY_FIELDS if fp8[f] != record[f]}
-        assert changed <= set(cake_policy.FP8_POLICY_OVERRIDES[arch]), arch
+        assert {f: fp8[f] for f in fields} == fields, arch
+        assert {f: fp8[f] for f in POLICY_FIELDS if f not in fields} == {
+            f: record[f] for f in POLICY_FIELDS if f not in fields
+        }, arch
         DispatchPolicy.from_record(fp8)  # a valid record
-    assert before == cake_jit.POLICY
-    assert fp8_policy_record("sm_107a", cake_jit.POLICY["sm_107a"])[
-        "static_scan_kinds"
-    ] == ["l6", "narrow", "split_narrow"]
-    for arch in ("sm_100a", "sm_103a"):
-        assert fp8_policy_record(arch, cake_jit.POLICY[arch]) == cake_jit.POLICY[arch]
-    with pytest.raises(NotImplementedError, match="FP8"):
-        fp8_policy_record("sm_90a", cake_jit.POLICY["sm_100a"])
+    assert before == (cake_jit.POLICY, cake_jit.POLICY_FP8)
+    assert {
+        arch: fields["static_scan_kinds"]
+        for arch, fields in cake_jit.POLICY_FP8.items()
+    } == {
+        "sm_100a": [],
+        "sm_103a": [],
+        "sm_107a": ["l6", "narrow", "split_narrow"],
+    }
+    # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
+    with pytest.raises(ValueError, match="static_scan_kinds"):
+        fp8_policy_record(cake_jit.POLICY["sm_107a"], {})
+    with pytest.raises(ValueError, match="static_scan_kinds"):
+        fp8_policy_record(
+            cake_jit.POLICY["sm_100a"], {"static_scan_kinds": [], "unknown": 1}
+        )
 
 
 def test_fp8_policy_fails_closed_without_fp8_programs(monkeypatch):

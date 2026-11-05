@@ -48,7 +48,8 @@ from . import cake_build
 # with its role, its architecture-free ``library`` stem and its
 # architectures, ``PROGRAM_KEYS`` the program of every host dispatch key per
 # architecture (see ``cake_policy``), ``POLICY`` the per-architecture host
-# dispatch record and ``NUMERICS`` the documented numerics of the programs.
+# dispatch record, ``POLICY_FP8`` the fields of that record the FP8 input form
+# replaces and ``NUMERICS`` the documented numerics of the programs.
 # The launch geometry of a program (block, cluster, dynamic shared memory) is
 # fixed in its host binding.  A scan binding takes ``zero_region`` (slot kind
 # ``zero``) right before the grid: a byte range of the workspace it zeroes on
@@ -57,7 +58,8 @@ from . import cake_build
 # program's record lists in ``ticket_arg_arches`` the architectures on which it
 # draws its work units from that block instead of the workspace's ticket tail.
 # Every scan program takes ``K_scale`` (per-key FP32 scales) right before
-# ``TicketWord``; only an FP8 form reads it, and every program here is BF16.
+# ``TicketWord``; the FP8 programs (keys tagged ``:fp8``) read it, the BF16
+# programs never do.
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
 ABI: str = "dsa_indexer_v5"
@@ -127,11 +129,12 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 }
 # The architectures whose scan programs draw every work unit from a ticket word
 # (``cake_policy.TICKET_TAIL_BYTES``): every scan program on every architecture
-# but the physical kinds of ``POLICY[arch]["static_scan_kinds"]`` (the sm_107a
-# l6 programs), which keep the static enumeration.  A program whose record lists
-# the architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
-# (``cake_backend`` gives a prepared runner one of its own, zeroed once); every
-# other drawing program draws from the workspace's ticket tail.  Every completed
+# but the physical kinds of the ``static_scan_kinds`` of its input form
+# (``POLICY[arch]`` for BF16, ``POLICY_FP8[arch]`` for FP8), which keep the
+# static enumeration.  A program whose record lists the architecture in
+# ``ticket_arg_arches`` draws from its ``TicketWord`` block (``cake_backend``
+# gives a prepared runner one of its own, zeroed once); every other drawing
+# program draws from the workspace's ticket tail.  Every completed
 # scan launch leaves the ticket word at 0; the host (``cake_backend``) zeroes the
 # tail once when it prepares a runner on its own workspace, and on a caller-owned
 # ``workspace_buffer`` (others may write that buffer between runs) passes it as
@@ -987,6 +990,15 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_persist_max_k": 2048,
         "rank_persist_ctas_per_sm": 4,
     },
+}
+# The FP8 input form's dispatch record of an architecture is its ``POLICY``
+# record with these fields replaced (``cake_policy.fp8_policy_record``); each
+# names its own ``static_scan_kinds``: on sm_107a every FP8 scan program keeps
+# the static unit enumeration.
+POLICY_FP8: dict[str, dict[str, Any]] = {
+    "sm_100a": {"static_scan_kinds": []},
+    "sm_103a": {"static_scan_kinds": []},
+    "sm_107a": {"static_scan_kinds": ["l6", "narrow", "split_narrow"]},
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5676"
 

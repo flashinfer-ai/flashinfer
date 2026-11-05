@@ -90,9 +90,10 @@ Every allocation happens in :func:`prepare_dsa_indexer_det_topk`; the returned
 runner launches with no CUDA allocation and no host synchronization, so a
 runner (or a CUDA graph capturing it) replays for new values written into the
 bound tensors.  The host decides the program from host-known integers only
-(:mod:`cake_policy`, the registry's ``POLICY`` record of the architecture) and
-fails closed when the decided program is not registered for the device's
-architecture.  Kernels are reached through the argument plans of the registry
+(:mod:`cake_policy`, the registry's ``POLICY`` record of the architecture,
+with its ``POLICY_FP8`` fields for the FP8 form) and fails closed when the
+decided program is not registered for the device's architecture.  Kernels
+are reached through the argument plans of the registry
 (``cake_jit.ARG_PLANS``); ``cake_jit.ABI`` names the keyword set its kernels
 expect (:data:`ABI_CONTRACT`).
 """
@@ -113,6 +114,7 @@ from .cake_jit import (
     FFI_ENTRY,
     NUMERICS,
     POLICY,
+    POLICY_FP8,
     PROGRAM_KEYS,
     PROGRAMS,
     STAGES,
@@ -277,9 +279,9 @@ def registry_abi() -> str:
 
 def policy_for(arch: str, form: str = BF16) -> DispatchPolicy:
     """The dispatch policy of the input form ``form`` on ``arch``: the registry's ``POLICY`` record (BF16), or for the
-    FP8 form that record with ``cake_policy.FP8_POLICY_OVERRIDES`` (``fp8_policy_record``).  The registry is immutable
-    for the life of the process, so a record is validated once per architecture and form; an architecture without
-    programs of the form raises on every call."""
+    FP8 form that record with the fields of the registry's ``POLICY_FP8`` record replaced (``fp8_policy_record``).
+    The registry is immutable for the life of the process, so a record is validated once per architecture and form;
+    an architecture without programs of the form raises on every call."""
     return _policy_for(arch, form)
 
 
@@ -292,12 +294,12 @@ def _policy_for(arch: str, form: str) -> DispatchPolicy:
             f"(registered: {sorted(POLICY)}; see {TRACKING_ISSUE})"
         )
     if form == FP8:
-        if not fp8_programs_for(arch):
+        if not fp8_programs_for(arch) or arch not in POLICY_FP8:
             raise NotImplementedError(
                 f"The generated float8_e4m3fn DSA indexer top-k programs for {arch} are not registered in this "
                 f"checkout (see {TRACKING_ISSUE})"
             )
-        record = fp8_policy_record(arch, record)
+        record = fp8_policy_record(record, POLICY_FP8[arch])
     elif form != BF16:
         raise ValueError(f"form must be one of {tuple(FORM_DTYPES)}, got {form!r}")
     return DispatchPolicy.from_record(record)
@@ -1321,8 +1323,8 @@ def _prepare_runner(
     # right before every scan launch (see ``DSAIndexerDetRunner.ticket_tail``).
     # A static call (``ticket_static_path``: the shape bounds the work units by the launched
     # grid, so every scan launch takes the static fast path and never touches the word) is
-    # zeroed neither here nor per run.  A program of the record's ``static_scan_kinds`` (the
-    # sm_107a l6 programs) keeps the static enumeration on every call: no tail view, nothing zeroed.
+    # zeroed neither here nor per run.  A program of the ``static_scan_kinds`` of its form's record
+    # (``policy_for(arch, form)``) keeps the static enumeration on every call: no tail view, nothing zeroed.
     # A program that reads its TicketWord argument (``reads_ticket_word``) has no tail here: it draws from its
     # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it.
     # (``tail_at`` / ``tail_static`` were decided above, before the first device operation; a call launches

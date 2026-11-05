@@ -52,9 +52,10 @@ The opt-in FP8 input form (float8_e4m3fn ``q`` / ``k``) has its own scan
 programs, keyed ``scan:<kind>:u<unroll>:s0:f1:fp8[:lsf]``, for the narrow, l6
 and split kinds only.  An FP8 call runs the same decision procedure under the
 architecture's FP8 record (``fp8_policy_record``: the ``POLICY`` record with
-``FP8_POLICY_OVERRIDES``) and then the registered FP8 program of the decided
-kind, or of its ``FP8_KIND_FALLBACK`` kind (``select_fp8_program``).  Every
-FP8 program of one architecture computes the same ids and score bits.
+the fields of the registry's ``POLICY_FP8`` record replaced) and then the
+registered FP8 program of the decided kind, or of its ``FP8_KIND_FALLBACK``
+kind (``select_fp8_program``).  Every FP8 program of one architecture
+computes the same ids and score bits.
 """
 
 from __future__ import annotations
@@ -167,13 +168,6 @@ FP8_KIND_FALLBACK = {
     "pair_wide": "narrow",
     "split_wide": "split_narrow",
     "split_l6": "split_narrow",
-}
-# The fields of an architecture's ``POLICY`` record the FP8 form replaces: on sm_107a every FP8 scan program keeps the
-# static unit enumeration (no ticket tail, no TicketWord), where the BF16 narrow and split programs draw tickets.
-FP8_POLICY_OVERRIDES: dict[str, dict[str, Any]] = {
-    "sm_100a": {},
-    "sm_103a": {},
-    "sm_107a": {"static_scan_kinds": ["l6", "narrow", "split_narrow"]},
 }
 # Admissible sampled rank shift (permille): the backend's ``sample_shift_permille`` knob bound and the bound of a record's
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
@@ -1301,13 +1295,19 @@ def scan_key_form(key: str) -> Optional[str]:
     return None if fields is None else fields.form
 
 
-def fp8_policy_record(arch: str, record: dict) -> dict:
-    """The FP8 form's dispatch record of ``arch``: the architecture's record ``record`` (``POLICY[arch]``) with the
-    fields of ``FP8_POLICY_OVERRIDES[arch]`` replaced; an architecture without an entry has no FP8 dispatch."""
-    overrides = FP8_POLICY_OVERRIDES.get(arch)
-    if overrides is None:
-        raise NotImplementedError(f"no FP8 dispatch record for {arch}")
-    return {**record, **overrides}
+def fp8_policy_record(record: dict, fp8_record: dict) -> dict:
+    """The FP8 form's dispatch record of an architecture: its record ``record`` (``POLICY[arch]``) with the fields of
+    its FP8 record ``fp8_record`` (``POLICY_FP8[arch]``) replaced.  ``fp8_record`` names its own ``static_scan_kinds``
+    (the FP8 programs never keep the BF16 programs' static kinds) and no field outside ``POLICY_FIELDS``."""
+    if (
+        not isinstance(fp8_record, dict)
+        or "static_scan_kinds" not in fp8_record
+        or not set(fp8_record) <= set(POLICY_FIELDS)
+    ):
+        raise ValueError(
+            f"an FP8 dispatch record must name static_scan_kinds and only fields of {POLICY_FIELDS}, got {fp8_record!r}"
+        )
+    return {**record, **fp8_record}
 
 
 def fp8_scan_programs(scan_keys: Collection[str]) -> dict:
@@ -1810,7 +1810,6 @@ __all__ = [
     "FORMS",
     "FP8",
     "FP8_KIND_FALLBACK",
-    "FP8_POLICY_OVERRIDES",
     "KINDS",
     "MERGE_KEY",
     "POLICY_FIELDS",

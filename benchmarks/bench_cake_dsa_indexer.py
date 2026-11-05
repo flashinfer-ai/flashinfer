@@ -828,7 +828,8 @@ def forced_policy(backend, overrides: dict):
     ``plan_dsa_indexer_det_topk`` and ``prepare_dsa_indexer_det_topk`` look ``policy_for`` up on the module at every call, so
     the workspace bound, the plan record and the prepared launches of an arm built inside this scope all follow the
     forced policy (``DispatchPolicy.from_record`` validates the record as it does the registry's); the original
-    function is restored on exit.  The FP8 form's record (``fp8_policy_record``) takes the same overrides.
+    function is restored on exit.  The FP8 form's record (``fp8_policy_record`` of ``POLICY`` and ``POLICY_FP8``) takes
+    the same overrides.
     """
     original = backend.policy_for
     forced = {}
@@ -837,7 +838,7 @@ def forced_policy(backend, overrides: dict):
         if (arch, form) not in forced:
             record = backend.POLICY[arch]
             if form != "bf16":
-                record = backend.fp8_policy_record(arch, record)
+                record = backend.fp8_policy_record(record, backend.POLICY_FP8[arch])
             forced[(arch, form)] = backend.DispatchPolicy.from_record(
                 {**record, **overrides}
             )

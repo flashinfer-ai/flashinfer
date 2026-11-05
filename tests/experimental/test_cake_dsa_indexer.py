@@ -4470,7 +4470,7 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
         lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
         for kind in policy_for(arch).static_scan_kinds:
             assert kind in kinds and kind not in lsf_kinds, (arch, kind)
-        # the FP8 form decides its tail by its own record (``FP8_POLICY_OVERRIDES``): every static kind is an FP8 kind
+        # the FP8 form decides its tail by its own record (``POLICY_FP8``): every static kind is an FP8 kind
         # the architecture registers without an :lsf copy
         if not cake_backend.fp8_programs_for(arch):
             continue
