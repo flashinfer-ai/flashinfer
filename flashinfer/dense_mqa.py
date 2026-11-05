@@ -60,8 +60,11 @@ def fp8_mqa_logits(
     ``q`` E4M3 ``[Q, H, 128]`` (``H`` in the catalog's head counts), ``kv`` the
     pair ``(E4M3 [K, 128], FP32 scales [K])``, FP32 ``weights [Q, H]``, int32
     ``ks`` / ``ke [Q]`` with ``0 <= ks <= ke <= K``. Returns the FP32 ``[Q, K]``
-    view of a row-padded buffer whose every cell is written (``-inf`` outside
-    each row's window), so ``clean_logits`` does not change the result;
+    view of a row-padded buffer. The cells inside each row's window are the
+    same for both ``clean_logits`` values. With ``clean_logits=True`` every
+    other cell is ``-inf`` (a route whose own programs store raw tiles rejects
+    it); with ``clean_logits=False`` (DeepGEMM semantics) a route that
+    catalogues a ``"raw"`` variant leaves them unwritten.
     ``max_seqlen_k`` must be 0. ``sm_count`` overrides the CTA budget (default:
     the device's SM count). Which ``(H, Q, K)`` points are served is a catalog
     property: ``dense_route_available(H, Q, K)`` in

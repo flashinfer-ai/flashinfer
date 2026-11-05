@@ -124,13 +124,14 @@ BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
 # build where the loader names one (``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES``,
 # see _work_bin_turn_short_program): at most this many 32-token chunks in the
 # longest task and at least this many tasks per SM.  That build stores each
-# task's final state with per-warp TMA boxes; on sm_100a it spills more in the
-# chunk loop than the stock store and binds a tensor map of the final state on
-# every call, which pays only where the bins turn their state over every few
-# chunks and the launch has many such tasks per SM.  Measured on a 148-SM
-# sm_100a: 64-token tasks at 768 and 1024 tasks gain; 256 tasks of 64 tokens
-# and launches of up to 255-token tasks do not.  Every other turnover launch
-# keeps the turnover build (the stock store there).
+# task's final state with per-warp TMA boxes and, for a pool updated in place,
+# loads each task's entering state with TMA boxes from a bin's second task on;
+# it binds a tensor map of the final state on every call, which pays only where
+# the bins turn their state over every few chunks and the launch has many such
+# tasks per SM.  Measured on a 148-SM sm_100a: 64-token tasks at 768 and 1024
+# tasks gain; 256 tasks of 64 tokens and launches of up to 255-token tasks do
+# not.  Every other turnover launch keeps the turnover build (the stock store
+# there).
 BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS = 2
 BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
@@ -4520,7 +4521,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             # A turnover launch of short tasks with many tasks per SM that
             # takes neither build takes the module's short-task turnover build
             # where the loader names one: the same bins, table and bits with
-            # the per-warp TMA final-state store.
+            # the per-warp TMA final-state store and TMA entering-state loads.
             if (
                 bin_mix_plan is None
                 and uses_default_fused_m128

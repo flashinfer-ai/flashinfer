@@ -1252,7 +1252,7 @@ def emulate_backward(
                                 out_segs, dtype=torch.int32, device=rk.ctx.device
                             ),
                             **rk.pool_args(
-                                "out", "b1_m_dm", b1_send[rk.rank], "h0_index"
+                                "out", "b1_m_dm", b1_send[rk.rank], "b1_m_index"
                             ),
                             "init_mode": 0,
                             "use_u": 0,

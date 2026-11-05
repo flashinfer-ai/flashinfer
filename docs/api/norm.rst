@@ -181,7 +181,9 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
   order depend on scheduling: the weight gradient can differ between calls,
-  always within the deterministic backward's error bound. Up to 256 rows
+  always within the deterministic backward's error bound (for FP32 normal
+  gates, terms and sums; with subnormal values both backwards can leave it).
+  Up to 256 rows
   the backward is one thread-block cluster of 16 CTAs that adds
   the CTAs' partial sums in a fixed order on chip: the same bits on every
   call, within the same bound, and no workspace. The workspace

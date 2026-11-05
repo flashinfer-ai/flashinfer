@@ -966,20 +966,54 @@ def _fp8_persistent_program(
     return "fp8_h128_prefill_source_persistent"
 
 
-def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
+# SM107: the FP8/H64 rows of one complete sparse tile and at least half of a
+# second (widths 192-252) also run the persistent body past 12 tokens, and from
+# 48 keys of a second (widths 176-191) up to 16 tokens.  Per architecture:
+# (minimum width, minimum width up to 16 tokens).
+_FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH = {"sm_107a": (192, 176)}
+
+
+def _fp8_h64_uses_persistent_body(
+    sparse_topk: int, num_query_tokens: int, arch: Optional[str] = None
+) -> bool:
     """FP8/H64 rows that run the FP8/H128 persistent body while it fits one wave
-    (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+    (Cake seed ``portfolio_v34.uses_persistent_body``).
+
+    On SM107 the rows of one complete tile and at least half of a second join
+    them past 12 tokens, and from 48 keys of a second up to 16 tokens
+    (``_FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH``).  VR200 (208 SMs, two
+    boards), q_len 1 and 4: widths 192-252 at 13-31 tokens, M64 body
+    5.93-6.19 -> persistent body 5.65-6.17 us (0.99-1.05x; 1.00-1.05x up to
+    24 tokens); width 176 at 13-16 tokens 5.93-6.03 -> 5.78-5.90 us
+    (1.02-1.03x), 0.97-1.01x past 16 tokens.  Narrower widths stay on the M64
+    body (1.00-1.02x up to 16 tokens, 0.97-1.00x past them, one board).
+    """
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
+    if full_tiles == 1:
+        min_width, short_min_width = _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH.get(
+            arch, (2 * _TILE_KV, 2 * _TILE_KV)
+        )
+        if num_query_tokens <= 16:
+            min_width = short_min_width
+        return sparse_topk >= min_width
     return full_tiles >= 2
 
 
 # SM107: the M64 body (K=64 QK) takes the FP8/H64 decode rows of two to four
-# sparse tiles before the half wave.  Per tile count ``ceil(sparse_topk / 128)``,
-# ``(num, den)``: the M64 body from ``den * tokens > num * sm_count`` on.
+# sparse tiles before the half wave.  Per ``(ceil(sparse_topk / 128),
+# sparse_topk // 128)`` (all tiles, complete tiles), ``(num, den)``: the M64
+# body from ``den * tokens > num * sm_count`` on.
 _FP8_H64_M64_EARLY_WAVE = {
-    "sm_107a": {2: (1, 8), 3: (1, 4), 4: (3, 10)},
+    "sm_107a": {
+        (2, 1): (3, 20),
+        (2, 2): (1, 8),
+        (3, 2): (51, 200),
+        (3, 3): (1, 4),
+        (4, 3): (3, 10),
+        (4, 4): (13, 50),
+    },
 }
 
 
@@ -1005,13 +1039,21 @@ def _fp8_h64_uses_m64_body(
     persistent body -> M64 body over the rows each tile count adds: two tiles
     5.79-7.79 -> 5.54-6.24 us, three tiles 7.33-8.76 -> 7.06-7.92 us, four
     tiles 8.76-9.54 -> 8.23-9.09 us (0.99-1.25x).  Five tiles and up stay on
-    the persistent body below the half wave (M64 0.83-1.02x there).
+    the persistent body below the half wave (M64 0.83-1.02x there).  The
+    complete-tile count refines the edges (VR200, 208 SMs, two boards): two
+    tiles with one complete take the M64 body from 32 tokens, where the two
+    bodies meet (6.03-6.10 vs 6.05-6.10 us); three tiles with two complete
+    (widths 260-380, measured at 260 and 320) keep the persistent body at 53
+    tokens (M64 7.22-7.34 vs 7.08-7.20 us); and four complete tiles (width
+    512) take the M64 body from 55 tokens (8.28-8.65 -> 8.11-8.25 us at 55-62
+    tokens).
     """
     if 2 * num_query_tokens > sm_count:
         return True
     if sparse_topk is None:
         return False
-    early = _FP8_H64_M64_EARLY_WAVE.get(arch, {}).get(_ceil_div(sparse_topk, _TILE_KV))
+    tiles = (_ceil_div(sparse_topk, _TILE_KV), sparse_topk // _TILE_KV)
+    early = _FP8_H64_M64_EARLY_WAVE.get(arch, {}).get(tiles)
     return early is not None and early[1] * num_query_tokens > early[0] * sm_count
 
 
@@ -1315,7 +1357,7 @@ def _route(
                 # token, unified 128-row KV stage, no V gathers).  Two exported
                 # programs, selected by the item width.
                 return _fp8_h64_m64_program(sparse_topk)
-            if _fp8_h64_uses_persistent_body(sparse_topk, num_query_tokens):
+            if _fp8_h64_uses_persistent_body(sparse_topk, num_query_tokens, arch):
                 # Same persistent FP8 body as FP8/H128 (heads >= num_heads
                 # predicated) for the multi-tile rows of one wave: GB300 10.5-12.0
                 # us vs 13.4-14.1 us for the M64 body on the 1-72-token topk4x
@@ -1327,7 +1369,9 @@ def _route(
                 return "fp8_lowhead_h64"
             # Rows with one complete tile (and width 256): the M64 body beats
             # the H64 cluster body at every token count (GB300, topk128x widths
-            # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
+            # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).  On SM107 the
+            # rows of _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH took the persistent
+            # body above.
             return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
             if _fp8_lowhead_swa_uses_m64_body(num_query_tokens, sm_count, arch):
