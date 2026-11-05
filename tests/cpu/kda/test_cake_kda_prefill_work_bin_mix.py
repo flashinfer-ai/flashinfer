@@ -332,21 +332,31 @@ def test_short_task_scope_and_program_lookup(monkeypatch):
 
 
 def test_shipped_loader_names_the_unbounded_direct_short_task_build():
-    # One short-task turnover build, on sm_100a alone: the sm_103a turnover
-    # build of the same module, shipping for both architectures, beside the
-    # sm_100a turnover build.
+    # One short-task turnover build, on sm_100a alone: the module's turnover
+    # build plus the TMA entering-state load, shipping for sm_100a alone,
+    # beside the sm_100a turnover build; the turnover build itself (the
+    # sm_103a turnover route) ships for sm_103a alone.
     routes = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES
     assert set(routes) == {"sm_100a", "sm_103a"} and routes["sm_103a"] == {}
     assert len(routes["sm_100a"]) == 1
     for module, program in routes["sm_100a"].items():
         assert module in TURN["sm_100a"] and program != TURN["sm_100a"][module]
-        assert program == TURN["sm_103a"][module]
-        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
+        assert program != TURN["sm_103a"][module]
+        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_100a"]
+        assert registry._RENDERED_MODULES[TURN["sm_103a"][module]]["arches"] == [
+            "sm_103a"
+        ]
         assert (
             runtime._work_bin_turn_short_program(
                 TURN["sm_100a"][module], "sm_100a", [64] * 64, 12, 148
             )
             == program
+        )
+        assert (
+            runtime._work_bin_turn_short_program(
+                TURN["sm_100a"][module], "sm_100a", [64] * 16, 12, 148
+            )
+            is None
         )
 
 
