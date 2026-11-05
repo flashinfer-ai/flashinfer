@@ -29,6 +29,23 @@ split plan, same per-item code and fold order: the output is bitwise the shipped
 flag words live in a buffer of the launcher (zeroed once when it is built); one launcher must not
 run on two streams at once (as its workspace).
 
+Three options select the extended programs of the same plan (``main_<kind>_ext`` /
+``reduce_<kind>_ext``; the default call launches the programs above with the arguments above):
+
+* ``lse``: a caller-owned FP32 buffer of one value per (token, head) row, ``[total_q, H]`` or
+  ``[B, q_len, H]`` (contiguous), receives ``log(sum_k exp(bmm1_scale * q . k_k))`` over the row's
+  visible keys, natural log (``lse_base="e"``) or base 2 (``lse_base="2"``); a row that sees no
+  key gets ``-inf`` and a zero ``O`` row.
+* ``causal=False``: every query token of a request sees all ``seq_lens[b]`` keys (uniform
+  non-causal multi-token verify); ``causal_seqs`` is not read.
+* ``cp_world`` / ``cp_rank`` / ``causal_seqs``: the cache holds the rank's shard of a
+  decode-context-parallel KV sequence.  Global position ``p`` lives on rank ``p % cp_world`` at
+  local index ``p // cp_world``; ``causal_seqs[b]`` is request ``b``'s global KV length including its
+  query tokens and ``seq_lens[b]`` its local length.  Query token ``q`` of a request sees the
+  local keys whose global position is below ``causal_seqs[b] - q_len + q + 1``.  Merge the ranks'
+  ``(O, lse)`` with a log-sum-exp weighted combine in the matching base.  Block interleave
+  (``cp_interleave > 1``) is refused.
+
 Query and KV views may be row-strided on every route: every row of ``query`` and every token
 row of ``kv_cache`` must be 576 contiguous FP8 elements, and rows must be equally spaced (a
 16-byte multiple); the TMA descriptors of the row-tile programs and of the two-CTA wide kernel
@@ -101,6 +118,13 @@ WIDE_TAIL_MIN_GAIN = 0.02
 WIDE_CTA_THREADS = 384
 WIDE_CTA_SMEM_BYTES = 232448
 TMA_ROW_ALIGN = 16  # bytes: TMA global strides are 16-byte multiples
+# log2 of the probability scale of each attention schedule (row tiles: 224 = 2^7.807355, wide: 112):
+# the split statistics carry it, so the reducer's LSE subtracts it (``lse_bias``).  The literals are
+# the kernels' own f32 constants.
+ROW_TILE_P_SCALE_LOG2 = 7.807355
+WIDE_P_SCALE_LOG2 = 6.807355
+# lse_scale: log2-sum-exp -> natural log or base 2.
+LSE_BASES = {"e": math.log(2.0), "2": 1.0}
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +631,113 @@ def _bind_args(
     return args
 
 
+def _is_pow2(n: int) -> bool:
+    return (
+        isinstance(n, int) and not isinstance(n, bool) and n >= 1 and n & (n - 1) == 0
+    )
+
+
+def _ext_values(
+    *,
+    lse: Optional[torch.Tensor],
+    lse_base: str,
+    causal: bool,
+    causal_seqs: Optional[torch.Tensor],
+    cp_world: int,
+    cp_rank: int,
+    cp_interleave: int,
+    rows: int,
+    batch: int,
+    seq_lens: torch.Tensor,
+    device: torch.device,
+) -> Optional[dict[str, Any]]:
+    """Construction-time check of the LSE / DCP / mask options; ``None`` keeps the default programs.
+
+    Otherwise the arguments the ``_ext`` programs take besides the default ones: ``lse`` (the caller's
+    buffer, or a launcher-owned one when only the mask changes), ``lse_scale``, ``causal_seqs``
+    (``seq_lens`` without DCP: the bound is then the local bottom-right one), ``causal`` and the shard
+    geometry ``cp_shift = log2(W * I)``, ``cp_ishift = log2(I)``, ``cp_rank_off = rank * I``,
+    ``cp_span = I``.
+    """
+    if lse_base not in LSE_BASES:
+        raise ValueError(f"lse_base must be 'e' or '2', got {lse_base!r}")
+    if not isinstance(causal, bool):
+        raise TypeError(f"causal must be a bool, got {type(causal).__name__}")
+    if not _is_pow2(cp_world):
+        raise ValueError(f"cp_world must be a power of two >= 1, got {cp_world!r}")
+    if (
+        not isinstance(cp_rank, int)
+        or isinstance(cp_rank, bool)
+        or not 0 <= cp_rank < cp_world
+    ):
+        raise ValueError(
+            f"cp_rank must be an integer with 0 <= cp_rank < cp_world={cp_world}, got {cp_rank!r}"
+        )
+    if not _is_pow2(cp_interleave):
+        raise ValueError(
+            f"cp_interleave must be a power of two >= 1, got {cp_interleave!r}"
+        )
+    if cp_interleave != 1:
+        raise NotImplementedError(
+            "CAKE Kimi-K3 MLA supports cyclic DCP sharding only (cp_interleave=1)"
+        )
+    if cp_world > 1:
+        if causal_seqs is None:
+            raise ValueError("causal_seqs is required when cp_world > 1")
+        if not isinstance(causal_seqs, torch.Tensor):
+            raise TypeError("causal_seqs must be a torch.Tensor")
+        if causal_seqs.dtype != torch.int32:
+            raise ValueError(f"causal_seqs must be int32, got {causal_seqs.dtype}")
+        if causal_seqs.device != device:
+            raise ValueError(
+                f"causal_seqs must be on the query device {device}, got {causal_seqs.device}"
+            )
+        if tuple(causal_seqs.shape) != (batch,):
+            raise ValueError(
+                f"causal_seqs must have shape ({batch},), got {tuple(causal_seqs.shape)}"
+            )
+        if not causal_seqs.is_contiguous():
+            raise ValueError("causal_seqs must be contiguous")
+    elif causal_seqs is not None:
+        raise ValueError(
+            "causal_seqs is only read with cp_world > 1 (the global length of a sharded request)"
+        )
+    if lse is not None:
+        if not isinstance(lse, torch.Tensor):
+            raise TypeError("lse must be a torch.Tensor")
+        if lse.dtype != torch.float32:
+            raise ValueError(f"lse must be float32, got {lse.dtype}")
+        if lse.device != device:
+            raise ValueError(
+                f"lse must be on the query device {device}, got {lse.device}"
+            )
+        if not lse.is_contiguous():
+            raise ValueError("lse must be contiguous")
+        if lse.numel() != rows:
+            raise ValueError(
+                f"lse must hold one value per (token, head) row of query ({rows}), got "
+                f"{lse.numel()} ([total_q, H] or [B, q_len, H])"
+            )
+    if lse is None and causal and cp_world == 1:
+        return None
+    lse_rows = (
+        lse.reshape(-1)
+        if lse is not None
+        else torch.empty(max(rows, 1), dtype=torch.float32, device=device)
+    )
+    shift_i = cp_interleave.bit_length() - 1
+    return dict(
+        lse=lse_rows,
+        lse_scale=LSE_BASES[lse_base],
+        causal_seqs=causal_seqs if cp_world > 1 else seq_lens,
+        causal=int(causal),
+        cp_shift=(cp_world * cp_interleave).bit_length() - 1,
+        cp_ishift=shift_i,
+        cp_rank_off=cp_rank * cp_interleave,
+        cp_span=cp_interleave,
+    )
+
+
 @functools.cache
 def _kernel_entry(name: str, arch: str, ffi_entry: str):
     from ..jit.cake_kimi_k3_mla import get_cake_kimi_k3_mla_module
@@ -627,7 +758,14 @@ class KimiK3MlaFp8PagedAttention:
     docstring); ``kv_cache`` FP8 ``[pages, 64, 576]`` or ``[pages, 1, 64, 576]`` (token rows may
     be strided); ``block_tables`` int32 ``[B, width]``; ``seq_lens`` int32 ``[B]``; ``out`` BF16
     ``query.shape[:-1] + (512,)`` with dense rows; ``workspace_buffer`` a CUDA byte buffer of at
-    least ``workspace_bytes(rows_max, num_split)`` bytes.
+    least ``workspace_bytes(rows_max, num_split)`` bytes (the options below do not change it).
+
+    ``lse`` (FP32, one value per query row, caller-owned), ``lse_base`` (``"e"`` or ``"2"``),
+    ``causal`` (``False``: every query token sees all ``seq_lens[b]`` keys), ``cp_world`` /
+    ``cp_rank`` / ``causal_seqs`` (int32 ``[B]`` global lengths, required iff ``cp_world > 1``) and
+    ``cp_interleave`` (only 1) follow the module docstring; they are bound here, so ``launch`` stays
+    allocation-free and CUDA-Graph replayable with new ``seq_lens`` / ``causal_seqs`` contents.
+    Plan the shard with its local ``max_seq_len``.
     """
 
     def __init__(
@@ -645,6 +783,13 @@ class KimiK3MlaFp8PagedAttention:
         max_q_len: Optional[int] = None,
         max_seq_len: Optional[int] = None,
         num_split: Optional[int] = None,
+        lse: Optional[torch.Tensor] = None,
+        lse_base: str = "e",
+        causal: bool = True,
+        causal_seqs: Optional[torch.Tensor] = None,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        cp_interleave: int = 1,
     ):
         from ..jit.cake_kimi_k3_mla import get_cake_kimi_k3_mla_kernel
 
@@ -693,6 +838,19 @@ class KimiK3MlaFp8PagedAttention:
             )
         if max_seq_len is None:
             max_seq_len = int(block_tables.shape[-1]) * PAGE_SIZE
+        ext = _ext_values(
+            lse=lse,
+            lse_base=lse_base,
+            causal=causal,
+            causal_seqs=causal_seqs,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            cp_interleave=cp_interleave,
+            rows=int(q_rows.shape[0]),
+            batch=int(batch),
+            seq_lens=seq_lens,
+            device=device,
+        )
         self.arch, sm_count = _device_facts(_device_index(device))
         self.batch = int(batch)
         self.num_heads = int(num_heads)
@@ -741,6 +899,11 @@ class KimiK3MlaFp8PagedAttention:
             self.tile_flags = torch.zeros(
                 2 + tail_items, dtype=torch.int32, device=device
             ).view(torch.uint32)
+        self.lse = None if ext is None else ext["lse"]
+        if ext is not None:
+            # Same plan, grids and workspace; the _ext programs add the LSE store and the
+            # visible-key bound.
+            main_kind, reduce_kind = f"{main_kind}_ext", f"{reduce_kind}_ext"
         main = get_cake_kimi_k3_mla_kernel(main_kind, arch=self.arch)
         reduce = get_cake_kimi_k3_mla_kernel(reduce_kind, arch=self.arch)
         self.route_metadata = dict(
@@ -750,6 +913,7 @@ class KimiK3MlaFp8PagedAttention:
             rt=plan.rt,
             reducer=reduce_kind,
             persistent=self.tile_flags is not None,
+            ext=ext is not None,
             main_module=main["name"],
             reduce_module=reduce["name"],
         )
@@ -781,6 +945,8 @@ class KimiK3MlaFp8PagedAttention:
             main_values.update(
                 n_work_clusters=wide_work_clusters(plan), tile_flags=self.tile_flags
             )
+        if ext is not None:
+            main_values.update(ext)
         self._main_fn = _kernel_entry(main["name"], self.arch, main["ffi_entry"])
         self._main_args = _bind_args(main, main_values, grid_main)
         self._reduce_fn = None
@@ -805,6 +971,11 @@ class KimiK3MlaFp8PagedAttention:
             )
             if self.tile_flags is not None:
                 reduce_values.update(tile_flags=self.tile_flags)
+            if ext is not None:
+                p_scale_log2 = WIDE_P_SCALE_LOG2 if plan.wide else ROW_TILE_P_SCALE_LOG2
+                reduce_values.update(
+                    lse=ext["lse"], lse_scale=ext["lse_scale"], lse_bias=-p_scale_log2
+                )
             self._reduce_args = _bind_args(reduce, reduce_values, plan.grid_reduce)
 
     def launch(self) -> None:
@@ -827,11 +998,19 @@ def run_cake_kimi_k3_mla_fp8_paged_attention(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     max_seq_len: Optional[int] = None,
+    lse: Optional[torch.Tensor] = None,
+    lse_base: str = "e",
+    causal: bool = True,
+    causal_seqs: Optional[torch.Tensor] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    cp_interleave: int = 1,
 ) -> torch.Tensor:
     """One-shot entry used by ``trtllm_batch_decode_with_kv_cache_mla(backend="cake")``.
 
     The plan is cached per batch shape (:func:`plan_attention`) and the device facts per device,
-    so a decode loop pays only argument validation and binding per step.
+    so a decode loop pays only argument validation and binding per step.  ``lse`` and the mask /
+    DCP options are the :class:`KimiK3MlaFp8PagedAttention` ones.
     """
     KimiK3MlaFp8PagedAttention(
         query=query,
@@ -845,6 +1024,13 @@ def run_cake_kimi_k3_mla_fp8_paged_attention(
         cum_seq_lens_q=cum_seq_lens_q,
         max_q_len=max_q_len,
         max_seq_len=max_seq_len,
+        lse=lse,
+        lse_base=lse_base,
+        causal=causal,
+        causal_seqs=causal_seqs,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        cp_interleave=cp_interleave,
     ).launch()
     return out
 
