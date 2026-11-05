@@ -1731,15 +1731,22 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     # ---- sm_103a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
     #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
-    #      rule's 8), with the per-tile K partitions of the row's plan without them, measured on GB300 against
-    #      that plan ----
-    ('sm_103a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
-    ('sm_103a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12},
+    #      rule's 8; round 9 at T 16231 / 16384: the tall epilogue released by row half in place of the column-chunk
+    #      one, the sm_100a keys' rule, measured against the round-6 program), with the per-tile K partitions of the
+    #      row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
     # ---- sm_103a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the sm_100a key's program:
     #      the half-tail program with the tall epilogue released by row half and the column-grouped raster in
     #      8-column-tile groups, in place of the inherited sm_100a ragged rule's overlapped half-tail program), with the
     #      per-tile K partitions of the row's plan without it, measured on GB300 against that plan ----
     ('sm_103a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_103a: the GB T-exact rules of round 9 - the 12288 -> 4096 forward at T 16231 / 16384 (the half-tail
+    #      program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups,
+    #      in place of the ragged rule's overlapped half-tail program in 16-column-tile groups), with the per-tile K
+    #      partitions of the row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
 }
 # fmt: on
 

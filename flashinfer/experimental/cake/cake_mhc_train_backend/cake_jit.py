@@ -84,7 +84,10 @@ column slab too (``cake_mhc_train_bwd_slab_atomic__lpt__h<H>``,
 ``cake_mhc_train_bwd_slab_atomic__lpt_os__h<H>``), picked as at hidden 4096.
 sm_103a has no ``lpt`` calibration of these sizes yet (``BWD_SLAB_LPT_HIDDEN`` is
 ``None`` there): its column slab runs ``dynr`` in the ``"chunk"`` band of
-``BWD_SLAB_ORDER`` and ``dynr_os`` in the ``"slab"`` band above it.
+``BWD_SLAB_ORDER`` and ``dynr_os`` in the ``"slab"`` band above it (on the
+152-SM board at 7168 in the bands of its cell of ``BWD_SLAB_ORDER_OVERRIDES``:
+``"slab"`` also on 47 of the 48 token-count segments in 33793..63091 whose
+column-slab chunk count is at least 19; 34817..35264 keeps ``"chunk"``).
 
 So ``bwd_finish`` is the deterministic token-owner pass, the fn split and the
 column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
@@ -7930,13 +7933,13 @@ BWD_SLAB_LPT_HIDDEN = {
 # from 28826 (48 counts) no count is slower in either of 2 runs, -557..-859 us in sum; between 16132 and 27973 six
 # counts read +1.3..+3.9 us slower in one run. At 7168 from 63092 (5 counts) none is slower in any of 3 runs, -142..-182
 # us in sum; below it slower and faster counts interleave by geometry (44 of 103 counts slower in all 3 runs, 59 in at
-# least one). At 73728 / 98304 / 122880 (4096) and 73728 / 98304 (5120, 7168) the slab order is faster in 16 of 16
-# groups (-19..-61 us). sm_107a: "chunk" at every size. At 4096 a 212-SM A/B (2 runs) reads the slab order faster at 84
-# of the 96 token counts from 1877 and slower at none, -853..-935 us in sum per run; its slab arm also ran a banded
-# two-size calibration, which picks another geometry at 9 counts, where the slab order under the chunk arm's (0.5, 0.97)
-# reads faster in both runs as well. The 208- and 216-SM boards are not measured, so they keep the chunk order; the
-# 212-SM board's slab order from 1877 tokens is BWD_SLAB_ORDER_OVERRIDES's. sm_107a routes no column slab of 5120 /
-# 7168.
+# least one): the 152-SM board's bands in 33793..63091 are BWD_SLAB_ORDER_OVERRIDES's, by the chunk count. At 73728 /
+# 98304 / 122880 (4096) and 73728 / 98304 (5120, 7168) the slab order is faster in 16 of 16 groups (-19..-61 us).
+# sm_107a: "chunk" at every size. At 4096 a 212-SM A/B (2 runs) reads the slab order faster at 84 of the 96 token counts
+# from 1877 and slower at none, -853..-935 us in sum per run; its slab arm also ran a banded two-size calibration, which
+# picks another geometry at 9 counts, where the slab order under the chunk arm's (0.5, 0.97) reads faster in both runs
+# as well. The 208- and 216-SM boards are not measured, so they keep the chunk order; the 212-SM board's slab order from
+# 1877 tokens is BWD_SLAB_ORDER_OVERRIDES's. sm_107a routes no column slab of 5120 / 7168.
 # sm_100a (GB200, 152 SMs): at 4096 from 2048 (95 counts) no count is slower in both of 2 runs and only 2670 in one
 # (backward +0.6 us), backward / checkpointed step -1381..-1820 us in sum per run; below it no count is faster in either
 # run (backward +1.7..+1.8 us, checkpointed step -0.4..-0.9 us in sum). At 5120 the slab order is faster at 96 of the
@@ -7975,7 +7978,8 @@ BWD_SLAB_ORDER = {
 # pass the device's, so the selection, the launch grid and the route plans follow it); every other board and a call
 # without an SM count read the tables above. A key names its hidden size: a cell of every size would apply a 4096
 # calibration at 5120 and 7168, where None routes no lpt__h<H> record. The SM count stands for the board: every sm_107a
-# device with 212 SMs reads the cells below.
+# device with 212 SMs reads the cells of ("sm_107a", 212, 4096) below, every sm_103a device with 152 SMs the order cell
+# of ("sm_103a", 152, 7168).
 # sm_107a with 212 SMs (R200) at hidden 4096, by the package-level A/B of BWD_SLAB_ORDER (2 runs, 16 replay groups x 30
 # replays, each after a 512 MiB L2 flush, backward and checkpointed-step graphs, 103 token counts in 256..65592): the
 # slab arm (the slab order, with (0.5, 0.985) to 33600 tokens, (0.5, 0.98) to 34368 and (0.5, 0.97) above, at every
@@ -8000,11 +8004,91 @@ BWD_SLAB_ORDER = {
 # and (27, 1408, 23, 256) at 33287..33401 faster in every group (-7.1..-10.6 us): the 0.985 band ends at 33600, between
 # the two (no firing token count in 33402..33902 is measured); above 34368 (0.5, 0.97) stays (keep 0.98 adds token
 # counts that read up to +15 us: BWD_SLAB_LPT). The 208- and 216-SM boards are not measured and keep the tables above.
+# sm_103a with 152 SMs (GB300) at hidden 7168: an order cell alone (BWD_SLAB_LPT_HIDDEN routes no lpt__h7168 record
+# there, so the cell moves dynr__h7168 to dynr_os__h7168 and nothing else). In 33793..63091, where BWD_SLAB_ORDER runs
+# the chunk order, the faster order follows the column slab's chunk count P (k7_chunks at 152 SMs). By a package-level
+# A/B of the two orders (the plan otherwise the same; 4 fresh concurrent 1-GPU processes on each of two nodes, eager
+# calls timed with CUDA events and CUDA-graph replays, each after a 512 MiB L2 flush, on the backward and
+# checkpointed-step graphs; a token count is faster where the slab order is faster by at least 0.15 % and beyond its
+# null controls in 3 of 4 processes in both timing modes on both graphs, slower where it is slower beyond them in 2 of 4
+# in either timing mode on either graph), the cell runs the slab order on each segment of one P >= 19 in 33793..63091
+# (48 segments, P 19 / 23 / 27 / 31) whose token count measured on both nodes is faster on both and where neither that
+# token count nor the segment's lowest is slower on the second node: 47 segments, 18355 token counts, the lowest token
+# count of each faster but 33793 (a tie); 34817..35264 (P 19) reads a tie on the second node and keeps the chunk order.
+# At the 47 token counts measured on both nodes the slab order is -0.34..-2.12 % on the backward and -0.21..-1.15 % on
+# the checkpointed step (eager, the second node's median), -1591.4 / -1548.9 us in sum. Below 33793 the P 19 token
+# counts 13344 and 21824 read slower on both nodes, 24192 faster and 32768 a tie, so the bands start at 33793. The
+# segments of P 4 keep the chunk order (at none of the 5 P 4 token counts measured, 33312 / 47605 / 49152 / 52384 /
+# 56128, is the slab order faster on both graphs; it reads beyond its null controls on one graph alone at 49152, the
+# backward on the second node, and at 47605, the checkpointed step on the first). From 63092 the cell's last band is the
+# table's "slab" band. The 148-SM sm_103a board (B300) is not measured and keeps BWD_SLAB_ORDER.
 # Pure literals, outside H_TABLES (as BWD_SLAB_ORDER).
 BWD_SLAB_ORDER_OVERRIDES: dict[
     tuple[str, int, int], tuple[tuple[int | None, str], ...]
 ] = {
     ("sm_107a", 212, 4096): ((1876, "chunk"), (None, "slab")),
+    ("sm_103a", 152, 7168): (
+        (33792, "chunk"),
+        (34048, "slab"),
+        (35264, "chunk"),
+        (35328, "slab"),
+        (36096, "chunk"),
+        (36480, "slab"),
+        (36608, "chunk"),
+        (36800, "slab"),
+        (37376, "chunk"),
+        (37696, "slab"),
+        (37888, "chunk"),
+        (38016, "slab"),
+        (38144, "chunk"),
+        (38272, "slab"),
+        (38400, "chunk"),
+        (38912, "slab"),
+        (39424, "chunk"),
+        (40128, "slab"),
+        (40960, "chunk"),
+        (41344, "slab"),
+        (41984, "chunk"),
+        (42688, "slab"),
+        (43008, "chunk"),
+        (43200, "slab"),
+        (43264, "chunk"),
+        (44160, "slab"),
+        (44544, "chunk"),
+        (44992, "slab"),
+        (45312, "chunk"),
+        (46208, "slab"),
+        (46592, "chunk"),
+        (46656, "slab"),
+        (46848, "chunk"),
+        (47424, "slab"),
+        (48128, "chunk"),
+        (48640, "slab"),
+        (49152, "chunk"),
+        (50112, "slab"),
+        (50432, "chunk"),
+        (51072, "slab"),
+        (51200, "chunk"),
+        (51584, "slab"),
+        (51712, "chunk"),
+        (52288, "slab"),
+        (52480, "chunk"),
+        (53568, "slab"),
+        (54016, "chunk"),
+        (54720, "slab"),
+        (55040, "chunk"),
+        (55936, "slab"),
+        (56320, "chunk"),
+        (57536, "slab"),
+        (57600, "chunk"),
+        (59584, "slab"),
+        (59904, "chunk"),
+        (60800, "slab"),
+        (61184, "chunk"),
+        (62208, "slab"),
+        (62464, "chunk"),
+        (None, "slab"),
+    ),
 }
 BWD_SLAB_LPT_OVERRIDES: dict[tuple[str, int, int], Any] = {
     ("sm_107a", 212, 4096): (

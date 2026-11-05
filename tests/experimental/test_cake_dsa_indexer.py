@@ -73,6 +73,8 @@ DispatchPolicy = cake_policy.DispatchPolicy
 finalize_grid = cake_policy.finalize_grid
 finalize_key = cake_policy.finalize_key
 scan_key = cake_policy.scan_key
+scan_key_fields = cake_policy.scan_key_fields
+scan_key_form = cake_policy.scan_key_form
 select_program = cake_policy.select_program
 stage_slug = cake_policy.stage_slug
 
@@ -109,6 +111,7 @@ _COMMON = dict(
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
     split_wave_scope=None,
+    split_fit_rule=None,
     l6_solo_rule=None,
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
@@ -341,6 +344,16 @@ def test_registry_records_are_well_formed():
         assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
             MERGE_KEY
         }, arch
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
+        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
+        # record of its own, ``policy_for(arch, "fp8")``)
+        for key in scan_keys:
+            fields = scan_key_fields(key)
+            assert fields is not None, (arch, key)
+            assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
+            if fields.form == cake_policy.FP8:
+                assert not fields.snake and fields.sample_fit, (arch, key)
+        scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
             policy.rank_finalize and policy.rank_rule is not None
@@ -1849,6 +1862,32 @@ def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
         assert moved, arch
 
 
+def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
+    """sm_100a / sm_103a ``split_fit_rule`` [4096]: a split call whose mean unit keys fit ceil(keys / top_k) <= split_max
+    splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the floor rule,
+    and so does a call the floor rule does not split.  sm_107a has no fit rule."""
+    for arch in ("sm_100a", "sm_103a"):
+        p = policy_for(arch)
+        assert p.split_fit_rule == [4096], arch
+        # 4 queries x 22018 keys: floor rule 5, fit ceil(22016 / 2048) = 11 -> 12 (two splits per chunk)
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True) == 5
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 2048) == 12
+        assert p.split_rule_for(4, 30466, 1, 1, 152, p.block_q_l6, False, 2048) == 16
+        # 41986 keys need 21 splits > split_max: the floor rule's 10
+        assert p.split_rule_for(4, 41986, 1, 1, 152, p.block_q_l6, True, 2048) == 10
+        # top_k 4096: one split per chunk, ceil(22016 / 4096) = 6
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 4096) == 6
+        # the floor rule does not split 8192 keys: no fit split either
+        assert p.split_rule_for(1, 8192, 1, 1, 152, p.block_q_l6, True, 2048) == 1
+    assert policy_for("sm_107a").split_fit_rule is None
+    assert (
+        policy_for("sm_107a").split_rule_for(
+            4, 22018, 1, 1, 212, policy_for("sm_107a").block_q_l6, True, 2048
+        )
+        == 5
+    )
+
+
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
     """sm_107a's ``split_wave_scope`` [["narrow"], 1, True]: the two-way wave split of ``split_wave_rule`` stays on sampled
     single-segment calls of the narrow unit only (never with the sampled first threshold off, and never for the
@@ -2049,12 +2088,13 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
         )
         assert policy_for(arch).sample_fit_kinds == registered, arch
     # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    # (12 splits: split_fit_rule gives each split at most top_k keys)
     p = policy_for("sm_103a")
     geometry = dict(
         num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
     )
     c = select_program(p, candidate_multiplier=16, **geometry)
-    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 5, 32768)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 12, 32768)
     assert c.physical_kind == "split_l6" and not c.sample_fit
     assert (
         select_program(p, **geometry).cand_cap == 32768
@@ -4063,7 +4103,7 @@ def test_static_ticket_word_calls_get_the_placeholder_and_shape_alone_decides():
     for r in (a, b):
         static = (
             r._tail_static
-            or r.choice.physical_kind in policy_for(r.arch).static_scan_kinds
+            or r.choice.physical_kind in policy_for(r.arch, r.form).static_scan_kinds
         )
         assert (r.ticket_block is not None) == (
             not static and cake_backend.reads_ticket_word(r.programs["scan"], r.arch)
@@ -4374,10 +4414,11 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
             assert list(reads) == [a for a in record["arches"] if a in reads], name
     readers = {}
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
-        static = set(policy_for(arch).static_scan_kinds)
         for key, name in keys.items():
             if not key.startswith("scan:"):
                 continue
+            # the static kinds of the key's form (on sm_107a every FP8 kind is static)
+            static = set(policy_for(arch, scan_key_form(key)).static_scan_kinds)
             parts = key.split(":")
             reads = cake_backend.reads_ticket_word(name, arch)
             assert reads == (
@@ -4397,8 +4438,9 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
                 arch
             )  # every drawing program reads it, no static one does
     assert cake_jit.ARG_PLANS["scan"][-5] == ["buffer", "TicketWord"]
+    assert cake_jit.ARG_PLANS["scan"][-6] == ["buffer", "K_scale"]
     assert all(
-        ["buffer", "TicketWord"] not in plan
+        ["buffer", "TicketWord"] not in plan and ["buffer", "K_scale"] not in plan
         for role, plan in cake_jit.ARG_PLANS.items()
         if role != "scan"
     )
@@ -4428,6 +4470,22 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
         lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
         for kind in policy_for(arch).static_scan_kinds:
             assert kind in kinds and kind not in lsf_kinds, (arch, kind)
+        # the FP8 form decides its tail by its own record (``POLICY_FP8``): every static kind is an FP8 kind
+        # the architecture registers without an :lsf copy
+        if not cake_backend.fp8_programs_for(arch):
+            continue
+        fp8 = [
+            scan_key_fields(k)
+            for k in keys
+            if k.startswith("scan:") and scan_key_form(k) == cake_policy.FP8
+        ]
+        fp8_static = policy_for(arch, cake_policy.FP8).static_scan_kinds
+        assert cake_backend.ticket_tail_skips(arch, cake_policy.FP8) == frozenset(
+            fp8_static
+        )
+        for kind in fp8_static:
+            assert kind in {f.physical for f in fp8}, (arch, kind)
+            assert kind not in {f.physical for f in fp8 if f.lsf}, (arch, kind)
 
 
 # ---------------------------------------------------------------------------
@@ -4513,13 +4571,16 @@ class _EagerCall:
 
 def test_offsets_placeholder_is_one_never_written_tensor_per_device():
     """A call without ``q_causal_offsets`` passes the device's offsets placeholder (one int64 element, ``has_offsets``
-    = 0): the same tensor for every runner and eager call of the device, never written by any launch."""
+    = 0), and every call the device's ``K_scale`` placeholder (one float32 element, read by no BF16 program): the
+    same tensors for every runner and eager call of the device, never written by any launch."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     holder = cake_backend._offsets_placeholder(device.index)
     assert holder is cake_backend._offsets_placeholder(device.index)
     assert holder.dtype == torch.int64 and holder.numel() == 1
     assert holder.device == device
+    scales = cake_backend._unread_placeholder(device.index, torch.float32)
+    assert scales.dtype == torch.float32 and scales.numel() == 1
     before = holder.clone()
     for n, (seg_q, seg_k, top_k) in enumerate(_EAGER_GEOMETRIES):
         inputs = ref.make_random_inputs(
@@ -4528,6 +4589,7 @@ def test_offsets_placeholder_is_one_never_written_tensor_per_device():
         assert inputs.q_causal_offsets is None
         runner = _prepare(inputs)
         assert runner.tensors["q_offsets"] is holder
+        assert runner.tensors["K_scale"] is scales
         expected = _cloned(runner())
         for _ in range(2):
             assert ref.same_bits(runner(), expected)
@@ -4573,7 +4635,7 @@ def test_eager_entry_graph_capture_holds_only_the_runner_launches(
     expected = _cloned(call())  # loads the programs and makes the device's placeholders
     kept = cake_backend._offsets_placeholder(device.index)
     if first_use == "in_capture":
-        monkeypatch.setattr(cake_backend, "_OFFSETS_PLACEHOLDERS", {})
+        monkeypatch.setattr(cake_backend, "_UNREAD_PLACEHOLDERS", {})
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -4582,7 +4644,7 @@ def test_eager_entry_graph_capture_holds_only_the_runner_launches(
     if first_use == "in_capture":
         assert runner.tensors["q_offsets"] is not kept
         # made during the capture: not kept
-        assert cake_backend._OFFSETS_PLACEHOLDERS == {}
+        assert cake_backend._UNREAD_PLACEHOLDERS == {}
     else:
         assert runner.tensors["q_offsets"] is kept
     ops = _device_ops(graph.replay, tmp_path, f"graph_{first_use}")

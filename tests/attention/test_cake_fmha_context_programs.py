@@ -2731,6 +2731,53 @@ def test_cake_context_runtime_program_takes_the_sizes_of_each_launch(
     assert len(module.calls) == 2
 
 
+def test_cake_context_bf16_runtime_tail_order_follows_the_makespan_model(
+    monkeypatch,
+) -> None:
+    """A causal runtime-size BF16 launch with two or more work units past its
+    last whole 8-unit section sets bit 31 of ``full_sections`` when the
+    modelled makespan of the interleaved tail order is the shorter; whole
+    sections, one tail unit and launches of many waves keep the plain order."""
+
+    interleave = cake_api._context_bf16_tail_interleave
+    # one request of 8192 queries over 16384 keys, 4 units of pack 8 (32-token
+    # m-blocks): interleaved on 148 and 152 SMs; 8320 queries only on 152
+    assert interleave(1, 8192, 16384, 4, 32, 148)
+    assert interleave(1, 8192, 16384, 4, 32, 152)
+    assert not interleave(1, 8320, 16384, 4, 32, 148)
+    assert interleave(1, 8320, 16384, 4, 32, 152)
+    # more queries than keys: the tiles whose rows see no key run every block
+    assert interleave(1, 16384, 12288, 4, 32, 148)
+    # whole sections, one tail unit, more than 32 waves
+    assert not interleave(2, 8192, 16384, 4, 32, 148)
+    assert not interleave(1, 8192, 16384, 9, 32, 148)
+    assert not interleave(1, 131072, 131072, 4, 32, 148)
+
+    module = _stand_in_module("context_bf16", "RUNTIME_PACK8")
+    tables = torch.arange(1024, dtype=torch.int32).view(1, 1024)
+
+    def full_sections(max_q_len, *, is_causal=True):
+        return _launch_values(
+            monkeypatch,
+            tables,
+            shared=True,
+            batch=1,
+            module=module,
+            max_q_len=max_q_len,
+            max_kv_len=16384,
+            is_causal=is_causal,
+        )["full_sections"]
+
+    assert full_sections(8192) == cake_api._CONTEXT_BF16_TAIL_INTERLEAVE == 1 << 31
+    assert full_sections(8320) == 0
+    assert full_sections(8192, is_causal=False) == 0
+    # 3 requests of 4 units: one whole section, 4 tail units of 2 m-blocks
+    first = _launch_values(
+        monkeypatch, tables[:, :4].repeat(3, 1), shared=True, module=module
+    )
+    assert first["full_sections"] == 1
+
+
 def test_cake_context_one_stage_program_takes_one_stage_m_blocks(
     monkeypatch,
 ) -> None:
@@ -3401,6 +3448,50 @@ def test_cake_context_bf16_runtime_programs_run_tiles_without_keys(
     jit_out, _ = _run_bf16_batch(case)
     assert served_programs == [program]
     assert torch.equal(_bits(jit_out), _bits(out))
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # one request, 4 units of pack 8: every unit a tail unit
+        ((32, 4), (1000,), (1333,), 16),
+        # ragged requests of 2 units each: 6 tail units over 3 requests
+        ((16, 2), (700, 300, 511), (900, 1500, 511), 64),
+        # more queries than keys
+        ((32, 4), (1200,), (500,), 32),
+        # 3 requests of 4 units: one whole section and 4 tail units
+        ((32, 4), (513, 257, 1000), (513, 2000, 1000), 16),
+    ],
+)
+def test_cake_context_bf16_runtime_tail_orders_are_bitwise_the_same(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size
+) -> None:
+    """The runtime-size program of the batch's JIT pack writes the same bytes
+    with its tail units one after another and interleaved, the JIT route's."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    program = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target].get((pack, None))
+    if program is None:
+        pytest.skip(f"no runtime-size program of pack {pack} on {target}")
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    outs = []
+    for interleaved in (False, True):
+        monkeypatch.setattr(
+            cake_api,
+            "_context_bf16_tail_interleave",
+            lambda *sizes, interleaved=interleaved: interleaved,
+        )
+        out, _ = _run_bf16_batch(case)
+        assert served_programs[-1] == program
+        outs.append(out)
+    served = len(served_programs)
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    jit_out, _ = _run_bf16_batch(case)
+    assert len(served_programs) == served
+    assert torch.equal(_bits(outs[1]), _bits(outs[0]))
+    assert torch.equal(_bits(outs[0]), _bits(jit_out))
 
 
 # --- GPU: the other context JIT routes on tiles without a visible key -------

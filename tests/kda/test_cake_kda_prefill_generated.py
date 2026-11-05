@@ -3196,9 +3196,9 @@ def test_pair_cluster_capacity_probe_caches_only_an_answer(monkeypatch):
 # A launch whose stock plan is the M64 value split and whose sequences mix long
 # (>= MIXLEN_LONG_MIN tokens) and short ones runs as parts: the long sequences
 # as owner/helper parts with MIXLEN_HELPERS helpers per task, the short ones as
-# plain M64 parts.  "rng": one owner/helper part over the first..last long
-# sequence and the short parts after it, all on the caller stream; "cc": one
-# side-stream owner/helper part per run of long sequences.
+# plain M64 parts.  "rng": one side-stream owner/helper part over the
+# first..last long sequence, the short parts beside it on the caller stream;
+# "cc": one side-stream owner/helper part per run of long sequences.
 MIXLEN_ROWS = [
     pytest.param(
         [8192, 17], 12, "rng", dict(indexed=False), id="8192+17-h12-dense-state"
@@ -3245,8 +3245,8 @@ def _mixlen_parts(schedule, mode):
 
 def _assert_mixlen_route(prepared, lengths, mode):
     """The split plan of ``prepared``: every sequence in one part, long parts
-    on the owner/helper build (side streams under "cc"), short parts on the M64
-    value split."""
+    on the owner/helper build on side streams, short parts on the M64 value
+    split on the caller stream."""
     arch = registry.device_arch()
     parts = _mixlen_parts(str(prepared.schedule), mode)
     covered = sorted(i for _, i0, i1, _ in parts for i in range(i0, i1 + 1))
@@ -3256,7 +3256,7 @@ def _assert_mixlen_route(prepared, lengths, mode):
         assert schedule.startswith("fused_m64_independent_dvsplit_fp32_state"), parts
         if schedule.endswith(helpers):
             assert any(n >= runtime.MIXLEN_LONG_MIN for n in lengths[i0 : i1 + 1])
-            assert bool(side) == (mode == "cc"), parts
+            assert side, parts
         else:
             assert all(n < runtime.MIXLEN_LONG_MIN for n in lengths[i0 : i1 + 1])
             assert not side, parts
@@ -3315,6 +3315,10 @@ def test_mixlen_split_is_bitwise_the_stock_m64_program(lengths, heads, mode, sta
 
 
 MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS = [8128, 64] * 2, 16
+MIXLEN_GRAPH_ROWS = [
+    pytest.param([8128, 64] * 2, 16, "cc", id="2x(8128+64)-h16-cc"),
+    pytest.param([1024, 64], 12, "rng", id="1024+64-h12-rng"),
+]
 
 
 @requires_blackwell
@@ -3340,17 +3344,17 @@ def test_mixlen_split_plan_cache_hit_matches_a_fresh_preparation():
 
 
 @requires_blackwell
-def test_mixlen_split_replays_from_a_cuda_graph():
+@pytest.mark.parametrize("lengths,heads,mode", MIXLEN_GRAPH_ROWS)
+def test_mixlen_split_replays_from_a_cuda_graph(lengths, heads, mode):
     """The split's fork / join of its side-stream parts is captured: a graph
     replay matches the eager launch bit for bit."""
-    lengths, heads = MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS
-    _mixlen_capacity_or_skip(lengths, heads, "cc")
+    _mixlen_capacity_or_skip(lengths, heads, mode)
     d = _inputs(lengths, heads)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         call = _Call(d, -5.0)
-        _assert_mixlen_route(call.prepared, lengths, "cc")
+        _assert_mixlen_route(call.prepared, lengths, mode)
         eager = call.run()
     torch.cuda.current_stream().wait_stream(side)
     call.poison()

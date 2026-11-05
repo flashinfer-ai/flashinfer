@@ -3194,19 +3194,22 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # (the 17408 -> 5120 forward: test_gb_t_exact_rules_plan_their_programs); their round 7 adds
     # 2 sm_100a keys (the 5120 -> 17408 weight gradient: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 8
     # adds one sm_100a key and one sm_103a key (the 16384 -> 6144 forward: test_gb_t_exact_rules_plan_their_programs)
-    # and re-values two round-6 keys;
+    # and re-values two round-6 keys; their round 9 adds two sm_103a keys (the 12288 -> 4096 forward:
+    # test_gb_t_exact_rules_plan_their_programs) and re-values the two sm_103a round-6 keys;
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
     assert (
         len(ROW_RULES)
-        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 2 + 1
+        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 2 + 2 + 1
     )
     assert (
         sum(k[0] == "sm_100a" for k in ROW_RULES)
         == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1
     )
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
-    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1
+    assert (
+        sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2
+    )
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
         "sm_100a": {"pro": 7},
@@ -6672,7 +6675,8 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # rules re-measured (the sm_100a 4096 -> 48 input gradient and 4096 -> 512 forward, the sm_103a 4096 -> 512 and
 # 5120 -> 512 forwards, at T 16231 / 16384; round 4: the 5120 -> 17408 input gradient; round 5: the sm_100a
 # 12288 -> 4096 forward; round 6: the 17408 -> 5120 forward, the ragged rule's program; round 8: its form with the tall
-# epilogue released by row half) name their T-exact key and its program.
+# epilogue released by row half on sm_100a; round 9: the same form on sm_103a, and the sm_103a 12288 -> 4096
+# forward at T 16231 / 16384) name their T-exact key and its program.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -6886,12 +6890,12 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, False, False, False, False, 4096, 2048, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
-    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
-    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
-    (('sm_103a', False, False, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
-    (('sm_103a', False, False, False, False, False, 5120, 17408, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, False, False, False, False, 5120, 17408, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
     (('sm_103a', False, False, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 12288, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 16384, 2048, None), 16172, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
@@ -7166,8 +7170,8 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
             # an own sm_103a rule of the row at these dims wins over the parent's: the GB T-exact keys of the 6144 x 2048
             # rows and of the 16384 -> 6144 forward at T 16231 over the sm_100a ragged rules, the ragged 4096 -> 48 rule
             # over the sm_100a T-exact keys;
-            # an own T-exact key wins over the row's own ragged rule (the 5120 -> 17408 input gradient and the
-            # 17408 -> 5120 forward at T 16231)
+            # an own T-exact key wins over the row's own ragged rule (the 5120 -> 17408 input gradient, the
+            # 17408 -> 5120 forward and the 12288 -> 4096 forward at T 16231)
             src = (arch_of,) + key
             own_exact = ("sm_103a",) + key[:5] + dims
             if arch_of == "sm_103a" and M is None and own_exact in ROW_RULES:
@@ -8256,7 +8260,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
 # 17408 -> 5120 forward (the ragged rule's own program, 12-column-tile raster groups in place of its 8); round 8 moves
 # it to the tall epilogue released by row half on sm_100a and adds the 16384 -> 6144 forward at T 16231 (the half-tail
 # program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups, in place of
-# the ragged rule's overlapped half-tail program).
+# the ragged rule's overlapped half-tail program); round 9 moves the sm_103a 17408 -> 5120 keys the same way and adds
+# the sm_103a 12288 -> 4096 forward at T 16231 / 16384 (that form in 8-column-tile groups, in place of the ragged rule's
+# overlapped half-tail program in 16-column-tile groups).
 GB_T_EXACT_ROWS = {
     ("sm_100a", True, 2048, 16384): (
         (16172, 16231),
@@ -8316,7 +8322,7 @@ GB_T_EXACT_ROWS = {
     ),
     ("sm_103a", False, 5120, 17408): (
         (16231, 16384),
-        "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7",
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_100a", False, 6144, 16384): (
         (16231,),
@@ -8326,11 +8332,15 @@ GB_T_EXACT_ROWS = {
         (16231,),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
+    ("sm_103a", False, 4096, 12288): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
+    ),
 }
 # The GB T-exact rows whose keys keep the ragged rule's program and change only its raster group (round 6: the
-# 17408 -> 5120 forward in 12-column-tile groups, the ragged rule's 8; sm_103a only since round 8):
-# the row's plan without the key runs the same program at the ragged rule's raster group.
-GB_T_EXACT_RASTER_ROWS = frozenset({("sm_103a", False, 5120, 17408)})
+# 17408 -> 5120 forward in 12-column-tile groups, the ragged rule's 8; sm_103a only since round 8, none since
+# round 9): the row's plan without the key runs the same program at the ragged rule's raster group.
+GB_T_EXACT_RASTER_ROWS = frozenset()
 GB_T_EXACT_KEYS = sorted(
     (arch, False, b_mn, False, False, False, N, K, T)
     for (arch, b_mn, N, K), (Ts, _template) in GB_T_EXACT_ROWS.items()
@@ -8359,7 +8369,9 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
     round 4: the 5120 -> 17408 input gradient with the overlapped half-tail program through the one-slot
     TMA store; round 5 on sm_100a: the 12288 -> 4096 forward, the same way; round 6: the 17408 -> 5120 forward
     with the ragged rule's program in 12-column-tile raster groups; round 8: on sm_100a the tall
-    epilogue released by row half, and the 16384 -> 6144 forward at T 16231 with that form in 8-column-tile groups)
+    epilogue released by row half, and the 16384 -> 6144 forward at T 16231 with that form in 8-column-tile groups;
+    round 9: the same form on the sm_103a 17408 -> 5120 forward, and the sm_103a 12288 -> 4096 forward at
+    T 16231 / 16384 in 8-column-tile groups)
     plan their program at their T on every SM count of the architecture's parts, with whole K per output tile like
     the row's plan without the key (another program, or for round 6 the same program at another raster group);
     one token more or less plans that plan.  The sm_103a 4096 -> 48 input gradient

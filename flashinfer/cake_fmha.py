@@ -1437,8 +1437,9 @@ _CONTEXT_FP8_RUNTIME_PARAMS = (
 
 
 # A runtime-size BF16 program takes the sizes after the BF16 parameters: the
-# m-block count, the whole 8-unit L2 sections of the tile order, the work
-# units per request, the query heads, the GQA group and the log2 page size.
+# m-block count, the whole 8-unit L2 sections of the tile order (bit 31: the
+# tail order, :data:`_CONTEXT_BF16_TAIL_INTERLEAVE`), the work units per
+# request, the query heads, the GQA group and the log2 page size.
 _CONTEXT_BF16_RUNTIME_PARAMS = (
     *_CONTEXT_HOST_PARAMS["context_bf16"],
     "m_blocks",
@@ -1448,6 +1449,80 @@ _CONTEXT_BF16_RUNTIME_PARAMS = (
     "group",
     "page_shift",
 )
+
+# The tail order of a causal runtime-size BF16 launch.  Its work units past the
+# last whole 8-unit section run one unit's m-blocks after another, or, with
+# this bit of ``full_sections`` set, interleaved like a section: every tail
+# unit's m-block, the largest first.  The order moves no tile's work, so the
+# output is the same bit for bit; the launch takes the order of the shorter
+# modelled makespan (:func:`_context_bf16_tail_interleave`).
+_CONTEXT_BF16_TAIL_INTERLEAVE = 1 << 31
+# The tail-order model: a tile costs its KV blocks plus this many; the
+# interleaved order must be shorter by this fraction; a launch of more waves
+# than this keeps the plain order.
+_CONTEXT_BF16_TAIL_TILE_COST = 2
+_CONTEXT_BF16_TAIL_MARGIN = 0.005
+_CONTEXT_BF16_TAIL_MAX_WAVES = 32
+
+
+def _context_bf16_tail_makespan(costs: list[int], num_ctas: int) -> int:
+    """The finish time of a persistent launch over tiles of ``costs`` in tile
+    order: CTA ``i`` runs tile ``i`` first and claims its next tile from the
+    counter when it starts one."""
+
+    first = min(num_ctas, len(costs))
+    ends = costs[:first]
+    claims = [(0, cta) for cta in range(first)]
+    for cost in costs[first:]:
+        _, cta = heapq.heappop(claims)
+        start = ends[cta]
+        ends[cta] = start + cost
+        heapq.heappush(claims, (start, cta))
+    return max(ends)
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_bf16_tail_interleave(
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    units_per_batch: int,
+    m_block_tokens: int,
+    num_ctas: int,
+) -> bool:
+    """Whether a causal runtime-size BF16 launch runs its tail units
+    interleaved: two or more of them, and the modelled makespan of that order
+    shorter than the plain one's by :data:`_CONTEXT_BF16_TAIL_MARGIN`.  Every
+    request at the planned maxima; a tile's KV blocks are those of its
+    bottom-right causal bound (a bound below zero wraps to every block, as the
+    kernel's unsigned bound does)."""
+
+    total_bh = batch_size * units_per_batch
+    full_sections, tail_units = divmod(total_bh, 8)
+    m_blocks = max((max_q_len + m_block_tokens - 1) // m_block_tokens, 1)
+    if (
+        tail_units < 2
+        or num_ctas <= 0
+        or m_blocks * total_bh > _CONTEXT_BF16_TAIL_MAX_WAVES * num_ctas
+    ):
+        return False
+    full_n = max((max_kv_len + 127) // 128, 1)
+    shift = max_kv_len - max_q_len
+    # tile costs per m-block, the largest (last) m-block first
+    cost = []
+    for m_block in reversed(range(m_blocks)):
+        top = (m_block + 1) * m_block_tokens + shift
+        blocks = full_n if top < 0 or top >= max_kv_len else (top + 127) // 128
+        cost.append(_CONTEXT_BF16_TAIL_TILE_COST + max(blocks, 1))
+    head = [
+        cost[(tile >> 3) % m_blocks] for tile in range(8 * m_blocks * full_sections)
+    ]
+    tail = range(tail_units * m_blocks)
+    plain = head + [cost[r % m_blocks] for r in tail]
+    interleaved = head + [cost[r // tail_units] for r in tail]
+    return _context_bf16_tail_makespan(interleaved, num_ctas) < (
+        1.0 - _CONTEXT_BF16_TAIL_MARGIN
+    ) * _context_bf16_tail_makespan(plain, num_ctas)
 
 
 # A runtime-size NVFP4 program takes the sizes after the NVFP4 parameters: the
@@ -7926,7 +8001,20 @@ class CakeFmhaContextProgramModule:
                 arguments = (
                     *arguments,
                     num_m_blocks,
-                    total_bh // 8,
+                    total_bh // 8
+                    | (
+                        _CONTEXT_BF16_TAIL_INTERLEAVE
+                        if is_causal
+                        and _context_bf16_tail_interleave(
+                            int(batch_size),
+                            int(max_q_len),
+                            int(max_kv_len),
+                            units_per_batch,
+                            self.m_block_tokens,
+                            num_ctas,
+                        )
+                        else 0
+                    ),
                     units_per_batch,
                     num_q_heads,
                     num_q_heads // key_cache.shape[1],
