@@ -1995,7 +1995,14 @@ class AutoTuner:
         return new_config
 
     def _tactic_still_valid(
-        self, runner: TunableRunner, inputs, tactic: Any, custom_op: str, source: str
+        self,
+        runner: TunableRunner,
+        inputs,
+        tactic: Any,
+        custom_op: str,
+        source: str,
+        *,
+        validation_profile: OptimizationProfile | None = None,
     ) -> bool:
         """Runner-contract revalidation of a cached (on-disk) tactic.
 
@@ -2004,13 +2011,27 @@ class AutoTuner:
         ``isValidConfig`` pattern).  A tactic that fails it is treated as a
         loud cache miss instead of becoming a silent different kernel or an
         execute-time crash (the "plan rejected at execute, server dead"
-        class).  Runners without the method are trusted as before.
+        class). Runners without a validator are trusted as before.
+
+        During profile reuse, shape-aware runners may instead expose
+        ``validate_tactic_for_profile(inputs, tactic, profile)``. This avoids
+        checking a bucket's tactic against the original caller's row count.
+        Other validators continue receiving the original inputs unchanged.
         """
+        validate_profile = (
+            getattr(runner, "validate_tactic_for_profile", None)
+            if validation_profile is not None
+            else None
+        )
         validate = getattr(runner, "validate_tactic", None)
-        if validate is None:
+        if validate_profile is None and validate is None:
             return True
         try:
-            ok = bool(validate(inputs, tactic))
+            ok = bool(
+                validate_profile(inputs, tactic, validation_profile)
+                if validate_profile is not None
+                else validate(inputs, tactic)
+            )
         except Exception:
             ok = False
         if not ok:
@@ -2189,6 +2210,7 @@ class AutoTuner:
         inputs: list[torch.Tensor] | None = None,
         *,
         require_profiling_policy: bool = False,
+        validation_profile: OptimizationProfile | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
 
@@ -2213,20 +2235,20 @@ class AutoTuner:
                 when choose_one can profile and when selecting its resulting winner.
                 Lookup-only callers leave this False, even inside tuning contexts.
                 Legacy v1 policy checks are unchanged.
+            validation_profile: Bucket being reused during profiling. Enables
+                an optional profile-aware validator without synthesizing tensors;
+                runtime lookups leave this unset.
 
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
 
         Note:
-            input_shapes and inputs feed orthogonal paths inside
-            this method: input_shapes flows only into
-            _find_nearest_profile (bucket matching) and inputs
-            flows only into r.get_cache_key_extras(inputs).  Callers
-            may therefore pass them describing different tensor sets
-            (e.g. a profile's opt_shapes alongside the caller's real
-            inputs) so long as get_cache_key_extras is
-            synthesis-invariant; see: TunableRunner.get_cache_key_extras.
+            A profiling lookup may combine a bucket's input_shapes with the
+            caller's original inputs. Cache extras must be synthesis-invariant;
+            see TunableRunner.get_cache_key_extras. validation_profile lets
+            shape-aware validators use the bucket's dimensions while retaining
+            the original tensors for other properties such as workspace capacity.
         """
         with self._lock:
             result = self._search_cache_impl(
@@ -2236,6 +2258,7 @@ class AutoTuner:
                 tuning_config,
                 inputs,
                 require_profiling_policy=require_profiling_policy,
+                validation_profile=validation_profile,
             )
             # In tuning mode a miss means "profile this bucket", so only
             # lookup-only searches fall back to the top tuned bucket. Replay
@@ -2260,6 +2283,7 @@ class AutoTuner:
                 tuning_config,
                 inputs,
                 nearest_profile=top_profile,
+                validation_profile=validation_profile,
             )
             if not top_result[0]:
                 return result
@@ -2286,6 +2310,7 @@ class AutoTuner:
         *,
         require_profiling_policy: bool = False,
         nearest_profile: tuple[tuple[int, ...], ...] | None = None,
+        validation_profile: OptimizationProfile | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search sources 1-4 of :meth:`search_cache` for one profile.
 
@@ -2330,7 +2355,12 @@ class AutoTuner:
                         continue
                     tactic, stored_profile = winners[cache_key]
                     if not self._tactic_still_valid(
-                        r, inputs, tactic, custom_op, "memory"
+                        r,
+                        inputs,
+                        tactic,
+                        custom_op,
+                        "memory",
+                        validation_profile=validation_profile,
                     ):
                         if (
                             rejections is not None
@@ -2378,7 +2408,12 @@ class AutoTuner:
                                 rejections.append("runner_mismatch")
                             continue
                         if not self._tactic_still_valid(
-                            runners[r_id], inputs, tactic, custom_op, "config file"
+                            runners[r_id],
+                            inputs,
+                            tactic,
+                            custom_op,
+                            "config file",
+                            validation_profile=validation_profile,
                         ):
                             if (
                                 rejections is not None
@@ -2450,7 +2485,12 @@ class AutoTuner:
                             rejections.append("runner_mismatch")
                         continue
                     if not self._tactic_still_valid(
-                        runners[r_id], inputs, tactic, custom_op, "managed cache"
+                        runners[r_id],
+                        inputs,
+                        tactic,
+                        custom_op,
+                        "managed cache",
+                        validation_profile=validation_profile,
                     ):
                         if (
                             rejections is not None
@@ -2499,6 +2539,20 @@ class AutoTuner:
                         continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
+                        if not self._tactic_still_valid(
+                            runners[r_id],
+                            inputs,
+                            file_tactic,
+                            custom_op,
+                            "bundled config",
+                            validation_profile=validation_profile,
+                        ):
+                            if (
+                                rejections is not None
+                                and "invalid_tactic" not in rejections
+                            ):
+                                rejections.append("invalid_tactic")
+                            continue
                         if report is not None:
                             report._record(
                                 custom_op,
@@ -3060,6 +3114,7 @@ class AutoTuner:
                         tuning_config,
                         inputs=inputs,
                         require_profiling_policy=True,
+                        validation_profile=p,
                     )
                     selection = (
                         (runner_id, type(runners[runner_id]).__name__, tactic)

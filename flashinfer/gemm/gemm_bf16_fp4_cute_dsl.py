@@ -1000,9 +1000,7 @@ def _compute_cute_dsl_sm100(
     return out
 
 
-def _cute_dsl_bf16_fp4_runner(
-    enable_pdl: bool = True, *, allow_gemv: bool = True
-) -> TunableRunner:
+def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
     """Build a ``CuteDslBf16Fp4Runner`` for the cute-DSL bf16 x fp4 GEMM."""
 
     class CuteDslBf16Fp4Runner(TunableRunner):
@@ -1010,15 +1008,37 @@ def _cute_dsl_bf16_fp4_runner(
             a, b, _, _, out_dtype, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            # GEMV requires one row. Top-bucket cache fallback must not reuse
-            # its tactic for larger M, even when only M=1 has been tuned.
-            # Config indices also depend on the device's SM count.
-            return (
-                out_dtype,
-                n,
-                k,
-                get_device_sm_count(a.device),
-                allow_gemv,
+            # The config list holds device-derived gemv splits, so a tuned
+            # index must not replay on a different SM count.
+            return (out_dtype, n, k, get_device_sm_count(a.device))
+
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            """Reject a cached GEMV tactic outside its single-row domain."""
+            return self._validate_tactic_for_m(inputs, tactic, int(inputs[0].shape[0]))
+
+        def validate_tactic_for_profile(
+            self, inputs: List[torch.Tensor], tactic: int, profile: OptimizationProfile
+        ) -> bool:
+            """Validate a warm bucket against its profiled row count."""
+            return self._validate_tactic_for_m(
+                inputs, tactic, int(profile.get_opt_shapes()[0][0])
+            )
+
+        def _validate_tactic_for_m(
+            self, inputs: List[torch.Tensor], tactic: int, m: int
+        ) -> bool:
+            if tactic == -1:
+                return True
+            a, b, _, _, _, _, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            configs = _bf16_fp4_cute_dsl_tactic_configs(
+                n, k, get_device_sm_count(a.device)
+            )
+            if not 0 <= tactic < len(configs):
+                return False
+            return configs[tactic][7] != "gemv" or (
+                m == 1 and get_compute_capability(a.device)[0] == 12
             )
 
         def get_valid_tactics(
@@ -1033,7 +1053,7 @@ def _cute_dsl_bf16_fp4_runner(
             sm_count = get_device_sm_count(a.device)
             # GEMV is validated only on SM12x; the autotuner ranks by time
             # and would not catch a wrong-but-fast kernel elsewhere.
-            gemv_ok = allow_gemv and get_compute_capability(a.device)[0] == 12
+            gemv_ok = get_compute_capability(a.device)[0] == 12
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k, sm_count)
 
             def split_reduces_makespan(cfg) -> bool:
@@ -1091,7 +1111,7 @@ def _cute_dsl_bf16_fp4_runner(
                 if m != 1:
                     raise ValueError(f"the gemv tactic requires m == 1, got m={m}")
                 splits = cfg[5]
-            elif allow_gemv and cfg is None and m == 1 and not do_preparation:
+            elif cfg is None and m == 1 and not do_preparation:
                 # Prep calls run outside the autotuner's per-tactic exception
                 # guard; a gemv failure there would abort the whole op.
                 splits = _select_bf16_fp4_gemv_split(
@@ -1231,7 +1251,7 @@ def _compute_cute_dsl(
     alpha_for_launch = _prepare_bf16_fp4_alpha(alpha, a.device)
 
     tuner = AutoTuner.get()
-    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=enable_pdl, allow_gemv=m == 1)
+    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=enable_pdl)
     inputs = [a, b, b_sf_u8, alpha_for_launch, out_dtype, out, block_size]
     chosen_runner, tactic = tuner.choose_one(
         "bf16_fp4_cute_dsl_gemm",
