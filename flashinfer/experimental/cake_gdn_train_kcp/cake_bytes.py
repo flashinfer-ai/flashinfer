@@ -62,14 +62,16 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   ``[NC_pad, HV, 128, 128]``, ``v_new`` / ``w`` / ``u`` ``[R, HV, 128]``, ``Aqk`` and
   ``Akk`` ``[R, HV, 64]`` (BF16), ``gamma [NC_pad, HV]`` and the FP32 row factors
   ``gcum`` / ``rowscale`` / ``qscale`` ``[R, HV]`` (the host skips #1 and the walk
-  entirely).  ``M_seg`` is retained with
+  entirely); ``save_mode="light_akk"`` (the in-kernel norm only) adds #1's
+  ``Akk`` tape alone (``[R, HV, 64]`` BF16, ``128 R HV`` bytes: its light replay
+  runs #1 without the block inverse).  ``M_seg`` is retained with
   ``save_transfer`` and with ``save_mode="full"`` (whose backward runs no transfer
   walk); the light ``save_transfer=False`` form re-runs the transfer walks
   (KDA semantics).  ``boundary_mode="replay"`` keeps no ``S_in`` /
-  c1 tensor / ``M_seg``, no tape and no ``qk_rstd`` in either ``save_mode`` (the
+  c1 tensor / ``M_seg``, no tape and no ``qk_rstd`` in any ``save_mode`` (the
   backward re-runs the whole forward: offset and transfer walks, exchange, merge
-  and the tapes; ``save_mode="full"`` there runs the same backward as
-  ``"light"``).  Inputs are references (0 extra bytes); the int32
+  and the tapes; ``save_mode="full"`` / ``"light_akk"`` there run the same
+  backward as ``"light"``).  Inputs are references (0 extra bytes); the int32
   tables live on the context (not per layer).
 * ``gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, ...)``: the caller-held
   workspace of one rank: the exchange pools (the send pools, the c1 / b1 / b2
@@ -106,7 +108,8 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   hand-off tensors, ``bwd.kept_tapes``, not workspace; under ``graph="replay"``
   the arena's own rows), plus the arena
   ``qk_rstd`` in the backward forms that re-run #1
-  (the light replay of a saved set and the replay of a call without one; the
+  (the light replay of a saved set -- the solve-free replay of
+  ``save_mode="light_akk"`` too -- and the replay of a call without one; the
   ``save_mode="full"`` and kept-tape backwards read the saved one) and at #1 of
   a forward that keeps no saved set (``boundary_mode="replay"``,
   ``save_for_backward=False``).  The eager forward drops ``kn`` before its
@@ -131,8 +134,14 @@ from .cake_kcp_plan import (
     ContextKcp,
 )
 from .cake_options import REUSE_RECOMPUTE_TAPES_DEFAULT
+from .cake_options import SAVE_MODES as _OPTION_SAVE_MODES
+from .cake_options import SAVE_MODES_AKK
 
-SAVE_MODES = ("light", "full")
+SAVE_MODES = _OPTION_SAVE_MODES
+# The save modes that keep #1's Akk tape for the solve-free light replay (mirror of cake_kcp.AKK_SAVE_MODES) and the
+# save modes whose forward keeps no h / v_new tape (cake_kcp.LIGHT_FORWARD_SAVE_MODES: the output walk)
+AKK_SAVE_MODES = SAVE_MODES_AKK
+LIGHT_FORWARD_SAVE_MODES = ("light", *AKK_SAVE_MODES)
 BOUNDARY_MODES = ("saved", "replay")
 GROUP_REDUCE = ("fused", "host")
 GRAPH_MODES = ("off", "replay")
@@ -161,6 +170,19 @@ FWD_TAPES_ARENA_AFTER_FWD = ("aqk", "qscale", "h_tape", "v_new")
 # tapes #5 reads besides them (cake_kcp.FWD_TAPES_ARENA_AFTER_FUSED), and its peak is #1's (akk / gcum still bound).
 FWD_TAPES_ARENA_AFTER_FUSED = ("aqk", "qscale")
 FUSED_FREE_TAPES = ("h_tape", "v_new")
+# The forward tapes in this module's spellings (cake_kcp.FWD_TAPES order)
+LIGHT_TAPE_ORDER = (
+    "w",
+    "u",
+    "aqk",
+    "akk",
+    "gcum",
+    "rowscale",
+    "qscale",
+    "gamma",
+    "h_tape",
+    "v_new",
+)
 TAPE_NAME_OF = {"gcum": "g_cum"}  # this module's spelling -> cake_kcp's
 # The in-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel``): bytes per (token, Q/K head) of one normalized row tape
 # (``qn`` / ``kn``: BF16 [T_r, H_qk, 128]) and of the FP32 ``r`` of q and k together (``qk_rstd`` [2, T_r, H_qk]).
@@ -214,6 +236,18 @@ def _mode(value: str, allowed: tuple[str, ...], name: str) -> str:
     if value not in allowed:
         raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
     return value
+
+
+def _save_mode(save_mode: str, l2n: bool) -> str:
+    """``save_mode`` checked against :data:`SAVE_MODES`; a mode of :data:`AKK_SAVE_MODES` needs the in-kernel norm
+    (the ``ValueError`` of ``OptionsKcp.check``: the replay program is built in its in-kernel-norm form only)."""
+    _mode(save_mode, SAVE_MODES, "save_mode")
+    if save_mode in AKK_SAVE_MODES and not l2n:
+        raise ValueError(
+            f"save_mode={save_mode!r} keeps the Akk tape for the solve-free replay of #1_l2n: it needs "
+            "use_qk_l2norm_in_kernel=True"
+        )
+    return save_mode
 
 
 def state_bytes(HV: int) -> int:
@@ -372,7 +406,7 @@ def gdn_saved_layout_kcp(
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     C = _channels(H_qk, HV, C)
-    _mode(save_mode, SAVE_MODES, "save_mode")
+    _save_mode(save_mode, l2n)
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     hp = ctx.heads(HV)
     P = _segments(ctx, hp.P, P)
@@ -392,11 +426,13 @@ def gdn_saved_layout_kcp(
     # the replay boundary keeps nothing: a "full" forward under boundary_mode="replay" saves no tape and its backward
     # is the "light" one (cake_kcp: no saved set, the replayed forward writes the tapes into the arena)
     full = save_mode == "full" and saved
-    terms.update(  # the #1 outputs: saved in "full" only (the light backward re-runs #1)
+    # "light_akk": the light set plus #1's Akk tape (its light replay reads it instead of forming it)
+    akk = (full or save_mode in AKK_SAVE_MODES) and saved
+    terms.update(  # the #1 outputs: saved in "full" (the light backward re-runs #1), Akk also in "light_akk"
         {
             "gamma": ctx.NC_pad * HV * CHUNK_F32 if full else 0,
             "gcum": ctx.R * HV * ROW_F32 if full else 0,
-            "akk": ctx.R * HV * ROW_BF16_64 if full else 0,
+            "akk": ctx.R * HV * ROW_BF16_64 if akk else 0,
         }
     )
     terms.update(
@@ -589,12 +625,22 @@ def gdn_workspace_layout_kcp(
       rows (``bwd.qn`` / ``bwd.kn`` at full size, ``bwd.kept_tapes`` 0); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a
       forward without a saved set;
       ``bwd.qk_rstd`` where the backward re-runs #1 (the light replay of a saved set, a backward without one).
+    * ``save_mode="light_akk"`` (the in-kernel norm only) with a saved set: the light form, except that the forward
+      writes #1's ``Akk`` into a fresh saved tensor (no ``fwd.akk`` term) and the backward binds it, so its replay
+      re-creates every forward tape but ``Akk`` (no ``bwd.akk`` term; ``bwd.qk_rstd`` as the light replay: the
+      solve-free #1_l2n writes the arena ``r``).  It has no kept-tape form (the runtime hands off from a ``"light"``
+      forward only, and under ``torch.utils.checkpoint`` the mode saves as ``"light"``); without a saved set it is
+      the light form.  These figures are the call outside a checkpoint: under
+      ``torch.utils.checkpoint(use_reentrant=False)`` a ``"light_akk"`` call runs as ``"light"`` (the original
+      forward and the recompute) and binds the ``save_mode="light"`` figures of the same options (``Akk`` in the
+      arena at #1, re-created by the replay form or held by the kept hand-off), so a checkpointed ``"light_akk"``
+      layer is sized with ``save_mode="light"``.
     """
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     with_set = _flag(save_for_backward, "save_for_backward")
     C = _channels(H_qk, HV, C)
-    _mode(save_mode, SAVE_MODES, "save_mode")
+    _save_mode(save_mode, l2n)
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     _mode(group_reduce, GROUP_REDUCE, "group_reduce")
     _mode(graph, GRAPH_MODES, "graph")
@@ -614,16 +660,18 @@ def gdn_workspace_layout_kcp(
     keep = saved and with_set
     # the backward reads the saved tapes; a call without a saved set keeps none, so "full" there is the light replay
     full = save_mode == "full" and keep
-    # the forward writes its tapes into fresh saved tensors (not arena tapes)
-    fresh_tapes = full
+    # "light_akk": #1's Akk tape is a saved-set tensor (the forward writes it there; the light replay reads it)
+    akk_saved = save_mode in AKK_SAVE_MODES and keep
+    # the forward writes these tapes into fresh saved tensors (not arena tapes; cake_kcp.saved_tapes)
+    fresh_tapes = set(LIGHT_TAPE_ORDER) if full else {"akk"} if akk_saved else set()
     # the kept-tape backward exists for the light form with a saved set only (the runtime hands off only from a
-    # forward that saves: cake_kcp._fwd_entry / _fwd_body)
-    kept = kept_form and keep and not full
+    # "light" forward that saves: cake_kcp._fwd_entry / _fwd_body)
+    kept = kept_form and keep and save_mode == "light"
     # the eager hand-off: the kept tapes leave the arena (fresh tensors outside the workspace); under graph="replay"
     # they are the arena's own tapes, bound through the backward (cake_kcp._kept_stale: the arena hand-off)
     handed = kept and eager
     # the shipped forward folds #5 into its tape walks (cake_kcp._fuse_o_enabled with test knob fused_o = 1)
-    fused = save_mode == "light" and saved and _fwdh_out_shipped()
+    fused = save_mode in LIGHT_FORWARD_SAVE_MODES and saved and _fwdh_out_shipped()
     # a2a collectives run when a fragment of the group crosses a rank (cake_kcp._forward: tb.N_out)
     exchanges = ctx.N_out > 0
     # staging planes at P > 1: stage_b always; stage_m only when the call does not bind a saved M_seg^T for it (the
@@ -690,11 +738,11 @@ def gdn_workspace_layout_kcp(
     c1_gone = (fwd_pools["c1_send"] + c1_send_mf) if (eager and exchanges) else 0
     # the tapes #1 writes (an arena that binds no tape yet: h / v_new come with the first tape walk, after the offset
     # walks bound u in their place); #1's backward-only outputs leave an eager arena right after #1
-    prep_tapes = (
-        {}
-        if fresh_tapes
-        else {k: v for k, v in light_tapes.items() if k not in FUSED_FREE_TAPES}
-    )
+    prep_tapes = {
+        k: v
+        for k, v in light_tapes.items()
+        if k not in FUSED_FREE_TAPES and k not in fresh_tapes
+    }
 
     def forward_moments(
         fuse: bool, drop_prep: bool
@@ -704,7 +752,9 @@ def gdn_workspace_layout_kcp(
             for k, v in prep_tapes.items()
             if not (drop_prep and k in FWD_TAPES_DEAD_AFTER_PREP)
         }
-        if not (fuse or fresh_tapes):
+        if not (
+            fuse or full
+        ):  # the split tape walk's h / v_new (fresh saved tensors in "full")
             walk_tapes.update({k: light_tapes[k] for k in FUSED_FREE_TAPES})
         moments = {
             "prep": fwd_pool_sum + sum(prep_tapes.values()) + qk_sum + fwd_rstd,
@@ -751,6 +801,11 @@ def gdn_workspace_layout_kcp(
     bwd_fwd_tapes_end: dict[str, int]
     if full:
         bwd_fwd_tapes, bwd_fwd_tapes_end = {}, {}
+    elif akk_saved:
+        # the solve-free replay re-creates every forward tape but Akk (the saved set's tensor)
+        bwd_fwd_tapes = bwd_fwd_tapes_end = {
+            k: v for k, v in light_tapes.items() if k not in fresh_tapes
+        }
     elif handed:
         bwd_fwd_tapes = {}
         bwd_fwd_tapes_end = {
@@ -901,7 +956,10 @@ def gdn_workspace_bytes_kcp(
     save_for_backward: bool = True,
 ) -> int:
     """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_workspace_layout_kcp`): the
-    most the workspace binds in the forward or the backward of these options (the calls that query covers)."""
+    most the workspace binds in the forward or the backward of these options (the calls that query covers).
+    ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint; under
+    ``torch.utils.checkpoint(use_reentrant=False)`` the call runs as ``"light"`` and binds the ``save_mode="light"``
+    figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``."""
     return gdn_workspace_layout_kcp(
         ctx,
         H_qk=H_qk,
@@ -927,6 +985,9 @@ __all__ = [
     "GRAPH_MODES",
     "GROUP_REDUCE",
     "SAVE_MODES",
+    "AKK_SAVE_MODES",
+    "LIGHT_FORWARD_SAVE_MODES",
+    "LIGHT_TAPE_ORDER",
     "TICKET_BYTES",
     "TICKET_SITES",
     "TICKET_SLOT_BYTES",

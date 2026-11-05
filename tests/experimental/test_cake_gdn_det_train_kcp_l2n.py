@@ -917,10 +917,14 @@ def test_norm_tapes_are_not_retained() -> None:
     )  # norm-off layout unchanged
 
 
-def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o() -> None:
-    """The arena at #5 holds ``qn`` but no ``kn`` (the tape walks were its last readers); ``qn`` goes after #5."""
+@pytest.mark.parametrize("fused_o", (0, 1))
+def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o(fused_o: int) -> None:
+    """The arena at #5 holds ``qn`` but no ``kn`` (the tape walks were its last readers); ``qn`` goes after #5.  The
+    fused forward (``fused_o`` = 1, the shipped form) reads both rows in its output walks and drops both after them;
+    either form leaves neither row in the arena."""
     ctx, ops = _setup()
     seen = {}
+    ws = kcp.WorkspaceDetKcp()
 
     class Recording(kcp.FakeBackend):
         def run(self, name, args):
@@ -935,8 +939,9 @@ def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o() -> None:
             *_ops(ops),
             ctx,
             backend="fake",
-            workspace=kcp.WorkspaceDetKcp(),
+            workspace=ws,
             use_qk_l2norm_in_kernel=True,
+            test_knobs={"fused_o": fused_o},
         )
     finally:
         kcp.set_backend("fake", previous)
@@ -944,8 +949,14 @@ def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o() -> None:
         "kn",
         "qn",
     ]  # the saved r is a fresh tensor, never the arena's
-    assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
-    assert seen["fwd_o"] == ["qn"]
+    if fused_o and kcp.fused_o_shipped():
+        assert seen["kcp_fwdh_out"] == ["kn", "qn"]
+        assert "kcp_fwdh_tape" not in seen and "fwd_o" not in seen
+    else:
+        assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
+        assert seen["fwd_o"] == ["qn"]
+        assert "kcp_fwdh_out" not in seen
+    assert not {"qn", "kn"} & set(ws._tapes)
 
 
 def test_saved_count_and_the_recompute_output_skip() -> None:
