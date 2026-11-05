@@ -536,6 +536,231 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    ("context_bf16", "RUNTIME_PACK1_SINK"): (
+        "cake_fmha_context_bf16_482e2382bb911034ae07",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_SINK"): (
+        "cake_fmha_context_bf16_d7f958d0e6f32932b91f",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_SINK"): (
+        "cake_fmha_context_bf16_927f70849dcb9b7d659b",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_SINK"): (
+        "cake_fmha_context_bf16_58802d18c1f0ff9d2f7d",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_SINK"): (
+        "cake_fmha_context_bf16_6b8dc5e5a06de7b8ddf4",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_SINK"): (
+        "cake_fmha_context_bf16_19aaac13890ddbaad3ca",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_SINK"): (
+        "cake_fmha_context_bf16_2b9bc5919f2729955ba7",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_SINK"): (
+        "cake_fmha_context_bf16_db6a1c7757541d45cd22",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16_SINK"): (
+        "cake_fmha_context_bf16_add546aaeef4cc5f7f39",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK1_LSE"): (
+        "cake_fmha_context_bf16_ddb09abf5f450f3b2228",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_LSE"): (
+        "cake_fmha_context_bf16_3c3bd6700072f0fd45c2",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_LSE"): (
+        "cake_fmha_context_bf16_0d435a49bb7c76d4b562",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_LSE"): (
+        "cake_fmha_context_bf16_add5b0599a64c23d3fc2",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_LSE"): (
+        "cake_fmha_context_bf16_22ad59fa8cff2bfc1647",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_LSE"): (
+        "cake_fmha_context_bf16_b488ff4071059d04dc31",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_LSE"): (
+        "cake_fmha_context_bf16_cabb262616c2401896b6",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_LSE"): (
+        "cake_fmha_context_bf16_15636ff97b7b1de20471",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16_LSE"): (
+        "cake_fmha_context_bf16_5164ef76a00d85d4bdd2",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK1_NONCAUSAL"): (
+        "cake_fmha_context_bf16_b85606b52eadf25563c1",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_NONCAUSAL"): (
+        "cake_fmha_context_bf16_a2582fa57aa043587f87",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_NONCAUSAL"): (
+        "cake_fmha_context_bf16_fda0975ed77ec050db27",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_NONCAUSAL"): (
+        "cake_fmha_context_bf16_b37a0a81098560353b6a",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_NONCAUSAL"): (
+        "cake_fmha_context_bf16_6375841ae49a636c540c",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_NONCAUSAL"): (
+        "cake_fmha_context_bf16_dcbe0498011dc9d8b042",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_NONCAUSAL"): (
+        "cake_fmha_context_bf16_622790b157a41f99256e",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_NONCAUSAL"): (
+        "cake_fmha_context_bf16_71fb277d88964bff260f",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16_NONCAUSAL"): (
+        "cake_fmha_context_bf16_907e68c861f4e2898b4c",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK1_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_62e0f39c39a59eebb3e6",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_79d0333089a0d28374d4",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_af38e50e15184bc44799",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_126a07604bcc1bd2a126",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_676842ac8d64cf652446",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_2b81c131ad0c9a86a93d",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_6ae60b0708827ddfa82f",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_078e5b8c33befc9bc85a",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16_NONCAUSAL_SINK"): (
+        "cake_fmha_context_bf16_5607821f28f71bfa4cc1",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK1_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_86d6f1082dedbeccfcdd",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_6e8ec4e524ae9d6b3e5d",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_995dea83caaca8f8b5b9",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_f5a6fb25be32f892b13f",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_bc5e84d155d847ca7767",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_abe24aa28fe5f3fa80b0",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_1f1d7f69b7f798da463e",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_8417d51c012a393dfb78",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16_NONCAUSAL_LSE"): (
+        "cake_fmha_context_bf16_8190b799b7e19b7b2103",
+        None,
+        False,
+    ),
     ("context_fp8", "B256"): ("cake_fmha_context_fp8_d910d4336baa2166efb0", 1, False),
     ("context_fp8", "B256_SCALE_PTR"): (
         "cake_fmha_context_fp8_7e4d0a44e40dc1f1247c",
@@ -1093,8 +1318,9 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
 # is the JIT module's bit for bit; a program serves only the calls whose JIT
 # pack (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g,
 # page_size)`` names the program (``None``: every page size 16 .. 1024).  The
-# host consults them only for a causal call without LSE or sink that no exact
-# route serves, except the calls of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
+# host consults them for a causal call without LSE or sink that no exact route
+# serves, except the calls of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`; the tables
+# below serve the other flag forms (:data:`_CONTEXT_RUNTIME_FLAG_ROUTES`).
 _CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     "sm100a": {
         (16, None): "RUNTIME_PACK16",
@@ -1119,6 +1345,167 @@ _CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (1, None): "RUNTIME_PACK1",
     },
 }
+# The flag forms of the runtime-size BF16 programs: the same packs and page
+# sizes, built with the call's attention sinks, LSE output or non-causal mask;
+# each computes the tiles of the JIT module of its form, bit for bit.
+# causal, attention sinks
+_CONTEXT_BF16_RUNTIME_SINK_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_SINK",
+        (12, None): "RUNTIME_PACK12_SINK",
+        (8, None): "RUNTIME_PACK8_SINK",
+        (7, None): "RUNTIME_PACK7_SINK",
+        (6, None): "RUNTIME_PACK6_SINK",
+        (5, None): "RUNTIME_PACK5_SINK",
+        (4, None): "RUNTIME_PACK4_SINK",
+        (2, None): "RUNTIME_PACK2_SINK",
+        (1, None): "RUNTIME_PACK1_SINK",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_SINK",
+        (12, None): "RUNTIME_PACK12_SINK",
+        (8, None): "RUNTIME_PACK8_SINK",
+        (7, None): "RUNTIME_PACK7_SINK",
+        (6, None): "RUNTIME_PACK6_SINK",
+        (5, None): "RUNTIME_PACK5_SINK",
+        (4, None): "RUNTIME_PACK4_SINK",
+        (2, None): "RUNTIME_PACK2_SINK",
+        (1, None): "RUNTIME_PACK1_SINK",
+    },
+}
+# causal, LSE output
+_CONTEXT_BF16_RUNTIME_LSE_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_LSE",
+        (12, None): "RUNTIME_PACK12_LSE",
+        (8, None): "RUNTIME_PACK8_LSE",
+        (7, None): "RUNTIME_PACK7_LSE",
+        (6, None): "RUNTIME_PACK6_LSE",
+        (5, None): "RUNTIME_PACK5_LSE",
+        (4, None): "RUNTIME_PACK4_LSE",
+        (2, None): "RUNTIME_PACK2_LSE",
+        (1, None): "RUNTIME_PACK1_LSE",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_LSE",
+        (12, None): "RUNTIME_PACK12_LSE",
+        (8, None): "RUNTIME_PACK8_LSE",
+        (7, None): "RUNTIME_PACK7_LSE",
+        (6, None): "RUNTIME_PACK6_LSE",
+        (5, None): "RUNTIME_PACK5_LSE",
+        (4, None): "RUNTIME_PACK4_LSE",
+        (2, None): "RUNTIME_PACK2_LSE",
+        (1, None): "RUNTIME_PACK1_LSE",
+    },
+}
+# not causal
+_CONTEXT_BF16_RUNTIME_NONCAUSAL_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_NONCAUSAL",
+        (12, None): "RUNTIME_PACK12_NONCAUSAL",
+        (8, None): "RUNTIME_PACK8_NONCAUSAL",
+        (7, None): "RUNTIME_PACK7_NONCAUSAL",
+        (6, None): "RUNTIME_PACK6_NONCAUSAL",
+        (5, None): "RUNTIME_PACK5_NONCAUSAL",
+        (4, None): "RUNTIME_PACK4_NONCAUSAL",
+        (2, None): "RUNTIME_PACK2_NONCAUSAL",
+        (1, None): "RUNTIME_PACK1_NONCAUSAL",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_NONCAUSAL",
+        (12, None): "RUNTIME_PACK12_NONCAUSAL",
+        (8, None): "RUNTIME_PACK8_NONCAUSAL",
+        (7, None): "RUNTIME_PACK7_NONCAUSAL",
+        (6, None): "RUNTIME_PACK6_NONCAUSAL",
+        (5, None): "RUNTIME_PACK5_NONCAUSAL",
+        (4, None): "RUNTIME_PACK4_NONCAUSAL",
+        (2, None): "RUNTIME_PACK2_NONCAUSAL",
+        (1, None): "RUNTIME_PACK1_NONCAUSAL",
+    },
+}
+# not causal, attention sinks
+_CONTEXT_BF16_RUNTIME_NONCAUSAL_SINK_ROUTES: dict[
+    str, dict[tuple[int, int | None], str]
+] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_NONCAUSAL_SINK",
+        (12, None): "RUNTIME_PACK12_NONCAUSAL_SINK",
+        (8, None): "RUNTIME_PACK8_NONCAUSAL_SINK",
+        (7, None): "RUNTIME_PACK7_NONCAUSAL_SINK",
+        (6, None): "RUNTIME_PACK6_NONCAUSAL_SINK",
+        (5, None): "RUNTIME_PACK5_NONCAUSAL_SINK",
+        (4, None): "RUNTIME_PACK4_NONCAUSAL_SINK",
+        (2, None): "RUNTIME_PACK2_NONCAUSAL_SINK",
+        (1, None): "RUNTIME_PACK1_NONCAUSAL_SINK",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_NONCAUSAL_SINK",
+        (12, None): "RUNTIME_PACK12_NONCAUSAL_SINK",
+        (8, None): "RUNTIME_PACK8_NONCAUSAL_SINK",
+        (7, None): "RUNTIME_PACK7_NONCAUSAL_SINK",
+        (6, None): "RUNTIME_PACK6_NONCAUSAL_SINK",
+        (5, None): "RUNTIME_PACK5_NONCAUSAL_SINK",
+        (4, None): "RUNTIME_PACK4_NONCAUSAL_SINK",
+        (2, None): "RUNTIME_PACK2_NONCAUSAL_SINK",
+        (1, None): "RUNTIME_PACK1_NONCAUSAL_SINK",
+    },
+}
+# not causal, LSE output
+_CONTEXT_BF16_RUNTIME_NONCAUSAL_LSE_ROUTES: dict[
+    str, dict[tuple[int, int | None], str]
+] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16_NONCAUSAL_LSE",
+        (12, None): "RUNTIME_PACK12_NONCAUSAL_LSE",
+        (8, None): "RUNTIME_PACK8_NONCAUSAL_LSE",
+        (7, None): "RUNTIME_PACK7_NONCAUSAL_LSE",
+        (6, None): "RUNTIME_PACK6_NONCAUSAL_LSE",
+        (5, None): "RUNTIME_PACK5_NONCAUSAL_LSE",
+        (4, None): "RUNTIME_PACK4_NONCAUSAL_LSE",
+        (2, None): "RUNTIME_PACK2_NONCAUSAL_LSE",
+        (1, None): "RUNTIME_PACK1_NONCAUSAL_LSE",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16_NONCAUSAL_LSE",
+        (12, None): "RUNTIME_PACK12_NONCAUSAL_LSE",
+        (8, None): "RUNTIME_PACK8_NONCAUSAL_LSE",
+        (7, None): "RUNTIME_PACK7_NONCAUSAL_LSE",
+        (6, None): "RUNTIME_PACK6_NONCAUSAL_LSE",
+        (5, None): "RUNTIME_PACK5_NONCAUSAL_LSE",
+        (4, None): "RUNTIME_PACK4_NONCAUSAL_LSE",
+        (2, None): "RUNTIME_PACK2_NONCAUSAL_LSE",
+        (1, None): "RUNTIME_PACK1_NONCAUSAL_LSE",
+    },
+}
+# Per component, the runtime-size route table of each flag form
+# ``(is_causal, return_lse, enable_sink)`` its programs serve: a call that no
+# exact route serves takes the program of its pack and page size from the
+# table of its own form, and a form the component lists no table for keeps
+# the JIT module.  (Sinks with LSE is no route.)
+_CONTEXT_RUNTIME_FLAG_ROUTES: dict[
+    str,
+    dict[tuple[bool, bool, bool], dict[str, dict[tuple[int, int | None], str]]],
+] = {
+    "context_bf16": {
+        (True, False, False): _CONTEXT_BF16_RUNTIME_ROUTES,
+        (True, False, True): _CONTEXT_BF16_RUNTIME_SINK_ROUTES,
+        (True, True, False): _CONTEXT_BF16_RUNTIME_LSE_ROUTES,
+        (False, False, False): _CONTEXT_BF16_RUNTIME_NONCAUSAL_ROUTES,
+        (False, False, True): _CONTEXT_BF16_RUNTIME_NONCAUSAL_SINK_ROUTES,
+        (False, True, False): _CONTEXT_BF16_RUNTIME_NONCAUSAL_LSE_ROUTES,
+    },
+}
+# The runtime-size BF16 programs of the flag forms (every form but the causal
+# one without LSE or sink): they run the units past the last whole section in
+# the plain order and take no tail-order bit
+# (:data:`_CONTEXT_BF16_TAIL_INTERLEAVE`).
+_CONTEXT_BF16_FLAG_FORM_PROGRAMS = frozenset(
+    name
+    for form, routes in _CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].items()
+    if form != (True, False, False)
+    for table in routes.values()
+    for name in table.values()
+)
 # Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
 # JIT pack above 1 whose ``max_q_len`` is a power of two of at least
 # ``queries``, over at least ``keys`` cache keys, keeps the JIT module.  The
@@ -1161,6 +1548,58 @@ _CONTEXT_NVFP4_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (4, None): "RUNTIME_PACK4_SM103A",
         (2, None): "RUNTIME_PACK2_SM103A",
         (1, None): "RUNTIME_PACK1_SM103A",
+    },
+}
+# Per target and mask (causal or not), per JIT pack: the calls the runtime-size
+# BF16 programs of the other flag forms (sinks, LSE, not causal) serve,
+# ``(keys, query x keys, work)``: a call over more than ``keys`` cache keys
+# (``max_kv_len``), of a larger ``max_q_len * max_kv_len``, or of a larger
+# ``batch_size * num_q_heads * max_q_len * max_kv_len`` keeps the JIT module of
+# its form (``None``: no bound).  Past them the programs ran in or below the A/A
+# band of the JIT module, or slower (B200: causal packs 8 and 16 at 4 .. 16 x
+# 512 .. 2048 x 8192 keys, packs 2, 4 and 8 at 16384 keys, pack 1 measured up
+# to 16384 keys; not causal pack 1 at 8 x 2048 x 8192 x 32 heads, 16 x 512 x
+# 16384 keys, 8192 x 8192 and 16384 x 4096).  Causal packs 4 and 16 stop at
+# 5120 keys.  sm103a (GB300, 10 layouts each): causal packs 2 .. 16 ran faster
+# than the JIT module at 8192 keys and pack 8 not at 12288; causal pack 1 at
+# 14336 keys but not at 16384; not causal pack 1 up to 16384 keys, 8192 x 8192
+# and 16 x 32 heads x 4096 x 4096; not causal pack 8 up to 16384 x 12288 and
+# 2 x 32 heads x 8192 x 16384 but not at 16384 x 16384; pack 16 up to
+# 16384 x 12288 and 64 heads x 4096 x 16384 but not at 64 heads x 8192 x 16384.
+_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS: dict[
+    str, dict[bool, dict[int, tuple[int | None, int | None, int | None]]]
+] = {
+    "sm100a": {
+        True: {
+            1: (16384, None, None),
+            2: (6144, None, None),
+            4: (5120, None, None),
+            5: (6144, None, None),
+            6: (6144, None, None),
+            7: (6144, None, None),
+            8: (6144, None, None),
+            12: (6144, None, None),
+            16: (5120, None, None),
+        },
+        False: {1: (8192, 4096 * 4096, 1 << 31)},
+    },
+    "sm103a": {
+        True: {
+            1: (14336, None, None),
+            2: (8192, None, None),
+            4: (8192, None, None),
+            5: (8192, None, None),
+            6: (8192, None, None),
+            7: (8192, None, None),
+            8: (8192, None, None),
+            12: (8192, None, None),
+            16: (8192, None, None),
+        },
+        False: {
+            1: (16384, 8192 * 8192, 1 << 33),
+            8: (None, 16384 * 12288, 1 << 33),
+            16: (None, 16384 * 12288, 1 << 32),
+        },
     },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
@@ -7518,7 +7957,7 @@ def select_cake_fmha_context_route(
     # The generated program serving the route on ``target`` (its key is the
     # route's component, scale form, head counts, pack, m-blocks, page size
     # and exact class), or ``None`` to keep the component's JIT module; the
-    # programs are causal and write no LSE and take no sink.
+    # exact and FP8 programs are causal and write no LSE and take no sink.
     program = None
     # the pack of the runtime-size program a call no exact route serves takes
     runtime_pack: int | None = None
@@ -7581,28 +8020,6 @@ def select_cake_fmha_context_route(
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
-        # A BF16 call no exact route serves: the runtime-size program of its
-        # JIT pack and page size (the same tile work as the JIT module), but
-        # not for the power-of-two query lengths of
-        # :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
-        runtime_bf16 = _CONTEXT_BF16_RUNTIME_ROUTES.get(target)
-        pow2_q = _CONTEXT_BF16_RUNTIME_POW2_Q.get(target)
-        jit_pow2 = (
-            pow2_q is not None
-            and pack_g > 1
-            and max_q_len >= pow2_q[0]
-            and max_q_len & (max_q_len - 1) == 0
-            and max_kv_len >= pow2_q[1]
-        )
-        if (
-            program is None
-            and component == "context_bf16"
-            and runtime_bf16
-            and not jit_pow2
-        ):
-            program = runtime_bf16.get((pack_g, page_size)) or runtime_bf16.get(
-                (pack_g, None)
-            )
         # An NVFP4 call no exact route serves: the runtime-size program of its
         # JIT pack (the same tile work as the JIT module), where the CUDA
         # toolkit builds the NVFP4 programs; else the JIT module, which needs
@@ -7840,6 +8257,49 @@ def select_cake_fmha_context_route(
             )
         ):
             program = one_wave
+    # A call no exact route serves, of a flag form its component's runtime-size
+    # programs serve (:data:`_CONTEXT_RUNTIME_FLAG_ROUTES`): the program of its
+    # JIT pack and page size in that form's table (the same tile work as the
+    # JIT module of the form): the causal form without LSE or sink except the
+    # power-of-two query lengths of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`, the
+    # other forms within the bounds of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`.
+    flag_form = (is_causal, lse is not None, sinks is not None)
+    runtime_form = (
+        _CONTEXT_RUNTIME_FLAG_ROUTES.get(component, {}).get(flag_form, {}).get(target)
+    )
+    plain = flag_form == (True, False, False)
+    if runtime_form and plain and component == "context_bf16":
+        # the causal form's own table as the module holds it at this call
+        runtime_form = _CONTEXT_BF16_RUNTIME_ROUTES.get(target)
+    pow2_q = _CONTEXT_BF16_RUNTIME_POW2_Q.get(target) if plain else None
+    jit_pow2 = (
+        pow2_q is not None
+        and pack_g > 1
+        and max_q_len >= pow2_q[0]
+        and max_q_len & (max_q_len - 1) == 0
+        and max_kv_len >= pow2_q[1]
+    )
+    bound_keys, bound_area, bound_work = (
+        _CONTEXT_BF16_RUNTIME_FLAG_BOUNDS.get(target, {})
+        .get(is_causal, {})
+        .get(pack_g, (None, None, None))
+        if component == "context_bf16" and not plain
+        else (None, None, None)
+    )
+    if (
+        program is None
+        and runtime_form
+        and not jit_pow2
+        and (bound_keys is None or max_kv_len <= bound_keys)
+        and (bound_area is None or max_q_len * max_kv_len <= bound_area)
+        and (
+            bound_work is None
+            or batch_size * num_q_heads * max_q_len * max_kv_len <= bound_work
+        )
+    ):
+        program = runtime_form.get((pack_g, page_size)) or runtime_form.get(
+            (pack_g, None)
+        )
     return CakeFmhaContextRoute(
         target=target,
         component=component,
@@ -7935,8 +8395,10 @@ class CakeFmhaContextProgramModule:
         count ``batch_size x num_q_heads / pack_g``.  A device-scale program
         reads the raw bmm1 scale and the bmm2 scale through device
         pointers; a host-scalar program takes them as scalars and never reads
-        the pointers.  The LSE, sink and Q-length pointers are unread (the
-        programs write no LSE, take no sink and derive the query lengths from
+        the pointers.  A BF16 program of a flag form with LSE or sinks takes
+        the caller's ``lse`` (``[tokens, num_q_heads]``, contiguous) or
+        ``attention_sinks``; the other LSE and sink pointers and the Q-length
+        pointer are unread (the programs derive the query lengths from
         ``cum_seq_lens_q``): they point at a small per-device buffer.  A
         runtime-size program also takes the scale source, the m-block count of
         ``max_q_len``, the head counts, the GQA group and the log2 page size of
@@ -7944,11 +8406,15 @@ class CakeFmhaContextProgramModule:
         """
 
         route = self.route
-        if lse is not None or attention_sinks is not None:
-            # route selection keeps such calls on the JIT module: the unread
-            # pointers below never stand in for a caller's LSE or sinks
+        form = (route.return_lse, route.enable_sink, route.is_causal)
+        given = (lse is not None, attention_sinks is not None, bool(is_causal))
+        if given[:2] != form[:2] or (form != (False, False, True) and given != form):
+            # the LSE output and sinks of a call are its program's, and a
+            # program of a flag form takes the calls of its causal mask only:
+            # the unread pointers below never stand in for a caller's LSE or
+            # sinks
             raise RuntimeError(
-                "a Cake FMHA context program writes no LSE and takes no sinks"
+                "Cake FMHA context launch does not match its program's flag form"
             )
         if self.runtime:
             num_q_heads = query.shape[1]
@@ -8059,17 +8525,17 @@ class CakeFmhaContextProgramModule:
             output_scale, bmm1_is_log2 = float(bmm2_scale), 0
             bmm1_ptr = bmm2_ptr = unread_f32
         # The arguments in the binding's order: ``_CONTEXT_HOST_PARAMS`` of the
-        # component (LSE_ptr, sinks and seq_lens_q unread; a runtime-size
-        # program's sizes after them), then the grid; the order is checked
-        # against the record at load.
+        # component (LSE_ptr and sinks unread unless the program's flag form
+        # takes them, seq_lens_q unread; a runtime-size program's sizes after
+        # them), then the grid; the order is checked against the record at load.
         if not self.quantized:
             arguments: tuple[Any, ...] = (
                 query,
                 key_cache,
                 value_cache,
                 out,
-                unread_f32,
-                unread_f32,
+                unread_f32 if lse is None else lse,
+                unread_f32 if attention_sinks is None else attention_sinks,
                 page_table_k,
                 page_table_v,
                 unread_i32,
@@ -8089,6 +8555,7 @@ class CakeFmhaContextProgramModule:
                     | (
                         _CONTEXT_BF16_TAIL_INTERLEAVE
                         if is_causal
+                        and route.program not in _CONTEXT_BF16_FLAG_FORM_PROGRAMS
                         and _context_bf16_tail_interleave(
                             int(batch_size),
                             int(max_q_len),
