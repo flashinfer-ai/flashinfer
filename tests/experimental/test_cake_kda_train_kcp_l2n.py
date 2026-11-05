@@ -1669,8 +1669,8 @@ def _fake_pick(stage: str, path: str, mode: str, docs: int, heads: int, arch: st
     """The fake registry's selection, shaped as the existing backend's: the intra programs switch above 256
     documents; fused, the forward's intra program is the ``_l2n`` twin and on the replay the intra program (at most
     256 documents) or the prep (above) is; the GLM intra program per architecture (fused, its twin; fallback, its
-    capture form); this package's fused gradient (its l2n class, both forms); the fallback form's separate programs
-    (none in the fused form)."""
+    capture form); this package's fused gradient (its l2n class, both forms) and the raw gate mode's parameter-gradient
+    reduce (its l2n record, both forms); the fallback form's separate programs (none in the fused form)."""
     few = docs <= 256
     twin = "_l2n" if mode == "fused" else ""
     if stage == "fwd_intra":
@@ -1683,6 +1683,8 @@ def _fake_pick(stage: str, path: str, mode: str, docs: int, heads: int, arch: st
         return glm.get(arch, "glm_intra_v18") + (twin or "_cap")
     if stage == "dqkg":
         return "dqkg_int_l2n" if few else "dqkg_l2n"
+    if stage == "param_finalize":
+        return "param_finalize_l2n"
     return stage if mode == "fallback" else None
 
 
@@ -1769,7 +1771,9 @@ def test_l2n_capability_check() -> None:
     """:func:`cake_kcp_plan.qk_l2norm_missing` (form, gate, arch): rank-independent inputs only (no context, no token
     count, no plan).  It selects through the existing backend's ``select_record(..., l2n=form)`` (and ``gate=`` in the
     raw gate mode) every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` of the form on the route's two local paths
-    (this package's fused gradient ``dqkg`` among them), over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at
+    (this package's fused gradient ``dqkg`` among them) and, in the raw gate mode, of
+    :data:`cake_kcp_plan.QK_L2NORM_GATE_STAGES` (the parameter-gradient reduce ``param_finalize``, an l2n stage of this
+    package's registry; never in the g mode), over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at
     each SM count of the architecture (:data:`cake_kcp_plan.QK_L2NORM_SMS`; every exported architecture for ``None``),
     each problem once; the grid holds both document regimes (at most and above 256) on both recurrence routes (segmented
     and serial) on every architecture.  A reason while the existing backend's entry points lack
@@ -1794,6 +1798,10 @@ def test_l2n_capability_check() -> None:
         "fused": readers + gradient,
         "fallback": readers + separate + gradient,
     }
+    gate_stages = cake_kcp_plan.QK_L2NORM_GATE_STAGES
+    assert gate_stages == {"g": (), "raw": ((B, "param_finalize"),)}
+    assert "param_finalize" in cake_jit.L2N_STAGES
+    assert "param_finalize" not in det_jit.L2N_STAGES
     assert cake_kcp_plan.QK_L2NORM_LAYOUTS == ("fwd", "fwd_kcp", "replay")
     # the grid: both document regimes on both routes, on every architecture at each of its SM counts
     grid, sms = cake_kcp_plan.QK_L2NORM_GRID, cake_kcp_plan.QK_L2NORM_SMS
@@ -1828,7 +1836,7 @@ def test_l2n_capability_check() -> None:
                     for a in (cake_jit.ARCHES if arch is None else (arch,))
                     for sm in sms[a]
                     for problem in grid
-                    for path, stage in stages[form]
+                    for path, stage in stages[form] + gate_stages[gate]
                 }
                 got = [tuple(k[f] for f in fields) for k in seen]
                 assert len(got) == len(want) and set(got) == want, (form, gate, arch)
@@ -1930,6 +1938,17 @@ def test_l2n_capability_check() -> None:
             assert cake_kcp_plan.qk_l2norm_missing("fallback", "g", "sm_103a") is None
             for arch in ("sm_103a", None):
                 assert cake_kcp_plan.qk_l2norm_missing("fused", "g", arch) == want
+    # the raw gate mode's parameter-gradient reduce, an l2n stage of this package's registry, in both forms (the g
+    # mode selects none: its check passes on the same registry)
+    for form in ("fused", "fallback"):
+        with pytest.MonkeyPatch.context() as m:
+            pick = _pick_but(lambda s, *k: s == "param_finalize", None)
+            _fake_registry(m, pick=pick)
+            assert cake_kcp_plan.qk_l2norm_missing(form, "g") is None
+            assert cake_kcp_plan.qk_l2norm_missing(form, "raw") == (
+                "the single-rank registry selects no param_finalize on "
+                f"{B} (sm_100a, 148 SMs, 1 documents, 4 heads, 1 chunks)"
+            )
     # the gate mode: the raw gate mode needs a selection by gate mode
     raw = "the single-rank registry selects no record of gate mode 'raw'"
     for form in ("fused", "fallback"):
@@ -2016,15 +2035,20 @@ def test_l2n_capability_check_passes_on_the_registry(form: str, gate: str) -> No
     """The unpatched capability check (uncached) passes on this package's registry and ``build.json`` for both forms
     and gate modes on every exported architecture: every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` selects a
     delivered, exported record of the mode over the whole grid, the fused gradient (``dqkg``, an l2n stage of this
-    package's registry) too -- once per problem and SM count, never an S1 record -- so the flag-on rows of this file
-    run rather than skip."""
+    package's registry) too -- once per problem and SM count, never an S1 record -- and in the raw gate mode the
+    parameter-gradient reduce (``param_finalize``, an l2n stage of this package's registry) -- once per problem and
+    SM count, ``param_finalize_l2n``, never an R1c cast; never in the g mode --, so the flag-on rows of this file run
+    rather than skip."""
     select = cake_jit.select_record
     picked: list = []
+    finalize: list = []
 
     def recording(stage, **kw):
         name = select(stage, **kw)
         if stage == "dqkg":
             picked.append(name)
+        if stage == "param_finalize":
+            finalize.append(name)
         return name
 
     with pytest.MonkeyPatch.context() as m:
@@ -2040,6 +2064,9 @@ def test_l2n_capability_check_passes_on_the_registry(form: str, gate: str) -> No
         assert name not in cake_jit.S1_RECORDS, name
         assert form in record.get("l2n", ["off"]), name
         assert record.get("gate", "g") == gate, name
+    want = problems if gate == "raw" else 0
+    assert len(finalize) == want, (len(finalize), want)
+    assert set(finalize) <= {"param_finalize_l2n"}, set(finalize)
 
 
 def test_l2n_stage_values_merge() -> None:

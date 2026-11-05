@@ -3181,7 +3181,9 @@ def local_tail_count_words(arena_bytes: int, H: int) -> int:
 # ``cake_jit.select_record(..., l2n=mode)`` (a stage of its ``L2N_STAGES`` selects among the records whose ``l2n`` modes
 # hold the mode) for the stages of :data:`QK_L2NORM_STAGES` on the route's two local paths (the forward's
 # ``fwd_nosave``, the backward's ``replay``): the deterministic package's stages and this package's fused gradient
-# (``dqkg``, an l2n stage of its registry, whose ``dqkg_*_l2n`` class the mode selects); in the fused form the forward's
+# (``dqkg``, an l2n stage of its registry, whose ``dqkg_*_l2n`` class the mode selects), and in the raw gate mode the
+# stages of :data:`QK_L2NORM_GATE_STAGES` (the parameter-gradient reduce ``param_finalize``, an l2n stage of its
+# registry too, whose ``param_finalize_l2n`` record the mode selects); in the fused form the forward's
 # intra program normalizes and on the replay exactly one first q / k reader does, the intra program or the prep, as the
 # existing order of the problem gives (:func:`qk_l2norm_intra_first`; in the fallback form none of them does).  The
 # check selects over the fixed grid :data:`QK_L2NORM_GRID` x :data:`QK_L2NORM_SMS` (no rank's tokens: at most and above
@@ -3216,6 +3218,14 @@ _QK_L2NORM_GRADIENT = ((LOCAL_PATH_BWD, "dqkg"),)
 QK_L2NORM_STAGES = {
     "fused": _QK_L2NORM_READERS + _QK_L2NORM_GRADIENT,
     "fallback": _QK_L2NORM_READERS + _QK_L2NORM_SEPARATE + _QK_L2NORM_GRADIENT,
+}
+# the raw gate mode's parameter-gradient reduce: an l2n stage of the single-rank registry (the raw class's l2n GLM
+# intra programs write the deterministic per-chunk partials, so an l2n mode selects ``param_finalize_l2n``, the
+# deterministic record, never an ``R1c`` cast), on the backward's path in both forms; the g mode has no record of
+# the stage.  (path, stage) per gate mode, after the form's stages
+QK_L2NORM_GATE_STAGES = {
+    "g": (),
+    "raw": ((LOCAL_PATH_BWD, "param_finalize"),),
 }
 # (num_chunks_pad, num_seqs, num_heads) of the check: 1 / 256 / 257 documents (the intra programs switch above 256),
 # 4 / 16 / 64 heads (the segmented route at few heads and at the 16 heads some architectures list, the serial route
@@ -3380,15 +3390,17 @@ def _qk_l2norm_problem(
 ) -> str | None:
     """Why the records the existing backend selects (``cake_jit.select_record`` with ``modes``) for one problem
     ``(num_chunks_pad, num_seqs, num_heads)`` of :data:`QK_L2NORM_GRID` on architecture ``arch`` with ``sm`` SMs do
-    not serve mode ``mode``, ``None`` when they do: every stage of :data:`QK_L2NORM_STAGES` selects a record (no
-    ``ValueError``, no ``None``) delivered for ``arch`` with a library in ``libraries`` (``build.json``), and the
-    readers give the route's order (:func:`_qk_l2norm_readers`)."""
+    not serve mode ``mode``, ``None`` when they do: every stage of :data:`QK_L2NORM_STAGES` and of the gate mode's
+    :data:`QK_L2NORM_GATE_STAGES` (``modes``' ``gate``, ``"g"`` when absent) selects a record (no ``ValueError``, no
+    ``None``) delivered for ``arch`` with a library in ``libraries`` (``build.json``), and the readers give the
+    route's order (:func:`_qk_l2norm_readers`)."""
     from ..cake.cake_kda_train import cake_jit
 
     nc, docs, heads = problem
     where = f"{arch}, {sm} SMs, {docs} documents, {heads} heads, {nc} chunks"
     picked: dict[tuple[str, str], str] = {}
-    for path, stage in QK_L2NORM_STAGES[mode]:
+    gate = modes.get("gate", "g")
+    for path, stage in QK_L2NORM_STAGES[mode] + QK_L2NORM_GATE_STAGES.get(gate, ()):
         what = f"{stage} on {path} ({where})"
         try:
             name = cake_jit.select_record(
@@ -3437,6 +3449,7 @@ def _qk_l2norm_inputs() -> tuple[Any, ...]:
         cake_jit.ARCHES,
         cake_build.libraries_by_name,
         QK_L2NORM_STAGES,
+        QK_L2NORM_GATE_STAGES,
         QK_L2NORM_GRID,
         QK_L2NORM_SMS,
         QK_L2NORM_SMS_ANY,
@@ -3456,10 +3469,10 @@ def qk_l2norm_missing(
     over the fixed problem grid (:data:`QK_L2NORM_GRID`, :data:`QK_L2NORM_SMS`), its ``build.json`` libraries and its
     static layout tables -- never from a rank's tokens or plan, so every rank gets the same answer: its entry points
     do not take ``use_qk_l2norm_in_kernel``; its plan, layout table or record selection has no such mode (or gate
-    mode); a stage of :data:`QK_L2NORM_STAGES` selects no record for a problem of the grid, or one not delivered or
-    not exported for the architecture; the selected readers do not give the route's order (:func:`_qk_l2norm_readers`);
-    or a layout of :data:`QK_L2NORM_LAYOUTS` lacks the :data:`QK_L2NORM_SLOTS` views.  A passed
-    check is kept while the objects it read are the same objects."""
+    mode); a stage of :data:`QK_L2NORM_STAGES` (and, in the raw gate mode, of :data:`QK_L2NORM_GATE_STAGES`) selects
+    no record for a problem of the grid, or one not delivered or not exported for the architecture; the selected
+    readers do not give the route's order (:func:`_qk_l2norm_readers`); or a layout of :data:`QK_L2NORM_LAYOUTS` lacks
+    the :data:`QK_L2NORM_SLOTS` views.  A passed check is kept while the objects it read are the same objects."""
     if mode == "off":
         return None
     key = (mode, gate, arch)
