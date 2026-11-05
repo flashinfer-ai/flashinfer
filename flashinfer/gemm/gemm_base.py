@@ -6648,6 +6648,8 @@ def _check_mm_mxfp8_problem_size(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -6753,6 +6755,11 @@ def _check_mm_mxfp8_problem_size(
                 f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
             )
 
+    if pdl_signal_at not in _MM_MXFP8_PDL_SIGNAL_POINTS:
+        raise ValueError(
+            f"pdl_signal_at must be one of {_MM_MXFP8_PDL_SIGNAL_POINTS}, "
+            f"got {pdl_signal_at!r}."
+        )
     _validate_mxfp8_output_dtype(out_dtype)
     return True
 
@@ -6767,6 +6774,8 @@ def _cutlass_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",  # unused
 ):
     # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
@@ -6797,6 +6806,8 @@ def _trtllm_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["trtllm", "auto"] = "auto",
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",  # unused
 ):
     if out_dtype != torch.bfloat16:
         return False
@@ -6825,6 +6836,8 @@ def _cute_dsl_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",  # unused
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
@@ -6847,6 +6860,8 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",  # unused
 ):
     if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
         if backend != "cutedsl_low_latency":
@@ -6878,6 +6893,8 @@ def _cudnn_mm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cudnn", "auto"] = "cudnn",
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",  # unused
 ):
     # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
     # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
@@ -6994,6 +7011,40 @@ def _is_per_token_alpha(alpha_tensor) -> bool:
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
 
+# Values of mm_mxfp8's ``pdl_signal_at``: PDL_SIGNAL_POINTS of the SM100 kernels
+# in kernels/dense_blockscaled_gemm_sm100.py, which this module imports lazily.
+_MM_MXFP8_PDL_SIGNAL_POINTS = (
+    "kernel_end",
+    "after_wait",
+    "after_mainloop",
+    "after_stores",
+)
+# Pipeline stages of weights the SM100 cute-dsl kernels load before
+# griddepcontrol.wait under mm_mxfp8(prefetch_weights_before_wait=True). The
+# split-K kernel also L2-prefetches the rest of its K slice before the wait; the
+# persistent kernel streams the rest of its tile after it.
+_MM_MXFP8_PDL_PROLOGUE_STAGES = 4
+
+
+def _mm_mxfp8_pdl_kernel_options(
+    prefetch_weights_before_wait: bool,
+    pdl_signal_at: str,
+    swap_ab: bool,
+    is_split_k: bool,
+) -> dict:
+    """PDL keyword arguments of one SM100 cute-dsl mm_mxfp8 kernel.
+
+    The weights are ``b``: the kernel's A operand under swap_ab, else its B.
+    """
+    options: dict = {"pdl_signal_at": pdl_signal_at}
+    if prefetch_weights_before_wait:
+        options.update(
+            pdl_prologue_operand="a" if swap_ab else "b",
+            pdl_prologue_stages=_MM_MXFP8_PDL_PROLOGUE_STAGES,
+            pdl_prologue_l2_prefetch=is_split_k,
+        )
+    return options
+
 
 def _check_cute_dsl_arch(device: torch.device) -> None:
     """Reject the CuTe-DSL backend when the installed DSL cannot emit for ``device``.
@@ -7059,8 +7110,15 @@ def _cute_dsl_gemm_mxfp8_runner(
     out_dtype: torch.dtype,
     warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
     low_m_only: bool = False,
+    prefetch_weights_before_wait: bool = False,
+    pdl_signal_at: str = "kernel_end",
 ):
-    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107)."""
+    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107).
+
+    ``prefetch_weights_before_wait`` / ``pdl_signal_at``: see ``mm_mxfp8``.
+    They change neither the tactics nor the results, so the autotune key
+    leaves them out and tuned tactics carry over.
+    """
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -7282,6 +7340,9 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
+            pdl_options = _mm_mxfp8_pdl_kernel_options(
+                prefetch_weights_before_wait, pdl_signal_at, swap_ab, is_split_k
+            )
             cache_key = (
                 sf_vec_size,
                 mma_tiler_mn,
@@ -7291,6 +7352,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 enable_pdl,
                 out_dtype,
                 split_k_slices,
+                tuple(sorted(pdl_options.items())),
             )
 
             make_kernel: Callable[[], object]
@@ -7301,6 +7363,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     mma_tiler_mn,
                     split_k_slices,
                     enable_pdl,
+                    **pdl_options,
                 )
             else:
                 make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
@@ -7309,6 +7372,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
+                    **pdl_options,
                 )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(
@@ -7587,25 +7651,44 @@ def _cute_dsl_mxfp8_runners(
     enable_pdl: bool,
     out_dtype: torch.dtype,
     inputs: List[torch.Tensor],
+    prefetch_weights_before_wait: bool = False,
+    pdl_signal_at: str = "kernel_end",
 ) -> List[TunableRunner]:
-    """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default."""
+    """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default.
+
+    The PDL options reach the SM100 block-scaled kernels only; the warp split-K
+    runner keeps its own synchronization.
+    """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
+    pdl_kwargs = dict(
+        prefetch_weights_before_wait=prefetch_weights_before_wait,
+        pdl_signal_at=pdl_signal_at,
+    )
     # Older DSLs lack cutlass.experimental; only the block-scaled runner remains.
     if not is_cute_dsl_experimental_available():
-        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
+        return [
+            _cute_dsl_gemm_mxfp8_runner(
+                sm_major, sm_minor, enable_pdl, out_dtype, **pdl_kwargs
+            )
+        ]
     warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl)
     # One autotune call profiles every M bucket with these runners, so whether the
     # warp runner is registered must not depend on M; per profile it offers
     # tactics only for the M it serves.
     if not warp.supports_inputs(inputs, check_m=False):
-        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
+        return [
+            _cute_dsl_gemm_mxfp8_runner(
+                sm_major, sm_minor, enable_pdl, out_dtype, **pdl_kwargs
+            )
+        ]
     cluster_splitk = _cute_dsl_gemm_mxfp8_runner(
         sm_major,
         sm_minor,
         enable_pdl,
         out_dtype,
         warp_splitk_supports=warp.supports_inputs,
+        **pdl_kwargs,
     )
     a, b = inputs[0], inputs[1]
     # Untuned, warp split-K runs first only while its 16-wide output tiles fit in
@@ -7619,13 +7702,28 @@ def _cute_dsl_mxfp8_runners(
 
 
 def _cute_dsl_mxfp8_runners_sm107(
-    out_dtype: torch.dtype, inputs: List[torch.Tensor]
+    out_dtype: torch.dtype,
+    inputs: List[torch.Tensor],
+    prefetch_weights_before_wait: bool = False,
+    pdl_signal_at: str = "kernel_end",
 ) -> List[TunableRunner]:
-    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default."""
+    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default.
+
+    The PDL options reach the low-M SM100 runner only: the SM107 kernel launches
+    without PDL and the warp split-K runner keeps its own synchronization.
+    """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
     sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
-    low_m = _cute_dsl_gemm_mxfp8_runner(10, 7, True, out_dtype, low_m_only=True)
+    low_m = _cute_dsl_gemm_mxfp8_runner(
+        10,
+        7,
+        True,
+        out_dtype,
+        low_m_only=True,
+        prefetch_weights_before_wait=prefetch_weights_before_wait,
+        pdl_signal_at=pdl_signal_at,
+    )
     a, b, _, _, _, out, _ = inputs
     m, k = a.shape
     n = b.shape[1]
@@ -7803,6 +7901,8 @@ def _heuristic_func_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
+    prefetch_weights_before_wait: bool = False,  # unused
+    pdl_signal_at: str = "kernel_end",  # unused
 ) -> List[str]:
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
@@ -7844,6 +7944,8 @@ def mm_mxfp8(
     backend: Literal[
         "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
+    prefetch_weights_before_wait: bool = False,
+    pdl_signal_at: str = "kernel_end",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -7903,6 +8005,31 @@ def mm_mxfp8(
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
+
+    prefetch_weights_before_wait: bool
+        Lets the ``"cute-dsl"`` backend's SM100 block-scaled kernels (on
+        SM100/SM103, and the low-M runner on SM107) load the first pipeline
+        stages of ``b`` and ``b_descale`` before ``griddepcontrol.wait``, so
+        the weight stream overlaps the kernel this call waits on through
+        programmatic dependent launch (PDL). Set it only if no kernel that
+        may still be running when this call starts writes ``b`` or
+        ``b_descale``, as for the static weights of a linear layer. ``a``,
+        ``a_descale`` and ``out`` are still accessed only after the wait, and
+        the result is bitwise the same. Defaults to ``False``; other backends
+        and kernels ignore it.
+
+    pdl_signal_at: str
+        Where those same kernels let PDL dependents launch
+        (``griddepcontrol.launch_dependents``; a CTA signals at its first one,
+        dependents launch once every CTA has signalled). From earliest to
+        latest: ``"after_wait"`` (right after the wait), ``"after_mainloop"``
+        (once a CTA has issued its last MMA), ``"kernel_end"`` (default,
+        unchanged: normally once a CTA's last loaded stage has been consumed)
+        or ``"after_stores"`` (once a CTA has issued its last ``out`` store).
+        Dependents still wait for this call to complete before reading
+        ``out``; with ``"after_wait"`` they must also not write, before their
+        own wait, anything this call reads. Other backends and kernels ignore
+        it.
 
     Returns
     -------
@@ -7982,9 +8109,22 @@ def mm_mxfp8(
             use_8x4_sf_layout
         ),
         "cute-dsl": lambda: (
-            _cute_dsl_mxfp8_runners_sm107(out_dtype, inputs)
+            _cute_dsl_mxfp8_runners_sm107(
+                out_dtype,
+                inputs,
+                prefetch_weights_before_wait=prefetch_weights_before_wait,
+                pdl_signal_at=pdl_signal_at,
+            )
             if _use_sm107_mxfp8_cute_dsl(major, minor, a, b, out)
-            else _cute_dsl_mxfp8_runners(major, minor, True, out_dtype, inputs)
+            else _cute_dsl_mxfp8_runners(
+                major,
+                minor,
+                True,
+                out_dtype,
+                inputs,
+                prefetch_weights_before_wait=prefetch_weights_before_wait,
+                pdl_signal_at=pdl_signal_at,
+            )
         ),
         "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
             major * 10 + minor, True

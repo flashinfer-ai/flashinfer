@@ -383,9 +383,9 @@ def test_mm_mxfp8_cute_dsl_special_scale_encodings(a_scale, b_scale, expected):
     )
 
 
-# Triggers the dependent launch first, spins, and only then writes the weight and
-# its scales, so a dependent GEMM that reads them before griddepcontrol.wait sees
-# the NaN bytes left in the buffers.
+# Triggers the dependent launch first, spins, and only then writes a GEMM operand
+# and its scales, so a dependent GEMM that reads them before griddepcontrol.wait
+# sees the NaN bytes left in the buffers.
 _PDL_PRODUCER_CUDA = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -427,16 +427,11 @@ void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, at::Tensor s_out,
 """
 
 
-@pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("m,n,k", [(1, 1152, 1536), (16, 2304, 2048), (32, 256, 2048)])
-def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
-    """The cute-dsl GEMM launches with PDL; it must not read the weight or its
-    scales before the kernel that writes them has finished."""
-    _skip_if_unsupported("cute-dsl")
+def _load_pdl_producer():
     from torch.utils.cpp_extension import load_inline
 
     major, minor = get_compute_capability(torch.device("cuda"))
-    producer = load_inline(
+    return load_inline(
         name="test_mm_mxfp8_pdl_producer",
         cpp_sources=[
             "void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, "
@@ -449,6 +444,15 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
         functions=["pdl_delayed_producer"],
         verbose=False,
     )
+
+
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize("m,n,k", [(1, 1152, 1536), (16, 2304, 2048), (32, 256, 2048)])
+def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
+    """The cute-dsl GEMM launches with PDL; it must not read the weight or its
+    scales before the kernel that writes them has finished."""
+    _skip_if_unsupported("cute-dsl")
+    producer = _load_pdl_producer()
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -493,6 +497,216 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
             "the GEMM read the weight before it was written"
         )
         _assert_cosine_similarity(reference, out)
+
+
+def _mxfp8_runner_inputs(m, n, k):
+    """Runner inputs for an (m, n, k) mm_mxfp8 and its BF16 reference."""
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    inputs = [
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        torch.bfloat16,
+        out,
+        workspace,
+    ]
+    return inputs, torch.mm(input, weight.T)
+
+
+def _one_tactic_per_kernel_structure(tactics):
+    """The first tactic of each structure: split-K, swap_ab, cluster, 2-CTA, narrow N."""
+    picked = {}
+    for tactic in tactics:
+        mma_tiler_mn, cluster_shape_mn, swap_ab, _, split_k_slices = tactic
+        key = (
+            split_k_slices > 1,
+            swap_ab,
+            tuple(cluster_shape_mn) != (1, 1),
+            mma_tiler_mn[0] == 256,
+            mma_tiler_mn[1] < 64,
+        )
+        picked.setdefault(key, tactic)
+    return list(picked.values())
+
+
+def _mxfp8_cute_dsl_runner(**pdl_options):
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16, **pdl_options
+    )
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.int16)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (8, 1536, 2048),  # split-K and narrow swap_ab tiles
+        (32, 512, 256),  # fewer K blocks (per K slice) than pre-loaded stages
+        (256, 1024, 4096),  # wide tiles, clusters, 2-CTA MMA
+        # More tiles than CTAs: persistent CTAs run a second tile, whose stages
+        # are acquired normally after the pre-loaded first one.
+        (2048, 8192, 1024),
+        (16, 49152, 1024),  # the same under swap_ab with narrow tiles
+    ],
+)
+@pytest.mark.parametrize("pdl_signal_at", ["kernel_end", "after_stores"])
+def test_mm_mxfp8_cute_dsl_prefetch_weights_before_wait_bitwise(m, n, k, pdl_signal_at):
+    """Loading the weights before the PDL wait, and moving the dependents'
+    launch, change no output bit for any kernel structure the runner offers."""
+    _skip_if_unsupported("cute-dsl")
+    inputs, reference = _mxfp8_runner_inputs(m, n, k)
+    out = inputs[5]
+    stock = _mxfp8_cute_dsl_runner()
+    early = _mxfp8_cute_dsl_runner(
+        prefetch_weights_before_wait=True, pdl_signal_at=pdl_signal_at
+    )
+    tactics = _one_tactic_per_kernel_structure(stock.get_valid_tactics(inputs, None))
+    assert tactics
+    for tactic in tactics:
+        out.fill_(float("nan"))
+        stock(inputs, tactic=tactic)
+        expected = out.clone()
+        _assert_cosine_similarity(reference, expected, context=str(tactic))
+        out.fill_(float("nan"))
+        early(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(out), _bits(expected)), tactic
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (8, 1536, 2048),
+        (256, 1024, 4096),
+        # More tiles than CTAs, without and with swap_ab.
+        (2048, 8192, 1024),
+        (16, 49152, 1024),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_prefetch_weights_still_waits_for_activations(m, n, k):
+    """With prefetch_weights_before_wait the GEMM still reads the activations
+    and their scales only after the kernel that writes them has finished."""
+    _skip_if_unsupported("cute-dsl")
+    producer = _load_pdl_producer()
+    inputs, _ = _mxfp8_runner_inputs(m, n, k)
+    input_mxfp8, _, input_scale, _, _, out, _ = inputs
+    stock = _mxfp8_cute_dsl_runner()
+    early = _mxfp8_cute_dsl_runner(prefetch_weights_before_wait=True)
+    stale_input = torch.empty_like(input_mxfp8)
+    stale_scale = torch.empty_like(input_scale)
+    late_inputs = [stale_input, inputs[1], stale_scale, *inputs[3:]]
+    tactics = _one_tactic_per_kernel_structure(stock.get_valid_tactics(inputs, None))
+    for tactic in tactics:
+        stock(inputs, tactic=tactic)
+        expected = out.clone()
+        for _ in range(3):
+            # NaN in E4M3 (0x7F) and in E8M0 (0xFF): a stale read poisons the output.
+            stale_input.view(torch.uint8).fill_(0x7F)
+            stale_scale.view(torch.uint8).fill_(0xFF)
+            torch.cuda.synchronize()
+            producer.pdl_delayed_producer(
+                stale_input, input_mxfp8, stale_scale, input_scale, 4_000_000
+            )
+            early(late_inputs, tactic=tactic)
+            torch.cuda.synchronize()
+            assert torch.equal(_bits(out), _bits(expected)), (
+                f"{tactic}: the GEMM read the activations before they were written"
+            )
+
+
+@pytest.mark.parametrize(
+    "pdl_signal_at", ["kernel_end", "after_wait", "after_mainloop", "after_stores"]
+)
+@pytest.mark.parametrize("m", [16, 256])
+def test_mm_mxfp8_cute_dsl_pdl_options_chain(pdl_signal_at, m):
+    """GEMM -> PDL quantize -> GEMM through mm_mxfp8 with the PDL options gives
+    the bits of the same chain without them."""
+    _skip_if_unsupported("cute-dsl")
+    k1, n1, n2 = 1024, 4096, 4096
+    x = torch.randn([m, k1], device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn([n1, k1], device="cuda", dtype=torch.bfloat16)
+    w2 = torch.randn([n2, n1], device="cuda", dtype=torch.bfloat16)
+    x_q, w1_q, x_sf, w1_sf = _prepare_mxfp8_tensors(
+        x, w1, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    w2_q, w2_sf = mxfp8_quantize(w2, sf_swizzle_layout=SfLayout.layout_128x4)
+
+    def chain(**pdl_options):
+        h = mm_mxfp8(x_q, w1_q.T, x_sf, w1_sf, backend="cute-dsl", **pdl_options)
+        h_q, h_sf = mxfp8_quantize(
+            h,
+            backend="cute-dsl",
+            enable_pdl=True,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+        return mm_mxfp8(h_q, w2_q.T, h_sf, w2_sf, backend="cute-dsl", **pdl_options)
+
+    # The untuned default runner and tactic, the same for both chains.
+    AutoTuner.get().clear_cache()
+    with autotune(False):
+        expected = chain()
+        torch.cuda.synchronize()
+        for _ in range(3):
+            actual = chain(
+                prefetch_weights_before_wait=True, pdl_signal_at=pdl_signal_at
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(_bits(actual), _bits(expected))
+
+
+def test_mm_mxfp8_pdl_kernel_options():
+    """CPU-only: the option checks and the weight operand under swap_ab."""
+    pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm100 as sm100
+
+    assert gemm_base._MM_MXFP8_PDL_SIGNAL_POINTS == sm100.PDL_SIGNAL_POINTS  # pyright: ignore[reportPrivateUsage]
+    options = gemm_base._mm_mxfp8_pdl_kernel_options  # pyright: ignore[reportPrivateUsage]
+    assert options(False, "kernel_end", True, False) == {"pdl_signal_at": "kernel_end"}
+    swapped = options(True, "after_stores", True, True)
+    assert swapped["pdl_prologue_operand"] == "a"
+    assert swapped["pdl_prologue_l2_prefetch"]
+    assert swapped["pdl_prologue_stages"] > 0
+    assert swapped["pdl_signal_at"] == "after_stores"
+    unswapped = options(True, "kernel_end", False, False)
+    assert unswapped["pdl_prologue_operand"] == "b"
+    assert not unswapped["pdl_prologue_l2_prefetch"]
+    for valid in (swapped, unswapped):
+        sm100._check_pdl_prologue_options(  # pyright: ignore[reportPrivateUsage]
+            valid["pdl_prologue_operand"],
+            valid["pdl_prologue_stages"],
+            valid["pdl_prologue_l2_prefetch"],
+            valid["pdl_signal_at"],
+        )
+
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
+        Sm100BlockScaledSplitKGemmKernel,
+    )
+
+    invalid = [
+        dict(pdl_prologue_stages=4),  # no operand named
+        dict(pdl_prologue_l2_prefetch=True),  # no operand named
+        dict(pdl_prologue_operand="b"),  # nothing loaded early
+        dict(pdl_prologue_operand="c", pdl_prologue_stages=4),
+        dict(pdl_prologue_operand="a", pdl_prologue_stages=-1),
+        dict(pdl_signal_at="early"),
+    ]
+    for kwargs in invalid:
+        with pytest.raises(ValueError):
+            sm100.Sm100BlockScaledPersistentDenseGemmKernel(
+                32, (128, 128), (1, 1), **kwargs
+            )
+        with pytest.raises(ValueError):
+            Sm100BlockScaledSplitKGemmKernel(32, (128, 8), 2, **kwargs)
 
 
 @pytest.mark.arch_rubin
