@@ -2817,9 +2817,14 @@ def create_transform_kv_task(
     *,
     domain: int | cutlass.Int32,
     task_class: type[DecodeGenTask] = DecodeGenTask,
+    inst_id: int | None = None,
     **kw: TaskKwarg,
 ) -> Task:
     """Create the K/V transform task.
+
+    ``inst_id`` restricts the task to one KV instance's stream, converted
+    into that instance's own ring by the transform_kv (instance 0) or
+    transform_kv1 (instance 1) warp group.
 
     Consume one shared ``smem_kv``, or the four split `smem_k0/k1/v0/v1`
     and publish the same ordered K0/V0/K1/V1 stream into ``smem_transformed_kv``.
@@ -2835,6 +2840,11 @@ def create_transform_kv_task(
     tail_labels = (
         ("transform_v0",) if cfg.num_insts_kv == 1 else ("transform_v0", "transform_v1")
     )
+    if inst_id is not None:
+        # Same HEAD/LOOP/TAIL order as the MMA task's use of this instance.
+        head_labels = (f"transform_k{inst_id}",)
+        loop_labels = (f"transform_k{inst_id}", f"transform_v{inst_id}")
+        tail_labels = (f"transform_v{inst_id}",)
 
     split_sources = (smem_k0, smem_k1, smem_v0, smem_v1)
     use_split_sources = smem_kv is None
@@ -2936,11 +2946,17 @@ def create_transform_kv_task(
         src_resources=src,
         dst_resources=[smem_transformed_kv],
         cfg=cfg,
-        warp_idx=cfg.transform_kv_warp_idx,
-        num_warps=cfg.transform_kv_num_warps,
+        warp_idx=cfg.transform_kv1_warp_idx if inst_id == 1 else cfg.transform_kv_warp_idx,
+        num_warps=(
+            cfg.transform_kv1_num_warps if inst_id == 1 else cfg.transform_kv_num_warps
+        ),
         schedule=captured_schedule,
-        num_registers=cfg.transform_kv_task_num_registers,
-        name="TransformKvTask",
+        num_registers=(
+            cfg.transform_kv1_task_num_registers
+            if inst_id == 1
+            else cfg.transform_kv_task_num_registers
+        ),
+        name="TransformKv1Task" if inst_id == 1 else "TransformKvTask",
         **kw,
     )
 
@@ -2966,13 +2982,20 @@ def create_mma_task(
     *,
     domain: int | cutlass.Int32,
     task_class: type[DecodeGenTask] = DecodeGenTask,
+    smem_kv1: MemoryResource | None = None,
     **kw: TaskKwarg,
 ) -> Task:
-    """Create the MMA task for the shared K/V ring path."""
+    """Create the MMA task for the shared K/V ring path.
+
+    ``smem_kv1``, when given, supplies instance 1's K/V descriptors from its
+    own ring (per-instance converters); otherwise both instances read
+    ``smem_kv``.
+    """
 
     def mma_schedule_body(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
+        smem_kv1: MemoryResource,
         tmem_s0: MemoryResource,
         tmem_s1: MemoryResource | None,
         smem_p0: MemoryResource,
@@ -2996,7 +3019,7 @@ def create_mma_task(
         )
         if cfg.num_insts_kv != 1:
             _consume_staged_qk_mma(
-                smem_kv,
+                smem_kv1,
                 tmem_s1,
                 q_desc,
                 "k_desc_1",
@@ -3044,7 +3067,7 @@ def create_mma_task(
             if cfg.num_insts_kv != 1:
                 if cfg.uses_two_inst_tmem_p:
                     _consume_staged_pv_mma(
-                        smem_kv,
+                        smem_kv1,
                         smem_p1,
                         tmem_o,
                         "v_desc_1",
@@ -3054,7 +3077,7 @@ def create_mma_task(
                         cfg,
                     )
                 _consume_staged_qk_mma(
-                    smem_kv,
+                    smem_kv1,
                     tmem_s1,
                     q_desc,
                     "k_desc_1",
@@ -3064,7 +3087,7 @@ def create_mma_task(
                 )
                 if not cfg.uses_two_inst_tmem_p:
                     _consume_staged_pv_mma(
-                        smem_kv,
+                        smem_kv1,
                         smem_p1,
                         tmem_o,
                         "v_desc_1",
@@ -3093,7 +3116,7 @@ def create_mma_task(
         )
         if cfg.num_insts_kv != 1:
             _consume_staged_pv_mma(
-                smem_kv,
+                smem_kv1,
                 smem_p1,
                 tmem_o,
                 "v_desc_1",
@@ -3106,12 +3129,15 @@ def create_mma_task(
     def mma_schedule_prelude(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
+        smem_kv1: MemoryResource | None,
         smem_p0: MemoryResource,
         smem_p1: MemoryResource | None,
     ) -> None:
         """Initialize invariant shared-ring descriptor slots."""
         smem_q.init_descriptor_state()
         smem_kv.init_descriptor_state()
+        if smem_kv1 is not None:
+            smem_kv1.init_descriptor_state()
         smem_p0.init_descriptor_state()
         if cfg.num_insts_kv != 1:
             assert smem_p1 is not None
@@ -3121,6 +3147,7 @@ def create_mma_task(
     def mma_schedule(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
+        smem_kv1: MemoryResource | None,
         tmem_s0: MemoryResource,
         tmem_s1: MemoryResource | None,
         smem_p0: MemoryResource,
@@ -3135,6 +3162,7 @@ def create_mma_task(
             lambda: mma_schedule_prelude(
                 smem_q,
                 smem_kv,
+                smem_kv1,
                 smem_p0,
                 smem_p1,
             ),
@@ -3143,6 +3171,7 @@ def create_mma_task(
             lambda q_desc: mma_schedule_body(
                 smem_q,
                 smem_kv,
+                smem_kv if smem_kv1 is None else smem_kv1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -3155,6 +3184,7 @@ def create_mma_task(
     captured_schedule = mma_schedule(
         smem_q,
         smem_kv,
+        smem_kv1,
         tmem_s0,
         tmem_s1,
         smem_p0,
@@ -3163,6 +3193,8 @@ def create_mma_task(
         work_queue,
     )
     src = [smem_q, smem_kv, smem_p0]
+    if smem_kv1 is not None:
+        src.append(smem_kv1)
     dst = [tmem_s0, tmem_o]
     if cfg.num_insts_kv != 1:
         src.append(smem_p1)

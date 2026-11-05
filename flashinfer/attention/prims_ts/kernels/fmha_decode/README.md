@@ -28,13 +28,15 @@ Q tiles of 48 rows or more, for fixed grouped paged queries:
 | Swaps Q64 | 256, 512 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Swaps Q128 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Keeps Q128 | 128 | FP8 / FP8 | FP16, BF16 | 1 |
+| Keeps Q64 | 128 | FP8 / NVFP4 | FP16, BF16 | 1 |
 
 The Swaps rows support dense or causal masks and direct or GMEM split-KV
 reduction (fused or separate kernel). Packed queries, persistent scheduling,
 sparse routes, sliding windows, attention sinks, cluster-SMEM reduction, and
 FP8 output keep their narrower tiles. D512/Q128 is rejected: its PV
 accumulators alone need all 512 TMEM columns. D512 converts K and V in
-separate warp groups.
+separate warp groups. Keeps Q64 NVFP4 converts each KV instance's K/V into
+its own FP8 SMEM ring in a separate warp group.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 

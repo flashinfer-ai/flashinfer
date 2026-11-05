@@ -19,7 +19,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Int32, Int64
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import (
@@ -47,6 +47,7 @@ from .helpers_common import (
     _qkv_smem_swizzle,
 )
 from .smem_resources import SmemKvResource, SmemKvTileResource
+from .tmem_transformed_kv import _mul_e2m1x4_e4m3x4_bx
 
 
 @cute.jit
@@ -133,6 +134,51 @@ def _cvt_e2m1x2_byte_to_bf16x2(packed_byte: Int32) -> Int32:
         write_only_types=[Int32],
         read_only_args=[packed_byte & Int32(0xFF)],
     )
+
+
+
+@cute.jit
+def gather_byte_of_words(
+    w0: Int32, w1: Int32, w2: Int32, w3: Int32, byte_idx: Int32
+) -> Int32:
+    """Return byte ``byte_idx`` (0-3) of each word, packed w0 low to w3 high.
+
+    Two PRMTs pick the byte from (w0, w1) and (w2, w3); a third packs the
+    resulting halves.
+    """
+    pair_sel = byte_idx | ((byte_idx + Int32(4)) << Int32(4))
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 lo, hi; "
+        "prmt.b32 lo, {$r0}, {$r1}, {$r4}; "
+        "prmt.b32 hi, {$r2}, {$r3}, {$r4}; "
+        "prmt.b32 {$w0}, lo, hi, 0x5410; }",
+        write_only_types=[Int32],
+        read_only_args=[w0, w1, w2, w3, pair_sel],
+    )
+
+
+@cute.jit
+def unpack_e2m1x8_word(word: Int32) -> tuple[Int32, Int32]:
+    """Spread eight packed E2M1 values into two words of one value per byte.
+
+    Input byte k holds values 2k (low nibble) and 2k+1 (high nibble). The
+    outputs hold values 0-3 and 4-7 in their low nibbles, the format QMUL4
+    consumes.
+    """
+    lo = word & Int32(0x0F0F0F0F)
+    hi = (word >> Int32(4)) & Int32(0x0F0F0F0F)
+    # PRMT selectors interleave (lo, hi) bytes: 0x5140 -> lo0 hi0 lo1 hi1.
+    first = cute.arch.inline_ptx(
+        "prmt.b32 {$w0}, {$r0}, {$r1}, 0x5140;",
+        write_only_types=[Int32],
+        read_only_args=[lo, hi],
+    )
+    second = cute.arch.inline_ptx(
+        "prmt.b32 {$w0}, {$r0}, {$r1}, 0x7362;",
+        write_only_types=[Int32],
+        read_only_args=[lo, hi],
+    )
+    return first, second
 
 
 @dataclass(kw_only=True)
@@ -418,6 +464,111 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                 )
 
     @cute.jit
+    def _transform_nvfp4_rows(
+        self,
+        src_base: cutlass.Array,
+        src_sf_base: cutlass.Array,
+        dst_base: cutlass.Array,
+        head_dim_stage_idx: Constexpr[int],
+        is_v: Constexpr[int],
+        transform_thread_idx: Int32,
+    ) -> None:
+        """Convert one dense NVFP4 stage to 128B-swizzled FP8 K-major rows.
+
+        Thread t owns KV row t. Its packed row is 64 bytes (128 FP4 values)
+        stored with the 64B TMA swizzle, so 16-byte chunk j sits at chunk
+        j ^ ((t >> 1) & 3). Each chunk holds two 16-value scale blocks; block b
+        becomes one 16-byte FP8 chunk, stored at chunk b ^ (t & 7) of the
+        128-byte destination row. Within each group of eight rows, both
+        patterns touch every 16-byte bank group once.
+        """
+        cfg = self.cfg
+        row = transform_thread_idx
+        src_words = cutlass.Array(
+            src_base.data_ptr(),
+            dtype=Int32,
+            shape=(cfg.smem_kv_storage_tile_bytes // 4,),
+            addrspace=3,
+        )
+        dst_words = cutlass.Array(
+            dst_base.data_ptr(),
+            dtype=Int32,
+            shape=(cfg.smem_transformed_kv_tile_bytes // 4,),
+            addrspace=3,
+        )
+        sf_bytes_per_token = cfg.smem_kv_sf_bytes_per_token
+        scales_per_stage = cfg.head_dim_kv_stage // 16
+        # scale_words = (scales of blocks 0-3, scales of blocks 4-7), one
+        # E4M3 byte per 16-column block.
+        if cutlass.const_expr(not is_v):
+            # K scales are token-major: 8 contiguous bytes for this stage.
+            src_sf_qwords = cutlass.Array(
+                src_sf_base.data_ptr(),
+                dtype=Int64,
+                shape=(cfg.smem_kv_sf_tile_bytes // 8,),
+                addrspace=3,
+            )
+            sf_qword = src_sf_qwords[
+                row * Int32(sf_bytes_per_token // 8) + Int32(head_dim_stage_idx)
+            ]
+            scale_words = (Int32(sf_qword), Int32(sf_qword >> Int64(32)))
+        else:
+            # V scales interleave four tokens: byte (r//4)*4*S + blk*4 + r%4
+            # for S scale bytes per token, i.e. byte r%4 of word (r//4)*S + blk.
+            src_sf_words = cutlass.Array(
+                src_sf_base.data_ptr(),
+                dtype=Int32,
+                shape=(cfg.smem_kv_sf_tile_bytes // 4,),
+                addrspace=3,
+            )
+            word_base = (row >> Int32(2)) * Int32(sf_bytes_per_token) + Int32(
+                head_dim_stage_idx * scales_per_stage
+            )
+            words = [
+                src_sf_words[word_base + Int32(blk)] for blk in range(scales_per_stage)
+            ]
+            token_in_group = row & Int32(3)
+            scale_words = (
+                gather_byte_of_words(
+                    words[0], words[1], words[2], words[3], token_in_group
+                ),
+                gather_byte_of_words(
+                    words[4], words[5], words[6], words[7], token_in_group
+                ),
+            )
+        src_swizzle = (row >> Int32(1)) & Int32(3)
+        dst_swizzle = row & Int32(7)
+        # Issue all four 16-byte loads before converting so they overlap.
+        packed = [
+            (
+                src_words.data_ptr()
+                + row * Int32(16)
+                + ((Int32(chunk) ^ src_swizzle) << Int32(2))
+            ).load(count=4, alignment=16)
+            for chunk in range(4)
+        ]
+        for chunk in cutlass.range_constexpr(4):
+            for half in cutlass.range_constexpr(2):
+                blk = chunk * 2 + half
+                fp8_words = []
+                for w in cutlass.range_constexpr(2):
+                    unpacked = unpack_e2m1x8_word(packed[chunk][half * 2 + w])
+                    for part in cutlass.range_constexpr(2):
+                        fp8_words.append(
+                            _mul_e2m1x4_e4m3x4_bx(
+                                unpacked[part], scale_words[blk // 4], blk % 4
+                            )
+                        )
+                (
+                    dst_words.data_ptr()
+                    + row * Int32(32)
+                    + ((Int32(blk) ^ dst_swizzle) << Int32(2))
+                ).store(
+                    cutlass.Vector.from_elements(tuple(fp8_words), Int32),
+                    alignment=16,
+                )
+
+    @cute.jit
     def _transform_load(
         self,
         stage_info: StageInfo,
@@ -469,6 +620,17 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         src_sf_base = None
         if cutlass.const_expr(cfg.use_nvfp4_kv):
             src_sf_base = src._sf_stage_base(src_stage_idx)
+        if cutlass.const_expr(cfg.uses_fast_smem_nvfp4_transform):
+            self._transform_nvfp4_rows(
+                src_base,
+                src_sf_base,
+                dst_base,
+                head_dim_stage_idx,
+                is_v,
+                transform_thread_idx,
+            )
+            cute.arch.fence_view_async_shared()
+            return
         total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
         num_threads = cfg.transform_kv_num_warps * 32
         chunks_per_thread = total_elems // (num_threads * 8)
@@ -563,6 +725,18 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
     def v_desc_0(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
         """Publish the first V descriptor consumed by PV MMA."""
         # ConsWork: expose the committed shared-ring V stage for PV instance 0.
+        return self._build_kv_desc(stage_info, KV_KIND_V)
+
+    @consumer_work(returns=kv_desc_slot)
+    @cute.jit
+    def kv_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+        """Publish a K descriptor for the one-instance QK MMA (K-only ring)."""
+        return self._build_kv_desc(stage_info, KV_KIND_K)
+
+    @consumer_work(returns=v_desc_0_slot)
+    @cute.jit
+    def v_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+        """Publish a V descriptor for the one-instance PV MMA (V-only ring)."""
         return self._build_kv_desc(stage_info, KV_KIND_V)
 
     @consumer_work(returns=v_desc_1_slot)

@@ -10219,15 +10219,15 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size",
+    "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size,use_keeps_mma_ab",
     (
-        (128, 48, 6, 65, 8, torch.float16, "disabled", 64),
-        (256, 48, 7, 769, 16, torch.bfloat16, "gmem_reduction", 32),
-        (128, 48, 7, 769, 8, torch.float16, "gmem_reduction_with_separate_kernel", 64),
-        (128, 64, 6, 769, 8, torch.float16, "gmem_reduction", 32),
-        (128, 64, 8, 8193, 8, torch.float16, "gmem_reduction_with_separate_kernel", 64),
-        (256, 64, 6, 65, 16, torch.bfloat16, "disabled", 64),
-        (128, 128, 12, 769, 8, torch.float16, "disabled", 64),
+        (128, 48, 6, 65, 8, torch.float16, "disabled", 64, False),
+        (256, 48, 7, 769, 16, torch.bfloat16, "gmem_reduction", 32, False),
+        (128, 48, 7, 769, 8, torch.float16, "gmem_reduction_with_separate_kernel", 64, False),
+        (128, 64, 6, 769, 8, torch.float16, "gmem_reduction", 32, False),
+        (128, 64, 8, 8193, 8, torch.float16, "gmem_reduction_with_separate_kernel", 64, False),
+        (256, 64, 6, 65, 16, torch.bfloat16, "disabled", 64, False),
+        (128, 128, 12, 769, 8, torch.float16, "disabled", 64, False),
         (
             256,
             128,
@@ -10237,9 +10237,17 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
             torch.bfloat16,
             "gmem_reduction_with_separate_kernel",
             32,
+            False,
         ),
-        (512, 64, 6, 769, 8, torch.float16, "gmem_reduction", 16),
-        (512, 128, 12, 769, 8, torch.float16, "disabled", 32),
+        (512, 64, 6, 769, 8, torch.float16, "gmem_reduction", 16, False),
+        (512, 128, 12, 769, 8, torch.float16, "disabled", 32, False),
+        # Keeps Q64 with SMEM-converted NVFP4 K/V: per-instance converters at
+        # D128, separate K and V converters at D256.
+        (128, 64, 8, 769, 8, torch.float16, "disabled", 64, True),
+        (128, 64, 7, 8193, 8, torch.bfloat16, "gmem_reduction", 32, True),
+        (128, 64, 8, 8193, 8, torch.float16, "gmem_reduction_with_separate_kernel", 16, True),
+        (256, 64, 8, 769, 8, torch.bfloat16, "disabled", 64, True),
+        (256, 64, 7, 8193, 16, torch.float16, "gmem_reduction", 32, True),
     ),
 )
 def test_attention_ts_decode_large_tile_size_q(
@@ -10252,6 +10260,7 @@ def test_attention_ts_decode_large_tile_size_q(
     seq_len_kv: int,
     seq_len_q: int,
     page_size: int,
+    use_keeps_mma_ab: bool,
 ) -> None:
     """Q48/Q64/Q128 NVFP4 tiles preserve every row through tails and split merge."""
     from flashinfer.attention.prims_ts import decode as decode_module
@@ -10260,7 +10269,7 @@ def test_attention_ts_decode_large_tile_size_q(
         return make_decode_config(
             headdim=head_dim,
             args={
-                "use_keeps_mma_ab": False,
+                "use_keeps_mma_ab": use_keeps_mma_ab,
                 "groups_tokens_heads_q": True,
                 "tile_size_q": tile_size_q,
                 "use_persistent_scheduler": False,

@@ -55,13 +55,31 @@ def create_dual_transform_kv_task(
     """Create the converter for one operand of the dual K/V transform.
 
     ``is_v`` selects the V converter (``transform_v_*`` warps, V source ring
-    and FIFO); otherwise this is the K converter. The K stream runs one tile
+    and FIFO); otherwise this is the K converter. With
+    ``uses_dual_smem_transform`` (D256 Keeps), ``tmem_kv`` is instead an FP8
+    SMEM ring for the Keeps MMA and V uses the ``transform_kv1_*`` warps. The K stream runs one tile
     ahead of V, matching the MMA task: HEAD converts the first K tile, each
     LOOP iteration converts the next K (or the current V), and TAIL converts
     the last V. Every tile converts all ``num_head_dim_stages_kv`` stages.
     """
-    assert cfg.uses_dual_kv_transform
+    assert cfg.uses_dual_kv_transform or cfg.uses_dual_smem_transform
     label = "transform_v0" if is_v else "transform_k0"
+    # The SMEM dual transform runs V in the transform_kv1 warp group.
+    v_warp_idx = (
+        cfg.transform_kv1_warp_idx
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_warp_idx
+    )
+    v_num_warps = (
+        cfg.transform_kv1_num_warps
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_num_warps
+    )
+    v_num_registers = (
+        cfg.transform_kv1_task_num_registers
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_task_num_registers
+    )
 
     @schedule
     def conversion_schedule(smem_kv: MemoryResource, tmem_kv: MemoryResource):
@@ -94,12 +112,10 @@ def create_dual_transform_kv_task(
         src_resources=[smem_kv],
         dst_resources=[tmem_kv],
         cfg=cfg,
-        warp_idx=cfg.transform_v_warp_idx if is_v else cfg.transform_kv_warp_idx,
-        num_warps=cfg.transform_v_num_warps if is_v else cfg.transform_kv_num_warps,
+        warp_idx=v_warp_idx if is_v else cfg.transform_kv_warp_idx,
+        num_warps=v_num_warps if is_v else cfg.transform_kv_num_warps,
         schedule=conversion_schedule(smem_kv, tmem_kv),
-        num_registers=cfg.transform_v_task_num_registers
-        if is_v
-        else cfg.transform_kv_task_num_registers,
+        num_registers=v_num_registers if is_v else cfg.transform_kv_task_num_registers,
         name="TransformVTask" if is_v else "TransformKTask",
         **kw,
     )

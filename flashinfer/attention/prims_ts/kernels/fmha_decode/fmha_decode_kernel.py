@@ -1240,6 +1240,7 @@ def _build_decode_gen_schedule(
         )
     transformed_kv = None
     transformed_v = None
+    transformed_kv1 = None
     mma_smem_kv = smem_kv
     if cfg.use_transform_kv:
         if cfg.store_transformed_kv_in_tmem:
@@ -1259,6 +1260,21 @@ def _build_decode_gen_schedule(
                     src_smem_kv=smem_v0,
                     name="tmemTransformedV",
                 )
+        elif cfg.uses_dual_smem_transform:
+            # One-instance Keeps: separate K and V rings replace the raw K and
+            # V rings at the MMA.
+            transformed_kv = SmemTransformedKvResource(
+                pipeline_config=smem_transformed_kv_cfg,
+                cfg=cfg,
+                src_smem_k0=smem_k0,
+                name="smemTransformedK",
+            )
+            transformed_kv1 = SmemTransformedKvResource(
+                pipeline_config=smem_transformed_kv_cfg,
+                cfg=cfg,
+                src_smem_v0=smem_v0,
+                name="smemTransformedV",
+            )
         else:
             transformed_kv = SmemTransformedKvResource(
                 pipeline_config=smem_transformed_kv_cfg,
@@ -1272,6 +1288,20 @@ def _build_decode_gen_schedule(
                 num_heads_kv=num_heads_kv,
                 name="smemTransformedKv",
             )
+            if cfg.uses_per_inst_smem_transform:
+                # KV instance 1 converts into its own ring.
+                transformed_kv1 = SmemTransformedKvResource(
+                    pipeline_config=smem_transformed_kv_cfg,
+                    cfg=cfg,
+                    src_smem_kv=smem_kv,
+                    src_smem_k0=smem_k0,
+                    src_smem_k1=smem_k1,
+                    src_smem_v0=smem_v0,
+                    src_smem_v1=smem_v1,
+                    page_idx_kv=page_idx_kv,
+                    num_heads_kv=num_heads_kv,
+                    name="smemTransformedKv1",
+                )
         mma_smem_kv = transformed_kv
 
     # The correction task stages and reads the work tile's V scales itself.
@@ -1576,6 +1606,8 @@ def _build_decode_gen_schedule(
         smem_resources.append(transformed_kv)
     if transformed_v is not None:
         smem_resources.append(transformed_v)
+    if transformed_kv1 is not None:
+        smem_resources.append(transformed_kv1)
     smem_resources.append(smem_p0)
     if not use_one_inst_kv:
         smem_resources.append(smem_p1)
@@ -1847,8 +1879,8 @@ def _build_decode_gen_schedule(
     elif use_one_inst_qkv:
         mma_task = create_mma_task_one_inst_qkv(
             smem_q,
-            smem_k0,
-            smem_v0,
+            transformed_kv if cfg.uses_dual_smem_transform else smem_k0,
+            transformed_kv1 if cfg.uses_dual_smem_transform else smem_v0,
             tmem_s0,
             smem_p0,
             tmem_o,
@@ -1892,10 +1924,12 @@ def _build_decode_gen_schedule(
             cfg,
             domain=mma_domain,
             domain_bias=0,
+            smem_kv1=transformed_kv1,
             **task_runtime_kwargs,
         )
     transform_kv_task = None
     transform_v_task = None
+    transform_kv1_task = None
     if cfg.uses_dual_kv_transform:
         transform_kv_task = create_dual_transform_kv_task(
             smem_k0,
@@ -1914,6 +1948,40 @@ def _build_decode_gen_schedule(
             is_v=True,
             domain_bias=0,
             **task_runtime_kwargs,
+        )
+    elif cfg.uses_dual_smem_transform:
+        transform_kv_task, transform_kv1_task = (
+            create_dual_transform_kv_task(
+                raw,
+                ring,
+                cfg,
+                domain=load_domain,
+                is_v=is_v,
+                domain_bias=0,
+                **task_runtime_kwargs,
+            )
+            for raw, ring, is_v in (
+                (smem_k0, transformed_kv, False),
+                (smem_v0, transformed_kv1, True),
+            )
+        )
+    elif cfg.uses_per_inst_smem_transform:
+        transform_kv_task, transform_kv1_task = (
+            create_transform_kv_task(
+                smem_kv,
+                smem_k0,
+                smem_k1,
+                smem_v0,
+                smem_v1,
+                ring,
+                work_queue,
+                cfg,
+                domain=load_domain,
+                domain_bias=0,
+                inst_id=inst_id,
+                **task_runtime_kwargs,
+            )
+            for inst_id, ring in ((0, transformed_kv), (1, transformed_kv1))
         )
     elif cfg.use_transform_kv:
         transform_kv_task = create_transform_kv_task(
@@ -2027,6 +2095,8 @@ def _build_decode_gen_schedule(
         task_list.append(transform_kv_task)
     if transform_v_task is not None:
         task_list.append(transform_v_task)
+    if transform_kv1_task is not None:
+        task_list.append(transform_kv1_task)
     if use_one_inst_qkv and not use_clc_dynamic:
         task_list.extend([correction_task, mma_task])
         task_list.append(softmax0_task)
@@ -2049,15 +2119,22 @@ def _build_decode_gen_schedule(
         [smem_page_offsets_v] if smem_page_offsets_v is not None else list(smem_kv_deps)
     )
     if use_one_inst_qkv:
+        mma_k = transformed_kv if cfg.uses_dual_smem_transform else smem_k0
+        mma_v = transformed_kv1 if cfg.uses_dual_smem_transform else smem_v0
         resource_dependency_graph = {
             smem_q: [],
             smem_k0: smem_kv_deps,
             smem_v0: smem_kv_deps,
-            tmem_s0: [smem_k0, smem_q],
+            **(
+                {transformed_kv: [smem_k0], transformed_kv1: [smem_v0]}
+                if cfg.uses_dual_smem_transform
+                else {}
+            ),
+            tmem_s0: [mma_k, smem_q],
             smem_p0: [tmem_s0],
             tmem_softmax_local0: [tmem_s0],
             tmem_softmax_global0: [tmem_s0],
-            tmem_o: [smem_p0, smem_v0],
+            tmem_o: [smem_p0, mma_v],
             tmem_corr0: [tmem_softmax_local0, tmem_o],
         }
     elif cfg.uses_dual_kv_transform:
@@ -2081,7 +2158,10 @@ def _build_decode_gen_schedule(
             smem_k1: smem_k_deps,
             smem_v0: smem_v_deps,
             smem_v1: smem_v_deps,
-            transformed_kv: [smem_k0, smem_k1, smem_v0, smem_v1],
+            transformed_kv: [smem_k0, smem_v0]
+            if transformed_kv1 is not None
+            else [smem_k0, smem_k1, smem_v0, smem_v1],
+            **({transformed_kv1: [smem_k1, smem_v1]} if transformed_kv1 is not None else {}),
             tmem_s0: [transformed_kv, smem_q],
             smem_p0: [tmem_s0],
             tmem_softmax_local0: [tmem_s0],
@@ -2092,11 +2172,15 @@ def _build_decode_gen_schedule(
         if not use_one_inst_kv:
             resource_dependency_graph.update(
                 {
-                    tmem_s1: [transformed_kv, smem_q],
+                    tmem_s1: [
+                        transformed_kv if transformed_kv1 is None else transformed_kv1,
+                        smem_q,
+                    ],
                     smem_p1: [tmem_s1],
                     tmem_softmax_local1: [tmem_s1],
                     tmem_softmax_global1: [tmem_s1],
-                    tmem_o: [smem_p0, smem_p1, transformed_kv],
+                    tmem_o: [smem_p0, smem_p1, transformed_kv]
+                    + ([transformed_kv1] if transformed_kv1 is not None else []),
                     tmem_corr1: [
                         tmem_softmax_local0,
                         tmem_softmax_local1,
@@ -2260,7 +2344,17 @@ def _build_decode_gen_schedule(
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
-    if transformed_kv is not None:
+    if cfg.uses_dual_smem_transform:
+        # One-instance Keeps reads K from one ring and V from the other.
+        dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"kv_desc"}
+        dma_consumer_release_labels[(transformed_kv1, tmem_o)] = {"v_desc"}
+    elif transformed_kv1 is not None:
+        # Each instance ring publishes its own K and V descriptors.
+        dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"k_desc_0"}
+        dma_consumer_release_labels[(transformed_kv, tmem_o)] = {"v_desc_0"}
+        dma_consumer_release_labels[(transformed_kv1, tmem_s1)] = {"k_desc_1"}
+        dma_consumer_release_labels[(transformed_kv1, tmem_o)] = {"v_desc_1"}
+    elif transformed_kv is not None:
         dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"k_desc_0"}
         dma_consumer_release_labels[
             (transformed_kv if transformed_v is None else transformed_v, tmem_o)
@@ -3789,6 +3883,11 @@ def fmha_decode_launch(
             tma_box0_v = cfg.head_dim_kv_stage // 2
             tma_swizzle_k = cuda.TensorMapSwizzle.none
             tma_swizzle_v = cuda.TensorMapSwizzle.none
+            if cutlass.const_expr(cfg.uses_fast_smem_nvfp4_transform):
+                # 64-byte packed rows; the 64B swizzle gives conflict-free
+                # 16-byte row loads in the fast SMEM converter.
+                tma_swizzle_k = cuda.TensorMapSwizzle.s64b
+                tma_swizzle_v = cuda.TensorMapSwizzle.s64b
     if cutlass.const_expr(cfg.tile_size_kv == 256):
         # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.
         # A KV64 TensorMap atom lets the shared load resource place each
