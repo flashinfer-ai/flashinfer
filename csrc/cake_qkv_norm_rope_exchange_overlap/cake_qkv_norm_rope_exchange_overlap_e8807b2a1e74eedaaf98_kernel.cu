@@ -140,7 +140,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_qkv_norm_rope_exchange_overlap_8c058fcdef1025917043(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
+kernel_cake_qkv_norm_rope_exchange_overlap_e8807b2a1e74eedaaf98(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -522,6 +522,70 @@ kernel_cake_qkv_norm_rope_exchange_overlap_8c058fcdef1025917043(const __grid_con
                     it_c = it_c + 1;
                 }
                 asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
+                asm volatile("" : "+f"(accum[0]) :: "memory");
+                asm volatile("" : "+f"(accum[1]) :: "memory");
+                asm volatile("" : "+f"(accum[2]) :: "memory");
+                asm volatile("" : "+f"(accum[3]) :: "memory");
+                asm volatile("" : "+f"(accum[4]) :: "memory");
+                asm volatile("" : "+f"(accum[5]) :: "memory");
+                asm volatile("" : "+f"(accum[6]) :: "memory");
+                asm volatile("" : "+f"(accum[7]) :: "memory");
+                asm volatile("" : "+f"(accum[8]) :: "memory");
+                asm volatile("" : "+f"(accum[9]) :: "memory");
+                asm volatile("" : "+f"(accum[10]) :: "memory");
+                asm volatile("" : "+f"(accum[11]) :: "memory");
+                asm volatile("" : "+f"(accum[12]) :: "memory");
+                asm volatile("" : "+f"(accum[13]) :: "memory");
+                asm volatile("" : "+f"(accum[14]) :: "memory");
+                asm volatile("" : "+f"(accum[15]) :: "memory");
+                asm volatile("" : "+f"(accum[16]) :: "memory");
+                asm volatile("" : "+f"(accum[17]) :: "memory");
+                asm volatile("" : "+f"(accum[18]) :: "memory");
+                asm volatile("" : "+f"(accum[19]) :: "memory");
+                asm volatile("" : "+f"(accum[20]) :: "memory");
+                asm volatile("" : "+f"(accum[21]) :: "memory");
+                asm volatile("" : "+f"(accum[22]) :: "memory");
+                asm volatile("" : "+f"(accum[23]) :: "memory");
+                asm volatile("" : "+f"(accum[24]) :: "memory");
+                asm volatile("" : "+f"(accum[25]) :: "memory");
+                asm volatile("" : "+f"(accum[26]) :: "memory");
+                asm volatile("" : "+f"(accum[27]) :: "memory");
+                asm volatile("" : "+f"(accum[28]) :: "memory");
+                asm volatile("" : "+f"(accum[29]) :: "memory");
+                asm volatile("" : "+f"(accum[30]) :: "memory");
+                asm volatile("" : "+f"(accum[31]) :: "memory");
+                asm volatile("" : "+f"(accum[32]) :: "memory");
+                asm volatile("" : "+f"(accum[33]) :: "memory");
+                asm volatile("" : "+f"(accum[34]) :: "memory");
+                asm volatile("" : "+f"(accum[35]) :: "memory");
+                asm volatile("" : "+f"(accum[36]) :: "memory");
+                asm volatile("" : "+f"(accum[37]) :: "memory");
+                asm volatile("" : "+f"(accum[38]) :: "memory");
+                asm volatile("" : "+f"(accum[39]) :: "memory");
+                asm volatile("" : "+f"(accum[40]) :: "memory");
+                asm volatile("" : "+f"(accum[41]) :: "memory");
+                asm volatile("" : "+f"(accum[42]) :: "memory");
+                asm volatile("" : "+f"(accum[43]) :: "memory");
+                asm volatile("" : "+f"(accum[44]) :: "memory");
+                asm volatile("" : "+f"(accum[45]) :: "memory");
+                asm volatile("" : "+f"(accum[46]) :: "memory");
+                asm volatile("" : "+f"(accum[47]) :: "memory");
+                asm volatile("" : "+f"(accum[48]) :: "memory");
+                asm volatile("" : "+f"(accum[49]) :: "memory");
+                asm volatile("" : "+f"(accum[50]) :: "memory");
+                asm volatile("" : "+f"(accum[51]) :: "memory");
+                asm volatile("" : "+f"(accum[52]) :: "memory");
+                asm volatile("" : "+f"(accum[53]) :: "memory");
+                asm volatile("" : "+f"(accum[54]) :: "memory");
+                asm volatile("" : "+f"(accum[55]) :: "memory");
+                asm volatile("" : "+f"(accum[56]) :: "memory");
+                asm volatile("" : "+f"(accum[57]) :: "memory");
+                asm volatile("" : "+f"(accum[58]) :: "memory");
+                asm volatile("" : "+f"(accum[59]) :: "memory");
+                asm volatile("" : "+f"(accum[60]) :: "memory");
+                asm volatile("" : "+f"(accum[61]) :: "memory");
+                asm volatile("" : "+f"(accum[62]) :: "memory");
+                asm volatile("" : "+f"(accum[63]) :: "memory");
                 unsigned int last_stage_c = (it_c + 5) % 6;
                 mbarrier_arrive(empty_addr + (last_stage_c) * 8);
                 unsigned int local_lo = mt_c * 128 + math_wg_idx * 64 + warp_in_wg * 16 + lane_row;
@@ -1717,20 +1781,20 @@ kernel_cake_qkv_norm_rope_exchange_overlap_8c058fcdef1025917043(const __grid_con
     } else if (warp == 11) {
         { // rendezvous_main
             if (bid == 0) {
-                // nvlink_barrier(pg_flags) phase=1 owner_warp=11
+                // nvlink_barrier(pg_flags) phase=0 owner_warp=11
                 {
                     const int __ws = pg_world;
                     const int __me = pg_rank;
                     const int __warp = warp;
                     const int __lane = lane;
                     if (__warp == 11) {
-                        unsigned* __local_epoch = pg_flags.ptrs[__me] + 1;
+                        unsigned* __local_epoch = pg_flags.ptrs[__me] + 0;
                         unsigned __previous_epoch;
                         asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
                             : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
                         const unsigned __epoch = __previous_epoch + 1u;
                         const int __bank = (int)(__epoch & 1u);
-                        const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
+                        const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
                         asm volatile("fence.proxy.async.global;" ::: "memory");
                         if (__lane < __ws) {
                             unsigned* __peer_mailbox = pg_flags.ptrs[__lane] + __mailbox_base + __me;
