@@ -29,12 +29,14 @@
 """
 Tile scheduler for Chunked Gated Delta Net (GDN).
 
-Each tile = one (batch, head) pair. The assigned CTA loops over all
-chunks for that tile sequentially, which is required because the
-recurrent state S must be propagated chunk-by-chunk.
+Each tile = one (batch, head, v_slice) triple: with ``v_split > 1`` the value
+rows of each (batch, head) pair are split into ``v_split`` slices that run on
+separate CTAs. The assigned CTA loops over all chunks for that tile
+sequentially, which is required because the recurrent state S must be
+propagated chunk-by-chunk.
 
-Persistent grid shape:     (min(B * H, max_active_clusters), 1, 1)
-Non-persistent grid shape: (B, H, 1)  - one CTA per tile, 2D grid
+Persistent grid shape:     (min(B * H * v_split, max_active_clusters), 1, 1)
+Non-persistent grid shape: (B, H, v_split)  - one CTA per tile, 3D grid
 """
 
 from typing import Tuple, Optional
@@ -65,6 +67,7 @@ class GDNTileSchedulerParams:
         num_seqs_fdd: cute.FastDivmodDivisor = None,
         num_heads_fdd: cute.FastDivmodDivisor = None,
         *,
+        v_split: int = 1,
         loc=None,
         ip=None,
     ):
@@ -75,8 +78,10 @@ class GDNTileSchedulerParams:
         self.is_persistent = is_persistent
         # num_o_heads: HQ for GQA (grouped-query), HV for GVA/MHA
         self.num_o_heads = num_q_heads if is_GQA else num_v_heads
+        # Compile-time number of value-row slices per (batch, head) pair.
+        self.v_split = v_split
         if total_tiles is None:
-            self.total_tiles = num_seqs * self.num_o_heads
+            self.total_tiles = num_seqs * self.num_o_heads * v_split
         else:
             self.total_tiles = total_tiles
         self.num_seqs_fdd = num_seqs_fdd
@@ -86,8 +91,9 @@ class GDNTileSchedulerParams:
                 num_seqs, loc=loc, ip=ip
             )
         if num_heads_fdd is None:
+            # Divides the flat tile index by the (head, v_slice) tiles per batch.
             self.num_heads_fdd = cute.fast_divmod_create_divisor(
-                self.num_o_heads, loc=loc, ip=ip
+                self.num_o_heads * v_split, loc=loc, ip=ip
             )
         self._loc = loc
 
@@ -127,7 +133,9 @@ class GDNTileSchedulerParams:
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
 
-        return GDNTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
+        return GDNTileSchedulerParams(
+            *(tuple(obj_list)), v_split=self.v_split, loc=self._loc
+        )
 
     @dsl_user_op
     def get_grid_shape(
@@ -136,18 +144,18 @@ class GDNTileSchedulerParams:
         if cutlass.const_expr(self.is_persistent):
             return (min(self.total_tiles, max_active_clusters), 1, 1)
         else:
-            return (self.num_seqs, self.num_o_heads, 1)
+            return (self.num_seqs, self.num_o_heads, self.v_split)
 
 
 class GDNTileScheduler:
     """
     Tile scheduler supporting both persistent and non-persistent modes.
 
-    Persistent:     CTAs are assigned (batch, head) tiles in round-robin order
-                    and loop over multiple tiles, processing all chunks per tile
-                    before moving on.
-    Non-persistent: Each CTA handles exactly one (batch, head) tile; the 2D
-                    grid maps blockIdx.x -> batch, blockIdx.y -> head.
+    Persistent:     CTAs are assigned (batch, head, v_slice) tiles in
+                    round-robin order and loop over multiple tiles, processing
+                    all chunks per tile before moving on.
+    Non-persistent: Each CTA handles exactly one tile; the 3D grid maps
+                    blockIdx.x -> batch, blockIdx.y -> head, blockIdx.z -> v_slice.
     """
 
     def __init__(
@@ -228,12 +236,18 @@ class GDNTileScheduler:
     def _get_current_work_for_linear_idx(
         self, linear_idx: Int32, *, loc=None, ip=None
     ) -> WorkTileInfo:
-        # Used only in persistent mode: decode flat tile index -> (batch, head).
-        # Tile ordering: head-major, i.e. linear_idx = batch * num_o_heads + head.
+        # Used only in persistent mode: decode flat tile index -> (batch, head, v_slice).
+        # Tile ordering: linear_idx = (batch * num_o_heads + head) * v_split + v_slice.
         is_valid = linear_idx < cute.size(self.params.total_tiles, loc=loc, ip=ip)
-        remain_work_idx, head_idx = divmod(linear_idx, self.params.num_heads_fdd)
+        remain_work_idx, head_slice_idx = divmod(linear_idx, self.params.num_heads_fdd)
         _, batch_idx = divmod(remain_work_idx, self.params.num_seqs_fdd)
-        cur_tile_coord = tuple(Int32(x) for x in (batch_idx, head_idx, 1))
+        if cutlass.const_expr(self.params.v_split == 1):
+            head_idx = head_slice_idx
+            v_slice = Int32(0)
+        else:
+            head_idx = head_slice_idx // self.params.v_split
+            v_slice = head_slice_idx - head_idx * self.params.v_split
+        cur_tile_coord = tuple(Int32(x) for x in (batch_idx, head_idx, v_slice))
         return WorkTileInfo(cur_tile_coord, is_valid)
 
     @dsl_user_op
@@ -242,7 +256,8 @@ class GDNTileScheduler:
             return self._get_current_work_for_linear_idx(
                 self._current_work_linear_idx, loc=loc, ip=ip
             )
-        # Non-persistent: 2D grid -> blockIdx.x = batch, blockIdx.y = head.
+        # Non-persistent: 3D grid -> blockIdx.x = batch, blockIdx.y = head,
+        # blockIdx.z = v_slice.
         batch_idx, head_idx, _ = self.block_idx
         return WorkTileInfo(
             (batch_idx, head_idx, self.block_idx[2]), cutlass.Boolean(self.is_valid)
