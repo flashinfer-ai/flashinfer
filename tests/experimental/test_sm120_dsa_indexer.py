@@ -474,7 +474,7 @@ class _Paged:
         dev,
         zero_frac=0.0,
         crowd=False,
-        block_bytes=None,
+        page_stride=None,
         page_offset=0,
     ):
         row = _D // 2 if fp4 else _D
@@ -482,19 +482,19 @@ class _Paged:
         num_pages = B * blocks + 3
         self.keys = _keys(fp4, (num_pages * P,), gen, dev, zero_frac, crowd)
         page_bytes = P * (row + 4)
-        if block_bytes is None:
+        if page_stride is None:
             cache = torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=dev)
         else:
-            # Each page at page_offset in a larger block, the storage ending
-            # with the last page (one layer's cache inside per-block buffers).
+            # Pages page_stride bytes apart, each at page_offset, the storage
+            # ending with the last page; the bytes between pages are poisoned.
             pool = torch.full(
-                ((num_pages - 1) * block_bytes + page_offset + page_bytes,),
+                ((num_pages - 1) * page_stride + page_offset + page_bytes,),
                 0xFF,
                 dtype=torch.uint8,
                 device=dev,
             )
             cache = pool.as_strided(
-                (num_pages, page_bytes), (block_bytes, 1), page_offset
+                (num_pages, page_bytes), (page_stride, 1), page_offset
             )
             cache.zero_()
         cache[:, : P * row] = self.keys.data.view(torch.uint8).reshape(
@@ -597,14 +597,26 @@ def test_paged(fp4, heads, top_k, B, next_n, lens, P, zero_frac):
 
 @pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
 @pytest.mark.parametrize("heads,top_k", _HK)
-def test_paged_block_view(fp4, heads, top_k):
-    """Pages viewed inside larger blocks, as when a layer's indexer cache
-    shares each block with other caches."""
+@pytest.mark.parametrize(
+    "gap_after,page_offset", [(256, 0), (1024, 512)], ids=["padded", "offset"]
+)
+def test_paged_strided_pages(fp4, heads, top_k, gap_after, page_offset):
+    """Pages further apart than their bytes (padded pages, or pages at an
+    offset inside larger blocks), the storage ending with the last page."""
     dev = torch.device("cuda")
-    gen = torch.Generator(device=dev).manual_seed(heads + top_k)
+    gen = torch.Generator(device=dev).manual_seed(heads + top_k + gap_after)
     lens = [9000, 300, 20000]
+    P = 64
+    page_bytes = P * ((_D // 2 if fp4 else _D) + 4)
     paged = _Paged(
-        fp4, len(lens), max(lens), 64, gen, dev, block_bytes=212256, page_offset=101376
+        fp4,
+        len(lens),
+        max(lens),
+        P,
+        gen,
+        dev,
+        page_stride=page_offset + page_bytes + gap_after,
+        page_offset=page_offset,
     )
     q, w, ctx = _decode_inputs(fp4, len(lens), 2, heads, lens, gen, dev)
     idx, sc = _run_decode(q, w, ctx, paged, top_k)
@@ -816,6 +828,14 @@ def test_paged_validation():
         _run_decode(q, w, ctx, paged, 512, ratio=2)
     with pytest.raises(ValueError, match="top_k"):
         _run_decode(q, w, ctx, paged, 0)
+    # A page whose bytes are not contiguous (rows strided apart).
+    gapped = paged.cache.new_zeros(
+        paged.cache.shape[0], paged.P, 2 * paged.cache.shape[2]
+    )[:, :, : paged.cache.shape[2]]
+    with pytest.raises(ValueError, match="contiguous bytes"):
+        sm120.dsa_indexer_det_topk_paged(
+            q.data, gapped, w, ctx, paged.table, max_context_len=1000
+        )
     with pytest.raises(ValueError, match="capacity"):
         sm120.dsa_indexer_det_topk_paged(
             q.data,
