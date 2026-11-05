@@ -973,13 +973,14 @@ def test_k1_excluded_token_counts(no_k1_chains):
     is at or above the row's SM-count floor, on exactly that SM count below it.  Every entry belongs to a row with a
     verdict on its part; per SM count its ranges are closed, disjoint and not adjacent, start at a measured token count
     or one token above one (512 to 65537; the sm_107a FP32 one-split rows from 40961, one token above the last measured
-    token count at which they meet the accuracy budget) and end at one or have no upper bound; the row runs the
-    deterministic program at both ends and keeps its verdict (inside the token window, the override of
-    :data:`K1_SPLIT_OVERRIDES_BY_SM` for the part's SM count, if any) one token outside a range (inside the token window
-    of a per-SM-count table), on a part with fewer SMs than an entry at or above the floor, on the floor's part for an
-    entry below it, and above 65536 tokens unless a range has no upper bound.  A token count with an odd number of
-    64-token blocks inside an entry of :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` for the part, or inside an entry of
-    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` for the part's exact SM count, runs the deterministic program too."""
+    token count at which they meet the accuracy budget, ``5120 -> 1024`` from 32769) and end at one or have no upper
+    bound; the row runs the deterministic program at both ends and keeps its verdict (inside the token window, the
+    override of :data:`K1_SPLIT_OVERRIDES_BY_SM` for the part's SM count, if any) one token outside a range (inside the
+    token window of a per-SM-count table), on a part with fewer SMs than an entry at or above the floor, on the floor's
+    part for an entry below it, and above 65536 tokens unless a range has no upper bound.  A token count with an odd
+    number of 64-token blocks inside an entry of :data:`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS` for the part, or inside an
+    entry of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` for the part's exact SM count, runs the deterministic program
+    too."""
     table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
     odd_table = cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS
     exact_table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM
@@ -1493,14 +1494,16 @@ def test_k1_212_sm_two_split_ranges(monkeypatch, no_k1_chains):
         assert p(M, N, 512) == tuple(by_sm[("sm_107a", 1, M, N, "f32")]), (M, N)
         for T in (8320, 12000, 32640, 65664, 131072):
             assert p(M, N, T) is None, (M, N, T)
-        # 208 SMs: the deterministic program outside the window; 216 SMs: the one-split verdict up to 40960 tokens,
-        # the deterministic program from 40961 tokens up
+        # 208 SMs: the deterministic program outside the window; 216 SMs: the one-split verdict below the row's
+        # open-ended entry (``K1_SM107A_WIDE_FP32_OPEN``: 40961 tokens, ``5120 -> 1024`` 32769), the deterministic
+        # program from there up
         rule = tuple(cake_backend.K1_SPLIT_RULES[("sm_107a", 1, M, N, "f32")])
-        for T in (960, 1024, 6000, 8192, 32768, 40960):
+        T0 = K1_SM107A_WIDE_FP32_OPEN[(M, N)]
+        for T in (960, 1024, 6000, 8192, 32768, T0 - 1):
             assert p(M, N, T, sm_count=216) == rule, (M, N, T)
         for T in (1024, 6000, 8192, 32768):
             assert p(M, N, T, sm_count=208) is None, (M, N, T)
-        for T in (40961, 65536):
+        for T in (T0, 40961, 65536):
             assert p(M, N, T, sm_count=216) is None, (M, N, T)
 
     sms_list = (208, 210, 211, 212, 213, 216, 217)
@@ -1936,7 +1939,7 @@ def test_k1_216_sm_override_holds_only_at_its_sm_count_and_token_counts(
     monkeypatch, no_k1_chains
 ):
     """``4096 -> 1024`` FP32 takes the 192-wide row-major program at one split on exactly 216 SMs at 16172 to 16384
-    tokens (:data:`K1_SPLIT_OVERRIDES_BY_SM`), except at 16231 tokens (its 216-SM entry of
+    tokens (:data:`K1_SPLIT_OVERRIDES_BY_SM`), except at 16231 and 16384 tokens (its 216-SM entries of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`: the deterministic program); one token outside that window and on 217 SMs it
     keeps its :data:`K1_SPLIT_RULES` verdict (256-wide tiles at one split) up to 40960 tokens, on 215 SMs (no table) it
     runs the deterministic program, and on 212 SMs its own tables decide (the 192-wide row-major program at one split in
@@ -1956,7 +1959,7 @@ def test_k1_216_sm_override_holds_only_at_its_sm_count_and_token_counts(
             arch=arch, L=1, M=M, N=N, K=T, out_f32=True, sm_count=sms
         )
 
-    for T in (16172, 16200, 16300, 16384):
+    for T in (16172, 16200, 16300, 16383):
         assert plan(216, T) == (192, 1), T
         assert plan(217, T) == (256, 1), T
         assert plan(212, T) == (192, 1), T
@@ -1964,6 +1967,11 @@ def test_k1_216_sm_override_holds_only_at_its_sm_count_and_token_counts(
     # 16231 tokens: the deterministic program from 216 SMs up and on 208 / 212 SMs
     for sms in (208, 212, 215, 216, 217, 280):
         assert plan(sms, 16231) is None, sms
+    # 16384 tokens: the deterministic program from 216 SMs up (a strict re-measurement on a 216-SM part); 212 SMs keep
+    # the window verdict of their table
+    for sms in (215, 216, 217, 280):
+        assert plan(sms, 16384) is None, sms
+    assert plan(212, 16384) == (192, 1)
     two_212 = K1_212_TWO_SPLIT_RANGES[(d_in, d_out, "f32")]
     for T in (1024, 8192, 16171, 16385, 32768, 40960):
         assert plan(216, T) == (256, 1), T
@@ -1983,7 +1991,7 @@ def test_k1_216_sm_override_holds_only_at_its_sm_count_and_token_counts(
         is None
     )
     # the planned launch on 216 SMs in the window: the 192-wide row-major-store program
-    T = 16384
+    T = 16383
     G = torch.zeros(T, d_out, dtype=torch.bfloat16)
     X = torch.zeros(T, d_in, dtype=torch.bfloat16)
     out = torch.zeros(d_out, d_in, dtype=torch.float32)
@@ -2047,15 +2055,16 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules(no_k1_chains):
         assert p(4096, 512, sms, 16231) is None and p(4096, 512, sms, 16384) is None
         for T in (16172, 16230, 16232, 16383):
             assert p(4096, 512, sms, T) == (128, 1), (sms, T)
-    # 4096 -> 1024: at 16231 tokens on 208, 212 and 216 SMs, and at 16384 on 208 SMs (a strict re-measurement of the
-    # restored window: the deterministic plan there is faster); 212 SMs (their table) and 216 SMs (the 216-SM override)
-    # keep the 192-wide row-major program at 16384, and 208 SMs the 256-wide tiles below it
+    # 4096 -> 1024: at 16231 tokens on 208, 212 and 216 SMs, and at 16384 on 208 and 216 SMs (strict re-measurements
+    # of the restored window); 212 SMs (their table) keep the 192-wide row-major program at 16384, 208 SMs the
+    # 256-wide tiles and 216 SMs the 216-SM override below it
     for sms in (208, 212, 216):
         assert p(4096, 1024, sms, 16231) is None, sms
-    assert p(4096, 1024, 208, 16384) is None
+    for sms in (208, 216):
+        assert p(4096, 1024, sms, 16384) is None, sms
     assert p(4096, 1024, 208, 16383) == (256, 1)
-    for sms in (212, 216):
-        assert p(4096, 1024, sms, 16384) == (192, 1), sms
+    assert p(4096, 1024, 216, 16383) == (192, 1)
+    assert p(4096, 1024, 212, 16384) == (192, 1)
     # 4096 -> 48 and 4096 -> 64: entries on 208 and 216 SMs, none on 212
     for N in (48, 64):
         assert p(4096, N, 212, 16231) == (64, 3) and p(4096, N, 212, 16384) == (64, 3)
@@ -2103,6 +2112,14 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules(no_k1_chains):
 #: 5e-5 and largest absolute error at most 1e-3 of the largest reference magnitude, against FP64) on every seed at
 #: 40960 tokens and missed it from 45056 tokens up.
 K1_SM107A_FP32_BUDGET_TOKENS = 40961
+#: The first token count of each row's open-ended entry: ``K1_SM107A_FP32_BUDGET_TOKENS``, except ``5120 -> 1024`` from
+#: 32769 (a strict re-measurement on a 216-SM part: the checkpointed step more than 1.3 % slower at 36864 and 40960).
+K1_SM107A_WIDE_FP32_OPEN = {
+    (4096, 512): K1_SM107A_FP32_BUDGET_TOKENS,
+    (4096, 1024): K1_SM107A_FP32_BUDGET_TOKENS,
+    (5120, 512): K1_SM107A_FP32_BUDGET_TOKENS,
+    (5120, 1024): 32769,
+}
 #: Those rows ``(d_in, d_out)`` and their one-split programs ``(block_n, splits)`` below that token count.
 K1_SM107A_WIDE_FP32_ROWS = {
     (4096, 512): (128, 1),
@@ -2116,14 +2133,14 @@ def test_k1_sm107a_wide_fp32_rows_at_large_token_counts(no_k1_chains):
     """The one-split programs of the sm_107a FP32 rows ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and
     ``5120 -> 1024`` miss the FP32 accuracy budget at large token counts: from ``K1_SM107A_FP32_BUDGET_TOKENS`` up, with
     no upper bound, these rows run the deterministic program on parts of 216 SMs or more (their entries in
-    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`) and keep their one-split program below (961 to 40960 tokens included).  The
+    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`; ``5120 -> 1024`` from 32769 tokens, ``K1_SM107A_WIDE_FP32_OPEN``) and keep
+    their one-split program below (961 tokens and up included).  The
     208-SM and 212-SM tables hold only at 16172 to 16384 tokens and at 512 tokens on 212 SMs
     (:data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`), so those parts run the deterministic program at these token counts,
     except the 212-SM two-split ranges at either number of 64-token K blocks (``K1_212_TWO_SPLIT_RANGES``); the other
     entries of these rows lie in that window.  No other sm_107a row has a range without an upper bound, and sm_100a /
     sm_103a have no verdict for these rows.  These are the tables under :data:`K1_CHAIN_RANGES_BY_SM` (taken out here),
     whose ranges run three accumulation chains on 212 and 216 SMs."""
-    T0 = K1_SM107A_FP32_BUDGET_TOKENS
     rows = K1_SM107A_WIDE_FP32_ROWS
     excluded = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
     by_sm = cake_backend.K1_SPLIT_RULES_BY_SM
@@ -2141,6 +2158,7 @@ def test_k1_sm107a_wide_fp32_rows_at_large_token_counts(no_k1_chains):
 
     for (M, N), choice in rows.items():
         key = ("sm_107a", 1, M, N, "f32")
+        T0 = K1_SM107A_WIDE_FP32_OPEN[(M, N)]
         assert cake_backend.K1_SPLIT_RULES[key] == choice
         assert [e for e in excluded[key] if e[2] is None] == [(216, T0, None)]
         for _, lo, hi in excluded[key]:
@@ -2148,7 +2166,7 @@ def test_k1_sm107a_wide_fp32_rows_at_large_token_counts(no_k1_chains):
         for sms in (216, 217, 280):
             for T in (512, 704, 961, 1024, 8192, 32768, T0 - 1):
                 assert p(M, N, sms, T) == choice, (M, N, sms, T)
-            for T in (T0, 45056, 65536, 65537, 131072):
+            for T in (T0, T0 + 4095, 45056, 65536, 65537, 131072):
                 assert p(M, N, sms, T) is None, (M, N, sms, T)
         assert p(M, N, 212, 512) == tuple(by_sm[("sm_107a", 212)][key]), (M, N)
         two = K1_212_TWO_SPLIT_RANGES[(M, N, "f32")]
@@ -2393,7 +2411,7 @@ def test_k1_chain_ranges(monkeypatch):
             assert cake_backend.k1_chain_plan(K=T, **kw) is None
             assert cake_backend.k1_plan(K=T, **kw) is None, (d_in, d_out, T)
     # at a failing token count the rows keep the routing of the other tables: the plan without the chain ranges
-    # (216 SMs: 4096 -> 1024 at 16384 tokens the 216-SM override, 5120 -> 1024 at 32768 tokens one chain)
+    # (216 SMs: 4096 -> 1024 at 16384 tokens the deterministic program, 5120 -> 1024 at 32768 tokens one chain)
     assert failing
     monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
     for (key, sms, T), plan in failing.items():
@@ -2403,7 +2421,7 @@ def test_k1_chain_ranges(monkeypatch):
         )
         assert plan == want, (key, sms, T)
     p216 = dict(arch="sm_107a", L=1, out_f32=True, sm_count=216)
-    assert failing[(("sm_107a", 1, 4096, 1024, "f32"), 216, 16384)] == (192, 1)
+    assert failing[(("sm_107a", 1, 4096, 1024, "f32"), 216, 16384)] is None
     assert failing[(("sm_107a", 1, 5120, 1024, "f32"), 216, 32768)] == (256, 1)
     for M, N in ((4096, 512), (4096, 1024)):
         assert cake_backend.k1_plan(M=M, N=N, K=16231, **p216) is None
@@ -5204,10 +5222,10 @@ def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
 def test_k1_sm107a_wide_fp32_rows_bind_per_token_count(monkeypatch, no_k1_chains):
     """The convenience path keys a K1 call by the geometry of its views, the token count included, and plans each key
     at the part's SM count: on a 216-SM ``sm_107a`` part the weight gradient of each row of
-    ``K1_SM107A_WIDE_FP32_ROWS`` binds its one-split program one token below ``K1_SM107A_FP32_BUDGET_TOKENS`` and
+    ``K1_SM107A_WIDE_FP32_ROWS`` binds its one-split program one token below its ``K1_SM107A_WIDE_FP32_OPEN`` and
     the deterministic package's plan at that token count and at 65536 tokens, after the smaller token count's entry
     is cached."""
-    arch, T0 = "sm_107a", K1_SM107A_FP32_BUDGET_TOKENS
+    arch = "sm_107a"
     entry_fn = _cpu_k1_launches(monkeypatch, arch)
     facts = det_backend.DeviceFacts(
         index=0, arch=arch, sm_count=216, l2_bytes=126 << 20
@@ -5216,6 +5234,7 @@ def test_k1_sm107a_wide_fp32_rows_bind_per_token_count(monkeypatch, no_k1_chains
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     bf16 = torch.bfloat16
     for (d_in, d_out), choice in K1_SM107A_WIDE_FP32_ROWS.items():
+        T0 = K1_SM107A_WIDE_FP32_OPEN[(d_in, d_out)]
         cake_backend._K1_ATOMIC_CACHE.clear()
         entry_fn.calls.clear()
         out = torch.empty(d_out, d_in)
@@ -5473,8 +5492,7 @@ def test_k1_chain_ranges_bind_per_token_count(monkeypatch, sm_count):
     row of ``K1_CHAIN_RANGES`` binds the one-split program of three chains at the first and the last token count of a
     range and at 4097 tokens inside it (inside the row's 212-SM two-split range too), and the routing of the other
     tables at the measured token counts where the program failed (the deterministic program, or a program of one chain:
-    the 216-SM override of ``4096 -> 1024`` at 16384 tokens, the one-split program of ``5120 -> 1024`` at 32768 tokens
-    on 216 SMs), each token count its own cache entry."""
+    the one-split program of ``5120 -> 1024`` at 32768 tokens on 216 SMs), each token count its own cache entry."""
     arch = "sm_107a"
     entry_fn = _cpu_k1_launches(monkeypatch, arch)
     facts = det_backend.DeviceFacts(
@@ -8578,9 +8596,10 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
 def test_gpu_k1_sm_count_overrides_run_their_programs():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): every overridden row prepares and runs the override's
-    program at the first and the last token count of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` outside the part's ranges of
-    :data:`K1_CHAIN_RANGES_BY_SM`, which come first (``4096 -> 1024`` FP32 at 16384 tokens: the 192-wide row-major-store
-    program at one split), meets the deterministic package's FP64 budget and, where both run one split, gives the bits
+    program at the first and the last token count of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and one token below the last,
+    outside the part's ranges of :data:`K1_CHAIN_RANGES_BY_SM`, which come first, and its token counts of
+    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` (``4096 -> 1024`` FP32 at 16383 tokens: the 192-wide row-major-store program
+    at one split), meets the deterministic package's FP64 budget and, where both run one split, gives the bits
     of the row's :data:`K1_SPLIT_RULES` program (256-wide transposed tiles) on the same inputs.  A part of any other SM
     count skips."""
     device, arch = _atomic_device_or_skip()
@@ -8595,7 +8614,8 @@ def test_gpu_k1_sm_count_overrides_run_their_programs():
         _, L, M, N, dt = key
         f32 = dt == "f32"
         rule = cake_backend.K1_SPLIT_RULES[key]
-        for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
+        lo_t, hi_t = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
+        for T in (lo_t, hi_t - 1, hi_t):
             kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count)
             # the ranges of K1_CHAIN_RANGES_BY_SM come first
             if cake_backend.k1_chain_plan(**kw) is not None:
@@ -8634,7 +8654,8 @@ def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): the convenience path of every overridden row binds the
     override's program (its :data:`_K1_ATOMIC_CACHE` entry) at the first and the last token count of
-    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` outside the part's ranges of :data:`K1_CHAIN_RANGES_BY_SM` and gives the bits of
+    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and one token below the last, outside the part's ranges of
+    :data:`K1_CHAIN_RANGES_BY_SM` and its token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`, and gives the bits of
     the prepared launch, the tickets zero after.  A part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
@@ -8647,7 +8668,8 @@ def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
     for key, (block_n, splits) in rows:
         _, L, M, N, dt = key
         f32 = dt == "f32"
-        for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
+        lo_t, hi_t = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
+        for T in (lo_t, hi_t - 1, hi_t):
             kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count)
             # the ranges of K1_CHAIN_RANGES_BY_SM come first
             if cake_backend.k1_chain_plan(**kw) is not None:

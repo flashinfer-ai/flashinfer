@@ -332,8 +332,8 @@ K1_SPLIT_RULES:dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] =
     ("sm_103a", 1, 6144, 32, "bf16"): (64, 2), ("sm_103a", 1, 6144, 32, "f32"): (64, 2),
     ("sm_103a", 1, 6144, 128, "bf16"): (128, 2), ("sm_103a", 1, 6144, 128, "f32"): (128, 2),
     # sm_107a (216 SMs): two to four splits; the one-split rows store whole tiles (deterministic) and win where the
-    # deterministic package's sm_107a program of the row is slower (the FP32 one-split rows up to 40960 tokens:
-    # K1_SPLIT_RULE_EXCLUDED_TOKENS).  d_out 64 BF16 at d_in 4096 is not faster than the
+    # deterministic package's sm_107a program of the row is slower (the FP32 one-split rows up to 40960 tokens,
+    # 5120 -> 1024 to 32768: K1_SPLIT_RULE_EXCLUDED_TOKENS).  d_out 64 BF16 at d_in 4096 is not faster than the
     # deterministic plan in every run; d_in 4096 to d_out 512 BF16 (192 CTAs) and to d_out 4096 FP32 (216 CTAs) need
     # more SMs than a kernel holding 32 SMs leaves free and lose next to it
     ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
@@ -426,17 +426,24 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: was faster, and the row's program was 14.5 % slower at the operation and left the checkpointed step 6.3 % slower in
 #: graph replays. The open-ended sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows
 #: ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961
-#: tokens up because their one-split program's FP64 relative Frobenius error exceeds the deterministic package's FP32
-#: error budget (5e-5) on every seed there.  That program adds the whole token reduction of an output in one chain, and
-#: its error grows about linearly with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the same
-#: program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an FP64 reference,
-#: each row on two parts, 5 seeds, at 512 to 65536 tokens: within the budget on every seed up to 40960 tokens (1.86e-5
-#: at 16384 tokens, 3.77e-5 at 32768) and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens, where the
-#: deterministic program's is 3.8e-5).  The range has no upper bound: the error keeps growing with the token count.  The
-#: token counts between 40960 and 45056 run the deterministic program too (not measured).  From 961 tokens (16 K blocks)
-#: up the deterministic program of these rows cuts the token reduction into units of ``ceil(blocks / 2)`` K blocks and
-#: adds the partials in a fixed order (its automatic two-way split); there the one-split program's error is 2.0 to 2.4
-#: times the deterministic program's (reported); up to 960 tokens the two give the same bits.
+#: tokens up (``5120 -> 1024`` from 32769, below) because their one-split program's FP64 relative Frobenius error
+#: exceeds the deterministic package's FP32 error budget (5e-5) on every seed there.  That program adds the whole token
+#: reduction of an output in one chain, and its error grows about linearly with the token count.  Measured with the
+#: 216-SM plan on 212-SM R200 parts (the same program and accumulation order as on 216 SMs; the error does not depend on
+#: the SM count) against an FP64 reference, each row on two parts, 5 seeds, at 512 to 65536 tokens: within the budget on
+#: every seed up to 40960 tokens (1.86e-5 at 16384 tokens, 3.77e-5 at 32768) and above it on every seed from 45056
+#: tokens up (7.6e-5 at 65536 tokens, where the deterministic program's is 3.8e-5).  The range has no upper bound: the
+#: error keeps growing with the token count.  The token counts between 40960 and 45056 run the deterministic program too
+#: (not measured).  From 961 tokens (16 K blocks) up the deterministic program of these rows cuts the token reduction
+#: into units of ``ceil(blocks / 2)`` K blocks and adds the partials in a fixed order (its automatic two-way split);
+#: there the one-split program's error is 2.0 to 2.4 times the deterministic program's (reported); up to 960 tokens the
+#: two give the same bits.  A later strict re-measurement on a 216-SM R200 part, each failure reproduced in a second
+#: run, moved two more token counts to the deterministic program on parts of at least 216 SMs: ``5120 -> 1024`` from
+#: 32769 tokens up, whose one-split program left the checkpointed step 1.6 to 5.3 % slower at 36864 and 40960 tokens
+#: (eager launches or graph replays; the weight gradient itself took 0.87 to 0.92 times the deterministic program's
+#: time, and the output met the FP32 budget), while it kept the rule and the 1.3 % bound at 16385 to 32768 tokens; and
+#: ``4096 -> 1024`` at 16384 tokens, where its 216-SM override (:data:`K1_SPLIT_OVERRIDES_BY_SM`) failed the rule above
+#: in 4 and 5 of 8 groups (median time ratios 0.982 to 0.995).
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -485,7 +492,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ),
     ("sm_107a", 1, 4096, 1024, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
-        (216, 40961, None),
+        (216, 16384, 16384), (216, 40961, None),
     ),
     ("sm_107a", 1, 5120, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 32, "f32"): ((216, 512, 512),),
@@ -499,7 +506,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ),
     ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384), (216, 40961, None)),
     ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
-    ("sm_107a", 1, 5120, 1024, "f32"): ((216, 40961, None),),
+    ("sm_107a", 1, 5120, 1024, "f32"): ((216, 32769, None),),
     ("sm_107a", 1, 6144, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 8192, 128, "bf16"): ((216, 512, 512), (216, 65536, 65536)),
     ("sm_107a", 1, 8192, 128, "f32"): ((216, 512, 512), (216, 65536, 65536)),
@@ -788,9 +795,10 @@ K1_TWO_SPLIT_RANGES_BY_SM: dict[
 #: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part.  Every other token count, every other SM count and every row
 #: without an entry keep the verdict of :data:`K1_SPLIT_RULES`.  On 216 SMs ``4096 -> 1024`` FP32 takes the 192-wide
 #: row-major program at one split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave next to a
-#: kernel holding 32 SMs), which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile; at 16231 tokens
-#: the row runs the deterministic program (its entry in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`), and at 16172 tokens the
-#: three-chain program of :data:`K1_CHAIN_RANGES_BY_SM`.
+#: kernel holding 32 SMs), which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile; at 16231 and
+#: 16384 tokens the row runs the deterministic program (its entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`; 16384: a
+#: strict re-measurement on a 216-SM part), and at 16172 tokens the three-chain program of
+#: :data:`K1_CHAIN_RANGES_BY_SM`.
 # fmt: off
 K1_SPLIT_OVERRIDES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
