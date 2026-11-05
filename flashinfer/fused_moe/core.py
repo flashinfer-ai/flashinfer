@@ -1518,7 +1518,7 @@ def cutlass_fused_moe(
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
-    use_fused_finalize: bool = True,
+    use_fused_finalize: Optional[bool] = None,
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     *,
@@ -1676,11 +1676,15 @@ def cutlass_fused_moe(
         communication where the scaling factors are received in linear (non-swizzled) format.
         Only relevant when input_sf is not None.
 
-    use_fused_finalize : bool = True
+    use_fused_finalize : Optional[bool]
         Whether to fuse the top-k expert reduction ("finalize") into the GEMM2 epilogue.
-        Defaults to True for best performance. The fused epilogue reduces expert outputs via
-        non-associative atomics, so results are not deterministic run-to-run. Set to
-        False to use the non-fused, deterministic finalize path.
+        The fused epilogue reduces expert outputs via non-associative atomics, so results
+        are not deterministic run-to-run. Set to False to use the non-fused, deterministic
+        finalize path. When ``None`` (default) the fused path is used unless
+        ``torch.are_deterministic_algorithms_enabled()`` is true, in which case the
+        autotuner never offers or replays a fused-finalize GEMM2 tactic. An explicit
+        True or False always wins. The flag is part of the autotune cache key, so pass the
+        same resolved value to :func:`cutlass_fused_moe_workspace_size`.
 
     profile_ids : Optional[List[int]]
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
@@ -1745,6 +1749,8 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    if use_fused_finalize is None:
+        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     # Reject an unhonorable pinned recipe before any device work. The NVFP4
     # test mirrors the binding's isNvfp4Quant() plus the W4A16 flag.
     is_nvfp4 = (
@@ -1918,7 +1924,7 @@ def cutlass_fused_moe_workspace_size(
     use_deepseek_fp8_block_scale: bool = False,
     use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
-    use_fused_finalize: bool = True,
+    use_fused_finalize: Optional[bool] = None,
     use_packed_weights: bool = False,
     use_wfp4afp8_humming: bool = False,
     device: Optional[torch.device] = None,
@@ -1952,6 +1958,10 @@ def cutlass_fused_moe_workspace_size(
         Input and weight dtypes, used to select the kernel runner.
     output_dtype : torch.dtype, optional
         Output dtype (default: ``torch.bfloat16``).
+    use_fused_finalize : Optional[bool]
+        Must match the value :func:`cutlass_fused_moe` resolves to. ``None``
+        (default) follows the same rule: fused unless
+        ``torch.are_deterministic_algorithms_enabled()`` is true.
     device : torch.device, optional
         CUDA device on which the workspace will be used. Defaults to the
         current CUDA device.
@@ -1965,6 +1975,8 @@ def cutlass_fused_moe_workspace_size(
         ``"cake"`` returns the prepared SiTU scratch size using host metadata
         only. It requires BF16/uint8, TP8, SiTU and the documented fixed geometry.
     """
+    if use_fused_finalize is None:
+        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 

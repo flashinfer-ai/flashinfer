@@ -40,41 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_ACC_OFFSET 0
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_K_PIPE_STAGES 4
-#define NUM_TMEM_PIPE_STAGES 4
-#define NUM_TMEM_LAP_PIPE_STAGES 1
-#define NUM_VERDICT_PIPE_STAGES 1
-#define NUM_TK_PIPE_STAGES 2
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 32768
-#define SMEM_SMEM_Q_STRIDE 32768
-#define SMEM_SMEM_W_OFF 66560
-#define SMEM_SMEM_W_STAGE_BYTES 512
-#define SMEM_SMEM_W_STRIDE 512
-#define SMEM_SMEM_K_OFF 67584
-#define SMEM_SMEM_K_STAGE_BYTES 32768
-#define SMEM_SMEM_K_STRIDE 32768
-#define SMEM_S_HIST_OFF 198656
-#define SMEM_S_HIST_STAGE_BYTES 8192
-#define SMEM_S_HIST_STRIDE 8192
-#define SMEM_S_COUNT_OFF 206848
-#define SMEM_S_COUNT_STAGE_BYTES 32
-#define SMEM_S_COUNT_STRIDE 32
-#define SMEM_S_TAU_OFF 206880
-#define SMEM_S_TAU_STAGE_BYTES 64
-#define SMEM_S_TAU_STRIDE 64
-#define SMEM_S_FAIL_OFF 206944
-#define SMEM_S_FAIL_STAGE_BYTES 16
-#define SMEM_S_FAIL_STRIDE 16
-#define SMEM_S_TK_OFF 207008
-#define SMEM_S_TK_STAGE_BYTES 16
-#define SMEM_S_TK_STRIDE 16
-#define SMEM_TOTAL 207104
-#define TILE_UNROLL 1
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -198,7 +163,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -206,7 +171,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, unsigned int* __restrict__ TicketWord)
+kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, float* __restrict__ K_scale, unsigned int* __restrict__ TicketWord)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -237,7 +202,7 @@ kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CU
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 66560);
@@ -254,12 +219,13 @@ kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CU
     const int s_fail_addr = smem + 206944;
     int* s_tk = reinterpret_cast<int*>(smem_raw + 207008);
     const int s_tk_addr = smem + 207008;
+
+    // Kernel setup ops
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
-    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (24 barriers at smem_raw[0..192))
 
     if (warp == 9) {
         uint32_t leader = elect_sync();
@@ -320,10 +286,10 @@ kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CU
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_acc = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (warp == 0) {
         if (elect_sync()) {
@@ -951,7 +917,7 @@ kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CU
                             int d_pos = 0;
                             int r_pos = 0;
                             int until_check = check_period - 1;
-                            constexpr int ti_2_unroll = TILE_UNROLL;
+                            constexpr int ti_2_unroll = 1;
                             #pragma unroll ti_2_unroll
                             for (int ti_2 = 0; ti_2 < n_tiles_5; ti_2++) {
                                 int tile_1 = d_pos;
@@ -1351,7 +1317,7 @@ kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CU
                                                 }
                                                 cum_above += lane_bins[0];
                                                 int target_lane;
-                                                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane) : "r"(is_target * lane_0));
+                                                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane) : "r"(is_target * lane_0));
                                                 int digit_sel = __shfl_sync(0xFFFFFFFF, d_sel, target_lane);
                                                 int above_cnt = __shfl_sync(0xFFFFFFFF, above_sel, target_lane);
                                                 int bucket_cnt = __shfl_sync(0xFFFFFFFF, count_sel, target_lane);
@@ -1645,7 +1611,7 @@ kernel_cake_dsa_indexer_det_topk_9cc421366d6079aa6ca8(const __grid_constant__ CU
                                         }
                                         cum_above_1 += lane_bins_1[0];
                                         int target_lane_1;
-                                        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane_1) : "r"(is_target_1 * lane_0));
+                                        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane_1) : "r"(is_target_1 * lane_0));
                                         int digit_sel_1 = __shfl_sync(0xFFFFFFFF, d_sel_1, target_lane_1);
                                         int above_cnt_1 = __shfl_sync(0xFFFFFFFF, above_sel_1, target_lane_1);
                                         int bucket_cnt_1 = __shfl_sync(0xFFFFFFFF, count_sel_1, target_lane_1);

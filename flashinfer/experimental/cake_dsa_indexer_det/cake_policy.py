@@ -78,6 +78,7 @@ POLICY_FIELDS = (
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
     "split_wave_scope",  # [unit geometries, max segments, sampled calls only] the two-way split of split_wave_rule is limited to, or None (every call)
+    "split_fit_rule",  # [merge chunk entries]: a call the split rule splits takes ceil(mean unit keys / top_k) splits, rounded up to whole merge chunks, where that is more and fits split_max and the grid; or None
     "split_units",  # unit geometries ("l6", "narrow", "wide") whose split program the architecture registers; any other unit never splits
     "pair_rule",  # [min mean unit tiles, max mean unit tiles, min top_k] of the CTA-pair program, or None
     "pair_units",  # unit geometries ("l6", "narrow", "wide") whose CTA-pair program the architecture registers; the pair rule applies to these units only
@@ -233,6 +234,7 @@ _OPTIONAL_RULE = (
     "wide_first_rule",
     "split_wave_rule",
     "split_wave_scope",
+    "split_fit_rule",
     "pair_rule",
     "l6_solo_rule",
     "snake_rule",
@@ -284,6 +286,7 @@ class DispatchPolicy:
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
     split_wave_scope: Optional[list]
+    split_fit_rule: Optional[list]
     split_units: list
     pair_rule: Optional[list]
     pair_units: list
@@ -417,6 +420,13 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['split_wave_scope'] must be [ascending unit geometries {UNITS}, max segments >= 1, sampled only (bool)] or None, got {scope!r}"
+            )
+        fit_rule = raw["split_fit_rule"]
+        if fit_rule is not None and (
+            len(fit_rule) != 1 or not _is_int(fit_rule[0]) or fit_rule[0] < 1
+        ):
+            raise ValueError(
+                f"policy['split_fit_rule'] must be [merge chunk entries >= 1] or None, got {fit_rule!r}"
             )
         solo = raw["l6_solo_rule"]
         if solo is not None and (
@@ -833,13 +843,14 @@ class DispatchPolicy:
         grid: int,
         block_q: int,
         sampled: bool = True,
+        top_k: Optional[int] = None,
     ) -> int:
         """Key-range splits per unit of the unit ``block_q``: the split rule (``split_rule_for``) for a unit of
         ``split_units``; 1 for any other unit, whose split program the architecture does not register."""
         if self.unit_name(block_q) not in self.split_units:
             return 1
         return self.split_rule_for(
-            num_queries, num_keys, num_segments, ratio, grid, block_q, sampled
+            num_queries, num_keys, num_segments, ratio, grid, block_q, sampled, top_k
         )
 
     def split_rule_for(
@@ -851,6 +862,7 @@ class DispatchPolicy:
         grid: int,
         block_q: int,
         sampled: bool = True,
+        top_k: Optional[int] = None,
     ) -> int:
         """The split rule alone (no registration guard): ``min(grid // units, mean tiles // split_min_range_tiles,
         split_max)``, at least 1, and the two-way wave split of ``split_wave_rule`` where that gives 1 -- inside
@@ -892,6 +904,22 @@ class DispatchPolicy:
 
             if eff(2) - eff(1) >= float(rule[1]):
                 n = 2
+        fit = self.split_fit_rule
+        if fit is not None and n > 1 and top_k is not None and int(top_k) > 0:
+            # split_fit_rule: a split call whose splits can each hold at most top_k keys needs no selection inside a
+            # split; the merge reads its staging in chunks of fit[0] entries, so the split count is rounded up to whole
+            # chunks (more splits in the last chunk cost the merge nothing)
+            segments = max(1, int(num_segments))
+            r = max(1, int(ratio))
+            mean_keys = max(
+                0.0, (int(num_keys) - int(num_queries) / (2 * r)) / segments
+            )
+            k = int(top_k)
+            n_fit = max(1, -(-int(mean_keys) // k))
+            per_chunk = max(1, int(fit[0]) // k)
+            n_fit = -(-n_fit // per_chunk) * per_chunk
+            if n < n_fit <= min(int(grid) // units, self.split_max):
+                n = n_fit
         return n
 
     def pair_for(
@@ -1412,7 +1440,9 @@ def select_program(
         else int(candidate_multiplier)
     )
     block_q = policy.unit_block_q_for(T, Tkv, S, r, grid, K)
-    n_split = policy.n_split_for(T, Tkv, S, r, grid, block_q, sampled=tiles > 0)
+    n_split = policy.n_split_for(
+        T, Tkv, S, r, grid, block_q, sampled=tiles > 0, top_k=K
+    )
     split = n_split > 1
     pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K, block_q)
     # lever LSF (#7549): the longest-first segment order pays off only where the segments differ, so the copy that

@@ -3887,7 +3887,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "2bb09f47b495079a750b9fd1cd3f5a15935bfd86adf54c1bf2e061b9855af118",
+   "closure_sha256": "eb2d7b63ba6fded6cd565c7f10c115806d9cf577962ae8325c812c13530aeda5",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -4140,7 +4140,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "378739973b51e5dfdae011d54aa7351b355e7a2547a015ef14aa59092a816036",
+   "closure_sha256": "f87649f9aa9b7ebc06cfbf88bf64735620ad806a0d91a3ec0499dae622a0fb83",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a",
@@ -4395,7 +4395,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "82c51ca327bd55131140a7a7f0f87bae67dc73ed557860e5661dea96bc7b312b",
+   "closure_sha256": "990cdd0be58bb80fca6bfc7c1f7fdb96bec729b689ceb73ce5c194099251226a",
    "compile_flags": [
     "--use_fast_math"
    ],
