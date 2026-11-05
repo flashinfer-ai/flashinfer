@@ -17,7 +17,8 @@ module, ``_RENDERED_WORK_BIN_MIX_ROUTES`` for the bin-mix build of a module's
 work-bin turnover build, ``_RENDERED_WORK_BIN_POOL_ROUTES`` for the helper-pool build
 of its bin-mix build, ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` for the short-task build
 of its turnover build, ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` for the long-task build of
-its bin-mix build).
+its bin-mix build, ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` for the hybrid build
+of an M64 value-split module's owner/helper build).
 """
 
 from functools import cache
@@ -5499,6 +5500,19 @@ _RENDERED_WORK_BIN_MIX_LONG_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_d692d2b532922f2ee845",
     },
+    "sm_103a": {},
+}
+
+# architecture -> shipped module -> generated hybrid build of the owner/helper
+# build of an M64 value-split module (``_RENDERED_M64_OWNER_HELPER_ROUTES``):
+# one helper CTA per task prepares the chunks c % 8 >= 4 and the task's two
+# value-half owner CTAs prepare the others and copy the helper's from the
+# global ring.  The runtime launches it cooperatively, grid (tasks, 3), on the
+# equal-length launches of a one-helper row of its owner/helper rule that would
+# take the pair-share build; every other launch keeps its pair-share or routed
+# program.
+_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {},
     "sm_103a": {},
 }
 
