@@ -1394,7 +1394,10 @@ def test_batch_mla_fp8_nope_folded_scale_page_one_matches_bf16_reference(kv_len)
 
     torch.cuda.synchronize()
     torch.testing.assert_close(o_fp8, o_bf16, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(lse_fp8, lse_bf16, rtol=2e-2, atol=2e-2)
+    # The folded-scale LSE error is at most ~4.7e-3 in these configs; keep a
+    # dedicated bound instead of reusing the output tolerance (2e-2 would
+    # allow ~0.15 at kv_len=63).
+    torch.testing.assert_close(lse_fp8, lse_bf16, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("ckv_magnitude", [0.01, 0.1, 1.0])
