@@ -1282,7 +1282,7 @@ def test_auto_follows_the_head_counts_and_the_verified_devices(
     heads = min(cake_backend.HANDOFF_HEADS)
     # the largest bounds the problem meets at that head count, and each one past it
     at = (heads * S, S // N)
-    assert S >= at[1] * N and S < (at[1] + 1) * N, (S, N)
+    assert at[1] * N <= S < (at[1] + 1) * N, (S, N)
     # (heads, toolkit, (min head-tokens, min mean document length), published and hits, unverified)
     cases = (
         (heads, "9.9", at, 1, 0),
@@ -1673,7 +1673,7 @@ def test_the_auto_size_bounds(monkeypatch) -> None:
         assert large(S, N, 12) is admitted, (S, N)
     for H in sorted(cake_backend.HANDOFF_HEADS):
         S = _smallest_admitted(H)
-        assert H * S >= min_head_tokens and S >= min_doc, (H, S)
+        assert min_head_tokens <= H * S and min_doc <= S, (H, S)
         assert large(S, 1, H) and not large(S - 1, 1, H), (H, S)
     heads = max(cake_backend.HANDOFF_HEADS)
     for N in (1, 2, 4, 13, 300):
