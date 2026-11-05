@@ -18,6 +18,7 @@ from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_bucket
 
 
 def checked_relative_error(output, reference):
+    """Return relative L2 error only when both tensors are finite and error < 3%."""
     error = (
         output.float() - reference.float()
     ).norm() / reference.float().norm().clamp_min(1e-8)
@@ -47,6 +48,7 @@ def compare_planners(args):
     stream = torch.cuda.current_stream()
 
     def wall_samples(call):
+        """Measure completed wall microseconds, synchronizing each warmed call."""
         for _ in range(5):
             call()
             stream.synchronize()
@@ -59,6 +61,7 @@ def compare_planners(args):
         return samples
 
     def graph_samples(call):
+        """Measure Graph GPU microseconds with CUPTI and cold-L2 flushing both off."""
         return [
             value * 1000
             for value in bench_gpu_time(
@@ -140,6 +143,7 @@ def compare_planners(args):
             bank.append((q, kv, sf, outputs, workspaces))
 
         def compute(planner):
+            """Consume one planner's descriptors across layers without refreshing them."""
             for q, kv, sf, outputs, workspaces in bank:
                 xqa_decode_with_buckets(
                     q,
@@ -167,6 +171,7 @@ def compare_planners(args):
             compute("gpu")
 
         def external(planner):
+            """Refresh outside capture, then replay the compute-only consumer Graph."""
             plans[planner].prepare()
             compute_graphs[planner].replay()
 
@@ -185,6 +190,7 @@ def compare_planners(args):
             )
 
         def gpu_window():
+            """Include one GPU assignment followed by all layer consumers in timing."""
             plans["gpu"].prepare()
             compute("gpu")
 
@@ -312,6 +318,7 @@ def suite_cases(suite="tencent22"):
 
 
 def atomic_json(target, value):
+    """Replace the report after its complete JSON payload reaches a sibling file."""
     temporary = target.with_suffix(target.suffix + ".partial")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
     temporary.replace(target)
@@ -454,6 +461,7 @@ def run_suite(args):
 
 
 def main(argv=None):
+    """Validate comparison modes and route CLI requests to finite example windows."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lengths", default="131072,4096,4096,4096")
     parser.add_argument("--layers", type=int, default=2)
@@ -552,6 +560,12 @@ def main(argv=None):
 
 
 def run_case(args, lengths, capacity, *, suite=False):
+    """Compare bucket and native attention on shared operands and fixed capacity.
+
+    Check outputs/counters before and after any requested timing. Optional
+    tile, scheduling-mode and compile comparisons retain their own workspaces;
+    returned records describe these attention windows rather than model speed.
+    """
     device = torch.device(args.device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -567,6 +581,7 @@ def run_case(args, lengths, capacity, *, suite=False):
     lens = torch.tensor(lengths, dtype=torch.int32, device=device)
 
     def make_plan(query_tile, mode=args.mode):
+        """Keep lengths and reserved table capacity identical across plan arms."""
         return create_xqa_decode_bucket_plan(
             lens,
             page_table_width=width,
@@ -648,6 +663,7 @@ def run_case(args, lengths, capacity, *, suite=False):
             ]
 
     def compute(selected_plan=plan, selected_bank=bank):
+        """Consume the selected prepared plan using one workspace per layer."""
         for q, k, v, ks, vs, out, _, workspace, _ in selected_bank:
             xqa_decode_with_buckets(
                 q,
@@ -664,10 +680,12 @@ def run_case(args, lengths, capacity, *, suite=False):
             )
 
     def candidate(selected_plan=plan, selected_bank=bank):
+        """Refresh the shared plan once, then execute every compatible layer."""
         selected_plan.prepare()
         compute(selected_plan, selected_bank)
 
     def native():
+        """Run native XQA with matching operands, scales and causal suffix mask."""
         for q, k, v, ks, vs, _, native_out, _, scratch in bank:
             xqa_batch_decode_with_kv_cache(
                 q.view(-1, args.num_kv_heads * args.head_group_ratio, 256),
@@ -690,6 +708,7 @@ def run_case(args, lengths, capacity, *, suite=False):
     torch.cuda.synchronize()
 
     def check_outputs(selected_bank=bank):
+        """Require finite agreement with native output and zeroed merge counters."""
         errors = []
         for _, _, _, _, _, out, native_out, workspace, _ in selected_bank:
             errors.append(checked_relative_error(out, native_out))
@@ -781,6 +800,7 @@ def run_case(args, lengths, capacity, *, suite=False):
         print(dict(compiled_public_window=counts), flush=True)
 
         def per_layer_prepare():
+            """Control window that repeats the same assignment before each layer."""
             for operands in bank:
                 plan.prepare()
                 compute(plan, [operands])

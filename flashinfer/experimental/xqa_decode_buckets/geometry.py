@@ -9,6 +9,7 @@ HEAD_GROUP_RATIOS = (4, 6, 8)
 
 
 def check_head_config(num_kv_heads: int = 1, head_group_ratio: int = 6) -> None:
+    """Require bounded KV-head counts and one supported queries-per-KV-head ratio."""
     if type(num_kv_heads) is not int or not 1 <= num_kv_heads <= (1 << 31) - 1:
         raise ValueError("num_kv_heads must be a bounded positive integer")
     if type(head_group_ratio) is not int or head_group_ratio not in HEAD_GROUP_RATIOS:
@@ -16,11 +17,13 @@ def check_head_config(num_kv_heads: int = 1, head_group_ratio: int = 6) -> None:
 
 
 def check_query_length(q_len_per_req: int = 1) -> None:
+    """Require an integer count of one to five uniform suffix tokens per request."""
     if type(q_len_per_req) is not int or not 1 <= q_len_per_req <= 5:
         raise ValueError("q_len_per_req must be an integer in [1,5]")
 
 
 def check_query_tile(query_tile=16, q_len_per_req=1):
+    """Validate query-row tile height; the 32-row specialization requires T > 1."""
     check_query_length(q_len_per_req)
     if type(query_tile) is not int or query_tile not in (16, 32):
         raise ValueError("query_tile must be 16 or 32")
@@ -31,6 +34,7 @@ def check_query_tile(query_tile=16, q_len_per_req=1):
 def query_group_count(
     num_kv_heads=1, head_group_ratio=6, q_len_per_req=1, query_tile=16
 ):
+    """Count KV heads times query-row tiles, the grid-Y/workspace group dimension."""
     check_head_config(num_kv_heads, head_group_ratio)
     check_query_tile(query_tile, q_len_per_req)
     groups = num_kv_heads * (
@@ -48,6 +52,11 @@ def causal_mask_words(q_len_per_req):
 
 
 def workspace_capacity(batch, ctas, table_width, page_size=32, num_groups=1):
+    """Bound native partial slots across groups, checking the int32 slot index.
+
+    This is a count of scratch slots, not bytes; native sizing converts it to
+    the actual workspace byte allocation.
+    """
     if type(num_groups) is not int or not 1 <= num_groups <= (1 << 31) - 1:
         raise ValueError("num_groups must be a bounded positive integer")
     capacity = plan_capacity(batch, ctas, table_width, page_size) * num_groups
@@ -57,6 +66,7 @@ def workspace_capacity(batch, ctas, table_width, page_size=32, num_groups=1):
 
 
 def max_table_width(page_size: int = 32) -> int:
+    """Bound pages per request so rounded token-tile arithmetic fits int32."""
     if type(page_size) is not int or page_size not in PAGE_SIZES:
         raise ValueError("page_size must be 16, 32 or 64")
     return ((1 << 31) - 1 - (TILE - 1)) // page_size
@@ -66,7 +76,11 @@ MAX_TABLE_WIDTH = max_table_width()
 
 
 def plan_capacity(batch: int, ctas: int, table_width: int, page_size: int = 32) -> int:
-    """Capacity bound for intersections of B request intervals and C buckets."""
+    """Bound task/partial slots per group by B + C - 1 interval intersections.
+
+    B counts requests, C counts owner CTAs and table_width counts pages per
+    request. Validate these static bounds without inspecting live lengths.
+    """
     if (
         type(batch) is not int
         or type(ctas) is not int
@@ -91,7 +105,14 @@ def plan_geometry(
     q_len_per_req: int = 1,
     query_tile: int = 16,
 ) -> tuple[int, bool]:
-    """Return checked CTA capacity and static direct-path eligibility."""
+    """Return owner-CTA capacity per group and static direct-path eligibility.
+
+    Each KV tile covers 256 tokens. Divide the SM count among query/head groups
+    and cap the resulting CTA budget by reserved page-table tile capacity, with
+    at least one owner per request. B=1 always supports direct partitioning;
+    larger batches are direct only if every reserved tile fits that budget.
+    Live lengths do not alter this geometry or require device readback.
+    """
     plan_capacity(batch, batch, table_width, page_size)
     if type(sm_count) is not int or not 1 <= sm_count <= MAX_CTAS:
         raise ValueError("Expected a bounded positive integer SM count")

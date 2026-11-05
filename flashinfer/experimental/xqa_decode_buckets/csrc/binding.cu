@@ -8,6 +8,7 @@
 namespace buckets = flashinfer::xqa_buckets;
 
 namespace {
+/// Check a contiguous CUDA tensor's dtype, owning device, and exact element count.
 void check_tensor(TensorView t, DLDataType dtype, DLDevice device, int64_t elements) {
   CHECK_CUDA(t);
   CHECK_CONTIGUOUS(t);
@@ -16,6 +17,7 @@ void check_tensor(TensorView t, DLDataType dtype, DLDevice device, int64_t eleme
   TVM_FFI_ICHECK_EQ(t.numel(), elements);
 }
 
+/// Validate descriptor storage and form non-owning views; direct plans have empty descriptors.
 buckets::PlanParams plan_params(TensorView lengths, TensorView tasks, TensorView requests,
                                 TensorView spans, TensorView header, int64_t ctas, bool aligned) {
   int64_t batch = lengths.numel();
@@ -51,6 +53,7 @@ buckets::PlanParams plan_params(TensorView lengths, TensorView tasks, TensorView
 }
 }  // namespace
 
+/// Refresh prepared descriptors asynchronously on the lengths tensor's current CUDA stream.
 void bucket_plan(TensorView lengths, TensorView tasks, TensorView requests, TensorView spans,
                  TensorView header, int64_t ctas, bool aligned) {
 #if FLASHINFER_XQA_DIRECT_TASKS
@@ -66,6 +69,7 @@ void bucket_plan(TensorView lengths, TensorView tasks, TensorView requests, Tens
 #endif
 }
 
+/// Fill CPU descriptor storage synchronously; the caller owns any staging lifetime and H2D copy.
 void bucket_plan_host(TensorView lengths, TensorView descriptors, int64_t ctas, int64_t table_width,
                       bool aligned, int64_t q_tokens) {
   CHECK_CPU(lengths);
@@ -87,6 +91,7 @@ void bucket_plan_host(TensorView lengths, TensorView descriptors, int64_t ctas, 
                      int(table_width), aligned, tokensPerPage, int(q_tokens));
 }
 
+/// Reject partial-storage sizes that exceed native uint32 byte offsets before allocation.
 int64_t bucket_scratch_bytes(int64_t capacity) {
   TVM_FFI_ICHECK(capacity >= 1 && capacity <= INT32_MAX);
   uint64_t size = buckets::scratch_bytes(int(capacity));
@@ -94,12 +99,18 @@ int64_t bucket_scratch_bytes(int64_t capacity) {
   return int64_t(size);
 }
 
+/// Query the selected CUDA device's grid-y bound for query/head-group launch validation.
 int64_t bucket_grid_y_limit(int64_t device_id) {
   int limit = 0;
   checkCuda(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxGridDimY, int(device_id)));
   return limit;
 }
 
+/**
+ * Configure dynamic shared memory on the caller's current device before Graph capture.
+ * Write registers/thread, dynamic shared bytes, local bytes/thread, and resident CTAs/SM
+ * into four caller-owned CPU int64 elements for cold resource inspection.
+ */
 void bucket_configure(TensorView resources) {
   CHECK_CPU(resources);
   CHECK_CONTIGUOUS(resources);
@@ -119,6 +130,13 @@ void bucket_configure(TensorView resources) {
   out[3] = resident;
 }
 
+/**
+ * Validate native shapes, strides and float32 scale bounds, then enqueue bucket compute.
+ * Q/output are contiguous BF16. NHD cache heads store 128 packed NVFP4 bytes and 16
+ * E4M3 block scales for D256, with matching K/V strides. Prepared descriptors must be
+ * stream-ordered before this call. Callers retain disjoint output/scratch/counters;
+ * counters start at zero and are reset by completion. No host synchronization occurs.
+ */
 void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, TensorView vs,
                     TensorView table, TensorView lengths, TensorView tasks, TensorView requests,
                     TensorView spans, TensorView header, TensorView mask, TensorView semaphores,

@@ -22,6 +22,12 @@ def gen_module(
     multi_query: bool = False,
     query_tile: int = 16,
 ):
+    """Describe a JIT-only native XQA specialization for the fixed packed layout.
+
+    Validate page/head/query-tile options before constructing compilation flags.
+    Direct scheduling disables persistent task traversal; no module is built or
+    device resources configured until the returned specification is loaded.
+    """
     max_table_width(page_size)
     check_head_config(1, head_group_ratio)
     check_query_tile(query_tile, 2 if multi_query else 1)
@@ -67,6 +73,13 @@ def get_module(
     multi_query: bool = False,
     query_tile: int = 16,
 ):
+    """Cache a loaded specialization and its launch resources for one CUDA device.
+
+    Call cold, before capture: the owning device scopes dynamic-shared-memory
+    configuration and resource queries. CPU int64 staging returns registers,
+    shared bytes, local bytes and resident CTAs per SM as a plain tuple, without
+    depending on the process's default tensor device.
+    """
     # Configure dynamic shared memory outside capture, on each owning device.
     with torch.cuda.device(device):
         module = gen_module(

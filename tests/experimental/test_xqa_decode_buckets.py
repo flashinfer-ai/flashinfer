@@ -14,6 +14,11 @@ import torch
 
 
 def _check_aligned_boundaries(tmp_path):
+    """Compile shared partition arithmetic and compare it with wide intermediates.
+
+    Include empty requests, uneven boundaries and near-int32 limits so tile
+    rounding or boundary products cannot silently overflow.
+    """
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         raise unittest.SkipTest(
@@ -81,11 +86,17 @@ int main() {{
 
 
 def _require_sm120():
+    """Skip hardware tests unless the active CUDA device has the supported ISA."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise unittest.SkipTest("Requires SM120")
 
 
 def _check_host_planner(tmp_path):
+    """Compile host assignment against exact descriptors and coverage invariants.
+
+    Exercise both modes, page sizes, zero/skew generations and invalid lengths;
+    canaries protect descriptor boundaries independently of CUDA execution.
+    """
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         raise unittest.SkipTest("A C++17 compiler is needed for the host planner test")
@@ -202,6 +213,12 @@ def _case(
     head_group_ratio=6,
     q_len_per_req=1,
 ):
+    """Build two layer queries and packed cache operands with reusable capacity.
+
+    Separate/interleaved views retain native strides, random packed FP4 codes
+    and nontrivial head-dependent scales. Extra page-table capacity permits
+    later length and page-map changes without reallocating Graph operands.
+    """
     device = torch.device("cuda", torch.cuda.current_device())
     # Reserve the same per-request capacity for changed row lengths/page mappings.
     capacity_length = max(lengths) if capacity_length is None else capacity_length
@@ -274,6 +291,11 @@ def _case(
 
 
 def _reference(query, data, scales, table, lengths, bmm1, bmm2):
+    """Compute independent dequantized causal-prefix attention with BF16 rounding.
+
+    Decode FP4 codes and E4M3 scales directly, then select each suffix row's
+    visible KV prefix without reusing task boundaries or packed-mask logic.
+    """
     # All FP4 codes, nontrivial E4M3 scales and the native BF16 operand rounding.
     lut = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
@@ -316,6 +338,7 @@ def _reference(query, data, scales, table, lengths, bmm1, bmm2):
 
 
 def _assert_output(actual, expected):
+    """Require finite output and relative L2 error below the existing 3% bound."""
     assert torch.isfinite(actual).all()
     relative_rms = (
         actual.float() - expected.float()
@@ -324,6 +347,7 @@ def _assert_output(actual, expected):
 
 
 def _assert_plan(plan, lengths):
+    """Check direct emptiness or exact task/request/owner descriptor contents."""
     if plan.direct:
         assert plan.ctas % len(lengths) == 0
         assert all(
@@ -396,6 +420,12 @@ def _check_changed_graph(
     q_len_per_req=1,
     query_tile=16,
 ):
+    """Replay changed lengths, page maps and queries through fixed plan addresses.
+
+    Verify shared-plan consumers use independent workspaces, preserve read
+    operands and canaries, reset counters, and match a causal reference through
+    zero/restore generations. Skip only geometrically ineligible direct cases.
+    """
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
     from flashinfer.experimental.xqa_decode_buckets import backend
@@ -576,6 +606,7 @@ def _check_changed_graph(
     bmm1, bmm2 = 0.7 / 16, 1.3
 
     def compute_layers():
+        """Consume one prepared plan across layers without implicit reassignment."""
         for query, workspace, out in zip(queries, workspaces, outputs, strict=True):
             xqa_decode_with_buckets(
                 query,
@@ -663,6 +694,7 @@ def _check_changed_graph(
 
 
 def _check_module_case(lengths, mode):
+    """Check one public compute, its descriptors and counter reset against reference."""
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
 
@@ -689,7 +721,10 @@ def _check_module_case(lengths, mode):
 
 
 class GeometryTests(unittest.TestCase):
+    """CPU checks of static bounds, suffix masks and shared host arithmetic."""
+
     def test_query_tiles(self):
+        """Check tile legality, row-group counts and M32 direct-budget boundaries."""
         path = (
             Path(__file__).resolve().parents[2]
             / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
@@ -725,6 +760,7 @@ class GeometryTests(unittest.TestCase):
             geometry.query_group_count(1, 6, 1, 32)
 
     def test_multi_query_groups_and_mask(self):
+        """Verify causal mask bits, group expansion and bounded counter products."""
         path = (
             Path(__file__).resolve().parents[2]
             / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
@@ -756,6 +792,7 @@ class GeometryTests(unittest.TestCase):
             geometry.query_group_count((1 << 31) - 1, 8, 5)
 
     def test_causal_reference(self):
+        """Validate the reference using known prefix means and a future-V perturbation."""
         # Zero logits make each row the known mean of its visible V prefix.
         query = torch.zeros((1, 5, 4, 256), dtype=torch.bfloat16)
         key = torch.zeros((1, 16, 1, 128), dtype=torch.uint8)
@@ -779,6 +816,7 @@ class GeometryTests(unittest.TestCase):
         )
 
     def test_static_capacity_and_validation(self):
+        """Check exact CTA/direct thresholds, page units and invalid scalar bounds."""
         path = (
             Path(__file__).resolve().parents[2]
             / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
@@ -847,10 +885,12 @@ class GeometryTests(unittest.TestCase):
                 geometry.plan_geometry(4, 16, 132, page_size)
 
     def test_aligned_boundaries_use_wide_intermediates(self):
+        """Exercise shared C++ boundary products at values that overflow narrow math."""
         with tempfile.TemporaryDirectory() as directory:
             _check_aligned_boundaries(Path(directory))
 
     def test_head_group_geometry_and_bounds(self):
+        """Scale CTA/workspace budgets with heads while rejecting unsupported ratios."""
         path = (
             Path(__file__).resolve().parents[2]
             / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
@@ -890,12 +930,16 @@ class GeometryTests(unittest.TestCase):
             geometry.workspace_capacity(32, 170, 4096, 32, 1 << 30)
 
     def test_compiled_host_plan(self):
+        """Check the host planner ABI and full task coverage without a CUDA launch."""
         with tempfile.TemporaryDirectory() as directory:
             _check_host_planner(Path(directory))
 
 
 class BucketGraphTests(unittest.TestCase):
+    """Graph lifetime and changed-input coverage for both descriptor schedulers."""
+
     def test_host_replay(self):
+        """Refresh host descriptors before replay across shared and direct plans."""
         _require_sm120()
         for mode in ("persistent", "aligned"):
             for interleaved in (False, True):
@@ -913,6 +957,7 @@ class BucketGraphTests(unittest.TestCase):
                     )
 
     def test_direct_replay(self):
+        """Replay direct geometry without assignment across reserved capacities."""
         _require_sm120()
         for mode in ("persistent", "aligned"):
             for interleaved in (False, True):
@@ -936,20 +981,27 @@ class BucketGraphTests(unittest.TestCase):
                         )
 
     def test_persistent_interleaved(self):
+        """Preserve shared cache backing across persistent changed-input replays."""
         _check_changed_graph("persistent", True)
 
     def test_persistent_separate(self):
+        """Check persistent replay and input immutability with independent K/V storage."""
         _check_changed_graph("persistent", False)
 
     def test_aligned_interleaved(self):
+        """Check aligned-task replay with overlapping read-only cache backing."""
         _check_changed_graph("aligned", True)
 
     def test_aligned_separate(self):
+        """Protect outputs, counters and operand storage across aligned replays."""
         _check_changed_graph("aligned", False)
 
 
 class BucketModuleTests(unittest.TestCase):
+    """Small public-call numerical anchors for uniform and skewed workloads."""
+
     def test_small_uniform_and_skew(self):
+        """Compare both schedulers with reference under different request imbalances."""
         _require_sm120()
         for mode in ("persistent", "aligned"):
             for lengths in ([512], [8064] * 32, [131072] + [4096] * 31):
@@ -958,7 +1010,10 @@ class BucketModuleTests(unittest.TestCase):
 
 
 class BucketPageTests(unittest.TestCase):
+    """Page-size specialization checks with changed page maps and Graph replay."""
+
     def test_page_replay(self):
+        """Keep page/token indexing correct for 16/64-token direct and prepared plans."""
         _require_sm120()
         for page_size in (16, 64):
             for mode in ("persistent", "aligned"):
@@ -995,7 +1050,10 @@ class BucketPageTests(unittest.TestCase):
 
 
 class BucketHeadTests(unittest.TestCase):
+    """KV-head and GQA-ratio coverage of descriptor and workspace dimensions."""
+
     def test_grouped_replay(self):
+        """Verify every head group under both planners, schedulers and cache layouts."""
         _require_sm120()
         for heads in (1, 2, 4, 8):
             for ratio in (4, 6, 8):
@@ -1018,6 +1076,7 @@ class BucketHeadTests(unittest.TestCase):
                                 )
 
     def test_grouped_direct_and_pages(self):
+        """Check head-scaled direct budgets and nondefault page/head specializations."""
         _require_sm120()
         for heads, ratio in ((2, 4), (4, 6), (8, 8)):
             for mode in ("persistent", "aligned"):
@@ -1063,6 +1122,11 @@ def _check_future_kv(
     head_group_ratio=6,
     query_tile=16,
 ):
+    """Perturb a strong final KV position to expose suffix-mask leakage.
+
+    Earlier query rows must remain unchanged while the last row responds;
+    exercise the same invariant through replay for direct or prepared plans.
+    """
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
 
@@ -1117,6 +1181,7 @@ def _check_future_kv(
     workspace, output = plan.create_workspace(), torch.empty_like(query)
 
     def compute():
+        """Consume the fixed plan with the same scales as the causal reference."""
         xqa_decode_with_buckets(
             query,
             *data,
@@ -1170,10 +1235,14 @@ def _check_future_kv(
 
 
 class BucketQueryTileTests(unittest.TestCase):
+    """M32 numerical and ownership checks with explicit M16 compatibility anchors."""
+
     def test_causal_partition_smoke(self):
+        """Expose M32 suffix-mask leakage at the 256-token partition boundary."""
         _check_future_kv("persistent", False, head_group_ratio=8, query_tile=32)
 
     def test_prepared_m32_replay(self):
+        """Check M32 prepared-plan replay across query/head/page configurations."""
         for tokens, heads, ratio, page in ((3, 4, 6, 32), (5, 2, 8, 64), (2, 2, 4, 16)):
             for mode in ("persistent", "aligned"):
                 for planner in ("gpu", "host"):
@@ -1190,6 +1259,7 @@ class BucketQueryTileTests(unittest.TestCase):
                         )
 
     def test_direct_m32_replay(self):
+        """Check eligible M32 direct fixtures while retaining other valid subtests."""
         for tokens, heads, ratio, page in ((3, 4, 6, 32), (5, 2, 8, 64)):
             for mode in ("persistent", "aligned"):
                 for planner in ("gpu", "host"):
@@ -1218,6 +1288,7 @@ class BucketQueryTileTests(unittest.TestCase):
                             )
 
     def test_future_kv_m32(self):
+        """Require future-V isolation for M32 under both planners and task modes."""
         for heads, ratio, page in ((1, 6, 32), (2, 8, 64)):
             for direct in (False, True):
                 for mode in ("persistent", "aligned"):
@@ -1234,6 +1305,7 @@ class BucketQueryTileTests(unittest.TestCase):
                         )
 
     def test_default_m16_anchor(self):
+        """Retain the default M16 tile for grouped multi-query replay and direct decode."""
         _check_changed_graph(
             "persistent", False, num_kv_heads=4, head_group_ratio=6, q_len_per_req=3
         )
@@ -1241,10 +1313,14 @@ class BucketQueryTileTests(unittest.TestCase):
 
 
 class BucketMultiQueryTests(unittest.TestCase):
+    """Uniform suffix-query causality and Graph replay across supported T values."""
+
     def test_causal_partition_smoke(self):
+        """Expose future-V leakage when a five-row suffix crosses a KV tile boundary."""
         _check_future_kv("persistent", False)
 
     def test_uniform_query_replay(self):
+        """Cover T=2..5 row grouping with mutable lengths and both cache layouts."""
         _require_sm120()
         configs = (
             (2, 2, 4, 16),
@@ -1278,6 +1354,7 @@ class BucketMultiQueryTests(unittest.TestCase):
                             )
 
     def test_direct_query_replay(self):
+        """Verify multi-query direct plans only where the static SM budget permits."""
         _require_sm120()
         for tokens, heads, ratio, page in ((2, 2, 4, 16), (3, 4, 6, 32), (5, 8, 8, 64)):
             for mode in ("persistent", "aligned"):
@@ -1306,6 +1383,7 @@ class BucketMultiQueryTests(unittest.TestCase):
                             )
 
     def test_future_kv_perturbation(self):
+        """Check suffix visibility under page, planner, layout and scheduling changes."""
         for page in (16, 32, 64):
             for direct in (False, True):
                 for mode in ("persistent", "aligned"):
@@ -1324,6 +1402,7 @@ class BucketMultiQueryTests(unittest.TestCase):
                     )
 
     def test_q1_compatibility_anchor(self):
+        """Keep direct/prepared single-token behavior covered beside suffix queries."""
         _check_changed_graph("persistent", False, direct=True, capacity_length=512)
         _check_changed_graph("persistent", True, num_kv_heads=4, head_group_ratio=6)
         with self.subTest(direct_batch=4):
@@ -1339,7 +1418,14 @@ class BucketMultiQueryTests(unittest.TestCase):
 
 
 class HostPlannerTests(unittest.TestCase):
+    """Pinned staging ownership, descriptor equivalence and host-input validation."""
+
     def test_descriptor_abi_and_validation(self):
+        """Compare host/GPU descriptors while checking staging reuse and capture bans.
+
+        Retain stable descriptor addresses through back-to-back H2D refreshes,
+        zero/restore lengths and invalid host metadata or page configurations.
+        """
         _require_sm120()
         from flashinfer.xqa import create_xqa_decode_bucket_plan
         from flashinfer.experimental.xqa_decode_buckets.jit import get_module

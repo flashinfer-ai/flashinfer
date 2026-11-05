@@ -858,7 +858,11 @@ __device__ inline GemmOutRegTile loadGemmOutTile(Warp const& warp,
 #endif
   return dst;
 }
-// only the first nbValidRows rows are copied, to allow padding.
+/**
+ * Store the valid rows of a swizzled PV tile, skipping physical tile padding.
+ * For a multi-query suffix, dstOffset.y includes the query/head-row block offset;
+ * actualQSeqLen bounds the full request rather than only this physical row tile.
+ */
 __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, uint32_t nbQHeads,
 #if SPEC_DEC
                                              uint32_t headGrpSize, uint32_t idxHeadGrpOffset,
@@ -1559,6 +1563,14 @@ __device__ inline void addAttentionSinksSpecDec(ThrdRegRowMax& globalRowSum,
 }
 #endif
 
+/**
+ * Run native QK/online-softmax/PV and, for split requests, last-CTA partial merging.
+ * Task specializations supply request/head identity, contiguous KV-tile bounds and
+ * compact scratch ownership through XQATaskContext. Causal suffix positions retain
+ * the full request length even when the current task visits only a clipped interval.
+ * Persistent callers join all copies/users before reinitializing shared barriers
+ * for another task; ordinary native launches derive ownership from the launch grid.
+ */
 #ifdef NDEBUG
 __device__ __forceinline__
 #else

@@ -20,8 +20,10 @@ struct XQABucketSpan {
 namespace flashinfer::xqa_buckets {
 constexpr int MaxBatch = 32;
 constexpr int Tile = 256;
+/// Limit table width so converting page capacity to a rounded tile count fits int32.
 constexpr int max_table_width(int page_size) { return (0x7fffffff - (Tile - 1)) / page_size; }
 
+/// Size the shared task/request/span/header backing in int32 words, including unused slots.
 inline int64_t descriptor_words(int batch, int ctas) {
   return int64_t(6) * (int64_t(ctas) + batch);
 }
@@ -29,6 +31,14 @@ inline int64_t descriptor_words(int batch, int ctas) {
 // Caller validates storage size/type. No CUDA calls or allocation occur here.
 // Keep the ownership arithmetic identical to assign; only its execution moves
 // to the CPU. The GPU planner retains its parallel task/span fill.
+/**
+ * Build descriptors from caller-owned CPU lengths for a subsequent ordered H2D copy.
+ * Storage contains (ctas + batch - 1) four-word tasks, batch two-word request ranges,
+ * ctas two-word owner spans, and a four-word header. Persistent ownership intersects
+ * global tile buckets with requests; aligned ownership assigns request-local splits.
+ * Unused storage is cleared so copying the whole backing is well-defined. This routine
+ * validates lengths but neither allocates buffers nor performs or synchronizes CUDA work.
+ */
 inline void plan_host(const int* lengths, int* storage, int batch, int ctas, int table_width,
                       bool aligned, int page_size = 32, int q_len_per_req = 1) {
   if (batch < 1 || batch > MaxBatch || ctas < batch || ctas > INT32_MAX - MaxBatch ||

@@ -21,6 +21,11 @@ from test_xqa_decode_buckets import (
 
 
 def _fixture(*, direct=False, mode="persistent", planner="gpu", layers=1):
+    """Return a warmed public consumer with fixed plan/workspace addresses.
+
+    Layer banks share compatible metadata but retain independent writable
+    buffers. Keep host lengths available for later CPU refreshes outside Graphs.
+    """
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
 
@@ -54,6 +59,7 @@ def _fixture(*, direct=False, mode="persistent", planner="gpu", layers=1):
     workspaces = [plan.create_workspace() for _ in banks]
 
     def forward(table, *operands):
+        """Refresh GPU descriptors once, then consume them across the layer banks."""
         if planner == "gpu":
             plan.prepare()
         outputs = []
@@ -84,6 +90,12 @@ def _fixture(*, direct=False, mode="persistent", planner="gpu", layers=1):
 def _compile_check(
     *, direct=False, mode="persistent", planner="gpu", layers=1, opcheck=False
 ):
+    """Qualify schema/FakeTensor and real Inductor fullgraph Graph replay.
+
+    Mutate Q/K/V and lengths through zero/restore generations, compare every
+    output with reference, and require one graph with the expected plan/compute
+    operator counts. This checks integration behavior, not model performance.
+    """
     plan, workspaces, banks, args, forward, host_lengths, initial = _fixture(
         direct=direct, mode=mode, planner=planner, layers=layers
     )
@@ -225,8 +237,11 @@ def _compile_check(
 
 
 class BucketReviewCPUTests(unittest.TestCase):
+    """CPU adversarial checks for storage ownership, scalar bounds and reporting."""
+
     @staticmethod
     def _operands():
+        """Build disjoint aligned byte buffers for address checks without GPU work."""
         return {
             name: torch.empty(64, dtype=torch.uint8, device="cpu")
             for name in (
@@ -250,6 +265,7 @@ class BucketReviewCPUTests(unittest.TestCase):
 
     @staticmethod
     def _example():
+        """Load the actual CLI module for cheap report and numerical-check tests."""
         path = Path(__file__).resolve().parents[2] / "examples/xqa_decode_buckets.py"
         spec = importlib.util.spec_from_file_location("xqa_bucket_example", path)
         module = importlib.util.module_from_spec(spec)
@@ -257,6 +273,7 @@ class BucketReviewCPUTests(unittest.TestCase):
         return module
 
     def test_external_storage_overlap(self):
+        """Catch byte overlap between BF16 wrappers with different storage bases."""
         from flashinfer.experimental.xqa_decode_buckets import backend
 
         operands = self._operands()
@@ -271,6 +288,7 @@ class BucketReviewCPUTests(unittest.TestCase):
             backend._storage_checks(**operands)
 
     def test_writable_buffer_overlaps(self):
+        """Reject every write/read pairing and all three writable-buffer pairings."""
         from flashinfer.experimental.xqa_decode_buckets import backend
 
         readonly = (
@@ -309,6 +327,7 @@ class BucketReviewCPUTests(unittest.TestCase):
                     backend._storage_checks(**operands)
 
     def test_disjoint_subregions_and_empty_descriptors(self):
+        """Allow disjoint suballocations, empty descriptors and read-only interleaving."""
         from flashinfer.experimental.xqa_decode_buckets import backend
 
         operands = self._operands()
@@ -326,6 +345,7 @@ class BucketReviewCPUTests(unittest.TestCase):
         backend._storage_checks(**operands)
 
     def test_strided_input_extent(self):
+        """Catch overlap at a strided input's tail beyond its logical element count."""
         from flashinfer.experimental.xqa_decode_buckets import backend
 
         operands = self._operands()
@@ -336,6 +356,7 @@ class BucketReviewCPUTests(unittest.TestCase):
             backend._storage_checks(**operands)
 
     def test_scale_validation(self):
+        """Accept float32 endpoints and reject overflow/nonfinite scales before dispatch."""
         from flashinfer.experimental.xqa_decode_buckets import backend
 
         maximum = torch.finfo(torch.float32).max
@@ -361,6 +382,7 @@ class BucketReviewCPUTests(unittest.TestCase):
                     )
 
     def test_single_case_json(self):
+        """Persist ordinary CLI JSON atomically while mocking only expensive attention."""
         example = self._example()
         result = dict(relative_error=[0.01])
         with tempfile.TemporaryDirectory() as directory:
@@ -377,6 +399,7 @@ class BucketReviewCPUTests(unittest.TestCase):
             self.assertFalse(target.with_suffix(".json.partial").exists())
 
     def test_nonfinite_output_and_reference(self):
+        """Reject invalid references and NaN errors, including finite-input norm overflow."""
         example = self._example()
         reference = torch.ones(4, device="cpu")
         self.assertLess(
@@ -398,6 +421,7 @@ class BucketReviewCPUTests(unittest.TestCase):
             example.checked_relative_error(reference * 1.04, reference)
 
     def test_small_sm_direct_fixture_skips_before_allocation(self):
+        """Skip an ineligible direct geometry before allocating any CUDA fixture."""
         from flashinfer.experimental.xqa_decode_buckets import backend
 
         with (
@@ -425,7 +449,15 @@ class BucketReviewCPUTests(unittest.TestCase):
 
 
 class BucketReviewSM120Tests(unittest.TestCase):
+    """Real-device regressions for default-device isolation and native scalar checks."""
+
     def test_default_cuda_device_host_plan_and_interleaved_graph(self):
+        """Keep cold host allocations on CPU under a scoped CUDA default device.
+
+        Exercise native resource configuration after clearing the Python module
+        cache, pinned host planning and suffix-mask construction, then validate
+        an interleaved public Graph.
+        """
         _require_sm120()
         from flashinfer.experimental.xqa_decode_buckets import jit
         from flashinfer.xqa import (
@@ -465,6 +497,7 @@ class BucketReviewSM120Tests(unittest.TestCase):
             output = torch.empty_like(queries[0])
 
             def compute():
+                """Replay one prepared host plan without refreshing it inside capture."""
                 return xqa_decode_with_buckets(
                     queries[0],
                     *data,
@@ -491,6 +524,7 @@ class BucketReviewSM120Tests(unittest.TestCase):
             self.assertFalse(workspace.semaphores.any())
 
     def test_scale_overflow_public_registered_and_native(self):
+        """Reject invalid double scales through public, registered and raw FFI paths."""
         from flashinfer.experimental.xqa_decode_buckets import backend
         from flashinfer.xqa import xqa_decode_with_buckets
 
@@ -558,20 +592,31 @@ class BucketReviewSM120Tests(unittest.TestCase):
 
 
 class BucketCompileTests(unittest.TestCase):
+    """Dispatcher, compiler and alias-boundary coverage of the public bucket API."""
+
     def test_direct_public_inductor(self):
+        """Keep direct compute visible as a real fullgraph operator through replay."""
         _compile_check(direct=True, opcheck=True)
 
     def test_prepared_public_inductor(self):
+        """Capture assignment plus compute as one graph for both task schedulers."""
         for mode in ("persistent", "aligned"):
             _compile_check(mode=mode, opcheck=mode == "aligned")
 
     def test_host_prepared_consumer(self):
+        """Compile the host-plan consumer while leaving CPU/H2D refresh outside it."""
         _compile_check(mode="aligned", planner="host")
 
     def test_shared_plan_two_layers(self):
+        """Require one captured assignment to feed two independent layer workspaces."""
         _compile_check(mode="aligned", layers=2)
 
     def test_storage_guards(self):
+        """Reject eager aliases/misalignment and verify compiled rejection or safe output.
+
+        Poison outputs and vary the offending query so accepted compiled calls
+        must prove numerical correctness rather than reuse a stale eager result.
+        """
         plan, _, banks, args, forward, _, lengths = _fixture(direct=True)
         compiled = torch.compile(forward, fullgraph=True)
         compiled(*args)
@@ -622,6 +667,7 @@ class BucketCompileTests(unittest.TestCase):
         )
 
     def test_output_metadata_and_workspace_aliases(self):
+        """Reject eight output/metadata-workspace aliases before native kernel lookup."""
         from flashinfer.experimental.xqa_decode_buckets import backend
         from flashinfer.xqa import xqa_decode_with_buckets
 

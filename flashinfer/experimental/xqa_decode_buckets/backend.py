@@ -23,6 +23,11 @@ from .geometry import (
 
 
 def _tensor(tensor, name, *, dtype, shape, device, contiguous=True):
+    """Check tensor metadata against one CUDA operand's dtype, shape and device.
+
+    Cache views may opt out of contiguity; native packed-head stride checks
+    remain the caller's responsibility. No tensor values are inspected.
+    """
     if not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype:
         raise TypeError(f"{name} must have dtype {dtype}")
     if tensor.device != device or tensor.device.type != "cuda":
@@ -34,6 +39,11 @@ def _tensor(tensor, name, *, dtype, shape, device, contiguous=True):
 
 
 def _byte_span(tensor):
+    """Return a half-open addressed byte interval, or None for an empty tensor.
+
+    Include the element size, view offset and stride extent rather than relying
+    on a storage object's base address. Gaps in strided views are conservative.
+    """
     if not tensor.numel():
         return None
     # data_ptr() already includes the storage offset. Bound every addressed
@@ -65,6 +75,14 @@ def _storage_checks(
     causal_mask,
     semaphores,
 ):
+    """Check alignment and writable ownership using real tensor addresses.
+
+    Output, scratch and semaphores must be disjoint from every read operand and
+    each other. Read-only interleaved caches may overlap, and disjoint regions
+    of one allocation are allowed. Empty descriptors do not occupy a span.
+    Call only inside eager/CUDA implementations, outside FakeTensor tracing;
+    pointer and metadata inspection adds no device readback or kernel launch.
+    """
     # Real storage only: Dynamo/FakeTensor must not inspect pointers. Both the
     # raw eager path and registered CUDA implementation call this same check.
     for name, tensor in (
@@ -116,6 +134,7 @@ def _storage_checks(
 
 
 def _check_scales(bmm1_scale, bmm2_scale):
+    """Reject nonfinite scales or magnitudes outside native float32's range."""
     if not all(
         math.isfinite(float(scale))
         and abs(float(scale)) <= torch.finfo(torch.float32).max
@@ -125,6 +144,7 @@ def _check_scales(bmm1_scale, bmm2_scale):
 
 
 def _host_lengths(lengths, batch):
+    """Require contiguous CPU int32 lengths with one entry per request."""
     if not isinstance(lengths, torch.Tensor) or lengths.dtype != torch.int32:
         raise TypeError("host_seq_lens must be a CPU int32 tensor")
     if lengths.device.type != "cpu" or tuple(lengths.shape) != (batch,):
@@ -134,6 +154,12 @@ def _host_lengths(lengths, batch):
 
 
 def _descriptor_views(storage, batch, ctas):
+    """Split the flat int32 descriptor ABI without allocating new storage.
+
+    The order is (ctas + batch - 1) four-word tasks, batch two-word request
+    ranges, ctas two-word owner spans, then a four-word header. All views retain
+    the supplied backing, whose total size is 6 * (ctas + batch) words.
+    """
     capacity = ctas + batch - 1
     tasks_end = 4 * capacity
     requests_end = tasks_end + 2 * batch
@@ -158,6 +184,11 @@ def _prepare(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
+    """Enqueue device assignment into fixed descriptor buffers on the current stream.
+
+    The module must already be warmed before capture. Stream/event ordering
+    must place this refresh after lengths are updated and before all consumers.
+    """
     module, _ = get_module(
         not aligned,
         lengths.device,
@@ -183,6 +214,7 @@ def _fake_prepare(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
+    """Keep declared descriptor mutations symbolic without accessing real storage."""
     pass
 
 
@@ -212,6 +244,12 @@ def _compute(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
+    """Validate real storage, then enqueue native compute on the current CUDA stream.
+
+    Empty headers select the static direct specialization; otherwise consume
+    the descriptors prepared earlier. This implementation never refreshes the
+    plan, and only output, semaphores and scratch are writable operands.
+    """
     _check_scales(bmm1_scale, bmm2_scale)
     _storage_checks(
         q,
@@ -293,6 +331,7 @@ def _fake_compute(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
+    """Trace the schema's writable operands without pointer checks or GPU work."""
     pass
 
 
@@ -327,7 +366,11 @@ _compute_op = torch.ops.flashinfer.experimental_xqa_bucket_compute.default
 
 @dataclass(frozen=True)
 class BucketWorkspace:
-    """Mutable native partial/counter storage for ordered compute calls."""
+    """Caller-owned native partials and counters for ordered compute calls.
+
+    Sequential layers may reuse one workspace. Concurrent computes require
+    independent instances even when they consume the same prepared plan.
+    """
 
     scratch: torch.Tensor
     semaphores: torch.Tensor
@@ -380,6 +423,14 @@ class BucketPlan:
     _copy_done: torch.cuda.Event | None
 
     def prepare(self):
+        """Refresh descriptors in place while preserving every plan buffer address.
+
+        Direct plans need no assignment. GPU planning enqueues on the current
+        stream and may be captured after warmup. Host planning runs outside
+        capture/compiled consumers, fills retained pinned staging, and enqueues
+        H2D before compute. Its completion event protects staging from reuse;
+        callers still order device descriptor consumers and subsequent refreshes.
+        """
         if self.direct:
             return self
         if torch.compiler.is_compiling():
@@ -473,6 +524,17 @@ def create_plan(
     q_len_per_req=1,
     query_tile=16,
 ):
+    """Allocate and initialize a fixed-geometry SM120 plan before capture.
+
+    Reserve capacity from the page-table width, in pages per request, without
+    reading live CUDA lengths. Direct plans retain empty descriptors; prepared
+    plans allocate the task/request/span/header ABI. Cold module configuration,
+    suffix-mask construction and optional pinned host staging happen here.
+
+    Host planning retains caller-owned CPU lengths, which must mirror device
+    lengths. Compatible layers may share the resulting plan and request order;
+    each concurrent compute needs an independent workspace and stream ordering.
+    """
     check_head_config(num_kv_heads, head_group_ratio)
     groups = query_group_count(
         num_kv_heads, head_group_ratio, q_len_per_req, query_tile
@@ -605,6 +667,18 @@ def run(
     out=None,
     enable_pdl=None,
 ):
+    """Validate operands and consume an already prepared plan without assignment.
+
+    Q/output are BF16 [B,Hq,256] or [B,T,Hq,256]; packed NHD K/V and E4M3
+    scales have widths 128 and 16, with Hq = KV heads * head-group ratio.
+    Preserve native packed-head strides and finite float32-representable scales.
+    Real byte-span checks run inside the eager/registered CUDA implementation.
+
+    Length values and reachable page IDs remain caller preconditions. Refresh
+    once after a lengths update, order compute after that refresh, and keep the
+    plan/workspace alive through completion or Graph replay. Return the supplied
+    output, allocating one only when out is None.
+    """
     if not isinstance(plan, BucketPlan) or not isinstance(workspace, BucketWorkspace):
         raise TypeError("Expected a bucket plan and its caller-owned workspace")
     device, batch = plan.lengths.device, plan.lengths.numel()

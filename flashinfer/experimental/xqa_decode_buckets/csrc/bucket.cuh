@@ -70,8 +70,16 @@ static_assert(sizeof(SharedMem::Barrier) == 8 &&
                       SharedMem::nbOtherBarriers ==
                   12);
 
+/// Round a nonnegative work count up by a positive divisor within the checked int32 bounds.
 __device__ __forceinline__ int ceildiv(int a, int b) { return (a + b - 1) / b; }
 
+/**
+ * Refresh compact device descriptors in one CTA from live sequence lengths.
+ * Thread zero chooses the tile budget and request ranges; the CTA then fills tasks
+ * and owner spans in parallel. Persistent spans may visit multiple request fragments;
+ * aligned spans own one request-local split. Consumers must follow this launch through
+ * stream ordering or an explicit dependency; descriptor addresses remain unchanged.
+ */
 __global__ void assign(PlanParams p) {
   __shared__ int prefix[MaxBatch + 1], base[MaxBatch + 1], first[MaxBatch];
   __shared__ int budget, slots;
@@ -143,6 +151,7 @@ __global__ void assign(PlanParams p) {
   }
 }
 
+/// Zero an empty request's query/head-group output and reset its completion counter.
 __device__ __forceinline__ void clear_empty(ComputeParams const& p, int request, int group,
                                             int tid) {
 #if SPEC_DEC
@@ -164,6 +173,13 @@ __device__ __forceinline__ void clear_empty(ComputeParams const& p, int request,
   if (tid == 0) p.semaphores[request * p.groups + group] = 0;
 }
 
+/**
+ * Execute direct, aligned, or persistent ownership through the native XQA core.
+ * Direct owners derive live bounds without descriptors. Prepared owners consume task
+ * descriptors; a persistent CTA visits its span serially and drains copies/barriers
+ * before reuse. Each query/head group owns disjoint compact partials. Native XQA's
+ * last completing CTA rescales and merges a request's partials into the final output.
+ */
 __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
 #if ENABLE_PDL
   preExit();
@@ -266,6 +282,7 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
 #endif
 }
 
+/// Size native row-max/row-sum/PV partial segments for all group-expanded slots.
 inline uint64_t scratch_bytes(int capacity) {
   // Native MemSegmenter uses uint32 byte offsets. Size in uint64 first so the
   // binding can reject an overflow before any workspace allocation.
