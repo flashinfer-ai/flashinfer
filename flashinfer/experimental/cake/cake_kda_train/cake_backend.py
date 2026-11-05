@@ -271,6 +271,7 @@ import dataclasses
 import functools
 import inspect
 import math
+import operator
 import os
 import re
 import struct
@@ -284,6 +285,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from typing import Any, Protocol
 
 import torch
+import tvm_ffi
 
 from . import cake_jit
 from .cake_jit import CHUNK, HEAD_DIM, PATHS, STAGES, STAGES_BWD, STAGES_FWD
@@ -3786,14 +3788,142 @@ class KdaWorkspace:
         """Launch the record of ``stage`` on ``path`` (its ``launch``-th launch) with the logical argument
         ``values``; ``grid`` replaces the plan's grid (the tail split's per-range grids); ``record`` replaces the
         plan's record name only (the hand-off's intra twin, the tape path's w-only WY twin: the parent's grid rule
-        and grid)."""
+        and grid).  The default launcher (``cake_jit.run_module``) runs as :func:`_launch`."""
         name = self.plan.record(stage, path) if record is None else record
-        self.launcher(
+        launcher = self.launcher
+        if launcher is _RUN_MODULE:
+            _launch(
+                name,
+                values,
+                self.plan.grid(stage, path, launch) if grid is None else grid,
+                self.device_index,
+            )
+            return
+        launcher(
             name,
             values,
             grid=self.plan.grid(stage, path, launch) if grid is None else grid,
             device_index=self.device_index,
         )
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The default launcher's host path.  ``cake_jit.run_module(name, values, grid=grid, device_index=i)`` passes the
+# record's FFI entry (loaded for device ``i``'s architecture) the logical values and grid extents in the record's
+# kernel order (``arg_plan``), inside a tvm-ffi environment-stream context of the current CUDA device's current torch
+# stream.  :func:`_launch` makes the same call with the same arguments on the same stream: each record's argument
+# order is read once (an ``itemgetter`` of its logical names and the grid slots), each (record, device) entry is
+# looked up once, and an entry call (:func:`_fwd_call` / :func:`_bwd_call`) sets the environment stream once for
+# all its launches (:class:`_LaunchScope`: no launch sequence of this module changes the current device or stream
+# between its launches, so every launch would set the same stream); a launch outside such a call (a caller's
+# :meth:`KdaWorkspace.run`) sets it around itself.  A workspace with another ``launcher`` keeps calling it.
+_RUN_MODULE = cake_jit.run_module
+_launch_plans: dict[
+    str, tuple[Callable[[Any], Any] | None, int, tuple[tuple[int, int], ...]]
+] = {}
+_launch_entries: dict[tuple[str, int], Any] = {}
+_ffi_devices: dict[int, Any] = {}
+_launch_state = threading.local()
+
+
+def _launch_plan(
+    name: str,
+) -> tuple[Callable[[Any], Any] | None, int, tuple[tuple[int, int], ...]]:
+    """Record ``name``'s argument order: an ``itemgetter`` of its logical names in kernel order (``None`` without
+    one), their count, and ``(position, grid axis)`` of each grid extent in ascending position."""
+    found = _launch_plans.get(name)
+    if found is not None:
+        return found
+    record = cake_jit.MODULES[name]
+    logical = record["logical"]
+    names: list[str] = []
+    slots: list[tuple[int, int]] = []
+    for position, (kind, key) in enumerate(record["arg_plan"]):
+        if kind == "grid":
+            slots.append((position, "xyz".index(key[-1])))
+        else:
+            if key not in logical:
+                raise ValueError(
+                    f"record {name}: kernel parameter {key!r} has no logical name"
+                )
+            names.append(logical[key])
+    getter = operator.itemgetter(*names) if names else None
+    found = _launch_plans[name] = (getter, len(names), tuple(slots))
+    return found
+
+
+def _launch_entry(name: str, device_index: int) -> Any:
+    """The FFI entry of record ``name`` loaded for device ``device_index``'s architecture, looked up once."""
+    key = (name, device_index)
+    entry = _launch_entries.get(key)
+    if entry is None:
+        module = cake_jit.load(name, cake_jit.device_arch(device_index))
+        entry = _launch_entries[key] = getattr(
+            module, cake_jit.MODULES[name]["ffi_entry"]
+        )
+    return entry
+
+
+def _ffi_stream() -> Any:
+    """The tvm-ffi environment-stream context of the current CUDA device's current torch stream (a CUDA graph's
+    capture stream during capture): ``cake_jit.run_module``'s."""
+    index = torch.cuda.current_device()
+    device = _ffi_devices.get(index)
+    if device is None:
+        device = _ffi_devices[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(device, _current_stream_handle(index))
+
+
+class _LaunchScope:
+    """One entry call's environment stream for its default-launcher launches (:func:`_launch`): entered once around
+    the call's launch sequences; an inner scope of the same thread (none in this module) leaves the outer one's.
+    A workspace with another launcher enters none."""
+
+    __slots__ = ("_context",)
+
+    def __init__(self, ws: KdaWorkspace) -> None:
+        self._context = (
+            None
+            if ws.launcher is not _RUN_MODULE or getattr(_launch_state, "active", False)
+            else _ffi_stream()
+        )
+
+    def __enter__(self) -> None:
+        if self._context is not None:
+            self._context.__enter__()
+            _launch_state.active = True
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._context is not None:
+            _launch_state.active = False
+            self._context.__exit__(*exc)
+
+
+def _launch(
+    name: str, values: dict[str, Any], grid: tuple[int, int, int], device_index: int
+) -> None:
+    """``cake_jit.run_module(name, values, grid=grid, device_index=device_index)``: the same entry, arguments and
+    stream (inside an entry call's :class:`_LaunchScope`, its context; else one around this launch), the same
+    ``ValueError`` for a missing logical value."""
+    getter, count, slots = _launch_plan(name)
+    if getter is None:
+        args: list[Any] = []
+    else:
+        try:
+            got = getter(values)
+        except KeyError as exc:
+            raise ValueError(
+                f"record {name} needs logical argument {exc.args[0]!r}"
+            ) from None
+        args = list(got) if count > 1 else [got]
+    for position, axis in slots:
+        args.insert(position, int(grid[axis]))
+    entry = _launch_entry(name, device_index)
+    if getattr(_launch_state, "active", False):
+        entry(*args)
+    else:
+        with _ffi_stream():
+            entry(*args)
 
 
 class _HandoffWorkspace(KdaWorkspace):
@@ -5020,19 +5150,22 @@ def _fwd_call(
         q, k, v, g, beta, cu_seqlens, gate=gate, l2n=l2n
     )
     gp = _gate_params(gate, A_log, dt_bias, lower_bound, H, v.device)
-    with _workspace(
-        workspace,
-        S,
-        N,
-        H,
-        v.device,
-        backward=False,
-        save_mode=save_mode,
-        arena=arena,
-        doc_lengths=doc_lengths,
-        gate=gate,
-        l2n=l2n,
-    ) as ws:
+    with (
+        _workspace(
+            workspace,
+            S,
+            N,
+            H,
+            v.device,
+            backward=False,
+            save_mode=save_mode,
+            arena=arena,
+            doc_lengths=doc_lengths,
+            gate=gate,
+            l2n=l2n,
+        ) as ws,
+        _LaunchScope(ws),
+    ):
         out, saved = _forward(
             ws,
             q,
@@ -5798,20 +5931,23 @@ def _bwd_call(
     layout = None
     if accepted is not None and workspace is None:
         layout = HANDOFF_LAYOUT if accepted.with_rows else "bwd_tape"
-    with _workspace(
-        workspace,
-        S,
-        N,
-        H,
-        v.device,
-        backward=True,
-        save_mode="tape" if lean_tape else None,
-        arena=arena,
-        doc_lengths=doc_lengths,
-        layout=layout,
-        gate=gate,
-        l2n=l2n,
-    ) as ws:
+    with (
+        _workspace(
+            workspace,
+            S,
+            N,
+            H,
+            v.device,
+            backward=True,
+            save_mode="tape" if lean_tape else None,
+            arena=arena,
+            doc_lengths=doc_lengths,
+            layout=layout,
+            gate=gate,
+            l2n=l2n,
+        ) as ws,
+        _LaunchScope(ws),
+    ):
         grads = _backward(
             ws,
             q,
