@@ -1168,6 +1168,8 @@ def _dump_function_outputs(
             output_tensors, output_aliases = _stage_graph_tensor_plan(
                 output_tensors, plan
             )
+            if not is_capturing:
+                output_tensors = _materialize_dump_tensors(output_tensors)
 
         # Save output tensors. During graph capture we hold tensor references
         # in the registry; flush_graph_dumps() materializes them on demand so
