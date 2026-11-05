@@ -50,7 +50,7 @@ deterministic already.*
 | run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); a SIMT window (weight or input gradient): repeats bit for bit (every element stored once, its slices merged in a fixed order); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
 | architectures | `sm_100a`, `sm_103a`, `sm_107a`: one `-gencode=arch=compute_<arch>,code=sm_<arch>` build per program, minimum CUDA 12.8 / 12.9 / 13.4 (`build.json`) |
 | streams and threads | planning takes a module lock; the convenience path keeps one workspace arena per (device, stream); prepared launches own their workspace |
-| CUDA graphs | prepared launches allocate nothing on the device and capture into a CUDA graph (K2: the split, the memset of `out`, the program); no host synchronization |
+| CUDA graphs | prepared launches allocate nothing on the device and capture into a CUDA graph (K2: the split, the memset of `out`, the program); no host synchronization.  A convenience-path call captured into a CUDA graph (after a warm-up call on the capturing stream, so the capture plans and allocates nothing) stays valid until `clear_convenience_caches()` or `use_deterministic_backend`, which invalidate it: the arenas keep every buffer a launch was bound to, through growths and cache evictions |
 | other kernels on the device | the programs walk their work persistently over at most `sm_count // 2` CTA pairs and wait on no CTA that is not resident; every routed row was measured next to a kernel holding 8, 16 or 32 SMs on another stream (no more than 3 % slower than the deterministic plan there) |
 | context parallelism (KCP) | not applicable: a local operator on the caller's CP-local shards; no collectives; the reduction of parameter gradients across ranks stays with the caller |
 | autograd, checkpointing, gradient accumulation | none in either package: callers compose the forward and both gradients; `out` is overwritten, not accumulated into |
@@ -663,10 +663,13 @@ A K1 launch with more than one split uses an FP32 slot workspace (`tiles * num_s
 zero at creation: the last split of a partial tile reads the padding columns no split writes, and discards them) and
 the ticket counters (`tiles * 512` words, zero at creation, zero again after every complete launch).  A prepared
 launch owns both; the convenience path keeps them in an arena per (device, stream), so concurrent launches on
-different streams never share them.  After an aborted launch, call `PreparedAtomicGemm.reset_counters()` (or
-`clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on the launch stream (one memset) between
-the split and the program; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
-A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
+different streams never share them.  An arena never frees a buffer before `clear_convenience_caches()`: a growth (to
+at least twice the buffer's size) retires the buffer it replaces, and an entry evicted from the caches
+(`CONVENIENCE_CACHE_SIZE`) leaves its arena, so a launch captured into a CUDA graph keeps its workspace; the retired
+buffers of a kind hold fewer bytes than its live one.  After an aborted launch, call
+`PreparedAtomicGemm.reset_counters()` (or `clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on
+the launch stream (one memset) between the split and the program; prepared launches of both programs allocate nothing
+and can be captured in a CUDA graph.  A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
 issues its launches back to back.  A cached K1 launch of the convenience path orders its arguments once per cache key
 (the PDL flag is bound, so it is part of the key) and converts its workspace once per arena growth; a call rebuilds and converts only its operand views.  A K1 call that
 runs the deterministic program -- the forward, the input gradient, a weight-gradient row without a verdict -- launches
@@ -725,7 +728,7 @@ left it as an alias of the renamed modules.  The names keep their spelling and, 
 | name (`flashinfer.experimental.dense_projection_gemm`) | default | `deterministic=False` |
 |---|---|---|
 | the entry points of the table above | the deterministic package's `*_det_*` object | this package's schedule (routing table above) |
-| `cake_backend.clear_convenience_caches` | clears the caches and arenas of both packages | -- |
+| `cake_backend.clear_convenience_caches` | clears the caches and arenas of both packages (invalidates the CUDA graphs that captured a convenience-path call) | -- |
 | `cake_jit.{MODULES, KERNELS, ARG_PLANS}` | this package's programs only | -- |
 | `cake_jit.select_module`, `cake_jit.load_cake_dense_projection_gemm_module` | a deterministic template or program resolves through the deterministic package | -- |
 | `cake_build` | this package's loader (byte-identical to every Cake package's) | -- |
