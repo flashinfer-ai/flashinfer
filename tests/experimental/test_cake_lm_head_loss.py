@@ -1845,13 +1845,15 @@ def _compare_with_det(nd, det, *, record=None):
 
 
 @contextlib.contextmanager
-def _launch_record():
+def _launch_record(*, temperature: bool = False):
     """The launch keys both backend modules run (each key as ``_run_keys`` runs it), in order: the record of what a
     call launched (the hidden valid-row count's own chunk-0 launches are not keys).  A remembered binding fills
     ``dX_acc`` as it allocates it (``_filled_dx_acc``) instead of running the ``dx_fill`` key: that fill is recorded
-    as ``("dx_fill", "dx")`` at its place in the sequence."""
+    as ``("dx_fill", "dx")`` at its place in the sequence.  ``temperature``: also the keys of the calls with a
+    per-token temperature (``_run_keys_temperature``)."""
     launched: list = []
     originals = (cake_backend._run_keys, opt_in._run_keys)
+    tau_originals = (cake_backend._run_keys_temperature, opt_in._run_keys_temperature)
     fills = (cake_backend._filled_dx_acc, opt_in._filled_dx_acc)
 
     def recording(original):
@@ -1874,12 +1876,16 @@ def _launch_record():
 
     cake_backend._run_keys = recording(originals[0])
     opt_in._run_keys = recording(originals[1])
+    if temperature:
+        cake_backend._run_keys_temperature = recording(tau_originals[0])
+        opt_in._run_keys_temperature = recording(tau_originals[1])
     cake_backend._filled_dx_acc = filling(fills[0])
     opt_in._filled_dx_acc = filling(fills[1])
     try:
         yield launched
     finally:
         cake_backend._run_keys, opt_in._run_keys = originals
+        cake_backend._run_keys_temperature, opt_in._run_keys_temperature = tau_originals
         cake_backend._filled_dx_acc, opt_in._filled_dx_acc = fills
 
 
@@ -1995,6 +2001,48 @@ def test_device_changing_shapes_reuse_nonzero_scratch(glm_weight):
         else:
             _check_against_references(run, inputs[T], ceiling=True)
             seen[T] = run
+
+
+@pytest.mark.parametrize("T", [1, 256])
+@pytest.mark.parametrize("form", ["plain", "temperature"])
+def test_device_logprob_backward_makes_its_gradient_buffers_behind_the_recompute(
+    glm_weight, T, form
+):
+    """A remembered log-probability backward binding (plain and with a per-token temperature) makes ``dX_acc`` (with
+    its fill), ``dX`` and ``dW`` right before chunk 0's dX GEMM -- behind the row gathers and the recompute launch, the
+    launches a call of a few rows waits for on the host -- and the call repeats the first (prepared) call's ``logp`` /
+    ``dW`` bits (plain: and passes the gates; temperature: ``dX`` within :func:`_assert_tau_close`)."""
+    if form == "temperature":
+        _require_tau_program()
+        inp = _tau_inputs(T, W=glm_weight)
+    else:
+        _require_program(entry="logprob")
+        inp = _device_inputs(T, "ce", W=glm_weight)
+    cake_backend.BINDING_CACHE.clear()
+    first = _run(inp, 4096, entry="logprob", backend="cake")
+    with _launch_record(temperature=form == "temperature") as launched:
+        again = _run(inp, 4096, entry="logprob", backend="cake")
+    backward = [
+        b
+        for b in cake_backend.BINDING_CACHE._bindings.values()
+        if b.plan.need_dx and b.backward_run
+    ]
+    assert backward and all(b.backward_gradients_at_dx for b in backward), backward
+    stages = [key[0] for key in launched]
+    dz = next(
+        i for i, s in enumerate(stages) if s.startswith(cake_backend.LOGPROB_DZ_STAGE)
+    )
+    dx = next(i for i, s in enumerate(stages) if s.startswith("gemm_dx"))
+    assert dz < dx, stages
+    if "dx_fill" in stages:
+        # made inside the dX key's run, ahead of its launch (the record lists a key before running it)
+        assert stages.index("dx_fill") == dx + 1, stages
+    for key in ("logp", "dW"):
+        assert _same_bits(again[key], first[key]), key
+    if form == "temperature":
+        _assert_tau_close(again, first, (T, form), keys=("dX",))
+    else:
+        _check_against_references(again, inp, entry="logprob", ceiling=True)
 
 
 def test_device_checkpoint_replay(glm_weight):

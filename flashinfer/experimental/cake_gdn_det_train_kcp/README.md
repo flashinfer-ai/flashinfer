@@ -291,8 +291,9 @@ requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 ```
 gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
     c1_send = 2 * s * n_out(r)      c2_recv = s * n_in(r)      b2_recv = s * n_out(r)
-    b1_send = s * n_in(r) * (1 if save_transfer else 2)
-    c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
+    b1_send = s * (n_in(r) + (0 if save_transfer else n_io(r)))   n_io = fragments crossing in and out
+    c1_recv on an owner = 2 * s_owner * N_out      b1_recv on an owner = s_owner * (N_in + (0 if save_transfer else N_io))
+    N_in / N_out / N_io = the group totals of n_in / n_out / n_io      halo = rows(r) * C * 2
 gdn_det_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
 gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
     workspace binds in the forward (the tape walk: pools + the eight live tapes) or the backward (its phases: the
