@@ -856,8 +856,12 @@ def test_fp8_prepared_runner_graph_capture_and_replay():
 
 def test_fp8_k32_logits_match_deep_gemm_bitwise():
     """Diagnostic: on sm_100a / sm_103a the FP8 programs accumulate in DeepGEMM's four K = 32 steps, so every returned
-    score equals the stock ``deep_gemm.fp8_mqa_logits`` logit of its (query, key) pair bit for bit (up to the sign of
-    zero).  Skips where DeepGEMM does not import or on sm_107a (two K = 64 steps; last-bit differences allowed)."""
+    score equals the stock DeepGEMM FP8 MQA logit of its (query, key) pair bit for bit (up to the sign of zero).  The
+    logits come from ``deep_gemm.fp8_mqa_logits``, or in a build without it from ``deep_gemm.fp8_fp4_mqa_logits`` with
+    the same e4m3 ``q`` / ``k``, FP32 per-key scales and FP32 logits.  Skips on sm_107a (two K = 64 steps; last-bit
+    differences allowed), where DeepGEMM does not import, where the build has neither entry point, where an entry
+    point takes other arguments, and where ``fp8_fp4_mqa_logits`` rejects FP32 per-key scales on this architecture
+    (DeepGEMM builds that take MX block scale factors and return BF16 logits there: a different input format)."""
     _require_fp8_program()
     arch = arch_for(torch.device("cuda"))
     if arch not in _K32_ARCHES:
@@ -866,23 +870,44 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
         pytest.skip("deep_gemm is not installed")
     import deep_gemm
 
-    if not hasattr(deep_gemm, "fp8_mqa_logits"):
-        pytest.skip("this deep_gemm build has no fp8_mqa_logits")
     inputs = ref.make_fp8_inputs([512], [8192], top_k=2048, seed=67, device="cuda")
     indices, scores = _run(inputs)
     visible = ref.visible_rows(inputs).to(torch.int32)
     starts = torch.zeros_like(visible)
-    try:
-        logits = deep_gemm.fp8_mqa_logits(
-            inputs.q,
-            (inputs.k.contiguous(), inputs.k_scale),
-            inputs.w,
-            starts,
-            visible,
-            clean_logits=False,
+    kv = (inputs.k.contiguous(), inputs.k_scale)
+    if hasattr(deep_gemm, "fp8_mqa_logits"):
+        try:
+            logits = deep_gemm.fp8_mqa_logits(
+                inputs.q, kv, inputs.w, starts, visible, clean_logits=False
+            )
+        except TypeError as err:  # an API this diagnostic does not know
+            pytest.skip(f"deep_gemm.fp8_mqa_logits is not callable as expected: {err}")
+    elif hasattr(deep_gemm, "fp8_fp4_mqa_logits"):
+        try:
+            logits = deep_gemm.fp8_fp4_mqa_logits(
+                q=(inputs.q, None),
+                kv=kv,
+                weights=inputs.w,
+                cu_seq_len_k_start=starts,
+                cu_seq_len_k_end=visible,
+                clean_logits=False,
+                max_seqlen_k=0,
+                logits_dtype=torch.float32,
+            )
+        except TypeError as err:  # an API this diagnostic does not know
+            pytest.skip(
+                f"deep_gemm.fp8_fp4_mqa_logits is not callable as expected: {err}"
+            )
+        except RuntimeError as err:  # DeepGEMM's own argument checks
+            if "Assertion" not in str(err):
+                raise
+            pytest.skip(
+                f"this deep_gemm build's fp8_fp4_mqa_logits takes no FP32 per-key scales on {arch}: {err}"
+            )
+    else:
+        pytest.skip(
+            "this deep_gemm build has neither fp8_mqa_logits nor fp8_fp4_mqa_logits"
         )
-    except TypeError as err:  # an API this diagnostic does not know
-        pytest.skip(f"deep_gemm.fp8_mqa_logits is not callable as expected: {err}")
     logits = logits[:, : inputs.num_keys].float()
     valid = indices >= 0
     picked = logits.gather(1, indices.clamp_min(0).to(torch.int64))
@@ -890,6 +915,6 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
     want = torch.where(valid, picked + 0.0, torch.zeros_like(picked))
     mismatch = got.view(torch.int32) != want.view(torch.int32)
     assert not mismatch.any(), (
-        f"{int(mismatch.sum())} scores differ from deep_gemm.fp8_mqa_logits; first at "
+        f"{int(mismatch.sum())} scores differ from the DeepGEMM logits; first at "
         f"{mismatch.nonzero()[0].tolist()}"
     )
