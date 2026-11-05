@@ -163,6 +163,7 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
 
 
 def _check_mxfp8_cuda_capability(device: torch.device) -> None:
+    """Reject pre-SM100 CUDA devices while allowing the CPU host path."""
     if device.type == "cuda":
         major, minor = get_compute_capability(device)
         if major < 10:
