@@ -20,14 +20,16 @@ For every decode width ``B`` (``H = 12`` heads, one Kimi-K3 TP8 rank, unless
 ``--heads``) this reports the complete call ``runner.launch(latent, gate,
 valid_lengths, out)`` replayed from a CUDA graph: CUPTI kernel time, median
 over the measured iterations, with the L2 flushed before every iteration
-unless ``--warm-l2``.  The gate is the last ``H * 128`` columns of a
-``[B, pitch]`` fused projection output (``--gate-pitch 3648``, the default:
-``projected[:, 2112:]`` at ``H = 12``) or a dense ``[B, H * 128]`` tensor
-(``--gate-pitch`` equal to ``H * 128``).  Every row is valid.  The bandwidth
-column counts the bytes the call must move (``w_uv``, ``latent``, the gate
-and ``out``).  ``--baseline unfused`` adds the unfused composition on the
-same tensors under the same protocol: ``torch.bmm`` into the
-``[B, H * 128]`` output layout, then the FP32 sigmoid gate, the BF16
+unless ``--warm-l2``.  The flush needs CUPTI (``cupti-python`` >= 13); without
+it the script refuses a cold-L2 run, and a ``--warm-l2`` run falls back to
+CUDA-event timing of the graph replays.  The gate is the last ``H * 128``
+columns of a ``[B, pitch]`` fused projection output (``--gate-pitch 3648``,
+the default: ``projected[:, 2112:]`` at ``H = 12``) or a dense
+``[B, H * 128]`` tensor (``--gate-pitch`` equal to ``H * 128``).  Every row is
+valid.  The bandwidth column counts the bytes the call must move (``w_uv``,
+``latent``, the gate and ``out``).  ``--baseline unfused`` adds the unfused
+composition on the same tensors under the same protocol: ``torch.bmm`` into
+the ``[B, H * 128]`` output layout, then the FP32 sigmoid gate, the BF16
 rounding and the padded-row zeroing as elementwise torch operations.
 
 Usage::
@@ -45,6 +47,19 @@ import torch
 
 from flashinfer.cake_mla_value_gate import prepare_mla_value_gate
 from flashinfer.testing import bench_gpu_time_with_cupti
+
+
+def _cupti_available() -> bool:
+    """True when CUPTI >= 13 is importable: the per-iteration L2 flush needs it."""
+    try:
+        from importlib.metadata import version
+
+        from cupti import cupti  # noqa: F401
+
+        return int(version("cupti-python").split(".")[0]) >= 13
+    except (ImportError, ValueError):
+        return False
+
 
 # The owner's decode widths.
 ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64)
@@ -138,6 +153,13 @@ def main():
     args = parser.parse_args()
     if args.gate_pitch < args.heads * VALUE or args.gate_pitch % 2:
         parser.error(f"--gate-pitch must be even and at least {args.heads * VALUE}")
+    cupti = _cupti_available()
+    if not args.warm_l2 and not cupti:
+        parser.error(
+            "a cold-L2 run flushes the L2 through CUPTI: install cupti-python >= 13 "
+            "or pass --warm-l2"
+        )
+    timer = "CUPTI" if cupti else "CUDA events"
     records = [
         bench_row(
             rows,
@@ -153,7 +175,7 @@ def main():
     print(
         f"{torch.cuda.get_device_name()}  {first['arch']}  CUDA {torch.version.cuda}  "
         f"H={args.heads}  gate pitch {args.gate_pitch}  L2 {first['l2']}  "
-        f"PDL {'on' if first['enable_pdl'] else 'off'}"
+        f"PDL {'on' if first['enable_pdl'] else 'off'}  timer {timer}"
     )
     header = f"{'B':>4}{'call us':>10}{'GB/s':>8}"
     if args.baseline == "unfused":
@@ -170,6 +192,7 @@ def main():
                 {
                     "device": torch.cuda.get_device_name(),
                     "cuda": torch.version.cuda,
+                    "timer": timer,
                     "rows": records,
                 },
                 handle,
