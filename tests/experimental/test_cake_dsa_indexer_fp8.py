@@ -65,7 +65,7 @@ select_program = cake_policy.select_program
 stage_slug = cake_policy.stage_slug
 E4M3 = torch.float8_e4m3fn
 
-# The persistent grids of the production parts (B200; B300 / GB300 as deployed and the full B300 die; R200).
+# The SM counts each architecture ships with (one persistent CTA per SM).
 _GRIDS = {"sm_100a": (148,), "sm_103a": (148, 152, 160), "sm_107a": (212,)}
 # DeepGEMM's fp8_mqa_logits accumulates in four K = 32 steps, the order of the sm_100a / sm_103a FP8 programs.
 _K32_ARCHES = ("sm_100a", "sm_103a")

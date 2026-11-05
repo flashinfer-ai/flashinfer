@@ -1254,7 +1254,7 @@ def scan_key(
     lsf: bool = False,
     form: str = BF16,
 ) -> str:
-    """``:lsf``: the copy of the program that hands out its tickets longest segment first (lever LSF); ``form``
+    """``:lsf``: the longest-first (LSF) copy, which hands out the program's tickets longest segment first; ``form``
     ``"fp8"``: the FP8 program, tagged ``:fp8`` before the ``:lsf`` suffix."""
     key = f"scan:{physical}:u{int(tile_unroll)}:s{int(bool(snake))}:f{int(bool(sample_fit))}"
     if form == FP8:
