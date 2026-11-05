@@ -993,6 +993,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None
+        # Fold ClampedRelu2's L ** 2 into the output scales to avoid per-element
+        # multiplies by L. Assumes L ** 2 and alpha / L stay normal in fp32,
+        # which holds for any practical clamp limit.
+        # pre_fc2_routing quantizes with its own per-expert scale to match its
+        # reference bit for bit, so it keeps the unfolded form.
+        self.fold_clamped_relu2_l2 = (
+            self.use_clamped_relu2 and self.generate_sfc and not self.pre_fc2_routing
+        )
         if cutlass.const_expr(
             self.generate_sfc and not self.is_mxfp8_output and norm_const_tensor is None
         ):
@@ -2698,6 +2706,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             if cutlass.const_expr(self.use_clamped_relu2):
                 clamp_limit = clamped_relu2_limit[0]
                 inv_clamp_limit = cutlass.Float32(1.0) / clamp_limit
+                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                    norm_const = norm_const * clamp_limit * clamp_limit
 
             #
             # Persistent tile scheduling loop
@@ -2775,6 +2785,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         ]
                     norm_const = norm_const_tensor[expert_idx]
                     sf_from_amax = _div_full_f32(norm_const, cutlass.Float32(6.0))
+                act_scale = cutlass.Float32(alpha_val)
+                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                    act_scale = act_scale * inv_clamp_limit
 
                 #
                 # Slice to per mma tile index
@@ -2877,6 +2890,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
                         # ClampedRelu2: relu(L * tanh(x / L)) ** 2 on the
                         # alpha-scaled accumulator x, with L read at runtime.
+                        # tanh uses tanh.approx.f32 (one MUFU op, max relative
+                        # error ~2^-11), below the FP8/FP4 output rounding step.
+                        # With fold_clamped_relu2_l2, act_scale is alpha / L and
+                        # L ** 2 is in norm_const: this computes relu(tanh(x / L)) ** 2.
                         if cutlass.const_expr(self.pre_fc2_routing):
                             # BF16 rounding after FC1, the soft clamp, the square
                             # and the route weighting, as in the reference.
@@ -2897,20 +2914,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             ):
                                 acc_alpha = cute.arch.mul_packed_f32x2(
                                     (acc_vec[i], acc_vec[i + 1]),
-                                    (
-                                        cutlass.Float32(alpha_val),
-                                        cutlass.Float32(alpha_val),
-                                    ),
+                                    (act_scale, act_scale),
                                 )
-                                if cutlass.const_expr(self.use_clamped_relu2):
+                                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                                    acc_alpha = (
+                                        cute.math.tanh(acc_alpha[0], fastmath=True),
+                                        cute.math.tanh(acc_alpha[1], fastmath=True),
+                                    )
+                                elif cutlass.const_expr(self.use_clamped_relu2):
                                     acc_alpha = (
                                         clamp_limit
-                                        * tanh_f32(
+                                        * cute.math.tanh(
                                             acc_alpha[0] * inv_clamp_limit,
                                             fastmath=True,
                                         ),
                                         clamp_limit
-                                        * tanh_f32(
+                                        * cute.math.tanh(
                                             acc_alpha[1] * inv_clamp_limit,
                                             fastmath=True,
                                         ),
@@ -2923,9 +2942,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 ) = cute.arch.mul_packed_f32x2((r0, r1), (r0, r1))
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                                v = acc_vec[i] * cutlass.Float32(alpha_val)
-                                if cutlass.const_expr(self.use_clamped_relu2):
-                                    v = clamp_limit * tanh_f32(
+                                v = acc_vec[i] * act_scale
+                                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                                    v = cute.math.tanh(v, fastmath=True)
+                                elif cutlass.const_expr(self.use_clamped_relu2):
+                                    v = clamp_limit * cute.math.tanh(
                                         v * inv_clamp_limit, fastmath=True
                                     )
                                 v = cute.arch.fmax(v, cutlass.Float32(0.0))
@@ -3325,6 +3346,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 acc_scale1 = ue8m0_to_inv_scale_fast(
                                     tCrSFC[vi + 1].to(cutlass.Uint32)
                                 )
+                                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                                    # norm_const is L ** 2 here (1.0 otherwise).
+                                    acc_scale0, acc_scale1 = cute.arch.mul_packed_f32x2(
+                                        (acc_scale0, acc_scale1),
+                                        (norm_const, norm_const),
+                                    )
                                 vec0 = tTR_rAcc_frg[None, vi]
                                 vec1 = tTR_rAcc_frg[None, vi + 1]
                                 for ei in cutlass.range_constexpr(self.sf_vec_size):
