@@ -278,9 +278,6 @@ PageAttention for MLA
     Warm up before CUDA graph capture. Other attention keywords follow
     ``run`` semantics, including sparse lengths, the second cache and LSE.
 
-    The CuTe FP8 prefill path has unresolved async-copy racecheck reports;
-    this development route is not yet ready for production use.
-
 .. note::
 
     With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every

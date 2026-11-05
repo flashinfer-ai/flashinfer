@@ -6,7 +6,8 @@
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
 // 32-head x 64-candidate tile with compile-time prologue/epilogue fusion.
-// Unresolved: racecheck reports hazards on the asynchronous shared-memory copies.
+// Broadcast each warp-uniform arrival address to avoid the predicated/address-offset
+// code generation that produces async-copy racecheck reports.
 struct Params : cute_prefill::Params {
   bf16* bf16_output;
   size_t lse_stride;
@@ -111,7 +112,10 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
               :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
-        k_pipeline.producer_commit(write_state, cutlass::arch::cpasync_barrier_arrive);
+        k_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
+          unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
+          cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
+        });
         ++write_state;
       }
     }
@@ -171,7 +175,10 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
               :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
-        v_pipeline.producer_commit(write_state, cutlass::arch::cpasync_barrier_arrive);
+        v_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
+          unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
+          cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t const*>(__cvta_shared_to_generic(address)));
+        });
         ++write_state;
       }
     }
