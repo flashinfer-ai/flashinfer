@@ -5566,6 +5566,14 @@ def test_router_split_rules_are_measured_windows_and_resolve_by_device():
     SMs) and a ``kk`` / ``nn_t`` row in the T 16129-16384 window; ``router_splits`` returns it inside the window
     and the layout's default outside it, for another SM count or N, and without a device."""
     assert ROUTER_SPLIT_RULES
+    # the measured rows and their counts, pinned here rather than read from the table under test
+    assert {key: windows[0][2] for key, windows in ROUTER_SPLIT_RULES.items()} == {
+        ("sm_100a", 148, "nn_t", 5120): 9,
+        ("sm_100a", 152, "nn_t", 5120): 9,
+        ("sm_103a", 148, "nn_t", 5120): 9,
+        ("sm_103a", 152, "nn_t", 5120): 9,
+    }
+    assert all(len(windows) == 1 for windows in ROUTER_SPLIT_RULES.values())
     for (arch, sm_count, layout, H), windows in ROUTER_SPLIT_RULES.items():
         assert arch in ("sm_100a", "sm_103a") and sm_count in (148, 152), arch
         assert layout in ("kk", "nn_t") and H in (4096, 5120, 6144), layout
@@ -6157,7 +6165,7 @@ def test_convenience_plan_entry_rolls_back_a_failed_plan_and_rechecks_the_cache(
 
 def test_convenience_router_launch_holds_the_arena_lock(monkeypatch):
     """The K2 hit path holds its arena's lock from the carve of the workspace views through the launch and the
-    split-K reduction (CPU stand-ins for the device, the stream and the FFI entry)."""
+    split-K reduction (CPU stand-ins for the device and its facts, the stream and the FFI entry)."""
     monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
     monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
     monkeypatch.setattr(cake_backend, "_ARENAS", {})
@@ -6173,6 +6181,10 @@ def test_convenience_router_launch_holds_the_arena_lock(monkeypatch):
     cached.entry = entry_call
     key = convenience_key(0, 7, (4,), v["A"], v["B"], v["out"])
     cake_backend._K2_CACHE[key] = cached
+    facts = cake_backend.DeviceFacts(
+        index=0, arch="sm_100a", sm_count=148, l2_bytes=L2_BYTES
+    )
+    monkeypatch.setattr(cake_backend, "device_facts", lambda device=None: facts)
     monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
     monkeypatch.setattr(cake_backend, "_cuda_index", lambda d: 0)
     monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: 7)
@@ -6219,9 +6231,10 @@ _FAKE_SPLIT_RECORD = {
 
 
 def _cpu_router_registry(monkeypatch, *, fused):
-    """CPU stand-ins for a K2 plan on ``sm_100a``: the device check and the architecture, the stream and FFI
-    context, and a module loader whose entries record ``(module, arguments, an arena lock was held)``; with
-    ``fused`` the registry holds a stand-in fused split program, without it none.  Returns the recorded calls."""
+    """CPU stand-ins for a K2 plan on ``sm_100a``: the device check, the architecture and the device facts, the
+    stream and FFI context, and a module loader whose entries record ``(module, arguments, an arena lock was
+    held)``; with ``fused`` the registry holds a stand-in fused split program, without it none.  Returns the
+    recorded calls."""
     calls = []
     kernels = dict(cake_jit.KERNELS["sm_100a"])
     kernels.pop(cake_backend.SPLIT_TEMPLATE, None)
@@ -6229,6 +6242,10 @@ def _cpu_router_registry(monkeypatch, *, fused):
         kernels[cake_backend.SPLIT_TEMPLATE] = _FAKE_SPLIT_MODULE
         monkeypatch.setitem(cake_jit.MODULES, _FAKE_SPLIT_MODULE, _FAKE_SPLIT_RECORD)
     monkeypatch.setitem(cake_jit.KERNELS, "sm_100a", kernels)
+    facts = cake_backend.DeviceFacts(
+        index=0, arch="sm_100a", sm_count=148, l2_bytes=L2_BYTES
+    )
+    monkeypatch.setattr(cake_backend, "device_facts", lambda device=None: facts)
     monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
     monkeypatch.setattr(cake_backend, "require_arch", lambda device: "sm_100a")
     monkeypatch.setattr(cake_backend, "_cuda_index", lambda d: 0)
