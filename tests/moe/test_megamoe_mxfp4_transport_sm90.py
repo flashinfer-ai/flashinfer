@@ -21,7 +21,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tests.moe.test_megamoe_fp4_sm90 import _weights  # noqa: E402
+from tests.moe.test_megamoe_fp4_sm90 import _reference, _weights  # noqa: E402
 from tests.moe.test_megamoe_mxfp4_eplb_sm90 import (  # noqa: E402
     BITWISE_REPEAT_MAX_TOKENS,
     _assert_close,
@@ -40,6 +40,7 @@ def _same(y, expected, m, label):
 
 def _worker(rank, args):
     """Per-rank body: build both buffers, run identical inputs through each and compare."""
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % max(torch.cuda.device_count(), 1)))
     from flashinfer.megamoe import (
         MegaMoEExpertSlots,
         MegaMoENcclTransport,
@@ -49,13 +50,13 @@ def _worker(rank, args):
     )
 
     ep = args.ep
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(
         "nccl",
         rank=rank,
         world_size=ep,
         timeout=datetime.timedelta(minutes=10),
-        device_id=torch.device("cuda", rank),
+        device_id=torch.device("cuda", local_rank),
     )
     group = dist.group.WORLD
     h, ih, E, topk, S = (
@@ -67,8 +68,8 @@ def _worker(rank, args):
     )
     H = E // ep
     generator = torch.Generator(device="cuda").manual_seed(4099 + rank)
-    raw1, _ = _weights(H, ih * 2, h, 32, generator)
-    raw2, _ = _weights(H, h, ih, 32, generator)
+    raw1, ref1 = _weights(H, ih * 2, h, 32, generator)
+    raw2, ref2 = _weights(H, h, ih, 32, generator)
     w1, w2 = transform_mxfp4_weights_for_mega_moe(raw1, raw2)
     gs1 = torch.linspace(0.73, 1.37, H, device="cuda")
     gs2 = torch.linspace(1.31, 0.67, H, device="cuda")
@@ -76,26 +77,40 @@ def _worker(rank, args):
         E, device="cuda", generator=torch.Generator(device="cuda").manual_seed(31)
     )[:S].tolist()
 
-    transport = MegaMoENcclTransport(group, gin_contexts=args.gin_contexts)
-    # Plain resident experts: one buffer per transport.
-    plain = [
-        MegaMoESymmBuffer(group, E, args.capacity, topk, h, ih),
-        MegaMoESymmBuffer(group, E, args.capacity, topk, h, ih, transport=transport),
-    ]
-    # Redundant expert slots: the buffer geometry counts the slots as experts.
-    slotted = [
-        MegaMoESymmBuffer(group, E + ep * S, args.capacity, topk, h, ih),
-        MegaMoESymmBuffer(
-            group, E + ep * S, args.capacity, topk, h, ih, transport=transport
-        ),
-    ]
-    slots = [MegaMoEExpertSlots(b, E, S) for b in slotted]
-    for s in slots:
-        s.set_resident_weights(w1, w2, gs1, gs2)
-        assert s.set_replica_plan(torch.full((ep, S), -1)) == 0
-    peers = transport.peer_pointers(plain[1].window)
-    assert len(peers) == ep and all(p != 0 for p in peers), peers
-    assert peers[rank] == plain[1].buffer.data_ptr()
+    transport = MegaMoENcclTransport(
+        group,
+        gin_contexts=args.gin_contexts,
+        gin_signals=2 * (args.nodes - 1) if args.gin_contexts else 0,
+    )
+    plain, slotted, slots = [], [], []
+    if not args.nodes_only:
+        # Plain resident experts: one buffer per transport.
+        plain = [
+            MegaMoESymmBuffer(group, E, args.capacity, topk, h, ih),
+            MegaMoESymmBuffer(group, E, args.capacity, topk, h, ih, transport=transport),
+        ]
+        # Redundant expert slots: the buffer geometry counts the slots as experts.
+        slotted = [
+            MegaMoESymmBuffer(group, E + ep * S, args.capacity, topk, h, ih),
+            MegaMoESymmBuffer(
+                group, E + ep * S, args.capacity, topk, h, ih, transport=transport
+            ),
+        ]
+        slots = [MegaMoEExpertSlots(b, E, S) for b in slotted]
+        for s in slots:
+            s.set_resident_weights(w1, w2, gs1, gs2)
+            assert s.set_replica_plan(torch.full((ep, S), -1)) == 0
+        peers = transport.peer_pointers(plain[1].window)
+        assert len(peers) == ep and all(p != 0 for p in peers), peers
+        assert peers[rank] == plain[1].buffer.data_ptr()
+
+    nodes_buffer = None
+    if args.nodes > 1:
+        # Ranks spread over `nodes` nodes (node-major): tokens with an expert on
+        # another node travel through the mirror ranks' inboxes and outboxes.
+        nodes_buffer = MegaMoESymmBuffer(
+            group, E, args.capacity, topk, h, ih, transport=transport, num_nodes=args.nodes
+        )
 
     for m in args.tokens:
         x = (torch.randn(m, h, device="cuda", generator=generator) * 32).to(
@@ -103,6 +118,30 @@ def _worker(rank, args):
         )
         sf = torch.full((m, h // 128), 1 / 128, device="cuda")
         idx, routing = _skewed_routing(m, E, topk, hot, 0.5, generator)
+
+        if nodes_buffer is not None:
+            expected, counts_logical = _reference(
+                x.float() / 128, idx, routing, ref1, ref2, gs1, gs2, rank, H
+            )
+            nodes_buffer.stage(x, sf, idx, routing)
+            y = torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
+            stats = torch.zeros(H, dtype=torch.int32, device="cuda")
+            mxfp4_mega_moe(
+                y,
+                w1,
+                w2,
+                nodes_buffer,
+                cumulative_local_expert_recv_stats=stats,
+                l1_global_scales=gs1,
+                l2_global_scales=gs2,
+            )
+            torch.cuda.synchronize()
+            _assert_close(y, expected, (f"{args.nodes} nodes", m))
+            assert torch.equal(stats.long(), counts_logical), (f"{args.nodes} nodes counts", m)
+            if rank == 0:
+                print(f"{args.nodes}-node protocol check passed at {m} tokens per rank", flush=True)
+            if args.nodes_only:
+                continue
 
         outputs, counts = [], []
         for b in plain:
@@ -152,13 +191,20 @@ def _worker(rank, args):
         s.destroy()
     for b in plain + slotted:
         b.destroy()
+    if nodes_buffer is not None:
+        nodes_buffer.destroy()
     transport.close()
     dist.barrier()
     dist.destroy_process_group()
 
 
 def _run(args):
-    """Spawn ``args.ep`` workers on as many GPUs."""
+    """Spawn ``args.ep`` workers on as many GPUs, or run as one torchrun worker
+    when RANK / WORLD_SIZE are set (ranks on several hosts)."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        args.ep = int(os.environ["WORLD_SIZE"])
+        _worker(int(os.environ["RANK"]), args)
+        return
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29571")
     torch.multiprocessing.spawn(_worker, args=(args,), nprocs=args.ep)
@@ -176,6 +222,8 @@ def _namespace(ep, **overrides):
         capacity=384,
         tokens=[24, 96, 384],
         gin_contexts=0,
+        nodes=1,
+        nodes_only=False,
     )
     args.update(overrides)
     return argparse.Namespace(**args)
@@ -191,6 +239,16 @@ def test_mxfp4_nccl_transport(ep):
     _run(_namespace(ep))
 
 
+def test_mxfp4_two_virtual_nodes():
+    """Eight ranks on one host run as two nodes of four: the inter-node protocol
+    over the load/store carrier agrees with the logical reference."""
+    if torch.cuda.device_count() < 8:
+        pytest.skip("needs 8 GPUs")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 only")
+    _run(_namespace(8, nodes=2, nodes_only=True))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep", type=int, default=8)
@@ -202,4 +260,10 @@ if __name__ == "__main__":
     parser.add_argument("--capacity", type=int, default=384)
     parser.add_argument("--tokens", type=int, nargs="+", default=[24, 96, 384])
     parser.add_argument("--gin-contexts", type=int, default=0)
+    parser.add_argument("--nodes", type=int, default=1, help="nodes the ranks are spread over")
+    parser.add_argument(
+        "--nodes-only",
+        action="store_true",
+        help="skip the single-node pair (ranks on several hosts cannot share torch symmetric memory)",
+    )
     _run(parser.parse_args())

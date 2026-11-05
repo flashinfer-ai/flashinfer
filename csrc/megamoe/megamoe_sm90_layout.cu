@@ -6,9 +6,12 @@
 tvm::ffi::Array<int64_t> megamoe_sm90_symm_buffer_layout(int64_t ranks, int64_t experts,
                                                          int64_t capacity, int64_t topk,
                                                          int64_t hidden, int64_t intermediate,
-                                                         int64_t pool, int64_t sf_pool) {
+                                                         int64_t pool, int64_t sf_pool,
+                                                         int64_t remote_nodes) {
+  TVM_FFI_ICHECK(remote_nodes >= 0 and ranks % (remote_nodes + 1) == 0)
+      << "ranks must split evenly across the nodes";
   return flashinfer::megamoe::detail::symm_buffer_layout(ranks, experts, capacity, topk, hidden,
-                                                         intermediate, pool, sf_pool);
+                                                         intermediate, pool, sf_pool, remote_nodes);
 }
 
 // Word offsets of the replica-plan workspace (`eplb::Workspace`), then the

@@ -59,17 +59,25 @@ inline CUtensorMap make_tma_sf_desc(void* ptr, DLDataType dtype, int mn, int k, 
   return make_tma_2d_desc(ptr, dtype, mn, (k + gran_k - 1) / gran_k, block_mn, 1, mn, 0);
 }
 
+// [total bytes, input tokens, input scales, input top-k ids, input top-k weights,
+//  L1 tokens, L1 scales, L2 tokens, L2 scales, pool tokens, padded SF pool tokens,
+//  combine block, remote regions base, bytes per remote node, remote header bytes,
+//  remote inbox bytes, remote return bytes, remote slot-map bytes]
 inline tvm::ffi::Array<int64_t> symm_buffer_layout(int ranks, int experts, int capacity, int topk,
                                                    int hidden, int intermediate, int pool,
-                                                   int sf_pool) {
+                                                   int sf_pool, int remote_nodes = 0) {
   const layout::MegaMoEBuffers b(nullptr, ranks, experts, capacity, topk, hidden, intermediate,
-                                 pool, sf_pool);
+                                 pool, sf_pool, remote_nodes);
   auto off = [](const void* p) { return reinterpret_cast<int64_t>(p); };
   return tvm::ffi::Array<int64_t>(
-      {off(b.combine_token_buffer.get_end_ptr()), off(b.input_token_buffer.base),
-       off(b.input_sf_buffer.base), off(b.input_topk_idx_buffer.base),
-       off(b.input_topk_weights_buffer.base), off(b.l1_token_buffer.base), off(b.l1_sf_buffer.base),
-       off(b.l2_token_buffer.base), off(b.l2_sf_buffer.base), pool, sf_pool});
+      {off(b.remote.get_end_ptr()), off(b.input_token_buffer.base), off(b.input_sf_buffer.base),
+       off(b.input_topk_idx_buffer.base), off(b.input_topk_weights_buffer.base),
+       off(b.l1_token_buffer.base), off(b.l1_sf_buffer.base), off(b.l2_token_buffer.base),
+       off(b.l2_sf_buffer.base), pool, sf_pool, off(b.combine_token_buffer.base),
+       off(b.remote.base), static_cast<int64_t>(b.remote.bytes_per_node()),
+       static_cast<int64_t>(b.remote.header_bytes()), static_cast<int64_t>(b.remote.inbox_bytes()),
+       static_cast<int64_t>(b.remote.return_bytes()),
+       static_cast<int64_t>(b.remote.slot_map_bytes())});
 }
 
 template <typename T>

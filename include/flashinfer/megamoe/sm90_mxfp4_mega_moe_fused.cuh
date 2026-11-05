@@ -22,6 +22,7 @@
 #include <flashinfer/megamoe/mxfp4_dequant.cuh>
 #include <flashinfer/megamoe/scheduler.cuh>
 #include <flashinfer/megamoe/sym_buffer.cuh>
+#include <flashinfer/megamoe/remote.cuh>
 #include <type_traits>
 
 namespace flashinfer::megamoe {
@@ -183,13 +184,27 @@ template <uint32_t kNumSMs,
           // pull, and the weight loader gates each redundant slot's tasks on its
           // readiness counters. Off by default, so every existing instantiation is
           // unchanged.
-          bool kInKernelWeightCopy = false>
+          bool kInKernelWeightCopy = false,
+          // Nodes the ranks are spread over, node-major. Above one, ranks on other
+          // nodes are reached through the inbox and outbox of their mirror rank on
+          // this node (GIN puts), see layout::RemoteRegions.
+          uint32_t kNumNodes = 1>
 CUTLASS_GLOBAL __launch_bounds__(
     sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
     1) void sm90_mxfp4_mega_moe_fused_impl(void* y, int* cumulative_local_expert_recv_stats,
                                            const uint32_t num_tokens,
                                            const __grid_constant__ layout::SymBuffer<kNumRanks>
                                                sym_buffer,
+                                           // Where a peer's input block and combine block are
+                                           // read and written; equal to `sym_buffer` inside one
+                                           // NVLink domain, the mirror's inbox and outbox for a
+                                           // rank on another node.
+                                           const __grid_constant__ layout::SymRegions<kNumRanks>
+                                               sym_regions,
+                                           // Mirror ranks on the other nodes and the carrier
+                                           // that reaches them; unused with one node.
+                                           const __grid_constant__ comm::RemoteLinks<kNumNodes - 1>
+                                               remote_links,
                                            const __grid_constant__ cute::TmaDescriptor
                                                tensor_map_l1_acts,
                                            const __grid_constant__ cute::TmaDescriptor
@@ -245,6 +260,10 @@ CUTLASS_GLOBAL __launch_bounds__(
   constexpr uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4;
   constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
   constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+  FI_MEGAMOE_STATIC_ASSERT(kNumNodes >= 1 and kNumRanks % kNumNodes == 0,
+                           "Ranks must split evenly across nodes");
+  constexpr uint32_t kNumRemoteNodes = kNumNodes - 1;
+  constexpr uint32_t kNumLocalRanks = kNumRanks / kNumNodes;
 #include <flashinfer/megamoe/sm90_mxfp4_mega_moe_fused_body.inl>
 }
 

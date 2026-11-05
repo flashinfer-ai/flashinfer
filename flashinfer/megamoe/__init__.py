@@ -163,6 +163,9 @@ class MegaMoESymmBuffer:
         NCCL-window transport that owns the buffer memory. The default
         allocates torch symmetric memory, which reaches ranks on one node
         only; ranks on several nodes need the transport.
+    num_nodes : int
+        Nodes the ranks are spread over, node-major (rank ``r`` and
+        ``r + ranks / num_nodes`` are mirror ranks). Defaults to 1.
 
     Attributes
     ----------
@@ -185,8 +188,13 @@ class MegaMoESymmBuffer:
         activation_clamp: float = 10.0,
         fast_math: bool = True,
         transport: Optional["MegaMoENcclTransport"] = None,
+        num_nodes: int = 1,
     ) -> None:
         """Validate the geometry, allocate the symmetric buffer and expose this rank's staging views."""
+        if num_nodes < 1 or group.size() % num_nodes:
+            raise ValueError("num_nodes must divide the group size")
+        if num_nodes > 1 and transport is None:
+            raise ValueError("ranks on several nodes need the NCCL transport")
 
         # Buffer geometry is format-independent; NVFP4 checks its narrower
         # deployment constraints when selecting a fused/split plan.
@@ -204,6 +212,7 @@ class MegaMoESymmBuffer:
             raise ValueError("SM90 MegaMoE requires a Hopper GPU")
 
         self.group = group
+        self.num_nodes = num_nodes
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_topk = num_topk
@@ -233,12 +242,14 @@ class MegaMoESymmBuffer:
                 intermediate_hidden,
                 pool,
                 sf_pool,
+                num_nodes - 1,
             )
         )
         self._offsets = layout
         num_bytes = layout[0]
         self.num_max_pool_tokens = layout[9]
         self.num_padded_sf_pool_tokens = layout[10]
+        self._remote_args: Tuple[Any, ...] = ()
 
         self.transport = transport
         if transport is None:
@@ -253,6 +264,7 @@ class MegaMoESymmBuffer:
             self.window = transport.alloc_window(num_bytes)
             self.buffer = transport.window_tensor(self.window, torch.int8)
             self.handle = transport.peer_handle(self.window)
+        self._remote_args = self._compute_remote_args(layout)
         group.barrier()
         torch.cuda.synchronize()
 
@@ -267,6 +279,58 @@ class MegaMoESymmBuffer:
         )
         self.topk_weights = self._view(
             layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
+        )
+
+    def _compute_remote_args(self, layout) -> Tuple[Any, ...]:
+        """Kernel arguments that place every peer's input and combine blocks and
+        describe the mirror ranks: a peer on this node is its own buffer, a peer
+        on another node is reached through its mirror's inbox / outbox."""
+        ranks, rank, nodes = self.group.size(), self.group.rank(), self.num_nodes
+        local = ranks // nodes
+        my_node = rank // local
+        bases = [int(p) for p in self.handle.buffer_ptrs]
+        base = bases[rank]
+        input_off, combine_off = layout[1], layout[11]
+        remote_base, per_node, header, inbox = layout[12], layout[13], layout[14], layout[15]
+        input_ptrs, combine_ptrs = [], []
+        for r in range(ranks):
+            node = r // local
+            if node == my_node:
+                if bases[r] == 0:
+                    raise ValueError(f"rank {r} on this node is not load/store reachable")
+                input_ptrs.append(bases[r] + input_off)
+                combine_ptrs.append(bases[r] + combine_off)
+            else:
+                j = node if node < my_node else node - 1
+                mirror = r % local + my_node * local
+                region = bases[mirror] + remote_base + j * per_node
+                input_ptrs.append(region + header)
+                combine_ptrs.append(region + 2 * inbox)
+        link_ranks, link_nodes, link_lsa = [], [], []
+        for j in range(nodes - 1):
+            node = j if j < my_node else j + 1
+            peer = rank % local + node * local
+            link_ranks.append(peer)
+            link_nodes.append(my_node if my_node < node else my_node - 1)
+            link_lsa.append(bases[peer] - base if bases[peer] else 0)
+        transport = self.transport
+        needs_gin = any(offset == 0 for offset in link_lsa)
+        dev_comm = transport.dev_comm_pointer if (transport is not None and needs_gin) else 0
+        window = transport.window_handle(self.window) if (transport is not None and needs_gin) else 0
+        if needs_gin and (dev_comm == 0 or window == 0):
+            raise ValueError(
+                "a mirror rank on another host needs a transport created with GIN contexts"
+            )
+        return (
+            input_ptrs,
+            combine_ptrs,
+            link_ranks,
+            link_nodes,
+            link_lsa,
+            dev_comm,
+            window,
+            base,
+            0,
         )
 
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
@@ -667,15 +731,16 @@ def mxfp4_mega_moe(
         num_logical_experts=None if expert_slots is None else expert_slots.num_experts,
     )
     entry = "megamoe_sm90_mxfp4_fused"
-    extra_jit_args: Tuple[Any, ...] = ()
-    extra_kernel_args: Tuple[Any, ...] = ()
+    # Positional tail of gen_megamoe_sm90_mxfp4_module: in-kernel weight copy, nodes.
+    extra_jit_args: Tuple[Any, ...] = (expert_slots is not None, b.num_nodes)
+    # Region pointers and mirror links precede the in-kernel copy operands.
+    extra_kernel_args: Tuple[Any, ...] = b._remote_args
     if expert_slots is not None:
         expert_slots._check_kernel_operands(
             b, l1_weights, l2_weights, l1_global_scales, l2_global_scales
         )
         entry = "megamoe_sm90_mxfp4_fused_in_kernel_copy"
-        extra_jit_args = (True,)
-        extra_kernel_args = expert_slots._in_kernel_copy_args()
+        extra_kernel_args = extra_kernel_args + tuple(expert_slots._in_kernel_copy_args())
     return _run_kernel(
         gen_megamoe_sm90_mxfp4_module,
         entry,

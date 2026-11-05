@@ -19,6 +19,7 @@ constexpr uint32_t kSmemSize = {{ plan.smem_size }};
 constexpr bool kSwapAB = {{ 'true' if plan.swap_ab else 'false' }};
 constexpr bool kRS = {{ 'true' if plan.rs_swap_ab else 'false' }};
 constexpr bool kInKernelWeightCopy = {{ 'true' if in_kernel_weight_copy else 'false' }};
+constexpr uint32_t kNumNodes = {{ num_nodes }};
 constexpr uint32_t kNumThreads = sm90_mxfp4_num_threads(kSwapAB, kRS, kBlockM);
 constexpr auto kKernel = &sm90_mxfp4_mega_moe_fused_impl<
     kNumSMs, kNumRanks, kHidden, kIntermediateHidden, kNumExperts, kNumTopk,
@@ -28,5 +29,5 @@ constexpr auto kKernel = &sm90_mxfp4_mega_moe_fused_impl<
     {{ 'true' if plan.single_active_dispatch_warp else 'false' }},
     {{ 'true' if plan.use_mode2_row_decoder else 'false' }},
     {{ 'true' if plan.use_interleaved_scheduler else 'false' }}, kRS,
-    /* kPhaseStamps */ false, kInKernelWeightCopy>;
+    /* kPhaseStamps */ false, kInKernelWeightCopy, kNumNodes>;
 }  // namespace flashinfer::megamoe::config

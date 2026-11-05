@@ -87,7 +87,10 @@ if (warp_idx == 0 and cute::elect_one_sync()) {
 // per-64 SF capacity; this per-128 path uses its first half
 // as a dense per-128 layout so no framework allocation change is needed.
 // =====================================================================
+#define FI_MEGAMOE_BUFFERS_WITH_REMOTE_NODES 1
 #include <flashinfer/megamoe/detail/buffers.inl>
+#undef FI_MEGAMOE_BUFFERS_WITH_REMOTE_NODES
+#include <flashinfer/megamoe/detail/remote_common.inl>
 
 // =====================================================================
 // GEMM data types and shape constants
@@ -475,6 +478,9 @@ const auto cleanup_workspace = [&]() {
 #pragma unroll
     for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
       *workspace.get_expert_send_count_ptr(i) = 0;
+    if constexpr (kNumRemoteNodes > 0) {
+      if (thread_idx < kNumRemoteNodes) *remote.packed_token_count(thread_idx) = 0;
+    }
     if constexpr (kUseInterleavedScheduler) {
       if (thread_idx == 0) {
         *workspace.get_l1_task_count_ptr() = 0;
@@ -562,10 +568,22 @@ if (warp_idx < kNumDispatchWarps) {
   }
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+#include <flashinfer/megamoe/detail/remote_dispatch.inl>
+  // Tokens with an expert on another node: packed slot and outbound copy first,
+  // so the index pass can write their packed index.
+  remote_pack_tokens();
+  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
   // Write source token-topk indices to remote ranks
   read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
     const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
     const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
+    if constexpr (kNumRemoteNodes > 0) {
+      if (dst_rank_idx / kNumLocalRanks != my_node) {
+        remote_list_entry(token_topk_idx, static_cast<uint32_t>(expert_idx), dst_slot_idx);
+        return;
+      }
+    }
     const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(expert_idx % kNumExpertsPerRank,
                                                               sym_buffer.rank_idx, dst_slot_idx);
     *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
@@ -580,6 +598,10 @@ if (warp_idx < kNumDispatchWarps) {
     for (uint32_t i = thread_idx; i < kNumExperts; i += kNumActiveDispatchThreads) {
       const auto dst_rank_idx = i / kNumExpertsPerRank;
       const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+      if constexpr (kNumRemoteNodes > 0) {
+        // Owners on other nodes get this rank's counts from its mirror.
+        if (dst_rank_idx / kNumLocalRanks != my_node) continue;
+      }
       const auto expert_status = *workspace.get_expert_send_count_ptr(i);
       *sym_buffer.map(
           workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
@@ -592,8 +614,13 @@ if (warp_idx < kNumDispatchWarps) {
   }
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+  // Inter-node: ship this rank's packed tokens, then publish the mirrored
+  // sources' counts and lists into this node's owners before the barrier.
+  remote_send();
+  remote_publish_by_proxy();
+
   comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
-                       kBeforeDispatchPullBarrierTag>(
+                       kBeforeDispatchPullBarrierTag, kNumLocalRanks>(
       workspace, sym_buffer, sm_idx, thread_idx,
       [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, false, true);
   if (thread_idx == 0) stamp_max(1);
@@ -651,8 +678,9 @@ if (warp_idx < kNumDispatchWarps) {
       if (cute::elect_one_sync()) {
         ptx::tma_load_1d(
             pull_buffer.get_base_ptr(),
-            sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                           current_rank_in_expert_idx),
+            sym_regions.map_input(
+                input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                current_rank_in_expert_idx),
             pull_mbarrier, kHidden);
       }
       __syncwarp();
@@ -661,8 +689,9 @@ if (warp_idx < kNumDispatchWarps) {
       constexpr uint32_t kNumSFFloats = kHidden / 128;
       FI_MEGAMOE_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
       const auto remote_sf_ptr =
-          sym_buffer.map(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
-                         current_rank_in_expert_idx);
+          sym_regions.map_input(
+              input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
+              current_rank_in_expert_idx);
       const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<float>();
       const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
 #pragma unroll
@@ -675,8 +704,9 @@ if (warp_idx < kNumDispatchWarps) {
 
       if (cute::elect_one_sync()) {
         const auto weight =
-            *sym_buffer.map(input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                            current_rank_in_expert_idx);
+            *sym_regions.map_input(
+                input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                current_rank_in_expert_idx);
         *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
         ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
@@ -718,10 +748,14 @@ if (warp_idx < kNumDispatchWarps) {
 
   cleanup_workspace();
   comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
-                       kAfterWorkspaceCleanBarrierTag>(
+                       kAfterWorkspaceCleanBarrierTag, kNumLocalRanks>(
       workspace, sym_buffer, sm_idx, thread_idx,
       [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, true, false);
   if (thread_idx == 0) stamp_max(8);
+  if constexpr (kNumRemoteNodes > 0) {
+    // Signal targets of the next launch; every CTA read the epoch at entry.
+    if (sm_idx == 0 and thread_idx == 0) *remote.launch_epoch() = launch_epoch + 1;
+  }
   // In-kernel weight copy: the copy list is consumed. Every CTA of every rank
   // has passed the barrier above, so none can still be reading it: the copier
   // reads `copy_count` before its first copy, and the weight-loader warp reads
@@ -1487,7 +1521,7 @@ if (warp_idx < kNumDispatchWarps) {
   // NVLink barrier first: signals remote ranks that this rank's GEMM
   // outputs (NVLink scatter targets) are fully written.
   comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads, kEpilogueGridSyncIndex,
-                       kBeforeCombineReduceBarrierTag>(
+                       kBeforeCombineReduceBarrierTag, kNumLocalRanks>(
       workspace, sym_buffer, sm_idx, epilogue_thread_idx,
       [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); });
   if (epilogue_thread_idx == 0) stamp_max(6);
@@ -1496,10 +1530,16 @@ if (warp_idx < kNumDispatchWarps) {
   // dispatch may now safely clean workspace state.
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+#include <flashinfer/megamoe/detail/remote_combine.inl>
+  remote_return();
+  remote_wait_return();
+
 // These are function fragments: sizing declarations must precede the combine body.
 // clang-format off
+#define FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES 1
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
+#undef FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES
   // clang-format on
 }
 #else

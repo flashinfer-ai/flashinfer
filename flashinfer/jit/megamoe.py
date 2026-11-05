@@ -28,7 +28,15 @@ def _csrc_dir() -> Path:
     )
 
 
-def _gen_fp4_module(uri, template_name, filenames, render_args, use_fast_math):
+def _gen_fp4_module(
+    uri,
+    template_name,
+    filenames,
+    render_args,
+    use_fast_math,
+    extra_include_paths=(),
+    extra_cuda_cflags=(),
+):
     """Shared config rendering, source staging and CUDA build policy."""
     csrc = _csrc_dir()
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -52,11 +60,27 @@ def _gen_fp4_module(uri, template_name, filenames, render_args, use_fast_math):
             "--ptxas-options=--register-usage-level=5",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            *extra_cuda_cflags,
         ],
         extra_cflags=["-std=c++20"],
-        extra_include_paths=[directory, csrc, jit_env.FLASHINFER_CSRC_DIR],
+        extra_include_paths=[
+            directory,
+            csrc,
+            jit_env.FLASHINFER_CSRC_DIR,
+            *extra_include_paths,
+        ],
         use_fast_math=use_fast_math,
     )
+
+
+# NCCL GIN on the host-proxy backend; the other backends are compiled out, as
+# the SM120 MegaMoE does, so the persistent kernel does not carry their code.
+_GIN_PROXY_CFLAGS = (
+    "-DFI_MEGAMOE_WITH_NCCL_GIN=1",
+    "-DNCCL_GIN_GDAKI_ENABLE=0",
+    "-DNCCL_GIN_GPI_ENABLE=0",
+    "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
+)
 
 
 def get_megamoe_sm90_nvfp4_uri(
@@ -371,9 +395,10 @@ def get_megamoe_sm90_mxfp4_uri(
     activation_clamp,
     fast_math,
     in_kernel_weight_copy: bool = False,
+    num_nodes: int = 1,
 ) -> str:
     """Module key of the MXFP4 fused kernel: every compile-time policy, the rank
-    width and whether the kernel copies the weights of a replica plan."""
+    width, whether the kernel copies the weights of a replica plan and the node count."""
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -386,7 +411,8 @@ def get_megamoe_sm90_mxfp4_uri(
         fast_math,
         num_ranks=num_ranks,
     ).replace("nvfp4", "mxfp4")
-    return uri + ("_eplbcopy" if in_kernel_weight_copy else "")
+    uri += "_eplbcopy" if in_kernel_weight_copy else ""
+    return uri + (f"_nodes{num_nodes}" if num_nodes > 1 else "")
 
 
 def gen_megamoe_sm90_mxfp4_module(
@@ -401,8 +427,10 @@ def gen_megamoe_sm90_mxfp4_module(
     activation_clamp,
     fast_math,
     in_kernel_weight_copy: bool = False,
+    num_nodes: int = 1,
 ) -> JitSpec:
-    """JIT spec of the MXFP4 fused kernel, with or without the in-kernel weight copy."""
+    """JIT spec of the MXFP4 fused kernel, with or without the in-kernel weight copy,
+    for ranks on one node or spread over ``num_nodes`` nodes."""
     uri = get_megamoe_sm90_mxfp4_uri(
         plan,
         num_sms,
@@ -415,6 +443,7 @@ def gen_megamoe_sm90_mxfp4_module(
         activation_clamp,
         fast_math,
         in_kernel_weight_copy,
+        num_nodes,
     )
     return _gen_fp4_module(
         uri,
@@ -432,8 +461,11 @@ def gen_megamoe_sm90_mxfp4_module(
             activation_clamp=activation_clamp,
             fast_math=fast_math,
             in_kernel_weight_copy=in_kernel_weight_copy,
+            num_nodes=num_nodes,
         ),
         fast_math,
+        extra_include_paths=[_nccl_paths()[0]] if num_nodes > 1 else (),
+        extra_cuda_cflags=_GIN_PROXY_CFLAGS if num_nodes > 1 else (),
     )
 
 

@@ -18,6 +18,10 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
             tvm::ffi::Optional<tvm::ffi::TensorView> cumulative_local_expert_recv_stats,
             tvm::ffi::Optional<tvm::ffi::TensorView> l1_global_scales,
             tvm::ffi::Optional<tvm::ffi::TensorView> l2_global_scales,
+            tvm::ffi::Array<int64_t> input_block_ptrs, tvm::ffi::Array<int64_t> combine_block_ptrs,
+            tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
+            tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
+            int64_t window_base, int64_t gin_context,
             const eplb::InKernelCopy<cfg::kNumRanks>& in_kernel_copy) {
   TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), cfg::kNumRanks);
   TVM_FFI_ICHECK_GE(rank_idx, 0);
@@ -44,6 +48,30 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
                        cfg::kIntermediateHidden, cfg::kBlockM, cfg::kBlockN / 2);
   const std::vector<int64_t> ptrs(symm_buffer_ptrs.begin(), symm_buffer_ptrs.end());
   layout::SymBuffer<cfg::kNumRanks> sym_buffer(ptrs, static_cast<uint32_t>(rank_idx));
+  // Where each peer's input block and combine block are addressed: the peer's
+  // own buffer inside this NVLink domain, its mirror's inbox / outbox otherwise.
+  TVM_FFI_ICHECK_EQ(input_block_ptrs.size(), cfg::kNumRanks);
+  TVM_FFI_ICHECK_EQ(combine_block_ptrs.size(), cfg::kNumRanks);
+  const std::vector<int64_t> input_blocks(input_block_ptrs.begin(), input_block_ptrs.end());
+  const std::vector<int64_t> combine_blocks(combine_block_ptrs.begin(), combine_block_ptrs.end());
+  layout::SymRegions<cfg::kNumRanks> sym_regions(input_blocks, combine_blocks,
+                                                 input_blocks[rank_idx], combine_blocks[rank_idx]);
+  constexpr int64_t kNumRemoteNodes = cfg::kNumNodes - 1;
+  TVM_FFI_ICHECK_EQ(link_ranks.size(), kNumRemoteNodes);
+  TVM_FFI_ICHECK_EQ(link_nodes_at_mirror.size(), kNumRemoteNodes);
+  TVM_FFI_ICHECK_EQ(link_lsa_offsets.size(), kNumRemoteNodes);
+  comm::RemoteLinks<cfg::kNumNodes - 1> remote_links{};
+  for (int64_t j = 0; j < kNumRemoteNodes; ++j) {
+    TVM_FFI_ICHECK(link_ranks[j] >= 0 and link_ranks[j] < cfg::kNumRanks) << "mirror rank out of range";
+    TVM_FFI_ICHECK(link_lsa_offsets[j] != 0 or (dev_comm_ptr != 0 and window_handle != 0))
+        << "a mirror rank on another host needs the GIN device communicator and window";
+    remote_links.peers[j] = {static_cast<uint32_t>(link_ranks[j]),
+                             static_cast<uint32_t>(link_nodes_at_mirror[j]), link_lsa_offsets[j]};
+  }
+  remote_links.dev_comm = reinterpret_cast<const void*>(dev_comm_ptr);
+  remote_links.window = reinterpret_cast<void*>(window_handle);
+  remote_links.window_base = window_base;
+  remote_links.gin_context = static_cast<uint32_t>(gin_context);
   void* output = y.data_ptr();
   auto* stats = detail::optional_tensor_ptr<int>(cumulative_local_expert_recv_stats);
   const auto* w1 = static_cast<const uint8_t*>(l1_weights.data_ptr());
@@ -53,11 +81,12 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
   uint32_t tokens = static_cast<uint32_t>(num_tokens);
   unsigned long long* stamps = nullptr;
   void* args[] = {
-      &output,     &stats,  &tokens,
-      &sym_buffer, &tm_l1,  &tm_l1_sf,
-      &tm_out,     &tm_l2,  &tm_l2_sf,
-      &w1,         &w2,     &gs1,
-      &gs2,        &stamps, const_cast<eplb::InKernelCopy<cfg::kNumRanks>*>(&in_kernel_copy)};
+      &output,      &stats,  &tokens,
+      &sym_buffer,  &sym_regions, &remote_links,
+      &tm_l1,       &tm_l1_sf,    &tm_out,
+      &tm_l2,       &tm_l2_sf,    &w1,
+      &w2,          &gs1,         &gs2,
+      &stamps,      const_cast<eplb::InKernelCopy<cfg::kNumRanks>*>(&in_kernel_copy)};
   auto* kernel = reinterpret_cast<void*>(cfg::kKernel);
   TVM_FFI_ICHECK_EQ(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg::kSmemSize),
@@ -75,13 +104,18 @@ void megamoe_sm90_mxfp4_fused(
     tvm::ffi::TensorView l2_weights, tvm::ffi::Array<int64_t> offsets, int64_t num_tokens,
     tvm::ffi::Optional<tvm::ffi::TensorView> cumulative_local_expert_recv_stats,
     tvm::ffi::Optional<tvm::ffi::TensorView> l1_global_scales,
-    tvm::ffi::Optional<tvm::ffi::TensorView> l2_global_scales) {
+    tvm::ffi::Optional<tvm::ffi::TensorView> l2_global_scales,
+    tvm::ffi::Array<int64_t> input_block_ptrs, tvm::ffi::Array<int64_t> combine_block_ptrs,
+    tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
+    tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
+    int64_t window_base, int64_t gin_context) {
   TVM_FFI_ICHECK(!cfg::kInKernelWeightCopy)
       << "this module carries the in-kernel weight copy; call "
          "megamoe_sm90_mxfp4_fused_in_kernel_copy";
   launch(y, symm_buffer, symm_buffer_ptrs, rank_idx, l1_weights, l2_weights, offsets, num_tokens,
-         cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales,
-         eplb::InKernelCopy<cfg::kNumRanks>{});
+         cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, input_block_ptrs,
+         combine_block_ptrs, link_ranks, link_nodes_at_mirror, link_lsa_offsets, dev_comm_ptr,
+         window_handle, window_base, gin_context, eplb::InKernelCopy<cfg::kNumRanks>{});
 }
 
 // Same launch with the in-kernel weight copy: the redundant expert slots listed
@@ -95,7 +129,11 @@ void megamoe_sm90_mxfp4_fused_in_kernel_copy(
     tvm::ffi::TensorView l2_weights, tvm::ffi::Array<int64_t> offsets, int64_t num_tokens,
     tvm::ffi::Optional<tvm::ffi::TensorView> cumulative_local_expert_recv_stats,
     tvm::ffi::Optional<tvm::ffi::TensorView> l1_global_scales,
-    tvm::ffi::Optional<tvm::ffi::TensorView> l2_global_scales, tvm::ffi::TensorView eplb_workspace,
+    tvm::ffi::Optional<tvm::ffi::TensorView> l2_global_scales,
+    tvm::ffi::Array<int64_t> input_block_ptrs, tvm::ffi::Array<int64_t> combine_block_ptrs,
+    tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
+    tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
+    int64_t window_base, int64_t gin_context, tvm::ffi::TensorView eplb_workspace,
     tvm::ffi::TensorView arena, tvm::ffi::Array<int64_t> arena_ptrs, int64_t num_resident_experts,
     tvm::ffi::Array<int64_t> l1_planes, tvm::ffi::Array<int64_t> l2_planes) {
   TVM_FFI_ICHECK(cfg::kInKernelWeightCopy)
@@ -125,7 +163,9 @@ void megamoe_sm90_mxfp4_fused_in_kernel_copy(
   in_kernel_copy.num_resident_experts = static_cast<uint32_t>(num_resident_experts);
   in_kernel_copy.num_redundant_slots = static_cast<uint32_t>(num_redundant_slots);
   launch(y, symm_buffer, symm_buffer_ptrs, rank_idx, l1_weights, l2_weights, offsets, num_tokens,
-         cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, in_kernel_copy);
+         cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, input_block_ptrs,
+         combine_block_ptrs, link_ranks, link_nodes_at_mirror, link_lsa_offsets, dev_comm_ptr,
+         window_handle, window_base, gin_context, in_kernel_copy);
 }
 
 }  // namespace flashinfer::megamoe
