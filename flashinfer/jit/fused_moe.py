@@ -16,6 +16,7 @@ limitations under the License.
 
 import os
 import platform
+import re
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -329,6 +330,16 @@ def _manifest_host_compile_flags() -> List[str]:
     return ["-Xcompiler", "-fno-schedule-insns"]
 
 
+def _has_trtllm_clamped_relu2(enums_header: bytes) -> bool:
+    """Inspect the verified export header, not the host package version."""
+    source = enums_header.decode("utf-8")
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.DOTALL)
+    enum = re.search(r"enum\s+class\s+EltwiseActType\s*(?::[^{}]+)?\{([^}]+)\}", source)
+    return (
+        enum is not None and re.search(r"\bClampedRelu2\b", enum.group(1)) is not None
+    )
+
+
 def trtllm_gen_fused_moe_build_inputs(
     module_name: str,
     enable_rubin: bool = False,
@@ -369,9 +380,12 @@ def trtllm_gen_fused_moe_build_inputs(
 
     # Fetch BMM export headers via get_artifact() and symlink for C++ includes.
     bmm_export_path = f"{include_path}/trtllmGen_bmm_export"
+    activation_flags = []
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
+        if header == "Enums.h" and _has_trtllm_clamped_relu2(h):
+            activation_flags = ["-DFLASHINFER_TRTLLM_CLAMPED_RELU2"]
     # Per-module export-header root: the Blackwell and Rubin variants must not
     # share this symlink, or an AOT build (all modules generated, then compiled)
     # lets the last gen_* call's target win and skews the other module's ABI.
@@ -433,6 +447,7 @@ def trtllm_gen_fused_moe_build_inputs(
         "-DTLLM_GEN_EXPORT_INTERFACE",
         "-DTLLM_GEN_EXPORT_FLASHINFER",
         *rubin_flags,
+        *activation_flags,
         "-DTLLM_ENABLE_CUDA",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
