@@ -22,6 +22,15 @@ DEVICE_CONSTANTS = frozenset(
 )
 GATED = ("swiglu", "geglu", "geglu_tanh", "swiglu_step", "situ")
 NON_GATED = ("gelu", "identity", "relu", "relu2", "silu")
+# Gated activations whose parameters are launch-time scalars. They are exported
+# per architecture: a gated family that carries them expands the "gated_param"
+# group (GATED plus these), other gated families keep "gated".
+PARAMETERIZED_GATED = ("swiglu_param",)
+GATED_PARAM = GATED + PARAMETERIZED_GATED
+# Frost passes swiglu_param's scalars in first-use order, ahead of the output
+# scale; write_catalog checks every exported tail against this expansion.
+SWIGLU_PARAM_TAIL = ("swiglu_limit", "swiglu_alpha", "swiglu_lower", "swiglu_beta")
+_GATED_GROUPS = ("gated", "gated_param")
 
 
 def logical_id(raw, dtype):
@@ -101,13 +110,15 @@ def expand_catalog(payload: dict[str, Any]) -> dict[str, Any]:
                         else ["gate_alpha"]
                         + (
                             ["up_alpha"]
-                            if family["activation_group"] == "gated"
+                            if family["activation_group"] in _GATED_GROUPS
                             else []
                         )
                         + aux
                     )
                 if activation == "situ":
                     aux = aux[:-1] + ["gate_scale", "linear_scale"] + aux[-1:]
+                elif activation == "swiglu_param":
+                    aux = aux[:-1] + list(SWIGLU_PARAM_TAIL) + aux[-1:]
                 if quantized and dtype == "nvfp4":
                     aux.append("quant_scale")
                 if combine:
@@ -278,7 +289,9 @@ def write_catalog(
         if activation == "silu(gate) * up":
             activation = record["contract"]["activation"] = "swiglu"
         stage = "fc2" if record["op"].endswith("gemm2") else "fc1"
-        topology = "gated" if stage == "fc1" and activation in GATED else "non_gated"
+        topology = (
+            "gated" if stage == "fc1" and activation in GATED_PARAM else "non_gated"
+        )
         tactic = record["tactic"]
         tile = {
             k: deepcopy(v)
@@ -305,6 +318,21 @@ def write_catalog(
         )
         groups[key].append(record)
 
+    parameterized_families = {
+        key[:3]
+        for key, members in groups.items()
+        if any(r["contract"]["activation"] in PARAMETERIZED_GATED for r in members)
+    }
+
+    def group_of(arch, stage, topology):
+        if topology != "gated":
+            return topology
+        return (
+            "gated_param"
+            if (arch, stage, topology) in parameterized_families
+            else "gated"
+        )
+
     # Keep each producer's geometry-dependent body until its frozen fragments
     # have been factored into the shared template below.
     prepared = []
@@ -315,6 +343,7 @@ def write_catalog(
         groups.items(), key=lambda item: (item[0][-2] == "gather", item[0])
     ):
         arch, stage, topology, swapped, output, store, mode, chunk = key
+        group = group_of(arch, stage, topology)
         sources: dict[str, str] = {}
         prefixes: set[str] = set()
         parameters: dict[str, dict[str, str]] = {}
@@ -350,18 +379,24 @@ def write_catalog(
         expected = (
             ("identity",)
             if stage == "fc2"
-            else GATED
-            if topology == "gated"
-            else NON_GATED
+            else {"gated": GATED, "gated_param": GATED_PARAM}.get(group, NON_GATED)
         )
         if set(sources) != set(expected):
             if stage != "fc1":
                 raise RuntimeError(
                     f"missing activation source for {key}: {set(expected) - sources.keys()}"
                 )
-            # SiTU has two additional scalar arguments. Start from a common
-            # activation ABI when synthesizing other activation/store arms.
-            ordinary = sources.keys() - {"situ"}
+            # SiTU and the parameterized activations take additional scalar
+            # arguments. Start from a common activation ABI when synthesizing
+            # other activation/store arms; parameterized ones are never synthesized.
+            missing_parameterized = (set(expected) - sources.keys()) & set(
+                PARAMETERIZED_GATED
+            )
+            if missing_parameterized:
+                raise RuntimeError(
+                    f"missing exported {sorted(missing_parameterized)} source for {key}"
+                )
+            ordinary = sources.keys() - {"situ", *PARAMETERIZED_GATED}
             if not ordinary:
                 raise RuntimeError(
                     "Frost activation expansion needs a common ABI source"
@@ -429,7 +464,11 @@ def write_catalog(
             ),
         },
         dtype=dtype,
-        activation_groups={"gated": list(GATED), "non_gated": list(NON_GATED)},
+        activation_groups={
+            "gated": list(GATED),
+            "non_gated": list(NON_GATED),
+            **({"gated_param": list(GATED_PARAM)} if parameterized_families else {}),
+        },
         store_policies={
             "stg": {"data": "stg", "scales": "stg"},
             "tma": {"data": "tma", "scales": None},
@@ -463,7 +502,10 @@ def write_catalog(
         family_key = (arch, stage, topology)
         if family_key not in families:
             families[family_key] = dict(
-                arch=arch, stage=stage, activation_group=topology, variants=[]
+                arch=arch,
+                stage=stage,
+                activation_group=group_of(arch, stage, topology),
+                variants=[],
             )
         quantized = output != "bfloat16"
         policy = "tmastg" if store == "tma" and quantized else store
@@ -512,8 +554,19 @@ def write_catalog(
         )
     payload["families"] = list(families.values())
     expanded = expand_catalog(payload)
-    new_ids = {logical_id(r, dtype): r["id"] for r in expanded["kernels"]}
+    by_logical = {logical_id(r, dtype): r for r in expanded["kernels"]}
+    new_ids = {key: r["id"] for key, r in by_logical.items()}
     mapping = {r["id"]: new_ids[logical_id(r, dtype)] for r in records}
+    # The expansion recomputes every launch tail from the activation; it must
+    # reproduce the producer's argument order for each exported record.
+    for r in records:
+        expected_tail = r.get("launch", {}).get("tail")
+        actual_tail = by_logical[logical_id(r, dtype)]["launch"]["tail"]
+        if expected_tail is not None and list(expected_tail) != list(actual_tail):
+            raise RuntimeError(
+                f"Frost catalog launch tail {actual_tail} differs from the exported "
+                f"{list(expected_tail)} for {r['id']}"
+            )
     for destination, template in pending_sources.items():
         destination.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(

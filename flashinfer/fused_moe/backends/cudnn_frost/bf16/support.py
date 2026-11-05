@@ -42,7 +42,10 @@ def large_bf16_moe(config, act, arch):
             activation_name(config.activation)
         except NotImplementedError:
             return False
-        return moe_geometry(config, act)
+        # SM120 BF16 has no scale-factor layout; its kernels take whole
+        # 32-element blocks (catalog contracts) and routing moves 8-element
+        # packs, so e.g. gpt-oss's H = I = 2880 is admitted there.
+        return moe_geometry(config, act, multiple=32 if arch == 120 else 128)
     return False
 
 

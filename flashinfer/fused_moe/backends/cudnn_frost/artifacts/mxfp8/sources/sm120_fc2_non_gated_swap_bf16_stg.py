@@ -571,6 +571,10 @@ def frost_template_kernel(
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
         start_sf_block_n = cutlass.Int32(0)
+        # The 128-token SF blocks the host sizes the segmented token SF and grouped row-quant scale blobs for
+        # (fusion_ir.segmented_row_scale_capacity_rows).
+        sf_active = cutlass.min(cutlass.Int32(N), num_groups)
+        sf_capacity = sf_active + (cutlass.Int32(N) - sf_active) // 128
         scan_base = cutlass.Int32(0)
         group_idx = cutlass.Int32(0)
         group_begin = cutlass.Int32(0)
@@ -600,6 +604,11 @@ def frost_template_kernel(
                         if my_group != 0:
                             my_begin = cutlass.Int32(first_token_arr[my_group])
                         my_end = cutlass.Int32(first_token_arr[my_group + 1])
+                        # The offsets are device data the host never checks: clamp the group into the N routed
+                        # tokens, so a bad table drops tokens instead of storing past the output or reading past
+                        # token_index / token_ks, and its tile and SF block counts cannot go negative.
+                        my_end = cutlass.min(cutlass.max(my_end, cutlass.Int32(0)), cutlass.Int32(N))
+                        my_begin = cutlass.min(cutlass.max(my_begin, cutlass.Int32(0)), my_end)
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[1]) * tiles_along_m
                         my_sf_blocks = cute.ceil_div(my_end - my_begin, 128)
                     prefix_tiles = my_tiles
@@ -623,7 +632,9 @@ def frost_template_kernel(
                             prefix_tiles += prefix_delta
                             prefix_sf += prefix_sf_delta
                     my_start = start_linear_idx + prefix_tiles - my_tiles
-                    my_sf_start = start_sf_block_n + prefix_sf - my_sf_blocks
+                    # The clamped groups of a decreasing table can still overlap and so push the SF prefix past the
+                    # capacity: keep every SF segment inside it. Groups of a valid table always fit.
+                    my_sf_start = cutlass.min(start_sf_block_n + prefix_sf - my_sf_blocks, sf_capacity - my_sf_blocks)
                     thread_succeed = nvvm.vote_sync(
                         full_warp_mask,
                         linear_idx < my_start + my_tiles,

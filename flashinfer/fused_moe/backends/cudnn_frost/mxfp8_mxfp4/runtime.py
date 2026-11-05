@@ -16,10 +16,16 @@ from pathlib import Path
 import torch
 
 from .. import runtime
-from ..activations import ACTIVATIONS, is_gated
+from ..activations import (
+    ACTIVATIONS,
+    KNOWN_ACTIVATIONS,
+    SWIGLU_PARAM_SCALARS,
+    is_gated,
+    launch_scalars,
+)
 
 _FC2 = "block_scale_grouped_gemm2"
-_OPS = {f"block_scale_grouped_gemm1_{name}" for name in ACTIVATIONS} | {_FC2}
+_OPS = {f"block_scale_grouped_gemm1_{name}" for name in KNOWN_ACTIVATIONS} | {_FC2}
 _artifact_cache_version = 0
 
 _TAIL_SLOTS = {
@@ -31,6 +37,10 @@ _TAIL_SLOTS = {
     "gate_alpha": 4,
     "up_alpha": 5,
     "alpha": 4,
+    "swiglu_alpha": 6,
+    "swiglu_beta": 7,
+    "swiglu_limit": 8,
+    "swiglu_lower": 9,
 }
 
 
@@ -149,6 +159,8 @@ def discover(
             expected_tail.add("up_alpha")
         if expected["activation"] == "situ":
             expected_tail |= {"gate_scale", "linear_scale"}
+        elif expected["activation"] == "swiglu_param":
+            expected_tail |= set(SWIGLU_PARAM_SCALARS)
         if fused:
             expected_tail.add("output_scale")
             prefix = ("output_scale",) if store == "tma" else ("output", "output_scale")
@@ -368,6 +380,7 @@ class PreparedMxfp8Mxfp4GroupedGemm:
         scale: torch.Tensor | None = None,
         gemm_scales: tuple[torch.Tensor, ...] | None = None,
         workspace: torch.Tensor | None = None,
+        activation=None,
     ):
         if tokens.device.type != "cuda":
             raise ValueError("MXFP8 × MXFP4 grouped GEMM requires CUDA tensors")
@@ -443,15 +456,25 @@ class PreparedMxfp8Mxfp4GroupedGemm:
             raise ValueError("GEMM scales require 4B alignment")
         activation_scales = {}
         if kernel.activation == "situ":
-            activation = ACTIVATIONS["situ"]()
+            situ = ACTIVATIONS["situ"]()
             activation_scales = {
                 name: torch.full(
                     (1, 1, 1),
-                    getattr(activation, name),
+                    getattr(situ, name),
                     dtype=torch.float32,
                     device=tokens.device,
                 )
                 for name in ("gate_scale", "linear_scale")
+            }
+        elif kernel.activation == "swiglu_param":
+            # SwiGLU's launch-time alpha/beta/limit (defaults when not given).
+            activation_scales = {
+                name: torch.full(
+                    (1, 1, 1), value, dtype=torch.float32, device=tokens.device
+                )
+                for name, value in zip(
+                    SWIGLU_PARAM_SCALARS, launch_scalars(activation), strict=True
+                )
             }
         if workspace is None:
             workspace = torch.empty(
