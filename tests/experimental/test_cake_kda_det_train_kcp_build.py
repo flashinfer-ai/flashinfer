@@ -265,7 +265,7 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_dav",
         "kcp_fwdh_o",
     )
-    assert kcp_jit.WALK_PROGRAMS == (*kcp_jit.PROGRAMS[:5], "kcp_fwdh_o")
+    assert (*kcp_jit.PROGRAMS[:5], "kcp_fwdh_o") == kcp_jit.WALK_PROGRAMS
     assert kcp_jit.PRECISION_MODES == (0, 1, 2)
     assert kcp_jit.TRANSFER_WALKS == ("bf16x3_hw64", "tf32_hilo", "bf16x3")
 

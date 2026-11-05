@@ -551,8 +551,9 @@ def test_the_records_are_the_deterministic_records_under_this_packages_names() -
     assert not ours & theirs
     assert set(DET_ONLY_PROGRAMS) <= set(det_kcp_jit.PROGRAMS)
     assert not set(DET_ONLY_PROGRAMS) & set(kcp_jit.PROGRAMS)
-    assert kcp_jit.PROGRAMS == tuple(
-        p for p in det_kcp_jit.PROGRAMS if p not in DET_ONLY_PROGRAMS
+    assert (
+        tuple(p for p in det_kcp_jit.PROGRAMS if p not in DET_ONLY_PROGRAMS)
+        == kcp_jit.PROGRAMS
     )
     assert kcp_jit.LOGICAL_TENSORS == det_kcp_jit.LOGICAL_TENSORS
     assert kcp_jit.LOGICAL_SCALARS == det_kcp_jit.LOGICAL_SCALARS
