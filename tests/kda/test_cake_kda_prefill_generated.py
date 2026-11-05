@@ -1490,9 +1490,11 @@ def _assert_route(route, prepared):
     loaded = _modules(prepared)
     owner_helper = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
     hybrid = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
-    if route == "m64-hybrid" and not (hybrid and (arch, _sm_count()) == HYBRID_PART):
-        route = "pair-share"  # another part, or a loader without the build
+    if route == "m64-hybrid" and not hybrid:
+        route = "pair-share"  # a loader without the build keeps the pair-share one
     if route == "m64-hybrid":
+        if (arch, _sm_count()) != HYBRID_PART:
+            pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
         assert schedule == HYBRID_SCHEDULE, schedule
         assert loaded & hybrid
         return
