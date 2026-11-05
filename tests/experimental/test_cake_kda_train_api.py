@@ -947,7 +947,8 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
     """``workspace_bytes``, ``saved_bytes``, ``output_bytes`` and ``KdaWorkspace.for_problem`` take the
     deterministic package's ``l2n``: ``"off"`` gives the bytes of the omitted keyword, an l2n mode (``"fused"`` /
     ``"fallback"``, which runs the deterministic package's records in either gate mode) the deterministic package's
-    bytes of that mode, and the saved set adds the reciprocal norms (``8 S H`` bytes); any other value is a
+    bytes of that mode, and the saved set adds the reciprocal norms (``8 S H`` bytes); the flag-off raw backward of
+    an R1c row (``sm_100a`` here) adds the FP64 accumulators ``param_acc`` and no l2n mode does; any other value is a
     ``ValueError`` raised before the device is read, a known one reaches the device check."""
     S, N, H = 129, 1, 4
     assert (
@@ -980,9 +981,22 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
                         gate=gate,
                         l2n=l2n,
                     )
+                    acc = (
+                        cake_backend._param_acc_bytes(
+                            cake_backend.plan(
+                                S, N, H, 148, "sm_100a", gate=gate, l2n=l2n
+                            )
+                        )
+                        if gate == "raw" and backward
+                        else 0
+                    )
+                    # the R1c accumulators: the flag-off raw backward alone
+                    assert (acc > 0) == (
+                        gate == "raw" and backward and l2n == "off"
+                    ), (kw, acc)
                     assert cake_backend.workspace_bytes(
                         S, N, H, **kw
-                    ) == det_backend.workspace_bytes(S, N, H, **kw), kw
+                    ) == det_backend.workspace_bytes(S, N, H, **kw) + acc, kw
                     compared += 1
             assert cake_backend.output_bytes(
                 S, H, backward=True, gate=gate, l2n=l2n
@@ -1296,9 +1310,16 @@ def test_the_pairs_agree_on_every_head_count() -> None:
     assert reached == shipped
 
 
+# the raw gate's parameter finalize of the l2n modes: the deterministic param_finalize record (its program shared)
+L2N_PARAM = {"param_finalize_l2n": "param_finalize"}
+
+
 def _det_name(name: str | None) -> str | None:
     """The deterministic record a record of this package copies: the fused gradient's raw and l2n classes are the
-    deterministic ``dqkg`` records with a class suffix; every other copy keeps its name."""
+    deterministic ``dqkg`` records with a class suffix, ``param_finalize_l2n`` is ``param_finalize``; every other copy
+    keeps its name."""
+    if name in L2N_PARAM:
+        return L2N_PARAM[name]
     if name is not None and name.startswith("dqkg"):
         return name.removesuffix("_raw").removesuffix("_l2n")
     return name
@@ -1307,10 +1328,11 @@ def _det_name(name: str | None) -> str | None:
 def test_the_l2n_modes_select_the_deterministic_pair() -> None:
     """Over architecture x path x heads 1..128 (two packings each), both gate modes and both in-kernel Q/K L2 norm
     modes (``"fused"``, ``"fallback"``): the plan's records are the deterministic package's plan of the same mode,
-    record for record (the fused gradient's raw and l2n classes by their deterministic names), never an S1 record,
+    record for record (the fused gradient's raw and l2n classes and ``param_finalize_l2n`` by their deterministic
+    names), never an S1 record,
     never the gate epilogue; on the l2n stages each is the only record of its mode class whose rule admits the
     problem; and every program of the pair stages serving an l2n mode runs on exactly the architectures it ships
-    for."""
+    for, but the deterministic glm_intra_l2n's sm_103a build (kept beside its sm_103a form)."""
     reached: set = set()
     cells = 0
     for arch in cake_jit.ARCHES:
@@ -1373,7 +1395,11 @@ def test_the_l2n_modes_select_the_deterministic_pair() -> None:
         if _serves(name, "fused") or _serves(name, "fallback")
         for arch in cake_jit.MODULES[name]["arches"]
     }
-    assert reached == shipped
+    # every reached build ships; every shipped one is reached but the deterministic glm_intra_l2n's sm_103a build,
+    # which the deterministic package keeps while its sm_103a form glm_intra_v30_l2n serves that architecture
+    kept = {(cake_jit.MODULES["glm_intra_l2n"]["library"], "sm_103a")}
+    assert reached <= shipped
+    assert shipped - reached == kept
 
 
 def test_the_plan_refuses_a_mixed_pair(monkeypatch) -> None:

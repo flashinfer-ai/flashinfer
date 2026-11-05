@@ -228,20 +228,28 @@ def test_mode_keyword_must_be_a_bool(bad) -> None:
 
 def test_l2n_vocabulary_is_the_deterministic_packages() -> None:
     """The modes, the token-local stages and the logical names of the l2n programs are the deterministic package's;
-    the l2n stages add the fused gradient (whose S1 records serve the flag-off mode alone)."""
+    the l2n stages add the fused gradient (whose S1 records serve the flag-off mode alone) and the parameter finalize
+    (whose R1c casts serve the flag-off mode alone)."""
     assert (
         tuple(cake_backend.L2N_MODES)
         == tuple(cake_jit.L2N_MODES)
         == tuple(det_jit.L2N_MODES)
         == L2N_MODES
     )
-    assert set(cake_jit.L2N_STAGES) == set(det_jit.L2N_STAGES) | {"dqkg"}
-    assert "dqkg" not in det_jit.L2N_STAGES
+    nd_only = {"dqkg", "param_finalize"}
+    assert set(cake_jit.L2N_STAGES) == set(det_jit.L2N_STAGES) | nd_only
+    assert not nd_only & set(det_jit.L2N_STAGES)
     for stage in ("qk_l2norm", "qk_apply", "qk_pullback"):
         assert stage in cake_jit.STAGES and stage in cake_jit.OPTIONAL_STAGES
         assert stage in cake_jit.L2N_STAGES
     assert tuple(cake_jit.STAGES) == tuple(det_jit.STAGES)
-    assert tuple(cake_jit.LOGICAL_TENSORS) == tuple(det_jit.LOGICAL_TENSORS)
+    # the logical tensors are the deterministic package's plus the R1c accumulators (a flag-off record's operand)
+    own = ("param_acc",)
+    assert "param_acc" in cake_jit.LOGICAL_TENSORS
+    assert "param_acc" not in det_jit.LOGICAL_TENSORS
+    assert tuple(n for n in cake_jit.LOGICAL_TENSORS if n not in own) == tuple(
+        det_jit.LOGICAL_TENSORS
+    )
     assert tuple(cake_jit.LOGICAL_SCALARS) == tuple(det_jit.LOGICAL_SCALARS)
     for name in ("q_raw", "k_raw", "qn", "kn", "qk_rstd", "qn_int", "kn_int"):
         assert name in cake_jit.LOGICAL_TENSORS

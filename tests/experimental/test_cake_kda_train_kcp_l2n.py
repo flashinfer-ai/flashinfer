@@ -2492,7 +2492,10 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
             if kind.startswith("bwd"):
                 i = names.index("qk_pullback")
                 assert "_l2n_capture" in names[i - 1], names
-                assert names[i + 1 :] == (["param_finalize"] if gate == "raw" else [])
+                # the raw gate's parameter finalize of the l2n modes: the deterministic record (param_finalize_l2n)
+                assert names[i + 1 :] == (
+                    ["param_finalize_l2n"] if gate == "raw" else []
+                )
 
 
 def _drive_local(pkg: str, H: int, arch: str, sm: int, gate: str, mode: str, kind: str):
@@ -2757,7 +2760,8 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     rides on dg (raw gate mode: on ``dg_raw`` only where it covers the ``R`` rows, here not, so ``qn`` is per
     call).  Every launch that binds ``v_new`` / ``dv2`` binds the moved views and comes before the first launch
     that binds an output they ride on; the arena's cached views are not rebound; the backward allocates no byte
-    beyond the flag-off backward's but the replay's rstd (and the raw mode's per-call ``qn``).  A forward and a
+    beyond the flag-off backward's but the replay's rstd (and the raw mode's per-call ``qn``; on an R1c row, whose
+    flag-off backward reduces on the workspace's accumulators, the deterministic pair's partials).  A forward and a
     rank whose internal rows exceed twice its tokens move nothing; the decision is kept per plan."""
     missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
     if missing is not None:
@@ -2787,6 +2791,15 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
         def views(self, mode: str):
             assert mode == cake_kcp.LOCAL_LAYOUT_BWD, mode
             return self.ns
+
+        def _param_acc_begin(self, entry: str) -> torch.Tensor:
+            # the R1c accumulators of a flag-off raw row (sm_100a / sm_103a): the workspace's, no per-call bytes
+            stripes = cake_backend._r1c_stripes(self.plan)
+            assert stripes is not None and self.plan.l2n == "off", entry
+            return torch.zeros((stripes, H, 2, D), dtype=torch.float64)
+
+        def _param_acc_end(self) -> None:
+            pass
 
         def _launch(self, record, values, *, grid, device_index) -> None:
             launches.append(("backend", record, dict(values)))
@@ -2854,8 +2867,14 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     ctx = _cpu_ctx(sm=sm)
     T = int(ctx.T_r)
     call, res, allocs = drive(ctx, form)
-    _, _, allocs_off = drive(ctx, "off")
+    call_off, _, allocs_off = drive(ctx, "off")
     p = call.local.plan
+    # an l2n mode's raw backward runs the deterministic parameter pair (per-call partials dA_part / db_part), the
+    # flag-off one of an R1c row (sm_100a / sm_103a) the R1c pair on the workspace's accumulators
+    assert cake_backend._r1c_stripes(p) is None
+    r1c_off = cake_backend._r1c_stripes(call_off.local.plan) is not None
+    want_r1c = gate == "raw" and arch in ("sm_100a", "sm_103a")
+    assert r1c_off == want_r1c, (gate, arch)
     # the one-token document pads its chunk: dg_raw does not cover R
     assert T < p.R <= 2 * T
     dg = "dg_raw" if gate == "raw" else "dg"
@@ -2911,6 +2930,8 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     extra = (0 if kind == "bwd_saved" else 8 * T * H) + (
         0 if "v_new" in expected else T * H * D * 2
     )
+    # and on an R1c row the deterministic pair's FP32 partials [NC_pad, H, 128, 2] (dA_part, db_part)
+    extra += 2 * int(p.NC_pad) * H * D * 2 * 4 if r1c_off else 0
     assert sum(allocs) - sum(allocs_off) == extra
     assert p.workspace_bytes("replay") == cake_backend.plan(
         ctx.T_r, ctx.n_frag, H, sm, arch, gate=gate

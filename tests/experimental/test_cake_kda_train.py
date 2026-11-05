@@ -366,6 +366,10 @@ def _rule_kinds(rule: dict) -> list[str]:
     return kinds
 
 
+# the replay prep's saved-rstd twin (the deterministic package's copy, launched by name by the KCP backward in place of
+# its record when it reads the saved rstd): no plan's form
+FUSED_L2N_TWINS = {"bwd_prep_g8_replay_saved_l2n": "bwd_prep_g8_replay_l2n"}
+
 SELECT_KINDS = (
     "always",
     "otherwise",
@@ -396,6 +400,7 @@ SELECT_KINDS = (
     "arch_in",
     "path_in",
     "l2n_in",
+    "saved_rstd_twin",  # a record launched by name in place of another, never selected (#7817)
 )
 GRID_KINDS = (
     "fixed",
@@ -1130,9 +1135,11 @@ def test_registry_records_are_well_formed() -> None:
         "arches": unfused,
     }
     glm_records = set(cake_jit.records_of_stage("glm_intra"))
-    # and the deterministic package's GLM intra programs of the in-kernel Q/K L2 norm (fused, fallback capture)
+    # and the deterministic package's GLM intra programs of the in-kernel Q/K L2 norm (fused, its sm_103a form,
+    # fallback capture)
     assert glm_records == set(DET_GLM.values()) | set(S1_GLM.values()) | {
         "glm_intra_l2n",
+        "glm_intra_v30_l2n",
         "glm_intra_l2n_capture",
     }
     for name in (*sorted(glm_records), "gate_epilogue"):
@@ -1661,10 +1668,11 @@ def test_the_l2n_class_is_the_deterministic_l2n_class() -> None:
         if rec["stage"] in L2N_STAGES
         and (serves(rec, "fused") or serves(rec, "fallback"))
     }
-    # the deterministic l2n records: the 7 g + 7 raw fused ones, the sm_103a form, the 2 capture forms, the 3
-    # fallback programs and the 4 plain records the fused route keeps (fwd_intra / bwd_prep_g8_replay, g and raw)
+    # the deterministic l2n records: the 7 g + 7 raw fused ones, the sm_103a forward intra and GLM intra forms, the
+    # replay prep's saved-rstd twin, the 2 capture forms, the 3 fallback programs and the 4 plain records the fused
+    # route keeps (fwd_intra / bwd_prep_g8_replay, g and raw)
     det_l2n_only = {n for n in det_l2n if not serves(det_jit.MODULES[n], "off")}
-    assert len(det_l2n_only) == 20, sorted(det_l2n_only)
+    assert len(det_l2n_only) == 22, sorted(det_l2n_only)
     assert det_l2n <= set(cake_jit.MODULES)
     compared = 0
     for name in sorted(det_l2n):
@@ -2931,10 +2939,12 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
     fused_preps = tuple(f"{name}_l2n" for name in preps)
 
     def l2n_class(fused: bool) -> tuple[str, ...]:
+        # the saved-rstd twin (FUSED_L2N_TWINS) is no plan's form; the l2n class test compares it with its source
         return tuple(
             n
             for n in cake_jit.records_of_stage("bwd_prep")
             if (cake_jit.MODULES[n].get("l2n", ["off"]) == ["fused"]) == fused
+            and n not in FUSED_L2N_TWINS
         )
 
     assert l2n_class(False) == preps
