@@ -15,7 +15,7 @@ def _stage_kernel(
     weights,
     out_ids,
     out_weights,
-    ROWS: tl.constexpr,
+    ROWS,  # runtime: token count varies per call; constexpr would JIT per value
     INPUT_STRIDE: tl.constexpr,
     TOPK: tl.constexpr,
     HIDDEN: tl.constexpr,

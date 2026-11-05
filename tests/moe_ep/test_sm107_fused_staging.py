@@ -51,7 +51,7 @@ def compare(monkeypatch, x, topk=10, kind="mxfp8_e4m3", graph=False, strided=Fal
         assert torch.equal(
             expected[0].view(torch.uint8)[~en], actual[0].view(torch.uint8)[~an]
         )
-        for a, b in zip(expected[1:], actual[1:]):
+        for a, b in zip(expected[1:], actual[1:], strict=True):
             assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
     check()
