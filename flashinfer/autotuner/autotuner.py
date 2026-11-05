@@ -2545,12 +2545,9 @@ class AutoTuner:
     ) -> tuple[tuple[int, ...], ...] | None:
         """Return the largest tuned profile for a lookup above the tuned range.
 
-        A lookup's bucket can lie above every bucket tuned for the op: the
-        runtime size exceeds the tuned sizes, or tuning ran under
-        ``autotune(tuning_buckets=...)`` and stored its top bucket under a
-        value the op's own ``map_to_tuning_buckets`` never produces (e.g.
-        21504 stored as 21504 but looked up as its next power of two, 32768).
-        Either way the lookup would silently use the untuned fallback.
+        A lookup's bucket can lie above every bucket tuned for the op when the
+        runtime size exceeds the tuned sizes; the lookup would then silently
+        use the untuned fallback.
 
         Candidates are the tuned profiles in the active in-memory partition,
         the user-loaded configs and the hydrated entries of the active
