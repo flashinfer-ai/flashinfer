@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.mamba import causal_conv1d_fn, causal_conv1d_update
+from flashinfer.mamba.causal_conv1d import _prefill_workspace_size
 
 from .triton_reference.causal_conv1d_triton import (
     causal_conv1d_fn as triton_prefill,
@@ -233,7 +234,9 @@ def test_prefill_chunking_and_decode_are_identical():
         ("prefill", 3, 129, "ds", 1, True),
         ("prefill", 32, 24, "sd", 0, False),
         ("prefill", 33, 256, "sd", 8, False),
+        ("prefill", 64, 256, "sd", 0, False),
         ("prefill", 97, 24, "ds", 0, False),
+        ("prefill", 256, 24, "sd", 0, False),
         ("spec", 3, 256, "sd", 8, True),
         ("spec", 3, 129, "ds", 1, False),
         ("spec", 3, 128, "sd", 1, False),
@@ -243,9 +246,9 @@ def test_prefill_chunking_and_decode_are_identical():
 def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, strided):
     prefill, speculative = kind == "prefill", kind == "spec"
     if n == 1:
-        lengths = [35]
+        lengths = [40]
     elif n >= 32:
-        lengths = [32] * n
+        lengths = [64 if n == 64 else 32] * n
     elif kind == "decode":
         lengths = [1] * n
     else:
@@ -274,7 +277,17 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
     )
     mask = torch.ones(n, device="cuda", dtype=torch.bool)
     accepted = torch.ones(n, device="cuda", dtype=torch.int32) if speculative else None
-    workspace = torch.full((n + 4,), -123, device="cuda", dtype=torch.int32)
+    workspace_size = _prefill_workspace_size(rows, n) if prefill else 0
+    workspace = torch.full(
+        (workspace_size + 3,), -123, device="cuda", dtype=torch.int32
+    )
+
+    if prefill and n == 33:
+        expected = _reference(
+            x, w, state, lengths, list(range(n)), prefill=True, initial=[True] * n
+        )
+        automatic = causal_conv1d_fn(x, w, state, offsets, slots, mask)
+        _assert_result(automatic, state, expected)
 
     def run(pool, output):
         if prefill:
@@ -297,14 +310,21 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
         run(state, out)
     oracle = state.clone()
     if n >= 32:
-        variants = [[1] * (n - 1) + [rows - n + 1], [0] * (n - 1) + [rows], lengths]
-    elif n == 1 or kind == "decode":
+        variants = [
+            [1] * (n - 1) + [rows - n + 1],
+            [0] * n,
+            [0] * (n - 1) + [rows // 2],
+            lengths,
+        ]
+    elif n == 1:
+        variants = [[30], [1], [0], [40]]
+    elif kind == "decode":
         variants = [lengths] * 3
     else:
         variants = [[5, 7, 5], [0, 16, 1], [1, 0, 16]]
     for step, lengths in enumerate(variants):
         slot_ids = [(i + step) % (n + 3) for i in range(n)]
-        if step == 1:
+        if step == 1 and n != 1:
             slot_ids[0] = -1
         counts = None
         if speculative:
@@ -330,9 +350,11 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
             initial=mask.cpu().tolist(),
             accepted=counts,
         )
-        eager_state, eager_out = oracle.clone(), torch.empty_like(out)
+        expected[0][sum(lengths) :].fill_(-11)
+        eager_state, eager_out = oracle.clone(), torch.full_like(out, -11)
         run(eager_state, eager_out)
         workspace.fill_(-123)
+        out.fill_(-11)
         graph.replay()
         _assert_result(out, state, expected)
         torch.testing.assert_close(
@@ -349,6 +371,66 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
             )
             assert torch.all(tail == -7)
         oracle.copy_(expected[1])
+
+
+@pytest.mark.parametrize(
+    "layout,channels,history",
+    [("sd", 256, 7), ("sd", 129, 7), ("ds", 129, 7), ("sd", 256, 19), ("ds", 129, 19)],
+)
+def test_speculative_overflow_preserves_state_bounds(layout, channels, history):
+    tokens = history - 1
+    x = torch.randn(tokens, channels, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(channels, 4, device="cuda") * 0.1
+    state = _state(3, channels, history, layout, padding=16)
+    slots = torch.tensor([1], device="cuda", dtype=torch.int32)
+    accepted = torch.ones(1, device="cuda", dtype=torch.int32)
+    offsets = _offsets([tokens])
+    out = torch.full_like(x, -11)
+
+    def run():
+        return causal_conv1d_update(
+            x,
+            w,
+            state,
+            slots,
+            cu_seqlens=offsets,
+            num_accepted_tokens=accepted,
+            out=out,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for length, count in (
+        (tokens, 1),
+        (history - 2, history - 2),
+        (tokens, history - 1),
+    ):
+        original = state.clone()
+        expected_state = original.clone()
+        expected_out = torch.full_like(x, -11)
+        if count <= history - 2:
+            extended = torch.zeros(
+                3, channels, tokens + 2, device="cuda", dtype=torch.bfloat16
+            )
+            extended[:, :, :history] = original
+            expected = _reference(
+                x[:length], w, extended, [length], [1], accepted=[count]
+            )
+            expected_out[:length] = expected[0]
+            expected_state.copy_(expected[1][:, :, :history])
+        else:
+            expected_out[:length] = 0
+        accepted.fill_(count)
+        offsets.copy_(_offsets([length]))
+        out.fill_(-11)
+        x_bits = x.view(torch.int16).clone()
+        graph.replay()
+        _assert_result(out, state, (expected_out, expected_state))
+        torch.testing.assert_close(x.view(torch.int16), x_bits, atol=0, rtol=0)
+        padding = state.as_strided((3, 16), (state.stride(0), 1), channels * history)
+        assert torch.all(padding == -7)
 
 
 def test_empty_calls_output_lifetime_and_aliasing():

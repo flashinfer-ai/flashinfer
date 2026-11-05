@@ -43,6 +43,43 @@ def _step(h0, h1, h2, current, w0, w1, w2, w3, bias):
 
 
 @cute.jit
+def _token_loop(
+    x,
+    out,
+    state,
+    slot,
+    channel,
+    start,
+    stop,
+    h0,
+    h1,
+    h2,
+    w0,
+    w1,
+    w2,
+    w3,
+    bias,
+    speculative: cutlass.Constexpr,
+):
+    if cutlass.const_expr(speculative):
+        state[slot, channel, 0] = h1.to(cutlass.BFloat16)
+        state[slot, channel, 1] = h2.to(cutlass.BFloat16)
+    for token in cutlass.range(start, stop):
+        current = x[token, channel].to(cutlass.Float32)
+        value = _step(h0, h1, h2, current, w0, w1, w2, w3, bias)
+        out[token, channel] = value.to(cutlass.BFloat16)
+        h0, h1, h2 = h1, h2, current
+        if cutlass.const_expr(speculative):
+            position = token - start + 2
+            if position < state.shape[2]:
+                state[slot, channel, position] = x[token, channel]
+    if cutlass.const_expr(not speculative):
+        state[slot, channel, 0] = h0.to(cutlass.BFloat16)
+        state[slot, channel, 1] = h1.to(cutlass.BFloat16)
+        state[slot, channel, 2] = h2.to(cutlass.BFloat16)
+
+
+@cute.jit
 def _token_tile(
     x,
     out,
@@ -112,7 +149,7 @@ def _store_state_tile(
         offset = (i * block_c + tid) * 8
         row = offset // block_c
         column = offset % block_c
-        if row < length + 2:
+        if row < cute.min(length + 2, cutlass.Int64(max_tokens + 2)):
             values = cute.make_rmem_tensor((8,), cutlass.BFloat16)
             source = cute.make_tensor(
                 state_tile.iterator + offset, cute.make_layout((8,))
@@ -145,31 +182,41 @@ def _warp_chunk_prefix(offsets, base, block_t: cutlass.Constexpr):
 
 
 @cute.kernel
-def _chunk_prefix(
-    offsets: cute.Tensor, prefix: cute.Tensor, block_t: cutlass.Constexpr
+def _build_chunk_map(
+    offsets: cute.Tensor, mapping: cute.Tensor, block_t: cutlass.Constexpr
 ):
+    seq, _, _ = cute.arch.block_idx()
     lane = cute.arch.lane_idx()
     count = offsets.shape[0] - 1
-    carry = cutlass.Int32(0)
-    if lane == 0:
-        prefix[0] = carry
+    first = cutlass.Int32(0)
+    total = cutlass.Int32(0)
     for base in cutlass.range(0, count, 32):
-        seq = base + lane
         value = _warp_chunk_prefix(offsets, base, block_t)
-        if seq < count:
-            prefix[seq + 1] = carry + value
-        carry += cute.arch.shuffle_sync(value, 31)
+        group_total = cute.arch.shuffle_sync(value, 31)
+        preceding_lane = cute.max(0, cute.min(seq - base, 32) - 1)
+        preceding = cute.arch.shuffle_sync(value, preceding_lane)
+        if seq > base:
+            first += preceding
+        total += group_total
+    if seq == 0 and lane == 0:
+        mapping[0] = total
+    length = cutlass.Int64(offsets[seq + 1]) - offsets[seq]
+    chunks = cutlass.Int32((length + block_t - 1) // block_t)
+    for chunk in cutlass.range(lane, chunks, 32):
+        index = cutlass.Int64(first + chunk) * 2 + 1
+        mapping[index] = seq
+        mapping[index + 1] = chunk
 
 
 @cute.jit
-def _prefix_launch(
+def _chunk_map_launch(
     offsets: cute.Tensor,
-    prefix: cute.Tensor,
+    mapping: cute.Tensor,
     block_t: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
-    _chunk_prefix(offsets, prefix, block_t).launch(
-        grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+    _build_chunk_map(offsets, mapping, block_t).launch(
+        grid=(offsets.shape[0] - 1, 1, 1), block=(32, 1, 1), stream=stream
     )
 
 
@@ -218,7 +265,7 @@ def _conv(
     accepted: cute.Tensor,
     bias: cute.Tensor,
     out: cute.Tensor,
-    prefix: cute.Tensor,
+    mapping: cute.Tensor,
     prefill: cutlass.Constexpr,
     packed: cutlass.Constexpr,
     has_initial: cutlass.Constexpr,
@@ -252,7 +299,8 @@ def _conv(
         if cutlass.const_expr(single_sequence):
             seq = cutlass.Int32(0)
             chunk = task
-            active_task = cutlass.Int64(task) * block_t < x.shape[0]
+            sequence_length = cutlass.Int64(offsets[1]) - offsets[0]
+            active_task = cutlass.Int64(task) * block_t < sequence_length
         elif cutlass.const_expr(inline_prefix):
             cumulative = _warp_chunk_prefix(offsets, cutlass.Int32(0), block_t)
             active_task = task < cute.arch.shuffle_sync(cumulative, 31)
@@ -263,21 +311,11 @@ def _conv(
                     previous = cute.arch.shuffle_sync(cumulative, seq - 1)
                 chunk = task - previous
         else:
-            active_task = task < prefix[slots.shape[0]]
-        if (
-            cutlass.const_expr(not inline_prefix and not single_sequence)
-            and active_task
-        ):
-            lo = cutlass.Int32(0)
-            hi = cutlass.Int32(slots.shape[0])
-            while lo < hi:
-                mid = lo + (hi - lo) // 2
-                if prefix[mid + 1] <= task:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            seq = lo
-            chunk = task - prefix[seq]
+            active_task = task < mapping[0]
+            if active_task:
+                index = cutlass.Int64(task) * 2 + 1
+                seq = mapping[index]
+                chunk = mapping[index + 1]
     begin = cutlass.Int64(seq)
     end = begin + 1
     slot = cutlass.Int64(-1)
@@ -291,9 +329,7 @@ def _conv(
         if cutlass.const_expr(not warp_metadata):
             begin = cutlass.Int64(seq)
             end = begin + 1
-            if cutlass.const_expr(prefill and single_sequence):
-                end = cutlass.Int64(x.shape[0])
-            elif cutlass.const_expr(packed):
+            if cutlass.const_expr(packed):
                 begin = cutlass.Int64(offsets[seq])
                 end = cutlass.Int64(offsets[seq + 1])
             slot = cutlass.Int64(slots[seq])
@@ -308,7 +344,7 @@ def _conv(
         history_offset = cutlass.Int64(0)
         live = slot != -1
         if cutlass.const_expr(speculative):
-            live = live and count > 0
+            live = live and count > 0 and count <= state.shape[2] - 2
             history_offset = cutlass.Int64(count) - 1
         if start < stop:
             if live:
@@ -343,14 +379,14 @@ def _conv(
                         state[slot, channel, 0] = tail0.to(cutlass.BFloat16)
                         state[slot, channel, 1] = tail1.to(cutlass.BFloat16)
                         state[slot, channel, 2] = x[end - 1, channel]
-                elif cutlass.const_expr(speculative):
-                    if cutlass.const_expr(vector_state):
-                        state_tile[0, tid] = h1.to(cutlass.BFloat16)
-                        state_tile[1, tid] = h2.to(cutlass.BFloat16)
-                    elif cutlass.const_expr(not defer_state):
-                        state[slot, channel, 0] = h1.to(cutlass.BFloat16)
-                        state[slot, channel, 1] = h2.to(cutlass.BFloat16)
-
+                elif cutlass.const_expr(speculative and max_tokens > 0):
+                    if stop - start <= max_tokens:
+                        if cutlass.const_expr(vector_state):
+                            state_tile[0, tid] = h1.to(cutlass.BFloat16)
+                            state_tile[1, tid] = h2.to(cutlass.BFloat16)
+                        elif cutlass.const_expr(not defer_state):
+                            state[slot, channel, 0] = h1.to(cutlass.BFloat16)
+                            state[slot, channel, 1] = h2.to(cutlass.BFloat16)
                 taps = cute.make_rmem_tensor((4,), weight.element_type)
                 source = cute.make_tensor(
                     weight.iterator + cute.assume(channel * 4, divby=4),
@@ -366,32 +402,67 @@ def _conv(
                     b = bias[channel].to(cutlass.Float32)
                 if cutlass.const_expr(prefill or max_tokens > 0):
                     tile = block_t if cutlass.const_expr(prefill) else max_tokens
-                    if full_tile and stop - start == tile:
-                        _token_tile(
-                            x,
-                            out,
-                            state,
-                            slot,
-                            channel,
-                            start,
-                            stop,
-                            h0,
-                            h1,
-                            h2,
-                            w0,
-                            w1,
-                            w2,
-                            w3,
-                            b,
-                            tile,
-                            speculative,
-                            True,
-                            state_tile,
-                            vector_state,
-                            defer_state,
-                        )
+                    if prefill or stop - start <= tile:
+                        if full_tile and stop - start == tile:
+                            _token_tile(
+                                x,
+                                out,
+                                state,
+                                slot,
+                                channel,
+                                start,
+                                stop,
+                                h0,
+                                h1,
+                                h2,
+                                w0,
+                                w1,
+                                w2,
+                                w3,
+                                b,
+                                tile,
+                                speculative,
+                                True,
+                                state_tile,
+                                vector_state,
+                                defer_state,
+                            )
+                        else:
+                            _token_tile(
+                                x,
+                                out,
+                                state,
+                                slot,
+                                channel,
+                                start,
+                                stop,
+                                h0,
+                                h1,
+                                h2,
+                                w0,
+                                w1,
+                                w2,
+                                w3,
+                                b,
+                                tile,
+                                speculative,
+                                False,
+                                state_tile,
+                                vector_state,
+                                defer_state,
+                            )
+                        if cutlass.const_expr(vector_state):
+                            _store_state_tile(
+                                state,
+                                state_tile,
+                                slot,
+                                cutlass.Int64(channel_tile) * block_c,
+                                stop - start,
+                                max_tokens,
+                                block_c,
+                            )
                     else:
-                        _token_tile(
+                        _token_loop(
                             x,
                             out,
                             state,
@@ -407,35 +478,27 @@ def _conv(
                             w2,
                             w3,
                             b,
-                            tile,
                             speculative,
-                            False,
-                            state_tile,
-                            vector_state,
-                            defer_state,
                         )
                 else:
-                    for token in cutlass.range(start, stop):
-                        current = x[token, channel].to(cutlass.Float32)
-                        value = _step(h0, h1, h2, current, w0, w1, w2, w3, b)
-                        out[token, channel] = value.to(cutlass.BFloat16)
-                        h0, h1, h2 = h1, h2, current
-                        if cutlass.const_expr(speculative):
-                            state[slot, channel, token - begin + 2] = x[token, channel]
-                if cutlass.const_expr(vector_state):
-                    _store_state_tile(
+                    _token_loop(
+                        x,
+                        out,
                         state,
-                        state_tile,
                         slot,
-                        cutlass.Int64(channel_tile) * block_c,
-                        stop - start,
-                        max_tokens,
-                        block_c,
+                        channel,
+                        start,
+                        stop,
+                        h0,
+                        h1,
+                        h2,
+                        w0,
+                        w1,
+                        w2,
+                        w3,
+                        b,
+                        speculative,
                     )
-                if cutlass.const_expr(not prefill and not speculative):
-                    state[slot, channel, 0] = h0.to(cutlass.BFloat16)
-                    state[slot, channel, 1] = h1.to(cutlass.BFloat16)
-                    state[slot, channel, 2] = h2.to(cutlass.BFloat16)
             else:
                 for token in cutlass.range(start, stop):
                     out[token, channel] = cutlass.BFloat16(0.0)
@@ -452,7 +515,7 @@ def _launch(
     accepted,
     bias,
     out,
-    prefix,
+    mapping,
     prefill: cutlass.Constexpr,
     packed: cutlass.Constexpr,
     has_initial: cutlass.Constexpr,
@@ -487,7 +550,7 @@ def _launch(
         accepted,
         bias,
         out,
-        prefix,
+        mapping,
         prefill,
         packed,
         has_initial,
@@ -516,12 +579,12 @@ def _vector(dtype):
 
 
 @functools.cache
-def get_prefix_kernel(arch, device_index, block_t=BLOCK_T):
+def get_chunk_map_kernel(arch, device_index, block_t=BLOCK_T):
     return build_and_load_cute_dsl_kernel(
         "causal_conv1d",
-        f"prefix_t{block_t}_{arch}",
+        f"chunk_map_t{block_t}_{arch}",
         lambda: cute.compile(
-            _prefix_launch,
+            _chunk_map_launch,
             _vector(cutlass.Int32),
             _vector(cutlass.Int32),
             block_t,
@@ -601,7 +664,7 @@ def get_conv_kernel(
         assumed_align=2,
     )
     name = (
-        f"w4_p{int(prefill)}_r{int(packed)}_h{int(has_initial)}"
+        f"w4_map_p{int(prefill)}_r{int(packed)}_h{int(has_initial)}"
         f"_s{int(speculative)}_w{int(weight_fp32)}_b{bias_kind}"
         f"_l{int(channel_contiguous)}_u{max_tokens}_pfx{int(inline_prefix)}"
         f"_a{weight_alignment}_t{block_t}_c{block_c}_f{int(full_tile)}"

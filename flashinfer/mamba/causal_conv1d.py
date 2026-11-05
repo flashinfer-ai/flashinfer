@@ -18,8 +18,17 @@ def _supported(x, *args, **kwargs):
     return x.is_cuda and get_compute_capability(x.device) in ((10, 0), (10, 3))
 
 
-def _prefill_workspace_size(num_sequences):
-    return num_sequences + 1 if num_sequences > 32 else 0
+def _prefill_block_t(rows, num_sequences):
+    threshold = 64 if num_sequences > 32 else 128
+    return 8 if rows < threshold * num_sequences else 16
+
+
+def _prefill_workspace_size(rows, num_sequences):
+    if num_sequences <= 32 or rows == 0:
+        return 0
+    block_t = _prefill_block_t(rows, num_sequences)
+    capacity = min(rows, (rows + block_t - 1) // block_t + num_sequences)
+    return 1 + 2 * capacity
 
 
 def _disjoint(name, destination, *sources):
@@ -113,7 +122,7 @@ def _run(
 ):
     if x.shape[0] == 0:
         return out
-    from ..cute_dsl.causal_conv1d import BLOCK_C, get_conv_kernel, get_prefix_kernel
+    from ..cute_dsl.causal_conv1d import BLOCK_C, get_chunk_map_kernel, get_conv_kernel
 
     with torch.cuda.device(x.device):
         major, minor = get_compute_capability(x.device)
@@ -121,8 +130,8 @@ def _run(
         kind = "none"
         if bias is not None:
             kind = "fp32" if bias.dtype == torch.float32 else "bf16"
-        inline_prefix = prefill and not _prefill_workspace_size(indices.numel())
-        block_t = 8 if prefill and x.shape[0] < 128 * indices.numel() else 16
+        inline_prefix = prefill and indices.numel() <= 32
+        block_t = _prefill_block_t(x.shape[0], indices.numel()) if prefill else 16
         max_tokens = state.shape[2] - 2 if accepted is not None else 0
         if max_tokens > 16:
             max_tokens = 0
@@ -180,7 +189,7 @@ def _run(
             ),
         )
         if prefill and not inline_prefix:
-            get_prefix_kernel(arch, x.device.index, block_t)(offsets, workspace)
+            get_chunk_map_kernel(arch, x.device.index, block_t)(offsets, workspace)
         kernel(
             x,
             weight,
@@ -210,6 +219,58 @@ def causal_conv1d_fn(
     out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Apply width-four causal depthwise convolution and SiLU to packed sequences.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 CUDA input of shape ``[rows, channels]`` with contiguous channels.
+        Rows may have padding. State history stores these raw inputs.
+    weight : torch.Tensor
+        Contiguous FP32 or BF16 CUDA taps ``[channels, 4]``. Tap 3 multiplies
+        the current token. Accumulation and SiLU use FP32.
+    conv_state : torch.Tensor
+        In-place BF16 pool ``[slots, channels, L]``, ``L >= 3``. Either the
+        channel or history axis must be contiguous; slots must not overlap.
+        Each nonempty active sequence writes its final three raw history
+        values to positions 0:3, leaving the rest of the pool unchanged.
+    cu_seqlens : torch.Tensor
+        Contiguous CUDA int32 offsets ``[N+1]``, starting at zero,
+        nondecreasing, with the last offset at most ``rows``. Rows after the
+        last offset are not written. Empty sequences do not update state.
+    cache_indices : torch.Tensor
+        Contiguous CUDA int32 slot IDs ``[N]``. The -1 sentinel produces zero
+        output without accessing state. Live slots must be unique and in
+        ``[0, slots)``; slot zero is valid.
+    has_initial_state : Optional[torch.Tensor]
+        Contiguous CUDA bool ``[N]``. True rows read state positions 0:3;
+        false or omitted rows start from zero history.
+    bias : Optional[torch.Tensor]
+        Contiguous FP32 or BF16 CUDA ``[channels]``, added before the four FMAs.
+    out : Optional[torch.Tensor]
+        BF16 output matching x, with contiguous channels and nonoverlapping
+        rows. Must not share storage with any operand. Allocated if omitted;
+        unused trailing rows of an allocated output are unspecified.
+    workspace : Optional[torch.Tensor]
+        Contiguous CUDA int32 scratch. For ``N > 32`` and nonempty x, needs
+        ``1 + 2 * min(rows, ceil(rows / B) + N)`` elements, where B is 8 if
+        ``rows < 64*N`` and 16 otherwise. Allocated if omitted. Smaller
+        batches need no scratch. The chunk map is rebuilt on every call.
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 output ``[rows, channels]``; conv_state is updated in place.
+
+    Notes
+    -----
+    Device offset and slot values are caller-owned constraints; no host read
+    or validation synchronization occurs. State and workspace must not alias
+    other operands. Concurrent calls need disjoint live slots and scratch.
+    CUDA graph replay may change device metadata in place within fixed
+    capacities. Supply out and workspace before capture to reuse storage.
+    After prefill, the first speculative update uses accepted count 1.
+    """
     out = _validate(x, weight, conv_state, cache_indices, bias, out)
     n = cache_indices.numel()
     _vector("cu_seqlens", cu_seqlens, n + 1, torch.int32, x.device)
@@ -217,18 +278,18 @@ def causal_conv1d_fn(
         _vector("has_initial_state", has_initial_state, n, torch.bool, x.device)
     _disjoint("out", out, cu_seqlens, has_initial_state)
     _disjoint("conv_state", conv_state, cu_seqlens, has_initial_state)
-    workspace_size = _prefill_workspace_size(n)
+    workspace_size = _prefill_workspace_size(x.shape[0], n)
     if workspace is None and workspace_size:
         workspace = torch.empty(workspace_size, dtype=torch.int32, device=x.device)
     elif workspace is not None and (
         workspace.ndim != 1
-        or workspace.numel() < n + 1
+        or workspace.numel() < workspace_size
         or workspace.dtype != torch.int32
         or workspace.device != x.device
         or not workspace.is_contiguous()
     ):
         raise ValueError(
-            "workspace must be contiguous CUDA int32 with at least N+1 elements"
+            f"workspace must be contiguous CUDA int32 with at least {workspace_size} elements"
         )
     if workspace is not None:
         _disjoint(
@@ -271,6 +332,60 @@ def causal_conv1d_update(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Apply width-four causal convolution and SiLU, updating raw-input history.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 CUDA input ``[rows, channels]`` with contiguous channels and
+        nonoverlapping, optionally padded rows.
+    weight : torch.Tensor
+        Contiguous FP32 or BF16 CUDA ``[channels, 4]``. Tap 3 multiplies the
+        current token. Accumulation and SiLU use FP32.
+    conv_state : torch.Tensor
+        In-place BF16 ``[slots, channels, L]``, ``L >= 3``, with nonoverlapping
+        slots and either the channel or history axis contiguous. Ordinary
+        updates read positions 0:3 and replace them with the final three raw
+        inputs/history values; remaining positions are unchanged.
+    state_indices : torch.Tensor
+        Contiguous CUDA int32 ``[N]``. Live slot IDs must be unique and in
+        ``[0, slots)``. The -1 sentinel produces zero output and no state
+        access; slot zero is valid.
+    cu_seqlens : Optional[torch.Tensor]
+        Contiguous CUDA int32 ``[N+1]``. Offsets start at zero, are
+        nondecreasing and end at most at rows. Trailing output rows and state
+        for empty sequences remain untouched. If omitted, rows must equal N
+        and each sequence contains one token.
+    num_accepted_tokens : Optional[torch.Tensor]
+        Contiguous CUDA int32 ``[N]`` enabling linear speculative updates.
+        A positive count a includes the bonus token accepted from the previous
+        call and reads history ``state[..., a-1:a+2]``; require ``1 <= a <= L-2``
+        and a window written by that call. Nonpositive counts skip the row,
+        producing zero output and leaving state unchanged. A current sequence
+        of T tokens requires ``T <= L-2`` and writes
+        ``[old_h1, old_h2, x0, ..., x(T-1)]`` to positions ``0:T+2``.
+    bias : Optional[torch.Tensor]
+        Contiguous FP32 or BF16 CUDA ``[channels]``, added before the four FMAs.
+    out : Optional[torch.Tensor]
+        BF16 storage matching x with contiguous channels and nonoverlapping
+        rows. Must not share storage with any operand. Allocated if omitted;
+        unused trailing rows of an allocated output are unspecified.
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 output ``[rows, channels]``; conv_state is updated in place.
+
+    Notes
+    -----
+    Device offset and slot values are caller-owned constraints; no host read
+    or validation synchronization occurs. State must not alias other operands.
+    CUDA graph replay may change lengths, slots and counts in place within
+    fixed capacities. No workspace is needed. An accepted count above L-2
+    skips the row. A speculative sequence exceeding L-2 still produces all
+    outputs, but stores only the history prefix that fits; it cannot supply
+    a complete history for subsequent speculative verification.
+    """
     out = _validate(x, weight, conv_state, state_indices, bias, out)
     n = state_indices.numel()
     if cu_seqlens is None:
