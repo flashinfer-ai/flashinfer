@@ -1435,21 +1435,41 @@ def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
     cols = torch.arange(keys, device="cuda")
     window = (cols >= ks[:, None]) & (cols < ke[:, None])
     whole = {
-        clean: fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean).clone()
+        clean: fp8_mqa_logits(
+            q, (kv, scales), weights, ks, ke, clean_logits=clean
+        ).clone()
         for clean in (True, False)
     }
     # 256 rows of logits per launch: five ranges, the last one short.
     monkeypatch.setattr(
         _runtime, "MAX_LAUNCH_LOGITS", 256 * _runtime.logits_stride(keys)
     )
-    split = {
-        clean: fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean)
-        for clean in (True, False)
-    }
+    # Raw and cleaned programs write the same window bits, so the window check alone
+    # cannot see whether each range's plan gets the caller's clean_logits.
+    plan_flags = []
+    real_plan = _runtime.DenseMqaPlan
+
+    def recording_plan(*args, **kwargs):
+        plan_flags.append(kwargs.get("clean_logits"))
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(_runtime, "DenseMqaPlan", recording_plan)
+    split = {}
+    for clean in (True, False):
+        plan_flags.clear()
+        split[clean] = fp8_mqa_logits(
+            q, (kv, scales), weights, ks, ke, clean_logits=clean
+        )
+        assert len(plan_flags) > 1 and all(f is clean for f in plan_flags), plan_flags
+    monkeypatch.setattr(_runtime, "DenseMqaPlan", real_plan)
     torch.cuda.synchronize()
-    assert torch.equal(split[True], whole[True])
-    assert torch.equal(split[False][window], whole[False][window])
-    assert torch.equal(split[False][window], whole[True][window])
+
+    def bits(t):
+        return t.contiguous().view(torch.int32)
+
+    assert torch.equal(bits(split[True]), bits(whole[True]))
+    assert torch.equal(bits(split[False][window]), bits(whole[False][window]))
+    assert torch.equal(bits(split[False][window]), bits(whole[True][window]))
     with pytest.raises(ValueError, match="row ranges"):
         _runtime.DenseMqaPlan("fp8", q, kv, weights, ks, ke, kv_scales=scales)
 
