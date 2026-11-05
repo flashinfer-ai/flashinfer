@@ -595,6 +595,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
+        "flashinfer.experimental.cake_mla_value_gate",
+        "flashinfer/experimental/cake_mla_value_gate",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.experimental.deepgemm_batched_gemm",
         "flashinfer/experimental/deepgemm_batched_gemm",
         "cake_jit.py",
