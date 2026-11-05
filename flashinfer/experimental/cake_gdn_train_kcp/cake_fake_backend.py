@@ -49,6 +49,8 @@ emulations are bitwise the device ones in the norm and the pullback, and inherit
   bwd_dqkg_l2n      #8 on (q, k) = (qn, kn), the FP32 group sums through l2n_pullback(q_raw, q_rstd, .) before the
                     one BF16 rounding of dq / dk
   qk_apply          qn = bf16(q_raw * q_rstd), kn likewise, per real chunk
+  fwd_prep_replay_l2n  fwd_prep_l2n reading the given BF16 ``akk`` (the forward's tape, never written) in place of
+                    the block inverse: w / u from it, every other output as fwd_prep_l2n (save_mode="light_akk")
 
 ``group_reduce = 0`` (the host form): #8 writes the FP32 per-value-head partials ``dq_part`` / ``dk_part`` ``[T, HV,
 128]`` instead of ``dq`` / ``dk`` (the host sums them in head order and rounds once).
@@ -171,7 +173,10 @@ def _decay(G: torch.Tensor) -> torch.Tensor:
 # #1 fwd_prep
 
 
-def fwd_prep(values: Mapping[str, Any]) -> None:
+def fwd_prep(values: Mapping[str, Any], *, akk_in: bool = False) -> None:
+    """#1.  ``akk_in``: the solve-free replay (``fwd_prep_replay_l2n``'s body): ``akk`` is the forward's BF16 tape,
+    read in place of the block inverse and never written; every other output as #1 (``w`` / ``u`` are products of
+    the same BF16 ``Akk``, so they are #1's bit for bit)."""
     q, k, v, g, beta = (values[n] for n in ("q", "k", "v", "g", "beta"))
     HV, _H_qk, r = _group(values)
     scale = float(values["scale"])
@@ -196,14 +201,17 @@ def fwd_prep(values: Mapping[str, Any]) -> None:
             kk, qq = f32(k[tok, hq]), f32(q[tok, hq])  # [L, 128]
             D = _decay(G[:, hv])  # e^{G_i - G_j}, i >= j
             KK = mm(kk, kk.transpose(0, 1))
-            A_pre = (bet[:, hv][:, None] * KK * D).tril(
-                -1
-            )  # strictly lower: beta_i e^{G_i - G_j} k_i . k_j
-            Ainv = torch.linalg.solve_triangular(
-                eye[:L, :L] + A_pre, eye[:L, :L], upper=False, unitriangular=True
-            )  # FP32 block inverse
-            A_b = bf16(Ainv)  # ROUND #1: Akk tape
-            akk[rows, hv, :L] = A_b
+            if akk_in:
+                A_b = akk[rows, hv, :L]  # the forward's BF16 Akk tape (read only)
+            else:
+                A_pre = (bet[:, hv][:, None] * KK * D).tril(
+                    -1
+                )  # strictly lower: beta_i e^{G_i - G_j} k_i . k_j
+                Ainv = torch.linalg.solve_triangular(
+                    eye[:L, :L] + A_pre, eye[:L, :L], upper=False, unitriangular=True
+                )  # FP32 block inverse
+                A_b = bf16(Ainv)  # ROUND #1: Akk tape
+                akk[rows, hv, :L] = A_b
             kb = bf16(
                 kk * (bet[:, hv] * G[:, hv].exp())[:, None]
             )  # ROUND: MMA operand beta e^G k (FLA b_kb)
@@ -595,9 +603,9 @@ def _rstd_rows(x: torch.Tensor, T: int, heads: int, tstride: int) -> torch.Tenso
     return x.as_strided((T, heads), (tstride, 1), x.storage_offset())
 
 
-def fwd_prep_l2n(values: Mapping[str, Any]) -> None:
+def fwd_prep_l2n(values: Mapping[str, Any], *, akk_in: bool = False) -> None:
     """#1_l2n: ``qn`` / ``kn`` / ``q_rstd`` / ``k_rstd`` of the real chunks' tokens (:func:`.cake_l2n.qk_l2norm_ref`),
-    then #1 on ``(qn, kn)``."""
+    then #1 on ``(qn, kn)``.  ``akk_in``: ``fwd_prep_replay_l2n`` (#1 reads the given ``akk``, :func:`fwd_prep`)."""
     q, k, qn, kn = (values[n] for n in ("q", "k", "qn", "kn"))
     _HV, H_qk, _r = _group(values)
     T, ts = q.shape[0], int(values["rstd_tstride"])
@@ -609,7 +617,7 @@ def fwd_prep_l2n(values: Mapping[str, Any]) -> None:
             hat, rr = cake_l2n.qk_l2norm_ref(x[tok])
             xn[tok] = hat
             xr[tok] = rr
-    fwd_prep({**values, "q": qn, "k": kn})
+    fwd_prep({**values, "q": qn, "k": kn}, akk_in=akk_in)
 
 
 def qk_apply(values: Mapping[str, Any]) -> None:
@@ -710,6 +718,8 @@ def run_module(
     program = record["program"]
     if program == "fwd_prep_l2n":
         fwd_prep_l2n(values)
+    elif program == "fwd_prep_replay_l2n":
+        fwd_prep_l2n(values, akk_in=True)
     elif program == "bwd_dqkg_l2n":
         bwd_dqkg(values, l2n=True)
     elif program == "qk_apply":

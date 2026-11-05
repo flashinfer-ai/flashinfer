@@ -140,19 +140,27 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   FP8 `static_scan_kinds` itself.
   `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
   and maps the decided kind to a registered FP8 kind
-  (`FP8_KIND_FALLBACK`: `wide` -> `narrow`, `pair_l6` -> `l6`, `pair_narrow` /
-  `pair_wide` -> `narrow`, `split_wide` -> `split_narrow`, and `split_l6` ->
-  `split_narrow` where no FP8 `split_l6` program is registered); the program
+  (`FP8_KIND_FALLBACK`: `wide` / `pair_wide` / `pair_l6` -> `l6`, the largest
+  FP8 unit, `pair_narrow` -> `narrow`, `split_wide` -> `split_narrow`, and
+  `split_l6` -> `split_narrow` where no FP8 `split_l6` program is registered); the program
   runs without a CTA pair, in the plain unit order, in its sampled-fit form,
   with the decided tile unroll where an FP8 program of it is registered
   (else the smallest registered one) and in the longest-first order where
-  the BF16 rule picks it and an FP8 copy exists.  On `sm_107a` every FP8
+  the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its
+  own `sample_class_rule` class and `check_period_kind_overrides` period
+  (`cake_policy.fallback_knobs`): an `l6` program run for a `wide` decision
+  samples like an `l6` decision; explicit knobs stay.  On `sm_107a` every FP8
   kind keeps the static unit enumeration (`static_scan_kinds`): no ticket
   tail, nothing zeroed.  An architecture without FP8 programs raises
   `NotImplementedError`.
 * **Workspace**: `dsa_indexer_det_topk_workspace_size(...,
   dtype=torch.float8_e4m3fn)` bounds the FP8 programs' workspace; the
-  default `dtype=torch.bfloat16` returns the BF16 bound unchanged.
+  default `dtype=torch.bfloat16` returns the BF16 bound unchanged.  A
+  `wide` / `pair_wide` decision runs the FP8 `l6` unit, 6 queries per unit
+  rather than the narrow unit's 4, so its FP8 bound has 1.5x the scan
+  entries of the narrow fallback: an FP8 buffer sized for such a call before this
+  fallback is rejected (`workspace_buffer needs N bytes`) and must be sized
+  again with this function.
 * **Prepared runners** bind `k_scale` with `q` / `k`: new values written into
   it are read by the next run.
 
