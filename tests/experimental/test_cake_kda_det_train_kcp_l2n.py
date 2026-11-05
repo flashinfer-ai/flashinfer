@@ -2081,14 +2081,19 @@ LOCAL_RECORD_CASES = [
     LOCAL_RECORD_CASES,
     ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
 )
-def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> None:
+@pytest.mark.parametrize("fuse", (1, 0), ids=("fwd_o_fuse1", "fwd_o_fuse0"))
+def test_l2n_local_stage_values_cover_the_records(
+    H, arch, sm, gate, form, fuse
+) -> None:
     """The real drivers (:func:`cake_kcp._qk_l2norm_begin`, then :func:`cake_kcp._forward` /
     :func:`cake_kcp._backward`, their KCP programs and collectives recorded, not run) on the mode's plan
     (``cake_backend.plan(..., l2n=form)``): a saving and a non-saving forward, a saved-mode and a replay backward bind
     every logical name of every record they launch; no record outside the mode's own (``_l2n`` twins, the ``qk_*``
     programs) binds ``q_raw`` / ``k_raw``; the first reader gets the saved rstd with (1, 0), a fresh one with (0, 1)
     or none with (0, 0); no gate epilogue launches; stage for stage the records are the flag-off plan's or the mode's
-    twins, the KCP-owned records and the KCP walk / merge / collective sequence unchanged."""
+    twins, the KCP-owned records and the KCP walk / merge / collective sequence unchanged.  ``fuse``: the
+    ``fwd_o_fuse`` knob (1 shipped): a forward that keeps no tape walks ``kcp_fwdh_o``, whose local operands the
+    values carry, and launches no ``kcp_fwd_o``; under 0 (and in the replay forward) the tape walk and ``kcp_fwd_o``."""
     missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
     if missing is not None:
         pytest.skip(
@@ -2188,7 +2193,7 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
             local_values=None, out=None if backward else torch.zeros(1), grads=grads if backward else None,
             device=torch.device("cpu"), opts=opts, gate=gate, l2n=mode != "off", l2n_mode=mode, l2n_values=None,
             backend=backend, schedule=str(opts.schedule), exchange="a2a", merge_fuse=str(opts.merge_fuse),
-            saved_carry=int(opts.saved_carry), bufs={}, kcp=[],
+            saved_carry=int(opts.saved_carry), fwd_o_fuse=fuse, bufs={}, kcp=[],
         )  # fmt: skip
         backend.begin_call(call)
         kept = None
@@ -2201,6 +2206,15 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
             assert call.l2n_values is None, kind
         else:
             cake_kcp._forward(call, save=kind == "fwd_save", replay=False)
+        if (
+            kind != "bwd_saved"
+        ):  # the forward's walk program and the local operands it reads
+            fused = fuse == 1 and not backward
+            assert call.fwd_walk == ("kcp_fwdh_o" if fused else "kcp_fwdh_tape"), kind
+            absent = set(cake_kcp_jit._WALK_OPERANDS[call.fwd_walk]) - set(
+                call.local_values
+            )
+            assert not absent, (kind, call.fwd_walk, sorted(absent))
         done = list(launches)
         launches.clear()
         return done, kept, call.kcp
@@ -2221,6 +2235,8 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
         res, kept, kcp_on = run(form, kind)
         res_off, _, kcp_off = run("off", kind)
         assert kcp_on == kcp_off and kcp_on, kind  # the KCP programs and collectives
+        fwd_o = [r for s, r, _g, _v in res if s == "kcp" and r == "kcp_fwd_o"]
+        assert len(fwd_o) == int(kind.startswith("fwd") and fuse == 0), (kind, fwd_o)
         for src, record, _grid, values in res:
             m = mod(src, record)
             absent = set(m["logical"].values()) - set(values)
