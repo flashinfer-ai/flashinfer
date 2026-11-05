@@ -88,15 +88,14 @@ def _spec_fp8_keys(arch: str) -> set[str]:
 
 def _registries():
     """``(label, arch, scan keys, FP8 keys)``: the spec's key set over the registered BF16 keys of every architecture,
-    and the checkout's own registry where it registers FP8 programs."""
+    and the checkout's own registry (its FP8 keys empty where it registers none: the test skips)."""
     out = []
     for arch in sorted(cake_jit.PROGRAM_KEYS or {}):
         keys = cake_jit.PROGRAM_KEYS[arch]
         bf16 = {k for k in keys if scan_key_form(k) != FP8}
         out.append(("spec", arch, bf16 | _spec_fp8_keys(arch), _spec_fp8_keys(arch)))
         registered = {k for k in keys if scan_key_form(k) == FP8}
-        if registered:
-            out.append(("registry", arch, set(keys), registered))
+        out.append(("registry", arch, set(keys), registered))
     return out
 
 
@@ -323,6 +322,8 @@ def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
     kind (``FP8_KIND_FALLBACK``); on a geometry grid every program it selects is an FP8 key of the registry, never a
     CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow the BF16 decision where an
     FP8 program carries them, and every FP8 key is selected by some call."""
+    if not fp8_keys:
+        pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
     policy = _fp8_policy(arch)
     bf16_policy = DispatchPolicy.from_record(cake_jit.POLICY[arch])
     programs = fp8_scan_programs(keys)
@@ -877,7 +878,7 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
             visible,
             clean_logits=False,
         )
-    except (TypeError, RuntimeError) as err:  # an API this diagnostic does not know
+    except TypeError as err:  # an API this diagnostic does not know
         pytest.skip(f"deep_gemm.fp8_mqa_logits is not callable as expected: {err}")
     logits = logits[:, : inputs.num_keys].float()
     valid = indices >= 0
