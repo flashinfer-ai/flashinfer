@@ -235,6 +235,18 @@ struct Map {  // per-expert token bookkeeping, built identically by every CTA af
   int tiles_prefix[kMaxEl + 1];
 };
 
+// Top-k id of (token t, slot k) as every phase reads it: -1 for a masked route, an id outside
+// [0, W * EL), or a repeat of an earlier slot of the same token, so a token reaches each expert at
+// most once and its dispatch slot stays below TCAP
+__device__ __forceinline__ int route_at(const Args& a, int t, int k) {
+  const int64_t* ids = a.topk_ids + size_t(t) * a.TOPK;
+  const int64_t id = ids[k];
+  if (id < 0 || id >= int64_t(a.W) * a.EL) return -1;
+  for (int j = 0; j < k; ++j)
+    if (ids[j] == id) return -1;
+  return int(id);
+}
+
 __device__ __forceinline__ void token_src(const Map& m, int el, int j, int W, int& w, int& i) {
   w = 0;
   i = j;
@@ -258,6 +270,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
                  // start 15 comb-flag release  // 0 start 1 pushed 2 flags 3 work end 4 comb flags
                  // 5 end 6 L1-wait ns 7 items
   if (threadIdx.x == 0) s_epoch = *reinterpret_cast<volatile int*>(a.ctr + kCtrEpoch) + 1;
+  // the error word reports this call only (a wait records one no earlier than kSpinNs from now)
+  if (blockIdx.x == 0 && threadIdx.x == 0) a.ctr[kCtrErr] = 0;
   __syncthreads();
   const int epoch = s_epoch;
   int* ctr = a.ctr;
@@ -268,7 +282,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
   if (blockIdx.x == (a.T < int(gridDim.x) ? a.T : int(gridDim.x) - 1)) {
     for (int u = threadIdx.x; u < W * (1 + a.T * TOPK); u += blockDim.x) {
       const int dst = u / (1 + a.T * TOPK), v = u % (1 + a.T * TOPK);
-      a.peers.route[dst][a.rank * RS + v] = v == 0 ? a.T : int(a.topk_ids[v - 1]);
+      a.peers.route[dst][a.rank * RS + v] =
+          v == 0 ? a.T : route_at(a, (v - 1) / TOPK, (v - 1) % TOPK);
     }
     __threadfence_system();
     __syncthreads();
@@ -284,7 +299,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     if (threadIdx.x == 0) s_known = 0;
     __syncthreads();
     for (int u = threadIdx.x; u < a.T * TOPK; u += blockDim.x) {
-      const int e = int(a.topk_ids[u]);
+      const int e = route_at(a, u / TOPK, u % TOPK);
       if (e >= 0 && e / EL == a.rank) atomicOr(&s_known, 1ull << (e % EL));
     }
     __syncthreads();
@@ -337,9 +352,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       }
       if (warp < TOPK) {  // warp k: destination row of copy k (slot = tokens t' < t routed to the
                           // same expert)
-        const int e = int(a.topk_ids[t * TOPK + warp]);  // < 0: masked route, nothing to send
+        const int e = route_at(a, t, warp);  // < 0: masked route, nothing to send
         int slot = 0;
-        for (int u = lane; u < t * TOPK; u += 32) slot += (int(a.topk_ids[u]) == e);
+        for (int u = lane; u < t * TOPK; u += 32) slot += (route_at(a, u / TOPK, u % TOPK) == e);
 #pragma unroll
         for (int o = 16; o; o >>= 1) slot += __shfl_xor_sync(0xffffffffu, slot, o);
         if (lane == 0) {
@@ -355,7 +370,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         }
       }
       __syncthreads();
-      const int per = H / 16 + H / 32 / 16;  // uint4 per copy: data + scales
+      // per copy: H / 16 uint4 of data, then the H / 32 scale bytes as H / 256 uint2 (a scale row
+      // is only 8-byte aligned when hidden % 512 != 0)
+      const int per = H / 16 + H / 256;
       for (int u = threadIdx.x; u < TOPK * per; u += blockDim.x) {
         const int k = u / per, q = u % per;
         if (s_rowk[k] < 0) continue;
@@ -365,8 +382,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           reinterpret_cast<uint4*>(a.peers.pool_x[dst] + row * H)[q] =
               reinterpret_cast<const uint4*>(s_q)[q];
         else
-          reinterpret_cast<uint4*>(a.peers.pool_xs[dst] + row * (H / 128))[q - H / 16] =
-              reinterpret_cast<const uint4*>(s_sc)[q - H / 16];
+          reinterpret_cast<uint2*>(a.peers.pool_xs[dst] + row * (H / 128))[q - H / 16] =
+              reinterpret_cast<const uint2*>(s_sc)[q - H / 16];
       }
       __syncthreads();
     }
@@ -635,7 +652,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       const int t = v / (H / 8), h8 = (v % (H / 8)) * 8;
       float s[8] = {};
       for (int k = 0; k < TOPK; ++k) {
-        if (a.topk_ids[t * TOPK + k] < 0) continue;  // masked route: never dispatched
+        if (route_at(a, t, k) < 0) continue;  // masked route: never dispatched
         const float wk = a.topk_w[t * TOPK + k];
         const uint4 u = *reinterpret_cast<const uint4*>(comb + (size_t(t) * TOPK + k) * H + h8);
         const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&u);

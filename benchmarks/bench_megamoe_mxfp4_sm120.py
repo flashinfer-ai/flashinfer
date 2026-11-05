@@ -3,8 +3,8 @@
 Same method as bench_megamoe_fp4_sm90.py: each graph queues an unmeasured NCCL all-reduce gate, then the timing
 events around `repeats` back-to-back calls; per round the time is the maximum over ranks, and the median over
 rounds is reported. --cold-l2 writes 512 MB before every round (with --repeats 1), so the weights come from DRAM as
-in a decode step that walks every layer. Routing: random top-k (--routing random) or the README balanced assignment
-expert = s * E_local + (g + 7 s) % E_local (--routing balanced, one route per rank per token).
+in a decode step that walks every layer. Routing: random top-k (--routing random) or balanced (--routing balanced): top-k slot s of global token g goes to
+rank s % EP, local expert (g + 7 s) % E_local, so every rank gets floor or ceil of top-k / EP routes per token.
 
     python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --tokens 1 2 8 16 20 32 64
 """

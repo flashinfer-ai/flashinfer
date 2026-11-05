@@ -33,14 +33,20 @@ enum Sm120Offset : int {
   kNumSm120Offsets
 };
 
-static int sm120_grid_size() {
-  int dev = 0, sms = 0, occ = 0;
-  TVM_FFI_ICHECK_EQ(cudaGetDevice(&dev), cudaSuccess);
+// Every CTA of the grid must be resident at once (CTAs wait on each other's flags), so the grid is
+// the device's full occupancy and the launch is cooperative.
+static int sm120_grid_size(int dev) {
+  static int grids[64] = {};
+  TVM_FFI_ICHECK(dev >= 0 && dev < 64);
+  if (grids[dev] > 0) return grids[dev];
+  int sms = 0, occ = 0, coop = 0;
+  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), cudaSuccess);
+  TVM_FFI_ICHECK(coop) << "SM120 MegaMoE needs cooperative launch support";
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), cudaSuccess);
   TVM_FFI_ICHECK_EQ(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, s::sm120_mega_moe_kernel,
                                                                   s::kWarps * 32, 0),
                     cudaSuccess);
-  return occ * sms;
+  return grids[dev] = occ * sms;
 }
 
 void megamoe_sm120_mxfp4_fused(
@@ -103,9 +109,13 @@ void megamoe_sm120_mxfp4_fused(
   a.rank = static_cast<int>(rank_idx);
   a.swiglu_limit = static_cast<float>(activation_clamp);
 
-  static const int grid = sm120_grid_size();
-  s::sm120_mega_moe_kernel<<<grid, s::kWarps * 32, 0, get_stream(y.device())>>>(a);
-  TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess);
+  ffi::CUDADeviceGuard device_guard(y.device().device_id);
+  const int grid = sm120_grid_size(y.device().device_id);
+  void* params[] = {&a};
+  TVM_FFI_ICHECK_EQ(cudaLaunchCooperativeKernel(
+                        reinterpret_cast<const void*>(s::sm120_mega_moe_kernel), dim3(grid),
+                        dim3(s::kWarps * 32), params, 0, get_stream(y.device())),
+                    cudaSuccess);
 }
 
 }  // namespace flashinfer::megamoe
