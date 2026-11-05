@@ -219,6 +219,21 @@ kernels that do not read NVFP4 K/V directly.
 .. autoclass:: NVFP4KVMaterializer
     :members: run
 
+CSF Block Scales
+----------------
+
+Block-scale matrices compressed per 16-row slab (CSF), such as NVFP4 MoE expert
+scales kept compressed on the GPU and expanded into the fused MoE scale layout
+before each call.
+
+.. currentmodule:: flashinfer.quantization
+
+.. autosummary::
+    :toctree: ../generated
+
+    encode_csf_scales
+    expand_csf_scales
+
 FP8 Quantization
 ----------------
 

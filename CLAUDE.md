@@ -481,9 +481,10 @@ do not need one.
 internal CI: `/bot run tests/<dir-or-file> [tests/...]`. Targets are whitespace-separated paths under
 `tests/` (files or directories, no `::` selectors), written as real paths relative to the repo
 root, e.g. `tests/gemm/test_mm_fp4.py tests/utils/`; name the test files or directories the
-change touches. A bare `run` with no target starts the **full** suite, which
-is expensive. That is appropriate in select cases — a cross-cutting change, or a final
-pre-merge check — and the PR template has a checkbox to declare and justify it.
+change touches. Bare `run` asks AI for a recommendation; focused or inconclusive
+results only post advice. `run all` starts the expensive **full** suite, appropriate
+for a cross-cutting change or final pre-merge check. The PR template has a checkbox
+to declare and justify that full-suite request.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
