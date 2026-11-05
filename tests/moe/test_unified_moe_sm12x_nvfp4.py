@@ -65,7 +65,13 @@ def test_nvfp4_torch_oracle_rounding_and_limit():
     ],
 )
 def test_sm12x_nvfp4_native_chain(
-    model, activation, tokens, enable_pdl, input_scale, shape_override, per_expert_scales
+    model,
+    activation,
+    tokens,
+    enable_pdl,
+    input_scale,
+    shape_override,
+    per_expert_scales,
 ):
     if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
         pytest.skip("requires an SM120a device")

@@ -399,8 +399,8 @@ class Fixture:
                 torch.randn(h, intermediate, device="cuda", dtype=torch.bfloat16)
                 / intermediate**0.5
             )
-            q1, sf1, d1 = fake_quant(w1, weight_scale[expert:expert + 1])
-            q2, sf2, d2 = fake_quant(w2, weight_scale[expert:expert + 1])
+            q1, sf1, d1 = fake_quant(w1, weight_scale[expert : expert + 1])
+            q2, sf2, d2 = fake_quant(w2, weight_scale[expert : expert + 1])
             weights1.append(q1)
             scales1.append(pack_sf(sf1))
             weights2.append(q2)
