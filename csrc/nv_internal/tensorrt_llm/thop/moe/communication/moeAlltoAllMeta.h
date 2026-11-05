@@ -31,93 +31,102 @@ namespace torch_ext
 namespace moe_comm
 {
 
-// Per-rank layout: round state, dispatch control/payload, combine control/input/receive.
-// Fence combine pulls from peer input buffers; CFT pushes into the local receive inbox.
-// Region boundaries are fixed at allocation; token slices remain runtime-packed.
-// OFFSET fields are byte offsets from the per-rank workspace base; SIZE fields are byte capacities.
-// Array extents below use allocation-time max_tokens, top_k and ep_size, not runtime token counts.
-// CFT-only offsets and sizes are zero when CFT storage is not allocated.
+// Per-rank workspace layout of the NVLink one-sided all-to-all, computed once at allocation from
+// the configuration fields below. OFFSET fields are byte offsets from the rank's workspace slice,
+// SIZE fields byte capacities; every extent follows the allocation-time capacities, never a
+// step's token count. Three groups of regions:
+//   fence     round state, dispatch counters, flags and routing tables, the dispatch receive
+//             region (token slices packed per step), combine flags and the combine input region
+//             the peers pull from;
+//   CFT       byte counters and baselines of CFT counted writes and the combine receive inbox,
+//             placed among the fence regions; all zero when CFT_ENABLED is zero;
+//   sentinel  round state, the landing rows the dispatch and the combine push into (row
+//             (source rank, token), fixed across steps) and the receive buffers of the dispatched
+//             expert ids and weights; all zero when SENTINEL_MAX_NUM_TOKENS is zero.
+// A sentinel step also fills and reads the fence routing table TOPK_TARGET_RANKS, and its expert
+// output may sit in the combine input region.
 enum MoeA2AMetaInfoIndex : int64_t
 {
-    // Shared round state.
-    // uint32_t scalar advanced by dispatch/combine prepare; supplies sync epochs and round parity.
-    FLAG_VAL_OFFSET_INDEX = 0,
+    // Configuration.
+    // Number of ranks in the EP group.
+    EP_SIZE_INDEX = 0,
+    // Maximum input token count per rank.
+    MAX_NUM_TOKENS_INDEX = 1,
+    // Experts selected per token.
+    TOP_K_INDEX = 2,
+    // Expert statistics gathered from each rank; zero disables EPLB storage.
+    EPLB_STATS_NUM_EXPERTS_INDEX = 3,
+    // Whether the CFT regions are allocated; not a step's choice of data path.
+    CFT_ENABLED_INDEX = 4,
+    // Largest token count per rank of a sentinel step; zero: no sentinel regions.
+    SENTINEL_MAX_NUM_TOKENS_INDEX = 5,
+    // Payload format (moe_alltoall_sentinel::PayloadFormat) and hidden size of the landing rows.
+    SENTINEL_PAYLOAD_FORMAT_INDEX = 6,
+    SENTINEL_HIDDEN_SIZE_INDEX = 7,
+    // Bytes per rank, every region and alignment padding included.
+    WORKSPACE_SIZE_INDEX = 8,
 
-    // Dispatch control, routing metadata and receive payload.
-    // int32_t scalar counting token CTAs to elect the last CTA that publishes dispatch counts.
-    LOCAL_TOKEN_COUNTER_OFFSET_INDEX = 1,
-    // int32_t[ep_size]: outgoing token counts / slot allocators, indexed by destination rank.
-    SEND_COUNTERS_OFFSET_INDEX = 2,
-    // int32_t[2][ep_size]: incoming counts by round parity and sender; dispatch writes, combine reads.
-    RECV_COUNTERS_OFFSET_INDEX = 3,
-    // uint32_t[ep_size]: per-peer epoch flags for fence dispatch synchronization.
-    DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = 4,
-    // CFT-only cumulative received-byte counters per sender; uint64_t at kCftCounterStride byte spacing.
-    DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX = 5,
-    // CFT-only uint64_t[ep_size]: consumed-byte baselines for dispatch counters; ordinary device memory.
-    DISPATCH_COUNTER_BASELINE_OFFSET_INDEX = 6,
-    // int32_t[max_tokens][top_k]: destination ranks for local tokens, reused by combine to gather results.
-    TOPK_TARGET_RANKS_OFFSET_INDEX = 7,
-    // int32_t[max_tokens][top_k]: matching receive-slot indices within each destination's sender slice.
-    TOPK_TARGET_INDICES_OFFSET_INDEX = 8,
-    // int32_t[ep_size][eplb_stats_num_experts]: gathered per-rank expert statistics; empty without EPLB.
-    EPLB_GATHERED_STATS_OFFSET_INDEX = 9,
-    // Receive region for dispatched activations, scales, expert IDs/weights and optional extra payloads.
-    DISPATCH_PAYLOAD_OFFSET_INDEX = 10,
-    // Reserved dispatch payload capacity, including payload alignment padding.
-    DISPATCH_PAYLOAD_SIZE_INDEX = 11,
+    // Fence protocol: round state and dispatch.
+    // uint32_t round counter advanced by dispatch and prepare-combine: sync epochs and parity.
+    FLAG_VAL_OFFSET_INDEX = 9,
+    // int32_t counting token CTAs to elect the last CTA that publishes dispatch counts.
+    LOCAL_TOKEN_COUNTER_OFFSET_INDEX = 10,
+    // int32_t[ep_size]: outgoing token counts / slot allocators, by destination rank.
+    SEND_COUNTERS_OFFSET_INDEX = 11,
+    // int32_t[2][ep_size]: incoming counts by round parity and source rank.
+    RECV_COUNTERS_OFFSET_INDEX = 12,
+    // uint32_t[ep_size]: per-peer epoch flags of the dispatch.
+    DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = 13,
+    // int32_t[max_tokens][top_k]: destination rank of each local token's slot k.
+    TOPK_TARGET_RANKS_OFFSET_INDEX = 14,
+    // int32_t[max_tokens][top_k]: its receive-slot index within the destination's source slice.
+    TOPK_TARGET_INDICES_OFFSET_INDEX = 15,
+    // int32_t[ep_size][eplb_stats_num_experts]: gathered per-rank expert statistics.
+    EPLB_GATHERED_STATS_OFFSET_INDEX = 16,
+    // Receive region of the dispatched payloads (hidden states, scales, expert ids, weights,
+    // extra payloads), each payload starting on a kWorkspaceAlignment boundary.
+    DISPATCH_PAYLOAD_OFFSET_INDEX = 17,
+    DISPATCH_PAYLOAD_SIZE_INDEX = 18,
 
-    // Combine control, expert-output staging and the CFT-only receive inbox.
-    // uint32_t[ep_size]: peer readiness epochs, used by fence combine and the CFT cross-round guard.
-    COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = 12,
-    // CFT-only cumulative received-byte counters per expert-rank/token slot, kCftCounterStride bytes apart.
-    COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX = 13,
-    // CFT-only uint64_t[ep_size][max_tokens]: consumed-byte baselines for combine counters.
-    COMBINE_COUNTER_BASELINE_OFFSET_INDEX = 14,
-    // Expert-output / staging region: fence peers pull from it; MoE may write directly into it.
-    COMBINE_INPUT_OFFSET_INDEX = 15,
-    // Reserved combine input capacity, large enough for original-dtype MoE output even with FP8 wire data.
-    COMBINE_INPUT_SIZE_INDEX = 16,
-    // CFT-only receive inbox: peer pushes and the self contribution are gathered here for local reduction.
-    COMBINE_RECV_OFFSET_INDEX = 17,
-    // CFT receive payload capacity in wire-format bytes, excluding counters and baselines.
-    COMBINE_RECV_SIZE_INDEX = 18,
+    // Fence protocol: combine.
+    // uint32_t[ep_size]: per-peer readiness epochs of the combine.
+    COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = 19,
+    // Expert outputs the peers pull from; the split layer's expert computation may write into it.
+    COMBINE_INPUT_OFFSET_INDEX = 20,
+    COMBINE_INPUT_SIZE_INDEX = 21,
 
-    // Allocation-time configuration used to construct and validate the layout, not mutable round state.
-    // Maximum input token count per rank; bounds routing storage and per-rank token slots.
-    MAX_NUM_TOKENS_INDEX = 19,
-    // Configured experts selected per token; determines routing-table capacity.
-    TOP_K_INDEX = 20,
-    // Number of ranks in the EP group; determines peer-array sizes.
-    EP_SIZE_INDEX = 21,
-    // Number of expert statistics gathered from each rank; zero disables EPLB storage.
-    EPLB_STATS_NUM_EXPERTS_INDEX = 22,
-    // Whether CFT counters, baselines and receive storage are allocated; not the current transport choice.
-    CFT_ENABLED_INDEX = 23,
-    // Total required bytes per rank, including all control buffers, payloads and alignment padding.
-    WORKSPACE_SIZE_INDEX = 24,
+    // CFT counted writes.
+    // Cumulative received-byte counters per source rank, kCftCounterStride bytes apart.
+    DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX = 22,
+    // uint64_t[ep_size]: consumed-byte baselines of the dispatch counters.
+    DISPATCH_COUNTER_BASELINE_OFFSET_INDEX = 23,
+    // Cumulative received-byte counters per (expert rank, token) slot, kCftCounterStride bytes apart.
+    COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX = 24,
+    // uint64_t[ep_size][max_tokens]: consumed-byte baselines of the combine counters.
+    COMBINE_COUNTER_BASELINE_OFFSET_INDEX = 25,
+    // Receive inbox the peers push their combine partials into, in the wire format.
+    COMBINE_RECV_OFFSET_INDEX = 26,
+    COMBINE_RECV_SIZE_INDEX = 27,
 
-    // Sentinel protocol (flashinfer/comm/moe_alltoall_sentinel.cuh), appended after the regions above
-    // by moe_a2a_sentinel_extend_workspace_layout. Every field is zero when it is not allocated.
-    // Landing rows per source rank: the largest max_tokens_per_rank of a sentinel step.
-    SENTINEL_MAX_NUM_TOKENS_INDEX = 25,
-    // Payload format (moe_alltoall_sentinel::PayloadFormat) and hidden size the landing rows hold.
-    SENTINEL_PAYLOAD_FORMAT_INDEX = 26,
-    SENTINEL_HIDDEN_SIZE_INDEX = 27,
-    // Round state: int32 words (epoch, ...), then a uint64 receive-source mask per token slot.
+    // Sentinel protocol (flashinfer/comm/moe_alltoall_sentinel.cuh). Row (src, token) =
+    // token * ep_size + src of sentinel_max_tokens * ep_size rows.
+    // int32 round-state words, then a uint64 receive-source mask per token slot.
     SENTINEL_STATE_OFFSET_INDEX = 28,
-    // Landing rows: payload, scale and weight rows, then two sets of expert-id rows. A sentinel
-    // step's hidden states and scales are received in its payload and scale rows.
-    SENTINEL_LANDING_OFFSET_INDEX = 29,
+    // Landing rows of the hidden states and of their scales: a step's received rows, read in place.
+    SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX = 29,
+    SENTINEL_SCALE_ROWS_OFFSET_INDEX = 30,
+    // Landing rows of the routing weights, then two sets of expert-id rows (ID_ROW_SET_SIZE each).
+    SENTINEL_WEIGHT_ROWS_OFFSET_INDEX = 31,
+    SENTINEL_ID_ROWS_OFFSET_INDEX = 32,
+    SENTINEL_ID_ROW_SET_SIZE_INDEX = 33,
     // Combine landing rows: one bf16 partial row per (source rank, token).
-    SENTINEL_COMBINE_LANDING_OFFSET_INDEX = 30,
-    // Receive buffers of a sentinel dispatch's expert ids and weights.
-    SENTINEL_RECV_OFFSET_INDEX = 31,
-    // Their reserved capacity, including alignment padding.
-    SENTINEL_RECV_SIZE_INDEX = 32,
+    SENTINEL_COMBINE_ROWS_OFFSET_INDEX = 34,
+    // int32_t / 4-byte [rows][top_k] receive buffers of the dispatched expert ids and weights.
+    SENTINEL_RECV_IDS_OFFSET_INDEX = 35,
+    SENTINEL_RECV_WEIGHTS_OFFSET_INDEX = 36,
 
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
-    NUM_METAINFO_FIELDS = 33
+    NUM_METAINFO_FIELDS = 37
 };
 
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -127,39 +136,43 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
 {
     using namespace tensorrt_llm::kernels::moe_comm;
     return {
+        {"MOE_A2A_EP_SIZE_INDEX", EP_SIZE_INDEX},
+        {"MOE_A2A_MAX_NUM_TOKENS_INDEX", MAX_NUM_TOKENS_INDEX},
+        {"MOE_A2A_TOP_K_INDEX", TOP_K_INDEX},
+        {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
+        {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
+        {"MOE_A2A_SENTINEL_MAX_NUM_TOKENS_INDEX", SENTINEL_MAX_NUM_TOKENS_INDEX},
+        {"MOE_A2A_SENTINEL_PAYLOAD_FORMAT_INDEX", SENTINEL_PAYLOAD_FORMAT_INDEX},
+        {"MOE_A2A_SENTINEL_HIDDEN_SIZE_INDEX", SENTINEL_HIDDEN_SIZE_INDEX},
+        {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
         {"MOE_A2A_FLAG_VAL_OFFSET_INDEX", FLAG_VAL_OFFSET_INDEX},
         {"MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX", LOCAL_TOKEN_COUNTER_OFFSET_INDEX},
         {"MOE_A2A_SEND_COUNTERS_OFFSET_INDEX", SEND_COUNTERS_OFFSET_INDEX},
         {"MOE_A2A_RECV_COUNTERS_OFFSET_INDEX", RECV_COUNTERS_OFFSET_INDEX},
         {"MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX},
-        {"MOE_A2A_DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX", DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX},
-        {"MOE_A2A_DISPATCH_COUNTER_BASELINE_OFFSET_INDEX", DISPATCH_COUNTER_BASELINE_OFFSET_INDEX},
         {"MOE_A2A_TOPK_TARGET_RANKS_OFFSET_INDEX", TOPK_TARGET_RANKS_OFFSET_INDEX},
         {"MOE_A2A_TOPK_TARGET_INDICES_OFFSET_INDEX", TOPK_TARGET_INDICES_OFFSET_INDEX},
         {"MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX", EPLB_GATHERED_STATS_OFFSET_INDEX},
         {"MOE_A2A_DISPATCH_PAYLOAD_OFFSET_INDEX", DISPATCH_PAYLOAD_OFFSET_INDEX},
         {"MOE_A2A_DISPATCH_PAYLOAD_SIZE_INDEX", DISPATCH_PAYLOAD_SIZE_INDEX},
         {"MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", COMBINE_COMPLETION_FLAGS_OFFSET_INDEX},
-        {"MOE_A2A_COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX", COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX},
-        {"MOE_A2A_COMBINE_COUNTER_BASELINE_OFFSET_INDEX", COMBINE_COUNTER_BASELINE_OFFSET_INDEX},
         {"MOE_A2A_COMBINE_INPUT_OFFSET_INDEX", COMBINE_INPUT_OFFSET_INDEX},
         {"MOE_A2A_COMBINE_INPUT_SIZE_INDEX", COMBINE_INPUT_SIZE_INDEX},
+        {"MOE_A2A_DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX", DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX},
+        {"MOE_A2A_DISPATCH_COUNTER_BASELINE_OFFSET_INDEX", DISPATCH_COUNTER_BASELINE_OFFSET_INDEX},
+        {"MOE_A2A_COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX", COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX},
+        {"MOE_A2A_COMBINE_COUNTER_BASELINE_OFFSET_INDEX", COMBINE_COUNTER_BASELINE_OFFSET_INDEX},
         {"MOE_A2A_COMBINE_RECV_OFFSET_INDEX", COMBINE_RECV_OFFSET_INDEX},
         {"MOE_A2A_COMBINE_RECV_SIZE_INDEX", COMBINE_RECV_SIZE_INDEX},
-        {"MOE_A2A_MAX_NUM_TOKENS_INDEX", MAX_NUM_TOKENS_INDEX},
-        {"MOE_A2A_TOP_K_INDEX", TOP_K_INDEX},
-        {"MOE_A2A_EP_SIZE_INDEX", EP_SIZE_INDEX},
-        {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
-        {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
-        {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
-        {"MOE_A2A_SENTINEL_MAX_NUM_TOKENS_INDEX", SENTINEL_MAX_NUM_TOKENS_INDEX},
-        {"MOE_A2A_SENTINEL_PAYLOAD_FORMAT_INDEX", SENTINEL_PAYLOAD_FORMAT_INDEX},
-        {"MOE_A2A_SENTINEL_HIDDEN_SIZE_INDEX", SENTINEL_HIDDEN_SIZE_INDEX},
         {"MOE_A2A_SENTINEL_STATE_OFFSET_INDEX", SENTINEL_STATE_OFFSET_INDEX},
-        {"MOE_A2A_SENTINEL_LANDING_OFFSET_INDEX", SENTINEL_LANDING_OFFSET_INDEX},
-        {"MOE_A2A_SENTINEL_COMBINE_LANDING_OFFSET_INDEX", SENTINEL_COMBINE_LANDING_OFFSET_INDEX},
-        {"MOE_A2A_SENTINEL_RECV_OFFSET_INDEX", SENTINEL_RECV_OFFSET_INDEX},
-        {"MOE_A2A_SENTINEL_RECV_SIZE_INDEX", SENTINEL_RECV_SIZE_INDEX},
+        {"MOE_A2A_SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX", SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_SCALE_ROWS_OFFSET_INDEX", SENTINEL_SCALE_ROWS_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_WEIGHT_ROWS_OFFSET_INDEX", SENTINEL_WEIGHT_ROWS_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_ID_ROWS_OFFSET_INDEX", SENTINEL_ID_ROWS_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_ID_ROW_SET_SIZE_INDEX", SENTINEL_ID_ROW_SET_SIZE_INDEX},
+        {"MOE_A2A_SENTINEL_COMBINE_ROWS_OFFSET_INDEX", SENTINEL_COMBINE_ROWS_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_RECV_IDS_OFFSET_INDEX", SENTINEL_RECV_IDS_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_RECV_WEIGHTS_OFFSET_INDEX", SENTINEL_RECV_WEIGHTS_OFFSET_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},

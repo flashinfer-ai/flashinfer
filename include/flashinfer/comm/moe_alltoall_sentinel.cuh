@@ -878,7 +878,7 @@ __device__ __forceinline__ uint4 join_groups(float const (&group_sums)[NUM_GROUP
 // C4: reset this slot's ids rows of the round's landing set (their readers, the dispatch
 // blocks, have all ended), then the last block closes the round and advances the epoch (every
 // block read it first).
-__device__ __forceinline__ void rearm_ids_and_advance_epoch(CombineParams const& p, int token,
+__device__ __forceinline__ void reset_ids_and_advance_epoch(CombineParams const& p, int token,
                                                             int chunk, int ids_row_vectors,
                                                             int landing_set) {
   if (chunk == 0) {
@@ -941,7 +941,7 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(Combi
   }
   if (timed_out)
     report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (combine)");
-  rearm_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
+  reset_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
 #else
   __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif

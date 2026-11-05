@@ -1157,21 +1157,28 @@ def _landing_rows(comm) -> list:
     weights, ids) and combine. The dispatch rows leave out this rank's own
     payload and scale rows, which it stores itself and never polls."""
     index, meta = comm._index, comm.metainfo
-    landing, combine, recv = (
-        int(meta[getattr(index, f"SENTINEL_{name}_OFFSET_INDEX")])
-        for name in ("LANDING", "COMBINE_LANDING", "RECV")
+
+    def offset(name: str) -> int:
+        return int(meta[getattr(index, f"SENTINEL_{name}_OFFSET_INDEX")])
+
+    payload, combine, recv = (
+        offset("PAYLOAD_ROWS"),
+        offset("COMBINE_ROWS"),
+        offset("RECV_IDS"),
     )
-    rows = comm.ep_size * comm.sentinel_max_tokens
-    polled = torch.ones(combine - landing, dtype=torch.bool, device="cuda")
-    begin = 0
-    for row_bytes in (comm._sentinel_row.hidden_bytes, comm._sentinel_row.scale_bytes):
-        region = polled[begin : begin + rows * row_bytes]
-        region.view(comm.sentinel_max_tokens, comm.ep_size, row_bytes)[
+    polled = torch.ones(combine - payload, dtype=torch.bool, device="cuda")
+    for name, row_bytes in (
+        ("PAYLOAD_ROWS", comm._sentinel_row.hidden_bytes),
+        ("SCALE_ROWS", comm._sentinel_row.scale_bytes),
+    ):
+        begin = offset(name) - payload
+        rows = polled[
+            begin : begin + comm.ep_size * comm.sentinel_max_tokens * row_bytes
+        ]
+        rows.view(comm.sentinel_max_tokens, comm.ep_size, row_bytes)[
             :, comm.ep_rank
         ] = False
-        alignment = index.WORKSPACE_ALIGNMENT
-        begin += (rows * row_bytes + alignment - 1) // alignment * alignment
-    return [comm._rank_bytes[landing:combine][polled], comm._rank_bytes[combine:recv]]
+    return [comm._rank_bytes[payload:combine][polled], comm._rank_bytes[combine:recv]]
 
 
 def _rounds_under_skew(fmt) -> list:
@@ -1190,7 +1197,7 @@ def _rounds_under_skew(fmt) -> list:
         auto_sentinel_max_tokens=_SKEW_LIMIT,
         timeout_sec=_SKEW_TIMEOUT_SEC,
     )
-    armed = [rows.clone() for rows in _landing_rows(sentinel)]
+    initial = [rows.clone() for rows in _landing_rows(sentinel)]
     # Every rank holds its copy before a peer's first dispatch writes into
     # these rows.
     torch.cuda.synchronize()
@@ -1224,7 +1231,7 @@ def _rounds_under_skew(fmt) -> list:
         failures = [
             f"{label}: {n} bytes of the {name} landing rows not reset"
             for name, rows, ref in zip(
-                ("dispatch", "combine"), _landing_rows(sentinel), armed, strict=True
+                ("dispatch", "combine"), _landing_rows(sentinel), initial, strict=True
             )
             if (n := (rows != ref).sum().item())
         ]
@@ -1574,7 +1581,7 @@ def _params(**overrides):
 _LAYOUT = SimpleNamespace(
     SENTINEL_MAX_RANKS=64,
     SENTINEL_MAX_TOP_K=22,
-    SENTINEL_IDS_SENTINEL=_IDS_SENTINEL,
+    SENTINEL_ID_ROW_SENTINEL=_IDS_SENTINEL,
     SENTINEL_FORMAT_BF16=0,
     SENTINEL_FORMAT_MXFP8=1,
     SENTINEL_FORMAT_FP8_BLOCK128=2,
