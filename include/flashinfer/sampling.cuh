@@ -1263,16 +1263,24 @@ constexpr uint32_t SPLIT_ROW_SAMPLING_MAX_CLUSTER = 8;
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM>
 struct SplitRowSamplingTempStorage {
   static constexpr uint32_t NUM_WARPS = BLOCK_THREADS / 32;
-  // Per-warp mass/count above the two thresholds of the last pass, gathered from every rank:
-  // part[threshold][rank * NUM_WARPS + warp].
-  ValueCount<float> part[2][SPLIT_ROW_SAMPLING_MAX_CLUSTER * NUM_WARPS];
-  // (sampled index, bits of its probability), written by the rank that owns the sampled token.
-  int2 sample;
-  int32_t sel_thread;
+  struct Proposal {
+    // Per-warp statistics, replicated in every rank's distributed shared memory.
+    ValueCount<float> part[2][SPLIT_ROW_SAMPLING_MAX_CLUSTER * NUM_WARPS];
+    int equal[SPLIT_ROW_SAMPLING_MAX_CLUSTER * NUM_WARPS];
+    int2 sample;
+    int32_t sel_thread;
+    union {
+      typename BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
+      typename BlockReduce<int, BLOCK_THREADS>::TempStorage reduce_int;
+    } block_prim;
+  };
+  // The boundary scan runs only on rank 0 after all ranks have read their proposal.
+  // Sharing its scratch avoids reserving another scan buffer beside every staged chunk.
   union {
-    typename BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
-    typename BlockReduce<int, BLOCK_THREADS>::TempStorage reduce_int;
-  } block_prim;
+    Proposal proposal;
+    SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGO> boundary;
+  };
+  int resolution;
 };
 
 __device__ __forceinline__ ValueCount<float> WarpReduceValueCount(ValueCount<float> v) {
@@ -1325,7 +1333,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   const uint32_t warp_id = tx / 32, lane = tx % 32;
 
   extern __shared__ __align__(16) uint8_t smem_split_row[];
-  auto& temp_storage = *reinterpret_cast<TempStorage*>(smem_split_row);
+  auto& storage = *reinterpret_cast<TempStorage*>(smem_split_row);
+  auto& temp_storage = storage.proposal;
+  constexpr bool TOP_K = MODE != SplitRowSamplingMode::kTopP;
+  constexpr bool TOP_P = MODE != SplitRowSamplingMode::kTopK;
   float* chunk = reinterpret_cast<float*>(smem_split_row + round_up(sizeof(TempStorage), 16));
 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
@@ -1375,12 +1386,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   auto threshold_pass = [&](float thr0, float thr1) {
     float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
     int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
+    int equal = 0;
 #pragma unroll 2
     for (uint32_t i = warp_begin + lane * 4; i < warp_end; i += 128) {
       const float4 v4 = *reinterpret_cast<const float4*>(chunk + i);
       const float v[4] = {v4.x, v4.y, v4.z, v4.w};
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
+        equal += v[j] == thr0;
         s0[j] += v[j] > thr0 ? v[j] : 0.f;
         s1[j] += v[j] > thr1 ? v[j] : 0.f;
         if constexpr (MODE != SplitRowSamplingMode::kTopP) {
@@ -1393,7 +1406,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     ValueCount<float> t1{(s1[0] + s1[1]) + (s1[2] + s1[3]), (c1[0] + c1[1]) + (c1[2] + c1[3])};
     t0 = WarpReduceValueCount(t0);
     t1 = WarpReduceValueCount(t1);
+#pragma unroll
+    for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+      equal += __shfl_xor_sync(0xffffffff, equal, offset);
+    }
     if (lane < cluster_size) {
+      *cluster.map_shared_rank(&temp_storage.equal[rank * NUM_WARPS + warp_id], lane) = equal;
       *cluster.map_shared_rank(&temp_storage.part[0][rank * NUM_WARPS + warp_id], lane) = t0;
       *cluster.map_shared_rank(&temp_storage.part[1][rank * NUM_WARPS + warp_id], lane) = t1;
     }
@@ -1408,7 +1426,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   float low = 0, high = 1.f;
   int sampled_id = 0;
   bool is_valid = true;
-  do {
+  while (true) {
     const float u = curand_uniform(&state) * q;
     // Every warp of every rank selects the owner rank from the same data in the same order.
     float rank_mass = 0.f;
@@ -1488,25 +1506,67 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     threshold_pass(pivot_0, pivot_1);
     // Row totals: lane r sums rank r over its warps, then one fixed shuffle tree over ranks.
     ValueCount<float> r0{0.f, 0}, r1{0.f, 0};
+    int equal = 0;
     if (lane < cluster_size) {
 #pragma unroll
       for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+        equal += temp_storage.equal[lane * NUM_WARPS + w];
         r0 += temp_storage.part[0][lane * NUM_WARPS + w];
         r1 += temp_storage.part[1][lane * NUM_WARPS + w];
       }
     }
     const ValueCount<float> agg0 = WarpReduceValueCount(r0);
     const ValueCount<float> agg1 = WarpReduceValueCount(r1);
-    bool accept_0, accept_1;
-    if constexpr (MODE == SplitRowSamplingMode::kTopP) {
-      accept_0 = agg0.value < p;
-      accept_1 = agg1.value < p;
-    } else if constexpr (MODE == SplitRowSamplingMode::kTopK) {
-      accept_0 = agg0.count < k;
-      accept_1 = agg1.count < k;
-    } else {
-      accept_0 = agg0.count < k && agg0.value < p;
-      accept_1 = agg1.count < k && agg1.value < p;
+#pragma unroll
+    for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+      equal += __shfl_xor_sync(0xffffffff, equal, offset);
+    }
+    const bool accept_0 = (!TOP_K || agg0.count < k) && (!TOP_P || p >= 1.f || agg0.value < p);
+    const bool accept_1 = (!TOP_K || agg1.count < k) && (!TOP_P || p >= 1.f || agg1.value < p);
+    bool resolve_boundary =
+        TOP_K && equal > 1 && agg0.count < k && uint32_t(agg0.count) + equal > k;
+    bool reject_group = false;
+    if constexpr (TOP_P) {
+      if (p < 1.f) {
+        const float group_mass = pivot_0 * equal;
+        const float error = SamplingMassError<BLOCK_THREADS>(agg0.value + group_mass, d);
+        reject_group = agg0.value - error >= p;
+        resolve_boundary |= agg0.value + group_mass + error >= p;
+      }
+    }
+    if (reject_group) {
+      low = pivot_0;
+      q = agg0.value;
+      slot = 0;
+      continue;
+    }
+    if (resolve_boundary) {
+      // Keep the current proposal and RNG history. Restarting sampling from a new
+      // random draw only on tied proposals would bias the retained distribution.
+      cluster.sync();  // Every peer has finished reading the scratch being reused.
+      if (rank == 0) {
+        const int result = ResolveSamplingBoundary<TOP_K, TOP_P, BLOCK_THREADS, SCAN_ALGORITHM,
+                                                   REDUCE_ALGO, VEC_SIZE, true>(
+            probs + static_cast<size_t>(row_idx) * d, d, pivot_0, agg0.value, agg0.count, equal, k,
+            p, sampled_id, state, storage.boundary);
+        if (tx < cluster_size) {
+          *cluster.map_shared_rank(&storage.resolution, tx) = result;
+        }
+      }
+      cluster.sync();
+      const int result = storage.resolution;
+      if (result != -1) {
+        is_valid = result >= 0;
+        sampled_id = result;
+        break;
+      }
+      // A rejected group consumes no extra RNG draw. Restore the proposal scratch
+      // overwritten by the exact resolver before resuming the same cluster loop.
+      threshold_pass(pivot_0, pivot_1);
+      low = pivot_0;
+      q = agg0.value;
+      slot = 0;
+      continue;
     }
     if (accept_0) {
       // case 1: pivot_0 accepted
@@ -1526,7 +1586,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     }
     // part and sample are next written after the owner-search cluster.sync() of the next round,
     // which every CTA reaches only after its last read of them.
-  } while (low < high);
+  }
 
   // No distributed shared memory access follows the last cluster.sync(), so CTAs may exit.
   if (rank == 0 && tx == 0) {
@@ -1606,6 +1666,9 @@ cudaError_t SplitRowRejectionSamplingFromProb(uint32_t cluster_size, T* probs, I
     FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
     FLASHINFER_CUDA_CALL(
         cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    if (smem_size + attr.sharedSizeBytes > static_cast<size_t>(max_smem)) {
+      return cudaErrorNotSupported;
+    }
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                               max_smem - static_cast<int>(attr.sharedSizeBytes)));
     cudaLaunchAttribute attribute[1];

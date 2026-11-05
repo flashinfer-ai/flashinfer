@@ -28,7 +28,10 @@ orders retain their existing intermediate normalization semantics.
 For probability inputs, top-p compares cumulative input probabilities directly
 with ``top_p``; it does not multiply the threshold by the input row sum. Supply
 nonnegative, normalized probabilities. As before, ``top_p >= 1`` disables top-p
-filtering. Exact-boundary comparisons use the represented input values.
+filtering and keeps every token, even if row-sum rounding exceeds 1.
+At vocabulary sizes of at least 2048, ``top_p_renorm_probs`` previously scaled
+its threshold by the row sum; unnormalized inputs can therefore change their
+retained set. Exact-boundary comparisons use the represented input values.
 
 .. seealso::
 
