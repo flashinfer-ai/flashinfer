@@ -44,6 +44,19 @@ from .autotuner import (
 from .jit.core import logger
 
 
+def _is_listed(invalid_set: Set[Any], tactic: Any) -> bool:
+    """Whether *tactic* normalises to a member of *invalid_set*.
+
+    A tactic that cannot be hashed (a dict, or a tuple holding one) cannot
+    have been listed, so it is never blocked.  Such a tactic may come from a
+    user-written cache file; it must not break loading or filtering.
+    """
+    try:
+        return _tactic_to_json_hashable(tactic) in invalid_set
+    except TypeError:
+        return False
+
+
 class TacticsBlocklist:
     """Blocklist-based tactic filter backed by an offline-generated JSON file.
 
@@ -122,9 +135,7 @@ class TacticsBlocklist:
         if not self._invalid:
             return False
         invalid_set = self._invalid.get(f"{custom_op}::{runner_name}")
-        return (
-            invalid_set is not None and _tactic_to_json_hashable(tactic) in invalid_set
-        )
+        return invalid_set is not None and _is_listed(invalid_set, tactic)
 
     def filter(
         self,
@@ -152,9 +163,7 @@ class TacticsBlocklist:
         if invalid_set is None:
             return tactics
 
-        filtered = [
-            t for t in tactics if _tactic_to_json_hashable(t) not in invalid_set
-        ]
+        filtered = [t for t in tactics if not _is_listed(invalid_set, t)]
         removed = len(tactics) - len(filtered)
         if removed > 0:
             logger.debug(
