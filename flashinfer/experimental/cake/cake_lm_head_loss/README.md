@@ -399,6 +399,21 @@ it handles these rows on the device, without a host synchronization:
   either way -- and a plan with a form that has no counted one (an explicitly
   pinned swapped dX tile or weight-gradient TMA epilogue) runs the backward
   without the skip: no partition launch, rows in the forward's order.
+* The bf16 `dW` cast moves to the last chunk with a live row (`_lc` forms,
+  sm_100a and sm_103a records; a backward of two chunks or more): the live
+  rows of a call are a prefix of its chunks, so every chunk's weight-gradient
+  accumulate but the last reads the next chunk's count too
+  (`gemm_dw_acc_lc_dcnt`, `gemm_dw_acc_gn_lc_dcnt`).  With a live next chunk it
+  adds its tile into the FP32 sum as before; else it writes
+  `bf16(g * (sum + tile))` (`bf16(g * tile)` on the first chunk) into `dW` and
+  leaves the sum, and the deferred cast of the last chunk
+  (`gemm_dw_cast_bf16_lc_dcnt`, `gemm_dw_cast_bf16_tma_lc_dcnt`) writes nothing
+  when that chunk has no live row.  One program writes `dW`, and a backward
+  whose trailing chunks hold no live row runs no cast-only pass.  The plan
+  takes the forms whole or not at all (a record without one of them: the
+  counted forms above).  Only the eager skip path runs them: a runner of
+  `prepare_lm_head_loss(dcnt=...)` keeps the counted forms above, so its
+  `dw_acc` keeps holding the sum of the chunks before the last.
 
 Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
 in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row
@@ -540,7 +555,9 @@ import is the JIT fallback of `cake_build.py`.
   keeps the generic 4097-row floor (`ZERO_DLOGP_MIN_ROWS_DEFAULT`; `sm_103a`:
   3891). `dw_cast_tma_rule`
   bounds `sm_107a` as `sm_103a` (1792 rows): a short last chunk takes the
-  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.
+  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.  The
+  `sm_107a` record does not register the `_lc` forms (the cast at the last
+  live chunk): its skip runs the counted forms.
 * Temperature of the log-probability entry
   (https://github.com/flashinfer-ai/flashinfer/issues/7637): the
   deterministic package's four temperature forms per architecture (the row
