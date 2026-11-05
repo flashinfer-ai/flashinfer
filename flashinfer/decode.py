@@ -4957,12 +4957,21 @@ def trtllm_batch_decode_with_kv_cache(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
-        if q_len_per_req is not None:
+        # A variable-length query (``cum_seq_lens_q``) supersedes
+        # ``q_len_per_req``, which defaults to 1: deriving the batch from the
+        # token count instead would hand the kernel a batch size that indexes
+        # past the end of ``cum_seq_lens_q``, ``seq_lens`` and ``block_tables``.
+        if cum_seq_lens_q is not None:
+            if max_q_len is None:
+                raise ValueError("cum_seq_lens_q requires max_q_len")
+            batch_size = cum_seq_lens_q.size(0) - 1
+        elif q_len_per_req is not None:
             max_q_len = q_len_per_req
             batch_size = query.size(0) // q_len_per_req
         else:
-            assert max_q_len is not None
-            batch_size = cum_seq_lens_q.size(0) - 1
+            raise ValueError(
+                "either q_len_per_req or cum_seq_lens_q and max_q_len must be given"
+            )
 
         num_kv_heads = k_cache.size(-3)
         _check_block_tables_shape(

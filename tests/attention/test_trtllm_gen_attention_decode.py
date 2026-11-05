@@ -2498,3 +2498,68 @@ def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> 
         _assert_multi_wave_matches_fp32_reference(
             inp, out.to(GPU_DEVICE), cfg["q_dtype"], cfg["window_left"]
         )
+
+
+def test_trtllm_batch_decode_varlen_does_not_depend_on_default_q_len_per_req():
+    """``cum_seq_lens_q`` supersedes ``q_len_per_req``, whose default is 1.
+
+    With the default left in place, the batch size used to be derived from the
+    token count (``query.size(0) // 1``), so the kernel indexed the
+    ``batch + 1``-entry ``cum_seq_lens_q`` (and ``seq_lens``, ``block_tables``)
+    past their end and returned wrong rows without raising. The same varlen
+    call must give the same result whether ``q_len_per_req`` is left at its
+    default or passed as ``None``.
+    """
+    _skip_if_not_blackwell()
+    torch.manual_seed(0)
+    device = GPU_DEVICE
+    batch_size, num_kv_heads, head_grp_size, head_dim, page_size = 4, 8, 4, 128, 16
+    pages_per_req = 64
+    q_lens = torch.tensor([3, 1, 4, 2], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([300, 517, 64, 1000], dtype=torch.int32, device=device)
+    cum_seq_lens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens_q[1:] = torch.cumsum(q_lens, 0)
+    num_tokens = int(cum_seq_lens_q[-1])
+    query = torch.randn(
+        num_tokens,
+        num_kv_heads * head_grp_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        batch_size * pages_per_req,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    block_tables = torch.randperm(
+        batch_size * pages_per_req, dtype=torch.int32, device=device
+    ).reshape(batch_size, pages_per_req)
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    def run(**kwargs):
+        workspace.zero_()
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens,
+            int(seq_lens.max()),
+            bmm1_scale=head_dim**-0.5,
+            bmm2_scale=1.0,
+            kv_layout="HND",
+            backend="trtllm-gen",
+            max_q_len=int(q_lens.max()),
+            cum_seq_lens_q=cum_seq_lens_q,
+            **kwargs,
+        )
+
+    expected = run(q_len_per_req=None)
+    actual = run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
