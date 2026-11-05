@@ -1525,16 +1525,16 @@ ABI_PARAMS["dhu_tape"] = ABI_PARAMS["dhu_offset"]
 
 
 # Walk-launch geometry one_cta_per_sm / tape_one_cta_per_sm: the K1 / K2 walk kernels' occupancy capped from the host.
-# Their launch footprint (192 threads, 115712 B of dynamic shared memory) admits two CTAs per SM only at the full 228 KiB
-# carveout; the smallest configuration that fits one CTA admits exactly one.  The runtime picks a kernel's configuration at
-# launch from its function attribute (unset here) and otherwise from the device-wide preference (cudaDeviceSetCacheConfig):
-# cudaFuncCachePreferL1 selects the smallest fitting shared-memory configuration, i.e. one CTA per SM.  The generated
-# binding compiles the launch (cudaLaunchKernelExC with the fixed dynamic shared memory) and exports no symbol for the
-# kernel's registered host function (its wrapper survives only as the mangled `__device_stub__`, which the runtime does
-# not accept), so the per-function attribute cannot be set from the host; the knob brackets each capped launch with the
-# device-wide preference instead (PreferL1 before, PreferNone after).  The preference is host-side state read at launch:
-# launches already queued keep their configuration and only the bracketed launch takes PreferL1.  Host side only; no
-# kernel, launch-configuration or argument change.
+# Their launch footprint (192 threads, 320 for the split-role fwdh offset build; 115712 B of dynamic shared memory)
+# admits two CTAs per SM only at the full 228 KiB carveout; the smallest configuration that fits one CTA admits exactly
+# one.  The runtime picks a kernel's configuration at launch from its function attribute (unset here) and otherwise from
+# the device-wide preference (cudaDeviceSetCacheConfig): cudaFuncCachePreferL1 selects the smallest fitting
+# shared-memory configuration, i.e. one CTA per SM.  The generated binding compiles the launch (cudaLaunchKernelExC with
+# the fixed dynamic shared memory) and exports no symbol for the kernel's registered host function (its wrapper survives
+# only as the mangled `__device_stub__`, which the runtime does not accept), so the per-function attribute cannot be set
+# from the host; the knob brackets each capped launch with the device-wide preference instead (PreferL1 before,
+# PreferNone after).  The preference is host-side state read at launch: launches already queued keep their configuration
+# and only the bracketed launch takes PreferL1.  Host side only; no kernel, launch-configuration or argument change.
 WALK_CACHE_CONFIG_CAP = 2  # cudaFuncCachePreferL1 (driver_types.h): the smallest shared-memory configuration that fits
 WALK_CACHE_CONFIG_DEFAULT = (
     0  # cudaFuncCachePreferNone: the runtime's own choice (today's launches)
