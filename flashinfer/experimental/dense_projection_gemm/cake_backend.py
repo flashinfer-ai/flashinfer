@@ -48,10 +48,11 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
     ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the
     same top-k;
-  - the K2 input gradient in the token windows of its rows in :data:`ROUTER_RULES` (:func:`router_simt`): an
-    exact-FP32 program on the CUDA cores, one FFMA per product of the FP32 operands read in place and every element of
-    ``out`` stored once (other bits than the deterministic program's BF16x3 emulation); every other row and token
-    count runs the deterministic program (one split).
+  - the K2 weight and input gradients in the SIMT token windows of their rows in the router tables
+    (:func:`router_rules`, :func:`router_simt`): an exact-FP32 program on the CUDA cores over the FP32 operands read
+    in place (compensated in the 148-SM tables), every element of ``out`` stored once (other bits than the
+    deterministic program's BF16x3 emulation, within the deterministic package's router FP64 budget); the input
+    gradient's every other row and token count runs the deterministic program (one split).
 
   Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
   both modes: a recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input
@@ -1272,8 +1273,8 @@ class _VerdictTable(dict):
 #: partition spec -- ``"waves"`` (:func:`router_waves`), a head/tail spec ``"H<f>x<k>"`` or ``"H<f>x<k>p<h>"`` (the
 #: weight gradient's head/tail program, :func:`router_partition_of`) or one of :func:`router_units_of` (``"forward"``,
 #: ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's stream-K program, a SIMT spec
-#: ``"simt_n<tile_n>m<tile_m>s<slices>"`` the exact-FP32 program of the row's layout on the CUDA cores (the weight
-#: gradient's or the input gradient's, :func:`router_simt`); ``None`` runs the deterministic program (its production
+#: ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"`` the exact-FP32 program (plain, or compensated with a form) of the
+#: row's layout on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (its production
 #: split count).  A rule is ``None``, token windows ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window
 #: that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
 #: every other token count runs the deterministic program -- or a spec alone, at every token count (the plan a test or a
@@ -1299,7 +1300,11 @@ ROUTER_RULES: dict[
     ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-    # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.
+    # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.  A
+    # window keeps the deterministic package's router budget: for every seed (10 seeds per measured token count, the
+    # router FP64 error table of the README) a relative Frobenius error against FP64 of the exact operands, worst of
+    # 20 runs, at most 2e-6.  Its ratio to the error of the plan the row takes without the window is reported data,
+    # not a gate.
     # Few tokens on sm_100a: the SIMT program (measured at 64, 128, 192, 224 and 256 tokens, alone, in the backward
     # pass and in the checkpointed step), the 128 x 64 tile from 1 to 224 tokens at hidden 4096 (128 CTAs of 256
     # threads, one wave on 152 SMs; at 256 tokens it was 6 to 12 % slower than the deterministic plan in CUDA graphs
@@ -1388,11 +1393,59 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096 and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144, and at
 #: 192 tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
 #: resident kernel), up to 64 tokens at hidden 6144.
+#: The 148-SM B200 (sm_100a) and B300 (sm_103a) tables hold the compensated SIMT windows (specs
+#: ``"simt_n<tile_n>m<tile_m>s<slices>g<group>"`` / ``"...dot2"``, :func:`router_simt_template`), measured on one node
+#: of each part under the rule of :data:`ROUTER_RULES` (both launch orders, eager and CUDA graphs, next to a kernel
+#: holding 8, 16 or 32 SMs, the backward pass and the checkpointed step, each window at its first, last and inner token
+#: counts).
+#: The weight gradient takes the 64 x 64 tile in two slices in the Dot2 form from 1 to 17 tokens and with one Kahan step
+#: per product from 18 to 32; from 33 tokens Kahan groups of four K steps, the 64 x 64 tile to 160 tokens at hidden 5120
+#: and 6144, and at hidden 4096 the 128 x 64 tile from 33 to 48 and 65 to 112 tokens and the 64 x 64 tile from 49 to 64
+#: and 113 to 160.  The input gradient takes the 32 x 64 tile in four slices with Kahan groups of four K steps up to 32
+#: tokens.  Every window's program keeps the router budget: a relative Frobenius error against FP64 of at most 5.2e-8
+#: at the 105 measured token counts of each part's windows (10 seeds, worst of 20 runs; 0.55 to 1.009 times the
+#: deterministic program's).  Past the windows the programs missed the rule: the input gradient at 33 tokens (3.3 %
+#: slower next to a resident kernel at hidden 4096; the backward pass or the checkpointed step 1.3 to 2.7 % slower at
+#: hidden 5120 and 6144), the weight gradient at 176 tokens (3.6 to 6.0 % slower next to a resident kernel at hidden
+#: 4096 and 6144; the backward pass or the checkpointed step 2.4 to 3.5 % slower at hidden 5120, 4.0 % at 192 tokens).
+#: Every other row and token count of these parts runs the deterministic program.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]],
 ] = _VerdictTable({
+    ("sm_100a", 148): _VerdictTable({
+        ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
+        ("sm_100a", "nn_t", 4096, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
+            (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_100a", "nn_t", 5120, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_100a", "nn_t", 6144, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_100a", "kn", 4096, 256): ((1, 32, "simt_n64m32s4g4"),),
+        ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
+        ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
+    }),
+    ("sm_103a", 148): _VerdictTable({
+        ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
+        ("sm_103a", "nn_t", 4096, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
+            (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_103a", "nn_t", 5120, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_103a", "nn_t", 6144, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_103a", "kn", 4096, 256): ((1, 32, "simt_n64m32s4g4"),),
+        ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
+        ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
+    }),
     ("sm_107a", 208): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
@@ -1431,15 +1484,28 @@ ROUTER_HEAD_TAIL_TEMPLATES_BY_SM: dict[tuple[str, int], str] = {
     ("sm_107a", 212): "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
-#: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>"``: an exact-FP32 program on the CUDA cores with one CTA per
-#: ``tile_n x tile_m`` tile of ``out`` over the whole K range: ``slices`` slices of the CTA each take every
-#: ``slices``-th 16-element K block, one FFMA per product, and add in slice order.  No BF16 parts, no split of K across
-#: CTAs: every element of ``out`` is stored once, its bits fixed by ``K`` and the program.  On a weight-gradient row
-#: (``nn_t``) the program ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>``, ``out[N, M] = B[K, N].T @ A[K, M]``
-#: of the swapped launch (``A`` the activations, ``B`` the output gradient); on an input-gradient row (``kn``) the
-#: program ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>``, ``out[M, N] = A[M, K] @ B[K, N]`` (``A`` the
-#: output gradient, ``B`` the router weight; ``tile_m`` token rows by ``tile_n`` hidden columns).
-_ROUTER_SIMT_SPEC = re.compile(r"simt_n(\d+)m(\d+)s(\d+)")
+#: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"``: an exact-FP32 program on the CUDA cores with one
+#: CTA per ``tile_n x tile_m`` tile of ``out`` over the whole K range: ``slices`` slices of the CTA each take every
+#: ``slices``-th K block (16 elements; 8 in the Dot2 form) and add in slice order.  No BF16 parts, no split of K across
+#: CTAs: every element of ``out`` is stored once, its bits fixed by ``K`` and the program.  Without a form the plain
+#: program (one FFMA per product: ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` on a weight-gradient row,
+#: ``nn_t``, and ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` on an input-gradient row, ``kn``); with one a
+#: compensated program, each slice keeping a sum and its compensation and the slices merged in slice order by TwoSum
+#: with their compensations (every FP32 instruction rounded to nearest without flush):
+#:
+#: * ``g<group>``: per output and group of ``group`` consecutive K steps of a slice one FMA chain from the negated
+#:   compensation and one Kahan add (``(group + 3) / group`` FP32 instructions per product), the program
+#:   ``router_fp32_gemm_simt_kahan_n<tile_n>m<tile_m>s<slices>g<group>`` /
+#:   ``router_fp32_dgrad_simt_kahan_m<tile_m>n<tile_n>s<slices>g<group>`` -- for ``g1``, one Kahan step per product,
+#:   without the ``g1`` suffix;
+#: * ``dot2`` (weight gradient): each product rounded once with its exact error kept, a TwoSum into the sum and both
+#:   errors into the compensation, in blocks of 8 rows without the rows past ``K`` (10 FP32 instructions per product),
+#:   the program ``router_fp32_gemm_simt_kahan_dot2_n<tile_n>m<tile_m>s<slices>``.
+#:
+#: The weight gradient runs ``out[N, M] = B[K, N].T @ A[K, M]`` of the swapped launch (``A`` the activations, ``B`` the
+#: output gradient), the input gradient ``out[M, N] = A[M, K] @ B[K, N]`` (``A`` the output gradient, ``B`` the router
+#: weight; ``tile_m`` token rows by ``tile_n`` hidden columns).
+_ROUTER_SIMT_SPEC = re.compile(r"simt_n(\d+)m(\d+)s(\d+)(g\d+|dot2)?")
 #: The K rows of a SIMT program's block (its ``k_iters`` count them).
 ROUTER_SIMT_BLOCK_K = 16
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
@@ -1528,28 +1594,51 @@ def router_head_pairs(spec: Union[str, int, None]) -> Optional[int]:
     return None
 
 
-def router_simt_tile(spec: Union[str, int, None]) -> Optional[tuple[int, int, int]]:
-    """``(tile_n, tile_m, slices)`` of a SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>"``, else ``None``."""
+def router_simt_tile(
+    spec: Union[str, int, None],
+) -> Optional[tuple[Union[int, str], ...]]:
+    """The tile of a SIMT window spec: ``(tile_n, tile_m, slices)`` of a plain spec
+    ``"simt_n<tile_n>m<tile_m>s<slices>"``, ``(tile_n, tile_m, slices, form)`` of a compensated one (``form``
+    ``"g<group>"`` or ``"dot2"``); else ``None``."""
     if isinstance(spec, str):
         match = _ROUTER_SIMT_SPEC.fullmatch(spec)
         if match:
-            tile_n, tile_m, slices = (int(g) for g in match.groups())
-            return tile_n, tile_m, slices
+            tile_n, tile_m, slices, form = match.groups()
+            tile = (int(tile_n), int(tile_m), int(slices))
+            return tile if form is None else (*tile, form)
     return None
 
 
-def router_simt_template(tile: tuple[int, int, int], layout: str = "nn_t") -> str:
-    """The template of the SIMT program of ``(tile_n, tile_m, slices)`` of the layout class ``layout``: the weight
-    gradient's ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` (``nn_t``), the input gradient's
-    ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` (``kn``)."""
-    tile_n, tile_m, slices = (int(t) for t in tile)
-    if layout == "kn":
-        return f"{cake_jit.TEMPLATE_PREFIXES[4]}m{tile_m}n{tile_n}s{slices}"
-    if layout != "nn_t":
+def router_simt_template(
+    tile: tuple[Union[int, str], ...], layout: str = "nn_t"
+) -> str:
+    """The template of the SIMT program of the tile ``(tile_n, tile_m, slices)`` (plain) or ``(tile_n, tile_m, slices,
+    form)`` (compensated, :func:`router_simt_tile`) of the layout class ``layout``: the weight gradient's
+    ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` / ``router_fp32_gemm_simt_kahan_n<tile_n>m<tile_m>s<slices>
+    g<group>`` (``g1``: no suffix) / ``router_fp32_gemm_simt_kahan_dot2_n<tile_n>m<tile_m>s<slices>`` (``nn_t``), the
+    input gradient's ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` /
+    ``router_fp32_dgrad_simt_kahan_m<tile_m>n<tile_n>s<slices>g<group>`` (``kn``)."""
+    if len(tile) not in (3, 4):
+        raise ValueError(f"router_simt_template: {tile!r} is not a SIMT tile")
+    tile_n, tile_m, slices = (int(t) for t in tile[:3])
+    form = str(tile[3]) if len(tile) == 4 else None
+    if form is not None and not re.fullmatch(r"g[1-9]\d*|dot2", form):
+        raise ValueError(f"router_simt_template: {tile!r} is not a SIMT tile")
+    if layout not in ("nn_t", "kn"):
         raise ValueError(
             f"router_simt_template: no SIMT program of the {layout!r} class"
         )
-    return f"{cake_jit.TEMPLATE_PREFIXES[3]}n{tile_n}m{tile_m}s{slices}"
+    if form == "dot2" and layout == "kn":
+        raise ValueError(
+            f"router_simt_template: {tile!r}: the Dot2 form is the weight gradient's"
+        )
+    kahan = "" if form is None else "kahan_dot2_" if form == "dot2" else "kahan_"
+    suffix = "" if form in (None, "dot2", "g1") else form
+    if layout == "kn":
+        return (
+            f"{cake_jit.TEMPLATE_PREFIXES[4]}{kahan}m{tile_m}n{tile_n}s{slices}{suffix}"
+        )
+    return f"{cake_jit.TEMPLATE_PREFIXES[3]}{kahan}n{tile_n}m{tile_m}s{slices}{suffix}"
 
 
 def router_head_tail_template(arch: str, sm_count: Optional[int] = None) -> str:
@@ -1794,8 +1883,8 @@ def router_simt(
     K: int,
     sm_count: int,
     splits: Optional[int] = None,
-) -> Optional[tuple[int, int, int]]:
-    """``(tile_n, tile_m, slices)`` of the SIMT program a launch ``[M, N] = [M, K] @ [K, N]`` runs on a device of
+) -> Optional[tuple[Union[int, str], ...]]:
+    """The tile (:func:`router_simt_tile`) of the SIMT program a launch ``[M, N] = [M, K] @ [K, N]`` runs on a device of
     ``sm_count`` SMs: the weight gradient's (the swapped GEMM: ``M`` hidden, ``N`` experts, ``K`` tokens; layout class
     ``nn_t``) when the tile divides ``M`` and ``N``, the input gradient's (``M`` tokens, ``N`` hidden, ``K`` experts;
     layout class ``kn``) when the tile divides ``N`` (the last row tile takes the rows left).  The SIMT spec of the
@@ -1811,7 +1900,11 @@ def router_simt(
     tile = router_simt_tile(
         _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
     )
-    if tile is None or int(N) % tile[0] or (layout == "nn_t" and int(M) % tile[1]):
+    if (
+        tile is None
+        or int(N) % int(tile[0])
+        or (layout == "nn_t" and int(M) % int(tile[1]))
+    ):
         return None
     return tile
 
@@ -1822,7 +1915,7 @@ class AtomicRouterPlan:
     [K, N]``): ``m_tiles / 2 x n_tiles`` tiles of ``256 x 128``, their ``k_iters`` K blocks cut into ``units``
     stream-K spans (``2 * units`` CTAs; the first ``head_spans`` spans share the first ``head_steps`` steps on the
     head/tail program, every span alike when ``head_spans`` is 0); with part tiles the launch zeroes ``out`` before
-    the program.  With ``simt`` (a SIMT program, ``(tile_n, tile_m, slices)``, :func:`router_simt`): one CTA per
+    the program.  With ``simt`` (a SIMT program, its tile, :func:`router_simt`): one CTA per
     ``tile_n x tile_m`` tile of ``out`` over ``k_iters`` K blocks of :data:`ROUTER_SIMT_BLOCK_K` elements, the
     operands' row strides ``lda`` / ``ldb``; ``units`` 0, no part tiles.  The weight gradient's (``nn_t``) launches
     ``m_tiles x n_tiles`` CTAs over the transposed ``out`` (``A`` the activations, ``B`` the output gradient), the
@@ -1843,7 +1936,7 @@ class AtomicRouterPlan:
     template: str
     head_spans: int = 0
     head_steps: int = 0
-    simt: Optional[tuple[int, int, int]] = None
+    simt: Optional[tuple[Union[int, str], ...]] = None
     lda: int = 0
     ldb: int = 0
 
@@ -1996,7 +2089,7 @@ def plan_atomic_router(
         template = router_simt_template(simt, layout)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
-        tile_n, tile_m, _ = simt
+        tile_n, tile_m = int(simt[0]), int(simt[1])
         return (
             AtomicRouterPlan(
                 M=M_eff,
@@ -4829,9 +4922,9 @@ def router_dgrad(
     """``out[T, K] = G[T, N] @ W[N, K]`` in FP32: the deterministic program (one split: nothing to reduce) through the
     emulation; with ``deterministic=False`` in the token windows of the row's input-gradient verdict in
     :data:`ROUTER_RULES` (or, on a part with a table of its own, :data:`ROUTER_RULES_BY_SM`) the exact-FP32 SIMT
-    program (:func:`router_simt`: one FFMA per product of ``G`` and ``W`` read in place, every element of ``out``
-    stored once), and at every other row and token count the deterministic program through this package's binding of
-    it (:func:`_launch_cached_splitk_k2`: the same plan, program and bits).  ``enable_pdl`` as for
+    program (:func:`router_simt`: compensated sums of the products of ``G`` and ``W`` read in place, every element of
+    ``out`` stored once), and at every other row and token count the deterministic program through this package's
+    binding of it (:func:`_launch_cached_splitk_k2`: the same plan, program and bits).  ``enable_pdl`` as for
     :func:`prepare_router_fp32_gemm`."""
     if _resolve_deterministic(deterministic, "router_dgrad"):
         return _det_entry("router_dgrad")(G, W, out, **_pdl_kw(enable_pdl))

@@ -134,8 +134,10 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 # ``TicketWord`` (scan only, right before ``zero_region``) is the 16-byte block
 # a scan program draws its work units from where its registry record lists the
 # architecture in ``ticket_arg_arches``; every other scan program takes it and
-# never reads it.
-ABI_CONTRACT = "dsa_indexer_v4"
+# never reads it.  ``K_scale`` (scan only, right before ``TicketWord``) is the
+# per-key FP32 scale vector of an FP8 form; every program here is BF16 and
+# never reads it, so the host passes a never-dereferenced placeholder.
+ABI_CONTRACT = "dsa_indexer_v5"
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 CONTRACT_TENSORS = (
     "Q",  # q viewed as [T * 32, 128] (TMA source)
@@ -150,6 +152,7 @@ CONTRACT_TENSORS = (
     "Staging",  # the split staging [T, n_split, top_k] behind the candidate buffers (merge stage only)
     "zero_region",  # the scan's caller-owned ticket tail, zeroed by its binding before the launch, or an empty view
     "TicketWord",  # the scan's 16-byte ticket block (uint32 view): its own, or a zeroed placeholder it never reads
+    "K_scale",  # an FP8 form's per-key FP32 scales: a never-dereferenced float32 placeholder (BF16 programs only)
 )
 SCAN_SCALARS = (
     "num_segments",
@@ -729,7 +732,7 @@ _FFI_DEVICES: dict[int, Any] = {}
 _EMPTY_REGIONS: dict[int, Any] = {}
 _TICKET_PLACEHOLDERS: dict[int, Any] = {}
 _QUIET_SCAN_ARGS: dict[int, dict[str, Any]] = {}
-_OFFSETS_PLACEHOLDERS: dict[int, torch.Tensor] = {}
+_UNREAD_PLACEHOLDERS: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 # the ticket block a ``TicketWord`` argument points at: the ticket word (the low u32 of its first 8 bytes) and padding
 TICKET_BLOCK_BYTES = 16
 # the bytes a binding's ``zero_region`` zeroes to restore the ticket word of a block
@@ -774,16 +777,21 @@ def _quiet_scan_args(index: int) -> dict[str, Any]:
     return args
 
 
-def _offsets_placeholder(index: int) -> torch.Tensor:
-    """The ``q_offsets`` of a call without causal offsets (``has_offsets = 0``: no program dereferences it): one
-    int64 tensor per device, allocated without a device operation and never written, so such a call launches nothing
-    before its scan.  Made during a CUDA graph capture, it is the call's own (the capture's pool) and not kept."""
-    holder = _OFFSETS_PLACEHOLDERS.get(index)
+def _unread_placeholder(index: int, dtype: torch.dtype) -> torch.Tensor:
+    """A one-element ``dtype`` tensor on device ``index`` for an argument no launched program dereferences: one per
+    device and dtype, allocated without a device operation and never written, so such a call launches nothing before
+    its scan.  Made during a CUDA graph capture, it is the call's own (the capture's pool) and not kept."""
+    holder = _UNREAD_PLACEHOLDERS.get((index, dtype))
     if holder is None:
-        holder = torch.empty(1, dtype=torch.int64, device=f"cuda:{index}")
+        holder = torch.empty(1, dtype=dtype, device=f"cuda:{index}")
         if not torch.cuda.is_current_stream_capturing():
-            _OFFSETS_PLACEHOLDERS[index] = holder
+            _UNREAD_PLACEHOLDERS[(index, dtype)] = holder
     return holder
+
+
+def _offsets_placeholder(index: int) -> torch.Tensor:
+    """The ``q_offsets`` of a call without causal offsets (``has_offsets = 0``: no program dereferences it)."""
+    return _unread_placeholder(index, torch.int64)
 
 
 def _ffi_stream_context(index: int):
@@ -1083,6 +1091,8 @@ def _prepare_runner(
         "q_offsets": q_causal_offsets
         if q_causal_offsets is not None
         else _offsets_placeholder(device_index),
+        # only an FP8 form reads the per-key scales; every program here is BF16
+        "K_scale": _unread_placeholder(device_index, torch.float32),
         "Indices": indices
         if indices is not None
         else torch.empty((num_queries, int(top_k)), dtype=torch.int32, device=device),
