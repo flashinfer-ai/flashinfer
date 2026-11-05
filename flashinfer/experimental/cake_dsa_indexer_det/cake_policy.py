@@ -47,12 +47,22 @@ Nothing here reads device memory: the segment boundaries stay on the device
 and the dispatch sees only host-known integers.  The chosen program never
 changes a result -- every form computes the same ids and score bits -- so a
 wrong choice costs time, not correctness.
+
+The opt-in FP8 input form (float8_e4m3fn ``q`` / ``k``) has its own scan
+programs, keyed ``scan:<kind>:u<unroll>:s0:f1:fp8[:lsf]``, for the narrow, l6
+and split kinds only.  An FP8 call runs the same decision procedure under the
+architecture's FP8 record (``fp8_policy_record``: the ``POLICY`` record with
+the fields of the registry's ``POLICY_FP8`` record replaced) and then the
+registered FP8 program of the decided kind, or of its ``FP8_KIND_FALLBACK``
+kind (``select_fp8_program``).  Every FP8 program of one architecture
+computes the same ids and score bits.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Collection, Optional, Tuple
+import re
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Collection, NamedTuple, Optional, Tuple
 
 # Record fields in canonical order (the export writes them in this order).
 POLICY_FIELDS = (
@@ -142,6 +152,23 @@ PHYSICAL_KINDS = tuple(
     sorted(set(KINDS) - {"split"} | {f"split_{unit}" for unit in UNITS})
 )
 MERGE_KEY = "merge"
+# Input forms of a call, selected by its q / k dtype: ``bf16`` (the default) and ``fp8`` (float8_e4m3fn q / k with
+# per-key FP32 scales, opt-in).  An FP8 scan program's key carries the form tag before the LSF suffix,
+# ``scan:<kind>:u<unroll>:s<snake>:f<fit>:fp8[:lsf]``; the merge and finalize programs serve both forms.
+BF16 = "bf16"
+FP8 = "fp8"
+FORMS = (BF16, FP8)
+# The FP8 scan programs exist for the narrow, l6 and split kinds only, with no snake order and in the sampled-fit form.
+# An FP8 call runs the decision procedure of ``select_program`` under the FP8 record (``fp8_policy_record``); a decided
+# kind without an FP8 program runs the FP8 program of the kind below (same unit geometry where it has one, unpaired).
+FP8_KIND_FALLBACK = {
+    "wide": "narrow",
+    "pair_l6": "l6",
+    "pair_narrow": "narrow",
+    "pair_wide": "narrow",
+    "split_wide": "split_narrow",
+    "split_l6": "split_narrow",
+}
 # Admissible sampled rank shift (permille): the backend's ``sample_shift_permille`` knob bound and the bound of a record's
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
 # threshold is.
@@ -1220,11 +1247,84 @@ def physical_kind(kind: str, unit: str) -> str:
 
 
 def scan_key(
-    physical: str, tile_unroll: int, snake: bool, sample_fit: bool, lsf: bool = False
+    physical: str,
+    tile_unroll: int,
+    snake: bool,
+    sample_fit: bool,
+    lsf: bool = False,
+    form: str = BF16,
 ) -> str:
-    """``:lsf``: the copy of the program that hands out its tickets longest segment first (lever LSF)."""
+    """``:lsf``: the longest-first (LSF) copy, which hands out the program's tickets longest segment first; ``form``
+    ``"fp8"``: the FP8 program, tagged ``:fp8`` before the ``:lsf`` suffix."""
     key = f"scan:{physical}:u{int(tile_unroll)}:s{int(bool(snake))}:f{int(bool(sample_fit))}"
+    if form == FP8:
+        key += ":fp8"
+    elif form != BF16:
+        raise ValueError(f"form must be one of {FORMS}, got {form!r}")
     return key + ":lsf" if lsf else key
+
+
+class ScanKeyFields(NamedTuple):
+    """The fields of a scan program key (``scan_key``)."""
+
+    physical: str
+    tile_unroll: int
+    snake: bool
+    sample_fit: bool
+    form: str
+    lsf: bool
+
+
+_SCAN_KEY = re.compile(r"scan:([a-z0-9_]+):u([0-9]+):s([01]):f([01])(:fp8)?(:lsf)?")
+
+
+def scan_key_fields(key: str) -> Optional[ScanKeyFields]:
+    """The fields of the scan program key ``key``; None for any other key."""
+    match = _SCAN_KEY.fullmatch(key)
+    if match is None:
+        return None
+    physical, unroll, snake, fit, fp8, lsf = match.groups()
+    return ScanKeyFields(
+        physical, int(unroll), snake == "1", fit == "1", FP8 if fp8 else BF16, bool(lsf)
+    )
+
+
+def scan_key_form(key: str) -> Optional[str]:
+    """The input form (``FORMS``) of the scan program key ``key``; None for any other key."""
+    fields = scan_key_fields(key)
+    return None if fields is None else fields.form
+
+
+def fp8_policy_record(record: dict, fp8_record: dict) -> dict:
+    """The FP8 form's dispatch record of an architecture: its record ``record`` (``POLICY[arch]``) with the fields of
+    its FP8 record ``fp8_record`` (``POLICY_FP8[arch]``) replaced.  ``fp8_record`` names its own ``static_scan_kinds``
+    (the FP8 programs never keep the BF16 programs' static kinds) and no field outside ``POLICY_FIELDS``."""
+    if (
+        not isinstance(fp8_record, dict)
+        or "static_scan_kinds" not in fp8_record
+        or not set(fp8_record) <= set(POLICY_FIELDS)
+    ):
+        raise ValueError(
+            f"an FP8 dispatch record must name static_scan_kinds and only fields of {POLICY_FIELDS}, got {fp8_record!r}"
+        )
+    return {**record, **fp8_record}
+
+
+def fp8_scan_programs(scan_keys: Collection[str]) -> dict:
+    """The dispatchable FP8 scan programs of a registry's keys: ``{(physical kind, lsf): {tile unroll: key}}`` over the
+    FP8 keys of the form the FP8 programs are built in (no snake order, the sampled-fit form: ``s0`` / ``f1``)."""
+    programs: dict = {}
+    for key in scan_keys:
+        fields = scan_key_fields(key)
+        if (
+            fields is None
+            or fields.form != FP8
+            or fields.snake
+            or not fields.sample_fit
+        ):
+            continue
+        programs.setdefault((fields.physical, fields.lsf), {})[fields.tile_unroll] = key
+    return programs
 
 
 FINALIZE_ROLE = "finalize"  # CUB block radix sort programs
@@ -1617,9 +1717,99 @@ def select_program(
     )
 
 
+def fp8_program_choice(
+    policy: DispatchPolicy,
+    choice: ProgramChoice,
+    key: str,
+    n_split: Optional[int] = None,
+) -> ProgramChoice:
+    """``choice`` run by the FP8 scan program ``key``: the unit geometry, the split and the tile unroll follow the key,
+    an FP8 program has no CTA pair (the launched grid is the requested one), and the capacity, check period, sampling
+    knobs and finalize of ``choice`` stay.  ``n_split``: the key-range splits of a split key (default: the plan's, at
+    least 2); the workspace bound follows the unit geometry and the split."""
+    fields = scan_key_fields(key)
+    if fields is None or fields.form != FP8:
+        raise ValueError(f"{key!r} is not an FP8 scan program key")
+    physical = fields.physical
+    split = physical.startswith("split_")
+    unit = physical[len("split_") :] if split else physical
+    if unit not in UNITS:
+        raise ValueError(f"no FP8 program runs the scan kind of {key!r}")
+    block_q = {
+        "narrow": policy.block_q_narrow,
+        "wide": policy.block_q_wide,
+        "l6": policy.block_q_l6,
+    }[unit]
+    if not split:
+        n = 1
+    elif n_split is None:
+        n = max(2, int(choice.n_split))
+    else:
+        n = int(n_split)
+        if n < 2:
+            raise ValueError(f"a split program needs n_split >= 2, got {n_split!r}")
+    grid_ctas = int(choice.grid)
+    scan_entries = grid_ctas * block_q * int(choice.cand_cap)
+    staging = int(choice.num_queries) * n * int(choice.top_k) if split else 0
+    return replace(
+        choice,
+        grid_ctas=grid_ctas,
+        block_q=block_q,
+        unit=unit,
+        n_split=n,
+        split=split,
+        pair=False,
+        kind="split" if split else unit,
+        physical_kind=physical,
+        snake=fields.snake,
+        tile_unroll=fields.tile_unroll,
+        sample_fit=fields.sample_fit,
+        lsf=fields.lsf,
+        scan_key=key,
+        merge_key=MERGE_KEY if split else None,
+        scan_entries=scan_entries,
+        staging_entries=staging,
+        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes
+        + TICKET_TAIL_BYTES,
+    )
+
+
+def select_fp8_program(
+    policy: DispatchPolicy,
+    *,
+    scan_keys: Collection[str],
+    fp8_programs: Optional[dict] = None,
+    **call: Any,
+) -> ProgramChoice:
+    """The host dispatch of one FP8 call: the decision procedure of ``select_program`` (``call``: its keywords) under the
+    architecture's FP8 record ``policy`` (``fp8_policy_record``) with the registry's ``scan_keys``, run by the FP8
+    program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind where no FP8
+    program of that kind is registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered) and
+    with the decided tile unroll where an FP8 program of it is registered, else the smallest registered one.
+    ``fp8_programs``: ``fp8_scan_programs(scan_keys)``, made once by the caller.  Raises ``NotImplementedError`` when no
+    FP8 program serves the kind."""
+    choice = select_program(policy, scan_keys=scan_keys, **call)
+    programs = fp8_scan_programs(scan_keys) if fp8_programs is None else fp8_programs
+    physical = choice.physical_kind
+    if not any(kind == physical for kind, _lsf in programs):
+        physical = FP8_KIND_FALLBACK.get(physical, physical)
+    unrolls = programs.get((physical, choice.lsf)) or programs.get((physical, False))
+    if not unrolls:
+        raise NotImplementedError(
+            f"the FP8 dispatch selected the {physical!r} scan kind, which no registered FP8 program serves "
+            f"(registered FP8 kinds: {sorted({kind for kind, _lsf in programs})})"
+        )
+    key = unrolls.get(choice.tile_unroll, unrolls[min(unrolls)])
+    return fp8_program_choice(policy, choice, key)
+
+
 __all__ = [
+    "BF16",
     "FINALIZE_RANK_ROLE",
     "FINALIZE_ROLE",
+    "FORMS",
+    "FP8",
+    "FP8_KIND_FALLBACK",
     "KINDS",
     "MERGE_KEY",
     "POLICY_FIELDS",
@@ -1628,10 +1818,17 @@ __all__ = [
     "UNITS",
     "DispatchPolicy",
     "ProgramChoice",
+    "ScanKeyFields",
     "finalize_key",
     "finalize_role",
+    "fp8_policy_record",
+    "fp8_program_choice",
+    "fp8_scan_programs",
     "physical_kind",
     "scan_key",
+    "scan_key_fields",
+    "scan_key_form",
+    "select_fp8_program",
     "select_program",
     "stage_slug",
     "ticket_static_path",
