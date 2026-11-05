@@ -198,10 +198,15 @@ WALK_FORMS = ("auto", "full", "split")
 #     less time);
 #   sm_100a (GB200, 152 SMs; cold L2), H = 64: w4 253.6 / 267.7 | z2 412.6 /
 #     462.2 | c14 409.1 / 447.9 | d4 219.7 / 233.3 | w2d 517.9 / 538.0; H =
-#     32: w4 145.6 / 147.3 | z2 374.1 / 266.9 | w2d 342.9 / 307.3; H = 16: w4
-#     97.1 / 87.0 | z2 369.0 / 239.0 | w1 136.1 / 91.6; H = 8: w4 87.4 / 63.9;
-#     H = 4: w4 84.7 / 57.1 | z2 363.6 / 231.3 | w1 133.0 / 85.2 | w2d 315.7 /
-#     200.9 -> the same bands;
+#     48: w4 197.9 / 203.2 | z2 386.4 / 421.0 | c14 314.7 / 327.4 | d4 194.6
+#     / 183.8 | w2d 366.8 / 383.9; H = 40: w4 171.9 / 175.9 | z2 384.8 / 425.3
+#     | c14 263.9 / 277.7 | d4 189.6 / 179.6 | w2d 359.0 / 354.5; H = 32: w4
+#     145.6 / 147.3 | z2 374.1 / 266.9 | w2d 342.9 / 307.3; H = 16: w4 97.1 /
+#     87.0 | z2 369.0 / 239.0 | w1 136.1 / 91.6; H = 8: w4 87.4 / 63.9; H = 4:
+#     w4 84.7 / 57.1 | z2 363.6 / 231.3 | w1 133.0 / 85.2 | w2d 315.7 / 200.9
+#     -> the same bands: the faster record on 22 of these 26 rows (on the
+#     other four, w4 at H = 32, d4 at H = 48 and 40 and w2d at H = 40, the
+#     other record takes at most 5.5 % less time);
 #   sm_107a (an R200 board with 208 SMs; back to back; the kernel before its
 #     plain u loads), H = 64: w4 222.3 / 211.5 | z2 620.8 / 445.9 | c14 355.0
 #     / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (fewer heads not
