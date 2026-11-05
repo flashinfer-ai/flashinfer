@@ -257,10 +257,10 @@ def test_megamoe_mxfp4_sm120_hidden_widths(hidden):
 
 
 def test_megamoe_mxfp4_sm120_production_shape():
-    """DeepSeek-V4-Flash routed experts (H4096, I2048, 256 experts, top-6) at decode batch sizes, EP4."""
+    """DeepSeek-V4-Flash routed experts (H4096, I2048, 256 experts, top-6), EP4, up to the 256 tokens/rank cap."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
-    _run(_args(hidden=4096, intermediate=2048, capacity=64, tokens=[1, 16, 64]))
+    _run(_args(hidden=4096, intermediate=2048, capacity=256, tokens=[1, 16, 64, 256]))
 
 
 if __name__ == "__main__":
