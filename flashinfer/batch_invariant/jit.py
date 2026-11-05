@@ -37,8 +37,9 @@ MODE_DIRS: Tuple[Path, ...] = (
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
 #: relative-import closure of these files within the mode's directories.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
-    # the GEMM kernels and the split-K fixup share one module: both roots, so an edit to either invalidates its objects
-    "batch_invariant_gemm_bf16": (
+    # the GEMM kernels (both operand formats) and the split-K fixup share one module: both roots, so an edit to either
+    # invalidates its objects
+    "batch_invariant_gemm": (
         "gemm/batch_invariant/blocks/compile.py",
         "gemm/batch_invariant/fixup.py",
     ),
@@ -47,7 +48,7 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
 #: package: the relative-import closure cannot reach them, so they are keyed explicitly (a missing file is an error).
 MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_gemm_bf16": (
+    "batch_invariant_gemm": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
 }

@@ -42,6 +42,7 @@ import pathlib
 import random
 import re
 import threading
+import types
 
 import pytest
 import torch
@@ -6253,3 +6254,219 @@ def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_t
         assert kcp.kept_registry_size() == 0
     for n in ("out",) + CKPT_GRADS:
         assert torch.equal(arms[1][n], arms[0][n]), n
+
+
+# --------------------------------------------------------------------------- host launch path: stream binding, registry answers, chunk tokens
+# Host data only: what a launch binds for tvm-ffi and what the forward re-derives per call.  The launches, their
+# records, grids and arguments are not changed by any of them.
+
+
+def test_launch_binds_the_current_stream_through_use_raw_stream(monkeypatch) -> None:
+    """``cake_backend.run_module`` with a counting stand-in for ``tvm_ffi`` (only ``use_raw_stream``) and a set current
+    stream (CPU): every launch enters one ``use_raw_stream(device, raw)`` context on the current stream's device and
+    raw handle and launches inside it; a stream switch (another device's stream) binds that stream; a launch on
+    another thread binds its own; an exception from the launch leaves no binding behind."""
+    be = _package("cake_backend")
+    state = {"stream": (0, 11), "enters": 0, "bound": [], "launched": []}
+
+    class _Context:
+        def __init__(self, device, raw):
+            self.stream = (device[1], raw)  # the stand-in device is ("cuda", index)
+
+        def __enter__(self):
+            state["enters"] += 1
+            state["bound"].append(self.stream)
+            return self
+
+        def __exit__(self, *exc):
+            state["bound"].pop()
+
+    monkeypatch.setattr(be, "tvm_ffi", types.SimpleNamespace(use_raw_stream=_Context))
+    monkeypatch.setattr(be, "_ffi_device", lambda index: ("cuda", index))
+    monkeypatch.setattr(be, "_current_stream", lambda: state["stream"])
+    name = "fwd_prep"
+    values = {n: n for n, _axis in be._argument_plan(name) if n is not None}
+
+    def entry(*a):
+        state["launched"].append(state["bound"][-1] if state["bound"] else None)
+        if state.get("raise"):
+            raise RuntimeError("inside the launch")
+
+    module = types.SimpleNamespace(**{be.record(name)["ffi_entry"]: entry})
+
+    def launch() -> None:
+        be.run_module(name, values, grid=(1, 1, 1), device_index=0, module=module)
+
+    def enters_after(fn) -> int:
+        n = state["enters"]
+        fn()
+        return state["enters"] - n
+
+    assert enters_after(launch) == 1 and state["launched"][-1] == (0, 11)
+    assert enters_after(launch) == 1 and state["bound"] == []
+    state["stream"] = (1, 22)
+    assert enters_after(launch) == 1 and state["launched"][-1] == (1, 22)
+    state["stream"] = (0, 11)
+    worker = threading.Thread(target=launch)
+    assert enters_after(lambda: (worker.start(), worker.join())) == 1
+    assert state["launched"][-1] == (0, 11)
+    state["raise"] = True
+    with pytest.raises(RuntimeError, match="inside the launch"):
+        launch()
+    assert state["bound"] == [] and state["launched"][-1] == (0, 11)
+
+
+def test_stream_context_sets_the_ffi_stream_of_the_device() -> None:
+    """``cake_backend.stream_context((index, raw))`` with the real ``tvm_ffi``: inside, tvm-ffi's current stream of CUDA
+    device ``index`` is ``raw``, another device's stream is untouched, nested contexts restore in order and the
+    previous stream is back after the outermost one; ``_ffi_device`` builds each device once.  With CUDA: for torch's
+    current stream (the default one and a side stream) the stream it binds is the one ``tvm_ffi.use_torch_stream()``
+    binds."""
+    import tvm_ffi
+
+    be = _package("cake_backend")
+    dev0, dev1 = tvm_ffi.device("cuda", 0), tvm_ffi.device("cuda", 1)
+    before0, before1 = tvm_ffi.get_raw_stream(dev0), tvm_ffi.get_raw_stream(dev1)
+    with be.stream_context((0, 0x1234)):
+        assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        assert tvm_ffi.get_raw_stream(dev1) == before1
+        with be.stream_context((1, 0x5678)):
+            assert tvm_ffi.get_raw_stream(dev1) == 0x5678
+            assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        with be.stream_context((0, 0x9ABC)):
+            assert tvm_ffi.get_raw_stream(dev0) == 0x9ABC
+        assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        assert tvm_ffi.get_raw_stream(dev1) == before1
+    assert tvm_ffi.get_raw_stream(dev0) == before0
+    assert be._ffi_device(0) is be._ffi_device(0)
+    d1 = be._ffi_device(1)
+    assert (d1.dlpack_device_type(), d1.index) == (dev1.dlpack_device_type(), 1)
+    if not torch.cuda.is_available():
+        return
+    index = torch.cuda.current_device()
+    dev = tvm_ffi.device("cuda", index)
+    side = torch.cuda.Stream()
+    for stream in (torch.cuda.current_stream(), side):
+        with torch.cuda.stream(stream):
+            with tvm_ffi.use_torch_stream():
+                want = tvm_ffi.get_raw_stream(dev)
+            with be.stream_context(be._current_stream()):
+                got = tvm_ffi.get_raw_stream(dev)
+        assert got == want == stream.cuda_stream, (got, want, stream)
+
+
+def test_registry_answers_are_derived_once_per_registry_identity(monkeypatch) -> None:
+    """``l2n_records_shipped`` / ``fused_o_shipped(arch)`` answer as their derivation from the registry and derive it
+    once per registry identity: a repeated question reads no record; another ``records_of_program``, another record
+    table (a copy of the same records), a table of another size, another registry (a stand-in) or another
+    architecture is derived again; a registry without a record table is derived on every call."""
+    kcp = _package("cake_kcp")
+    jit = _package("cake_jit")
+    real = jit.records_of_program
+    calls: list[str] = []
+    # the real registry's answers, kept before records_of_program is replaced: another lookup is another key
+    kcp.l2n_records_shipped()
+    kcp.fused_o_shipped(None)
+
+    def counting(program):
+        calls.append(program)
+        return real(program)
+
+    def want_l2n(lookup) -> bool:
+        try:
+            return all(lookup(p) for p in kcp.L2N_PROGRAMS)
+        except ValueError:
+            return False
+
+    def want_fused(modules, lookup, arch) -> bool:
+        try:
+            names = lookup("kcp_fwdh_out")
+        except ValueError:
+            return False
+        forms = {
+            int(modules[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in modules[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    def derives(fn) -> int:
+        n = len(calls)
+        fn()
+        return len(calls) - n
+
+    monkeypatch.setattr(jit, "records_of_program", counting)
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) == 0
+    assert kcp.l2n_records_shipped() == want_l2n(real)
+    for arch in (None, *jit.ARCHES, "sm_00"):
+        assert derives(lambda a=arch: kcp.fused_o_shipped(a)) == 1, arch
+        assert derives(lambda a=arch: kcp.fused_o_shipped(a)) == 0, arch
+        assert kcp.fused_o_shipped(arch) == want_fused(jit.MODULES, real, arch), arch
+    # the same records in another table
+    monkeypatch.setattr(jit, "MODULES", dict(jit.MODULES))
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.fused_o_shipped(None)) == 1
+    del jit.MODULES[next(iter(jit.MODULES))]  # a table of another size
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) == 0
+
+    # stand-in registries: the answer is the stand-in's
+    def form(ctas: int) -> dict:
+        return {
+            "program": "kcp_fwdh_out",
+            "grid_rule": {"ctas_per_head": ctas},
+            "arches": ["sm_x"],
+        }
+
+    def registry(table) -> types.SimpleNamespace:
+        def lookup(program):
+            calls.append(program)
+            if program not in kcp.PROGRAMS:
+                raise ValueError(program)
+            return tuple(n for n, r in table.items() if r["program"] == program)
+
+        return types.SimpleNamespace(MODULES=table, records_of_program=lookup)
+
+    both = registry({"a": form(1), "b": form(2)})
+    for stand_in, fused in ((both, True), (registry({"a": form(1)}), False)):
+        monkeypatch.setattr(kcp, "_registry", lambda s=stand_in: s)
+        assert derives(lambda: kcp.fused_o_shipped("sm_x")) == 1
+        assert kcp.fused_o_shipped("sm_x") is fused
+        assert kcp.fused_o_shipped("sm_y") is False
+        assert derives(lambda: kcp.l2n_records_shipped()) > 0
+        assert kcp.l2n_records_shipped() is False
+    both.MODULES["c"] = form(1)  # the same table, grown
+    monkeypatch.setattr(kcp, "_registry", lambda: both)
+    assert derives(lambda: kcp.fused_o_shipped("sm_x")) == 1
+    tableless = types.SimpleNamespace(
+        MODULES=None, records_of_program=both.records_of_program
+    )
+    monkeypatch.setattr(kcp, "_registry", lambda: tableless)
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+
+
+def test_chunk_tokens_follow_the_contexts_chunk_table(monkeypatch) -> None:
+    """``_chunk_tokens`` (the in-kernel L2 norm's coverage check) is the table's sum, kept in the context's cache with
+    the table it was taken over: another table object is summed again, a list or a context without a cache dict is
+    summed per call and never kept; ``_prepare`` refuses a coverage other than the call's tokens."""
+    kcp, ctx, ops = _ckpt_setup()
+    key = ("kcp_chunk_tokens",)
+    stub = types.SimpleNamespace(_caches={})
+    t1, t2 = (64, 64, 10), (64, 64, 11)
+    assert kcp._chunk_tokens(stub, t1) == 138 and stub._caches[key] == (t1, 138)
+    assert kcp._chunk_tokens(stub, t1) == 138
+    assert kcp._chunk_tokens(stub, t2) == 139 and stub._caches[key][0] is t2
+    assert kcp._chunk_tokens(stub, [64, 1]) == 65 and stub._caches[key][0] is t2
+    for other in (types.SimpleNamespace(), types.SimpleNamespace(_caches=None)):
+        assert kcp._chunk_tokens(other, t1) == 138
+    # the real context: its own table, kept once; a wrong coverage is refused
+    out = _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+    assert ctx._caches[key] == (ctx.chunk_len, sum(ctx.chunk_len))
+    assert ctx._caches[key][0] is ctx.chunk_len
+    again = _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+    assert all(torch.equal(out[k], again[k]) for k in out)
+    monkeypatch.setattr(kcp, "_chunk_tokens", lambda c, table: sum(table) - 1)
+    with pytest.raises(ValueError, match="chunks cover"):
+        _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)

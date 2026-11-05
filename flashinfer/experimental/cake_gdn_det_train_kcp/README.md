@@ -124,6 +124,12 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   bitwise.  Gradient accumulation (`.backward()` twice) accumulates.
 * No cooperative launch anywhere in the package; every program is a plain
   stream-ordered launch.
+* Host launch path: each launch binds torch's current stream for tvm-ffi
+  through `tvm_ffi.use_raw_stream` with that stream's device and raw handle
+  (the stream `tvm_ffi.use_torch_stream()` binds, without building a
+  `torch.cuda.Stream` per launch).  The registry's answers (in-kernel L2 norm
+  and fused-output records) and the chunk table's token count are derived once
+  and reused.
 * On `sm_100a` and `sm_103a`, with a zigzag or zigzag-per-document partition
   of at most 8 ranks, the summaries' offset walk runs on a side stream beside
   the transfer walk (fork / join with CUDA events; the same launches,

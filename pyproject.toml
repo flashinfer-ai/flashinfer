@@ -151,7 +151,6 @@ exclude = [
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 # The batch-invariant GEMM dispatcher's fitted constants, read at runtime next to its module.
-"flashinfer.gemm.batch_invariant" = ["cost_model_fits.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]

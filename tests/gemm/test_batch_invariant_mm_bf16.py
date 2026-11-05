@@ -20,7 +20,7 @@ from flashinfer.gemm.batch_invariant.api import (
     mm_bf16_batch_invariant,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
-from flashinfer.gemm.batch_invariant.cost_model import PARTS
+from flashinfer.gemm.batch_invariant.heuristic import PARTS
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
     Knobs,
@@ -39,6 +39,38 @@ needs_device = pytest.mark.skipif(
     not _supported,
     reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
 )
+
+
+def kernel_events(prof) -> list:
+    """The kernel events of a ``torch.profiler`` trace, each with its launch grid (the chrome trace's ``args.grid``)."""
+    import json
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as f:
+        prof.export_chrome_trace(f.name)
+        with open(f.name) as trace:
+            return [
+                e
+                for e in json.load(trace)["traceEvents"]
+                if e.get("cat") == "kernel" and "grid" in e.get("args", {})
+            ]
+
+
+_PROFILER: dict = {}
+
+
+def profiler_records_kernels() -> bool:
+    """Whether ``torch.profiler``'s CUDA activities record kernels on this device: kineto's CUPTI may not support the part
+    under the installed toolkit (``CUPTI_ERROR_INVALID_DEVICE`` at initialisation), in which case a trace holds no kernel
+    event although the kernels ran. Probed once per process with a trivial launch."""
+    if "kernels" not in _PROFILER:
+        from torch.profiler import ProfilerActivity, profile
+
+        x = torch.ones(1024, device="cuda")
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            (x * 2).sum().item()
+        _PROFILER["kernels"] = bool(kernel_events(prof))
+    return _PROFILER["kernels"]
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -110,7 +142,8 @@ def test_fingerprint_is_a_function_of_the_weight_shape():
 def test_chunk_rule_takes_no_m():
     import inspect
 
-    assert list(inspect.signature(chunks_for).parameters) == ["N", "K"]
+    params = list(inspect.signature(chunks_for).parameters)
+    assert params == ["N", "K", "in_fmt"] and "M" not in params
     assert chunks_for(4096, 4096) == 1 and chunks_for(8192, 8192) == 1
     assert chunks_for(0, 4096) == 1  # an empty weight: no split, as in Lean
     assert (
@@ -149,6 +182,20 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in space, cfg.describe()
 
 
+def test_hbm_traffic_follows_the_tile_order():
+    """The traffic model: the operands' own bytes when every band's panels stay resident in the L2, refetches per band
+    or per wave when they do not, fewer of them with a wider swizzle band, and never below the operands' own bytes."""
+    from flashinfer.gemm.batch_invariant.heuristic import hbm_traffic
+
+    M, N, K, eb = 32768, 12288, 8192, 2.0
+    unique = (M + N) * K * eb + M * N * 2
+    args = (M, N, K, eb, 2, 256, 256, M // 256, N // 256, 1, 102)
+    assert hbm_traffic(*args, 1, "m", float("inf")) == unique
+    l2 = 80 * 2**20
+    assert hbm_traffic(*args, 1, "m", l2) > hbm_traffic(*args, 8, "m", l2) >= unique
+    assert hbm_traffic(*args, 1, "n", l2) > hbm_traffic(*args, 8, "n", l2) >= unique
+
+
 def test_tactic_encoding_round_trips():
     for cfg in enumerate_space(16, 128, 8192, chunks=4)[::97]:
         t = tuning.knobs_to_tactic(cfg)
@@ -161,7 +208,9 @@ def test_tactic_encoding_round_trips():
 def test_cache_key_covers_every_kernel_source():
     from flashinfer.batch_invariant.jit import relative_sources
 
-    srcs = set(relative_sources("batch_invariant_gemm_bf16"))
+    srcs = set(
+        relative_sources("batch_invariant_gemm")
+    )  # the GEMM cache module shared by the bf16 and fp8 classes
     assert {
         "gemm/batch_invariant/blocks/compile.py",
         "gemm/batch_invariant/fixup.py",
@@ -266,7 +315,7 @@ def test_weight_layouts_agree():
 @needs_device
 @pytest.mark.parametrize("M,N,K", [(1000, 4096, 4096), (37, 2048, 4000)])
 def test_config_agreement(M, N, K):
-    """R3: every configuration the tuner may choose (the cost model's top candidates on both parts) and a spread of
+    """R3: every configuration the tuner may choose (the dispatcher's top candidates on both parts) and a spread of
     hand-picked records (64- / 128- / 256-row tiles, 1- and 2-CTA MMA, clusters, both rasters, swizzles, a decode
     tile) give identical bits."""
     a, b = adv_bf16(M, K, 61), adv_bf16(K, N, 62)
@@ -420,6 +469,145 @@ def test_misaligned_a_is_copied_and_keeps_the_bits():
     assert torch.equal(bits(bi_mm(a_off[:1], b)), bits(bi_mm(a[:1], b)))
 
 
+def test_registering_an_unchanged_device_value_keeps_the_rank_cache():
+    """The device's L2 size and cluster capacities are registered on every call until the device is registered; a value
+    the heuristic already holds must not clear its cached rankings (the re-ranking costs milliseconds per call)."""
+    from flashinfer.gemm.batch_invariant import heuristic as H
+
+    fam, sm = "sm_100", 148
+    saved_cap = {k: dict(v) for k, v in H._QUERIED_CAPACITY.items()}
+    saved_l2 = dict(H._QUERIED_L2)
+    try:
+        H.register_capacity(fam, sm, 2, 70)
+        H.register_l2(fam, sm, 1.0e8)
+        H.rank(300, 4096, 4096, 1, "k", 2, sm, fam)
+        size = H.rank.cache_info().currsize
+        assert size >= 1
+        H.register_capacity(fam, sm, 2, 70)
+        H.register_l2(fam, sm, 1.0e8)
+        assert H.rank.cache_info().currsize == size
+        H.register_capacity(fam, sm, 2, 71)
+        assert H.rank.cache_info().currsize == 0
+    finally:
+        H._QUERIED_CAPACITY.clear()
+        H._QUERIED_CAPACITY.update(saved_cap)
+        H._QUERIED_L2.clear()
+        H._QUERIED_L2.update(saved_l2)
+        H.rank.cache_clear()
+
+
+@needs_device
+def test_failed_occupancy_query_is_retried_a_bounded_number_of_times(monkeypatch):
+    """A device whose occupancy query fails gets the part's nominal capacity; the query is retried on later calls a bounded
+    number of times, then the nominal value is kept, so a process on such a device does not re-query and re-rank on every
+    call."""
+    from flashinfer.gemm.batch_invariant import api
+    from flashinfer.gemm.batch_invariant import heuristic as H
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    index = dev.index
+    sm, fam = api.part_of(dev)
+    saved = (
+        dict(api._CO_RESIDENT),
+        set(api._REGISTERED_DEVICES),
+        dict(api._QUERY_FAILURES),
+        {k: dict(v) for k, v in H._QUERIED_CAPACITY.items()},
+    )
+    calls: list = []
+
+    def failing(device_index, cluster_size):
+        calls.append(cluster_size)
+        raise RuntimeError("no occupancy query on this device")
+
+    monkeypatch.setattr(api, "_query_co_resident_clusters", failing)
+    try:
+        for k in [k for k in api._CO_RESIDENT if k[0] == index]:
+            del api._CO_RESIDENT[k]
+        api._REGISTERED_DEVICES.discard(index)
+        api._QUERY_FAILURES.clear()
+        cfg = Knobs((128, 128), (2, 1), False, True, "m", 1)
+        first = api.persistent_clusters(dev, cfg)
+        assert first >= 1
+        for _ in range(api._QUERY_ATTEMPTS + 2):
+            assert api.persistent_clusters(dev, cfg) == first
+        sizes = {size for size in calls}
+        assert len(calls) <= api._QUERY_ATTEMPTS * len(sizes)
+        settled = len(calls)
+        for _ in range(10):
+            assert api.persistent_clusters(dev, cfg) == first
+        assert len(calls) == settled  # no further queries once the retries are spent
+        assert index in api._REGISTERED_DEVICES
+    finally:
+        api._CO_RESIDENT.clear()
+        api._CO_RESIDENT.update(saved[0])
+        api._REGISTERED_DEVICES.clear()
+        api._REGISTERED_DEVICES.update(saved[1])
+        api._QUERY_FAILURES.clear()
+        api._QUERY_FAILURES.update(saved[2])
+        H._QUERIED_CAPACITY.clear()
+        H._QUERIED_CAPACITY.update(saved[3])
+        H.rank.cache_clear()
+
+
+@needs_device
+def test_persistent_grid_is_the_device_co_resident_cluster_count():
+    """The compiled persistent grid is the launch device's co-resident cluster count for the configuration's cluster
+    shape (the GPC-aware occupancy query), not SMs // cluster size: the launched grid, read from a profiler trace of a
+    many-tile GEMM, is that many clusters; the kernel's cache key carries the count; the bits are those of any other grid.
+    Where the profiler records no kernels (a CUPTI that does not support the device under the installed toolkit), the
+    grid readback is skipped and the other checks still run."""
+    import cutlass.utils as cutlass_utils
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.gemm.batch_invariant.api import persistent_clusters
+    from flashinfer.gemm.batch_invariant.blocks.compile import kernel_name
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    a, b = rnd_bf16(4096, 1024, 161), rnd_bf16(1024, 4096, 162)
+    ref = bits(bi_mm(a, b))
+    traced = profiler_records_kernels()
+    for cfg in [
+        Knobs((128, 128), (1, 1), False, True, "m", 1),
+        Knobs((128, 128), (2, 1), False, True, "m", 1),
+        Knobs((256, 128), (2, 2), True, True, "m", 1),
+    ]:
+        size = cfg.cluster_m * cfg.cluster_n
+        query = cutlass_utils.HardwareInfo(device_id=dev.index).get_max_active_clusters(
+            size
+        )
+        clusters = persistent_clusters(dev, cfg)
+        assert clusters == query and 0 < clusters <= sms // size, (
+            cfg.describe(),
+            clusters,
+            query,
+        )
+        assert kernel_name(cfg, "n", 1, clusters).endswith(f"_g{clusters}")
+        out = mm_bf16_batch_invariant(
+            a, b, config=cfg
+        )  # compiled before the profiled launch
+        torch.cuda.synchronize()
+        if traced:
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                mm_bf16_batch_invariant(a, b, config=cfg, out=out)
+                torch.cuda.synchronize()
+            events = kernel_events(prof)
+            assert events, "no kernel in the trace"
+            grid = max(events, key=lambda e: e["dur"])["args"]["grid"]
+            launched = grid[0] * grid[1] * grid[2]
+            assert launched == clusters * size, (
+                cfg.describe(),
+                grid,
+                clusters,
+            )  # 512 tiles: more than the grid
+        assert torch.equal(bits(out), ref), cfg.describe()
+    if not traced:
+        pytest.skip(
+            "torch.profiler records no CUDA kernel on this device with the installed toolkit (CUPTI unavailable): the "
+            "launched grid was not read back; the occupancy query, the cache key and the bits were checked"
+        )
+
+
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     a, b = rnd_bf16(16, 4096, 101), rnd_bf16(4096, 4096, 102)
@@ -459,3 +647,20 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         mm_bf16_batch_invariant(
             a, b, torch.empty(16, 4096, dtype=torch.float16, device="cuda")
         )
+
+
+@needs_device
+def test_chunk_count_must_be_positive():
+    a, b = adv_bf16(16, 4096, 151).cuda(), adv_bf16(4096, 4096, 152).cuda()
+    # the output may not alias an operand (the bits would depend on which CTA runs first)
+    buf = torch.empty(16, 4096, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        mm_bf16_batch_invariant(buf, b, out=buf)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
+    ):
+        mm_bf16_batch_invariant(a, b, out=b[:16])
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
+        mm_bf16_batch_invariant(a, b, chunks=0)
