@@ -948,8 +948,8 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
 )
 def test_x_hint_band_edges_follow_the_deterministic_rule(arch: str, sm: int) -> None:
     """On both sides of every edge of the deterministic ``FWD_MAP_XNRM`` bands (the token counts where the mapping
-    pass runs its program's ``_xn`` form, whose X loads carry the L2 hint EVICT_NORMAL: at hidden 4096 on sm_100a /
-    sm_103a, none on sm_107a or at 5120 / 7168), on the boards of record, GB200 (sm_100a with 152 SMs) and B300
+    pass runs its program's ``_xn`` form, whose X loads carry the L2 hint EVICT_NORMAL: at hidden 4096 on sm_100a,
+    sm_103a and sm_107a, none at 5120 / 7168), on the boards of record, GB200 (sm_100a with 152 SMs) and B300
     (sm_103a with 148 SMs), at every hidden size of the architecture: ``fwd_map_program`` is the deterministic
     program, an ``_xn`` form exactly inside a band of the size, and ``fwd_prepare`` / ``fwd_recompute`` select the
     renamed deterministic records, whose mapping-pass record runs an ``_xn`` library exactly there."""
