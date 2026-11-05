@@ -3,7 +3,7 @@
 #include <flashinfer/attention/sparse_mla_sm120/execution/prefill_launch.cuh>
 
 #include "attention_dispatch.h"
-#include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/prefill.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/prefill_fp8.cuh>
 
 namespace flashinfer::sparse_mla_sm120 {
 

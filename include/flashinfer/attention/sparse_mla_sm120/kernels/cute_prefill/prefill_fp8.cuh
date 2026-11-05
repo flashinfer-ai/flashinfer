@@ -46,8 +46,8 @@ using MicroTransposed = decltype(composition(Swizzle<3, 4, 3>{},
 // Named barriers: 1 QK-local; 2/3 S-ready; 4/5 S-free.
 // PQuantGroup defaults to 32; development harnesses can instantiate 64.
 // Both use the same 64-candidate load tile and shared-memory allocation.
-// The softmax loop and reduction order differ from the original kernel, so
-// a 32-candidate quantization group does not guarantee bitwise equality.
+// The softmax reduction spans 64 candidates regardless of PQuantGroup;
+// quantization-group size alone does not determine FP32 reduction order.
 // Host validation accepts H=8/16/32/64. FullHeadTiles is selected for H%32==0;
 // the remaining cases contain only whole eight-head PV warps.
 template <bool Mega, int PQuantGroup = 32, bool FullHeadTiles = false>
@@ -503,7 +503,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
     // Phase 4 — PV epilogue, once all main and extra candidate tiles are consumed.
     // The sink contributes to the softmax denominator but has no value vector.
     // Write LSE in the caller's units; an empty row without a sink gets -infinity
-    // and zero output. Normalize with the original BF16 context rounding boundary.
+    // and zero output. Normalize at the BF16 context rounding boundary.
     float denominator = row_l;
     float out_factor = 1.f;
     float sink = p.sink ? p.sink[h0 + own_head] * LOG2E : -INFINITY;
