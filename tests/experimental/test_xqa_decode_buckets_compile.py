@@ -442,9 +442,7 @@ class BucketReviewSM120Tests(unittest.TestCase):
             q_len_per_req=3,
         )
         host_lengths = torch.tensor(lengths, dtype=torch.int32, device="cpu")
-        previous = torch.get_default_device()
-        try:
-            torch.set_default_device(lens.device)
+        with torch.device(lens.device):
             jit.get_module.cache_clear()  # Exercise cold configure's CPU resources.
             with patch.object(torch, "tensor", wraps=torch.tensor) as tensor_factory:
                 plan = create_xqa_decode_bucket_plan(
@@ -491,8 +489,6 @@ class BucketReviewSM120Tests(unittest.TestCase):
                 _reference(queries[0], data, scales, table, lengths, 0.7 / 16, 1.3),
             )
             self.assertFalse(workspace.semaphores.any())
-        finally:
-            torch.set_default_device(previous)
 
     def test_scale_overflow_public_registered_and_native(self):
         from flashinfer.experimental.xqa_decode_buckets import backend
