@@ -103,16 +103,16 @@ the rank-local stages run the non-deterministic single-rank package's raw
 records, copies of the deterministic raw programs on every row but for the
 parameter-gradient reduce, so every output and the raw gate's gradient are
 bitwise those of ``deterministic=True``.  On SM107 the parameter partial sums
-are bitwise too.  On SM100 / SM103 with the in-kernel q / k L2 norm off (with
-it the reduce is the deterministic package's on every architecture, below) each
-rank adds its per-chunk parameter partials in FP64 in no fixed order and rounds the sums to FP32 once, so its
-partial sums can differ from run to run and from ``deterministic=True``: from
-run to run by one FP32 ulp at most while the FP64 sum's order error stays below
-half an FP32 ulp of the result (only per-chunk terms that nearly cancel exceed
-it), and their error against an FP64 reference stays within the deterministic
-package's plus the FP64 sum's own error; its local arena then
-also holds the FP64 accumulators (2 KiB per head; 16 KiB per head on SM100 from
-32 heads), which ``kda_workspace_bytes_kcp`` counts.
+are bitwise too.  On SM100 / SM103 with the in-kernel q / k L2 norm off (with it
+the reduce is the deterministic package's on every architecture, below) each
+rank adds its per-chunk parameter partials in FP64 in no fixed order and rounds
+the sums to FP32 once, so its partial sums can differ from run to run and from
+``deterministic=True``: from run to run by one FP32 ulp at most while the FP64
+sum's order error stays below half an FP32 ulp of the result (only per-chunk
+terms that nearly cancel exceed it), and their error against an FP64 reference
+stays within the deterministic package's plus the FP64 sum's own error; its
+local arena then also holds the FP64 accumulators (2 KiB per head; 16 KiB per
+head on SM100 from 32 heads), which ``kda_workspace_bytes_kcp`` counts.
 :func:`reduce_gate_param_grads_kcp` keeps the fixed rank order, so every rank
 gets the same sums from the same partials; as the partials can change from run
 to run, so can those sums, by a few FP32 ulps that grow with the world size
@@ -124,7 +124,9 @@ both packages too, in either gate mode: the compute entries forward it, and
 ``kda_workspace_bytes_kcp`` / ``kda_saved_bytes_kcp`` take it.  With
 ``deterministic=False`` the rank-local stages run the non-deterministic
 single-rank package's in-kernel-norm records, copies of the deterministic
-programs on every row (no ``S1`` pair), so every output and gradient (``dg``
+programs on every row (no ``S1`` pair; in the raw gate mode the deterministic
+parameter-gradient reduce on every architecture), so every output and gradient
+(``dg`` and, in the raw gate mode, the ``dA_log`` / ``ddt_bias`` partial sums
 included) is bitwise that of ``deterministic=True``; the checkpoint hand-off
 does not engage in this mode either.
 
@@ -684,7 +686,9 @@ def kda_saved_bytes_kcp(
     ``checkpoint_handoff`` (a ``bool``, the hand-off decision, not :func:`chunk_kda_kcp`'s mode; another value raises
     ``TypeError``; ``False`` by default: the light set): ``True`` is the saved set, at the same ``save_transfer``, of
     a ``deterministic=False`` forward that the checkpoint hand-off engages on (plus :func:`kda_handoff_bytes_kcp`,
-    without the carry plane; see :func:`chunk_kda_kcp`).  The deterministic package has no hand-off:
+    without the carry plane; see :func:`chunk_kda_kcp`); the hand-off engages neither in the raw gate mode nor with
+    the in-kernel q / k L2 norm, so with ``deterministic=False`` ``True`` beside ``use_gate_in_kernel=True`` or
+    ``use_qk_l2norm_in_kernel=True`` raises ``ValueError``.  The deterministic package has no hand-off:
     ``deterministic=True`` ignores it and returns that package's figure."""
     if not isinstance(checkpoint_handoff, bool):
         raise TypeError(
