@@ -354,7 +354,7 @@ def test_former_names_are_aliases_of_the_det_names() -> None:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 35 and len(set(cake_jit.STAGES)) == 35
+    assert len(cake_jit.STAGES) == 36 and len(set(cake_jit.STAGES)) == 36
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -379,8 +379,9 @@ def test_registry_records_are_well_formed() -> None:
         params = cake_backend.parameters(name)
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
-    # one program per record: a kernel swap renames exactly the records it touches; the one shared library is the
-    # sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program
+    # one program per record: a kernel swap renames exactly the records it touches; the two shared libraries are the
+    # sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program, and the
+    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program
     wavefront = cake_jit.MODULES["dhu_tc2_wavefront"]
     assert wavefront["arches"] == ["sm_100a", "sm_103a"]
     shared = cake_jit.MODULES["dhu_tc2_wavefront_split_sm_107a"]
@@ -392,7 +393,28 @@ def test_registry_records_are_well_formed() -> None:
     eight = cake_jit.MODULES["dhu_tc2_wavefront_sm_107a"]
     assert eight["stage"] == "dhu_tc2_wavefront" and eight["arches"] == ["sm_107a"]
     assert len({wavefront["library"], split["library"], eight["library"]}) == 3
-    assert len(libraries) == len(cake_jit.MODULES) - 1
+    wy, wy2, wy2_107 = (
+        cake_jit.MODULES[name] for name in ("wy_tc", "wy_tc2", "wy_tc2_sm_107a")
+    )
+    assert wy2["arches"] == ["sm_100a", "sm_103a"] and wy2_107["arches"] == ["sm_107a"]
+    assert (
+        wy2_107["library"] == wy2["library"] != wy["library"]
+        and "sm_107a" in wy["arches"]
+    )
+    assert len(libraries) == len(cake_jit.MODULES) - 2
+
+
+def test_the_wy_stage_follows_the_architecture() -> None:
+    assert cake_chain.WY_TC2_ARCHS == ("sm_100a", "sm_103a", "sm_107a")
+    assert {arch: cake_chain.wy_stage(arch) for arch in ARCHES} == {
+        "sm_100a": "wy_tc2",
+        "sm_103a": "wy_tc2",
+        "sm_107a": "wy_tc2",
+    }
+    assert cake_chain.LAUNCH_ARGS["wy_tc2"] == cake_chain.LAUNCH_ARGS["wy_tc"]
+    assert (
+        cake_jit.MODULES["wy_tc2"]["arg_plan"] == cake_jit.MODULES["wy_tc"]["arg_plan"]
+    )
 
 
 def test_scan_records_carry_the_planner_constants() -> None:
@@ -1235,6 +1257,12 @@ TWO_STREAM_FORMS = {
 }
 
 
+def _on_device(stages: list[str]) -> list[str]:
+    """``stages`` with ``wy_tc`` as this device's forward WY stage (:func:`cake_chain.wy_stage`)."""
+    wy = cake_chain.wy_stage(cake_backend.device_arch(torch.cuda.current_device()))
+    return [wy if stage == "wy_tc" else stage for stage in stages]
+
+
 def _adjoint_two_streams(form: str, heads: tuple[int, int]) -> bool:
     """Whether the adjoint ``dhu_tc2`` runs as two groups on a grouped table on this device: a serial plan beside
     ``tail_g2`` (beside ``tail_g3`` too on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``), the pass 2 of a split
@@ -1276,7 +1304,7 @@ def test_two_streams_match_one_stream(
         side = [stage for stage, stream in launches[start:] if stream != main]
         # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B beside the
         # fused tail of group A (beside tail_g3 off TWO_STREAM_SERIAL_G3_ARCHS one launch on the caller's stream)
-        expected = ["wy_tc", "fwd_ho"] + (
+        expected = _on_device(["wy_tc", "fwd_ho"]) + (
             ["dhu_tc2"] if _adjoint_two_streams("serial", heads) else []
         )
         assert side == (expected if streams == 2 else []), (streams, launches[start:])
@@ -1480,7 +1508,7 @@ def test_two_streams_survive_interleaved_allocations(form, device, monkeypatch) 
         got = _run(inputs, seq_lens, streams=2, host_cache=i % 2 == 0, **pins)
         del junk
         _assert_bitwise(got, one, OUTPUT_NAMES)
-    assert side_launches == side_per_call * 16, side_launches
+    assert side_launches == _on_device(side_per_call) * 16, side_launches
 
 
 @pytest.mark.parametrize("form", sorted(TWO_STREAM_FORMS))
@@ -1525,7 +1553,7 @@ def test_two_streams_under_cuda_graph_capture(form, device, monkeypatch) -> None
     # the capture stream: the call's first launch (the prep) runs on the caller's stream
     main = captured[0][1]
     side = [stage for stage, stream in captured if stream != main]
-    assert side == side_per_call, captured
+    assert side == _on_device(side_per_call), captured
     for _ in range(2):
         graph.replay()
     torch.cuda.synchronize()
@@ -1650,6 +1678,27 @@ def test_prep_forms_agree_bitwise(route, beta_dtype, device, monkeypatch) -> Non
     suffix = "_bf16beta" if beta_dtype == torch.bfloat16 else ""
     assert tma_preps == {"prep_tma" + suffix} and _preps(stages) == {"prep" + suffix}
     _assert_bitwise(tma, plain, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize("save_state", [True, False], ids=["saved", "recompute"])
+def test_the_wy_stage_of_the_device_gives_the_wy_tc_bits(
+    save_state, device, monkeypatch
+) -> None:
+    # every forward WY launch (and the backward's recompute) runs the device's stage, wy_tc2; wy_tc in its place
+    # gives the same bits
+    seq_lens = (300, 77, 640, 17)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=29)
+    wy = cake_chain.wy_stage(cake_backend.device_arch(torch.cuda.current_device()))
+    stages = _record_launches(monkeypatch)
+    ruled = _run(inputs, seq_lens, save_state=save_state)
+    launched = [stage for stage in stages if stage.startswith("wy_tc")]
+    assert launched and set(launched) == {wy}, stages
+    stages.clear()
+    monkeypatch.setattr(cake_chain, "wy_stage", lambda arch: "wy_tc")
+    plain = _run(inputs, seq_lens, save_state=save_state)
+    replaced = [stage for stage in stages if stage.startswith("wy_tc")]
+    assert replaced == ["wy_tc"] * len(launched), stages
+    _assert_bitwise(ruled, plain, OUTPUT_NAMES)
 
 
 def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:

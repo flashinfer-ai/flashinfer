@@ -81,3 +81,46 @@ def test_ulysses_lowp_aot_inventory(
     } == expected
     for name, generator in generators.items():
         assert generator.call_count == int(name in expected)
+
+
+@pytest.mark.parametrize(
+    ("arches", "expected"),
+    [
+        (set(), {"89"}),  # Retry empty import-time device detection.
+        ({(8, "9")}, {"89"}),
+        ({(12, "0a")}, {"120a"}),
+        ({(12, "0f")}, {"120a"}),
+        ({(8, "9"), (12, "0f")}, {"89", "120a"}),
+        ({(8, "0"), (8, "9"), (9, "0a")}, {"89"}),
+    ],
+)
+def test_ulysses_lowp_compilation_targets(monkeypatch, arches, expected):
+    from flashinfer.jit import comm, core
+
+    monkeypatch.setattr(comm.current_compilation_context, "TARGET_CUDA_ARCHS", arches)
+    if not arches:
+        monkeypatch.setattr(
+            core,
+            "CompilationContext",
+            lambda: SimpleNamespace(TARGET_CUDA_ARCHS={(8, "9")}),
+        )
+    # Exercise the real generator: inventory mocks cannot detect extra cubins
+    # in an architecture-specific provider. SM120 must retain its golden 120a
+    # target even when the compilation context normalizes it to 120f.
+    flags = comm.gen_ulysses_lowp_module().extra_cuda_cflags
+    assert {flag for flag in flags if flag.startswith("-gencode=")} == {
+        f"-gencode=arch=compute_{arch},code=sm_{arch}" for arch in expected
+    }
+    assert "-use_fast_math" in flags
+
+
+@pytest.mark.parametrize(
+    "arches",
+    [{(8, "0")}, {(8, "6")}, {(9, "0a")}, {(10, "0a")}, {(12, "1a")}],
+)
+def test_ulysses_lowp_rejects_unsupported_compilation_targets(monkeypatch, arches):
+    from flashinfer.jit import comm
+
+    monkeypatch.setattr(comm.current_compilation_context, "TARGET_CUDA_ARCHS", arches)
+    with pytest.raises(RuntimeError, match="SM89 or SM120 compilation target"):
+        comm.gen_ulysses_lowp_module()

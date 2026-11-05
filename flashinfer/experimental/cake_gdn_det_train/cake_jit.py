@@ -44,9 +44,12 @@ The stages, in launch order: ``meta`` (the chunk and segment tables from
 ``cu_seqlens`` on the device), ``prep`` / ``prep_bf16beta`` (Q/K L2 norm, gate
 cumsum, FP32 beta), ``prep_tma`` / ``prep_tma_bf16beta`` (the same prep with
 the q / k tiles staged by TMA, one CTA per (chunk, key head); same bits),
-``wy_tc`` (the WY representation, tcgen05), the forward register scans
-``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the segment-parallel
-route; the serial and split scans serve the backward's recompute), ``stitch``
+``wy_tc`` (the WY representation, tcgen05), ``wy_tc2`` (the same chains and
+outputs in a five-CTA-per-SM form: a 64-column TMEM accumulator and packed
+lower-triangular operands), the forward
+register scans ``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the
+segment-parallel route; the serial and split scans serve the backward's
+recompute), ``stitch``
 (the segment stitch of both directions), ``fwd_ho`` (the forward scan and the
 output in one tcgen05 kernel), ``dv_local``, the adjoint register scans
 ``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_pre_dvl_r64k1`` (the ``(64, 1)``
@@ -97,6 +100,7 @@ STAGES = (
     "prep_tma",
     "prep_tma_bf16beta",
     "wy_tc",
+    "wy_tc2",
     "fwd_h_r32k2",
     "fwd_h_r32k1",
     "fwd_h_r64k1",
@@ -339,6 +343,68 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_det_train_fffbca00fed25d191c1b",
         "stage": "wy_tc",
+    },
+    "wy_tc2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "kn"],
+            ["buffer", "v"],
+            ["buffer", "g_cs"],
+            ["buffer", "beta"],
+            ["buffer", "A_out"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "recompute"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_969371cd5760127281dd",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 41600,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_969371cd5760127281dd",
+        "stage": "wy_tc2",
+    },
+    "wy_tc2_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "kn"],
+            ["buffer", "v"],
+            ["buffer", "g_cs"],
+            ["buffer", "beta"],
+            ["buffer", "A_out"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "recompute"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_969371cd5760127281dd",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 41600,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_969371cd5760127281dd",
+        "stage": "wy_tc2",
     },
     "fwd_h_r32k2": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

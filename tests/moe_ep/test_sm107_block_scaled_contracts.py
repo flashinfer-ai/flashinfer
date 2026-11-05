@@ -183,6 +183,13 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     create = mock.Mock(return_value=backend)
     resolve = mock.Mock(return_value=({}, "default"))
     execution = mock.Mock()
+
+    def gather(results, result, *, group):
+        assert group is backend.ep_comm_group
+        results[:] = [result] * len(results)
+
+    exchange = mock.Mock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
     monkeypatch.setattr(registry, "create_mega_kernel", create)
     monkeypatch.setattr(tuning, "_dummy_transformed_weights", lambda *a: (None, None))
     monkeypatch.setattr(
@@ -196,6 +203,8 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     monkeypatch.setattr(tuning, "finish_sweep", finish)
 
     assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
+    exchange.assert_called_once()
+    assert finish.call_args.args[8] == [{}]
     config = create.call_args.args[0]
     assert isinstance(config, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig)
     assert config.kernel_variant == variant
@@ -204,7 +213,7 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     assert resolve.call_args.kwargs["kernel_variant"] == variant
     assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
     assert execution.call_args.kwargs["quantize_input"] is True
-    backend._allocate_workspace.return_value.destroy.assert_called_once()
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
 
 
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():

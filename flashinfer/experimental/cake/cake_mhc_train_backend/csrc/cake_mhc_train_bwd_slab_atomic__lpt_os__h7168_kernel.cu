@@ -40,104 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCW_OFFSET 0
-#define TMEM_DFB0_OFFSET 256
-#define TMEM_DFB1_OFFSET 320
-#define TMEM_DFS0_OFFSET 384
-#define TMEM_DFS1_OFFSET 448
-#define NUM_STAGE_PIPE_STAGES 2
-#define NUM_FN_PIPE_STAGES 1
-#define NUM_TK_PIPE_STAGES 2
-#define NUM_ACC_PIPE_STAGES 2
-#define SMEM_WTV_OFF 222208
-#define SMEM_WTV_STAGE_BYTES 6144
-#define SMEM_WTV_STRIDE 6144
-#define SMEM_TKV_OFF 228352
-#define SMEM_TKV_STAGE_BYTES 16
-#define SMEM_TKV_STRIDE 16
-#define SMEM_X0_1_0_OFF 1024
-#define SMEM_X0_1_0_STAGE_BYTES 8192
-#define SMEM_X0_1_0_STRIDE 86016
-#define SMEM_DY0_1_0_OFF 33792
-#define SMEM_DY0_1_0_STAGE_BYTES 8192
-#define SMEM_DY0_1_0_STRIDE 86016
-#define SMEM_X0_1_1_OFF 9216
-#define SMEM_X0_1_1_STAGE_BYTES 8192
-#define SMEM_X0_1_1_STRIDE 86016
-#define SMEM_DY0_1_1_OFF 41984
-#define SMEM_DY0_1_1_STAGE_BYTES 8192
-#define SMEM_DY0_1_1_STRIDE 86016
-#define SMEM_X0_1_2_OFF 17408
-#define SMEM_X0_1_2_STAGE_BYTES 8192
-#define SMEM_X0_1_2_STRIDE 86016
-#define SMEM_DY0_1_2_OFF 50176
-#define SMEM_DY0_1_2_STAGE_BYTES 8192
-#define SMEM_DY0_1_2_STRIDE 86016
-#define SMEM_X0_1_3_OFF 25600
-#define SMEM_X0_1_3_STAGE_BYTES 8192
-#define SMEM_X0_1_3_STRIDE 86016
-#define SMEM_DY0_1_3_OFF 58368
-#define SMEM_DY0_1_3_STAGE_BYTES 8192
-#define SMEM_DY0_1_3_STRIDE 86016
-#define SMEM_DUS_OFF 66560
-#define SMEM_DUS_STAGE_BYTES 8192
-#define SMEM_DUS_STRIDE 86016
-#define SMEM_DZ_0_OFF 74752
-#define SMEM_DZ_0_STAGE_BYTES 4096
-#define SMEM_DZ_0_STRIDE 86016
-#define SMEM_DZ_1_OFF 78848
-#define SMEM_DZ_1_STAGE_BYTES 4096
-#define SMEM_DZ_1_STRIDE 86016
-#define SMEM_DZ_2_OFF 82944
-#define SMEM_DZ_2_STAGE_BYTES 4096
-#define SMEM_DZ_2_STRIDE 86016
-#define SMEM_FN0_0_OFF 173056
-#define SMEM_FN0_0_STAGE_BYTES 8192
-#define SMEM_FN0_0_STRIDE 8192
-#define SMEM_FN0_1_OFF 181248
-#define SMEM_FN0_1_STAGE_BYTES 8192
-#define SMEM_FN0_1_STRIDE 8192
-#define SMEM_FN1_0_OFF 189440
-#define SMEM_FN1_0_STAGE_BYTES 8192
-#define SMEM_FN1_0_STRIDE 8192
-#define SMEM_FN1_1_OFF 197632
-#define SMEM_FN1_1_STAGE_BYTES 8192
-#define SMEM_FN1_1_STRIDE 8192
-#define SMEM_FN2_0_OFF 205824
-#define SMEM_FN2_0_STAGE_BYTES 8192
-#define SMEM_FN2_0_STRIDE 8192
-#define SMEM_FN2_1_OFF 214016
-#define SMEM_FN2_1_STAGE_BYTES 8192
-#define SMEM_FN2_1_STRIDE 8192
-#define SMEM_FNW_0_OFF 173056
-#define SMEM_FNW_0_STAGE_BYTES 16384
-#define SMEM_FNW_0_STRIDE 16384
-#define SMEM_FNW_1_OFF 189440
-#define SMEM_FNW_1_STAGE_BYTES 16384
-#define SMEM_FNW_1_STRIDE 16384
-#define SMEM_FNW_2_OFF 205824
-#define SMEM_FNW_2_STAGE_BYTES 16384
-#define SMEM_FNW_2_STRIDE 16384
-#define SMEM_XA_0_OFF 1024
-#define SMEM_XA_0_STAGE_BYTES 16384
-#define SMEM_XA_0_STRIDE 86016
-#define SMEM_XA_1_OFF 17408
-#define SMEM_XA_1_STAGE_BYTES 16384
-#define SMEM_XA_1_STRIDE 86016
-#define SMEM_DZN0_OFF 74752
-#define SMEM_DZN0_STAGE_BYTES 4096
-#define SMEM_DZN0_STRIDE 86016
-#define SMEM_DZN1_OFF 78848
-#define SMEM_DZN1_STAGE_BYTES 4096
-#define SMEM_DZN1_STRIDE 86016
-#define SMEM_DZN2_OFF 82944
-#define SMEM_DZN2_STAGE_BYTES 4096
-#define SMEM_DZN2_STRIDE 86016
-#define SMEM_TOTAL 228480
-#define THREADS 384
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -252,7 +154,7 @@ __device__ __forceinline__ void tma_store_2d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -310,7 +212,7 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* wtv = reinterpret_cast<unsigned int*>(smem_raw + 222208);
     const int wtv_addr = smem + 222208;
     unsigned int* tkv = reinterpret_cast<unsigned int*>(smem_raw + 228352);
@@ -367,6 +269,8 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
     const int dzn1_addr = smem + 78848;
     __nv_bfloat16* dzn2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int dzn2_addr = smem + 82944;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dY))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dU))) : "memory");
@@ -374,8 +278,7 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&fnTp))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dX))) : "memory");
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (22 barriers at smem_raw[0..176))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -436,14 +339,14 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accw = taddr;
+    const unsigned int tmem_dfb0 = taddr + 256;
+    const unsigned int tmem_dfb1 = taddr + 320;
+    const unsigned int tmem_dfs0 = taddr + 384;
+    const unsigned int tmem_dfs1 = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_accw = taddr;
-    const int tmem_dfb0 = taddr + 256;
-    const int tmem_dfb1 = taddr + 320;
-    const int tmem_dfs0 = taddr + 384;
-    const int tmem_dfs1 = taddr + 448;
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -1255,7 +1158,7 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
                                     "setp.ne.b32 p, %0, 0;\n\t"
                                     "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                     "}"
-                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + ((unsigned long long)rowq * 24)));
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq * 24));
                                 #pragma unroll
                                 for (int kq_2 = 0; kq_2 < 2; kq_2++) {
                                     int rowa = t0_1 + tokbase + wq_r4[kq_2];
@@ -2731,7 +2634,7 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
                                 "setp.ne.b32 p, %0, 0;\n\t"
                                 "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                 "}"
-                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + ((unsigned long long)rowq_1 * 24)));
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_1 * 24));
                             #pragma unroll
                             for (int kq_4 = 0; kq_4 < 2; kq_4++) {
                                 int rowa_2 = t0_1 + 64 + tokbase + wq_r4[kq_4];
@@ -2807,7 +2710,7 @@ kernel_cake_mhc_train_bwd_slab_atomic__lpt_os__h7168(const __grid_constant__ CUt
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + ((unsigned long long)rowq_2 * 24)));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_2 * 24));
                                     #pragma unroll
                                     for (int kq_6 = 0; kq_6 < 2; kq_6++) {
                                         int rowa_4 = row0_1_1 + tokbase + wq_r4[kq_6];

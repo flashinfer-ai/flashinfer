@@ -66,6 +66,12 @@ TILE_FIELDS: tuple[str, ...] = (
 TILE_DEST = TILE_FIELDS.index("dest")
 TILE_WORD = TILE_FIELDS.index("word")
 TILE_LAST_TICKET = TILE_FIELDS.index("last_ticket")
+# Column order of a cross-destination-band (``xband``) table: the eight fields above describe head 0 of a
+# 256-column tile, ``dest1`` / ``base_elem1`` its head 1 (``word`` / ``last_ticket`` are shared; both bases hold
+# the head's own position, so no head stride is added to either).
+TILE_FIELDS_XB: tuple[str, ...] = (*TILE_FIELDS, "dest1", "base_elem1")
+TILE_DEST1 = TILE_FIELDS_XB.index("dest1")
+TILE_BASE_ELEM1 = TILE_FIELDS_XB.index("base_elem1")
 # Tile order within a destination: ``mt_outer`` = token tiles outer;
 # ``nt_outer`` = the destination's ``3 * n_sub`` column tiles outer, token tiles
 # inner (the CTAs of one column tile share its weight box through L2);
@@ -135,7 +141,11 @@ RESERVED_SMS = 2
 # in ``describe()``) = the small-row word gate fires on every row count.  Every
 # gate is inclusive at its threshold; the first three change neither the tile
 # table nor the stored bits, the pair-tile gate changes the producer program of
-# the rows it selects and needs that program delivered.  Measured per
+# the rows it selects and needs that program delivered.  On the cells of
+# ``SHAPE_GATE_K_TABLE`` the per-destination launch gate reads its threshold by
+# the call's hidden size (K of the projection) instead of one value; the
+# cross-destination-band gate (``xband_min_m``, ``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``)
+# sits beside the four gates.  Measured per
 # architecture (``SHAPE_GATE_DEFAULT_BY_ARCH``): SM100 / SM103 ship the small-row
 # word gate and the per-destination launch gate, SM90 ships the small-row word
 # gate and the large-row reserved-SM gate, SM107 ships no per-architecture gate;
@@ -507,9 +517,88 @@ def _plan_rows(
     return rows, pads
 
 
+def _plan_rows_xband(
+    *,
+    rank: int,
+    dest_order: Sequence[int],
+    m_tiles: int,
+    heads: int,
+    head_dim: int,
+    h_local: int,
+    layout: str,
+    plane: int,
+    s_local: int,
+    row_stride: int,
+    group_m: int,
+    lockstep: int,
+    m_tiles_per_word: int,
+) -> tuple[list[list[int]], int]:
+    """:data:`TILE_FIELDS_XB` rows of the cross-destination-band plan in production order; returns
+    ``(rows, pad_rows)``.
+
+    Each GEMM group ``g`` (Q, K, V) is cut into ``H * head_dim / 256`` tiles; tile ``k`` covers the global heads
+    ``2k`` and ``2k + 1``, each with its own destination ``head // H_local`` and the slot base of :func:`_plan_rows`
+    at local head ``head % H_local``.  A tile belongs to the destination of its first head: destination blocks in
+    ``dest_order``, inside a block the ``group_m`` m-tile groups, the block's tiles (``g`` outer, ``k`` inner) outer
+    and the group's m-tiles inner -- the order of :func:`_plan_rows`.  ``word = mt // G``; ``last_ticket = 3 *
+    H_local * in_word - 1`` counts one ticket per head.  ``lockstep > 1`` pads every same-``n0`` run like
+    :func:`_plan_rows` (``dest = dest1 = -1``, ``word = 0``, ``last_ticket = 0``)."""
+
+    G = m_tiles_per_word
+    heads_per_tile = XBAND_BN // head_dim
+    tiles_per_group = heads * head_dim // XBAND_BN
+    rows: list[list[int]] = []
+    pads = 0
+
+    def base_of(g: int, hl: int) -> int:
+        if layout == "bshd":
+            return g * plane + rank * s_local * row_stride + hl * head_dim
+        return rank * s_local * row_stride + hl * 3 * head_dim + g * head_dim
+
+    def tile(mt: int, g: int, k: int) -> list[int]:
+        h0, h1 = heads_per_tile * k, heads_per_tile * k + 1
+        word = mt // G
+        in_word = min(G, m_tiles - word * G)
+        return [
+            mt,
+            g * heads * head_dim + k * XBAND_BN,
+            h0 // h_local,
+            GEMM_GROUP_NORM_KIND[g],
+            base_of(g, h0 % h_local),
+            row_stride,
+            word,
+            3 * h_local * in_word - 1,
+            h1 // h_local,
+            base_of(g, h1 % h_local),
+        ]
+
+    for dest in dest_order:
+        owned = [
+            (g, k)
+            for g in range(3)
+            for k in range(tiles_per_group)
+            if (heads_per_tile * k) // h_local == int(dest)
+        ]
+        for g0 in range(0, m_tiles, group_m):
+            mts = range(g0, min(m_tiles, g0 + group_m))
+            for g, k in owned:
+                run = [tile(mt, g, k) for mt in mts]
+                while lockstep > 1 and len(run) % lockstep:
+                    pad = list(run[-1])
+                    pad[TILE_DEST] = -1
+                    pad[TILE_DEST1] = -1
+                    pad[TILE_WORD] = 0
+                    pad[TILE_LAST_TICKET] = 0
+                    run.append(pad)
+                    pads += 1
+                rows.extend(run)
+    return rows, pads
+
+
 @dataclass(frozen=True)
 class TilePlan:
-    """One rank's tile table (CPU ``int64 [num_tiles, 8]``) and the scalars bound next to it."""
+    """One rank's tile table (CPU ``int64 [num_tiles, 8]``, ``[num_tiles, 10]`` for a cross-destination-band plan)
+    and the scalars bound next to it."""
 
     tiles: torch.Tensor
     layout: str
@@ -542,17 +631,25 @@ class TilePlan:
     group_m: int
     pair: bool
     num_pad_rows: int
+    xband: bool = False
 
     @property
     def lockstep(self) -> int:
         return PAIR_LOCKSTEP if self.pair else 1
 
     @property
+    def tile_fields(self) -> tuple[str, ...]:
+        """The table's columns: :data:`TILE_FIELDS_XB` for a cross-destination-band plan, else
+        :data:`TILE_FIELDS`."""
+
+        return TILE_FIELDS_XB if self.xband else TILE_FIELDS
+
+    @property
     def num_real_tiles(self) -> int:
         return self.num_tiles - self.num_pad_rows
 
     def summary(self) -> dict[str, Any]:
-        return {
+        record = {
             "layout": self.layout,
             "world": self.world,
             "rank": self.rank,
@@ -577,6 +674,10 @@ class TilePlan:
             "pair": self.pair,
             "num_pad_rows": self.num_pad_rows,
         }
+        if self.xband:
+            record["xband"] = True
+            record["tile_fields"] = list(TILE_FIELDS_XB)
+        return record
 
 
 def chunk_plan(
@@ -589,12 +690,17 @@ def chunk_plan(
     order: str = "mt_outer",
     group_m: int | None = None,
     pair: bool = False,
+    xband: bool = False,
 ) -> TilePlan:
     """The exchange plan of source ``rank`` as a tile table.
 
     Destination order: sender-cyclic remote first ``(r + 1, ..., r + W - 1) mod
     W``, local ``r`` last.  Readiness words: ``G = ceil(m_tiles /
     words_capacity_per_dest)`` token tiles per word, ``word = mt // G``.
+    ``xband`` builds the cross-destination-band table of
+    :func:`_plan_rows_xband` (``block_n = XBAND_BN`` pair plan of an
+    :func:`xband_eligible` geometry; ``n_sub`` = ``H_local`` head tickets per
+    destination band and GEMM group).
     """
 
     if layout not in LAYOUTS:
@@ -618,14 +724,26 @@ def chunk_plan(
         geometry.h_local,
         geometry.c_band,
     )
-    if c_band % block_n:
+    if not isinstance(xband, bool):
+        raise ValueError(f"xband must be a bool, got {xband!r}")
+    if xband:
+        if block_n != XBAND_BN or not pair:
+            raise ValueError(
+                f"a cross-destination-band plan is a block_n={XBAND_BN} pair plan, got block_n={block_n} pair={pair}"
+            )
+        if not xband_eligible(geometry):
+            raise ValueError(
+                f"a cross-destination-band plan needs a destination band that is not a multiple of {XBAND_BN} "
+                f"columns while H * head_dim is, got H={heads} W={geometry.world_size} band={c_band}"
+            )
+    elif c_band % block_n:
         raise ValueError(
             f"block_n={block_n} must divide the destination band of {c_band} columns"
         )
     batch, s_local, s_global = geometry.batch, geometry.s_local, geometry.s_global
     M, K, N = geometry.rows, geometry.hidden, 3 * heads * head_dim
     m_tiles = ceil_div(M, BLOCK_M)
-    n_sub = c_band // block_n
+    n_sub = h_local if xband else c_band // block_n
     G = ceil_div(m_tiles, words_capacity_per_dest)
     num_words = ceil_div(m_tiles, G)
     dest_order = tuple((rank + k) % world for k in range(1, world)) + (rank,)
@@ -640,30 +758,49 @@ def chunk_plan(
     batch_stride = s_global * row_stride
     order, group_m_eff = _resolve_order(order, group_m, pair, m_tiles)
     lockstep = PAIR_LOCKSTEP if pair else 1
-    rows, num_pad_rows = _plan_rows(
-        rank=rank,
-        dest_order=dest_order,
-        m_tiles=m_tiles,
-        n_sub=n_sub,
-        block_n=block_n,
-        heads=heads,
-        head_dim=head_dim,
-        c_band=c_band,
-        layout=layout,
-        plane=plane,
-        s_local=s_local,
-        row_stride=row_stride,
-        group_m=group_m_eff,
-        lockstep=lockstep,
-        m_tiles_per_word=G,
-    )
+    if xband:
+        rows, num_pad_rows = _plan_rows_xband(
+            rank=rank,
+            dest_order=dest_order,
+            m_tiles=m_tiles,
+            heads=heads,
+            head_dim=head_dim,
+            h_local=h_local,
+            layout=layout,
+            plane=plane,
+            s_local=s_local,
+            row_stride=row_stride,
+            group_m=group_m_eff,
+            lockstep=lockstep,
+            m_tiles_per_word=G,
+        )
+        real_rows = m_tiles * 3 * heads * head_dim // XBAND_BN
+        width = len(TILE_FIELDS_XB)
+    else:
+        rows, num_pad_rows = _plan_rows(
+            rank=rank,
+            dest_order=dest_order,
+            m_tiles=m_tiles,
+            n_sub=n_sub,
+            block_n=block_n,
+            heads=heads,
+            head_dim=head_dim,
+            c_band=c_band,
+            layout=layout,
+            plane=plane,
+            s_local=s_local,
+            row_stride=row_stride,
+            group_m=group_m_eff,
+            lockstep=lockstep,
+            m_tiles_per_word=G,
+        )
+        real_rows = world * m_tiles * 3 * n_sub
+        width = len(TILE_FIELDS)
     tiles = torch.tensor(rows, dtype=torch.int64).contiguous()
     num_tiles = len(rows)
-    if num_tiles - num_pad_rows != world * m_tiles * 3 * n_sub or tuple(
-        tiles.shape
-    ) != (
+    if num_tiles - num_pad_rows != real_rows or tuple(tiles.shape) != (
         num_tiles,
-        len(TILE_FIELDS),
+        width,
     ):
         raise AssertionError("tile table inconsistent with the plan")
     return TilePlan(
@@ -698,6 +835,7 @@ def chunk_plan(
         group_m=group_m_eff,
         pair=pair,
         num_pad_rows=num_pad_rows,
+        xband=xband,
     )
 
 
@@ -711,10 +849,14 @@ def plan_for(
     words_capacity_per_dest: int = DEFAULT_WORDS_CAPACITY_PER_DEST,
     group_m_scale: Optional[int] = None,
     pair: Optional[bool] = None,
+    xband: bool = False,
 ) -> tuple[Policy, TilePlan]:
     """Policy and tile plan of one row for one rank (``group_m_scale`` ``None`` = the architecture's default for
     the geometry's world size).  ``pair`` overrides the policy's pair tile (``False`` = the single-CTA producer with
-    the policy's tile order and ``group_m``, what a fired ``pair_off_large_m`` gate selects); ``None`` keeps it."""
+    the policy's tile order and ``group_m``, what a fired ``pair_off_large_m`` gate selects); ``None`` keeps it.
+    ``xband`` (what a fired ``xband_min_m`` gate selects) builds the cross-destination-band plan: the
+    ``block_n = XBAND_BN`` pair tiles with the policy's tile order and ``group_m``; the policy (``bn`` of the band)
+    must be the pair tile."""
 
     policy = plan_policy(
         geometry, arch=arch, pair_available=pair_available, group_m_scale=group_m_scale
@@ -730,15 +872,31 @@ def plan_for(
                 f" / group_m {policy.group_m}",
             ),
         )
+    if xband:
+        if not policy.pair:
+            raise ValueError(
+                "the cross-destination-band plan is the 2-CTA pair tile, but the row's policy is the single-CTA "
+                f"producer (pair_available={pair_available}, pair={pair})"
+            )
+        policy = dataclasses.replace(
+            policy,
+            reasons=(
+                *policy.reasons,
+                f"xband_min_m gate: band {geometry.c_band} % {XBAND_BN} != 0 and H * head_dim % {XBAND_BN} == 0 -> "
+                f"block_n {XBAND_BN} cross-destination-band pair tiles ({len(TILE_FIELDS_XB)}-field table) with "
+                f"order {policy.order} / group_m {policy.group_m}, one persistent launch",
+            ),
+        )
     plan = chunk_plan(
         geometry,
         layout,
         rank,
-        block_n=policy.bn,
+        block_n=XBAND_BN if xband else policy.bn,
         words_capacity_per_dest=words_capacity_per_dest,
         order=policy.order,
         group_m=policy.group_m if policy.order == "grouped" else None,
         pair=policy.pair,
+        xband=bool(xband),
     )
     return policy, plan
 
@@ -872,6 +1030,204 @@ def _check_shape_gate_override_table() -> None:
 _check_shape_gate_override_table()
 
 
+# Per-(architecture, world size) threshold of the per-destination launch gate by the call's hidden size ``K`` (the K
+# of the projection): ``(arch, world_size) -> ((k_lo, threshold), ...)`` with ``k_lo`` ascending from 0.  A call reads
+# the threshold of the last band whose ``k_lo <= K`` and launches the producer once per destination run iff
+# ``rows >= threshold`` (inclusive; ``0`` = that band never fires).  A cell without an entry keeps the one-band
+# ``per_dest_large_m`` of ``default_shape_gates``.  Measured per cell: on SM100 and SM103 the per-destination launch
+# pays at a smaller row count for a large hidden size than for a small one.  The table applies while
+# ``per_dest_large_m`` is left at its default: an explicit ``per_dest_large_m`` in
+# ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` decides the gate alone, and ``per_dest_k_table=0`` there switches the table
+# off (the one-band threshold of the per-architecture table).  It changes the launch structure only -- neither the
+# tile table nor the stored bits.
+SHAPE_GATE_K_TABLE: dict[tuple[str, int], tuple[tuple[int, int], ...]] = {
+    ("sm_100a", 8): ((0, 16384), (4096, 32768), (6144, 16384)),
+    ("sm_100a", 4): ((0, 32768), (6144, 16384), (8192, 8192)),
+    ("sm_100a", 2): ((0, 16384), (8192, 8192)),
+    ("sm_103a", 8): ((0, 32768), (6144, 16384)),
+    ("sm_103a", 4): ((0, 32768), (6144, 16384)),
+    ("sm_103a", 2): ((0, 32768), (4096, 16384)),
+}
+
+
+def check_shape_gate_k_table(bands: Any) -> tuple[tuple[int, int], ...]:
+    """Validate one ``SHAPE_GATE_K_TABLE`` entry: a non-empty tuple of ``(k_lo, threshold)`` int pairs, ``k_lo``
+    strictly ascending from 0, thresholds in ``[0, SHAPE_GATE_ALL_ROWS)``, neighbouring bands at different
+    thresholds.  Returns the entry as a tuple of tuples."""
+
+    if not isinstance(bands, (tuple, list)) or not bands:
+        raise ValueError(
+            f"a K table entry must be a non-empty tuple of (k_lo, threshold), got {bands!r}"
+        )
+    checked: list[tuple[int, int]] = []
+    for band in bands:
+        if (
+            not isinstance(band, (tuple, list))
+            or len(band) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in band
+            )
+        ):
+            raise ValueError(
+                f"K table band {band!r} must be a (k_lo, threshold) pair of ints >= 0"
+            )
+        k_lo, threshold = int(band[0]), int(band[1])
+        if (not checked and k_lo != 0) or (checked and k_lo <= checked[-1][0]):
+            raise ValueError(
+                f"K table bands must start at k_lo = 0 and ascend strictly, got {bands!r}"
+            )
+        if threshold >= SHAPE_GATE_ALL_ROWS:
+            raise ValueError(
+                f"K table band {band!r}: the threshold must be below SHAPE_GATE_ALL_ROWS (0 = never fires)"
+            )
+        if checked and threshold == checked[-1][1]:
+            raise ValueError(
+                f"K table bands {bands!r}: neighbouring bands read the same threshold {threshold}; merge them"
+            )
+        checked.append((k_lo, threshold))
+    return tuple(checked)
+
+
+def _check_shape_gate_k_table() -> None:
+    """Import-time check of :data:`SHAPE_GATE_K_TABLE`: delivered cells of architectures that ship the
+    per-destination launch gate, valid entries, each differing from the cell's one-band threshold."""
+
+    for (arch, world_size), bands in SHAPE_GATE_K_TABLE.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"SHAPE_GATE_K_TABLE[{(arch, world_size)!r}] is not a delivered cell"
+            )
+        if check_shape_gate_k_table(bands) != bands:
+            raise ValueError(
+                f"SHAPE_GATE_K_TABLE[{(arch, world_size)!r}] is not in canonical form"
+            )
+        one_band = {
+            **SHAPE_GATE_DEFAULT_BY_ARCH[arch],
+            **SHAPE_GATE_DEFAULT_BY_ARCH_WORLD.get((arch, world_size), {}),
+        }["per_dest_large_m"]
+        if not one_band:
+            raise ValueError(
+                f"SHAPE_GATE_K_TABLE[{(arch, world_size)!r}]: {arch} ships the per-destination launch gate off"
+            )
+        if all(threshold == one_band for _, threshold in bands):
+            raise ValueError(
+                f"SHAPE_GATE_K_TABLE[{(arch, world_size)!r}] equals the one-band per_dest_large_m={one_band}"
+            )
+
+
+_check_shape_gate_k_table()
+
+
+def default_shape_gate_k_table(
+    arch: str, *, world_size: int
+) -> Optional[tuple[tuple[int, int], ...]]:
+    """The shipped K table of the per-destination launch gate of ``arch`` for a group of ``world_size`` ranks
+    (:data:`SHAPE_GATE_K_TABLE`; ``None`` = the one-band threshold of :func:`default_shape_gates`); an unknown
+    architecture or world size is an error."""
+
+    default_shape_gates(arch, world_size=world_size)
+    return SHAPE_GATE_K_TABLE.get((arch, world_size))
+
+
+def k_band_index(bands: Sequence[tuple[int, int]], hidden: int) -> int:
+    """Index of the band a call with ``K = hidden`` reads (the last band whose ``k_lo <= hidden``)."""
+
+    if isinstance(hidden, bool) or not isinstance(hidden, int) or hidden < 1:
+        raise ValueError(f"hidden must be a positive int, got {hidden!r}")
+    index = 0
+    for position, (k_lo, _threshold) in enumerate(bands):
+        if hidden >= k_lo:
+            index = position
+    return index
+
+
+def k_band_threshold(bands: Sequence[tuple[int, int]], hidden: int) -> int:
+    """The per-destination launch threshold a call with ``K = hidden`` reads from a K table entry."""
+
+    return int(bands[k_band_index(bands, hidden)][1])
+
+
+# Cross-destination-band plans (``xband``).  On a row whose destination band is not a multiple of 256 columns
+# (``block_n_for`` gives 128) while every Q / K / V group is (``H * head_dim % 256 == 0``; e.g. 8 ranks with hidden
+# 3072: 24 heads, 3 per destination), the 2-CTA ``block_n = 256`` pair producer still runs: each 256-column tile covers
+# two consecutive global heads, each head carries its own destination and slot base (:data:`TILE_FIELDS_XB`) and takes
+# its own readiness ticket.  ``xband_min_m`` is a row-count gate beside the four gates: an eligible call with ``rows >=
+# xband_min_m`` runs the cross-destination-band plan as one persistent launch (it takes precedence over the
+# per-destination launch gate); ``0`` = never.  A threshold is at least ``PAIR_MIN_M`` (the eligible rows pair only
+# from there) and applies on the pair architectures only.  ``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD`` lists the cells that
+# ship it (every other cell: 0): SM103 groups of 8 ranks, where it was measured; SM100 groups of 8 ranks keep it off
+# (their default producer build stores through bulk row copies, which the cross-band tile does not support).  The
+# tile table and the producer program change; the stored bits do not.
+XBAND_BN = 256
+XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], int] = {
+    ("sm_103a", 8): 4096,
+}
+
+
+def xband_eligible(geometry: Geometry) -> bool:
+    """Whether a cross-destination-band plan exists for the geometry: the destination band is not a multiple of
+    :data:`XBAND_BN` columns while ``H * head_dim`` is (a 256-column tile never straddles a Q / K / V group)."""
+
+    return (
+        geometry.c_band % XBAND_BN != 0
+        and (geometry.heads * geometry.head_dim) % XBAND_BN == 0
+    )
+
+
+def check_xband_min_m(arch: str, value: Any) -> int:
+    """Validate an ``xband_min_m`` threshold for ``arch``: an int ``>= 0`` (``0`` = off); a non-zero threshold is at
+    least ``PAIR_MIN_M``, below ``SHAPE_GATE_ALL_ROWS``, and refused off the pair architectures."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"xband_min_m must be an int >= 0 (0 = off), got {value!r}")
+    if value and value < PAIR_MIN_M:
+        raise ValueError(
+            f"xband_min_m={value} is below PAIR_MIN_M={PAIR_MIN_M}: the cross-destination-band plan is the 2-CTA "
+            f"pair tile, which a 128-column row runs from {PAIR_MIN_M} rows only"
+        )
+    if value >= SHAPE_GATE_ALL_ROWS:
+        raise ValueError(
+            f"xband_min_m={value} is not below SHAPE_GATE_ALL_ROWS ({SHAPE_GATE_ALL_ROWS}): no row count reaches it; "
+            "a gate that never fires is 0"
+        )
+    if value and arch not in PAIR_ARCHES:
+        raise ValueError(
+            f"xband_min_m={value} is refused on {arch}: the cross-destination-band plan is the 2-CTA pair tile "
+            f"(pair architectures: {PAIR_ARCHES})"
+        )
+    return int(value)
+
+
+def _check_xband_default_table() -> None:
+    for (arch, world_size), value in XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered cell"
+            )
+        if not check_xband_min_m(arch, value):
+            raise ValueError(
+                f"XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}] is 0; list only the cells that ship it"
+            )
+
+
+_check_xband_default_table()
+
+
+def default_xband_min_m(arch: str, *, world_size: int) -> int:
+    """The shipped ``xband_min_m`` of ``arch`` for a group of ``world_size`` ranks
+    (:data:`XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD`; 0 = off); an unknown architecture or world size is an error."""
+
+    default_shape_gates(arch, world_size=world_size)
+    return int(XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD.get((arch, world_size), 0))
+
+
 @dataclass(frozen=True)
 class ShapeGateVerdict:
     """The row-count gates of one call (``rows = batch * s_local``): which fired and what they select.
@@ -879,7 +1235,11 @@ class ShapeGateVerdict:
     stands); ``reserved_sms`` is ``0`` when the large-row reserved-SM gate fired, else ``None`` (``RESERVED_SMS``
     stands); ``producer_launches`` is ``"per_dest"`` or ``"persistent"``; ``pair`` is ``False`` when the pair-tile
     gate fired (the single-CTA producer), else ``None`` (the policy's tile stands); ``bn`` is the tile width the
-    verdict was read against (``None`` when the caller gave none)."""
+    verdict was read against (``None`` when the caller gave none).  With a K table (``k_table``, the per-destination
+    launch threshold by hidden size) the verdict records the call's ``hidden`` and the threshold it read
+    (``per_dest_threshold``); with the cross-destination-band gate on (``xband_min_m``), ``xband`` is ``True`` when it
+    fired (the cross-destination-band plan, one persistent launch), ``False`` otherwise, and ``xband_suppressed``
+    names a per-destination launch gate that fired but yields to it; ``xband`` is ``None`` while the gate is off."""
 
     rows: int
     gates: dict[str, int]
@@ -888,10 +1248,17 @@ class ShapeGateVerdict:
     reserved_sms: Optional[int] = None
     pair: Optional[bool] = None
     bn: Optional[int] = None
+    hidden: Optional[int] = None
+    k_table: Optional[tuple[tuple[int, int], ...]] = None
+    per_dest_threshold: Optional[int] = None
+    xband_min_m: int = 0
+    xband: Optional[bool] = None
+    xband_eligible: Optional[bool] = None
+    xband_suppressed: tuple[str, ...] = ()
 
     @property
     def fired(self) -> tuple[str, ...]:
-        """The gates that fired, in ``SHAPE_GATE_NAMES`` order."""
+        """The gates that fired, in ``SHAPE_GATE_NAMES`` order, then ``xband_min_m``."""
 
         fired = []
         if self.words_capacity_per_dest is not None:
@@ -902,10 +1269,12 @@ class ShapeGateVerdict:
             fired.append("per_dest_large_m")
         if self.pair is not None:
             fired.append("pair_off_large_m")
+        if self.xband:
+            fired.append("xband_min_m")
         return tuple(fired)
 
     def summary(self) -> dict[str, Any]:
-        return {
+        record = {
             "rows": self.rows,
             "bn": self.bn,
             "gates": spell_shape_gates(self.gates),
@@ -915,14 +1284,36 @@ class ShapeGateVerdict:
             "producer_launches": self.producer_launches,
             "pair": self.pair,
         }
+        if self.k_table is not None:
+            record["hidden"] = self.hidden
+            record["per_dest_k_table"] = [list(band) for band in self.k_table]
+            record["per_dest_threshold"] = self.per_dest_threshold
+        if self.xband_min_m:
+            record["xband_min_m"] = self.xband_min_m
+            record["xband"] = self.xband
+            record["xband_eligible"] = self.xband_eligible
+            record["xband_suppressed"] = list(self.xband_suppressed)
+        return record
 
 
 def gate_rows(
-    gates: Mapping[str, Any], rows: int, *, bn: Optional[int] = None
+    gates: Mapping[str, Any],
+    rows: int,
+    *,
+    bn: Optional[int] = None,
+    hidden: Optional[int] = None,
+    k_table: Optional[Sequence[tuple[int, int]]] = None,
+    xband_min_m: int = 0,
+    xband_eligible: Optional[bool] = None,
 ) -> ShapeGateVerdict:
     """Resolve the row-count gates on one call's ``rows`` (inclusive thresholds; a gate at ``0`` never fires).
     ``bn`` is the call's tile width (:func:`block_n_for`), required while a gate of :data:`SHAPE_GATE_BN` is on:
-    the pair-tile gate fires on ``bn == PAIR_BN`` calls only."""
+    the pair-tile gate fires on ``bn == PAIR_BN`` calls only.  ``k_table`` (an entry of :data:`SHAPE_GATE_K_TABLE`)
+    replaces the ``per_dest_large_m`` threshold by the threshold of the band of the call's ``hidden`` (required with
+    it).  ``xband_min_m`` (``0`` = off) is the cross-destination-band gate: it fires on a call with ``rows >=
+    xband_min_m`` whose geometry is :func:`xband_eligible` (``xband_eligible``, required unless the verdict cannot
+    depend on it: a ``bn == XBAND_BN`` call is never eligible, a call below the threshold never fires) and then
+    suppresses a fired per-destination launch gate (the plan is one persistent launch)."""
 
     checked = check_shape_gates(gates)
     if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
@@ -931,6 +1322,10 @@ def gate_rows(
         isinstance(bn, bool) or not isinstance(bn, int) or bn not in BLOCK_N_CHOICES
     ):
         raise ValueError(f"bn must be one of {BLOCK_N_CHOICES}, got {bn!r}")
+    if hidden is not None and (
+        isinstance(hidden, bool) or not isinstance(hidden, int) or hidden < 1
+    ):
+        raise ValueError(f"hidden must be a positive int, got {hidden!r}")
     small = checked["words_capacity_small_m"]
     reserved = checked["reserved_sms_large_m"]
     large = checked["per_dest_large_m"]
@@ -943,22 +1338,118 @@ def gate_rows(
     pair_fires = (
         bool(pair_off) and bn == SHAPE_GATE_BN["pair_off_large_m"] and rows >= pair_off
     )
+    bands = None
+    if k_table is not None:
+        bands = check_shape_gate_k_table(k_table)
+        if hidden is None:
+            raise ValueError(
+                "the per-destination launch gate reads its threshold from the K table by the call's hidden size; "
+                "pass hidden=geometry.hidden"
+            )
+        large = k_band_threshold(bands, hidden)
+    per_dest = bool(large) and rows >= large
+    if (
+        isinstance(xband_min_m, bool)
+        or not isinstance(xband_min_m, int)
+        or xband_min_m < 0
+    ):
+        raise ValueError(
+            f"xband_min_m must be an int >= 0 (0 = off), got {xband_min_m!r}"
+        )
+    xband: Optional[bool] = None
+    suppressed: tuple[str, ...] = ()
+    if xband_min_m:
+        if xband_eligible is None and bn == XBAND_BN:
+            xband_eligible = False
+        if xband_eligible is None and rows < xband_min_m:
+            xband = False
+        elif not isinstance(xband_eligible, bool):
+            raise ValueError(
+                f"xband_min_m={xband_min_m} fires on xband_eligible calls only; pass the call's verdict "
+                "(xband_eligible=xband_eligible(geometry))"
+            )
+        else:
+            xband = xband_eligible and rows >= xband_min_m
+        if xband and per_dest:
+            per_dest = False
+            suppressed = ("per_dest_large_m",)
     return ShapeGateVerdict(
         rows=int(rows),
         gates=checked,
         words_capacity_per_dest=1 if small and rows <= small else None,
-        producer_launches="per_dest" if large and rows >= large else "persistent",
+        producer_launches="per_dest" if per_dest else "persistent",
         reserved_sms=0 if reserved and rows >= reserved else None,
         pair=False if pair_fires else None,
         bn=bn,
+        hidden=hidden,
+        k_table=bands,
+        per_dest_threshold=int(large) if bands is not None else None,
+        xband_min_m=int(xband_min_m),
+        xband=xband,
+        xband_eligible=xband_eligible if xband_min_m else None,
+        xband_suppressed=suppressed,
     )
+
+
+def plan_row(
+    geometry: Geometry,
+    layout: str,
+    rank: int,
+    *,
+    arch: str,
+    gates: Mapping[str, Any],
+    k_table: Optional[Sequence[tuple[int, int]]] = None,
+    xband_min_m: int = 0,
+    pair_available: bool = True,
+    words_capacity_per_dest: int = DEFAULT_WORDS_CAPACITY_PER_DEST,
+    group_m_scale: Optional[int] = None,
+) -> tuple[ShapeGateVerdict, Policy, TilePlan]:
+    """The host plan of one call: the row-count gate verdict (:func:`gate_rows` on the call's rows, tile width,
+    hidden size and cross-destination-band eligibility), then the policy and tile plan of :func:`plan_for` with the
+    verdict applied -- one readiness word per destination for a fired small-row gate (otherwise
+    ``words_capacity_per_dest``), the single-CTA producer for a fired pair-tile gate, the cross-destination-band plan
+    for a fired ``xband_min_m`` gate.  ``verdict.producer_launches`` / ``verdict.reserved_sms`` are the launch
+    structure of the call."""
+
+    bn = block_n_for(geometry)
+    verdict = gate_rows(
+        gates,
+        int(geometry.rows),
+        bn=bn,
+        hidden=int(geometry.hidden),
+        k_table=k_table,
+        xband_min_m=xband_min_m,
+        xband_eligible=xband_eligible(geometry) if xband_min_m else None,
+    )
+    words = (
+        verdict.words_capacity_per_dest
+        if verdict.words_capacity_per_dest is not None
+        else words_capacity_per_dest
+    )
+    policy, plan = plan_for(
+        geometry,
+        layout,
+        rank,
+        arch=arch,
+        pair_available=pair_available,
+        words_capacity_per_dest=words,
+        group_m_scale=group_m_scale,
+        pair=verdict.pair,
+        xband=bool(verdict.xband),
+    )
+    return verdict, policy, plan
 
 
 def dest_parts(plan: TilePlan) -> tuple[tuple[int, int], ...]:
     """Contiguous ``(start, stop)`` runs of the plan's table that share one destination, in table order; lockstep pad
     rows (``dest = -1``) stay with the run they pad.  Covers the table exactly once -- the launches of a
-    ``per_dest`` call."""
+    ``per_dest`` call.  A cross-destination-band plan has no per-destination runs (its tiles span two destinations;
+    it runs as one persistent launch) and is refused."""
 
+    if plan.xband:
+        raise ValueError(
+            "dest_parts: a cross-destination-band plan has no per-destination runs; it runs as one persistent launch"
+        )
     dests = [int(value) for value in plan.tiles[:, TILE_FIELDS.index("dest")].tolist()]
     if not dests:
         raise ValueError("dest_parts: empty tile table")
@@ -999,29 +1490,41 @@ __all__ = [
     "SHAPE_GATE_BN",
     "SHAPE_GATE_DEFAULT_BY_ARCH",
     "SHAPE_GATE_DEFAULT_BY_ARCH_WORLD",
+    "SHAPE_GATE_K_TABLE",
     "SHAPE_GATE_NAMES",
     "SHAPE_GATE_OFF",
     "SUPPORTED_WORLD_SIZES",
     "TILE_FIELDS",
+    "TILE_FIELDS_XB",
     "TILE_ORDERS",
+    "XBAND_BN",
+    "XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD",
     "Geometry",
     "Policy",
     "ShapeGateVerdict",
     "TilePlan",
     "block_n_for",
     "ceil_div",
+    "check_shape_gate_k_table",
     "check_shape_gates",
+    "check_xband_min_m",
     "chunk_plan",
     "default_group_m_scale",
+    "default_shape_gate_k_table",
     "default_shape_gates",
+    "default_xband_min_m",
     "dest_parts",
     "gate_rows",
     "heads_divisibility_error",
+    "k_band_index",
+    "k_band_threshold",
     "pair_geometry",
     "plan_for",
     "plan_policy",
+    "plan_row",
     "producer_grid",
     "shape_gate_spelling",
     "spell_shape_gates",
     "words_capacity_for_rows",
+    "xband_eligible",
 ]

@@ -21,9 +21,11 @@ with FLA's ``chunk_gated_delta_rule`` signature (no context parallelism).
 
 The forward runs the prep (``prep_tma``, the q / k tiles staged by TMA and one
 CTA per (chunk, key head), unless its dispatch rule :func:`use_prep_tma` keeps
-the plain prep; both give the same bits), the tcgen05 WY stage and the fused
-tcgen05 scan and output (``fwd_ho``; a split plan first runs the pre-scan and
-the stitch for the segment start states).  The backward runs ``dv_local`` and
+the plain prep; both give the same bits), the tcgen05 WY stage
+(:func:`wy_stage`: ``wy_tc2``, five CTAs per SM, on the architectures of
+``WY_TC2_ARCHS``, else ``wy_tc``; the same bits) and the fused tcgen05 scan
+and output (``fwd_ho``; a split plan first runs the pre-scan and the stitch
+for the segment start states).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -128,6 +130,7 @@ __all__ = [
     "wavefront_engaged",
     "wavefront_order",
     "wavefront_split_engaged",
+    "wy_stage",
 ]
 
 CHUNK: int = int(cake_jit.CHUNK)
@@ -193,6 +196,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "prep_tma": _PREP_TMA_ARGS,
     "prep_tma_bf16beta": _PREP_TMA_ARGS,
     "wy_tc": _WY_ARGS,
+    "wy_tc2": _WY_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
@@ -1600,6 +1604,18 @@ def _wait_entry(device_index: int):
 # --------------------------------------------------------------------------- #
 # forward
 # --------------------------------------------------------------------------- #
+# The forward WY stage: on an architecture of ``WY_TC2_ARCHS`` every ``wy_tc`` launch (the forward, both sequence
+# groups of the P form and the backward's recompute) runs ``wy_tc2`` instead, the same per-element chains, grid and
+# outputs (so the same bits) with a 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
+# on an SM where ``wy_tc`` fits four.
+WY_TC2_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
+
+
+def wy_stage(arch: str) -> str:
+    """The stage of the forward WY launches on ``arch``: ``wy_tc2`` on ``WY_TC2_ARCHS``, else ``wy_tc``."""
+    return "wy_tc2" if arch in WY_TC2_ARCHS else "wy_tc"
+
+
 def _wy_outputs(kn, v, total_tokens, num_v_heads):
     w = torch.empty(
         (total_tokens, num_v_heads, HEAD_DIM), dtype=kn.dtype, device=kn.device
@@ -1623,8 +1639,8 @@ def _launch_wy(
     recompute,
 ):
     w, u = _wy_outputs(kn, v, total_tokens, num_v_heads)
-    _launch("wy_tc", meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
-            num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
+    _launch(wy_stage(arch), meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start,
+            meta.chunk_len, num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
     return w, u
 
 
@@ -1785,8 +1801,10 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     groups = cast("StreamGroups", meta.fwd_groups)
     n, na, ca = segs.num_segments, groups.split, groups.split_chunk
 
+    wy_name = wy_stage(arch)
+
     def wy_tc(c0, c1):
-        _launch("wy_tc", c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
+        _launch(wy_name, c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
                 meta.chunk_len[c0:c1], num_heads, num_v_heads, 0)  # fmt: skip
 
     def fwd_ho(s0, s1):

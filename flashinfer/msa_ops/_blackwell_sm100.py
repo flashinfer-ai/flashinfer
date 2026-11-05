@@ -84,6 +84,14 @@ the eager calls that carry a workspace (its warm-up), never select the fused
 program: the program has a hard context bound and a replay does not pass the
 host's guard, while a captured decode is typically replayed as the contexts
 grow.
+
+Uniform FP8 prefill route.  A prefill call with FP8 Q, K and V is served on
+one measured box only: paged K/V, causal, no explicit ``q_offset``, one
+request of one query token over 64 Q heads and 4 KV heads, and a page table
+of one page (``_use_prefill_fp8q``).  The unfolded union program converts the
+E4M3 Q to BF16 in its Q ingress (route
+``prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any``) and writes a
+BF16 output.  Every other FP8-Q prefill call raises ``NotImplementedError``.
 """
 
 from __future__ import annotations
@@ -170,6 +178,39 @@ _DECODE_QPAIR_NUM_Q_HEADS = 32
 _DECODE_QPAIR_NUM_KV_HEADS = 4
 _DECODE_QPAIR_MAX_KV_LEN = 6223
 _DECODE_QPAIR_MAX_PAGES = -(-_DECODE_QPAIR_MAX_KV_LEN // _BLOCK_SIZE)
+# Decode on the union program: a paged causal BF16 decode call with eight query
+# tokens per request over 64 Q heads and 4 KV heads, 64 or 128 requests, no
+# explicit ``q_offset`` and a page table of at most 10 pages is the prefill call
+# of the folded GQA-16 union program (route
+# ``prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64``) with
+# ``cu_seqlens_q = arange(batch_size + 1) * seqlen_q`` and the all-zero
+# ``cu_seqlens_k`` / ``q_offsets`` carrier of paged prefill (the program reads
+# ``kv_lens`` and derives the right-aligned causal offsets).  Measured on
+# compute capability 10.0 and 10.3, it is faster than the M16 decode program
+# at these shapes; the page-table width stands in for the longest context, so a
+# page table wider than 10 pages keeps the decode program.  The two int32
+# carriers are written once per (device, batch, seqlen_q) and only re-bound
+# afterwards (``_decode_union_carriers``): the union program is the only
+# launch of the call.
+_DECODE_UNION_TARGETS = ("sm100a", "sm103a")
+_DECODE_UNION_SEQLEN_Q = 8
+_DECODE_UNION_NUM_Q_HEADS = 64
+_DECODE_UNION_NUM_KV_HEADS = 4
+_DECODE_UNION_BATCHES = (64, 128)
+_DECODE_UNION_MAX_PAGES = 10
+# Uniform FP8 prefill on the union program: a paged causal prefill call with
+# FP8 Q, K and V, one request of one query token over 64 Q heads and 4 KV
+# heads, no explicit ``q_offset`` and a page table of one page is served by the
+# unfolded union program that converts the E4M3 Q to BF16 in its Q ingress
+# (route ``prefill_union:float8_e4m3fn:float8_e4m3fn:paged:gqa0:any``, BF16
+# output).  Measured on compute capability 10.0 and 10.3 at this shape only;
+# ``_use_prefill_fp8q`` admits no other FP8-Q prefill call.
+_PREFILL_FP8Q_TARGETS = ("sm100a", "sm103a")
+_PREFILL_FP8Q_BATCH_SIZE = 1
+_PREFILL_FP8Q_TOTAL_Q = 1
+_PREFILL_FP8Q_NUM_Q_HEADS = 64
+_PREFILL_FP8Q_NUM_KV_HEADS = 4
+_PREFILL_FP8Q_MAX_PAGES = 1
 # One-launch persistent K-major prefill: the fused form of the persistent
 # producer and its combine (route ``kmaj_p_fused:<layout>:gqa<g>``) runs the
 # combine in the producer's softmax warps after a grid-wide rendezvous, on a
@@ -845,6 +886,15 @@ _implicit_kmaj_p_states_lock = threading.Lock()
 # same of stream handles.
 _lean_completion_counters: dict[tuple[int, int, int], torch.Tensor] = {}
 _lean_completion_counters_lock = threading.Lock()
+# The ``cu_seqlens_q`` and all-zero ``cu_seqlens_k`` carriers of workspace-free
+# decode calls on the union program, one pair per (device, batch, seqlen_q):
+# written once on the creating stream, which is then synchronized, and never
+# written or freed afterwards, so a launch on any stream reads the final
+# values.  The admission box bounds the entries (two batch sizes, one seqlen_q).
+_decode_union_carriers_cache: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+_decode_union_carriers_lock = threading.Lock()
 
 
 def is_blackwell_msa_device(device: torch.device | str) -> bool:
@@ -1499,6 +1549,89 @@ def _decode_qpair_grid(
     tasks = total_q // 2 * num_kv_heads
     ctas = min(tasks, num_sms)
     return ctas, (tasks + ctas - 1) // ctas - 1
+
+
+def _use_decode_union(
+    *,
+    target: BlackwellMSATarget,
+    paged: bool,
+    causal: bool,
+    derive_q_offset: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    max_pages: int,
+) -> bool:
+    """Whether one decode call is served by the folded GQA-16 union program.
+
+    Every clause is a pure function of the call: a target of
+    ``_DECODE_UNION_TARGETS``, paged causal BF16 Q / K / V, no explicit
+    ``q_offset``, ``_DECODE_UNION_SEQLEN_Q`` query tokens per request over
+    ``_DECODE_UNION_NUM_Q_HEADS`` Q heads and ``_DECODE_UNION_NUM_KV_HEADS`` KV
+    heads, a batch size of ``_DECODE_UNION_BATCHES`` and a page table of at most
+    ``_DECODE_UNION_MAX_PAGES`` pages.  An input the predicate cannot judge is
+    refused.
+    """
+    if max_pages < 0:
+        raise ValueError(f"max_pages must be non-negative, got {max_pages}")
+    return (
+        target in _DECODE_UNION_TARGETS
+        and bool(paged)
+        and bool(causal)
+        and bool(derive_q_offset)
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+        and v_dtype == torch.bfloat16
+        and int(seqlen_q) == _DECODE_UNION_SEQLEN_Q
+        and int(num_q_heads) == _DECODE_UNION_NUM_Q_HEADS
+        and int(num_kv_heads) == _DECODE_UNION_NUM_KV_HEADS
+        and int(batch_size) in _DECODE_UNION_BATCHES
+        and 0 < max_pages <= _DECODE_UNION_MAX_PAGES
+    )
+
+
+def _use_prefill_fp8q(
+    *,
+    paged: bool,
+    causal: bool,
+    derive_q_offset: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    total_q: int,
+    max_pages: int,
+) -> bool:
+    """Whether one FP8-Q prefill call lies in the box of the FP8-Q union program.
+
+    Every clause is a pure function of the call's shape: paged causal FP8 Q /
+    K / V, no explicit ``q_offset``, ``_PREFILL_FP8Q_BATCH_SIZE`` request of
+    ``_PREFILL_FP8Q_TOTAL_Q`` query token over ``_PREFILL_FP8Q_NUM_Q_HEADS`` Q
+    heads and ``_PREFILL_FP8Q_NUM_KV_HEADS`` KV heads and a page table of
+    ``_PREFILL_FP8Q_MAX_PAGES`` page (``topk`` is 16 on every call).  The caller
+    adds the target clause (``_PREFILL_FP8Q_TARGETS``) after the shape clauses,
+    so a call outside the box is declined before any device query.
+    """
+    fp8 = torch.float8_e4m3fn
+    return (
+        bool(paged)
+        and bool(causal)
+        and bool(derive_q_offset)
+        and q_dtype == fp8
+        and k_dtype == fp8
+        and v_dtype == fp8
+        and int(num_q_heads) == _PREFILL_FP8Q_NUM_Q_HEADS
+        and int(num_kv_heads) == _PREFILL_FP8Q_NUM_KV_HEADS
+        and int(batch_size) == _PREFILL_FP8Q_BATCH_SIZE
+        and int(total_q) == _PREFILL_FP8Q_TOTAL_Q
+        and int(max_pages) == _PREFILL_FP8Q_MAX_PAGES
+    )
 
 
 def _use_decode_l2ef(
@@ -3335,7 +3468,8 @@ def _run_prefill(
         if q_offsets is None:
             q_offsets = cu_k
     arguments = {
-        "q": q,
+        # FP8 Q (route prefill_union:float8_e4m3fn:...) is bound as its E4M3 bytes.
+        "q": q.view(torch.uint8) if q.dtype == torch.float8_e4m3fn else q,
         "k": k.view(torch.uint8) if fp8_kv else k,
         "k_scale": scale_dummy,
         "v": v.view(torch.uint8) if fp8_kv else v,
@@ -3525,6 +3659,114 @@ def _run_decode_m16(
         target=target,
         grid=grid,
         arguments=arguments,
+        workspace=workspace,
+        capturing=capturing,
+    )
+
+
+def _decode_union_carriers(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    *,
+    batch_size: int,
+    seqlen_q: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cu_seqlens_q, zeros)`` of a decode call on the union program.
+
+    ``cu_seqlens_q = arange(batch_size + 1) * seqlen_q`` and an all-zero
+    ``(batch_size + 1,)`` int32 carrier bound as ``cu_seqlens_k`` and
+    ``q_offsets`` (the paged program reads ``kv_lens`` / ``page_table`` and
+    derives the causal offsets).  Both are written when they are created and
+    only re-bound afterwards, so the union program is the only launch of a
+    steady-state call.  With a workspace they are workspace buffers whose names
+    carry the batch size (and ``seqlen_q``), written on the workspace's stream;
+    a capture finds them warmed or raises.  Without one they are created once
+    per (device, batch, seqlen_q), the creating stream is synchronized, and they
+    are never written again.
+    """
+
+    shape = (batch_size + 1,)
+    if workspace is not None:
+        q_name = f"decode_union_cu_seqlens_q_b{batch_size}_s{seqlen_q}"
+        k_name = f"decode_union_cu_seqlens_k_b{batch_size}"
+        previous_q = workspace._buffers.get(q_name)
+        previous_k = workspace._buffers.get(k_name)
+        cu_q = _workspace_buffer(
+            workspace, q_name, shape, dtype=torch.int32, device=device
+        )
+        zeros = _workspace_buffer(
+            workspace, k_name, shape, dtype=torch.int32, device=device
+        )
+        if cu_q is not previous_q:
+            torch.arange(0, shape[0] * seqlen_q, seqlen_q, out=cu_q)
+        if zeros is not previous_k:
+            zeros.zero_()
+        return cu_q, zeros
+    key = (_device_index(device), batch_size, seqlen_q)
+    with _decode_union_carriers_lock:
+        carriers = _decode_union_carriers_cache.get(key)
+        if carriers is None:
+            cu_q = torch.arange(
+                0, shape[0] * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+            )
+            zeros = torch.zeros(shape, dtype=torch.int32, device=device)
+            torch.cuda.current_stream(device).synchronize()
+            carriers = (cu_q, zeros)
+            _decode_union_carriers_cache[key] = carriers
+    return carriers
+
+
+def _run_decode_union(
+    *,
+    target: BlackwellMSATarget,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_pages: int,
+    seqlen_q: int,
+    softmax_scale_log2: float,
+    return_softmax_lse: bool,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+    **_unused: Any,
+) -> None:
+    """A decode call served by the folded GQA-16 union prefill program
+    (``_use_decode_union``): the prefill call with the carriers of
+    ``_decode_union_carriers``, ``out`` and ``lse`` the decode buffers."""
+
+    batch_size = int(q.shape[0]) // seqlen_q
+    cu_q, zeros = _decode_union_carriers(
+        workspace, batch_size=batch_size, seqlen_q=seqlen_q, device=q.device
+    )
+    _run_prefill(
+        target=target,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=lse,
+        temperature_lse=lse,
+        q2k_indices=q2k_indices,
+        cu_q=cu_q,
+        cu_k=zeros,
+        q_offsets=zeros,
+        kv_lens=kv_lens,
+        page_table=page_table,
+        paged=True,
+        folded_gqa_group=int(q.shape[1]) // int(k.shape[1]),
+        batch_size=batch_size,
+        max_pages=max_pages,
+        causal=True,
+        derive_q_offset=True,
+        softmax_scale_log2=softmax_scale_log2,
+        lse_temperature_scale=1.0,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=False,
         workspace=workspace,
         capturing=capturing,
     )
@@ -3953,6 +4195,9 @@ def blackwell_msa_sparse_attention(
     extents) with an ``MSASparseAttentionWorkspace``; ``cu_seqlens_q[0]`` and
     ``cu_seqlens_k[0]`` must be 0 on those routes.  The union route reads no
     host lengths.
+    FP8 Q (over FP8 K/V) is served on one measured box only and writes a BF16
+    output; every other FP8-Q call raises ``NotImplementedError`` (module
+    docstring, uniform FP8 prefill route).
     """
 
     specialized, nvfp4_decline_reason = _try_nvfp4_prefill(
@@ -3992,7 +4237,31 @@ def blackwell_msa_sparse_attention(
     total_q, num_q_heads, num_kv_heads, group_size = _validate_attention_tensors(
         q, k, v, q2k_indices
     )
-    if q.dtype == torch.float8_e4m3fn:
+    if q.dtype == torch.float8_e4m3fn and not (
+        _use_prefill_fp8q(
+            paged=page_table is not None,
+            causal=causal,
+            derive_q_offset=q_offset is None,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            batch_size=(
+                int(cu_seqlens_q.numel()) - 1
+                if isinstance(cu_seqlens_q, torch.Tensor)
+                else -1
+            ),
+            total_q=total_q,
+            max_pages=(
+                int(page_table.shape[1])
+                if isinstance(page_table, torch.Tensor) and page_table.ndim == 2
+                else -1
+            ),
+        )
+        and _select_target(q.device) in _PREFILL_FP8Q_TARGETS
+    ):
+        # Uniform FP8 prefill outside the measured box (module docstring).
         raise NotImplementedError(
             "uniform FP8 Q/K/V is supported only by sparse decode"
         )
@@ -4032,7 +4301,12 @@ def blackwell_msa_sparse_attention(
             raise ValueError("lse_temperature_scale must be positive and finite")
         target = _select_target(q.device)
         out = _workspace_buffer(
-            workspace, "prefill_out", tuple(q.shape), dtype=q.dtype, device=q.device
+            workspace,
+            "prefill_out",
+            tuple(q.shape),
+            # FP8 Q (the uniform FP8 prefill box) writes a BF16 output.
+            dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
+            device=q.device,
         )
         lse = _workspace_buffer(
             workspace,
@@ -4351,6 +4625,21 @@ def blackwell_msa_sparse_decode_attention(
                     output_scale=output_scale,
                     **common,
                 )
+            elif _use_decode_union(
+                target=target,
+                paged=paged,
+                causal=causal,
+                derive_q_offset=derive_q_offset,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                v_dtype=v.dtype,
+                seqlen_q=int(seqlen_q),
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                batch_size=batch_size,
+                max_pages=max_pages,
+            ):
+                _run_decode_union(return_softmax_lse=return_softmax_lse, **common)
             else:
                 _run_decode_m16(
                     causal=causal, derive_q_offset=derive_q_offset, **common
