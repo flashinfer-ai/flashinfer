@@ -180,22 +180,23 @@ WALK_FORMS = ("auto", "full", "split")
 # The fused forward walk's rule per architecture: a rule, or head-count bands
 # ``((bound, rule), ..., (None, rule))`` whose first ``bound >= num_heads``
 # names the rule.  From kernel medians of its two records on the same inputs
-# (us, back-to-back launches, full-width / two-CTA; walk lists: w4 = the eight
-# fragments of a W4 zigzag rank, 48 to 20 chunks | z2 = two of 222 | c14 =
-# fourteen of 39 to 24 | d4 = four of 60 to 48 | w2d = four of 192 to 80 | w1 =
-# three of 79, 47 and 13):
-#   sm_103a (GB300, 152 SMs), H = 64: w4 252.0 / 258.8 | z2 407.3 / 429.9 |
-#     c14 400.6 / 410.8 | d4 216.7 / 223.8 | w2d 519.9 / 513.0; H = 32: w4
-#     142.7 / 139.4 | z2 371.1 / 263.5 | w2d 337.4 / 294.7; H = 16: w4 93.9 /
-#     83.6 | z2 366.3 / 236.3 | w1 134.6 / 90.1; H = 8: w4 86.3 / 63.0; H = 4:
-#     w4 84.5 / 55.9 | z2 362.7 / 230.2 | w1 132.2 / 85.0 | w2d 314.8 / 200.5
-#     -> the two-CTA record up to 32 heads, the full-width one above;
-#   sm_100a (GB200, 152 SMs), H = 64: w4 302.9 / 319.4 | z2 518.7 / 556.7 |
-#     c14 477.0 / 506.4 | d4 262.9 / 280.2 -> the full-width record at 64
-#     heads; the bands of sm_103a (the same SM count) below;
-#   sm_107a (an R200 board with 208 SMs), H = 64: w4 222.3 / 211.5 | z2 620.8
-#     / 445.9 | c14 355.0 / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (its
-#     lead grows as the heads, and so the CTAs, get fewer).
+# (us, full-width / two-CTA; walk lists: w4 = the eight fragments of a W4
+# zigzag rank, 48 to 20 chunks | z2 = two of 222 | c14 = fourteen of 39 to 24 |
+# d4 = four of 60 to 48 | w2d = four of 192 to 80 | w1 = three of 79, 47 and
+# 13):
+#   sm_103a (GB300, 152 SMs; cold L2), H = 64: w4 252.0 / 258.8 | z2 407.3 /
+#     429.9 | c14 400.6 / 410.8 | d4 216.7 / 223.8 | w2d 519.9 / 513.0; H =
+#     32: w4 142.7 / 139.4 | z2 371.1 / 263.5 | w2d 337.4 / 294.7; H = 16: w4
+#     93.9 / 83.6 | z2 366.3 / 236.3 | w1 134.6 / 90.1; H = 8: w4 86.3 / 63.0;
+#     H = 4: w4 84.5 / 55.9 | z2 362.7 / 230.2 | w1 132.2 / 85.0 | w2d 314.8 /
+#     200.5 -> the two-CTA record up to 32 heads, the full-width one above;
+#   sm_100a (GB200, 152 SMs; back to back), H = 64: w4 254.3 / 266.9 | z2
+#     411.5 / 455.6 | c14 406.3 / 444.7 | d4 219.2 / 232.9 -> the full-width
+#     record at 64 heads; the bands of sm_103a (the same SM count) below;
+#   sm_107a (an R200 board with 208 SMs; back to back; the kernel before its
+#     plain u loads), H = 64: w4 222.3 / 211.5 | z2 620.8 / 445.9 | c14 355.0
+#     / 339.6 | d4 241.2 / 221.6 -> the two-CTA record (its lead grows as the
+#     heads, and so the CTAs, get fewer).
 FWDH_O_FORM_RULE: dict[str, Any] = {
     "sm_100a": ((32, "split"), (None, "full")),
     "sm_103a": ((32, "split"), (None, "full")),
