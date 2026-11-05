@@ -54,7 +54,7 @@ from tests.cpu.trace_apply.seal_helpers import (
 @pytest.fixture(autouse=True)
 def clean_install():
     yield
-    clear_preloaded()
+    pk.release_packages()
     if ta.is_enabled():
         ta.disable_apply()
 

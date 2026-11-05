@@ -105,6 +105,109 @@ Trace Apply is strict. A matched solution that fails to build or run raises, so 
 broken solution is reported immediately rather than masked. A call with no
 matching registered name falls back to the original FlashInfer API.
 
+.. _trace_apply_setup:
+
+Setup: untimed weight preparation
+---------------------------------
+
+A solution may consume weights in a layout of its own. Trace Apply never
+converts a layout per call; instead the solution declares a **setup** step that
+runs once per weight set, outside the call path and outside CUDA-graph capture,
+and whose result reaches every later call by keyword. The declaration lives on the Solution ``spec`` and applies to the
+curated path and to sealed packages alike:
+
+========================== ====================================================================
+Field                      Meaning
+========================== ====================================================================
+``setup_entry_point``      ``"<file>.py::<symbol>"`` of ``setup(context) -> state``. Python
+                           family only; when present, ``destination_passing_style`` must be
+                           spelled explicitly.
+``teardown_entry_point``   ``"<file>.py::<symbol>"`` of ``teardown(state)``. Optional;
+                           requires ``setup_entry_point``.
+``setup_inputs``           The Definition inputs whose live tensors setup receives and whose
+                           identity keys the retained state: distinct identifiers, only with
+                           a setup. Empty means one state per process.
+``setup_state_param``      The keyword the entry point takes the state under (default
+                           ``"state"``; an identifier that is not a setup input).
+========================== ====================================================================
+
+The four fields join ``Solution.hash()`` and ``to_dict()`` only when a setup is
+declared, so every existing solution, package and build-cache key is unchanged.
+
+The ABI:
+
+.. code-block:: python
+
+   def setup(context):                        # once per weight set, eager, untimed
+       weights = context["setup_inputs"]["gemm1_weights"]
+       return {"relayout": my_layout(weights)}   # or {"state": ..., "input_buffers": {}}
+
+   def run(hidden_states, gemm1_weights, ..., state, output):
+       ...                                    # Definition inputs, the state, DPS outputs
+
+   def teardown(state):                       # only on release_packages() / release()
+       ...
+
+``context`` is a plain dict with these keys:
+``axes``, ``device`` (``"cuda:0"``), ``rank`` and ``world_size`` (from
+``torch.distributed`` when initialized, else ``0`` and ``1``), ``inputs``
+(``{name: {"shape", "stride", "dtype", "device"}}``: every Definition input in
+declared order when a sealed ``bundle/definition.json`` is known, a scalar
+input with ``shape`` None, else the call's tensors),
+``input_values`` (the non-tensor inputs), ``setup_inputs`` (the live tensors)
+and ``outputs``. ``axes`` and ``outputs`` are filled from the same
+``definition.json``, else empty; the curated loader passes no Definition.
+A ``{"state", "input_buffers"}`` result envelope is accepted with empty
+``input_buffers`` and refused otherwise: serving has no harness copy phase.
+
+A setup-bearing solution loads as a :class:`~flashinfer.trace_apply.SetupBoundCallable`
+through ``import_entry``, ``load_packages`` and the curated loader alike. Its
+published signature (``inspect.signature``) is the entry point's without the
+state parameter, so an ABI check binds the Definition inputs exactly as before.
+Per call it keys the ``setup_inputs`` tensors by **identity** — address, shape,
+stride, dtype and device — and runs ``setup`` on a miss. A Definition name is a
+shape class, not a layer: every MoE layer of a model shares one name and holds
+its own weights, so one state per key is one state per weight set, and the view
+of one storage an engine passes call after call keys the same. What setup
+retains is a second resident copy, allocated at the first eager call of each
+weight set and reported, never sized by Trace Apply. Identity cannot see bytes
+change behind a stable address, so an engine mode that rewrites weights in
+place is the consumer's to refuse.
+
+**Eager before capture.** A weight set first seen inside CUDA-graph capture is
+refused with ``SetupStateError`` (a ``RuntimeError``, never an ``ImportError``)
+and counted in ``refused_in_capture``: setup allocates and synchronizes, and a
+half-prepared call must never be captured. The first capture the callable
+observes freezes its key set, so a weight set that appears afterwards is refused
+too and a setup input that is really an activation cannot grow state without
+bound (``MAX_WEIGHT_SETS`` bounds it under eager execution). Run every weight
+set eagerly before capturing, as an engine's profiling and warm-up forwards do.
+A state does not survive ``fork``: a call from another process is refused. A
+setup that calls its own Definition with a new weight set is refused too,
+rather than left waiting on the lock it holds.
+
+``release_packages()`` tears down every sealed-package state this process
+retains (``teardown`` when declared; every binding is released before a failed
+teardown is raised), forgets the bound callables and clears the preloaded
+entries; ``setup_stats()`` returns ``{definition: {"runs", "weight_sets",
+"seconds", "retained_bytes", "refused_in_capture"}}`` for the same bindings. A
+binding that a CUDA-graph capture has observed is never released, by
+``release_packages()`` or by its own ``release()`` (a ``SetupStateError``):
+captured graphs replay against the state addresses, so the state is kept for
+the life of the process and stays in ``setup_stats()``. A setup-bearing
+solution loaded through the curated path is bound the same way but registered
+nowhere: ``disable_apply()`` drops it without teardown, and neither call sees
+it. Nothing runs at process exit.
+
+``setup_state_param`` is a field rather than a fixed ``state`` because Trace
+Apply calls Python-family solutions by keyword, so the wrapper must know the
+parameter's name; an existing kernel keeps whatever name it already uses, and
+the Solution records it. ``setup_inputs`` sits on the Solution rather than on the
+Definition because the Definition at this seam is a trace template with no
+per-solution permission document. FlashInfer's own weight-preparation helpers
+(``flashinfer.fused_moe.prepare``) may be called from a setup: a solution that
+needs the layout a FlashInfer kernel expects produces it there, once.
+
 .. _trace_apply_sealed_packages:
 
 Sealed kernel packages
@@ -145,7 +248,16 @@ The digest chain, all of which must hold before any code runs:
   language (``python``, ``triton``, ``cutedsl``, ``cutile``, ``tilelang``) — a
   compiled family would need nvcc at serving start, and a
   SOLBench/Kernel-Factory ``spec.languages`` document is refused rather than
-  silently translated.
+  silently translated;
+* a setup declaration on the Solution spec (:ref:`trace_apply_setup`) is
+  validated at verification, with the standard library: both symbols are
+  spelled ``<file>.py::<symbol>``, follow the entry-point rules (a sealed
+  Python file, canonical path, not shadowed) and name a file the Solution
+  lists in ``sources``; ``teardown_entry_point`` requires
+  ``setup_entry_point``, ``destination_passing_style`` is explicit,
+  ``setup_inputs`` are distinct identifiers and, when
+  ``bundle/definition.json`` is sealed, every setup input is a tensor input of
+  it and ``setup_state_param`` is none of its inputs or outputs.
 
 Loading
 ~~~~~~~
@@ -183,7 +295,9 @@ Programmatic use
    result.applied         # enable_apply() return value
 
 A verified package's entry point can also be imported on its own:
-``import_entry(verify_package(root, digest))`` returns the sealed callable.
+``import_entry(verify_package(root, digest))`` returns the sealed callable (for
+a setup-bearing package, the entry point bound to its setup and teardown, both
+imported from the same sealed namespace; see :ref:`trace_apply_setup`).
 Imported callables are registered as *preloaded* (``register_preloaded``), so
 the trace loaders never materialize sealed sources into the on-disk solution
 cache and every deferred import re-hashes the bytes it compiles. Importing a

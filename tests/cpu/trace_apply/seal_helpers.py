@@ -49,6 +49,56 @@ QUALIFICATION = {
     "inputs": {"x": "float32", "out": "float32"},
     "receipt_sha256": "c" * 64,
 }
+#: The same contract with a setup lifecycle: ``x`` doubles as the
+#: weight whose identity keys the retained state; the counters are read back
+#: through the sealed module.
+SETUP_SOURCE = b"""\
+CALLS = {"setup": 0, "run": 0, "teardown": 0}
+
+
+def setup(context):
+    CALLS["setup"] += 1
+    return {"serial": CALLS["setup"], "context": context}
+
+
+def run(x, state, out):
+    CALLS["run"] += 1
+    out.copy_(x + state["serial"])
+
+
+def teardown(state):
+    CALLS["teardown"] += 1
+"""
+#: The lifecycle split across files: the entry point in kernel.py, setup and
+#: teardown in prepare.py.
+PREPARE_KERNEL_SOURCE = b"def run(x, state, out):\n    out.copy_(x + state)\n"
+PREPARE_SOURCE = (
+    b"def setup(context):\n    return 1.0\n\n\ndef teardown(state):\n    pass\n"
+)
+SETUP_SPEC = {
+    **SOLUTION["spec"],
+    "setup_entry_point": "kernel.py::setup",
+    "teardown_entry_point": "kernel.py::teardown",
+    "setup_inputs": ["x"],
+    "setup_state_param": "state",
+}
+SETUP_SOLUTION = {
+    **SOLUTION,
+    "spec": SETUP_SPEC,
+    "sources": [{"path": "kernel.py", "content": SETUP_SOURCE.decode()}],
+}
+#: A Definition for OPERATION, sealed as bundle/definition.json by the tests
+#: that need the tensor-input rule and the setup context's axes and outputs.
+DEFINITION = {
+    "name": OPERATION,
+    "op_type": "copy",
+    "axes": {"rows": {"type": "var"}, "width": {"type": "const", "value": 4}},
+    "inputs": {
+        "x": {"shape": ["rows", "width"], "dtype": "float32"},
+        "scale": {"shape": None, "dtype": "float32"},
+    },
+    "outputs": {"out": {"shape": ["rows", "width"], "dtype": "float32"}},
+}
 
 
 def json_bytes(value: object) -> bytes:

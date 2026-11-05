@@ -46,11 +46,14 @@ from flashinfer.trace_apply.packages import (
     SealedPackageError,
     import_entry,
     load_packages,
+    release_packages,
+    setup_stats,
     verify_package,
 )
 
 # Internal: called only by the flashinfer package import.
 from flashinfer.trace_apply.packages import _load_packages_from_env  # noqa: F401
+from flashinfer.trace_apply.setup import SetupBoundCallable, SetupStateError
 
 
 def stats() -> dict:
@@ -67,6 +70,8 @@ __all__ = [
     "ROOT_ENV",
     "SealedPackage",
     "SealedPackageError",
+    "SetupBoundCallable",
+    "SetupStateError",
     "clear_preloaded",
     "disable_apply",
     "enable_apply",
@@ -75,6 +80,8 @@ __all__ = [
     "load_packages",
     "preloaded_entry",
     "register_preloaded",
+    "release_packages",
+    "setup_stats",
     "stats",
     "verify_package",
 ]

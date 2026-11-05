@@ -28,6 +28,12 @@ names a package pins every byte of it before anything is imported::
             solution.json    a FlashInfer Solution (trace/solution.py)
             ...              exactly the regular files the manifest lists
 
+A Solution may declare an untimed setup step on its spec (``setup_entry_point``
+and its companions): verification checks the declaration
+with the standard library, and ``import_entry`` returns the entry point bound to
+the setup and teardown symbols imported from the same sealed namespace
+(:mod:`flashinfer.trace_apply.setup`).
+
 Two environment variables drive loading at ``import flashinfer`` time:
 ``FLASHINFER_KERNEL_PACKAGES`` (comma-separated package digests) and
 ``FLASHINFER_KERNEL_PACKAGE_ROOT`` (the root directory holding them,
@@ -56,6 +62,7 @@ import json
 import os
 import re
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +80,8 @@ __all__ = [
     "check_target_hardware",
     "import_entry",
     "load_packages",
+    "release_packages",
+    "setup_stats",
     "verify_package",
 ]
 
@@ -89,7 +98,10 @@ DISABLE_ENV = "FLASHINFER_KERNEL_PLUGINS_DISABLE"
 DEFAULT_PACKAGE_ROOT = Path("/opt/flashinfer/kernel_packages")
 #: Version of this module's public surface, so consumers can feature-detect
 #: (an import that resolves but lacks the expected API_VERSION never activates).
-API_VERSION = 1
+#: 2: setup-bearing packages (``SealedPackage.setup_entry_point`` and
+#: companions, ``import_entry`` returning a bound callable, ``release_packages``,
+#: ``setup_stats``).
+API_VERSION = 2
 
 MANIFEST_NAME = "manifest.json"
 BUNDLE_DIR = "bundle"
@@ -138,6 +150,15 @@ class SealedPackage:
     family: str | None = None
     #: (module path, symbol) of the declared entry point, parsed and validated.
     entry_point: tuple[str, str] = ("", "")
+    #: (module path, symbol) of the declared setup and teardown entry points,
+    #: parsed and validated like ``entry_point``; None when not declared.
+    setup_entry_point: tuple[str, str] | None = None
+    teardown_entry_point: tuple[str, str] | None = None
+    #: Definition inputs whose live tensors setup receives and whose identity
+    #: keys the retained state (empty with a setup: one state per process).
+    setup_inputs: tuple[str, ...] = ()
+    #: The keyword the entry point takes the setup state under.
+    setup_state_param: str = "state"
 
     @property
     def bundle_sha256(self) -> str:
@@ -294,28 +315,33 @@ def _sealed_file_digests(
 
 
 def _entry_point(
-    solution: Mapping[str, Any], files: Mapping[str, Any]
+    solution: Mapping[str, Any], files: Mapping[str, Any], key: str = "entry_point"
 ) -> tuple[str, str]:
-    """Parse and validate ``spec.entry_point`` into a (module path, symbol) pair."""
+    """Parse and validate ``spec.<key>`` into a (module path, symbol) pair.
+
+    The setup and teardown entry points are parsed by the same rules as the
+    entry point: a sealed Python file, canonical path, identifiers only, not
+    shadowed by a package of the same name.
+    """
     spec = solution.get("spec")
-    entry = spec.get("entry_point") if isinstance(spec, dict) else None
+    entry = spec.get(key) if isinstance(spec, dict) else None
     if not isinstance(entry, str):
-        raise SealedPackageError("sealed spec must declare an entry_point")
+        raise SealedPackageError(f"sealed spec must declare {key}")
     if "::" in entry:
         filename, symbol = entry.split("::", 1)
         path = Path(filename)
         if path.suffix != ".py" or path.is_absolute() or str(path) != filename:
-            raise SealedPackageError(f"invalid Python entry_point {entry!r}")
+            raise SealedPackageError(f"invalid Python {key} {entry!r}")
         parts = path.with_suffix("").parts
         module_parts = parts[:-1] if parts[-1:] == ("__init__",) else parts
         if module_parts == parts and "/".join(parts) + "/__init__.py" in files:
             raise SealedPackageError(
-                f"entry_point file {filename!r} is shadowed by a package"
+                f"{key} file {filename!r} is shadowed by a package"
             )
     else:
         module, separator, symbol = entry.partition(":")
         if not separator:
-            raise SealedPackageError(f"invalid Python entry_point {entry!r}")
+            raise SealedPackageError(f"invalid Python {key} {entry!r}")
         parts = module_parts = tuple(module.split("."))
         package_file = "/".join(parts) + "/__init__.py"
         filename = package_file if package_file in files else "/".join(parts) + ".py"
@@ -324,12 +350,125 @@ def _entry_point(
         or not all(part.isidentifier() for part in parts)
         or not symbol.isidentifier()
     ):
-        raise SealedPackageError(f"invalid Python entry_point {entry!r}")
+        raise SealedPackageError(f"invalid Python {key} {entry!r}")
     if filename not in files:
-        raise SealedPackageError(
-            f"entry_point file {filename!r} is not sealed in the bundle"
-        )
+        raise SealedPackageError(f"{key} file {filename!r} is not sealed in the bundle")
     return ".".join(module_parts), symbol
+
+
+def _lifecycle_entry(
+    solution: Mapping[str, Any], files: Mapping[str, Any], key: str, entry: Any
+) -> tuple[str, str]:
+    """``_entry_point`` for a setup-lifecycle symbol, plus the two rules the
+    Solution schema adds for it: the ``<file>.py::<symbol>`` spelling alone
+    (``BuildSpec`` takes no ``module:symbol`` here) and a file the Solution lists
+    in ``sources`` (``Solution`` refuses one it does not), so verification
+    refuses what ``Solution.from_dict`` would refuse at load."""
+    if isinstance(entry, str) and entry.count("::") != 1:
+        raise SealedPackageError(
+            f"{SOLUTION_NAME}: {key} must be '<file>.py::<symbol>', got {entry!r}"
+        )
+    resolved = _entry_point(solution, files, key)
+    filename = entry.split("::", 1)[0]
+    if not any(
+        isinstance(source, Mapping) and source.get("path") == filename
+        for source in solution.get("sources", ())
+    ):
+        raise SealedPackageError(
+            f"{SOLUTION_NAME}: {key} file {filename!r} is not listed in sources"
+        )
+    return resolved
+
+
+def _setup_declaration(
+    spec: Mapping[str, Any],
+    solution: Mapping[str, Any],
+    files: Mapping[str, Any],
+    definition: Mapping[str, Any] | None,
+) -> tuple[tuple[str, str] | None, tuple[str, str] | None, tuple[str, ...], str]:
+    """Parse and validate the setup lifecycle a Solution may declare on its spec.
+
+    The fields: ``setup_entry_point`` (``setup(context) -> state``),
+    ``teardown_entry_point`` (requires setup), ``setup_inputs`` (the Definition
+    inputs whose live tensors setup receives; only with setup) and
+    ``setup_state_param`` (the keyword the entry point takes the state under).
+    A standard-library mirror of ``BuildSpec`` and ``Solution`` in
+    flashinfer/trace/solution.py, as ``_PYTHON_FAMILY`` is, plus the sealed-file
+    rules of ``_entry_point`` for both symbols (``_lifecycle_entry``) and, when
+    ``definition.json`` is sealed, the rules that every setup input is a tensor
+    input of it (a scalar input has ``"shape": null``) and that the state
+    keyword names none of its inputs or outputs, which the call would otherwise
+    already pass. Consumers that mirror these rules follow this order, so a
+    declaration with two faults is refused for the same first one everywhere.
+    """
+    setup = spec.get("setup_entry_point")
+    teardown = spec.get("teardown_entry_point")
+    setup_inputs = spec.get("setup_inputs", [])
+    state_param = spec.get("setup_state_param", "state")
+    if setup is None:
+        if teardown is not None:
+            raise SealedPackageError(
+                f"{SOLUTION_NAME}: teardown_entry_point requires setup_entry_point"
+            )
+        if setup_inputs:
+            raise SealedPackageError(
+                f"{SOLUTION_NAME}: setup_inputs requires setup_entry_point"
+            )
+    elif "destination_passing_style" not in spec:
+        raise SealedPackageError(
+            f"{SOLUTION_NAME}: destination_passing_style must be declared "
+            "explicitly when setup_entry_point is present"
+        )
+    if (
+        not isinstance(setup_inputs, list)
+        or not all(
+            isinstance(name, str) and name.isidentifier() for name in setup_inputs
+        )
+        or len(set(setup_inputs)) != len(setup_inputs)
+    ):
+        raise SealedPackageError(
+            f"{SOLUTION_NAME}: setup_inputs must be a list of distinct identifiers, "
+            f"got {setup_inputs!r}"
+        )
+    if not isinstance(state_param, str) or not state_param.isidentifier():
+        raise SealedPackageError(
+            f"{SOLUTION_NAME}: setup_state_param must be an identifier, got {state_param!r}"
+        )
+    if state_param in setup_inputs:
+        raise SealedPackageError(
+            f"{SOLUTION_NAME}: setup_state_param {state_param!r} is also a setup input"
+        )
+    if setup is None:
+        return None, None, (), state_param
+    if definition is not None:
+        inputs = definition.get("inputs")
+        declared = inputs if isinstance(inputs, dict) else {}
+        for name in setup_inputs:
+            declared_input = declared.get(name)
+            if (
+                not isinstance(declared_input, dict)
+                or declared_input.get("shape") is None
+            ):
+                raise SealedPackageError(
+                    f"{SOLUTION_NAME}: setup input {name!r} is not a tensor input of "
+                    f"the sealed {DEFINITION_NAME}"
+                )
+        outputs = definition.get("outputs")
+        if state_param in declared or state_param in (
+            outputs if isinstance(outputs, dict) else {}
+        ):
+            raise SealedPackageError(
+                f"{SOLUTION_NAME}: setup_state_param {state_param!r} is also an input "
+                f"or output of the sealed {DEFINITION_NAME}"
+            )
+    return (
+        _lifecycle_entry(solution, files, "setup_entry_point", setup),
+        _lifecycle_entry(solution, files, "teardown_entry_point", teardown)
+        if teardown is not None
+        else None,
+        tuple(setup_inputs),
+        state_param,
+    )
 
 
 def verify_package(
@@ -493,6 +632,9 @@ def verify_package(
             "solutions activate, a compiled family would need nvcc at serving start"
         )
     entry_point = _entry_point(solution, files)
+    setup_entry_point, teardown_entry_point, setup_inputs, setup_state_param = (
+        _setup_declaration(spec, solution, files, documents.get(DEFINITION_NAME))
+    )
     return SealedPackage(
         digest=digest,
         directory=directory,
@@ -504,6 +646,10 @@ def verify_package(
         target=target,
         family=family,
         entry_point=entry_point,
+        setup_entry_point=setup_entry_point,
+        teardown_entry_point=teardown_entry_point,
+        setup_inputs=setup_inputs,
+        setup_state_param=setup_state_param,
     )
 
 
@@ -573,6 +719,97 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
         raise SealedPackageError(f"no sealed module {fullname!r}")
 
 
+_bound_lock = threading.Lock()
+#: {(digest, pid): SetupBoundCallable} — one binding per package and process,
+#: so a repeat ``import_entry`` returns the identical object and the states it
+#: holds, exactly as a plain package's module cache returns the same function.
+_bound: dict[tuple[str, int], Any] = {}
+_bound_pid = os.getpid()
+
+
+def _own_bound() -> None:
+    """A forked child starts with a fresh registry lock and none of the parent's bindings.
+
+    The parent may have held the lock at the fork, which would block the child
+    for good instead of refusing; the parent's bindings refuse every call by
+    pid anyway, and the parent is the one to tear them down.
+    """
+    global _bound_lock, _bound, _bound_pid
+    if _bound_pid != os.getpid():
+        _bound_lock = threading.Lock()
+        _bound = {}
+        _bound_pid = os.getpid()
+
+
+def _sealed_symbol(
+    namespace: str, entry: tuple[str, str], key: str
+) -> Callable[..., Any]:
+    """Import the declared ``spec.<key>`` symbol from the sealed namespace."""
+    module, symbol = entry
+    try:
+        imported = importlib.import_module(
+            f"{namespace}.{module}" if module else namespace
+        )
+    except (ImportError, AttributeError, OSError, SyntaxError) as error:
+        raise SealedPackageError(f"cannot load sealed {key}: {error}") from error
+    function = getattr(imported, symbol, None)
+    if not callable(function):
+        raise SealedPackageError(f"declared {key} is not callable")
+    return function
+
+
+def _bound_entry(
+    package: SealedPackage, namespace: str, run: Callable[..., Any]
+) -> Any:
+    """The entry point bound to its setup lifecycle, built once per digest and process.
+
+    The sealed setup and teardown modules are imported, and the callable built,
+    outside ``_bound_lock``: sealed code must not run under the registry's lock,
+    where a module body that asks ``setup_stats()`` would wait on itself for
+    good. The lock guards the registry alone; of two concurrent binders the
+    first to insert wins, and the other's callable, holding no state yet, is
+    dropped. A second digest for a Definition another package already binds in
+    this process is refused, as ``load_packages`` refuses it: one Solution
+    serves a Definition.
+    """
+    from .setup import SetupBoundCallable, SetupStateError
+
+    _own_bound()
+    key = (package.digest, os.getpid())
+    with _bound_lock:
+        bound = _bound.get(key)
+    if bound is not None:
+        return bound
+    setup = _sealed_symbol(namespace, package.setup_entry_point, "setup_entry_point")
+    teardown = (
+        _sealed_symbol(namespace, package.teardown_entry_point, "teardown_entry_point")
+        if package.teardown_entry_point is not None
+        else None
+    )
+    try:
+        bound = SetupBoundCallable(
+            run,
+            setup,
+            teardown,
+            name=package.operation,
+            setup_inputs=package.setup_inputs,
+            state_param=package.setup_state_param,
+            definition=package.definition,
+        )
+    except SetupStateError as error:
+        raise SealedPackageError(
+            f"cannot bind sealed setup_entry_point: {error}"
+        ) from error
+    with _bound_lock:
+        for (digest, _), other in _bound.items():
+            if digest != package.digest and other.name == package.operation:
+                raise SealedPackageError(
+                    f"two sealed packages claim the same definition {package.operation!r} "
+                    f"in this process: {digest} is already bound; release_packages() first"
+                )
+        return _bound.setdefault(key, bound)
+
+
 def import_entry(package: SealedPackage) -> Callable[..., Any]:
     """Import the declared entry point, then re-authenticate the whole package.
 
@@ -581,6 +818,11 @@ def import_entry(package: SealedPackage) -> Callable[..., Any]:
     parent and its forked child) share module state. Every deferred import
     re-hashes the bytes it compiles; importing selected code executes it —
     verification is content authentication, not a sandbox.
+
+    A setup-bearing package returns its entry point bound to the setup and
+    teardown symbols imported from the same namespace (a
+    :class:`~flashinfer.trace_apply.setup.SetupBoundCallable`, built once per
+    digest and process); setup itself never runs here, it needs weights.
     """
     bundle = (package.directory / BUNDLE_DIR).resolve()
     for source in package.solution.get("sources", ()):
@@ -596,7 +838,7 @@ def import_entry(package: SealedPackage) -> Callable[..., Any]:
                 f"embedded solution source differs from {source['path']!r}"
             )
     try:
-        module, symbol = package.entry_point or _entry_point(
+        entry = package.entry_point or _entry_point(
             package.solution, package.manifest["files"]
         )
         namespace = f"_flashinfer_sealed_{package.digest[:16]}_{os.getpid()}"
@@ -616,17 +858,58 @@ def import_entry(package: SealedPackage) -> Callable[..., Any]:
             sys.meta_path.insert(
                 0, _BundleFinder(namespace, bundle, package.manifest["files"])
             )
-        imported = importlib.import_module(
-            f"{namespace}.{module}" if module else namespace
-        )
-        function = getattr(imported, symbol, None)
-        if not callable(function):
-            raise SealedPackageError("declared entry_point is not callable")
-    except (ImportError, AttributeError, OSError, SyntaxError) as error:
-        raise SealedPackageError(f"cannot load sealed entry_point: {error}") from error
+        function = _sealed_symbol(namespace, entry, "entry_point")
+        if package.setup_entry_point is not None:
+            function = _bound_entry(package, namespace, function)
     finally:
         verify_package(package.directory.parent, package.digest)
     return function
+
+
+def release_packages() -> None:
+    """Release this process's setup-bearing bindings, then drop every preloaded entry.
+
+    Each bound callable tears down the states it retains (``teardown(state)``
+    when declared) and leaves the registry, so a later ``import_entry`` binds
+    afresh; ``clear_preloaded`` then disarms the sealed seam as before. Every
+    binding is released before a failed teardown is raised. A binding a
+    CUDA-graph capture has observed is kept, states and all, and stays in
+    ``setup_stats()``: captured graphs replay against the state addresses, so
+    the state lives for the rest of the process (the reason nothing runs at
+    process exit either, where CUDA frees during interpreter teardown).
+    """
+    from .setup import SetupStateError
+
+    _own_bound()
+    with _bound_lock:
+        released = [bound for bound in _bound.values() if not bound.frozen]
+        for key in [key for key, bound in _bound.items() if not bound.frozen]:
+            del _bound[key]
+    failures: list[SetupStateError] = []
+    try:
+        for bound in released:
+            try:
+                bound.release()
+            except SetupStateError as error:
+                failures.append(error)
+    finally:
+        from .apply import clear_preloaded
+
+        clear_preloaded()
+    if failures:
+        raise SetupStateError(
+            f"{len(failures)} of {len(released)} setup-bearing bindings failed to "
+            "release: " + "; ".join(str(error) for error in failures)
+        ) from failures[0]
+
+
+def setup_stats() -> dict[str, dict[str, Any]]:
+    """``{definition name: stats}`` of this process's setup-bearing bindings
+    (``runs``, ``weight_sets``, ``seconds``, ``retained_bytes``, ``refused_in_capture``)."""
+    _own_bound()
+    with _bound_lock:
+        bound = list(_bound.values())
+    return {item.name: item.stats() for item in bound}
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +971,14 @@ def load_packages(
                 raise SealedPackageError(
                     f"two sealed packages claim the same definition {package.operation!r}"
                 )
-            solutions[package.operation] = Solution.from_dict(package.solution)
+            try:
+                solutions[package.operation] = Solution.from_dict(package.solution)
+            except (KeyError, TypeError, ValueError) as error:
+                # A refusal like the others, so a bad package never makes
+                # ``import flashinfer`` fail through ``_load_packages_from_env``.
+                raise SealedPackageError(
+                    f"{SOLUTION_NAME} is not a FlashInfer Solution: {error}"
+                ) from error
             result.packages.append(package)
             result.callables[
                 (package.operation, str(solutions[package.operation].name))
