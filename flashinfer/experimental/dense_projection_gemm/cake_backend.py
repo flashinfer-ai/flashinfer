@@ -957,17 +957,21 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: (forward + backward, 2 x forward + backward with an FP32 and with a BF16 weight gradient) no slower than with the
 #: deterministic plan: the median over every run of the paired step-time ratio at most 1.013, eager and CUDA graph
 #: separately, and no run above the largest ratio of the deterministic plan against itself in the same runs.
-#: ``4096 -> 512`` at 4096 tokens is not in the table: next to a kernel holding 32 SMs it was up to 4.7 % slower.
+#: Not in the table: ``4096 -> 512`` at 4096 tokens (next to a kernel holding 32 SMs it was up to 4.7 % slower), and
+#: ``4096 -> 512`` at 3072 tokens on both parts and ``5120 -> 512`` at 4096 tokens on ``sm_103a`` (in one run a training
+#: step with eager launches was further above the deterministic plan than that plan against itself).
 K1_FORWARD_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[int, int, int], dict[str, Any]]
 ] = {
-    (arch, 152): {
+    ("sm_100a", 152): {
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
-        (4096, 512, 3072): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 4096): K1_FORWARD_SINGLE_CTA_KNOBS,
-    }
-    for arch in ("sm_100a", "sm_103a")
+    },
+    ("sm_103a", 152): {
+        (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
+    },
 }
 
 

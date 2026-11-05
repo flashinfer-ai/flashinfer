@@ -5041,8 +5041,13 @@ GB_L2_BYTES = 135528448
 #: The rows of :data:`K1_FORWARD_RULES_BY_SM`, ``(arch, sm_count) -> {(K, N, T), ...}``: the forward of exactly these
 #: ``K -> N`` rows and token counts runs the single-CTA program on 152-SM sm_100a and sm_103a parts.
 K1_FORWARD_ROWS = {
-    (arch, 152): {(4096, 512, 2048), (4096, 512, 3072), (5120, 512, 1024), (5120, 512, 4096)}
-    for arch in ("sm_100a", "sm_103a")
+    ("sm_100a", 152): {(4096, 512, 2048), (5120, 512, 1024), (5120, 512, 4096)},
+    ("sm_103a", 152): {(4096, 512, 2048), (5120, 512, 1024)},
+}  # fmt: skip
+#: The forward rows measured on those parts that missed and keep the deterministic plan (keys as in K1_FORWARD_ROWS).
+K1_FORWARD_MISSED_ROWS = {
+    ("sm_100a", 152): {(4096, 512, 3072), (4096, 512, 4096)},
+    ("sm_103a", 152): {(4096, 512, 3072), (4096, 512, 4096), (5120, 512, 4096)},
 }  # fmt: skip
 #: The ``K -> N`` rows of the forward next to those of the table (and theirs) that the exact keys must leave alone.
 K1_FORWARD_NEAR_ROWS = ((4096, 512), (5120, 512), (4096, 128), (5120, 128), (4096, 1024), (6144, 512))  # fmt: skip
@@ -5052,8 +5057,9 @@ def test_k1_forward_rules_by_sm():
     """:data:`K1_FORWARD_RULES_BY_SM` holds the measured forward rows only, each with the single-CTA knobs, which the
     deterministic planner turns into its single-CTA program (128 x 128 tiles over the whole K, no stream-K units) where
     its own plan of the row runs CTA pairs of 256-wide tiles with stream-K units.  :func:`k1_forward_knobs` keys
-    exactly: every other architecture, SM count, row and token count (``4096 -> 512`` at 4096 tokens among them) gets
-    no knobs, i.e. the deterministic plan."""
+    exactly: every other architecture, SM count, row and token count (the measured rows that missed among them:
+    ``4096 -> 512`` at 3072 and 4096 tokens, ``5120 -> 512`` at 4096 tokens on ``sm_103a``) gets no knobs, i.e. the
+    deterministic plan."""
     table = cake_backend.K1_FORWARD_RULES_BY_SM
     single = cake_backend.K1_FORWARD_SINGLE_CTA_KNOBS
     assert single == {"cta1": True, "block_n": 128, "hints": ("none", "none")}
@@ -5080,7 +5086,8 @@ def test_k1_forward_rules_by_sm():
             assert default.template.endswith("_kk_n256_pro7"), (arch, K, N, T)
             assert int(default.sk_units) > 0, (arch, K, N, T)
     near = (-64, -1, 0, 1, 64)
-    Ts = {T + d for rows in K1_FORWARD_ROWS.values() for _, _, T in rows for d in near}
+    parts = (*K1_FORWARD_ROWS.values(), *K1_FORWARD_MISSED_ROWS.values())
+    Ts = {T + d for rows in parts for _, _, T in rows for d in near}
     Ts |= {512, 4096, 8192, 16384}
     routed = 0
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
@@ -5093,9 +5100,11 @@ def test_k1_forward_rules_by_sm():
                     assert bool(got) == held, (arch, sms, K, N, T)
                     routed += held
     assert routed == sum(len(v) for v in K1_FORWARD_ROWS.values())
-    for arch in ("sm_100a", "sm_103a"):
-        kw = dict(arch=arch, sm_count=152, K=4096, N=512, T=4096)
-        assert cake_backend.k1_forward_knobs(**kw) == ()
+    for (arch, sms), rows in K1_FORWARD_MISSED_ROWS.items():
+        assert not rows & K1_FORWARD_ROWS[(arch, sms)], arch
+        for K, N, T in rows:
+            kw = dict(arch=arch, sm_count=sms, K=K, N=N, T=T)
+            assert cake_backend.k1_forward_knobs(**kw) == (), kw
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
@@ -5121,7 +5130,8 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
         return det_backend._k1_plan(X, W.t(), out, **kw)[0]
 
     rows = sorted(K1_FORWARD_ROWS[(arch, 152)])
-    others = [(4096, 512, 4096), (4096, 512, 2049), (4096, 512, 2047), (5120, 512, 1023), (4096, 128, 2048), (5120, 1024, 1024)]  # fmt: skip
+    others = sorted(K1_FORWARD_MISSED_ROWS[(arch, 152)])
+    others += [(4096, 512, 2049), (4096, 512, 2047), (5120, 512, 1023), (4096, 128, 2048), (5120, 1024, 1024)]  # fmt: skip
     for K, N, T in rows + others:
         X, W = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16)
         out, what = torch.empty(T, N, dtype=bf16), (K, N, T)

@@ -648,6 +648,22 @@ Every other token count, SM count and row was not measured or missed, and runs t
 generic `dense_projection_gemm`, `prepare_dense_projection_gemm` and `plan_dense_projection_gemm` (their caller
 passes the planner knobs).
 
+| K1 forward row `d_in -> d_out` (BF16 out, both operands K-major) | 152 SMs: token counts (`K1_FORWARD_RULES_BY_SM`) | measured token counts outside them |
+|---|---|---|
+| `sm_100a` `4096 -> 512` | 2048 | 3072; 4096 |
+| `sm_100a` `5120 -> 512` | 1024, 4096 | -- |
+| `sm_103a` `4096 -> 512` | 2048 | 3072; 4096 |
+| `sm_103a` `5120 -> 512` | 1024 | 4096 |
+
+*Table: the K1 forward table (`K1_FORWARD_RULES_BY_SM` on `sm_100a` / `sm_103a` parts of exactly 152 SMs, GB200 and
+GB300).  `4096 -> 512` at 4096 tokens was up to 4.7 % slower than the deterministic plan next to a kernel holding 32
+SMs.  At 3072 tokens (`4096 -> 512`, both parts) and at 4096 tokens on `sm_103a` (`5120 -> 512`) the single op was
+faster and the step medians were below 1.000, but one run of a training step with eager launches was further above
+the deterministic plan than that plan against itself in the same runs: `sm_100a` `4096 -> 512` 2 x forward + backward
+with a BF16 weight gradient 1.007 (the deterministic plan against itself at most 1.002); `sm_103a` `4096 -> 512`
+forward + backward 1.015 (at most 1.013); `sm_103a` `5120 -> 512` 2 x forward + backward with an FP32 weight gradient
+1.015 (at most 1.012).*
+
 `prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
 forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the
 `rule_key` / `rule_value` of the plan it measured, in the format of these tables.
