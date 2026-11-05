@@ -39,17 +39,24 @@ const auto remote_return = [&]() {
         }
         mask = __ballot_sync(0xffffffff, mask);
         for (uint32_t c = lane_idx; c < kUint4PerRow; c += 32) {
-          float2 acc[4] = {};
-          uint32_t m = mask;
-          while (m) {
-            const uint32_t k = __ffs(m) - 1;
-            m ^= 1u << k;
-            // Combine layout: [top-k slot][packed token][row].
-            const auto v = reinterpret_cast<const uint4*>(
-                outbox + (static_cast<uint64_t>(k) * remote.capacity + p) * kRowBytes)[c];
-            const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&v);
+          // All slot rows of this column are loaded before any is summed, so the
+          // k loads overlap instead of paying one memory latency each.
+          uint4 v[kNumTopk];
 #pragma unroll
-            for (uint32_t q = 0; q < 4; ++q) ptx::accumulate(acc[q], pairs[q]);
+          for (uint32_t k = 0; k < kNumTopk; ++k) {
+            if (mask & (1u << k))
+              // Combine layout: [top-k slot][packed token][row].
+              v[k] = reinterpret_cast<const uint4*>(
+                  outbox + (static_cast<uint64_t>(k) * remote.capacity + p) * kRowBytes)[c];
+          }
+          float2 acc[4] = {};
+#pragma unroll
+          for (uint32_t k = 0; k < kNumTopk; ++k) {
+            if (mask & (1u << k)) {
+              const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&v[k]);
+#pragma unroll
+              for (uint32_t q = 0; q < 4; ++q) ptx::accumulate(acc[q], pairs[q]);
+            }
           }
           uint4 packed;
           auto* out_pairs = reinterpret_cast<nv_bfloat162*>(&packed);

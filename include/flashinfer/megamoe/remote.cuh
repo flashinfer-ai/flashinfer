@@ -55,12 +55,27 @@ CUTLASS_HOST_DEVICE constexpr uint32_t remote_return_signal(const uint32_t& node
 
 #if defined(__CUDA_ARCH__) or defined(__CLION_IDE__)
 
-// Warp-cooperative copy of `bytes` (multiple of 16) from `src` to `dst`.
+// Warp-cooperative copy of `bytes` (multiple of 16) from `src` to `dst`: up to
+// eight 16-byte loads per lane are issued before their stores, so a 4 KB row
+// costs one memory latency instead of eight.
 CUTLASS_DEVICE void copy_16b_warp(void* dst, const void* src, const uint64_t& bytes,
                                   const uint32_t& lane_idx) {
-  auto* d = static_cast<uint4*>(dst);
-  const auto* s = static_cast<const uint4*>(src);
-  for (uint64_t i = lane_idx; i < bytes / sizeof(uint4); i += 32) d[i] = s[i];
+  auto* __restrict__ d = static_cast<uint4*>(dst);
+  const auto* __restrict__ s = static_cast<const uint4*>(src);
+  const uint64_t n = bytes / sizeof(uint4);
+  for (uint64_t base = 0; base < n; base += 8 * 32) {
+    uint4 v[8];
+#pragma unroll
+    for (uint32_t u = 0; u < 8; ++u) {
+      const uint64_t i = base + u * 32 + lane_idx;
+      if (i < n) v[u] = s[i];
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < 8; ++u) {
+      const uint64_t i = base + u * 32 + lane_idx;
+      if (i < n) d[i] = v[u];
+    }
+  }
 }
 
 template <uint32_t kNumRemoteNodes>

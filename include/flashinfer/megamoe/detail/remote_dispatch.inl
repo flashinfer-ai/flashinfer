@@ -107,20 +107,42 @@ const auto remote_send = [&]() {
         counts[e] = static_cast<uint32_t>(
             *workspace.get_expert_send_count_ptr(node * kNumExpertsPerNode + e) & 0xffffffffu);
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      if (thread_idx == 0) {
-        uint32_t running = 0;
-        for (uint32_t e = 0; e < kNumExpertsPerNode; ++e) {
-          starts[e] = running;
-          running += counts[e];
+      // Exclusive prefix of the counts by warp 0: a few experts per lane, then a
+      // warp scan (the serial loop over the experts cost a memory latency each).
+      if (warp_idx == 0) {
+        constexpr uint32_t kPerLane = math::constexpr_ceil_div(kNumExpertsPerNode, 32u);
+        uint32_t local[kPerLane], sum = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kPerLane; ++i) {
+          const uint32_t e = lane_idx * kPerLane + i;
+          local[i] = e < kNumExpertsPerNode ? counts[e] : 0u;
+          sum += local[i];
         }
-        remote.header_control(header)[1] = running;
+        uint32_t running = math::warp_inclusive_sum(sum, lane_idx) - sum;
+#pragma unroll
+        for (uint32_t i = 0; i < kPerLane; ++i) {
+          const uint32_t e = lane_idx * kPerLane + i;
+          if (e < kNumExpertsPerNode) starts[e] = running;
+          running += local[i];
+        }
+        if (lane_idx == 31) remote.header_control(header)[1] = running;
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
       const uint32_t num_entries = remote.header_control(header)[1];
-      // Compaction: one warp per expert, lanes over its entries.
-      for (uint32_t e = warp_idx; e < kNumExpertsPerNode; e += kNumDispatchWarps) {
+      // Compaction: one thread per expert, its entries copied eight at a time
+      // (loads first, then stores), so the experts' lists move in parallel.
+      for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads) {
         const auto* src = remote.list_scratch(j, e);
-        for (uint32_t k = lane_idx; k < counts[e]; k += 32) entries[starts[e] + k] = src[k];
+        const uint32_t n = counts[e], s0 = starts[e];
+        for (uint32_t k0 = 0; k0 < n; k0 += 8) {
+          uint32_t v[8];
+#pragma unroll
+          for (uint32_t u = 0; u < 8; ++u)
+            if (k0 + u < n) v[u] = src[k0 + u];
+#pragma unroll
+          for (uint32_t u = 0; u < 8; ++u)
+            if (k0 + u < n) entries[s0 + k0 + u] = v[u];
+        }
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
       if (warp_idx == 0) {
