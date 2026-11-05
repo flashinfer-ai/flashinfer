@@ -335,7 +335,6 @@ def _instance(
             invalid_expert_id=invalid_expert_id,
         )
         config.setdefault("timeout_sec", 60)
-        config.setdefault("cft", False)  # Lamport against the fence transport
         _INSTANCES[key] = create_communication(
             BootstrapConfig(world_size=g.world, rank=g.rank),
             params,
@@ -1356,31 +1355,27 @@ def test_combine_takes_its_dispatch_transport(group):
 @collective
 def test_mixed_configs(group):
     """Ranks constructed with different configs agree: rank 0 alone turning
-    Lamport (or CFT) off turns it off on every rank, whose steps then match the
-    fence instance, and different explicit lamport_max_tokens fail everywhere."""
+    Lamport off turns it off on every rank, whose steps then match the fence
+    instance, and different explicit lamport_max_tokens fail everywhere."""
     num_experts = 32 * group.world
     first = group.rank == 0
     fence = _instance("bf16", 8, num_experts, 2048, 16, lamport=False)
     no_lamport = _instance(
         "bf16", 8, num_experts, 2048, 16, lamport=False if first else None, tag=7
     )
-    no_cft = _instance(
-        "bf16", 8, num_experts, 2048, 16, lamport=None, cft=False if first else None
-    )
     failures = []
-    if no_lamport.lamport_enabled or no_cft._cft_enabled or not no_cft.lamport_enabled:
-        failures.append("an instance did not take rank 0's transports")
-    for i, (comm, lamport_step) in enumerate(((no_lamport, False), (no_cft, True))):
-        failures += _check_round(
-            comm,
-            fence,
-            "bf16",
-            1300 + i,
-            16,
-            special=True,
-            label=f"instance {i}",
-            expect_lamport=lamport_step,
-        )
+    if no_lamport.lamport_enabled:
+        failures.append("the instance did not take rank 0's transport")
+    failures += _check_round(
+        no_lamport,
+        fence,
+        "bf16",
+        1300,
+        16,
+        special=True,
+        label="no_lamport",
+        expect_lamport=False,
+    )
     try:
         limit = 8 if first else 12
         _instance(
@@ -1519,7 +1514,7 @@ def _host_instance(fmt, params, max_tokens=16, row=None, **config):
     comm.lamport_max_tokens = max_tokens
     comm._lamport_format = fmt
     comm._lamport_row = row
-    comm._state = {"cft_ready": config.get("cft") is not False}
+    comm._state = {}
     return comm
 
 

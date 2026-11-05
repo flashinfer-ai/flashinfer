@@ -601,9 +601,8 @@ def fake_one_sided(monkeypatch):
     )
 
     module = _FakeOneSidedModule()
-    probe: dict = {"reason": None, "probed": 0, "fabric_handles": True}
 
-    def acquire(self, mapping, comm, metainfo, cft_capable):
+    def acquire(self, mapping, comm, metainfo):
         return {
             "key": None,
             "workspace": torch.zeros(self.ep_size, 1 << 16, dtype=torch.uint8),
@@ -611,14 +610,7 @@ def fake_one_sided(monkeypatch):
             "views": {},
             "refcount": 1,
             "round_owner": None,
-            "cft_ready": cft_capable,
         }
-
-    def unsupported_reason(device_index, fabric_handles):
-        probe["probed"] += 1
-        if not fabric_handles:
-            return "the workspace is not shared through FABRIC handles"
-        return probe["reason"]
 
     monkeypatch.setattr(
         one_sided, "get_nvlink_one_sided_alltoall_module", lambda: module
@@ -626,7 +618,6 @@ def fake_one_sided(monkeypatch):
     monkeypatch.setattr(
         one_sided, "layout_constants", lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT)
     )
-    monkeypatch.setattr(one_sided, "_cft_unsupported_reason", unsupported_reason)
     monkeypatch.setattr(
         one_sided,
         "mnnvl_mapping_and_config",
@@ -655,15 +646,9 @@ def fake_one_sided(monkeypatch):
         "get_comm",
         staticmethod(lambda mapping: SimpleNamespace(allgather=lambda data: (data,))),
     )
-    monkeypatch.setattr(mnnvl, "all_ranks_agree", lambda comm, local: local)
-    monkeypatch.setattr(
-        mnnvl.MnnvlMemory,
-        "uses_fabric_handles",
-        staticmethod(lambda comm, dev_id: probe["fabric_handles"]),
-    )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(flashinfer.utils, "device_support_pdl", lambda device: True)
-    return SimpleNamespace(module=module, probe=probe)
+    return SimpleNamespace(module=module)
 
 
 def _one_sided(params=None, **config):
@@ -684,36 +669,14 @@ def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
     ep, max_tokens, top_k, dispatch, combine_input, combine_recv, eplb, cft = (
         fake_one_sided.module.calls["layout"]
     )
-    assert (ep, max_tokens, top_k, eplb, cft) == (2, 3, 2, 4, True)
+    assert (ep, max_tokens, top_k, eplb) == (2, 3, 2, 4)
+    # No CFT receive inbox or counters.
+    assert combine_recv == 0 and cft is False
     tokens = ep * max_tokens
     # NVFP4 values and scales, int32 ids, FP32 weights and the extra payload,
     # plus one alignment unit for each payload's own boundary.
     assert dispatch == tokens * (32 + 4 + 2 * 4 * 2 + 16) + 4 * 256
     assert combine_input == tokens * 64 * 2
-    assert combine_recv == tokens * 64 * 2
-
-
-@pytest.mark.cpu_only
-def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
-    comm = _one_sided(cft=False)
-    assert not comm._cft_enabled
-    assert fake_one_sided.probe["probed"] == 0
-    assert fake_one_sided.module.calls["layout"][5] == 0
-
-    fake_one_sided.probe["reason"] = "the device does not support it"
-    assert not _one_sided()._cft_enabled
-
-    fake_one_sided.probe["reason"] = None
-    fake_one_sided.probe["fabric_handles"] = False
-    assert not _one_sided()._cft_enabled
-
-    fake_one_sided.probe["fabric_handles"] = True
-    comm = _one_sided(use_low_precision_combine=True, cft_max_tokens_for_dispatch=2)
-    assert comm._cft_enabled
-    # FP8 wire format sizes the CFT receive inbox.
-    assert fake_one_sided.module.calls["layout"][5] == 6 * 8
-    assert comm._use_cft(2, 2) and not comm._use_cft(3, 2)
-    assert _one_sided(cft=True)._use_cft(3, 2)
 
 
 def _fake_lamport(monkeypatch, module) -> list:
@@ -750,12 +713,29 @@ def _fake_lamport(monkeypatch, module) -> list:
 
 
 @pytest.mark.cpu_only
-def test_nvlink_one_sided_lamport_ahead_of_cft(fake_one_sided, monkeypatch) -> None:
-    """The Lamport transport takes the steps it carries ahead of CFT counted
-    writes, which take the others within their token limit, and the fence path
-    the rest. lamport=None allocates the Lamport regions also where CFT is
-    available, cft=True leaves every step to CFT, and lamport=True with
-    cft=True is refused."""
+def test_cft_probe_failure_is_a_reason(monkeypatch) -> None:
+    """The CFT support probe reports failures instead of raising, so that every
+    rank reaches the collective agreement."""
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import cft
+
+    def no_driver_version():
+        raise RuntimeError("nvmlSystemGetDriverVersion: Uninitialized")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (10, 0))
+    monkeypatch.setattr(cft, "_driver_branch", no_driver_version)
+    reason = cft.cft_unsupported_reason(0, fabric_handles=True)
+    assert reason is not None and "RuntimeError" in reason
+    # POSIX file descriptor workspaces rule CFT out before any probe runs.
+    assert "FABRIC" in cft.cft_unsupported_reason(0, fabric_handles=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (9, 0))
+    assert "below 10.0" in cft.cft_unsupported_reason(0, fabric_handles=True)
+
+
+@pytest.mark.cpu_only
+def test_nvlink_one_sided_lamport_selection(fake_one_sided, monkeypatch) -> None:
+    """The Lamport transport takes the steps it carries and the fence path the
+    rest. lamport=None allocates the Lamport regions unless cft=True, and
+    lamport=True with cft=True is refused."""
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
         communication as one_sided,
     )
@@ -763,13 +743,11 @@ def test_nvlink_one_sided_lamport_ahead_of_cft(fake_one_sided, monkeypatch) -> N
     extended = _fake_lamport(monkeypatch, fake_one_sided.module)
     params = _params(num_experts=8, top_k=4)
     hidden = torch.ones(3, 8, dtype=torch.bfloat16)
-    ids = torch.zeros(3, 4, dtype=torch.int32)
     weights = torch.ones(3, 4)
 
     def transports(comm, tokens, eplb_local_stats=None):
-        payloads = [hidden, ids, weights]
         return comm._dispatch_transports(
-            tokens, payloads, hidden, None, weights, eplb_local_stats
+            tokens, hidden, None, weights, eplb_local_stats
         )
 
     request = one_sided._lamport_request
@@ -779,25 +757,21 @@ def test_nvlink_one_sided_lamport_ahead_of_cft(fake_one_sided, monkeypatch) -> N
     assert request(NVLinkOneSidedConfig(lamport=True)) is True
     assert request(NVLinkOneSidedConfig(lamport=False)) is False
 
-    auto = _one_sided(params, cft_max_tokens_for_dispatch=2)
-    assert auto._cft_enabled and auto.lamport_max_tokens == 1 and extended == [1]
-    assert transports(auto, 1) == (True, False)  # CFT would take it too
-    assert transports(auto, 2) == (False, True)  # above the Lamport limit
-    assert transports(auto, 3) == (False, False)  # above both limits: fence
+    auto = _one_sided(params)
+    assert auto.lamport_max_tokens == 1 and extended == [1]
+    assert transports(auto, 1)
+    assert not transports(auto, 2)  # above the Lamport limit: fence
     stats = torch.zeros(8, dtype=torch.int32)
-    assert transports(auto, 1, stats) == (False, True)  # EPLB statistics
-    no_cft = _one_sided(params, cft=False)
-    assert transports(no_cft, 1) == (True, False)
-    assert transports(no_cft, 2) == (False, False)
-    cft = _one_sided(params, cft=True)
-    assert cft.lamport_max_tokens == 0 and extended == [1, 1]
-    assert transports(cft, 1) == (False, True)
+    assert not transports(auto, 1, stats)  # EPLB statistics
+    off = _one_sided(params, cft=True)
+    assert off.lamport_max_tokens == 0 and extended == [1]
+    assert not transports(off, 1)
     forced = _one_sided(params, lamport=True)
-    assert forced.lamport_max_tokens == 1 and extended == [1, 1, 1]
-    assert transports(forced, 1) == (True, False)
+    assert forced.lamport_max_tokens == 1 and extended == [1, 1]
+    assert transports(forced, 1)
     with pytest.raises(ValueError, match="lamport=True and cft=True"):
         _one_sided(params, cft=True, lamport=True)
-    assert extended == [1, 1, 1]
+    assert extended == [1, 1]
 
 
 @pytest.mark.cpu_only
@@ -809,7 +783,7 @@ def test_split_layer_step_bound_selects_lamport(
     transport; a larger bound, or none (the capacity), does not."""
     _fake_lamport(monkeypatch, fake_one_sided.module)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)  # host workspace
-    layer = _split_layer(NVLinkOneSidedConfig(cft=False))
+    layer = _split_layer(NVLinkOneSidedConfig())
     calls = fake_one_sided.module.calls
     for bound, lamport in ((1, True), (2, False), (None, False)):
         layer(
@@ -827,10 +801,10 @@ def test_split_layer_step_bound_selects_lamport(
 
 @pytest.mark.cpu_only
 def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
-    """Each rank votes its own CFT and Lamport decisions, so a rank that turns
-    a transport off turns it off on every rank, and ranks that pass different
+    """Each rank votes its own Lamport decision, so a rank that turns the
+    transport off turns it off on every rank, and ranks that pass different
     lamport_max_tokens fail alike. Every rank constructs on its own thread; the
-    group's collectives (the handle-type precheck among them) must pair up."""
+    group's collectives must pair up."""
     import threading
     from types import SimpleNamespace
 
@@ -858,14 +832,7 @@ def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
         rank = mapping.rank
         return SimpleNamespace(allgather=lambda data: group["g"].allgather(rank, data))
 
-    def uses_fabric_handles(comm, dev_id):
-        assert set(comm.allgather("precheck")) == {"precheck"}, "collectives differ"
-        return True
-
     monkeypatch.setattr(mnnvl.MnnvlMemory, "get_comm", staticmethod(get_comm))
-    monkeypatch.setattr(
-        mnnvl.MnnvlMemory, "uses_fabric_handles", staticmethod(uses_fabric_handles)
-    )
     fake_one_sided.module.moe_a2a_lamport_extend_workspace_layout = (
         lambda metainfo, max_tokens, fmt, hidden: None
     )
@@ -916,15 +883,13 @@ def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
 
     def transports(results):
         assert all(isinstance(r, NVLinkOneSidedAlltoAll) for r in results), results
-        return [(r._cft_enabled, r.lamport_max_tokens) for r in results]
+        return [r.lamport_max_tokens for r in results]
 
-    assert transports(construct({}, {}, sm_counts=(3, 2))) == [(True, 2)] * 2
-    assert transports(construct({"cft": False}, {})) == [(False, 3)] * 2
-    assert transports(construct({}, {"lamport": False})) == [(True, 0)] * 2
+    assert transports(construct({}, {}, sm_counts=(3, 2))) == [2] * 2
+    assert transports(construct({}, {"lamport": False})) == [0] * 2
     # Auto Lamport is off under cft=True, so on every rank.
-    assert transports(construct({"cft": True}, {})) == [(True, 0)] * 2
-    assert transports(construct({"lamport": False}, {"cft": False})) == [(False, 0)] * 2
-    assert transports(construct(*[{"lamport_max_tokens": 2}] * 2)) == [(True, 2)] * 2
+    assert transports(construct({"cft": True}, {})) == [0] * 2
+    assert transports(construct(*[{"lamport_max_tokens": 2}] * 2)) == [2] * 2
     for limits in ((2, None), (2, 3)):
         results = construct(*[{"lamport_max_tokens": n} for n in limits])
         for result in results:
@@ -940,27 +905,10 @@ def test_nvlink_one_sided_enable_pdl_override(fake_one_sided) -> None:
 
 
 @pytest.mark.cpu_only
-def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
-    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
-        communication as one_sided,
-    )
-
-    def no_driver_version():
-        raise RuntimeError("nvmlSystemGetDriverVersion: Uninitialized")
-
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (10, 0))
-    monkeypatch.setattr(one_sided, "_driver_branch", no_driver_version)
-    reason = one_sided._cft_unsupported_reason(0, fabric_handles=True)
-    assert reason is not None and "RuntimeError" in reason
-    # POSIX file descriptor workspaces rule CFT out before any probe runs.
-    assert "FABRIC" in one_sided._cft_unsupported_reason(0, fabric_handles=False)
-
-
-@pytest.mark.cpu_only
 def test_nvlink_one_sided_instances_sharing_a_workspace_cannot_interleave(
     fake_one_sided,
 ) -> None:
-    first, second = _one_sided(cft=False), _one_sided(cft=False)
+    first, second = _one_sided(), _one_sided()
     second._state = first._state
     hidden = torch.ones(2, 8, dtype=torch.bfloat16)
     ids = torch.tensor([[0, 3], [1, 2]])
@@ -981,7 +929,7 @@ def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(
     fake_one_sided, monkeypatch
 ) -> None:
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
-    comm = _one_sided(cft=False)
+    comm = _one_sided()
     comm.dispatch(
         torch.ones(2, 8, dtype=torch.bfloat16), torch.tensor([[0, 3], [1, 2]])
     )
@@ -998,9 +946,7 @@ def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(
 @pytest.mark.cpu_only
 def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     calls = fake_one_sided.module.calls
-    comm = _one_sided(
-        _params(num_experts=8, top_k=4), cft_max_tokens_for_dispatch=2, timeout_sec=60
-    )
+    comm = _one_sided(_params(num_experts=8, top_k=4), timeout_sec=60)
     hidden = torch.ones(2, 8, dtype=torch.bfloat16)
     scale = torch.ones(2, 16, dtype=torch.uint8)
     ids = torch.tensor([[0, 3, 5, 7], [1, 2, 4, 6]])
@@ -1017,13 +963,15 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
         torch.int32,
         torch.float32,
     ]
-    rank, ep, top_k, num_experts, eplb, use_cft, id_index, invalid = args[:8]
+    rank, ep, top_k, num_experts, eplb, use_cft, id_index, invalid, use_lamport = args[
+        :9
+    ]
     assert (rank, ep, top_k, num_experts, eplb) == (0, 2, 4, 8, None)
-    # Every payload row is a multiple of 16 bytes, so this small step uses CFT,
-    # which also fills the padding rows' expert ids.
-    assert use_cft and id_index == 2 and invalid == -1
+    # A fence step leaves the padding rows' expert ids to the sanitize op.
+    assert use_cft is False and id_index == -1 and invalid == -1
+    assert use_lamport is False
     assert args[-2] == 60
-    assert "sanitize" not in calls
+    assert calls["sanitize"][0].shape == (2, 2, 4)
     assert result.tokens_per_rank == 2
     assert result.hidden_states.shape == (4, 8)
     assert result.hidden_states_scale.shape == (4, 16)
@@ -1036,23 +984,17 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     assert out.shape == (2, 8)
     payload, local_num_tokens = calls["combine"][:2]
     assert payload.shape == (2, 2, 8) and local_num_tokens == 2
-    # A 16-byte BF16 row allows CFT for the combine as well.
-    assert calls["combine"][11] is True and calls["combine"][14] is out
+    assert calls["combine"][11] is False  # no CFT counted writes
+    assert calls["combine"][14] is out and calls["combine"][-1] is False
 
-    # The full-capacity step exceeds the CFT limit: the fence path runs and
-    # the padding rows are sanitized separately.
+    # A full-capacity step.
     comm.dispatch(hidden, ids, weights)
-    assert calls["dispatch"][3][5] is False and calls["dispatch"][3][6] == -1
+    assert calls["dispatch"][2] == 3 and calls["dispatch"][3][6] == -1
     assert calls["sanitize"][0].shape == (2, 3, 4)
     output = torch.empty(2, 8, dtype=torch.bfloat16)
     assert (
         comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16), output=output) is output
     )
-
-    # Eight-byte expert-id rows cannot use CFT counted writes.
-    narrow = _one_sided(_params(num_experts=8, top_k=2))
-    narrow.dispatch(hidden, ids[:, :2], runtime_max_tokens_per_rank=2)
-    assert calls["dispatch"][3][5] is False
 
     with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
         comm.dispatch(hidden, ids, weights, runtime_max_tokens_per_rank=4)
