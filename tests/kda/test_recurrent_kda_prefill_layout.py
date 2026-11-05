@@ -157,21 +157,26 @@ def test_prefill_fallback_preserves_decode_qk_layout(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    ("backend", "heads", "state_dtype"),
+    ("backend", "heads", "state_dtype", "layout"),
     [
-        ("auto", 4, torch.bfloat16),
-        ("cute-dsl", 12, torch.bfloat16),
-        ("cute-dsl", 96, torch.float32),
-        ("cute-dsl-persistent", 96, torch.float32),
+        ("auto", 4, torch.bfloat16, "token-strided"),
+        ("cute-dsl", 12, torch.bfloat16, "token-strided"),
+        ("cute-dsl", 96, torch.float32, "token-strided"),
+        ("cute-dsl-persistent", 96, torch.float32, "token-strided"),
+        ("cute-dsl", 12, torch.bfloat16, "transposed"),
+        ("cute-dsl", 12, torch.bfloat16, "misaligned"),
     ],
 )
 @pytest.mark.parametrize("packed", [False, True])
 def test_prefill_strided_qkv_capture_reads_changed_inputs(
-    backend, heads, state_dtype, packed
+    backend, heads, state_dtype, layout, packed
 ):
     device = torch.device("cuda")
-    if get_compute_capability(device) not in ((10, 0), (10, 3)):
-        pytest.skip("requires SM100/SM103 KDA prefill")
+    capability = get_compute_capability(device)
+    if capability not in ((10, 0), (10, 3)) and not (
+        capability == (12, 0) and layout in ("transposed", "misaligned")
+    ):
+        pytest.skip("requires SM100/SM103, or SM120 for Q/K packing")
     values = _strict_prefill_kwargs(
         _make_inputs(
             seq_lens=(33, 65) if packed else (33, 33),
@@ -182,9 +187,20 @@ def test_prefill_strided_qkv_capture_reads_changed_inputs(
             seed=31,
         )
     )
-    values.update(_strided_qkv(values, independent=not packed))
-    if backend == "auto":
-        values["v"] = values["v"].contiguous()
+    if layout == "token-strided":
+        values.update(_strided_qkv(values, independent=not packed))
+    else:
+        for name in ("q", "k"):
+            tensor = values[name]
+            if layout == "transposed":
+                values[name] = tensor.transpose(1, 2).contiguous().transpose(1, 2)
+            else:
+                batch, tokens, heads, dim = tensor.shape
+                width = heads * dim
+                carrier = torch.empty(
+                    (batch, tokens, width + 8), dtype=tensor.dtype, device=device
+                )
+                values[name] = carrier[..., 1 : width + 1].view_as(tensor).copy_(tensor)
     values["output"] = torch.empty(
         values["q"].shape, dtype=values["q"].dtype, device=device
     )

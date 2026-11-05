@@ -240,14 +240,17 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend. Ordinary prefill accepts strided Q/K:
-            dense-only providers pack them internally, while cuDNN retains
-            supported strides. Explicit ``"cute-dsl"`` and
-            ``"cute-dsl-persistent"`` read Q/K/V token-strided views directly
-            when head/features are contiguous, base pointers and token pitches
-            are 16-byte aligned,
-            and fixed batches flatten without a copy. Other inputs keep their
-            layout requirements.
+            the frozen prefill backend. Ordinary prefill with ``"auto"``,
+            ``"cake"`` or ``"small-bh"`` packs strided Q/K; ``"auto"`` can
+            select CuTe prefill with supported token-strided V. Explicit
+            ``"cute-dsl"`` and ``"cute-dsl-persistent"`` read Q/K/V views
+            directly when head/features are contiguous, base pointers and
+            token pitches are 16-byte aligned, and fixed batches flatten
+            without a copy. Ordinary ``"cute-dsl"`` packs unsupported Q/K
+            layouts; persistent CuTe requires the supported layout. V is never
+            packed automatically and must meet the selected backend's layout
+            requirements. cuDNN retains its supported strides. Other inputs
+            keep their layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -777,9 +780,13 @@ def recurrent_kda(
                 beta=beta,
                 initial_state=initial_state,
             )
-        if backend != "cute-dsl" or q.stride(-1) != 1:
+        if backend != "cute-dsl" or not (
+            q.ndim == 4 and _kda_prefill._supports_strided_qkv(q)
+        ):
             q = q.contiguous()
-        if backend != "cute-dsl" or k.stride(-1) != 1:
+        if backend != "cute-dsl" or not (
+            k.ndim == 4 and _kda_prefill._supports_strided_qkv(k)
+        ):
             k = k.contiguous()
     if backend in ("auto", "small-bh"):
         small_bh_available = (

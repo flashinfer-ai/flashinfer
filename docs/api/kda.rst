@@ -101,12 +101,13 @@ Input layout
 ~~~~~~~~~~~~
 
 Ordinary prefill with ``auto``, ``cake`` or ``small-bh`` packs strided Q/K
-before selecting dense-only kernels. Explicit ``cute-dsl`` consumes supported
-Q/K/V token-strided views directly on SM100/SM103/SM107 and SM120; Q/K with a
-non-unit last-dimension stride are packed. ``cute-dsl-persistent`` also reads
-supported Q/K/V token-strided views directly on SM100/SM103. ``cudnn`` retains
-its supported strides. Gates, state and output keep their existing layout
-requirements.
+before backend selection. ``auto`` can select CuTe prefill with supported
+token-strided V. Explicit ``cute-dsl`` consumes supported Q/K/V token-strided
+views directly on SM100/SM103/SM107 and SM120, and packs Q/K layouts the kernel
+cannot read directly. ``cute-dsl-persistent`` requires supported Q/K/V
+token-strided views on SM100/SM103. V is never packed automatically and must
+meet the selected backend's layout requirements. ``cudnn`` retains its supported
+strides. Gates, state and output keep their existing layout requirements.
 Output alias checks use the original Q/K storage, and decode retains its
 existing layout contract.
 
