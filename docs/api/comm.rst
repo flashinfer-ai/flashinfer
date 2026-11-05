@@ -865,13 +865,17 @@ groups of 2 ranks and SM90 run the baseline build.  The ``fma`` builds contract
 the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
 their stored bits can differ from those of the builds without it; both agree
 within the kernel's accuracy tolerance, and the builds without the fused
-multiply-add epilogue store identical bits.  The wide-load builds require
-32-byte-aligned ``cos_sin`` and norm-weight tensors (a misaligned view raises
-and names the opt-out).  The
+multiply-add epilogue store identical bits.  Every build requires ``cos_sin``
+and norm-weight tensors that start at 16-byte-aligned addresses, the wide-load
+builds at 32-byte-aligned ones (a misaligned view raises; for the 32-byte bases
+the error names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
 ``shipped`` / a delivered build name) overrides the selection per session,
-rank-uniformly; the baseline build stays delivered beside every variant, and a
-build that is not delivered for the session's tile width raises and names the
+rank-uniformly; the baseline build stays delivered beside every variant.  A
+default build that is not delivered for the session's tile width (the two-rank
+``fma`` build at a 128-column tile, for example hidden 768 with 6 heads over 2
+ranks) runs the baseline build instead; a build named by the environment
+variable that is not delivered for the tile width raises and names the
 delivered ones.  The host plan's group scaling follows the same keying
 (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``): on SM100
 groups of 4 and 2 ranks and on SM103 every group size double the token-tile
