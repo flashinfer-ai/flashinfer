@@ -19,7 +19,15 @@ from ..fp_interface import exact as fp32
 from ..fp_interface.term import Term
 from ..fp_interface.term import TermAlgebra as _Base
 
-__all__ = ["Term", "TermAlgebra", "evaluate", "fingerprint", "sexpr", "size"]
+__all__ = [
+    "Term",
+    "TermAlgebra",
+    "evaluate",
+    "fingerprint",
+    "fingerprint_dag",
+    "sexpr",
+    "size",
+]
 
 
 class TermAlgebra(_Base):
@@ -123,6 +131,33 @@ def fingerprint(t: Term) -> str:
     """Structural sha256 of the canonical S-expression (op names, leaf coordinates, binary32 constants, association;
     commutative operands sorted): independent of interning ids and construction order."""
     return hashlib.sha256(sexpr(t).encode()).hexdigest()[:16]
+
+
+def fingerprint_dag(t: Term) -> str:
+    """A structural hash linear in the size of the term's DAG: every node's digest is the sha256 of its op, its constants
+    and its children's digests, the children of the commutative nodes (``add``, ``mul``, ``fmaxc``) sorted by digest, so
+    it is independent of interning ids, construction order and operand order like :func:`fingerprint`, but does not
+    expand shared sub-terms (:func:`fingerprint` prints the S-expression, whose size is quadratic for a sum whose every
+    leaf embeds the row's maximum). The class's fingerprint uses it; its values differ from :func:`fingerprint`'s."""
+    memo: Dict[int, str] = {}
+    stack = [t]
+    while stack:
+        cur = stack[-1]
+        if cur.uid in memo:
+            stack.pop()
+            continue
+        deps = [a for a in cur.args if isinstance(a, Term) and a.uid not in memo]
+        if deps:
+            stack.extend(deps)
+            continue
+        stack.pop()
+        kids = [memo[a.uid] if isinstance(a, Term) else f"#{a!r}" for a in cur.args]
+        if cur.op in ("add", "mul", "fmaxc"):
+            kids = sorted(kids)
+        memo[cur.uid] = hashlib.sha256(
+            (cur.op + "(" + ",".join(kids) + ")").encode()
+        ).hexdigest()
+    return memo[t.uid][:16]
 
 
 def size(t: Term) -> int:

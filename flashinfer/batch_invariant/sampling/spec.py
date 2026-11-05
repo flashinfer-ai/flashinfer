@@ -28,7 +28,8 @@ from typing import Any, Callable, Dict, Optional
 from ..canon import Digit, Reduction
 from ..fp_interface import exact as fp32
 from .schedule import LANES, V, padded_blocks
-from .sterm import Term, TermAlgebra, fingerprint
+from .sterm import Term, TermAlgebra
+from .sterm import fingerprint_dag as fingerprint
 
 CLASS = "lse.row.v1"
 LOG2E = 1.4426950408889634  # rounded to binary32 (0x3FB8AA3B) wherever it enters the dataflow
@@ -258,8 +259,9 @@ class LSESpec:
 
 
 def spec_fingerprint(N: int, in_fmt: str = "bf16", temperature: bool = False) -> str:
-    """Identifier of the numerical specification for vocabulary ``N``: a structural hash of the two reductions, the
-    first and last probability (the last exercises the padding), the log-softmax element and the ``lse`` of row 0."""
+    """Identifier of the numerical specification for vocabulary ``N``: a structural hash (``sterm.fingerprint_dag``,
+    linear in the term DAG, so computable at every vocabulary) of the two reductions, the first and last probability (the
+    last exercises the padding), the log-softmax element and the ``lse`` of row 0."""
     spec = LSESpec(N, in_fmt=in_fmt, temperature=temperature)
     outs = spec.outputs(0)
     parts = [

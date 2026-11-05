@@ -134,27 +134,33 @@ def check_ref(got, x, temp=None, ids=None, rows=None):
 
 
 def test_fingerprints_are_pinned():
-    """The receipts: one specification per (vocabulary, input dtype, temperature form); the two entries run one class."""
+    """The receipts: one specification per (vocabulary, input dtype, temperature form); the two entries run one class;
+    the hash is structural over the term DAG (``sterm.fingerprint_dag``)."""
     assert (
         bi.class_name("softmax") == "lse.row"
         and bi.class_name("log_probs") == "lse.row"
     )
     assert (
         bi.fingerprint("softmax", N=300, dtype="bf16", temperature=False)
-        == "lse-row-5468780e77132f3d"
+        == "lse-row-89aa36214ccfeb63"
     )
     assert (
         bi.fingerprint("softmax", N=300, dtype=torch.bfloat16, temperature=True)
-        == "lse-row-3287e2af4bf731c1"
+        == "lse-row-02dd3fe1ed41200e"
     )
     assert (
         bi.fingerprint("log_probs", N=300, dtype="f32", temperature=False)
-        == "lse-row-a3e00b2b6467cd07"
+        == "lse-row-209c8fa9070f30ed"
     )
     assert bi.fingerprint("log_probs", N=300, dtype="bf16", temperature=False) == (
         bi.fingerprint("softmax", N=300, dtype="bf16", temperature=False)
     )
     assert S.spec_fingerprint(301, "bf16") != S.spec_fingerprint(300, "bf16")
+    # the hash is linear in the term DAG: a production vocabulary is a receipt, not a cost
+    assert (
+        bi.fingerprint("log_probs", N=32000, dtype="bf16", temperature=False)
+        == "lse-row-c5477bcc11e0e90c"
+    )
     with pytest.raises(TypeError):
         bi.fingerprint("softmax", N=300)
 
