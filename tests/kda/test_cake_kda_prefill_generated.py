@@ -27,7 +27,10 @@ cooperative launches take instead of the pair-share or routed program, and
 which turnover launches whose bin table the bin-mix rule admits take
 cooperatively instead of the turnover program on the ``WORK_BIN_MIX_ARCHES``
 parts, and ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` the long-task builds of the
-bin-mix programs, which bin-mix launches of longer tasks take instead.
+bin-mix programs, which bin-mix launches of longer tasks take instead, and
+``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` the hybrid builds of the M64
+owner/helper programs, which the equal-length launches of a one-helper rule row
+take cooperatively instead of the pair-share program.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -265,6 +268,20 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    hybrids = registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES
+    assert set(hybrids) == set(registry.ARCHES)
+    for arch, modules in hybrids.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its owner/helper,
+            # pair-share or routed program.
+            helped = registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch]
+            assert module in helped, (arch, module)
+            assert program != helped[module]
+            assert program != registry._RENDERED_PAIR_SHARE_ROUTES[arch][module]
+            assert program != registry._RENDERED_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -335,6 +352,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].items(),
+            *registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1147,6 +1165,7 @@ def unrouted(monkeypatch):
             "_RENDERED_WORK_BIN_POOL_ROUTES",
             "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
             "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+            "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1470,6 +1489,15 @@ def _assert_route(route, prepared):
     schedule = str(prepared.schedule)
     loaded = _modules(prepared)
     owner_helper = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    hybrid = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
+    if route == "m64-hybrid" and not hybrid:
+        route = "pair-share"  # a loader without the build keeps the pair-share one
+    if route == "m64-hybrid":
+        if (arch, _sm_count()) != HYBRID_PART:
+            pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+        assert schedule == HYBRID_SCHEDULE, schedule
+        assert loaded & hybrid
+        return
     if route == "m64-owner-helper" and not owner_helper:
         route = "pair-share"  # a loader without the build keeps the pair-share one
     if route == "m64-owner-helper":
@@ -2378,6 +2406,7 @@ GRAPH_ROWS = [
         id="2x(8128+64)-h16-lb5-pair-share",
     ),
     pytest.param([4096] * 4, 16, None, "pool", False, id="4x4096-h16-pool"),
+    pytest.param([4096] * 4, 12, -5.0, "m64-hybrid", False, id="4x4096-h12-lb5-m64ohl"),
     pytest.param([8192], 12, -5.0, "map-fold", False, id="8192-h12-lb5-map-fold"),
 ]
 
@@ -2892,6 +2921,114 @@ def test_refused_m64_owner_helper_launch_runs_its_fallback(monkeypatch):
         schedule.removesuffix("_owner2helper") + "_pair_share",
     )
     _assert_bitwise(result, kept.run(), "refused owner/helper vs its fallback")
+
+
+# The M64 owner/helper hybrid build: equal-length launches of 37 to 48 tasks
+# at 2048 tokens or more that the pair-share rule takes (the shipped one-helper
+# row of a 148-SM sm_100a part), on a grid (tasks, 3).
+HYBRID_PART = ("sm_100a", 148)
+HYBRID_SCHEDULE = "fused_m64_independent_dvsplit_fp32_state_owner1helper_hybrid"
+M64_HYBRID_ROWS = [
+    pytest.param([4096] * 4, 12, id="4x4096-h12"),
+    pytest.param([2049] * 5, 9, id="5x2049-h9"),
+    pytest.param([2600] * 2, 19, id="2x2600-h19"),
+    pytest.param([2048] * 4, 12, id="4x2048-h12"),
+    pytest.param([7000] * 3, 13, id="3x7000-h13"),
+]
+
+
+def _m64_hybrid_programs():
+    arch = registry.device_arch()
+    programs = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
+    if not programs:
+        pytest.skip(f"the loader names no M64 owner/helper hybrid build on {arch}")
+    if (arch, _sm_count()) != HYBRID_PART:
+        pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+    return programs
+
+
+@requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
+@pytest.mark.parametrize("state", M64_OWNER_HELPER_STATES)
+@pytest.mark.parametrize("lengths,heads", M64_HYBRID_ROWS)
+def test_m64_owner_helper_hybrid_is_bitwise_the_pair_share_and_routed_programs(
+    lengths, heads, state, monkeypatch
+):
+    """A launch the shipped one-helper row takes runs the hybrid build and
+    equals, bit for bit, the pair-share program it replaces and the routed
+    program: output, final states and checkpoint rows, launch after launch
+    (the program leaves its words zero), with and without initial states and
+    checkpoint rows."""
+    hybrid = _m64_hybrid_programs()
+    tasks = len(lengths) * heads
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = runtime._probe_m64_cooperative_capacity(device)
+    assert capacity, "the cooperative capacity probe failed"
+    if tasks * 3 > capacity:
+        pytest.skip(f"{capacity} resident CTAs for {tasks} x 3")
+    d = _inputs(lengths, heads)
+    taken = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(taken.prepared.schedule) == HYBRID_SCHEDULE
+    assert _modules(taken.prepared) & hybrid
+    result = taken.run()
+    _assert_bitwise(taken.run(), result, "hybrid repeat")
+
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    base = HYBRID_SCHEDULE.removesuffix("_owner1helper_hybrid")
+    kept = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(kept.prepared.schedule) == base + "_pair_share"
+    assert not _modules(kept.prepared) & hybrid
+    _assert_bitwise(result, kept.run(), "hybrid vs pair-share")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_PAIR_SHARE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    routed = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(routed.prepared.schedule) == base
+    _assert_bitwise(result, routed.run(), "hybrid vs routed M64")
+
+
+@requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
+def test_refused_m64_owner_helper_hybrid_launch_runs_its_fallback(monkeypatch):
+    """A hybrid grid the device cannot hold (60 tasks x 3 CTAs, the capacity
+    probe and the rule rows overridden): the driver refuses it, the plan
+    switches for good to the pair-share program and matches it bit for bit."""
+    hybrid = _m64_hybrid_programs()
+    lengths, heads = [4096] * 5, 12
+    tasks = len(lengths) * heads
+    assert tasks * 3 > _sm_count()
+    d = _inputs(lengths, heads)
+    monkeypatch.setattr(runtime, "_m64_cooperative_capacity", lambda device: 1 << 20)
+    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN", ((tasks, 2048, 1),))
+    monkeypatch.setattr(runtime, "M64_PAIR_SHARE_MIN_SEQ_LEN", ((tasks, 2048),))
+    device = torch.device("cuda", torch.cuda.current_device())
+    if runtime._probe_m64_pair_cluster_capacity(device) < tasks:
+        pytest.skip(f"fewer 2-CTA clusters than {tasks} tasks")
+    refused = _Call(_own_pool(d), -5.0, indexed=False)
+    assert str(refused.prepared.schedule) == HYBRID_SCHEDULE
+    assert _modules(refused.prepared) & hybrid
+    result = refused.run()
+    assert not _modules(refused.prepared) & hybrid
+    assert str(refused.prepared.schedule).endswith("_pair_share")
+    probe = torch.zeros(1024, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
+    assert float(probe.sum()) == 1024.0
+    _assert_bitwise(refused.run(), result, "fallback repeat")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    kept = _Call(_own_pool(d), -5.0, indexed=False)
+    assert str(kept.prepared.schedule).endswith("_pair_share")
+    _assert_bitwise(result, kept.run(), "refused hybrid vs its fallback")
 
 
 CHAIN_ROWS = [
