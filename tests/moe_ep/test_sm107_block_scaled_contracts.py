@@ -10,6 +10,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from flashinfer.moe_ep import FleetParams, MoEEpTensors
 from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
@@ -194,6 +195,14 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     monkeypatch.setattr(package, "sm107_schedule_candidates", lambda *a, **k: [{}])
     finish = mock.Mock(return_value={"fc2_use_bulk": True})
     monkeypatch.setattr(tuning, "finish_sweep", finish)
+
+    # world_size=2 makes the schedule sweep share rank 0's grid through a
+    # collective; model it in-process so the mocked backend needs no real group.
+    def all_gather_object(output, obj, *, group):
+        assert group is backend.ep_comm_group
+        output[:] = [obj] * len(output)
+
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
 
     assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
     config = create.call_args.args[0]
