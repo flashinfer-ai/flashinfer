@@ -417,17 +417,19 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1 token table of
 #: the README): a measured token count is an entry where the row's program failed the rule above in some run, or left
 #: the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio of the
-#: medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  The 212-SM entry of
-#: ``4096 -> 1024`` FP32 at 16384 tokens comes from a later strict re-measurement of the restored window on a 212-SM
-#: R200 part: its program left the checkpointed step 4.0 % slower in graph replays and 1.4 % in eager launches (ratio of
-#: the medians). The open-ended sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows
-#: ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961
-#: tokens up because their one-split program's FP64 relative Frobenius error exceeds the deterministic package's FP32
-#: error budget (5e-5) on every seed there.  That program adds the whole token reduction of an output in one chain, and
-#: its error grows about linearly with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the same
-#: program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an FP64 reference,
-#: each row on two parts, 5 seeds, at 512 to 65536 tokens: within the budget on every seed up to 40960 tokens (1.86e-5
-#: at 16384 tokens, 3.77e-5 at 32768) and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens, where the
+#: medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  The 208-SM and 212-SM
+#: entries of ``4096 -> 1024`` FP32 at 16384 tokens come from a later strict re-measurement of the restored window on
+#: R200 parts: on 212 SMs its program left the checkpointed step 4.0 % slower in graph replays and 1.4 % in eager
+#: launches (ratio of the medians); on 208 SMs the deterministic program's plan there (160-wide tiles) was faster, and
+#: the row's program was 14.5 % slower at the operation and left the checkpointed step 6.3 % slower in graph replays.
+#: The open-ended sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows ``4096 -> 512``,
+#: ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961 tokens up because
+#: their one-split program's FP64 relative Frobenius error exceeds the deterministic package's FP32 error budget (5e-5)
+#: on every seed there.  That program adds the whole token reduction of an output in one chain, and its error grows
+#: about linearly with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the same program and
+#: accumulation order as on 216 SMs; the error does not depend on the SM count) against an FP64 reference, each row on
+#: two parts, 5 seeds, at 512 to 65536 tokens: within the budget on every seed up to 40960 tokens (1.86e-5 at 16384
+#: tokens, 3.77e-5 at 32768) and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens, where the
 #: deterministic program's is 3.8e-5).  The range has no upper bound: the error keeps growing with the token count.  The
 #: token counts between 40960 and 45056 run the deterministic program too (not measured).  From 961 tokens (16 K blocks)
 #: up the deterministic program of these rows cuts the token reduction into units of ``ceil(blocks / 2)`` K blocks and
@@ -480,8 +482,8 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
         (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None),
     ),
     ("sm_107a", 1, 4096, 1024, "f32"): (
-        (208, 16231, 16231), (212, 16231, 16231), (212, 16384, 16384), (216, 16231, 16231),
-        (216, 40961, None),
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
+        (216, 16231, 16231), (216, 40961, None),
     ),
     ("sm_107a", 1, 5120, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 32, "f32"): ((216, 512, 512),),

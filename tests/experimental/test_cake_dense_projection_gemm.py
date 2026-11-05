@@ -2047,13 +2047,14 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules(no_k1_chains):
         assert p(4096, 512, sms, 16231) is None and p(4096, 512, sms, 16384) is None
         for T in (16172, 16230, 16232, 16383):
             assert p(4096, 512, sms, T) == (128, 1), (sms, T)
-    # 4096 -> 1024: at 16231 tokens on 208, 212 and 216 SMs, and at 16384 on 212 SMs (a strict re-measurement of the
-    # restored window: the checkpointed step more than 1.3 % slower); 216 SMs (the 216-SM override) keep the 192-wide
-    # row-major program at 16384, 208 SMs the 256-wide tiles, and 212 SMs (their table) the 192-wide one below 16384
+    # 4096 -> 1024: at 16231 tokens on 208, 212 and 216 SMs, and at 16384 on 208 and 212 SMs (a strict re-measurement
+    # of the restored window); 216 SMs (the 216-SM override) keep the 192-wide row-major program at 16384, and below
+    # 16384 208 SMs keep the 256-wide tiles and 212 SMs (their table) the 192-wide program
     for sms in (208, 212, 216):
         assert p(4096, 1024, sms, 16231) is None, sms
-    assert p(4096, 1024, 208, 16384) == (256, 1)
-    assert p(4096, 1024, 212, 16384) is None
+    for sms in (208, 212):
+        assert p(4096, 1024, sms, 16384) is None, sms
+    assert p(4096, 1024, 208, 16383) == (256, 1)
     assert p(4096, 1024, 212, 16383) == (192, 1)
     assert p(4096, 1024, 216, 16384) == (192, 1)
     # 4096 -> 48 and 4096 -> 64: entries on 208 and 216 SMs, none on 212
