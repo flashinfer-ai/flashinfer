@@ -81,6 +81,15 @@ Warp assignments (12 warps = 384 threads):
   warp  9       : TMA load warp  - loads q, k (double-buf), v
   warp  10      : TMA gate warp  - loads gate, beta
   warp  11      : epilogue warp   - store O to global memory
+
+V-split (``v_split=2``):
+  One work tile is a (sequence, head, V slice) triple instead of a (sequence,
+  head) pair, so a batch with few sequences fills twice as many CTAs. Each CTA
+  owns DV / v_split value rows of the state and of the output: the V-side GEMMs
+  (q*state, new_v, qkv, kv update) run as M = DV / v_split tiles, while the
+  K-side work (kk, qk, inverse) is repeated in every slice. The V rows of the
+  state evolve independently and the K-reduction order is unchanged, so the
+  output and the states are bitwise identical to ``v_split=1``.
 """
 
 import math
@@ -217,6 +226,7 @@ class GatedDeltaNetChunkedKernel:
         use_output_state_indices: bool = False,
         use_checkpoint_state_indices: bool = False,
         use_prefix_lens: bool = False,
+        v_split: int = 1,
     ):
         if state_stride_divisibility < 1 or (
             state_stride_divisibility & (state_stride_divisibility - 1)
@@ -231,6 +241,21 @@ class GatedDeltaNetChunkedKernel:
             raise ValueError(
                 "checkpoint_state_indices and prefix_lens require checkpoints"
             )
+        # V-split: each CTA owns DV / v_split value rows of the state and of the
+        # output, so a (sequence, head) pair becomes v_split work tiles. The V
+        # rows of the state evolve independently and the K-reduction order is
+        # unchanged, so every v_split gives bitwise identical results.
+        if v_split not in (1, 2):
+            raise ValueError(f"v_split must be 1 or 2, got {v_split}")
+        if (mma_tiler_qs[0], mma_tiler_qkv[0], mma_tiler_kv[0]) != (
+            (128 // v_split,) * 3
+        ):
+            raise ValueError(
+                f"v_split={v_split} needs M = {128 // v_split} V-side MMA tiles, got "
+                f"mma_tiler_qs={mma_tiler_qs}, mma_tiler_qkv={mma_tiler_qkv}, "
+                f"mma_tiler_kv={mma_tiler_kv}"
+            )
+        self.v_split = v_split
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
         self.state_dtype = state_dtype
@@ -398,6 +423,16 @@ class GatedDeltaNetChunkedKernel:
     # -----------------------------------------------------------------------
 
     @staticmethod
+    def mma_tilers(v_split: int = 1):
+        """``(mma_tiler_qk, mma_tiler_qs, mma_tiler_qkv, mma_tiler_kv)`` for ``v_split``.
+
+        The V-side GEMMs (q*state, new_v/qkv, kv update) run with M = DV / v_split;
+        the K-side kk/qk GEMMs do not depend on V.
+        """
+        dv = 128 // v_split
+        return (64, 64, 128), (dv, 64, 128), (dv, 64, 64), (dv, 128, 64)
+
+    @staticmethod
     def can_implement(
         io_dtype,
         acc_dtype,
@@ -406,6 +441,7 @@ class GatedDeltaNetChunkedKernel:
         mma_tiler_qs,
         mma_tiler_qkv,
         mma_tiler_kv,
+        v_split: int = 1,
     ):
         """Raise CantImplementError if this configuration is not supported."""
         if io_dtype not in [cutlass.Float16, cutlass.BFloat16]:
@@ -420,22 +456,22 @@ class GatedDeltaNetChunkedKernel:
             raise testing.CantImplementError(
                 f"inverse_dtype={inverse_dtype} must match io_dtype={io_dtype}"
             )
-        if mma_tiler_qk != (64, 64, 128):
+        if v_split not in (1, 2):
             raise testing.CantImplementError(
-                f"mma_tiler_qk={mma_tiler_qk} not supported; only (64, 64, 128) is supported"
+                f"v_split={v_split} not supported; only 1 and 2 are supported"
             )
-        if mma_tiler_qs != (128, 64, 128):
-            raise testing.CantImplementError(
-                f"mma_tiler_qs={mma_tiler_qs} not supported; only (128, 64, 128) is supported"
-            )
-        if mma_tiler_qkv != (128, 64, 64):
-            raise testing.CantImplementError(
-                f"mma_tiler_qkv={mma_tiler_qkv} not supported; only (128, 64, 64) is supported"
-            )
-        if mma_tiler_kv != (128, 128, 64):
-            raise testing.CantImplementError(
-                f"mma_tiler_kv={mma_tiler_kv} not supported; only (128, 128, 64) is supported"
-            )
+        supported = GatedDeltaNetChunkedKernel.mma_tilers(v_split)
+        for name, tiler, expected in zip(
+            ("mma_tiler_qk", "mma_tiler_qs", "mma_tiler_qkv", "mma_tiler_kv"),
+            (mma_tiler_qk, mma_tiler_qs, mma_tiler_qkv, mma_tiler_kv),
+            supported,
+            strict=True,
+        ):
+            if tuple(tiler) != expected:
+                raise testing.CantImplementError(
+                    f"{name}={tiler} not supported with v_split={v_split}; "
+                    f"only {expected} is supported"
+                )
 
     # -----------------------------------------------------------------------
     # Host entry point
@@ -627,6 +663,16 @@ class GatedDeltaNetChunkedKernel:
         tiled_mma_qkv = cute.make_tiled_mma(
             _mma_op(
                 self.mma_tiler_qkv,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                tcgen05.OperandSource.TMEM,
+            )
+        )
+        # The CG0 KK/QK accumulator ring keeps the M=128 fragment layout of the
+        # stock kernel for every v_split (the kk/qk GEMMs do not depend on V).
+        tiled_mma_qkv_ring = cute.make_tiled_mma(
+            _mma_op(
+                (128,) + tuple(self.mma_tiler_qkv[1:]),
                 OperandMajorMode.K,
                 OperandMajorMode.K,
                 tcgen05.OperandSource.TMEM,
@@ -880,6 +926,7 @@ class GatedDeltaNetChunkedKernel:
             num_v_heads=h_v,
             is_GQA=self.is_GQA,
             is_persistent=self.is_persistent,
+            v_split=self.v_split,
         )
         grid_shape = GDNTileScheduler.get_grid_shape(
             scheduler_params, self.max_active_clusters
@@ -887,6 +934,7 @@ class GatedDeltaNetChunkedKernel:
 
         self.kernel(
             tiled_mma_qk,
+            tiled_mma_qkv_ring,
             tiled_mma_qs,
             tiled_mma_qkv,
             tiled_mma_qkv_ss,
@@ -943,6 +991,8 @@ class GatedDeltaNetChunkedKernel:
         # Tiled MMAs (one per logical GEMM group)
         # GEMM 1 (kk) + GEMM 2 (qk)
         tiled_mma_qk: cute.TiledMma,
+        # CG0 KK/QK accumulator ring layout (M=128 for every v_split)
+        tiled_mma_qkv_ring: cute.TiledMma,
         # GEMM 3 (k*state) + GEMM 4 (q*state)
         tiled_mma_qs: cute.TiledMma,
         # GEMM 5 (new_v) + GEMM 6 (qkv)
@@ -1371,7 +1421,7 @@ class GatedDeltaNetChunkedKernel:
             )
             work = scheduler.initial_work_tile_info()
             while work.is_valid_tile:
-                batch_idx, head_idx, _ = work.tile_idx
+                batch_idx, head_idx, v_slice = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 if cutlass.const_expr(self.use_prefix_lens):
@@ -1416,6 +1466,7 @@ class GatedDeltaNetChunkedKernel:
                             mS_indices,
                             head_idx,
                             batch_idx,
+                            v_slice,
                             tmem_ptr,
                             tiled_mma_kv,
                             kv_acc_producer,
@@ -1474,6 +1525,7 @@ class GatedDeltaNetChunkedKernel:
                                 head_idx,
                                 seqlen_b,
                                 is_first_chunk,
+                                v_slice,
                             ),
                         )
                         is_first_chunk = False
@@ -1486,6 +1538,7 @@ class GatedDeltaNetChunkedKernel:
                             mS_indices,
                             head_idx,
                             batch_idx,
+                            v_slice,
                             tmem_ptr,
                             tiled_mma_kv,
                             kv_acc_consumer,
@@ -1512,6 +1565,7 @@ class GatedDeltaNetChunkedKernel:
                         mS_indices,
                         head_idx,
                         batch_idx,
+                        v_slice,
                     )
 
                 scheduler.advance_to_next_work()
@@ -1548,7 +1602,7 @@ class GatedDeltaNetChunkedKernel:
                         load_q_consumer,
                     ) = self.mma_cg0_pair(
                         tmem_ptr,
-                        (tiled_mma_qk, tiled_mma_qkv),
+                        (tiled_mma_qk, tiled_mma_qkv_ring),
                         (sQ, sK),
                         (
                             cg0_shared_acc_producer,
@@ -1696,7 +1750,7 @@ class GatedDeltaNetChunkedKernel:
                 tensormap_manager.fence_tensormap_initialization()
 
             while work.is_valid_tile:
-                batch_idx, head_idx, _ = work.tile_idx
+                batch_idx, head_idx, v_slice = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
                 batch_end = cu_seqlens[batch_idx + 1]
                 seqlen_b = cutlass.Int32(batch_end - batch_start)
@@ -1781,7 +1835,7 @@ class GatedDeltaNetChunkedKernel:
                                 (tma_q, tma_k, tma_v),
                                 (sQ, sK, sV),
                                 (load_q_producer, load_k_producer, load_v_producer),
-                                (chunk_offset, chunk_idx, batch_idx, head_idx),
+                                (chunk_offset, chunk_idx, batch_idx, head_idx, v_slice),
                                 (
                                     tensormap_manager,
                                     tensormap_q_ptr,
@@ -1798,7 +1852,7 @@ class GatedDeltaNetChunkedKernel:
                             (tma_q, tma_k, tma_v),
                             (sQ, sK, sV),
                             (load_q_producer, load_k_producer, load_v_producer),
-                            (chunk_offset, chunk_idx, batch_idx, head_idx),
+                            (chunk_offset, chunk_idx, batch_idx, head_idx, v_slice),
                             (
                                 tensormap_manager,
                                 tensormap_q_ptr,
@@ -1815,7 +1869,7 @@ class GatedDeltaNetChunkedKernel:
                                 (tma_q, tma_k, tma_v),
                                 (sQ, sK, sV),
                                 (load_q_producer, load_k_producer, load_v_producer),
-                                (chunk_offset, chunk_idx, batch_idx, head_idx),
+                                (chunk_offset, chunk_idx, batch_idx, head_idx, v_slice),
                                 (
                                     tensormap_manager,
                                     tensormap_q_ptr,
@@ -1849,7 +1903,7 @@ class GatedDeltaNetChunkedKernel:
                 tensormap_manager.fence_tensormap_initialization()
 
             while work.is_valid_tile:
-                batch_idx, head_idx, _ = work.tile_idx
+                batch_idx, head_idx, v_slice = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
                 batch_end = cu_seqlens[batch_idx + 1]
                 seqlen_b = cutlass.Int32(batch_end - batch_start)
@@ -1982,13 +2036,14 @@ class GatedDeltaNetChunkedKernel:
                                     o_store_consumer,
                                     chunk_offset,
                                     real_seqlen_b,
+                                    v_slice,
                                 )
                             else:
                                 o_store_consumer = self.epilogue_warp(
                                     (sO,),
                                     (tma_o,),
                                     (o_store_consumer,),
-                                    (head_idx, chunk_offset),
+                                    (head_idx, chunk_offset, v_slice),
                                     (tensormap_manager, tensormap_o_ptr),
                                 )
                         else:
@@ -1996,7 +2051,7 @@ class GatedDeltaNetChunkedKernel:
                                 (sO,),
                                 (tma_o,),
                                 (o_store_consumer,),
-                                (head_idx, chunk_offset),
+                                (head_idx, chunk_offset, v_slice),
                                 (tensormap_manager, tensormap_o_ptr),
                             )
                 scheduler.advance_to_next_work()
@@ -2038,7 +2093,7 @@ class GatedDeltaNetChunkedKernel:
         tma_q, tma_k, tma_v = tma_args
         sQ, sK, sV = smem_args
         load_q_producer, load_k_producer, load_v_producer = pipeline_args
-        chunk_offset, chunk_idx, batch_idx, head_idx = work_args
+        chunk_offset, chunk_idx, batch_idx, head_idx, v_slice = work_args
         tensormap_manager, tensormap_q_ptr, tensormap_k_ptr, tensormap_v_ptr = (
             tensormap_args
         )
@@ -2055,7 +2110,7 @@ class GatedDeltaNetChunkedKernel:
         #   mode[1,2] = (BT, DV) - tile shape for loading V (B operand in GEMMs 5/6)
         # (BT, DK)
         qk_tile = cute.select(self.mma_tiler_qk, mode=[0, 2])
-        # (DV, BT)
+        # (DV / v_split, BT)
         v_tile = cute.select(self.mma_tiler_qkv, mode=[0, 2])
 
         # ------------------------------------------------------------------
@@ -2142,7 +2197,8 @@ class GatedDeltaNetChunkedKernel:
             tensormap_manager.fence_tensormap_update(tensormap_v_ptr)
         cute.copy(
             tma_v.atom,
-            tVgV[(None, 0, 0)],
+            # V-split: the CTA loads the value rows of its slice only.
+            tVgV[(None, v_slice, 0)],
             tVsV[(None, v_handle.index)],
             tma_bar_ptr=v_handle.barrier,
             tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
@@ -2323,7 +2379,8 @@ class GatedDeltaNetChunkedKernel:
         pipeline.PipelineConsumer,
     ]:
         """Issue one pair's fixed KK0/KK1/QK0/QK1 sequence."""
-        tiled_mma_qk, tiled_mma_qkv = mma_args
+        # tiled_mma_ring: M=128 qkv layout of the KK/QK accumulator ring (every v_split)
+        tiled_mma_qk, tiled_mma_ring = mma_args
         sQ, sK = smem_args
         (
             cg0_acc_producer,
@@ -2331,10 +2388,8 @@ class GatedDeltaNetChunkedKernel:
             load_q_consumer,
         ) = pipeline_args
 
-        acc_shape = tiled_mma_qkv.partition_shape_C(
-            (self.mma_tiler_qkv[0], self.mma_tiler_qkv[1])
-        )
-        tCtAcc_fake = tiled_mma_qkv.make_fragment_C(
+        acc_shape = tiled_mma_ring.partition_shape_C((128, self.mma_tiler_qkv[1]))
+        tCtAcc_fake = tiled_mma_ring.make_fragment_C(
             cute.append(acc_shape, self.tmem_cg0_shared_acc_stages)
         )
         tCtAcc = cute.make_tensor(
@@ -4187,6 +4242,33 @@ class GatedDeltaNetChunkedKernel:
             if cursor[0] <= seqlen_b:
                 cursor[1] = cutlass.Int32(mCheckpoint_indices[checkpoint_offset])
 
+    # V-split: TMEM copy atoms of the state accumulator. The M=128 tile keeps
+    # the 32-datapath atoms; an M=64 tile occupies datapaths 0-15 of each
+    # 32-lane subpartition, so it uses 16-datapath atoms. The fp32 Ld16x256b /
+    # io-dtype St16x128b pair with equal repetition keeps the per-thread value
+    # order matched, as the kernel already does for NV.
+    def _state_t2r_op(self):
+        if self.mma_tiler_kv[0] == 128:
+            return tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
+        return tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8))
+
+    def _state_r2t_op(self):
+        if self.mma_tiler_kv[0] == 128:
+            return tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32))
+        return tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8))
+
+    def _state_inp_r2t_op(self):
+        if self.mma_tiler_qs[0] == 128:
+            return tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16))
+        return tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8))
+
+    def _state_tile(self, mS, head_idx, row, v_slice):
+        """``(DV / v_split, DK)`` slice ``v_slice`` of state row ``row`` of ``mS``."""
+        return cute.flat_divide(
+            mS[None, None, head_idx, row],
+            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+        )[None, None, v_slice, 0]
+
     @cute.jit
     def _load_initial_state(
         self,
@@ -4195,11 +4277,12 @@ class GatedDeltaNetChunkedKernel:
         mS_indices,
         head_idx,
         batch_idx,
+        v_slice,
         tmem_ptr,
         tiled_mma_kv,
         kv_acc_producer,
     ) -> pipeline.PipelineProducer:
-        """Load S_init from GMEM into state TMEM (fp32).
+        """Load S_init (value-row slice ``v_slice``) from GMEM into state TMEM (fp32).
 
         Two steps:
           1. GMEM fp32 -> registers
@@ -4221,9 +4304,7 @@ class GatedDeltaNetChunkedKernel:
         tCtState_mn_view = utils.gemm.sm100.transform_partitioned_tensor_layout(
             tCtState
         )
-        state_r2t_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
+        state_r2t_atom = cute.make_copy_atom(self._state_r2t_op(), self.acc_dtype)
         cState = cute.make_identity_tensor((self.mma_tiler_kv[0], self.mma_tiler_kv[1]))
         tCtState_for_r2t = tCtState[(None, None), 0, 0, 0]
         tiled_state_r2t = tcgen05.make_tmem_copy(state_r2t_atom, tCtState_for_r2t)
@@ -4237,10 +4318,7 @@ class GatedDeltaNetChunkedKernel:
             state_row = cutlass.Int32(mS_indices[batch_idx])
         else:
             state_row = batch_idx
-        gS_init = cute.flat_divide(
-            mS_init[None, None, head_idx, state_row],
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-        )[None, None, 0, 0]
+        gS_init = self._state_tile(mS_init, head_idx, state_row, v_slice)
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tGR_tCrState.shape[2]):
@@ -4292,9 +4370,11 @@ class GatedDeltaNetChunkedKernel:
         mS_indices,
         head_idx,
         batch_idx,
+        v_slice,
     ):
         """Copy initial state to final state for a sequence containing no tokens.
 
+        Each V-split CTA copies the value rows of its slice ``v_slice``.
         Slot mode (never with ``output_state_indices``, whose empty sequences
         write nothing) copies row ``state_indices[b]`` to the same row and
         skips a negative row.
@@ -4302,6 +4382,7 @@ class GatedDeltaNetChunkedKernel:
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
         state_elements = self.mma_tiler_kv[0] * self.mma_tiler_kv[1]
+        v_base = v_slice * self.mma_tiler_kv[0]
         if cutlass.const_expr(mS_indices is not None):
             state_row = cutlass.Int32(mS_indices[batch_idx])
         else:
@@ -4312,7 +4393,7 @@ class GatedDeltaNetChunkedKernel:
                     cg1_tidx, state_elements, num_threads_cg1, unroll=1
                 ):
                     key_idx = linear_idx // self.mma_tiler_kv[0]
-                    value_idx = linear_idx - key_idx * self.mma_tiler_kv[0]
+                    value_idx = linear_idx - key_idx * self.mma_tiler_kv[0] + v_base
                     mS_out[value_idx, key_idx, head_idx, state_row] = mS_init[
                         value_idx, key_idx, head_idx, state_row
                     ]
@@ -4321,7 +4402,7 @@ class GatedDeltaNetChunkedKernel:
                 cg1_tidx, state_elements, num_threads_cg1, unroll=1
             ):
                 key_idx = linear_idx // self.mma_tiler_kv[0]
-                value_idx = linear_idx - key_idx * self.mma_tiler_kv[0]
+                value_idx = linear_idx - key_idx * self.mma_tiler_kv[0] + v_base
                 mS_out[value_idx, key_idx, head_idx, state_row] = mS_init[
                     value_idx, key_idx, head_idx, state_row
                 ]
@@ -4335,6 +4416,7 @@ class GatedDeltaNetChunkedKernel:
         mS_indices,
         head_idx,
         batch_idx,
+        v_slice,
         tmem_ptr,
         tiled_mma_kv,
         # MMA -> CG1 consumer; waited+released inside this method
@@ -4347,6 +4429,8 @@ class GatedDeltaNetChunkedKernel:
         slot_args,
     ):
         """Store final recurrent state from TMEM (fp32) to GMEM mS_out.
+
+        Stores value-row slice ``v_slice`` (the whole state when ``v_split == 1``).
 
         Waits for the last GEMM-7 (kv_acc) to complete, reads state TMEM -> registers,
         writes registers -> GMEM fp32, then releases the consumer handle.
@@ -4389,10 +4473,8 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
 
-        # TMEM -> registers  (Ld32x32b)
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
+        # TMEM -> registers
+        atom_state_t2r = cute.make_copy_atom(self._state_t2r_op(), self.acc_dtype)
         tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
         tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
@@ -4428,13 +4510,13 @@ class GatedDeltaNetChunkedKernel:
                                     mS_checkpoints,
                                     head_idx,
                                     end_checkpoint_row,
+                                    v_slice,
                                     sub,
                                 )
                         else:
-                            gS_checkpoints = cute.flat_divide(
-                                mS_checkpoints[None, None, head_idx, checkpoint_offset],
-                                (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                            )[None, None, 0, 0]
+                            gS_checkpoints = self._state_tile(
+                                mS_checkpoints, head_idx, checkpoint_offset, v_slice
+                            )
                             tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                             cute.autovec_copy(
                                 tRG_rState[None, 0, sub],
@@ -4451,6 +4533,7 @@ class GatedDeltaNetChunkedKernel:
                             mS_out,
                             head_idx,
                             final_row,
+                            v_slice,
                             sub,
                         )
         else:
@@ -4470,10 +4553,9 @@ class GatedDeltaNetChunkedKernel:
                     if seqlen_b % checkpoint_every_n_tokens == 0:
                         num_valid_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                         if num_valid_chunks_b % 2 == 0:
-                            gS_checkpoints = cute.flat_divide(
-                                mS_checkpoints[None, None, head_idx, checkpoint_offset],
-                                (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                            )[None, None, 0, 0]
+                            gS_checkpoints = self._state_tile(
+                                mS_checkpoints, head_idx, checkpoint_offset, v_slice
+                            )
                             tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                             cute.autovec_copy(
                                 tRG_rState[None, 0, sub],
@@ -4485,10 +4567,7 @@ class GatedDeltaNetChunkedKernel:
                         state_row = cutlass.Int32(mS_indices[batch_idx])
                     else:
                         state_row = batch_idx
-                    gS_out = cute.flat_divide(
-                        mS_out[None, None, head_idx, state_row],
-                        (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                    )[None, None, 0, 0]
+                    gS_out = self._state_tile(mS_out, head_idx, state_row, v_slice)
                     tRG_tCgState = thr_state_t2r.partition_D(gS_out)
                     cute.autovec_copy(
                         tRG_rState[None, 0, sub],
@@ -4500,14 +4579,12 @@ class GatedDeltaNetChunkedKernel:
 
     @cute.jit
     def _store_state_row(
-        self, rState, thr_state_t2r, mS, head_idx, row: cutlass.Int32, sub
+        self, rState, thr_state_t2r, mS, head_idx, row: cutlass.Int32, v_slice, sub
     ):
         """Store this thread's state fragment ``rState`` (sub-tile ``sub``, or
-        all sub-tiles when ``sub`` is None) to row ``row`` of a state tensor."""
-        gS = cute.flat_divide(
-            mS[None, None, head_idx, row],
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-        )[None, None, 0, 0]
+        all sub-tiles when ``sub`` is None) to value-row slice ``v_slice`` of
+        row ``row`` of a state tensor."""
+        gS = self._state_tile(mS, head_idx, row, v_slice)
         tSgS = thr_state_t2r.partition_D(gS)
         cute.autovec_copy(
             rState,
@@ -4568,7 +4645,7 @@ class GatedDeltaNetChunkedKernel:
             o_store_producer,
         ) = pipeline_args
         tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv = mma_args
-        chunk_iter, num_pairs_b, head_idx, seqlen_b, is_first_chunk = work_args
+        chunk_iter, num_pairs_b, head_idx, seqlen_b, is_first_chunk, v_slice = work_args
 
         # ------------------------------------------------------------------
         # Preamble (identical to compute_group_1)
@@ -4591,12 +4668,8 @@ class GatedDeltaNetChunkedKernel:
         tCcState = cute.make_identity_tensor(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        atom_state_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
+        atom_state_t2r = cute.make_copy_atom(self._state_t2r_op(), self.acc_dtype)
+        atom_state_r2t = cute.make_copy_atom(self._state_r2t_op(), self.acc_dtype)
         tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
         tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
         tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
@@ -4625,7 +4698,7 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
         atom_state_inp_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
+            self._state_inp_r2t_op(), self.io_dtype
         )
         tCtState_inp_for_r2t = tCtState_inp_mn_view[None, None, 0]
         tiled_state_inp_r2t = tcgen05.make_tmem_copy(
@@ -4842,6 +4915,7 @@ class GatedDeltaNetChunkedKernel:
                                     mS_checkpoints,
                                     head_idx,
                                     checkpoint_row,
+                                    v_slice,
                                     None,
                                 )
                             else:
@@ -4851,13 +4925,13 @@ class GatedDeltaNetChunkedKernel:
                                     mS_checkpoints,
                                     head_idx,
                                     checkpoint_row,
+                                    v_slice,
                                     None,
                                 )
                     else:
-                        gS_checkpoints = cute.flat_divide(
-                            mS_checkpoints[None, None, head_idx, checkpoint_offset],
-                            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                        )[None, None, 0, 0]
+                        gS_checkpoints = self._state_tile(
+                            mS_checkpoints, head_idx, checkpoint_offset, v_slice
+                        )
                         tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                         if cutlass.const_expr(self.state_dtype != self.acc_dtype):
                             tRG_rState[None, 0, None].store(
@@ -4891,18 +4965,12 @@ class GatedDeltaNetChunkedKernel:
                     if checkpoint_token > 0:
                         if checkpoint_token <= seqlen_b:
                             if checkpoint_token % checkpoint_every_n_tokens == 0:
-                                gS_checkpoints = cute.flat_divide(
-                                    mS_checkpoints[
-                                        None,
-                                        None,
-                                        head_idx,
-                                        checkpoint_offset,
-                                    ],
-                                    (
-                                        self.mma_tiler_kv[0],
-                                        self.mma_tiler_kv[1],
-                                    ),
-                                )[None, None, 0, 0]
+                                gS_checkpoints = self._state_tile(
+                                    mS_checkpoints,
+                                    head_idx,
+                                    checkpoint_offset,
+                                    v_slice,
+                                )
                                 tSgCheckpoints = thr_state_t2r.partition_D(
                                     gS_checkpoints
                                 )
@@ -5111,13 +5179,13 @@ class GatedDeltaNetChunkedKernel:
         (sO,) = smem_args
         (tma_o,) = tma_args
         (o_store_consumer,) = pipeline_args
-        head_idx, chunk_offset = work_args
+        head_idx, chunk_offset, v_slice = work_args
         tensormap_manager, tensormap_o_ptr = tensormap_args
 
         o_handle = o_store_consumer.wait_and_advance()
 
         cta_layout = cute.make_layout(1)
-        # (BT, DV)
+        # (DV / v_split, BT)
         o_tile = cute.select(self.mma_tiler_qkv, mode=[0, 1])
 
         # Position global O tile at current chunk / head
@@ -5125,7 +5193,7 @@ class GatedDeltaNetChunkedKernel:
             (cutlass.Int32(0), chunk_offset),
             tma_o.tma_tensor[None, None, head_idx],
         )
-        # (BT, DV, num_o_tiles, ...)
+        # (DV / v_split, BT, v_split, num_chunk_tiles)
         gO = cute.flat_divide(mO, o_tile)
 
         # TMA partition: tOsO = SMEM source, tOgO = GMEM destination
@@ -5141,7 +5209,7 @@ class GatedDeltaNetChunkedKernel:
         cute.copy(
             tma_o.atom,
             tOsO[(None, o_handle.index)],
-            tOgO[(None, 0, 0)],
+            tOgO[(None, v_slice, 0)],
             tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
                 tensormap_o_ptr, cute.AddressSpace.generic
             ),
@@ -5164,30 +5232,33 @@ class GatedDeltaNetChunkedKernel:
         o_store_consumer: pipeline.PipelineConsumer,
         chunk_offset: cutlass.Int32,
         seqlen: cutlass.Int32,
+        v_slice: cutlass.Int32,
     ) -> pipeline.PipelineConsumer:
         """Warp 11: store the chunk that starts before its sequence (prefix_lens).
 
         ``mO_seq`` is the ``(DV, seqlen)`` output of one sequence and head, and
-        the chunk starts at row ``chunk_offset < 0`` (leading identity rows).
+        the chunk starts at row ``chunk_offset < 0`` (leading identity rows);
+        with V-split this CTA stores only value-row slice ``v_slice``.
         TMA stores require a non-negative box start, so the rows inside the
         sequence are copied from the staging buffer with predicated 128-bit
         stores; the leading rows and rows past the sequence are not written.
         """
         o_handle = o_store_consumer.wait_and_advance()
         lidx = tidx % self.threads_per_warp
-        # (DV, BT)
+        # (DV / v_split, BT)
         o_tile = cute.select(self.mma_tiler_qkv, mode=[0, 1])
         gO = cute.flat_divide(
             cute.domain_offset((cutlass.Int32(0), chunk_offset), mO_seq), o_tile
-        )[None, None, 0, 0]
+        )[None, None, v_slice, 0]
         cO = cute.flat_divide(
             cute.domain_offset(
                 (cutlass.Int32(0), chunk_offset),
                 cute.make_identity_tensor(mO_seq.shape),
             ),
             o_tile,
-        )[None, None, 0, 0]
-        # Each half-warp copies one 128-element row in 16-byte vectors.
+        )[None, None, v_slice, 0]
+        # Each group of o_tile[0] // vec lanes copies one value row of the
+        # tile in 16-byte vectors.
         vec = 128 // self.io_dtype.width
         lanes_per_row = o_tile[0] // vec
         atom_o_s2g = cute.make_copy_atom(
@@ -5227,7 +5298,9 @@ class GatedDeltaNetChunkedKernel:
         return cute.make_tensor(wo_swizzle_iter, tensor_pisl)
 
     @staticmethod
-    def get_workspace_size(num_sm: int, B: int, HQ: int, HV: int, is_persistent: bool):
+    def get_workspace_size(
+        num_sm: int, B: int, HQ: int, HV: int, is_persistent: bool, v_split: int = 1
+    ):
         # q, k, v, o
         if is_persistent:
             return (
@@ -5239,7 +5312,7 @@ class GatedDeltaNetChunkedKernel:
         return (
             GatedDeltaNetChunkedKernel.bytes_per_tensormap
             * GatedDeltaNetChunkedKernel.num_tensormaps
-            * (B * HO)
+            * (B * HO * v_split)
         )
 
     @cute.jit
