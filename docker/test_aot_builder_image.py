@@ -70,7 +70,8 @@ def main() -> None:
         _fail(f"{cudnn_package} is {_version(cudnn_package)}, expected {cudnn_version}")
 
     # The provider's build-system requires must resolve offline: pip would
-    # otherwise reach for the network at job time.
+    # otherwise reach for the network at job time. --no-deps because the baked
+    # cuDNN is deliberately newer than torch's pin (cu129 torch pins 9.20).
     subprocess.run(
         [
             sys.executable,
@@ -79,6 +80,7 @@ def main() -> None:
             "install",
             "--dry-run",
             "--no-index",
+            "--no-deps",
             "setuptools>=77",
             "packaging>=24",
             "wheel",
