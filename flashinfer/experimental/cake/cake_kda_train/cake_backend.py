@@ -2872,8 +2872,9 @@ def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 def _alloc(
     shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """Every per-call tensor (outputs, saved set, tables) comes from here: ``torch.empty``, since every element is
-    written by a kernel of the same call."""
+    """Every per-call tensor (outputs, saved set, tables) comes from here: ``torch.empty``, since a kernel of the
+    same call writes every element a reader reads (not every element: the tape set's ``h`` leaves its padding chunks
+    ``[NC, NC_pad)`` unwritten, and no reader reads them)."""
     return torch.empty(shape, dtype=dtype, device=device)
 
 

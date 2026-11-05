@@ -1066,15 +1066,20 @@ class _Count:
         for name, t in zip(names, got, strict=True):
             self.same(t, reference[name], (tag, name))
 
-    def saved(self, a, b, tag) -> None:
-        """Two l2n saved sets field for field: the same metadata and every present tensor bit for bit."""
+    def saved(self, a, b, tag, h_chunks: int | None = None) -> None:
+        """Two l2n saved sets field for field: the same metadata and every present tensor bit for bit.  ``h_chunks``
+        (a tape set): ``h`` on its written chunks ``[0, h_chunks)`` alone, the padding chunks up to ``NC_pad`` being
+        unwritten in both packages (no reader reads them)."""
         assert a.qk_l2norm is True and b.qk_l2norm is True, tag
         for field in ("version", "S", "H", "num_docs", "scale", "gate", "lower_bound"):
             assert getattr(a, field) == getattr(b, field), (tag, field)
         for field in SAVED_TENSORS:
             x, y = getattr(a, field), getattr(b, field)
             assert (x is None) == (y is None), (tag, field)
-            if x is not None:
+            if x is not None and field == "h" and h_chunks is not None:
+                assert x.shape == y.shape and 0 < h_chunks <= x.shape[0], (tag, field)
+                self.same(x[:h_chunks], y[:h_chunks], (tag, field, h_chunks))
+            elif x is not None:
                 self.same(x, y, (tag, field))
         assert a.qk_rstd is not None and a.qk_rstd.shape == (2, a.S, a.H), tag
         assert (a.tables is None) == (b.tables is None), tag
@@ -1196,7 +1201,10 @@ def test_l2n_paths_are_bitwise_the_deterministic_l2n(shape, gate: str) -> None:
     count.grads(_bwd(inputs, saved, gate, workspace=tape_ws), ref, gate, "light set")
     # either package's backward from the other's l2n sets (light and tape)
     _, det_saved_t = _fwd(inputs, gate, det=True, save_mode="tape")
-    count.saved(saved_t, det_saved_t, "tape set")
+    # the tape set's h on its written chunks: one per 64 tokens of each document
+    count.saved(
+        saved_t, det_saved_t, "tape set", h_chunks=sum(-(-n // 64) for n in lengths)
+    )
     for tag, nd_set, det_set in (
         ("light", saved, det_saved),
         ("tape", saved_t, det_saved_t),
