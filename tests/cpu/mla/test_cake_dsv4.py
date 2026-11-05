@@ -2587,7 +2587,7 @@ def test_fp8_h64_two_tile_decode_rows_take_the_h64_cluster_body_on_sm100_sm103(
     partial third run the H64 cluster body where it is built (SM100 / SM103);
     width 256 and one complete tile keep the M64 body, three tiles or 13+
     tokens the persistent body, and SM107 or an unknown architecture the M64
-    body."""
+    body (SM107 runs width 252 past 12 tokens on the persistent body)."""
     for tokens in range(1, 14):
         route = _route(
             dtype=torch.float8_e4m3fn,
@@ -2602,7 +2602,9 @@ def test_fp8_h64_two_tile_decode_rows_take_the_h64_cluster_body_on_sm100_sm103(
             arch=arch,
         )
         full_tiles = sparse_topk // 128
-        if full_tiles >= (3 if tokens <= 12 else 2):
+        if full_tiles >= (3 if tokens <= 12 else 2) or (
+            tokens > 12 and arch == "sm_107a"
+        ):
             expected = "fp8_h128_prefill_source_persistent_uniform"
         elif 256 < sparse_topk < 384 and arch in ("sm_100a", "sm_103a"):
             expected = "fp8_lowhead_h64"
@@ -2968,13 +2970,19 @@ def test_sm107a_lowhead_swa_rows_launch_the_m64_program_with_dense_offsets(
     "sparse_topk,page_size,sm107_first",
     [
         # (width, page size, first M64 token count on SM107 at 208 / 216 SMs)
-        (252, 2, (13, 13)),  # one complete tile: the M64 body at every count
-        (256, 2, (27, 28)),  # two tiles: 8 * tokens > sm_count
-        (260, 2, (53, 55)),  # three tiles: 4 * tokens > sm_count
-        (320, 64, (53, 55)),
-        (384, 2, (53, 55)),
-        (400, 2, (63, 65)),  # four tiles: 10 * tokens > 3 * sm_count
-        (512, 2, (63, 65)),
+        (160, 2, (13, 13)),  # one complete tile, 32 keys more: M64 throughout
+        (175, 2, (13, 13)),
+        (176, 2, (17, 17)),  # 48 keys more: the persistent body up to 16 tokens
+        (191, 2, (17, 17)),
+        (192, 2, (32, 33)),  # 64+ keys more: 20 * tokens > 3 * sm_count
+        (252, 2, (32, 33)),
+        (256, 2, (27, 28)),  # two complete tiles: 8 * tokens > sm_count
+        (260, 2, (54, 56)),  # three tiles, two complete: 200 * t > 51 * sm
+        (320, 64, (54, 56)),
+        (384, 2, (53, 55)),  # three complete tiles: 4 * tokens > sm_count
+        (400, 2, (63, 65)),  # four tiles, three complete: 10 * t > 3 * sm
+        (500, 2, (63, 65)),
+        (512, 2, (55, 57)),  # four complete tiles: 50 * t > 13 * sm
         (516, 2, (105, 109)),  # five tiles and up: the half wave
         (640, 64, (105, 109)),
     ],
@@ -2983,7 +2991,9 @@ def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
     arch, sparse_topk, page_size, sm107_first
 ):
     """On SM107 the FP8/H64 decode rows of two to four sparse tiles take the
-    M64 body before ``2 * tokens > sm_count``, by their tile count; other
+    M64 body before ``2 * tokens > sm_count``, by their tile and complete-tile
+    counts, and the rows of one complete tile and 64 or more keys of a second
+    run the persistent body until then (48-63 keys: up to 16 tokens); other
     widths and architectures keep the half-wave rule."""
     m64 = cake._fp8_h64_m64_program(sparse_topk)
     for sm_count, sm107 in zip((208, 216), sm107_first, strict=True):
@@ -3002,10 +3012,10 @@ def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
                 arch=arch,
             )
 
-        if sparse_topk < 256:
-            first = 13
-        elif arch == "sm_107a":
+        if arch == "sm_107a":
             first = sm107
+        elif sparse_topk < 256:
+            first = 13
         else:
             first = sm_count // 2 + 1
         below = "fp8_h128_prefill_source_persistent_uniform"

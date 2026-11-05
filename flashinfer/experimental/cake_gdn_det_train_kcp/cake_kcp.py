@@ -1823,8 +1823,8 @@ class _Tables:
             "fwd_b_off": SUMMARY_TILE,
             "fwd_out_off": TILE,
             "adj_d_off_d": TILE,
-            "adj_d_off_dm": SUMMARY_TILE,
-            "adj_m_off_b1": SUMMARY_TILE,
+            "adj_d_off_dm": TILE,
+            "adj_m_off_b1": TILE,
             "adj_m_off_c1": SUMMARY_TILE,
             "adj_out_off": TILE,
         }
@@ -1896,12 +1896,8 @@ class _Tables:
             in_slot[s // P] if (s % P == 0 and frags[s // P].crossing_in) else -1
             for s in range(NSEG)
         )
-        self.m_b1_index = tuple(
-            in_slot[s // P]
-            if (s % P == 0 and frags[s // P].crossing_in and frags[s // P].crossing_out)
-            else -1
-            for s in range(NSEG)
-        )
+        # io_slot (the b1 map plane) of segment 0 of a fragment crossing in and out, else -1
+        self.m_b1_index = tuple(int(i) for i in hp.b1_m_index)
         self.seg_index = tuple(range(NSEG))
         # the head plan's own device tables (uploaded once at first use) by content, so dev() never re-uploads them
         self._named: dict[tuple[torch.dtype, tuple[int, ...]], str] = {}
@@ -2217,11 +2213,12 @@ class _Tables:
             for f in ins:
                 if f.crossing_out:
                     S = [f.slot * P + p for p in range(P)]
+                    io = self.m_b1_index[f.slot * P]  # the map plane slot
                     for h in range(H):
                         ch["tmap_m"].add(
                             [(mt(s, h), -1, -1) for s in S],
                             x0=0,
-                            y_final=self.b1_m_tiles[in_slot[f.slot]][h] * TILE,
+                            y_final=self.b1_m_tiles[io][h] * TILE,
                         )
             for name, fs in (("dcarry_end", ends), ("dcarry_cross", outs)):
                 for f in fs:
@@ -3885,7 +3882,7 @@ def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
             elems = [
                 (
                     tb.ds_out_tiles[ring.out_slot[f.slot]][hh],
-                    m_tiles[ring.in_slot[f.slot]][hh],
+                    m_tiles[tb.m_b1_index[f.slot * tb.P]][hh],
                     d_tiles[ring.in_slot[f.slot]][hh],
                     ring.in_slot[f.slot] * H + hh,
                 )

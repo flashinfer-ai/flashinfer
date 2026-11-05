@@ -73,6 +73,8 @@ DispatchPolicy = cake_policy.DispatchPolicy
 finalize_grid = cake_policy.finalize_grid
 finalize_key = cake_policy.finalize_key
 scan_key = cake_policy.scan_key
+scan_key_fields = cake_policy.scan_key_fields
+scan_key_form = cake_policy.scan_key_form
 select_program = cake_policy.select_program
 stage_slug = cake_policy.stage_slug
 
@@ -342,6 +344,16 @@ def test_registry_records_are_well_formed():
         assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
             MERGE_KEY
         }, arch
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
+        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
+        # record of its own, ``policy_for(arch, "fp8")``)
+        for key in scan_keys:
+            fields = scan_key_fields(key)
+            assert fields is not None, (arch, key)
+            assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
+            if fields.form == cake_policy.FP8:
+                assert not fields.snake and fields.sample_fit, (arch, key)
+        scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
             policy.rank_finalize and policy.rank_rule is not None
@@ -4091,7 +4103,7 @@ def test_static_ticket_word_calls_get_the_placeholder_and_shape_alone_decides():
     for r in (a, b):
         static = (
             r._tail_static
-            or r.choice.physical_kind in policy_for(r.arch).static_scan_kinds
+            or r.choice.physical_kind in policy_for(r.arch, r.form).static_scan_kinds
         )
         assert (r.ticket_block is not None) == (
             not static and cake_backend.reads_ticket_word(r.programs["scan"], r.arch)
@@ -4402,10 +4414,11 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
             assert list(reads) == [a for a in record["arches"] if a in reads], name
     readers = {}
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
-        static = set(policy_for(arch).static_scan_kinds)
         for key, name in keys.items():
             if not key.startswith("scan:"):
                 continue
+            # the static kinds of the key's form (on sm_107a every FP8 kind is static)
+            static = set(policy_for(arch, scan_key_form(key)).static_scan_kinds)
             parts = key.split(":")
             reads = cake_backend.reads_ticket_word(name, arch)
             assert reads == (
@@ -4457,6 +4470,22 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
         lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
         for kind in policy_for(arch).static_scan_kinds:
             assert kind in kinds and kind not in lsf_kinds, (arch, kind)
+        # the FP8 form decides its tail by its own record (``POLICY_FP8``): every static kind is an FP8 kind
+        # the architecture registers without an :lsf copy
+        if not cake_backend.fp8_programs_for(arch):
+            continue
+        fp8 = [
+            scan_key_fields(k)
+            for k in keys
+            if k.startswith("scan:") and scan_key_form(k) == cake_policy.FP8
+        ]
+        fp8_static = policy_for(arch, cake_policy.FP8).static_scan_kinds
+        assert cake_backend.ticket_tail_skips(arch, cake_policy.FP8) == frozenset(
+            fp8_static
+        )
+        for kind in fp8_static:
+            assert kind in {f.physical for f in fp8}, (arch, kind)
+            assert kind not in {f.physical for f in fp8 if f.lsf}, (arch, kind)
 
 
 # ---------------------------------------------------------------------------
