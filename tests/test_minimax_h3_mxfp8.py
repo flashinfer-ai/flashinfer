@@ -119,6 +119,26 @@ def test_exact_architecture_router(monkeypatch, capability, expected) -> None:
     assert host.minimax_h3_mxfp8_target(torch.device("cuda")) == expected
 
 
+@pytest.mark.parametrize(
+    ("target", "identifier"),
+    [("sm_100a", "FUSED"), ("sm_103a", "FUSED_TILE_LANE")],
+)
+def test_gemm_program_router(target, identifier) -> None:
+    host = pytest.importorskip("flashinfer.diffusion_ops.cake_minimax_h3_mxfp8")
+    generated = pytest.importorskip(
+        "flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention"
+    )
+    program = host.minimax_h3_mxfp8_gemm_program(target)
+    assert program is getattr(generated, identifier)
+    assert target in program.targets
+    # Both fused programs take one argument list and launch alike, so the
+    # prepared call binds them the same way.
+    assert program.args == generated.FUSED.args
+    assert program.tensors == generated.FUSED.tensors
+    assert program.launch_record() == generated.FUSED.launch_record()
+    assert program.options_for(target) == generated.FUSED.options_for(target)
+
+
 def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
     host = pytest.importorskip("flashinfer.diffusion_ops.cake_minimax_h3_mxfp8")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))

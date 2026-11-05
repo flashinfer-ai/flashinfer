@@ -20,7 +20,8 @@ def decidedAxiom : Name := ``Lean.ofReduceBool
 /-- The named `native_decide` theorems: the exhaustive checks over the generator's configuration space and the
 dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time). -/
 def decidedTheorems : List Name :=
-  [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space]
+  [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
+   ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?

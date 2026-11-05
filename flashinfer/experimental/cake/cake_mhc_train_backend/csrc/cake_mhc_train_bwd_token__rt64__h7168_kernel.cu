@@ -47,21 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_DPRE_PART_OFF 0
-#define SMEM_DPRE_PART_STAGE_BYTES 1024
-#define SMEM_DPRE_PART_STRIDE 1024
-#define SMEM_FOLD_OFF 1024
-#define SMEM_FOLD_STAGE_BYTES 4096
-#define SMEM_FOLD_STRIDE 4096
-#define SMEM_GSUM_OFF 5120
-#define SMEM_GSUM_STAGE_BYTES 128
-#define SMEM_GSUM_STRIDE 128
-#define SMEM_HIST_S_OFF 6144
-#define SMEM_HIST_S_STAGE_BYTES 65152
-#define SMEM_HIST_S_STRIDE 65152
-#define SMEM_TOTAL 71296
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -98,7 +83,7 @@ kernel_cake_mhc_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, __nv
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dpre_part = reinterpret_cast<float*>(smem_raw + 0);
     const int dpre_part_addr = smem + 0;
     float* fold = reinterpret_cast<float*>(smem_raw + 1024);

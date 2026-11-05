@@ -80,7 +80,7 @@ kernel_cake_rmsnorm_det_train_61accbcc02891615f286(__nv_bfloat16* __restrict__ x
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* w_sm = reinterpret_cast<float*>(smem_raw + 128);
     const int w_sm_addr = smem + 128;
 

@@ -121,6 +121,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_nvfp4_ptilemax_attention" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_fp8_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
@@ -150,7 +151,6 @@ exclude = [
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 # The batch-invariant GEMM dispatcher's fitted constants, read at runtime next to its module.
-"flashinfer.gemm.batch_invariant" = ["cost_model_fits.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
@@ -268,6 +268,8 @@ exclude = [
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
   "flashinfer/attention/prims_ts/kernels/",
+  # Imported CuTe DSL kernels are kept byte-faithful to their source.
+  "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
@@ -316,6 +318,7 @@ exclude = [
 [tool.ruff]
 # Ruff infers the target from project.requires-python.
 extend-exclude = [
+  "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "flashinfer/fused_moe/backends/cudnn_frost/artifacts/*/sources/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",

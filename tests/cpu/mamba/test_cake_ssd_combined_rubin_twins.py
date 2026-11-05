@@ -96,6 +96,7 @@ def _rubin(module, monkeypatch, calls, arch="sm_107a"):
     """The device answers as ``arch`` (212 SMs on sm_107a); launches are
     captured, nothing runs."""
 
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(module, "_target_arch", lambda *_: arch)
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)

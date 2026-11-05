@@ -26,7 +26,7 @@ backend of its own. These prefill routes leave decode and speculative-decode
 dispatch unchanged.
 
 Automatic prefill policy on GB200 and GB300
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For one packed sequence, BF16 activations, head dimension 128 and an existing
 BF16 or FP32 state, ``auto`` uses these coarse performance regions:
@@ -119,7 +119,7 @@ existing layout contract.
     recurrent_kda
 
 Static PTX prefill on B300
-~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
 retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
@@ -727,7 +727,7 @@ should rotate fewer buffer sets, or call
 which releases all of it.
 
 Persistent CuTe DSL prefill with FP32 state
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``recurrent_kda(..., backend="cute-dsl-persistent")`` selects the persistent
 M128/BT32 kernel adapted from humanfia/kda-for-kda-release, now

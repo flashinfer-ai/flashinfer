@@ -530,8 +530,11 @@ class UlyssesCommunicator:
         ``(2**31 - 1) * 4`` bytes, and each call separately enforces the
         int32 element-index limit.
     max_elems : int, optional
-        Legacy element capacity. Converted to bytes using ``dtype.itemsize``.
-        Provide either ``max_elems`` or ``max_bytes``.
+        Deprecated since v0.7.3, scheduled for removal in a future release:
+        the v0.7.2
+        capacity in elements of ``dtype``, converted to
+        ``max_elems * dtype.itemsize`` bytes with a ``DeprecationWarning``.
+        Pass exactly one of ``max_bytes`` and ``max_elems``.
     dtype : torch.dtype
         Default element type of operands (float16 / bfloat16 / float32; PCIe
         additionally int8 / uint8 / float8_e4m3fn / float8_e5m2); enforced on
@@ -579,8 +582,10 @@ class UlyssesCommunicator:
             Quantized QKV requires the complete packed payload to fit.
             Used to size the backend workspace.
         max_elems : int, optional
-            Legacy upper bound in elements, converted with ``dtype.itemsize``.
-            Mutually exclusive with ``max_bytes``.
+            Deprecated since v0.7.3 (scheduled for removal in a future
+            release): the
+            v0.7.2 form of the capacity, in elements of ``dtype``; converted
+            with ``dtype.itemsize``. Mutually exclusive with ``max_bytes``.
         dtype : torch.dtype
             Default element dtype for collective operands. Must be one of
             ``torch.float16``, ``torch.bfloat16``, or ``torch.float32``;
@@ -660,6 +665,19 @@ class UlyssesCommunicator:
         # same error on every rank instead of hanging peers in a later gather.
         # Devices are validated per rank but may legitimately differ across
         # ranks (cuda:rank); only max_bytes and dtype must match.
+        if max_elems is not None:
+            # v0.7.2 sized the capacity in elements of ``dtype``; #4876 moved
+            # it to bytes so PCIe calls can name their own element type. The
+            # old spelling stays through the deprecation window.
+            warnings.warn(
+                "UlyssesCommunicator(max_elems=...) is deprecated; pass "
+                "max_bytes=max_elems * dtype.itemsize instead. Scheduled for "
+                "removal in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        # Normalized without raising: an invalid alias on one rank must be
+        # rejected by the joint validation on every rank, like max_bytes.
         capacity_bytes, capacity_error = self._normalize_capacity(
             max_bytes, max_elems, dtype
         )
@@ -761,10 +779,10 @@ class UlyssesCommunicator:
         """Normalize both public capacity forms without raising before the rank gather."""
         if max_elems is None:
             if max_bytes is None:
-                return None, "provide either max_bytes or max_elems"
+                return None, "max_bytes is required"
             return max_bytes, ""
         if max_bytes is not None:
-            return max_bytes, "provide only one of max_bytes or max_elems"
+            return max_bytes, "pass max_bytes or the deprecated max_elems, not both"
         if type(max_elems) is not int:
             return (
                 None,

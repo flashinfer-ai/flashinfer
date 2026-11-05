@@ -78,7 +78,7 @@ The names the training RMSNorm had before the deterministic package took its
   call computes ``dx`` row by row and adds the ``dw`` sums of its CTAs into
   FP64 sums in the workspace, in the order the CTAs finish: ``dw`` is not
   guaranteed bitwise reproducible; ``dx`` is, and it is within one BF16 ulp of
-  max(|dx|, rms(dx)) of the deterministic backward's ``dx`` (not always bitwise
+  ``max(|dx|, rms(dx))`` of the deterministic backward's ``dx`` (not always bitwise
   equal to it). In the windows the backward's notes name, a twosum single kernel
   keeps each thread's ``dw`` column sums exact (error-free FP32 products, TwoSum
   compensation) before the FP64 additions, so its ``dw`` error does not grow
@@ -181,7 +181,9 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
   order depend on scheduling: the weight gradient can differ between calls,
-  always within the deterministic backward's error bound. Up to 256 rows
+  always within the deterministic backward's error bound (for FP32 normal
+  gates, terms and sums; with subnormal values both backwards can leave it).
+  Up to 256 rows
   the backward is one thread-block cluster of 16 CTAs that adds
   the CTAs' partial sums in a fixed order on chip: the same bits on every
   call, within the same bound, and no workspace. The workspace

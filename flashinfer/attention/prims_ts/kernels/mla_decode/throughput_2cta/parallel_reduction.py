@@ -24,7 +24,7 @@ from ...separate_reduction import (
     normalized_lse_weight,
     attention_sink_scale,
 )
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.constants import STANDALONE_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import final_lse
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
@@ -436,7 +436,7 @@ def run_parallel_reduction_kernel(
                         weight *= sink_scale
                     smem_local_scale[local_slot_idx] = weight
 
-    prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
+    prims.barrier_cta_sync(STANDALONE_REDUCTION_SCALE_BARRIER_ID)
 
     # Every thread owns one contiguous BF16 vec4 GMEM fragment and immediately
     # converts it to FP32 registers. The shared scales directly normalize the
@@ -588,7 +588,7 @@ def run_parallel_reduction_kernel(
                     lane_peer_lse, merged_lse
                 )
 
-        prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
+        prims.barrier_cta_sync(STANDALONE_REDUCTION_SCALE_BARRIER_ID)
 
         merged_output = cutlass.Array(
             Float32,

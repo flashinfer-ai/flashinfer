@@ -24,9 +24,12 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   with zero mismatches; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of the deterministic
   package's ``cake_gdn_det_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of
   |ref| at the worst element).  No budget is derived from this package's output.
-* every arm (repeat, saved / replay, light / full, autograd / explicit, checkpoint / direct with its kept-tape and
-  recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay) within the FP64
-  budgets on its own and, against its partner arm, within the same budget constants; ``.backward()`` twice: half the
+* every arm (repeat, saved / replay, light / full, the full form's split twin (test knob ``fused_o_tape=0``; each full
+  forward's launch log names the walk it ran), autograd / explicit, checkpoint / direct with its kept-tape and
+  recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay, and the
+  checkpointed CUDA-graph replay steps of the recompute's tape hand-off: the shipped ``"auto"``, ``"auto"`` with the
+  size rule between the ranks, ``True``) within the FP64 budgets on its own and, against its partner arm, within the
+  same budget constants; ``.backward()`` twice: half the
   accumulated gradient against the FP64 gradient; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where
   the partition allows it, ring) runs with every package allocation filled with NaN bytes, and its saved set carries
   ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); the rows plan
@@ -59,8 +62,8 @@ Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views 
 call); plain ``split`` views of the leaf, direct and checkpointed, get three contiguous gradients and keep torch's
 split backward and their hooks and ``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
-partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
-(see the block comment before ``V1_LIBRARIES``).
+partner, the deterministic package with the norm within the same constants, the token-local program outputs exact,
+and ``save_mode="light_akk"`` against the light form (see the block comment before ``V1_LIBRARIES``).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest`` on a node with >= ``W`` GPUs) and one process per Slurm
 task (``SLURM_PROCID`` / ``SLURM_NTASKS``: the WORLD group is initialised once per process, every row runs on a
@@ -105,6 +108,22 @@ DET_API = (
     "flashinfer.cake_gdn_det_train_kcp"  # the deterministic route's public objects
 )
 FACADE = "flashinfer.cake_gdn_train_kcp"  # the mode-dispatching facade (deterministic=False -> this package)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
 
 
 def _mod(sub: str | None = None):
@@ -1467,6 +1486,7 @@ def _kept_record(T_r: int) -> dict:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "fwd_o",
     }
     first_local = next(
@@ -1597,7 +1617,38 @@ def _run_rank(
     for i in range(1, N_REPEAT):
         arm(f"run{i}", saved_pass(), res, "run0")
     arm("replay", saved_pass(boundary_mode="replay"), res, "run0")
-    arm("full", saved_pass(save_mode="full"), res, "run0")
+    res_full = saved_pass(save_mode="full")
+    full_fwd = dict(kcp.LAST_CALL["fwd"])
+    arm("full", res_full, res, "run0")
+    # the full forward writes its output and the saved h / v_new tapes in one walk per launch list
+    # (kcp_fwdh_out_tape) where the registry ships it for this architecture; test knob fused_o_tape = 0 is the
+    # split form (the tape walk, then #5): within the budgets of the shipped form, bitwise recorded, each forward's
+    # launch log and fwd_o evidence naming the form it ran (a rank without tokens runs neither walk)
+    res_full_split = saved_pass(save_mode="full", test_knobs={"fused_o_tape": 0})
+    split_fwd = dict(kcp.LAST_CALL["fwd"])
+    arm("full_split", res_full_split, res_full, "full")
+    full_arch = (
+        None if backend == "fake" else _mod("cake_backend").device_arch(device.index)
+    )
+    fused_tape = int(q.shape[0]) > 0 and kcp.fused_o_tape_shipped(full_arch)
+    full_seq, split_seq = list(full_fwd["sequence"]), list(split_fwd["sequence"])
+    info["full_fused_tape"] = {
+        "expected": bool(fused_tape),
+        "fwd_o": full_fwd.get("fwd_o"),
+        "split_fwd_o": split_fwd.get("fwd_o"),
+        "bitwise_vs_split": _bitwise(res_full, res_full_split),
+    }
+    want_fwd_o = "fused_tape" if fused_tape else "launched"
+    full_ok = (
+        full_fwd.get("fwd_o") == want_fwd_o
+        and ("kcp_fwdh_out_tape" in full_seq) == fused_tape
+        and ("fwd_o" in full_seq) == (not fused_tape)
+    )
+    split_ok = "kcp_fwdh_out_tape" not in split_seq
+    flags["full_forward_runs_the_tape_and_output_walk"] = bool(
+        (int(q.shape[0]) == 0 or full_ok) and split_ok
+    )
+    del res_full, res_full_split
     res_auto = autograd_pass(False)
     arm("autograd", res_auto, res, "run0")
     res_ckpt = autograd_pass(True)
@@ -2204,6 +2255,119 @@ def _run_rank(
     del g_res, g_cmp
     info["graph"] = graph_info
     flags["graph_capture"] = bool(graph_ok)
+    # graph="replay" + torch.utils.checkpoint (the recompute's tape hand-off): five checkpointed steps per arm on a
+    # caller-held workspace with the same leaves -- the shipped "auto" (this architecture's size rule), "auto" with
+    # the size rule set to the group's largest token x value-head rows (where the ranks' rows differ: the ranks below
+    # it replay the original forward's graph while the others capture the hand-off form, one group mixing both forms)
+    # and True.  Per rank every step's recompute decision and backward form are the expected ones (gated on every
+    # backend); the last step replays the forward and the backward graphs (gated with the capture on the kernel
+    # backend); the last step's out and gradients are within the budgets against FP64 and run0.
+    from torch.utils.checkpoint import checkpoint
+
+    ckpt_graph: dict[str, object] = {}
+    rows_by_rank = [part.rank_tokens(r) * HV for r in range(W)]
+    rows_here = T_r_here * HV
+    verified = kcp.torch_release_verified()
+    rule_arch = kcp._graph_recompute_arch(kcp.get_backend(backend), device)
+    rule_table = dict(kcp.GRAPH_RECOMPUTE_MIN_ROWS)
+    rule_default = kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT
+    split_rule = max(rows_by_rank) if min(rows_by_rank) < max(rows_by_rank) else None
+    ckpt_graph["rows_by_rank"] = rows_by_rank
+    ckpt_graph["arch"] = rule_arch
+    forms_ok = capture_ok = True
+    for name, reuse, rule in (
+        ("auto", "auto", None),
+        ("auto_split", "auto", split_rule),
+        ("kept", True, None),
+    ):
+        if name == "auto_split" and rule is None:
+            ckpt_graph[name] = "not run: every rank holds the same rows"
+            continue
+        g_res = None
+        try:
+            if rule is not None:
+                for a_ in kcp.GRAPH_RECOMPUTE_MIN_ROWS:
+                    kcp.GRAPH_RECOMPUTE_MIN_ROWS[a_] = rule
+                kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = rule
+            eff = kcp.GRAPH_RECOMPUTE_MIN_ROWS.get(
+                rule_arch, kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT
+            )
+            if reuse == "auto" and rows_here < eff:
+                expect = (False, "small", "replay")
+            elif T_r_here == 0:
+                expect = (False, "off", "replay")
+            elif reuse is True:
+                expect = (True, "always", "kept")
+            elif verified:
+                expect = (True, "dead", "kept")
+            else:  # no frame proof on this torch: the replay form (its reason names the torch build)
+                expect = (False, None, "replay")
+            kcp.graph_cache_clear()
+            wsg = kcp.WorkspaceKcp()
+            leaves = [
+                x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)
+            ]
+            o = {**base, "graph": "replay", "reuse_recompute_tapes": reuse}
+
+            def fn(*a, o=o, wsg=wsg):
+                return kcp.chunk_gdn_kcp(
+                    *a, ctx, workspace=wsg, deterministic=False, **o
+                )
+
+            steps: list[list] = []
+            for _ in range(5):
+                for lf in leaves:
+                    lf.grad = None
+                out = checkpoint(fn, *leaves, use_reentrant=False)
+                out.backward(dout)
+                f_, b_ = kcp.LAST_CALL["fwd"], kcp.LAST_CALL["bwd"]
+                steps.append(
+                    [
+                        str(f_["graph_event"]),
+                        str(b_["graph_event"]),
+                        bool(f_.get("hand_off")),
+                        f_.get("hand_off_reason"),
+                        b_.get("tapes_source"),
+                    ]
+                )
+            g_res = {
+                "out": out.detach().clone(),
+                **{n: lf.grad.clone() for n, lf in zip(GRADS, leaves, strict=True)},
+            }
+            forms = all(
+                (st[2], st[4]) == (expect[0], expect[2])
+                and (expect[1] is None or st[3] == expect[1])
+                for st in steps
+            )
+            replayed = steps[-1][0] == steps[-1][1] == "replay"
+            ckpt_graph[name] = {
+                "rule": eff,
+                "expect": list(expect),
+                "steps": steps,
+                "forms_ok": forms,
+            }
+            forms_ok &= forms
+            capture_ok &= replayed
+            torch.cuda.synchronize(device)
+        except Exception as exc:  # noqa: BLE001 - recorded; the gates decide below
+            ckpt_graph[name] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            forms_ok = capture_ok = False
+            g_res = None
+        finally:
+            kcp.GRAPH_RECOMPUTE_MIN_ROWS.clear()
+            kcp.GRAPH_RECOMPUTE_MIN_ROWS.update(rule_table)
+            kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = rule_default
+            kcp.graph_cache_clear()
+        g_cmp = (
+            g_res
+            if g_res is not None
+            else {n: torch.zeros_like(res[n]) for n in TENSORS}
+        )
+        arm(f"graph_ckpt_{name}", g_cmp, res, "run0", gate=kernels)
+        del g_res, g_cmp
+    info["graph_ckpt"] = ckpt_graph
+    flags["graph_ckpt_forms"] = bool(forms_ok)
+    flags["graph_ckpt_capture"] = bool(capture_ok)
     # #7038: the backward's time with a resident one-thread kernel on a side stream, over its time alone
     ratio = _side_stream_ratio(
         lambda: kcp.chunk_gdn_bwd_kcp(
@@ -2378,7 +2542,7 @@ def _run_rank(
         flag_list,
         verdicts,
         backend=backend,
-        kernel_only={"graph_capture"},
+        kernel_only={"graph_capture", "graph_ckpt_capture"},
         info_only={"side_stream_ratio"},
     )
     report["metrics"] = {n: verdicts.get(f"fp64:run0:{n}") for n in TENSORS}
@@ -2700,17 +2864,35 @@ def _spawn_entry(
             dist.destroy_process_group()
 
 
+# _free_port releases the port it finds before rank 0's rendezvous store binds it, so another socket of the node can
+# take it in between: rank 0 then fails in init_process_group with EADDRINUSE before the row runs.  Such a start is
+# retried on a fresh port, at most this many times in all.
+RENDEZVOUS_TRIES = 3
+
+
+def _rendezvous_port_taken(err: BaseException) -> bool:
+    """Whether a spawned start failed because rank 0's rendezvous port was taken (``EADDRINUSE`` from its store)."""
+    return "EADDRINUSE" in str(err)
+
+
 def _spawn_row(obj, backend: str, kind: str) -> None:
-    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides."""
+    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides.  A start
+    whose rendezvous port was taken is retried on a fresh port (:data:`RENDEZVOUS_TRIES`)."""
     with tempfile.TemporaryDirectory(prefix="cake_gdn_train_kcp_dist_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        mp.start_processes(
-            _spawn_entry,
-            args=(obj.W, obj, _free_port(), result_dir, backend, kind),
-            nprocs=obj.W,
-            join=True,
-            start_method="spawn",
-        )
+        for attempt in range(RENDEZVOUS_TRIES):
+            try:
+                mp.start_processes(
+                    _spawn_entry,
+                    args=(obj.W, obj, _free_port(), result_dir, backend, kind),
+                    nprocs=obj.W,
+                    join=True,
+                    start_method="spawn",
+                )
+                break
+            except mp.ProcessRaisedException as err:
+                if attempt + 1 == RENDEZVOUS_TRIES or not _rendezvous_port_taken(err):
+                    raise
         with open(os.path.join(result_dir, _report_file(obj, kind))) as fh:
             report = json.load(fh)
     assert report["pass"], json.dumps(
@@ -2953,6 +3135,54 @@ def test_poisoned_workspace_pairs(pair: PoisonPair, slurm) -> None:
         return
     _skip_unless_runnable(pair.W, backend)
     _spawn_row(pair, backend, "poison")
+
+
+def _fake_starts(monkeypatch, tmp_path, row: Row, failures: list[str]) -> list[int]:
+    """Replace the spawned start with one that raises ``failures`` in turn (a rank's error text) and then writes rank
+    0's passing report; returns the rendezvous port of every start."""
+    ports: list[int] = []
+    free = iter(range(41000, 41100))
+    monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: next(free))
+    monkeypatch.setenv("KCP_TEST_RESULT_DIR", str(tmp_path))
+
+    def start(fn, *, args, nprocs, join, start_method) -> None:
+        ports.append(args[2])
+        if len(ports) <= len(failures):
+            raise mp.ProcessRaisedException(failures[len(ports) - 1], 0, 0)
+        (tmp_path / _report_file(row, "full")).write_text(json.dumps({"pass": True}))
+
+    monkeypatch.setattr(mp, "start_processes", start)
+    return ports
+
+
+TAKEN = (
+    "DistNetworkError: The server socket has failed to listen on any local network address. port: 48409, "
+    "useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use"
+)
+
+
+def test_spawned_start_retries_a_taken_rendezvous_port(monkeypatch, tmp_path) -> None:
+    """A start whose rank 0 finds its rendezvous port taken (EADDRINUSE) runs again on a fresh port.  CPU-only."""
+    row = Row("Zz", (1,), (2, 6), 2, "contiguous")
+    ports = _fake_starts(monkeypatch, tmp_path, row, [TAKEN])
+    _spawn_row(row, "fake", "full")
+    assert ports == [41000, 41001]
+
+
+def test_spawned_start_does_not_retry_other_failures(monkeypatch, tmp_path) -> None:
+    """Any other rank failure is raised at once, and a port taken on every try is raised after
+    :data:`RENDEZVOUS_TRIES` starts.  CPU-only."""
+    row = Row("Zz", (1,), (2, 6), 2, "contiguous")
+    ports = _fake_starts(
+        monkeypatch, tmp_path, row, ["AssertionError: rank 0: out differs"]
+    )
+    with pytest.raises(mp.ProcessRaisedException, match="out differs"):
+        _spawn_row(row, "fake", "full")
+    assert ports == [41000]
+    ports = _fake_starts(monkeypatch, tmp_path, row, [TAKEN] * RENDEZVOUS_TRIES)
+    with pytest.raises(mp.ProcessRaisedException, match="EADDRINUSE"):
+        _spawn_row(row, "fake", "full")
+    assert len(ports) == RENDEZVOUS_TRIES
 
 
 def test_accuracy_budget_cells_cover_the_accuracy_rows() -> None:
@@ -3583,7 +3813,16 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
 #   row and ``packed_qkv_views_kcp`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
-#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term.
+#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
+# * ``save_mode="light_akk"`` (the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
+#   #1_l2n reading that tape): within the FP64 budgets and against the light form in every form (a2a / ring,
+#   ``save_transfer`` on / off, the plan's ``P`` and the forced ``P = 2``, autograd, checkpoint, CUDA-graph replay
+#   steps on the light steps' workspace); exact: the launch census (the backward's ``fwd_prep_l2n`` becomes the
+#   replay, once per light replay; the forward is light's), the saved ``Akk`` bytes (``128 R HV``, the byte query's
+#   difference), the checkpoint saving as ``"light"``, and on the kernel backend every form under NaN-filled
+#   allocations within the budgets of the light form of the same options, with the replay run; whether the two
+#   forms' bits agree (and whether the light form repeats its own) is recorded as data, not gated (the package
+#   has no bitwise contract).
 #
 # The rows skip with a clear reason while the registry does not ship the three records (the kernel backend refuses
 # the option then); ``KCP_TEST_BACKEND=fake`` runs them on the torch emulation.
@@ -3995,6 +4234,106 @@ def _run_rank_l2n(
             ring=W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS,
             **L2N,
         )
+    # (a2) save_mode="light_akk": the light set plus #1_l2n's BF16 Akk tape, whose light replay runs
+    # fwd_prep_replay_l2n (#1_l2n reading that tape).  Every form within the FP64 budgets and against its light
+    # partner; the launch census (the backward's fwd_prep_l2n becomes the replay, once per light replay; the forward
+    # is light's), the saved Akk bytes (128 R HV, the byte query's difference); on the kernel backend each form under
+    # NaN-filled allocations within the budgets of the light form of the same options (the arm below), the replay
+    # run gated, the bits against light and light's own repeat recorded as data only; autograd (the saved set
+    # through save_for_backward) and a non-reentrant checkpoint (the mode saves as "light" there).
+    akk_replay = kcp.AKK_REPLAY_OF["fwd_prep_l2n"]
+    akk_info: dict[str, object] = {"shipped": bool(jit.records_of_program(akk_replay))}
+    if not kernels or akk_info["shipped"]:
+        res_akk = saved_pass(save_mode="light_akk", **L2N)
+        arm("light_akk", res_akk, res, "run0")
+        lb, ab = res["bwd"], res_akk["bwd"]
+        n_l2n = lb["sequence"].count("fwd_prep_l2n")
+        flags["light_akk_census"] = bool(
+            res_akk["fwd"]["sequence"] == res["fwd"]["sequence"]
+            and ab["sequence"]
+            == [akk_replay if p_ == "fwd_prep_l2n" else p_ for p_ in lb["sequence"]]
+            and ab["sequence"].count(akk_replay) == n_l2n
+            and "fwd_prep_l2n" not in ab["sequence"]
+            and (T_r == 0 or (n_l2n >= 1 and ab["akk_source"] == "saved"))
+        )
+        replay_records = set(jit.records_of_program(akk_replay)) if kernels else set()
+        if kernels:
+            flags["light_akk_replay_records"] = sum(
+                r_ in replay_records for r_, _g in ab["records"]
+            ) == ab["sequence"].count(akk_replay) and [
+                g_ for _r, g_ in ab["records"]
+            ] == [g_ for _r, g_ in lb["records"]]
+        tape = int(ctx.R) * HV * 128
+        q_light = int(
+            gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N)
+        )
+        q_akk = int(
+            gb.gdn_saved_bytes_kcp(
+                ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", with_conv=False, **L2N
+            )
+        )
+        flags["light_akk_saved_bytes"] = (
+            int(res_akk["saved"].bytes) - int(res["saved"].bytes)
+            == tape
+            == q_akk - q_light
+        )
+        akk_info["census"] = {
+            "light_bwd": list(lb["sequence"]),
+            "light_akk_bwd": list(ab["sequence"]),
+            "akk_source": ab["akk_source"],
+        }
+        akk_info["saved_bytes"] = {
+            "light": int(res["saved"].bytes),
+            "light_akk": int(res_akk["saved"].bytes),
+            "tape": tape,
+            "query_difference": q_akk - q_light,
+        }
+        del res_akk
+        if kernels:
+            forms = [("akk", {}), ("akk_no_save_transfer", {"save_transfer": False})]
+            if info["p2_eligible"]:
+                forms += [
+                    ("p2_akk", {"segments": 2}),
+                    (
+                        "p2_akk_no_save_transfer",
+                        {"segments": 2, "save_transfer": False},
+                    ),
+                ]
+            if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+                forms.append(("ring_akk", {"exchange": "ring", "save_transfer": False}))
+            for name, opts in forms:
+                o = {**opts, **L2N}
+                lt = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                lt2 = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                ak = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light_akk", **o)
+                )
+                arm(f"{name}_light", lt)
+                arm(f"{name}_light_akk", ak, lt, f"{name}_light")
+                repeat, bits = _bitwise(lt2, lt), _bitwise(ak, lt)
+                akk_info[name] = {
+                    "P": None if ak["saved"] is None else int(ak["saved"].P),
+                    "bitwise_vs_light": bits,
+                    "light_repeat_bitwise": repeat,
+                    "akk_source": ak["bwd"]["akk_source"],
+                }
+                flags[f"{name}_replay_ran"] = (
+                    T_r == 0 or ak["bwd"]["akk_source"] == "saved"
+                )
+                del lt, lt2, ak
+        res_aa = autograd_pass(False, save_mode="light_akk", **L2N)
+        flags["light_akk_autograd_replay_ran"] = (
+            T_r == 0 or kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
+        )
+        arm("light_akk_autograd", res_aa, res_auto, "autograd")
+        res_ck = autograd_pass(True, save_mode="light_akk", **L2N)
+        flags["light_akk_ckpt_saves_light"] = (
+            kcp.LAST_CALL["bwd"]["save_mode"] == "light"
+            and akk_replay not in kcp.LAST_CALL["bwd"]["sequence"]
+        )
+        arm("light_akk_ckpt", res_ck, res_auto, "autograd")
+        del res_aa, res_ck
+    info["light_akk"] = akk_info
     res_host = saved_pass(group_reduce="host", **L2N)
     arm(
         "host_reduce", res_host, res, "run0", gate=False
@@ -4242,6 +4581,85 @@ def _run_rank_l2n(
     flags["l2n_graph_capture"] = bool(graph_ok)
     del g_res, g_cmp
 
+    # (e2) the same four steps with save_mode="light_akk" on the same workspace (its arena holds the light steps'
+    # tapes): the fourth replays both graphs and launches the replay in place of fwd_prep_l2n; within the budgets
+    akk_graph: dict[str, object] = {}
+    a_res = None
+    akk_graph_ok = (
+        True  # the replay not rendered (kernel backend): nothing of the mode runs
+    )
+    if not kernels or akk_info["shipped"]:
+        try:
+            kcp.graph_cache_clear()
+            events, sources = [], []
+            for _ in range(4):
+                out_g, saved_g = kcp.chunk_gdn_fwd_kcp(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    workspace=ws,
+                    graph="replay",
+                    save_mode="light_akk",
+                    deterministic=False,
+                    **base,
+                    **L2N,
+                )
+                grads_g = kcp.chunk_gdn_bwd_kcp(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    dout,
+                    saved=saved_g,
+                    workspace=ws,
+                    graph="replay",
+                    save_mode="light_akk",
+                    deterministic=False,
+                    **base,
+                    **L2N,
+                )
+                a_res = {
+                    "out": out_g.clone(),
+                    **{
+                        n: t.clone()
+                        for n, t in zip(
+                            ("dq", "dk", "dv", "dbeta", "dg"), grads_g, strict=True
+                        )
+                    },
+                }
+                events.append(
+                    [
+                        str(kcp.LAST_CALL["fwd"]["graph_event"]),
+                        str(kcp.LAST_CALL["bwd"]["graph_event"]),
+                    ]
+                )
+                sources.append(kcp.LAST_CALL["bwd"].get("akk_source"))
+            akk_graph["events"], akk_graph["akk_source"] = events, sources
+            akk_graph_ok = events[-1] == ["replay", "replay"] and (
+                T_r == 0 or all(src == "saved" for src in sources)
+            )
+            torch.cuda.synchronize(device)
+            kcp.graph_cache_clear()
+        except Exception as exc:  # noqa: BLE001 - recorded; the gate decides
+            akk_graph["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            akk_graph_ok = False
+            a_res = None
+            kcp.graph_cache_clear()
+        a_cmp = (
+            a_res
+            if a_res is not None
+            else {n: torch.zeros_like(res[n]) for n in TENSORS}
+        )
+        arm("graph_replay_light_akk", a_cmp, res, "run0", gate=kernels)
+        del a_res, a_cmp
+    info["graph_light_akk"] = akk_graph
+    flags["l2n_graph_capture_light_akk"] = bool(akk_graph_ok)
+
     # (f) memory: nothing of the norm in the arena after a forward / a backward; retained after a forward = off + r
     wsm = kcp.WorkspaceKcp()
     bad = {*kcp.QK_TAPES, kcp.QK_RSTD}
@@ -4354,7 +4772,13 @@ def _run_rank_l2n(
                 keys.append(key)
     # a rank without tokens has no rows to compare: the token-local flags exist on the ranks with tokens only
     padded = [{key: fl.get(key, True) for key in keys} for fl in flag_list]
-    _fold(report, padded, verdicts, backend=backend, kernel_only={"l2n_graph_capture"})
+    _fold(
+        report,
+        padded,
+        verdicts,
+        backend=backend,
+        kernel_only={"l2n_graph_capture", "l2n_graph_capture_light_akk"},
+    )
     report["metrics"] = {n: verdicts.get(f"fp64:run0:{n}") for n in TENSORS}
     report["repeats"] = _worst_of_runs(verdicts, N_REPEAT)
     for n in TENSORS:

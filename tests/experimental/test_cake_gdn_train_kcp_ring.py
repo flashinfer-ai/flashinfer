@@ -21,7 +21,9 @@ and with ``use_qk_l2norm_in_kernel``.  Two partitions of a four-rank group: one 
 (one and two hops) and one with no crossing fragment anywhere (``N_out == 0``: no exchange at all).  The ranks are
 CPU processes on a gloo group running the fake backend (the torch emulation of the programs' ABI).  Also on that group:
 ``save_mode="full"`` with ``save_transfer=False`` at ``P = 2``, ring and a2a, with every package allocation filled
-with NaN bytes -- the saved set carries ``M_seg`` and the full form gives the light form's bits.
+with NaN bytes -- the saved set carries ``M_seg`` and the full form gives the light form's bits, with the shipped
+tape-and-output walk ``kcp_fwdh_out_tape`` under both schedules and with its split form (test knob
+``fused_o_tape=0``: the tape walk, then #5).
 """
 
 from __future__ import annotations
@@ -115,11 +117,21 @@ def _pass(kcp, ctx, ops, **o) -> tuple[dict[str, torch.Tensor], list[str]]:
     return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dbeta": dbeta, "dg": dg}, seq
 
 
+def _few_cpu_threads() -> None:
+    """Each rank process runs the CPU emulation's many small ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool (one per rank) and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize)
+    spend far more time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so every rank runs
+    with at most 2 threads (8 for the four ranks) and oneDNN off; the rank process ends with the test."""
+    torch.set_num_threads(min(torch.get_num_threads(), 2))
+    torch.backends.mkldnn.enabled = False
+
+
 def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=W
     )
     try:
+        _few_cpu_threads()
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
         part = plan.partition_kcp(torch.tensor(cu, dtype=torch.int64), W, "contiguous")
@@ -188,11 +200,14 @@ FULL_P2 = [0, 130, 600, 1024]
 def _rank_full(rank: int, init_file: str) -> None:
     """Every tensor the package allocates is filled with NaN bytes; per exchange (ring, a2a) and norm (off, on) the
     full form's saved set carries ``M_seg`` and its forward + backward give the light form's bits (the fake backend
-    is deterministic), all finite."""
+    is deterministic), all finite: the shipped full forward (the tape-and-output walk at every tape-walk launch list,
+    no #5) under the ``wait_first`` and the ``overlap`` schedule (the document-start walk under c1 / the first ring
+    hop), and its split form (``fused_o_tape=0``: the tape walk, then #5)."""
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=W
     )
     try:
+        _few_cpu_threads()
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
         part = plan.partition_kcp(
@@ -233,19 +248,35 @@ def _rank_full(rank: int, init_file: str) -> None:
                     assert saved.P == 2 and saved.M_seg is not None, (rank, exchange)
                     del saved
                     light, _ = _pass(kcp, ctx, ops, **base)
-                    full, _ = _pass(kcp, ctx, ops, save_mode="full", **base)
-                    for name in TENSORS:
-                        a, b = light[name], full[name]
-                        assert torch.isfinite(a.float()).all(), (
+                    fused = kcp.fused_o_tape_shipped()
+                    arms = {
+                        "full": ({}, fused),
+                        "full_overlap": ({"schedule": "overlap"}, fused),
+                        "full_split": ({"fused_o_tape": 0}, False),
+                    }
+                    for arm, (knobs, tape_walk) in arms.items():
+                        full, seq = _pass(
+                            kcp, ctx, ops, save_mode="full", test_knobs=knobs, **base
+                        )
+                        assert ("kcp_fwdh_out_tape" in seq) == tape_walk, (
                             rank,
-                            exchange,
-                            l2n,
-                            name,
+                            arm,
+                            seq,
                         )
-                        assert torch.equal(a, b), (
-                            f"rank {rank} {exchange} l2n={l2n}: {name} of save_mode='full' differs from the light "
-                            f"form (max |diff| {(a.float() - b.float()).abs().max().item()})"
-                        )
+                        assert ("fwd_o" in seq) == (not tape_walk), (rank, arm, seq)
+                        assert ("kcp_fwdh_tape" in seq) == (not tape_walk), (rank, arm)
+                        for name in TENSORS:
+                            a, b = light[name], full[name]
+                            assert torch.isfinite(a.float()).all(), (
+                                rank,
+                                exchange,
+                                l2n,
+                                name,
+                            )
+                            assert torch.equal(a, b), (
+                                f"rank {rank} {exchange} l2n={l2n} {arm}: {name} of save_mode='full' differs from "
+                                f"the light form (max |diff| {(a.float() - b.float()).abs().max().item()})"
+                            )
         finally:
             kcp._alloc = real_alloc
         dist.barrier()
