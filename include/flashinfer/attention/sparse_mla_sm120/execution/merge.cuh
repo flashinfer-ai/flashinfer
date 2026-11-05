@@ -38,9 +38,8 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
 
   const float* lse_ptr = mid_lse + (size_t)t_idx * m_heads * num_splits + (size_t)h * num_splits;
 
-  // For at most 32 splits, each warp can reproduce the original first
-  // warp's XOR reduction. Keep its LSE inputs in registers and shuffle them
-  // into the accumulation loop, eliminating both CTA barriers and smem IO.
+  // Up to 32 splits fit in one warp. Reduce their LSEs in registers to avoid
+  // the shared-memory reduction and its two CTA barriers.
   float warp_lse = -1e30f;
   float global_max, inv_global_sum, global_lse;
   if constexpr (WarpReduction) {
@@ -60,8 +59,8 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
     float local_sum = warp_lse > -1e29f ? exp2f(warp_lse - global_max) : 0.f;
 #pragma unroll
     for (int s = 16; s >= 1; s >>= 1) local_sum += __shfl_xor_sync(0xffffffff, local_sum, s);
-    // The original kernel broadcasts lane zero; XOR sums in other lanes
-    // can differ by rounding because they visit operands in another order.
+    // Broadcast lane zero to match the shared-memory path's rounding;
+    // other lanes' XOR sums visit the operands in a different order.
     float total_sum = __shfl_sync(0xffffffff, local_sum, 0);
     if (attn_sink != nullptr) total_sum += exp2f(sink_log2 - global_max);
     inv_global_sum = total_sum > 0.f ? 1.f / total_sum : 0.f;

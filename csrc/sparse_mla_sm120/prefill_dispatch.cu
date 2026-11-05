@@ -24,8 +24,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
       return launch(std::integral_constant<ModelType, ModelType::DSV4_1_INLINE>{});
     return launch(std::integral_constant<ModelType, ModelType::DSV4_1>{});
   }
-  // Inline FP8 rows are flat; retain the existing routes for footer/mixed caches
-  // and requests that explicitly require BF16 QK arithmetic.
+  // The CuTe kernel requires flat inline FP8 rows and FP8 QK arithmetic.
   if (mt == ModelType::DSV4_1_INLINE && !m.extra_fp4 &&
       plan.numeric == execution::NumericRoute::FP8 &&
       m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes &&

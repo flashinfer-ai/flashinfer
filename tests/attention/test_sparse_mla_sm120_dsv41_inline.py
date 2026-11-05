@@ -675,7 +675,7 @@ def test_cake_rejects_inline_formats(sm12x):
 
 
 def test_inline_prefill_matches_reference(sm12x):
-    """The default prefill arithmetic stays within FP8 error bounds."""
+    """Compare default prefill with a decoded-cache FP64 reference."""
     from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1
 
     footer, _ = _caches("none", 32, 64, seed=128)

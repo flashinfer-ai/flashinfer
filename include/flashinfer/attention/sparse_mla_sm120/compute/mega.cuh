@@ -3,13 +3,13 @@
 #pragma once
 #include "../arch/common.cuh"
 
-// FlashMLA RoPE contract (395cb3af, fused_norm_rope_attn_rope_cast_fwd):
-// int32 positions, FP32 cache [position, (cos=32, sin=32)], adjacent pairs
-// in the final 64 features. Q uses +sin; O uses -sin (conjugate rotation).
-// See core_attn/kernel.h:27-31 and kernel.cuh:553-562, 730-750.
-// Contiguous [T,H,512] output, with one UE8M0 scale per 32 values.
-// Device positions remain live inputs during graph replay. The caller guarantees
-// positions are in [0, cos_sin_rows); no host readback is needed.
+// RoPE convention: int32 positions index FP32 rows [cos[32], sin[32]].
+// Rotate adjacent pairs in the last 64 features: forward for Q, inverse for O.
+// This matches FlashMLA 395cb3af, fused_norm_rope_attn_rope_cast_fwd/core_attn/
+// kernel.h:27-31 and kernel.cuh:553-562, 730-750 (convention, not bitwise parity).
+// Output is contiguous [T,H,512], with one UE8M0 scale per 32 features.
+// Positions are device inputs read on each replay; callers must keep them
+// within the cos_sin table's row bounds.
 struct SparseMlaMegaParams {
   const int32_t* positions = nullptr;
   const float* cos_sin = nullptr;
@@ -68,8 +68,8 @@ __device__ __forceinline__ void mega_store8(uint4 packed, size_t offset, int tok
   amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
   amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
   const uint32_t bits = (__float_as_uint(amax / 448.f) + 0x007fffff) & 0x7f800000;
-  // A finite scale is a normal power of two. Reflect its exponent to get
-  // the exact reciprocal without the general floating-point division path.
+  // The clamped, finite scale is a normal power of two; exponent reflection
+  // gives its reciprocal without division.
   const float inv = bits < 0x7f800000u ? __uint_as_float(0x7f000000u - bits) : 0.f;
   uint2 out;
   out.x = cvt_e4m3x4(f[0] * inv, f[1] * inv, f[2] * inv, f[3] * inv);

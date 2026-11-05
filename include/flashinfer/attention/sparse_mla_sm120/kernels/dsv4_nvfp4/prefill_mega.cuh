@@ -31,10 +31,10 @@
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
-// Prefill consumes the complete selected context in one CTA per query/head tile.
-// Keep native block-scaled FP4 MMA and BF16 RoPE arithmetic: expanding NVFP4
-// into FP8 in a three-WG loader was much slower than this native path.
-// Mega is compile-time: no query RoPE or output quantization in the BF16 route.
+// One CTA per query/head tile consumes the full sparse selection.
+// Non-RoPE features use block-scaled FP4 MMA; the RoPE tail uses BF16.
+// Mega=false accepts rotated Q and returns BF16 context; Mega=true also
+// applies Q RoPE, inverse output RoPE, and FP8 output quantization.
 
 __device__ __forceinline__ float2 prefill_sink_normalization(float lse, float sink) {
   if (sink == INFINITY) return make_float2(0.f, INFINITY);
@@ -143,8 +143,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 
   if (is_io) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(STREAMING_IO_MAX_REGS));
-    // KV gather remains double buffered.  The complete CTA-local V^T stage is
-    // released immediately after P x V, so producer can gather N+1 meanwhile.
+    // Double-buffer raw KV so gathering the next tile can overlap PV.
+    // The consumer releases each transposed V slot after PV completes.
     uint32_t raw_free_phase = 1;
     uint32_t raw_ready_phase = 0;
     uint32_t vt_free_phase[STREAMING_VT_PIPE_STAGES] = {};
@@ -399,8 +399,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       p_group[(gid + 8) * STREAMING_P_STRIDE + warp_first_cand + c1] = __float2bfloat16(w3);
     }
 
-    // P production is local to the math consumer.  In parallel the IO warps
-    // transpose/requantize the gathered 64-candidate V tile in shared memory.
+    // Math warps form P while IO warps transpose and requantize the
+    // 64-candidate V tile in shared memory.
     bar_sync_t<Dsv4Nvfp4Sync::MATH, STREAMING_MATH_THREADS>();
 
     for (int task = threadIdx.x; task < HEADS_PER_CTA * NVFP4_VT_SCALE_GROUPS;
@@ -547,7 +547,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
                     ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V + i * 8, token_idx, mega);
       }
-      // Next head group reuses the same dead raw-KV storage.
+      // Release epilogue scratch before the next head group reuses raw KV.
       bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, STREAMING_MATH_THREADS>();
     }
   }

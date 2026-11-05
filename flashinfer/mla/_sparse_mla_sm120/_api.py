@@ -1063,25 +1063,23 @@ class _SparseMLAPagedAttentionRunner:
     ) -> Optional[torch.Tensor]:
         """Experimental V4 sparse MLA with fused Q RoPE and FP8 output.
 
-        Q is unrotated BF16 [T,H,512]. Rotate its final 64 coordinates using
-        interleaved GPT-J pairs. ``positions`` is contiguous int32 [T], with
-        every value in [0, cos_sin.shape[0]); ``cos_sin`` is contiguous FP32
-        [max_position,64], first 32 columns cosine and last 32 sine.
-        Cached keys must already include their positional rotation.
+        ``q`` is unrotated BF16 [T,H,512]. RoPE rotates adjacent pairs in
+        its final 64 features. ``positions`` is contiguous int32 [T], with
+        values in [0, cos_sin.shape[0]). ``cos_sin`` is contiguous FP32
+        [num_positions,64]: 32 cosines followed by 32 sines per position.
+        Cached keys must already have RoPE applied.
 
         ``output`` is contiguous float8_e4m3fn [T,H,512]; ``output_scales``
-        is uint8 [T,H,16] containing UE8M0 exponents for groups of 32.
-        Decode as output.float() * 2**(scale - 127), broadcasting each scale
-        over 32 values. The epilogue preserves the baseline's BF16 context
-        rounding, applies inverse RoPE in FP32, then quantizes to FP8.
-        Output layout is ordinary head-major, not FlashMLA's GEMM-permuted
-        layout. Q normalization and learned projections remain outside.
+        is contiguous uint8 [T,H,16] with one UE8M0 exponent per 32 features.
+        Decode each scale as exp2(output_scales.float() - 127), repeat it
+        over its 32 features, and multiply by output.float(). The context
+        is rounded to BF16 before FP32 inverse RoPE and FP8 quantization.
+        The caller handles Q normalization and learned projections.
 
-        Uses the native sparse backend, including its FP8-cache hybrid
-        BF16-QK/FP8-PV prefill route and native NVFP4-cache route. Full-BF16
-        attention plans are rejected. Other keyword arguments have ``run``
-        semantics, including sinks, sparse lengths, extra cache and LSE.
-        Warm up before capture; positions and sparse inputs stay live on replay.
+        Requires backend="sparse"; full-BF16 attention plans are unsupported.
+        Other keyword arguments follow ``run``, including sinks, sparse
+        lengths, extra cache and LSE. Warm up before CUDA graph capture;
+        replay reads the current positions and sparse inputs.
         Inputs and output buffers must not overlap.
         """
         if self._backend != "sparse":
@@ -1092,9 +1090,9 @@ class _SparseMLAPagedAttentionRunner:
             raise ValueError("run_mega output must have dtype float8_e4m3fn")
         from ._prepared import wrapper_run
 
-        # Reuse Q's shape descriptor for the legacy BF16-output validation.
-        # Admitted mega routes never write through that pointer, so there is
-        # no BF16 context allocation or global-memory intermediate.
+        # Pass Q as the unused BF16-output descriptor to avoid allocating a
+        # full context buffer. Fused routes write only to output/output_scales;
+        # split decode still uses its partial-output scratch buffers.
         return wrapper_run(
             self,
             q,

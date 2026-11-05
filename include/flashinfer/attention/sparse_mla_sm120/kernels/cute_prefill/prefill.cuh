@@ -6,7 +6,7 @@
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 namespace flashinfer::sparse_mla_sm120::cute_prefill::integrated {
 // 32-head x 64-candidate tile with compile-time prologue/epilogue fusion.
-// Known issue: completion-driven LDGSTS still produces unresolved racecheck reports.
+// Unresolved: racecheck reports hazards on the asynchronous shared-memory copies.
 struct Params : cute_prefill::Params {
   bf16* bf16_output;
   size_t lse_stride;
@@ -22,7 +22,7 @@ struct alignas(128) Shared {
   Pipeline::SharedStorage k_pipeline, v_pipeline;
 };
 static_assert(sizeof(Shared) == 94336);
-// Logical feature iteration and physical ring capacity are independent.
+// K and V use three ring slots independently of the feature-loop extent.
 // K: (candidate=64, micro-feature=128, feature-half=2, ring-slot=3).
 // V: (candidate=64, micro-feature=128, ring-slot=3).
 using MicroLayout = decltype(composition(Swizzle<3, 4, 3>{},
@@ -30,15 +30,13 @@ using MicroLayout = decltype(composition(Swizzle<3, 4, 3>{},
 using MicroTransposed = decltype(composition(Swizzle<3, 4, 3>{},
     Layout<Shape<_128, _64>, Stride<_1, _128>>{}));
 
-// Score bank XOR: row bit0 -> column bit4, row bit1 -> column bit3 (float units).
-// Express the row-bit permutation as a hierarchical row layout, then apply one swizzle.
-// Compatible with both QK 2-float stores and PV 4-float loads.
+// Score swizzle (float elements): row bit0 -> column bit4, row bit1 -> column bit3.
+// It preserves QK's 2-float stores and PV's 4-float loads.
 // Named barriers: 1 QK-local; 2/3 S-ready; 4/5 S-free.
-// Development harnesses may instantiate PQuantGroup=64 to compare rounding
-// and throughput. Production dispatch uses 32; there is no runtime selector.
-// The 64-candidate load tile and shared-memory footprint do not change.
-// BF16-output and fused output share this arithmetic; FP32 reduction ordering
-// can still differ from the original 32-candidate softmax loop by a few ULPs.
+// PQuantGroup defaults to 32; development harnesses can instantiate 64.
+// Both use the same 64-candidate load tile and shared-memory allocation.
+// The softmax loop and reduction order differ from the original kernel, so
+// a 32-candidate quantization group does not guarantee bitwise equality.
 template <bool Mega, int PQuantGroup = 32>
 __global__ __launch_bounds__(384, 1) void prefill(Params p) {
   static_assert(PQuantGroup == 32 || PQuantGroup == 64);
@@ -92,10 +90,9 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       for (int micro = 0; micro < micro_steps; ++micro) {
         pipeline.producer_acquire(write_state);  // Wait only for a FREE slot.
         const int stage = write_state.index();
-        // SF slots are indexed by candidate tile, not feature micro-step.
-        // Three physical slots can cross candidate-tile boundaries. Before
-        // tile+2 starts, K has released tile's second micro-step and V has
-        // released at least its last micro-step, so two SF slots remain safe.
+        // Scale factors use two candidate-tile slots. Reusing a slot for
+        // tile+2 depends on producer_acquire retiring the earlier tile's
+        // feature stages: two for K, four for V.
         if (micro == 0) {
           int id = (warp % 2) ? id_hi : id_lo;
           if (load_k) {
@@ -321,8 +318,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       }
       row_l = row_l * alpha + row_sum4(tile_l);
       row_m = new_m;
-      // A thread owns two head columns, repeated across every feature tile.
-      // Hoist collectives explicitly: nvcc does not CSE unrolled __shfl_sync.
+      // Each thread owns two head columns. Compute their rescaling factors
+      // once to avoid repeating shuffles for every feature tile.
       float alpha0 = __shfl_sync(0xffffffff, alpha, (lane % 4) * 8);
       float alpha1 = __shfl_sync(0xffffffff, alpha, (lane % 4) * 8 + 4);
       #pragma unroll

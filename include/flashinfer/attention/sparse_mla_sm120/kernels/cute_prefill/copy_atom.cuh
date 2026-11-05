@@ -17,17 +17,15 @@ namespace cute {
 //   d2       X[1][row+0][col] X[1][row+1][col] X[1][row+2][col] X[1][row+3][col]
 //   d3       X[1][row+0][col+8] ...             ...             X[1][row+3][col+8]
 //
-// Example: lane 0 receives rows 0:4, columns 0 and 8, from both matrices;
-//          lane 1 receives rows 4:8 at those columns;
-//          lane 4 receives rows 0:4, columns 1 and 9.
+// For example, lane 0 receives rows 0:4 at columns 0 and 8 of both matrices.
 //
 // Raw transpose ownership             CUTLASS STSM-oriented repack
 //   d0 = [a0 a1 a2 a3]  ----+---->     dst0 = [a0 a1 b0 b1]
 //   d1 = [b0 b1 b2 b3]  ----+---->     dst1 = [a2 a3 b2 b3]
 //   d2/d3 are repacked the same way into dst2/dst3.
-// We omit that repack: the PV MMA A fragment consumes the raw column bytes.
-// DstLayout below maps (lane, register-bit) back to the X source bit offset;
-// local_tile/partition_S compose this atom with V's swizzled SMEM layout.
+// PV's MMA A fragment needs the raw column bytes, so no repack is applied.
+// DstLayout maps (lane, register-bit) to the source bit offset in X;
+// partition_S composes it with V's swizzled shared-memory layout.
 struct SM120_U8x16_LDSM_T_RAW {
   using SRegisters = uint128_t[1];
   using DRegisters = uint32_t[4];

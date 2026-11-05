@@ -156,8 +156,8 @@ __device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(const bf16*
 // Called by the math threads only; the trailing bar:2 syncs the math group.
 // q_base must be 16B-aligned row-wise: every row offset is a multiple of
 // D_QK * 2 bytes, and D_QK * 2 % 16 == 0 for every supported model type.
-// Rotation: 0 = optional prefill operand, 1 = ordinary decode, 2 = mega decode.
-// Decode specializations erase the optional checks from both hot paths.
+// Rotation: 0 checks the optional RoPE table, 1 skips RoPE, 2 requires RoPE.
+// Decode selects 1 or 2 at compile time to omit the null-table check.
 template <ModelType MT, int _MATH_THREADS, int Rotation = 0>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
                                                    bf16* q_rope, const bf16* q_base,
