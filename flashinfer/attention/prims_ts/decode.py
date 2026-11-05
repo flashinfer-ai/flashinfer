@@ -1256,7 +1256,8 @@ def _decode_launch_spec_from_config(
     )
     # Every plan, split or not, reserves counters for two device-wide waves of
     # logical Q CTAs, so plans sharing one buffer keep the same state bytes.
-    # Larger counts keep their exact size and cannot share a buffer.
+    # Larger counts keep their exact size; outside the sparse route (own slice),
+    # only separate-reduction plans reach them, and those never read the counters.
     scratch_reserve = max(2 * int(max_active_clusters), math.prod(scratch_shapes[2]))
 
     return _DecodeLaunchSpec(
@@ -1528,11 +1529,15 @@ def _resolve_decode_launch_spec(
         max_active_clusters=int(max_active_clusters),
         requested_splits=requested_splits if cfg.use_split_kv else None,
     )
-    # Split plans stay below one wave of logical Q CTAs, so their counters fit
-    # the shared reserve. The sparse route binds its own exact slice.
-    assert use_q_token_kv_block_sparse_route or (
-        resolved.scratch_reserve == 2 * int(max_active_clusters)
-    ), "split counters exceed the shared workspace reserve"
+    # Fused GMEM split plans publish through the counters, so they must fit the
+    # shared reserve. Separate-reduction plans (e.g. FP8 page-4 encoded-subpage,
+    # which always splits) never touch the counters and may exceed it.
+    assert (
+        use_q_token_kv_block_sparse_route
+        or not cfg.use_split_kv
+        or cfg.use_separate_reduction_kernel
+        or resolved.scratch_reserve == 2 * int(max_active_clusters)
+    ), "fused GMEM split counters exceed the shared workspace reserve"
     # Report the runtime fanout separately from the SM-bound workspace capacity.
     policy = dict(resolved.policy)
     policy["splits_kv"] = requested_splits

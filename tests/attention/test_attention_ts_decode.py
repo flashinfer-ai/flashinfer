@@ -6516,6 +6516,25 @@ def test_attention_ts_decode_split_workspace_is_plan_invariant(monkeypatch) -> N
                         128,
                     )
                 specs.append(spec)
+        # FP8 page-4 subpage plans always split with the separate reducer.
+        # At batch 160 / Hkv 2, their 320 counters exceed the reserve but still plan.
+        assert (
+            decode_module.get_prims_ts_batch_decode_workspace_size(
+                batch_size=160,
+                num_qo_heads=16,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=4,
+                max_kv_len=4096,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                storage_page_size=16,
+                device=0,
+            )
+            > 0
+        )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
     assert specs
