@@ -18,28 +18,27 @@ pair; keyword-only beyond ``ctx``).  ``s = HV * 128 * 128 * 4`` is one FP32
 state of all value heads (3 MiB at ``HV = 48``); ``n_in`` / ``n_out`` are this
 rank's crossing-in / crossing-out fragments (a fragment with a predecessor /
 with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
-``Hg = ceil(HV / W)`` the heads per owner.
+``n_io`` / ``N_io`` the fragments with both (``hp.n_io_by_rank``: the maps that
+travel on b1), ``Hg = ceil(HV / W)`` the heads per owner.
 
 * ``gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C)``: bytes this rank moves per
   collective and per boundary.  Per crossing-out fragment c1 sends ``2 s``
   (``[B_f | M_f^T]`` pair tiles) and b2 receives ``s`` (``dS_out``); per
   crossing-in fragment c2 receives ``s`` (``S_in``) and b1 sends ``s`` (``d_f``);
-  per crossing-out fragment b1 also sends ``s`` (the re-sent ``M_f^T``) when the
-  maps are not kept on the owner (``boundary_mode="saved"`` without
-  ``save_transfer``), i.e. ``b1_send = s n_in + s n_out [not save_transfer]``
-  (the per-rank lower-bound form; reported as ``b1_design``).  Owner side: c1 receives ``2 s_owner`` per crossing-out
+  per fragment crossing in and out b1 also sends ``s`` (the re-sent ``M_f^T``,
+  which the owner's adjoint chain reads; a document's last fragment has none)
+  when the maps are not kept on the owner (``boundary_mode="saved"`` without
+  ``save_transfer``), i.e. ``b1_send = s n_in + s n_io [not save_transfer]``
+  (reported as ``b1_design``).  Owner side: c1 receives ``2 s_owner`` per crossing-out
   fragment of the group; b1 receives ``s_owner`` per crossing-in fragment (the
-  ``d`` half, ``b1_d``) plus ``s_owner`` per crossing-out fragment when the maps
-  are re-sent (the ``m`` half, ``b1_m``); c2 / b2 send ``s_owner`` per
+  ``d`` plane, ``b1_d``) plus ``s_owner`` per fragment crossing in and out when the
+  maps are re-sent (the ``m`` plane, ``b1_m``); c2 / b2 send ``s_owner`` per
   crossing-in / crossing-out fragment of the group, with
   ``s_owner = Hg_r * 128 * 128 * 4``.  ``b1`` reports the bytes of the plan's
   b1 split tables (``hp.b1_splits``: what the host allocates and the collective
-  moves): their map half is paired with the crossing-IN slots
-  (``2 s`` per crossing-in fragment).  ``b1_design`` is the design form above
-  (a per-rank lower bound): equal to ``b1`` in the d-only form, different per
-  rank when the maps are re-sent on a rank with ``n_in != n_out`` (the sums over
-  the ranks agree).  Halo: ``rows * C * 2`` forward (BF16 ``x``
-  history rows), ``rows * C * 4`` backward (FP32 ``dpre`` rows).  ``B1`` =
+  moves): ``d_f`` plane + map plane; ``b1_design`` is the same total built
+  from the fragment counts (the padded owner slots included, so ``b1`` ==
+  ``b1_design``).  Halo: ``rows * C * 2`` forward (BF16 ``x`` history rows), ``rows * C * 4`` backward (FP32 ``dpre`` rows).  ``B1`` =
   forward (c1 + c2 + halo_fwd), ``B2`` = backward from the saved context
   (b1 + b2 + halo_bwd), ``B3`` = the replayed forward + the backward with b1 in
   its offsets-only form.  ``H_qk`` enters the exchange terms only through the
@@ -93,7 +92,9 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   hand-off tensors, ``bwd.kept_tapes``, not workspace), plus the arena
   ``qk_rstd`` in the backward forms that re-run #1
   (the light replay and ``boundary_mode="replay"``; the ``save_mode="full"``
-  and kept-tape backwards read the saved one).  The forward drops ``kn``
+  and kept-tape backwards read the saved one) and at #1 of a fused forward
+  that keeps no saved set (``save_for_backward=False``: ``fwd.qk_rstd``, the
+  forward's peak moment).  The forward drops ``kn``
   before its output and ``qn`` after #5, so nothing of the norm is left in
   the arena after a forward.
 
@@ -103,6 +104,7 @@ NC_pad`` padded token rows, ``NC_pad`` the even chunk bound), not estimates.
 
 from __future__ import annotations
 
+from . import cake_jit
 from .cake_kcp_plan import (
     HEAD_DIM,
     SAVE_TRANSFER_DEFAULT,
@@ -135,6 +137,10 @@ EYE_BYTES = STATE_TILE_BYTES
 # tapes #5 reads are what an eager forward leaves bound, and what a kept-tape backward re-adopts after #8.
 FWD_TAPES_DEAD_AFTER_PREP = ("akk", "gcum")
 FWD_TAPES_ARENA_AFTER_FWD = ("aqk", "qscale", "h_tape", "v_new")
+# A fused forward (the output walk ``kcp_fwdh_out``: #5 inside the tape walks) binds no h / v_new tape: it leaves the two
+# tapes #5 reads besides them (cake_kcp.FWD_TAPES_ARENA_AFTER_FUSED), and its peak is #1's (akk / gcum still bound).
+FWD_TAPES_ARENA_AFTER_FUSED = ("aqk", "qscale")
+FUSED_FREE_TAPES = ("h_tape", "v_new")
 TAPE_NAME_OF = {"gcum": "g_cum"}  # this module's spelling -> cake_kcp's
 # The in-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel``): bytes per (token, Q/K head) of one normalized row tape
 # (``qn`` / ``kn``: BF16 [T_r, H_qk, 128]) and of the FP32 ``r`` of q and k together (``qk_rstd`` [2, T_r, H_qk]).
@@ -222,14 +228,15 @@ def gdn_det_comm_bytes_kcp(
         "send": ctx.n_in * s_pad,
         "recv": ctx.N_in * s_owner,
     }  # d_f of every crossing-in fragment
-    b1_m = {  # M_f^T re-sent by every crossing-out fragment unless the owner kept the c1 pairs
-        "send": ctx.n_out * s_pad if with_maps else 0,
-        "recv": ctx.N_out * s_owner if with_maps else 0,
+    n_io, N_io = hp.n_io_by_rank[ctx.rank], sum(hp.n_io_by_rank)
+    b1_m = {  # M_f^T re-sent by every fragment crossing in and out unless the owner kept the c1 pairs
+        "send": n_io * s_pad if with_maps else 0,
+        "recv": N_io * s_owner if with_maps else 0,
     }
     b1_buf_send, b1_buf_recv = hp.b1_splits(
         with_maps
     )  # the plan's split tables (allocated buffers)
-    b1_design = {  # per-rank lower bound of the b1 traffic (d halves + re-sent maps)
+    b1_design = {  # d_f plane + re-sent maps from the counts, padding included (= b1)
         "send": b1_d["send"] + b1_m["send"],
         "recv": b1_d["recv"] + b1_m["recv"],
     }
@@ -269,8 +276,8 @@ def gdn_det_comm_bytes_kcp(
     pad_self = (
         hp.Hg_pad_by_rank[ctx.rank] - hp.Hg_r
     ) * STATE_TILE_BYTES  # this owner's padding per slot
-    n_b1_send = ctx.n_in + (ctx.n_out if with_maps else 0)
-    n_b1_recv = ctx.N_in + (ctx.N_out if with_maps else 0)
+    n_b1_send = ctx.n_in + (n_io if with_maps else 0)
+    n_b1_recv = ctx.N_in + (N_io if with_maps else 0)
     padding = {
         "c1": {"send": pn["c1_send"] * 4, "recv": pn["c1_recv"] * 4},
         "c2": {"send": pn["c2_send"] * 4, "recv": pn["c2_recv"] * 4},
@@ -403,6 +410,20 @@ def gdn_det_saved_bytes_kcp(
     )
 
 
+def _fwdh_out_shipped() -> bool:
+    """Whether the registry ships the output walk ``kcp_fwdh_out`` in both forms (``cake_kcp.fused_o_shipped``; each
+    record covers every architecture of :data:`cake_jit.ARCHES`): the shipped forward then fuses #5 into its walks."""
+    try:
+        names = cake_jit.records_of_program("kcp_fwdh_out")
+    except ValueError:  # a registry that does not know the program
+        return False
+    forms = {
+        int(cake_jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
+        for n in names
+    }
+    return forms >= {1, 2}
+
+
 def gdn_det_workspace_layout_kcp(
     ctx: ContextDetKcp,
     *,
@@ -418,6 +439,7 @@ def gdn_det_workspace_layout_kcp(
     group_reduce: str = "fused",
     reuse_recompute_tapes: bool | str | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    save_for_backward: bool = True,
 ) -> dict[str, int]:
     """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime
     maxima ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are
@@ -426,17 +448,25 @@ def gdn_det_workspace_layout_kcp(
     The terms follow the arena's lifetimes (the host drops a buffer at its last reader, so a lifetime's figure is
     the most the workspace binds in it, not the sum of everything it ever binds):
 
-    * ``forward``: the tape walk of an eager forward -- the pools plus the eight forward tapes live then (#1's
+    * ``forward``: the shipped forward of these options.  Fused (``save_mode="light"`` and ``boundary_mode="saved"``
+      where the registry ships the output walk ``kcp_fwdh_out``: #5 runs inside the tape walks and no ``h`` /
+      ``v_new`` tape exists): #1 -- the pools plus the eight tapes #1 writes; ``akk`` / ``gcum`` go right after it
+      and the output is a fresh tensor, so no later moment binds more.  Split (``forward_split``, also the
+      ``fused_o=0`` test knob's form): the tape walk -- the pools plus the eight forward tapes live then (#1's
       backward-only outputs ``akk`` / ``gcum`` are dropped right after #1; the six tapes #5 does not read go before
-      the output, so the forward's end state is below its peak).
+      the output, so the forward's end state is below its peak).  The offset walks bind ``u`` in place of ``h`` /
+      ``v_new``, so a fresh arena allocates those two at the first tape walk: under ``schedule="wait_first"`` and on
+      a rank without a document start that walk runs after the c1 send pool is released, at most ``fwd.c1_send``
+      below the split figure; a reused workspace binds them from the previous forward on.
     * ``backward``: the largest of its phases -- the adjoint exchange (every backward pool plus the tapes #6 wrote),
       the adjoint tape walk (``carry`` / ``b2_recv`` plus ``dh``; the exchange pools and staging planes are gone)
       and the end state (the tapes #8 / #9 read, every pool but ``eye`` released) -- with the forward tapes of the
       form: the replay form (``reuse_recompute_tapes=False``) re-creates the ten light tapes in the arena; the
       kept-tape form (``True``; the ``None`` default resolves to the package default) binds none of them during
       the backward (the ten tapes are the recompute forward's hand-off tensors, outside the workspace:
-      ``bwd.kept_tapes``) and re-adopts the four an eager forward leaves bound (``aqk`` / ``qscale`` / ``h`` /
-      ``v_new``) after #8, so its end state is the arena a forward leaves plus the backward tapes; that form's
+      ``bwd.kept_tapes``) and re-adopts the tapes an eager forward leaves bound (``aqk`` / ``qscale``, with ``h`` /
+      ``v_new`` when the forward is split) after #8, so its end state is the arena a forward leaves plus the backward
+      tapes; that form's
       recompute forward keeps every tape in the arena until the hand-off (``bwd.recompute_forward``) and counts as a
       phase too.  ``"auto"`` reports the replay form (the bound the workspace may reach when a later operation of the
       checkpointed region saves a tensor).  ``save_mode="full"`` saves the forward tapes as fresh tensors: none is
@@ -446,25 +476,43 @@ def gdn_det_workspace_layout_kcp(
       replay and ``save_mode="full"`` forms (``qk_apply`` writes them there) and in the kept form's recompute
       forward, which hands them over with the ten tapes: in the kept-tape backward they are hand-off tensors
       (``bwd.kept_tapes``, ``bwd.qn`` / ``bwd.kn`` 0); ``bwd.qk_rstd`` (the arena ``r``) where the backward re-runs #1
-      (the light replay, ``boundary_mode="replay"``).
+      (the light replay, ``boundary_mode="replay"``).  The fused forward's #1 binds the arena ``r`` too
+      (``fwd.qk_rstd``) when that forward keeps no saved set (``save_for_backward=False``); the saved set's ``r`` is a
+      fresh tensor, and the split forward drops the arena one before its tape walk.
+    * ``save_for_backward``: the forward of ``chunk_gdn_det_fwd_kcp`` with this keyword (the autograd entry always
+      saves).  ``False`` under ``boundary_mode="saved"``: the forward binds the pools a saved set would replace
+      (``c1_recv`` and the ``stage_m`` plane under ``save_transfer``) and, with the norm, the arena ``r`` above; it has
+      no backward (``backward=False`` is required).  ``boundary_mode="replay"`` keeps no saved set either way.
     """
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
+    keep_set = _flag(save_for_backward, "save_for_backward")
     C = _channels(H_qk, HV, C)
     _mode(save_mode, SAVE_MODES, "save_mode")
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     _mode(group_reduce, GROUP_REDUCE, "group_reduce")
+    if backward and boundary_mode == "saved" and not keep_set:
+        raise ValueError(
+            'save_for_backward=False under boundary_mode="saved" keeps no saved set: a forward without a backward '
+            "(backward=False)"
+        )
     kept_form = _kept_form(reuse_recompute_tapes)
-    hp = ctx.heads(HV)
-    P = hp.P if P is None else int(P)
-    if P < 1:
+    if P is not None and int(P) < 1:
         raise ValueError(f"P={P} must be >= 1")
+    # an overridden P is the plan the host allocates for (cake_kcp._prepare: ctx.prepare(..., P=P)); its NSEG sizes the
+    # staging planes
+    hp = ctx.heads(HV) if P is None else ctx.heads(HV, P=int(P))
+    P = hp.P if P is None else int(P)
     n, halo = hp.numel, ctx.halo
     R, NC_pad, T_r = ctx.R, ctx.NC_pad, ctx.T_r
     s = state_bytes(HV)
     saved = boundary_mode == "saved"
+    # the forward keeps a saved set (cake_kcp._fwd_entry: save)
+    keep = saved and keep_set
     full = save_mode == "full"
     kept = kept_form and not full  # the kept-tape backward is the light form's
+    # the shipped forward folds #5 into its tape walks (cake_kcp._fuse_o_enabled with test knob fused_o = 1)
+    fused = (not full) and saved and _fwdh_out_shipped()
     # staging planes at P > 1: stage_b always; stage_m only when the call does not bind the saved M_seg^T for it
     # (save_transfer or save_mode="full" under boundary_mode="saved" saves M_seg: the pool of that name is not sized,
     # cake_kcp SAVE_TRANSFER_FRESH_POOLS / _FULL_FRESH_POOLS); the ring pools are sized only under exchange="ring" and
@@ -473,6 +521,8 @@ def gdn_det_workspace_layout_kcp(
     staging = plane + (
         0 if (boundary_mode == "saved" and (save_transfer or full)) else plane
     )
+    # the forward binds stage_m / c1_recv from the workspace when it keeps no saved set (no fresh tensor for them)
+    fwd_staging = plane + (0 if (keep and (save_transfer or full)) else plane)
     carry = (ctx.n_frag * (P - 1) * s) if P > 1 else 0
     # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
     # in the backward; in "full" they are saved-set bytes (gdn_det_saved_layout_kcp), not workspace
@@ -491,29 +541,42 @@ def gdn_det_workspace_layout_kcp(
     light_sum = sum(light_tapes.values())
     fwd_pools = {
         "c1_send": n["c1_send"] * 4,
-        "c1_recv": 0 if (saved and save_transfer) else n["c1_recv"] * 4,
+        "c1_recv": 0 if (keep and save_transfer) else n["c1_recv"] * 4,
         "c2_send": n["c2_send"] * 4,
-        "staging": staging,
+        "staging": fwd_staging,
         "carry": carry,
         "halo_send": sum(halo.fwd_send_rows) * C * 2 if with_conv else 0,
         "eye": EYE_BYTES,  # the identity tile pool (one FP32 state), every workspace of the context
         "tickets": TICKET_BYTES,  # the persistent programs' ticket slots (every site, allocated together)
     }
-    # the forward's peak (the tape walk): #1's backward-only outputs are already dropped (FWD_TAPES_DEAD_AFTER_PREP)
-    fwd_tapes = (
+    # the split forward's peak (the tape walk): #1's backward-only outputs are already dropped
+    # (FWD_TAPES_DEAD_AFTER_PREP); the fused forward's peak is #1 (no h / v_new tape at any moment)
+    split_tapes = (
         {}
         if full
         else {
             k: v for k, v in light_tapes.items() if k not in FWD_TAPES_DEAD_AFTER_PREP
         }
     )
+    fwd_tapes = (
+        {k: v for k, v in light_tapes.items() if k not in FUSED_FREE_TAPES}
+        if fused
+        else split_tapes
+    )
     # the in-kernel L2 norm's normalized rows: live through the tape walk (kn goes before the output, qn after #5)
     qk_rows = (
         {"qn": T_r * H_qk * QK_ROW_BF16, "kn": T_r * H_qk * QK_ROW_BF16} if l2n else {}
     )
-    fwd = {**fwd_pools, **fwd_tapes, **qk_rows}
-    # the b1 buffers are the plan's split tables (their map half pairs with the crossing-in slots; the design's
-    # per-rank b1 QUERY is in gdn_det_comm_bytes_kcp -- the workspace counts what the host allocates)
+    # #1_l2n writes r into the arena when the forward keeps no saved set (cake_kcp.CallDetKcp.rstd_out; dropped right
+    # after #1): part of the fused peak (#1), gone before the split form's tape walk
+    fwd_rstd = (
+        {"qk_rstd": T_r * H_qk * QK_RSTD_BYTES if (fused and not keep) else 0}
+        if l2n
+        else {}
+    )
+    fwd = {**fwd_pools, **fwd_tapes, **qk_rows, **fwd_rstd}
+    # the b1 buffers are the plan's split tables (the d_f plane + the map plane of the fragments crossing in and
+    # out; the per-rank b1 QUERY is in gdn_det_comm_bytes_kcp -- the workspace counts what the host allocates)
     b1_send, b1_recv = hp.b1_splits(saved and not save_transfer)
     bwd_pools = {
         "b1_send": sum(b1_send) * 4,
@@ -544,7 +607,12 @@ def gdn_det_workspace_layout_kcp(
         bwd_fwd_tapes, bwd_fwd_tapes_end = {}, {}
     elif kept:
         bwd_fwd_tapes = {}
-        bwd_fwd_tapes_end = {k: light_tapes[k] for k in FWD_TAPES_ARENA_AFTER_FWD}
+        bwd_fwd_tapes_end = {
+            k: light_tapes[k]
+            for k in (
+                FWD_TAPES_ARENA_AFTER_FUSED if fused else FWD_TAPES_ARENA_AFTER_FWD
+            )
+        }
     else:
         bwd_fwd_tapes = bwd_fwd_tapes_end = light_tapes
     bwd_tapes = {
@@ -608,6 +676,9 @@ def gdn_det_workspace_layout_kcp(
         out["bwd.kept_tapes"] = light_sum + kept_qk if kept else 0
         out.update({f"bwd.phase.{k}": v for k, v in phases.items()})
     out["forward"] = sum(fwd.values())
+    out["forward_split"] = (
+        sum(fwd_pools.values()) + sum(split_tapes.values()) + sum(qk_rows.values())
+    )
     out["backward"] = max(phases.values()) if backward else 0
     # the hand-off tensors added to the phase they live through (the kept form's #8): the same figure as the replay
     out["backward_transient"] = (
@@ -638,6 +709,7 @@ def gdn_det_workspace_bytes_kcp(
     group_reduce: str = "fused",
     reuse_recompute_tapes: bool | str | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    save_for_backward: bool = True,
 ) -> int:
     """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_det_workspace_layout_kcp`): the
     most the workspace binds in the forward or the backward of these options."""
@@ -655,6 +727,7 @@ def gdn_det_workspace_bytes_kcp(
         group_reduce=group_reduce,
         reuse_recompute_tapes=reuse_recompute_tapes,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        save_for_backward=save_for_backward,
     )["workspace"]
 
 
@@ -668,6 +741,7 @@ __all__ = [
     "EYE_BYTES",
     "QK_ROW_BF16",
     "QK_RSTD_BYTES",
+    "FWD_TAPES_ARENA_AFTER_FUSED",
     "FWD_TAPES_ARENA_AFTER_FWD",
     "FWD_TAPES_DEAD_AFTER_PREP",
     "TAPE_NAME_OF",

@@ -131,6 +131,20 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   212-SM R200 the CP4 zigzag rows ran 1.2-2.5 % slower paired, and there is
   no 216-SM measurement.  The private lever `test_knobs={"walk_pair": 0}` (or
   `1`) forces one stream (or the pair on a zigzag partition).
+* A forward with `save_mode="light"` and `boundary_mode="saved"` that
+  launches the output program and hands no tapes to a backward runs the
+  output walk `kcp_fwdh_out` (#2+5 under "Kernel structure") at each of its
+  tape walks in place of the #2 tape walk and #5: each chunk's output comes
+  from the walk's own `h` snapshot and `v_new` operand, and the forward
+  allocates neither tape.  Its workspace peak is #1's, below the split
+  form's tape walk by the `h` / `v_new` tapes less #1's `akk` / `gcum`
+  (30,528 B per token at `HV = 48`; `gdn_det_workspace_layout_kcp(...)`
+  reports both as `forward` and `forward_split`).  The output and the saved
+  set are bitwise those of the split form.  `save_mode="full"`,
+  `boundary_mode="replay"`, a forward that hands its tapes to the kept-tape
+  backward, a re-run that leaves #5 out and the backward's replayed forward
+  keep the split form.  The private lever `test_knobs={"fused_o": 0}` forces
+  the split form.
 
 ### Partition and context
 
@@ -167,7 +181,7 @@ context serves every call of the same batch layout and head pair.
 | `p_rule`, `walk_seg` | plan policy / explicit override | how many intra-rank segments a fragment is walked as (`P`); a function of metadata and the SM count only. The shipped policy costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie); on a row with at most 12 value heads whose fragments are all at most 160 chunks long every rank then runs `P = 1` (no segment composition), so the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
 | `use_qk_l2norm_in_kernel` | **`False`**, `True` | the per-token L2 norm of every 128-channel Q / K head inside the programs (FLA's `use_qk_l2norm_in_kernel`; see "In-kernel Q / K L2 norm" below); a literal keyword of the three entry points as well |
-| `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width); without it every test-only value is refused |
+| `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width) and `fused_o` (`0` forces the split tape walk and #5); without it every test-only value is refused |
 
 The validator refuses every test-only value not named in `test_knobs`,
 `exchange="ring"` without both of its conditions, `HV % H_qk != 0`, a
@@ -291,15 +305,19 @@ requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 ```
 gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
     c1_send = 2 * s * n_out(r)      c2_recv = s * n_in(r)      b2_recv = s * n_out(r)
-    b1_send = s * n_in(r) * (1 if save_transfer else 2)
-    c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
+    b1_send = s * (n_in(r) + (0 if save_transfer else n_io(r)))   n_io = fragments crossing in and out
+    c1_recv on an owner = 2 * s_owner * N_out      b1_recv on an owner = s_owner * (N_in + (0 if save_transfer else N_io))
+    N_in / N_out / N_io = the group totals of n_in / n_out / n_io      halo = rows(r) * C * 2
 gdn_det_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
-gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
-    workspace binds in the forward (the tape walk: pools + the eight live tapes) or the backward (its phases: the
-    exchange, the adjoint tape walk, the end state); the default (`None`, i.e. `"auto"`) reports the replay form, the
-    bound of both forms, in which the ten forward tapes are workspace; `reuse_recompute_tapes=True` gives the kept-tape
-    figure, in which they are the recompute forward's hand-off tensors outside the workspace
-    (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as `backward_transient`)
+gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None, save_for_backward=True) -> per rank:
+    the most the caller-held workspace binds in the forward (the fused form: #1, the pools + the eight tapes #1 writes;
+    the split form, also `forward_split` of the layout: the tape walk, the pools + the eight live tapes) or the backward
+    (its phases: the exchange, the adjoint tape walk, the end state); the default (`None`, i.e. `"auto"`) reports the
+    replay form, the bound of both forms, in which the ten forward tapes are workspace; `reuse_recompute_tapes=True`
+    gives the kept-tape figure, in which they are the recompute forward's hand-off tensors outside the workspace
+    (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as `backward_transient`);
+    `save_for_backward=False` with `backward=False`: a `chunk_gdn_det_fwd_kcp` forward without a saved set, which binds
+    `c1_recv` / `stage_m` from the workspace and, with the norm, the arena `r` at #1 of the fused form (`fwd.qk_rstd`)
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on
@@ -326,11 +344,11 @@ exactly in FP64).  Programs: `fwd_prep_l2n` (#1 that first writes `qn` /
 `kn` with the pullback before the one BF16 rounding; `group_reduce="host"`
 runs the unchanged #8 and the reference pullback on the host, per block of
 2048 tokens) and `qk_apply` (`qn = bf16(q * r)` from the saved `r`).  Every
-other reader (#2, #3, #5, #7) is the unchanged program bound to `qn` / `kn`.
+other reader (#2, #3, #5, #2+5, #7) is the unchanged program bound to `qn` / `kn`.
 
 | path | `qn` / `kn` from | `r` the pullback reads | dropped |
 |---|---|---|---|
-| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
+| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a fused forward: both after its output walks; a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
 | light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
 | kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
 | `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
@@ -389,7 +407,7 @@ and the reference's own error.
 
 ## Kernel structure of one training step
 
-Eight new programs and one reused program compose a step (the affine merge is
+Nine new programs and one reused program compose a step (the affine merge is
 the KDA KCP package's gate-free program, rendered under this package's prefix
 with the `_kcp` suffix; its 20-hex digests equal that package's):
 
@@ -400,15 +418,16 @@ with the `_kcp` suffix; its 20-hex digests equal that package's):
 | 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |
 | 5 | `fwd_o` | the output from the `h` tape, `v_new` and `Aqk`; persistent, the tiles beyond the grid drawn in units from a ticket word |
+| 2+5 | `kcp_fwdh_out` (value width `vh` 128 or 64) | the output walk: #2's tape walk from `S_in` that writes each chunk's output from its `h` snapshot, its `v_new` operand, `q`, `Aqk` and `qscale` instead of the `h` / `v_new` tapes; the forward of a light, saved-boundary call that launches #5 runs it in place of the tape walk and #5 (see "Contract"); the `vh` 64 form (two CTAs per segment and head, the `_vh64` record) runs under #2's rule (`n_walk × HV ≤ SM count`, or its two-CTA grid finishes within the longest walked segment); bitwise the split form's output |
 | 6 | `bwd_prep` | `do_g`, `dv_intra`; persistent, the items beyond the grid drawn from a ticket word |
 | 7 | `kcp_dhu` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the adjoint state walk: the boundary adjoint from `dS_out`, the `dh` / `dv_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) writes bitwise-identical results and runs for the offset walk always, for the tape walk on `sm_100a` / `sm_103a` always and on `sm_107a` when `2 × n_walk × HV ≤ 4 × SM count`; on `sm_100a`, a walk whose longest segment has at least 400 chunks and whose two-CTA grid ends later than the one-CTA grid (LPT over two CTAs per SM) takes the `sm_107a` rule for both forms |
 | 8 | `bwd_dqkg` | `dq`, `dk` (grouped FP32 reduction), `dv`, the `dg` / `dbeta` partials; persistent, the (chunk, Q/K head) groups drawn from a ticket word |
 | 9 | `gate_epilogue` | the reverse cumulative sum of the `dg` partials and the `dbeta` finalize, FP32 fixed order |
 
 Tensor cores are used through `tcgen05` only; the FP32 chains and the gate
-epilogue run on CUDA cores.  Sixteen shipped libraries result (the two walk
-forms of #2 and of #7, each at two value widths, the two merge widths), each
-for `sm_100a`, `sm_103a` and `sm_107a`.
+epilogue run on CUDA cores.  Eighteen shipped libraries result (the two walk
+forms of #2 and of #7 and the output walk, each at two value widths, the two
+merge widths), each for `sm_100a`, `sm_103a` and `sm_107a`.
 
 The persistent programs (#5, #6, #8) launch no cooperative grid: a CTA that
 finishes its static tile draws the remaining work through an `atom.inc` on a
@@ -444,7 +463,9 @@ not the whole grid.
   chain under the per-rank programs (the shipped row policy may walk a whole
   fragment as one chain when its cost model prefers that); a partition beyond
   a cap is refused at context build.
-* The fused tape-walk-plus-output form is not part of this release: the
+* The output walk serves the light, saved-boundary forward only: under
+  `save_mode="full"` or `boundary_mode="replay"`, in a forward that hands its
+  tapes to the kept-tape backward and in the backward's replayed forward the
   output program runs after the tape walk.
 * The causal-convolution halo backward is the conv package's program; its
   launch form is that package's.

@@ -17,7 +17,8 @@ module, ``_RENDERED_WORK_BIN_MIX_ROUTES`` for the bin-mix build of a module's
 work-bin turnover build, ``_RENDERED_WORK_BIN_POOL_ROUTES`` for the helper-pool build
 of its bin-mix build, ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` for the short-task build
 of its turnover build, ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` for the long-task build of
-its bin-mix build).
+its bin-mix build, ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` for the hybrid build
+of an M64 value-split module's owner/helper build).
 """
 
 from functools import cache
@@ -4670,6 +4671,55 @@ _RENDERED_MODULES = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_kda_prefill_df6033e751431456c54b": {
+        "sources": [
+            "csrc/kda/prefill/cake_kda_prefill_df6033e751431456c54b_kernel.cu",
+            "csrc/kda/prefill/cake_kda_prefill_df6033e751431456c54b_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["tma_buffer", "q_tma"],
+            ["buffer", "k"],
+            ["tma_buffer", "k_tma"],
+            ["buffer", "v"],
+            ["tma_buffer", "v_tma"],
+            ["buffer", "g"],
+            ["tma_buffer", "g_tma"],
+            ["buffer", "beta"],
+            ["tma_buffer", "beta_tma"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "seq_order"],
+            ["buffer", "initial_state"],
+            ["buffer", "out"],
+            ["tma_buffer", "out_tma"],
+            ["buffer", "final_state"],
+            ["parameter", "state_indices_addr"],
+            ["parameter", "state_slot_stride"],
+            ["parameter", "use_state_indices"],
+            ["buffer", "initial_state_f32"],
+            ["buffer", "final_state_f32"],
+            ["parameter", "state_checkpoints_addr"],
+            ["parameter", "checkpoint_cu_starts_addr"],
+            ["buffer", "beta_active_out"],
+            ["parameter", "beta_token_stride"],
+            ["parameter", "g_token_stride"],
+            ["parameter", "checkpoint_every_n_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "scale"],
+            ["parameter", "lower_bound"],
+            ["workspace", "tensor_maps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a"],
+    },
     "cake_kda_prefill_e37381d75cc3b9e271d7": {
         "sources": [
             "csrc/kda/prefill/cake_kda_prefill_e37381d75cc3b9e271d7_kernel.cu",
@@ -5498,6 +5548,21 @@ _RENDERED_WORK_BIN_TURN_SHORT_ROUTES: dict[str, dict[str, str]] = {
 _RENDERED_WORK_BIN_MIX_LONG_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_d692d2b532922f2ee845",
+    },
+    "sm_103a": {},
+}
+
+# architecture -> shipped module -> generated hybrid build of the owner/helper
+# build of an M64 value-split module (``_RENDERED_M64_OWNER_HELPER_ROUTES``):
+# one helper CTA per task prepares the chunks c % 8 >= 4 and the task's two
+# value-half owner CTAs prepare the others and copy the helper's from the
+# global ring.  The runtime launches it cooperatively, grid (tasks, 3), on the
+# equal-length launches of a one-helper row of its owner/helper rule that would
+# take the pair-share build; every other launch keeps its pair-share or routed
+# program.
+_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "cake_kda_bf16_5535e79c76a18330f6f1": "cake_kda_prefill_df6033e751431456c54b",
     },
     "sm_103a": {},
 }

@@ -368,10 +368,15 @@ install_sccache() {
 # Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
+# Launchers and ACTIVE are enabled only after startup and zero-stats succeed.
+# Each setup starts a new stats session, discarding inherited runtime state.
 setup_sccache() {
   local key_prefix=$1
   local source_root=$2
   local sccache_arch
+  local setup_status
+  unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
+  unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
   if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
@@ -390,8 +395,6 @@ setup_sccache() {
   # /proc system-wide, including daemon-owned compilers, and docker --rm is the
   # final containment boundary if the watchdog cannot signal one of them.
   unset SCCACHE_CLIENT_SIDE
-  export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -408,10 +411,20 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  # Explicit return: a caller that guards setup_sccache with `if` runs it with
-  # errexit off, and must still see a failed startup.
-  sccache --start-server || return $?
-  sccache --zero-stats
+  # Explicit returns: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see failed control commands.
+  sccache --start-server || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  sccache --zero-stats || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  export FLASHINFER_CXX_LAUNCHER="sccache"
+  export FLASHINFER_NVCC_LAUNCHER="sccache"
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
@@ -442,6 +455,13 @@ setup_sccache() {
       printf 'cuda_version=%s\n' "${CUDA_VERSION:-unknown}"
       printf 'cuda_arch_list=%s\n' "${FLASHINFER_CUDA_ARCH_LIST:-unknown}"
     } > "${SCCACHE_STATS_DIR}/sccache-metadata.txt"
+  fi
+}
+
+# Best-effort cleanup must not mask the original setup failure.
+stop_sccache_after_setup_failure() {
+  if ! run_sccache_control_command --stop-server >/dev/null 2>&1; then
+    echo "WARNING: Failed to stop sccache after setup failure; daemon may remain running" >&2
   fi
 }
 
