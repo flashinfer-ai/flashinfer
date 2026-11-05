@@ -394,12 +394,14 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: count on a 148-SM B200 part; the deterministic plan of these rows is the same on 148 and 152 SMs).  sm_100a
 #: ``5120 -> 32`` BF16 runs the deterministic program from 49153 tokens: there the split program's output missed the
 #: BF16 budget for one of 10 seeds and the deterministic program's met it on every seed (provisional: 36865 to 57345
-#: tokens are measured next).  The sm_103a BF16 entries of ``5120 -> 32``, ``5120 -> 48``, ``5120 -> 64`` and
-#: ``5120 -> 128`` start at 61442 tokens: their split program's output met the BF16 budget on every seed at 32768 tokens
-#: (30 seeds on two parts) and at 32769 tokens (10 seeds), and missed it on every seed at 65536 tokens (30 seeds on two
-#: parts); provisional: the token counts from 32770 to 65535 were not measured with 10 seeds yet.  Unmeasured token
-#: counts keep the verdict: below 512, above 65536 (except the rows with open-ended entries), between two measured token
-#: counts with different outcomes, and on parts with fewer than 152 SMs (148-SM parts: their own entries in
+#: tokens are measured next).  The sm_103a BF16 entries of ``5120 -> 32``, ``5120 -> 64`` and ``5120 -> 128`` start at
+#: 45058 tokens and that of ``5120 -> 48`` at 49153: their split program's output met the BF16 budget on every seed at
+#: 32768 tokens (30 seeds on two parts) and at every measured token count up to 45057 tokens (``5120 -> 48``: 49152) on
+#: a 152-SM GB300 part (10 seeds, 20 runs each), and missed it for some seed at the next measured token count, 47105
+#: (``5120 -> 48``: 49153), where the deterministic program's output missed it too; the row keeps the deterministic
+#: program from there up (the split program misses it on every seed at 65536 tokens, 30 seeds on two parts).  Unmeasured
+#: token counts keep the verdict: below 512, above 65536 (except the rows with open-ended entries), between two measured
+#: token counts with different outcomes, and on parts with fewer than 152 SMs (148-SM parts: their own entries in
 #: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The sm_107a entries are single token counts of the deterministic
 #: package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for ``4096 -> 1024``), which give the
 #: row a faster deterministic plan there, and 16231 tokens of ``5120 -> 1024`` BF16 on 216 SMs (measured in the same
@@ -444,13 +446,13 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_103a", 1, 4096, 32, "f32"): ((152, 512, 512), (152, 32768, None)),
     ("sm_103a", 1, 4096, 48, "bf16"): ((152, 512, 512), (152, 32768, None)),
     ("sm_103a", 1, 4096, 48, "f32"): ((152, 512, 512), (152, 32768, None)),
-    ("sm_103a", 1, 5120, 32, "bf16"): ((152, 512, 512), (152, 61442, None)),
+    ("sm_103a", 1, 5120, 32, "bf16"): ((152, 512, 512), (152, 45058, None)),
     ("sm_103a", 1, 5120, 32, "f32"): ((152, 512, 512),),
-    ("sm_103a", 1, 5120, 48, "bf16"): ((152, 512, 2048), (152, 61442, None)),
+    ("sm_103a", 1, 5120, 48, "bf16"): ((152, 512, 2048), (152, 49153, None)),
     ("sm_103a", 1, 5120, 48, "f32"): ((152, 512, 2048),),
-    ("sm_103a", 1, 5120, 64, "bf16"): ((152, 512, 2048), (152, 61442, None)),
+    ("sm_103a", 1, 5120, 64, "bf16"): ((152, 512, 2048), (152, 45058, None)),
     ("sm_103a", 1, 5120, 64, "f32"): ((152, 512, 2048),),
-    ("sm_103a", 1, 5120, 128, "bf16"): ((152, 512, 8192), (152, 61442, None)),
+    ("sm_103a", 1, 5120, 128, "bf16"): ((152, 512, 8192), (152, 45058, None)),
     ("sm_103a", 1, 5120, 128, "f32"): ((152, 512, 4096),),
     ("sm_103a", 1, 6144, 32, "bf16"): ((152, 512, 512),),
     ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),

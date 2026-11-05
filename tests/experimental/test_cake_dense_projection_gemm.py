@@ -1074,9 +1074,9 @@ def test_k1_excluded_token_counts(no_k1_chains):
     assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
     assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
     assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
-    for T in (32768, 61441):
+    for T in (32768, 45057):
         assert cake_backend.k1_plan(K=T, sm_count=152, **kw) == (64, 2), T
-    assert cake_backend.k1_plan(K=61442, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=45058, sm_count=152, **kw) is None
     assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) is None
     assert cake_backend.k1_plan(K=131072, sm_count=149, **kw) == (64, 2)
     # a row without an entry keeps its verdict at every token count its split count fits
