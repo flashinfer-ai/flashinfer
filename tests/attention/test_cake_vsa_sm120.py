@@ -53,19 +53,35 @@ GROUPS = {"vsa_sm120_blk64": 1, "vsa_sm120_blk64_pair": 2}
 @pytest.mark.parametrize("group_size", [1, 4])
 @pytest.mark.parametrize("num_sms", [1, 7, 188])
 @pytest.mark.parametrize("kernel", [None, *KERNELS])
-def test_work_table_covers_every_row(group_size, num_sms, kernel):
+@pytest.mark.parametrize("pack", [None, False, True])
+def test_work_table_covers_every_row(group_size, num_sms, kernel, pack):
     generator = torch.Generator().manual_seed(group_size * 100 + num_sms)
     num_heads, mb, nb = 8, 9, 40
     counts = _random_counts(num_heads, mb, nb, generator)
     first = (torch.cumsum(counts.reshape(-1), 0) - counts.reshape(-1)).view_as(counts)
-    plan = cake_vsa_sm120.build_work(counts, first, group_size, num_sms, kernel=kernel)
+    plan = cake_vsa_sm120.build_work(
+        counts, first, group_size, num_sms, kernel=kernel, pack=pack
+    )
+    uniform = cake_vsa_sm120.build_work(
+        counts, first, group_size, num_sms, kernel=kernel, pack=False
+    )
     work = plan["work"].long()
+    packed = not torch.equal(plan["work"], uniform["work"])
+    # Packing only below _PACK_ROWS rows per virtual CTA (72 rows: on 188 SMs).
+    assert not packed or num_heads * mb < cake_vsa_sm120._PACK_ROWS * 2 * num_sms
     assert plan["total_work"] == work.shape[0]
     assert plan["kernel"] == kernel or (kernel is None and plan["kernel"] in KERNELS)
     ctas = 2 * num_sms // GROUPS[plan["kernel"]]
     assert plan["grid"] == (max(1, min(work.shape[0], ctas)), 1, 1)
     sizes = work[:, 3] - work[:, 2]
-    assert torch.all(sizes[:-1] >= sizes[1:]), "items are ordered longest first"
+    if packed and pack is None:
+        rows = [plan["work"].tolist(), uniform["work"].tolist()]
+        resident = 2 * num_sms
+        assert cake_vsa_sm120._pack_time(
+            rows[0], resident, plan["kernel"]
+        ) < cake_vsa_sm120._pack_time(rows[1], resident, uniform["kernel"])
+    if not packed:
+        assert torch.all(sizes[:-1] >= sizes[1:]), "items are ordered longest first"
     groups, slots = set(), set()
     for h in range(num_heads):
         for b in range(mb):
@@ -77,7 +93,7 @@ def test_work_table_covers_every_row(group_size, num_sms, kernel):
             parts = rows.shape[0]
             assert torch.all(rows[:, 5] == parts)
             part_sizes = rows[:, 3] - rows[:, 2]
-            assert int(part_sizes.max() - part_sizes.min()) <= 1
+            assert packed or int(part_sizes.max() - part_sizes.min()) <= 1
             if parts == 1:
                 assert int(rows[0, 4]) == -1
                 continue
@@ -101,6 +117,45 @@ def test_plan_picks_the_kernel_by_its_cost():
             counts
         )
         assert cake_vsa_sm120.build_work(counts, first, 1, 188)["kernel"] == kernel
+
+
+def _blocks(plan, resident):
+    """The KV blocks each of ``resident`` virtual CTAs runs under ``plan``."""
+    work = plan["work"].long()
+    grid = max(1, min(work.shape[0], resident))
+    return torch.zeros(resident, dtype=torch.int64).index_add_(
+        0, torch.arange(work.shape[0]) % grid, work[:, 3] - work[:, 2]
+    )
+
+
+@pytest.mark.parametrize("rows_per_head", [32, 64])
+def test_packing_fills_the_last_wave(rows_per_head):
+    """Equal rows of 32 blocks, 0.68 and 1.36 rows per virtual CTA on 188 SMs:
+    the packed plan cuts rows so that every virtual CTA has work and the
+    longest one has fewer blocks than in the uniform plan, deterministically."""
+    counts = torch.full((8, rows_per_head), 32, dtype=torch.int64)
+    first = (torch.cumsum(counts.reshape(-1), 0) - counts.reshape(-1)).view_as(counts)
+    plans = [cake_vsa_sm120.build_work(counts, first, 1, 188) for _ in range(2)]
+    uniform = cake_vsa_sm120.build_work(counts, first, 1, 188, pack=False)
+    assert torch.equal(plans[0]["work"], plans[1]["work"])
+    work = plans[0]["work"].long()
+    assert uniform["total_work"] == 8 * rows_per_head < work.shape[0]
+    assert int((work[:, 4] >= 0).sum()) > 0, "rows are cut"
+    packed_blocks, uniform_blocks = _blocks(plans[0], 376), _blocks(uniform, 376)
+    assert int(packed_blocks.min()) > 0
+    assert int(packed_blocks.max()) < int(uniform_blocks.max())
+    # K and V of up to the rows' _PACK_KV_BLOCKS limit over the 8 KV heads,
+    # and beyond.
+    limit = cake_vsa_sm120._PACK_KV_BLOCKS[8 * rows_per_head >= 376] // 8
+    for num_kv_blocks, expected in (
+        (32, plans[0]),
+        (limit, plans[0]),
+        (limit + 1, uniform),
+    ):
+        plan = cake_vsa_sm120.build_work(
+            counts, first, 1, 188, num_kv_blocks=num_kv_blocks
+        )
+        assert torch.equal(plan["work"], expected["work"])
 
 
 def _bsr(mb, nb, generator):
@@ -259,11 +314,13 @@ def test_ragged_split_rows(dtype, hq, hkv):
 
 @requires_sm12x
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_sms,part", [(7, 2), (None, None)])
-def test_both_kernels_give_the_same_bits(dtype, num_sms, part):
+@pytest.mark.parametrize(
+    "num_sms,part,pack", [(7, 2, None), (None, None, False), (None, None, True)]
+)
+def test_both_kernels_give_the_same_bits(dtype, num_sms, part, pack):
     """One plan's work table on either kernel (several waves of split rows on 7
-    SMs' worth of virtual CTAs, and the device's own plan): bitwise-equal out
-    and lse, within the FP32 reference's tolerance."""
+    SMs' worth of virtual CTAs, and the device's own plan, uniform and packed):
+    bitwise-equal out and lse, within the FP32 reference's tolerance."""
     device = torch.device("cuda")
     generator = torch.Generator().manual_seed(11)
     hq, hkv, m, n = 8, 2, 1024, 4096
@@ -274,10 +331,15 @@ def test_both_kernels_give_the_same_bits(dtype, num_sms, part):
     if num_sms is None:
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     got = {}
+    table = cake_vsa_sm120.plan_block_mask(
+        block_mask, hq // hkv, num_sms, device, part=part, kernel=KERNELS[0], pack=pack
+    )
+    if pack:
+        assert table["total_work"] > hq * (m // R), "the packed plan cuts rows"
     for kernel in KERNELS:
-        plan = cake_vsa_sm120.plan_block_mask(
-            block_mask, hq // hkv, num_sms, device, part=part, kernel=kernel
-        )
+        ctas = 2 * num_sms // GROUPS[kernel]
+        grid = (max(1, min(table["total_work"], ctas)), 1, 1)
+        plan = dict(table, kernel=kernel, grid=grid)
         got[kernel] = cake_vsa_sm120.run(plan, q, k, v, None, None, None, True)
         assert torch.equal(
             plan["split_counters"], torch.zeros_like(plan["split_counters"])
