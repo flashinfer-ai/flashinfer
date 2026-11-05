@@ -41,6 +41,7 @@ import os
 import random
 import threading
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -55,21 +56,16 @@ HEAD_DIM = 128
 #: Elementwise tolerance against the reference below, as
 #: ``abs(got - ref) <= ATOL + RTOL * abs(ref)``.
 #:
-#: Output and final state get their own numbers on purpose, and the state's are
-#: looser for a reason that is worth writing down rather than discovering
-#: again. The reference here is *contract*-shaped: it walks tokens one at a
-#: time and rounds to bfloat16 where the public ABI does. The kernels are
-#: chunk-shaped: they accumulate a chunk in float32 and round at the chunk
-#: boundary. Both are correct implementations of the same contract and they do
-#: not associate identically, so a state element that has absorbed 128 tokens
-#: can land one or two bfloat16 ULP apart -- measured at 3.9e-3 on ~5 of
-#: 196608 elements at magnitude 0.26, which is exactly 2 ULP there.
-#:
-#: The numbers below admit about three times that and nothing more. They are
-#: not a way to make a failure go away: the same kernels agree *bitwise* with
-#: the standalone implementation used during validation, and their float64
-#: error is identical to that implementation's, so anything this would newly
-#: catch is a change in the kernel rather than in the rounding.
+#: Output and final state get their own numbers, and the state's are looser.
+#: The reference is token-serial: one rank-1 update per token. The kernels are
+#: chunk-parallel: each 16-token chunk's update is formed at once, in the WY/UT
+#: reordering with a blockwise inverse. Both hold the state in bfloat16 between
+#: steps and do a step's arithmetic in float32, but a step is one token for the
+#: reference and one chunk for the kernels, so the same contract is associated
+#: and rounded differently and a state element that has absorbed many tokens
+#: can land a few bfloat16 ULP from the reference. The numbers below admit a
+#: small multiple of that and nothing more: a miss here is a change in the
+#: kernel, not in the rounding.
 OUTPUT_RTOL, OUTPUT_ATOL = 1.0e-2, 1.0e-3
 STATE_RTOL, STATE_ATOL = 2.0e-2, 6.0e-3
 
@@ -295,7 +291,7 @@ def _call(inputs, **overrides):
 
 @pytest.fixture
 def as_sm120_host(monkeypatch):
-    """Make CPU tensors look like SM120 CUDA tensors to the predicate.
+    """Make ``_eligibility_kwargs`` tensors look like SM120 CUDA tensors.
 
     Everything the rejection reason checks after the device is structural and
     device-independent, but the device check runs first -- so without this the
@@ -314,8 +310,26 @@ def as_sm120_host(monkeypatch):
             and tensor.is_contiguous()
         ),
     )
-    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setitem(globals(), "_HOST_AS_CUDA", True)
     return kda_prefill
+
+
+class _HostAsCudaTensor(torch.Tensor):
+    """A CPU tensor that reports ``is_cuda``, for the host-only predicate tests.
+
+    Scoped to the tensors it wraps: the alternative, patching
+    ``torch.Tensor.is_cuda`` for the duration of a test, lies to every tensor
+    in the process.
+    """
+
+    @property
+    def is_cuda(self):  # type: ignore[override]
+        return True
+
+
+#: Set by the ``as_sm120_host`` fixture so ``_eligibility_kwargs`` hands out
+#: ``_HostAsCudaTensor`` instances instead of plain CPU tensors.
+_HOST_AS_CUDA = False
 
 
 def _eligibility_kwargs(**overrides):
@@ -355,6 +369,15 @@ def _eligibility_kwargs(**overrides):
         checkpoint_every_n_tokens=0,
     )
     kwargs.update(overrides)
+    if _HOST_AS_CUDA:
+        kwargs = {
+            key: (
+                value.as_subclass(_HostAsCudaTensor)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for key, value in kwargs.items()
+        }
     return kwargs
 
 
@@ -583,14 +606,18 @@ def test_sm120_facade_imports_without_device_code():
     module-level ``from . import decomp`` would undo it and nothing else in the
     suite would notice.
     """
+    import subprocess
     import sys
 
-    from flashinfer import kda_kernels
-
-    assert hasattr(kda_kernels, "can_implement_kda_prefill_sm120")
-    loaded = {name for name in sys.modules if "sm120_prefill" in name}
-    assert "flashinfer.kda_kernels.sm120_prefill.decomp" not in loaded
-    assert "flashinfer.kda_kernels.sm120_prefill.fused" not in loaded
+    # A fresh interpreter, so an earlier test in this process that imported a
+    # device module cannot make this one fail or pass by accident.
+    probe = (
+        "import sys, flashinfer.kda_kernels as k;"
+        "assert hasattr(k, 'can_implement_kda_prefill_sm120');"
+        "loaded = [m for m in sys.modules if 'sm120_prefill' in m];"
+        "assert not any(m.endswith(('.decomp', '.fused')) for m in loaded), loaded"
+    )
+    subprocess.run([sys.executable, "-c", probe], check=True)
 
 
 def test_sm120_can_implement_is_fail_closed_on_cpu():
@@ -612,6 +639,9 @@ def test_sm120_variant_policy_reports_tuned_or_fallback():
 
     tuned = sm120_prefill.describe_variant_policy(156)
     assert "measured on this device" in tuned
+    assert "equal lengths and CTA>=96" in tuned
+    assert "T<=8192" in tuned
+    assert "CTA>=128" in tuned
 
     fallback = sm120_prefill.describe_variant_policy(999)
     assert "FALLBACK" in fallback
@@ -622,24 +652,37 @@ def test_sm120_variant_choice_is_a_pure_function_of_shape():
     sm120_prefill = _sm120_prefill()
     choose = sm120_prefill.choose_variant
 
-    # Every measured row, at the CTA value on each side of its own threshold.
-    # Written as a table rather than as prose assertions because the previous
-    # version described `H >= 96 or T <= 48 or CTA >= 512` -- thresholds two
-    # re-fits out of date -- and still passed, since none of its cases sat near
-    # a boundary that had moved.
+    # Every row, at the CTA value on each side of its own threshold. Written
+    # as a table of boundary cases rather than prose assertions: cases far
+    # from the lines keep passing after the lines move.
     #
-    # (sm_count, cta_threshold): the profile's own CTA line.
-    for sm_count, threshold in ((110, 128), (156, 144), (188, 144)):
+    # (sm_count, uniform, cta_threshold, tokens_threshold).
+    for sm_count, uniform, threshold, tokens in (
+        (110, True, 96, 130),
+        (110, False, 96, 130),
+        (156, True, 96, 130),
+        (156, False, 128, 130),
+        (188, True, 96, 130),
+        (188, False, 128, 130),
+    ):
         # CTA = 2 * batch * heads, so batch = threshold // (2 * heads) puts the
         # shape exactly on the line, and one less batch puts it just under.
         heads = 8
         on = threshold // (2 * heads)
-        assert choose(on, heads, 1024, sm_count=sm_count) == "fused", sm_count
-        assert choose(on - 1, heads, 1024, sm_count=sm_count) == "decomp", sm_count
+        assert choose(on, heads, 1024, sm_count=sm_count, uniform=uniform) == "fused", (
+            sm_count
+        )
+        assert (
+            choose(on - 1, heads, 1024, sm_count=sm_count, uniform=uniform) == "decomp"
+        ), sm_count
 
-        # The tokens term is 32 on every row, and it fires independently of CTA.
-        assert choose(1, 1, 32, sm_count=sm_count) == "fused", sm_count
-        assert choose(1, 1, 33, sm_count=sm_count) == "decomp", sm_count
+        # The tokens term fires independently of CTA.
+        assert choose(1, 1, tokens, sm_count=sm_count, uniform=uniform) == "fused", (
+            sm_count
+        )
+        assert (
+            choose(1, 1, tokens + 1, sm_count=sm_count, uniform=uniform) == "decomp"
+        ), sm_count
 
         # No row has a heads term, and it cannot be tested through `choose`:
         # CTA is 2 * batch * heads, so the smallest CTA any H >= 96 shape can
@@ -647,20 +690,69 @@ def test_sm120_variant_choice_is_a_pure_function_of_shape():
         # the term is None -- it could never fire -- so assert the field.
         assert sm120_prefill.AUTO_PROFILES[sm_count].heads is None, sm_count
 
-    # The two larger parts sit at 144 and the 110-SM part at 128, so CTA 128
-    # separates them.  This is the case the re-fit turned on, and the one a
-    # single shared row would get wrong.
-    assert choose(8, 8, 1024, sm_count=110) == "fused"  # CTA 128 >= 128
-    assert choose(8, 8, 1024, sm_count=156) == "decomp"  # CTA 128 < 144
-    assert choose(8, 8, 1024, sm_count=188) == "decomp"
+    # CTA 128 goes to fused on every row. Ragged CTA 112 is where rows differ:
+    # fused on the 110-SM row, decomp on the other two, which is what keeps
+    # the table at three rows rather than one.
+    for sm_count in (110, 156, 188):
+        assert choose(8, 8, 1024, sm_count=sm_count) == "fused", sm_count  # CTA 128
+    assert choose(7, 8, 1024, sm_count=110, uniform=False) == "fused"
+    assert choose(7, 8, 1024, sm_count=156, uniform=False) == "decomp"
+    assert choose(7, 8, 1024, sm_count=188, uniform=False) == "decomp"
 
-    # CTA 144 is the shape FlashInfer benchmarks (six sequences, H=12) and the
-    # reason the threshold moved off 192.  All three rows must take it now.
+    # CTA 144 (six sequences, H=12) is over every row's line.
     for sm_count in (110, 156, 188):
         assert choose(6, 12, 8192, sm_count=sm_count) == "fused", sm_count
 
     # An unmeasured SM count falls back rather than extrapolating.
     assert choose(1, 96, 1024, sm_count=999) == choose(1, 96, 1024, sm_count=156)
+
+
+@pytest.mark.parametrize("sm_count", [110, 156, 188, 999])
+def test_sm120_uniform_cta_length_boundary(sm_count):
+    """The 156-SM line reverts only the newly admitted grids above 8K."""
+    choose = _sm120_prefill().choose_variant
+    for tokens in (8191, 8192, 8193, 16384, 32768):
+        expected = "decomp" if sm_count in (156, 999) and tokens > 8192 else "fused"
+        assert choose(1, 48, tokens, sm_count=sm_count) == expected
+        assert choose(4, 12, tokens, sm_count=sm_count) == expected
+        # The original wide-grid threshold remains independent of length.
+        assert choose(1, 64, tokens, sm_count=sm_count) == "fused"
+        # Ragged grids never use the lower line.
+        expected_ragged = "fused" if sm_count == 110 else "decomp"
+        assert (
+            choose(4, 12, tokens, sm_count=sm_count, uniform=False) == expected_ragged
+        )
+
+
+@pytest.mark.parametrize("sm_count", [110, 156, 188, 999])
+@pytest.mark.parametrize(
+    "lengths,expected",
+    [
+        ((4096,) * 4, "fused"),
+        ((4096, 1024, 65, 17), "decomp"),
+        ((4096, 4096, 4096, 0), "decomp"),
+        ((130, 1, 0, 0), "fused"),
+    ],
+)
+def test_sm120_variant_uses_uniform_length_metadata(
+    monkeypatch, sm_count, lengths, expected
+):
+    """Equal packed batches use the new line, but long tails keep the old one."""
+    sm120_prefill = _sm120_prefill()
+    monkeypatch.setattr(sm120_prefill, "_sm_count", lambda index: sm_count)
+    offsets = SimpleNamespace(
+        lengths=lengths,
+        sequences=len(lengths),
+        total_tokens=sum(lengths),
+        longest_sequence=max(lengths),
+    )
+    info = SimpleNamespace(batch=1, heads=12, tokens_per_sequence=sum(lengths))
+    if sm_count == 110:
+        expected = "fused"  # Both layouts use the 110-SM row's 96-CTA threshold.
+    assert (
+        sm120_prefill._resolve_variant("auto", info, offsets, True, None, device=0)
+        == expected
+    )
 
 
 def test_sm120_bound_workspace_rejects_an_explicit_variant_change():
@@ -756,15 +848,13 @@ def test_sm120_resolved_fast_path_rejects_rebound_inference_storage(monkeypatch)
 def test_sm120_flat_output_range_is_checked_on_the_host():
     """The flat output is bounded before a launch, not after it.
 
-    Two limits meet one element apart. The tail store writes a partial chunk
-    element-wise through ``(token * H + head) * DV + d``, which the device
-    builds and consumes as INT32, so it needs the largest *index* -- ``T_total *
-    H * DV - 1`` -- to fit. The DSL packs the flat view's extent as INT32 when
-    it crosses into the compiled entry, so it needs the *count*. The count is
-    therefore the bound, and it is the one asserted here: on hardware the shape
-    one element inside the index limit does not launch, it raises
-    ``OverflowError: Value overflow: 2147483648 exceeds range of l`` out of
-    ``build_memref_desc``, which names neither the tensor nor the shape.
+    Two limits meet one element apart. The tail store indexes the flat output
+    as ``(token * H + head) * DV + d`` in INT32, so the largest *index* must
+    fit; the DSL packs the flat view's extent as INT32 at the compiled entry,
+    so the *count* must fit. The count is the tighter bound and the one
+    asserted here: the shape one element inside the index limit does not
+    launch, it fails inside ``build_memref_desc`` with an overflow error that
+    names neither the tensor nor the shape.
     """
     from flashinfer.kda_kernels.sm120_prefill import runtime
 
@@ -787,10 +877,10 @@ def test_sm120_flat_output_range_is_checked_on_the_host():
 def test_sm120_variant_policy_reads_the_input_device(monkeypatch):
     """A host holding two CC 12.0 parts must not drive both from one row.
 
-    The measured rows disagree at CTA 128: the 110-SM part takes the fused
-    kernel there and the 188-SM part takes the decomposed one. Reading device 0
-    would apply the wrong row to every call on the other card, and the only
-    symptom is a time nobody can attribute.
+    The rows differ at ragged CTA 112: the 110-SM row takes the fused kernel there
+    and the 188-SM row takes the decomposed one. Reading device 0 would apply
+    the wrong row to every call on the other card, and the only symptom is a
+    time nobody can attribute.
     """
     sm120_prefill = _sm120_prefill()
 
@@ -806,12 +896,17 @@ def test_sm120_variant_policy_reads_the_input_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     try:
         choose = sm120_prefill.choose_variant
-        # CTA = 2 * batch * heads = 128: on the 110-SM row's threshold and
+        # CTA = 2 * batch * heads = 112: over the 110-SM row's threshold and
         # under the 188-SM row's.
-        assert choose(8, 8, 1024, device=torch.device("cuda", 0)) == "fused"
-        assert choose(8, 8, 1024, device=torch.device("cuda", 1)) == "decomp"
+        assert (
+            choose(7, 8, 1024, device=torch.device("cuda", 0), uniform=False) == "fused"
+        )
+        assert (
+            choose(7, 8, 1024, device=torch.device("cuda", 1), uniform=False)
+            == "decomp"
+        )
         # No device named still means the current one.
-        assert choose(8, 8, 1024) == "fused"
+        assert choose(7, 8, 1024, uniform=False) == "fused"
         # And the policy line names the card it actually read.
         assert "188 SMs" in sm120_prefill.describe_variant_policy(
             device=torch.device("cuda", 1)
@@ -824,16 +919,14 @@ def test_sm120_pinned_staging_carries_the_event_it_reuses_against():
     """A descriptor build may not refill a buffer whose transfer is pending.
 
     ``upload_bytes`` copies out of one pinned buffer per size with
-    ``non_blocking=True``, so the transfer is queued rather than finished when
-    it returns. Two cold builds of one size are ordinary rather than a corner --
-    the size is a function of the descriptor count, so any two cold calls of a
-    shape collide -- and without the event the second one's host-side refill
-    overwrites bytes the first one's DMA has not read yet, which reaches the
-    device as a descriptor made of two.
+    ``non_blocking=True``, so the transfer is still queued when it returns, and
+    two cold builds of one size are ordinary: the size is a function of the
+    descriptor count. Without the event the second refill overwrites bytes the
+    first DMA has not read yet, which reaches the device as a descriptor made
+    of two.
 
-    The event is what that costs, so the event is what is asserted: the byte
-    comparison below would pass on the racing version too, most of the time,
-    which is exactly why it cannot be the guard.
+    The event is what is asserted: the byte comparison below would pass on the
+    racing version too, most of the time, which is why it cannot be the guard.
     """
     _skip_if_not_sm120()
     from flashinfer.kda_kernels.sm120_prefill import runtime
@@ -896,16 +989,13 @@ def test_sm120_call_memos_hold_weak_references():
     """The three per-call memos may not be what keeps a caller's buffers alive.
 
     Each is keyed on tensor identity, and the obvious way to re-check that
-    identity on the next call is to hold the tensors. Holding them puts one
-    whole activation set -- q, k, v, g and out -- into steady-state device
-    memory and keeps those blocks away from the caching allocator until the
-    next call replaces them. The LRU behind each memo already used weak
-    references; the fast paths in the facade and in both variants did not.
+    identity on the next call is to hold the tensors -- which would pin one
+    whole activation set (q, k, v, g and out) in device memory until the next
+    call replaces it.
 
-    Structural rather than an allocator measurement, and deliberately so: a
-    live plan legitimately retains the buffers its descriptors and views
-    address, at the C level where ``gc`` cannot see it, so a byte count here
-    would be measuring the plan cache instead of these memos.
+    Checked structurally rather than by allocator measurement: a live plan
+    legitimately retains the buffers its descriptors and views address, so a
+    byte count here would be measuring the plan cache instead of these memos.
     """
     _skip_if_not_sm120()
     sm120_prefill = _sm120_prefill()
@@ -915,16 +1005,379 @@ def test_sm120_call_memos_hold_weak_references():
 
     memos = {"facade": sm120_prefill._RESOLVED_LAST}
     for name, module in sm120_prefill._MODULES.items():
-        memos[name] = module._LAST
+        memos[name] = module._MEMO.last
     assert any(memo is not None for memo in memos.values()), "no memo was written"
 
     for name, memo in memos.items():
         if memo is None:
             continue
         for held in memo[0]:
-            assert held is None or isinstance(held, weakref.ref), (
-                f"the {name} memo holds a strong reference: {type(held).__name__}"
-            )
+            assert (
+                held is None
+                or held is sm120_prefill._BY_ADDRESS
+                or isinstance(held, weakref.ref)
+            ), f"the {name} memo holds a strong reference: {type(held).__name__}"
+
+    # ``_BY_ADDRESS`` is the one permitted non-weakref, and it stands for a
+    # buffer this call allocated for itself -- verified by address, so it is not
+    # a strong reference either. It may only appear in the facade's memo, which
+    # is the only one told which slots the call owns.
+    for name, memo in memos.items():
+        if memo is None or name == "facade":
+            continue
+        assert sm120_prefill._BY_ADDRESS not in memo[0], (
+            f"the {name} memo claims a private slot it was never told about"
+        )
+
+
+@torch.inference_mode()
+def test_sm120_private_final_state_keeps_the_call_memo_warm(monkeypatch):
+    """A state buffer allocated per call must not cost a plan rebuild per call.
+
+    Without an ``initial_state`` the adapter allocates the final state itself,
+    so it is a new Python object on every call even when the caching allocator
+    hands back the same block. Verifying that slot by object identity -- right
+    for a caller-supplied tensor, where a recycled address could otherwise
+    become a stale plan hit -- would turn every warm call into a cold one, and
+    the fresh object's weakref callback would purge the LRU entry as it died.
+    The rebuild is invisible next to a long kernel and most of the call at the
+    short shapes this backend is fastest on.
+
+    ``output`` is supplied because the same exemption cannot apply to it: a
+    live plan retains the buffer its descriptors address, so a backend-allocated
+    output is still alive when the next call asks for one and never gets the
+    same block back. That is why the out slot is not marked private.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+
+    inputs = _make_inputs_sm120(seq_lens=[64], num_heads=4, packed=False, seed=SEED)
+    overrides = {
+        "output_final_state": True,
+        "output": torch.empty_like(inputs["v"]),
+    }
+
+    # The first call may compile and upload descriptors, and those allocations
+    # can move where the caching allocator places the next private state.  The
+    # memo's promise is about the calls after it.
+    _call(inputs, **overrides)
+    torch.cuda.synchronize()
+    gc.collect()
+
+    rebuilds = []
+    original = sm120_prefill._remember_call
+
+    def spy(*args, **kwargs):
+        rebuilds.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sm120_prefill, "_remember_call", spy)
+    # The slot is verified by address, so a rebuild is legitimate only when the
+    # allocator placed the private state somewhere new; count those moves and
+    # hold the memo to them rather than to the allocator's habits.
+    _, previous = _call(inputs, **overrides)
+    moves = 0
+    for _ in range(4):
+        _, state = _call(inputs, **overrides)
+        if state.data_ptr() != previous.data_ptr():
+            moves += 1
+        previous = state
+
+    assert len(rebuilds) <= moves, (
+        "the call memo rebuilt its plan on a warm call: "
+        f"{len(rebuilds)} rebuilds across five warm calls whose private state "
+        f"moved {moves} time(s)"
+    )
+
+
+def _fresh_decomp_inputs(seed: int, initial_state: bool = True):
+    """A shape the policy routes to the decomposed variant on every row.
+
+    B=1, T=512: eight recurrence CTAs and a sequence well over the tokens
+    threshold, so neither the CTA nor the tokens term picks the fused kernel.
+    """
+    return _make_inputs_sm120(
+        seq_lens=[512],
+        num_heads=4,
+        packed=False,
+        initial_state=initial_state,
+        seed=seed,
+    )
+
+
+@torch.inference_mode()
+def test_sm120_fresh_buffers_repoint_the_plan_instead_of_rebuilding(monkeypatch):
+    """New buffers of a known shape re-point the memoized plan, not rebuild it.
+
+    A serving loop hands the backend fresh activations, a gathered state and an
+    output view on every call, each a new object at a new address, so a memo
+    keyed on identity would miss and rebuild the plan every time.  A plan built
+    without a workspace is memoized by shape and re-pointed at the new
+    addresses instead, and every re-pointed call has to compute the answer for
+    *its* buffers.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    decomp = sm120_prefill._variant_module("decomp")
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+
+    builds: list = []
+    repoints: list = []
+    original_build = decomp._build_plan
+    original_rebind = decomp.rebind
+
+    def build_spy(*args, **kwargs):
+        builds.append(None)
+        return original_build(*args, **kwargs)
+
+    def rebind_spy(*args, **kwargs):
+        repoints.append(None)
+        return original_rebind(*args, **kwargs)
+
+    monkeypatch.setattr(decomp, "_build_plan", build_spy)
+    monkeypatch.setattr(decomp, "rebind", rebind_spy)
+
+    for call in range(4):
+        inputs = _fresh_decomp_inputs(seed=SEED + 100 + call)
+        expected_out, expected_state = _reference_kda_prefill(inputs)
+        out, state = _call(
+            inputs, output=torch.empty_like(inputs["v"]), output_final_state=True
+        )
+        torch.cuda.synchronize()
+        _assert_elementwise(
+            out, expected_out, f"call {call} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        _assert_elementwise(
+            state,
+            expected_state,
+            f"call {call} final_state",
+            rtol=STATE_RTOL,
+            atol=STATE_ATOL,
+        )
+
+    assert len(builds) == 1, (
+        f"the plan was built {len(builds)} times for four calls of one shape"
+    )
+    assert len(repoints) >= 3, "the later calls did not go through the re-point path"
+    assert len(sm120_prefill._SHAPE_PLANS) == 1
+
+
+@torch.inference_mode()
+def test_sm120_equal_offsets_in_a_new_tensor_keep_the_plan(monkeypatch):
+    """A fresh ``cu_seqlens`` with the same content resolves to the memoized plan.
+
+    A scheduler allocates new offsets every step and hands the same tensor to
+    every layer, and the content is identical for every step of one prefill.
+    Matching offsets by content keeps the plan across steps for one
+    device-to-host read per new tensor.  Short sequences route to the fused
+    variant, whose plans are keyed by identity, so this covers the identity
+    memo's content path rather than re-pointing.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    fused = sm120_prefill._variant_module("fused")
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    assert sm120_prefill.choose_variant(2, 4, 64) == "fused"
+
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 48], num_heads=4, packed=True, initial_state=True, seed=SEED + 7
+    )
+    output = torch.empty_like(inputs["v"])
+    builds: list = []
+    original = fused._build_plan
+
+    def spy(*args, **kwargs):
+        builds.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fused, "_build_plan", spy)
+    for step in range(4):
+        if step:
+            inputs["cu_seqlens"] = inputs["cu_seqlens"].clone()
+        expected_out, expected_state = _reference_kda_prefill(inputs)
+        out, state = _call(inputs, output=output, output_final_state=True)
+        torch.cuda.synchronize()
+        _assert_elementwise(
+            out, expected_out, f"step {step} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        _assert_elementwise(
+            state,
+            expected_state,
+            f"step {step} final_state",
+            rtol=STATE_RTOL,
+            atol=STATE_ATOL,
+        )
+    assert len(builds) == 1, (
+        f"a new offsets tensor with equal content rebuilt the plan {len(builds) - 1} times"
+    )
+
+
+@torch.inference_mode()
+def test_sm120_public_warm_call_skips_the_eligibility_walk(monkeypatch):
+    """A workspace-bound warm call skips the full eligibility walk.
+
+    The dispatcher's structural predicate admitted the call when the plan was
+    built, so a memo hit does not repeat it.  The ``[H * 128]`` ``dt_bias`` a
+    model stores is viewed as ``[H, 128]`` once per source tensor, so the view
+    is the same object on every call and the memo can match it.
+    """
+    _skip_if_not_sm120()
+    import flashinfer.kda_prefill as kda_prefill
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(
+        seq_lens=[256], num_heads=4, packed=False, initial_state=True, seed=SEED + 11
+    )
+    flat_dt_bias = inputs["dt_bias"].reshape(-1)
+    output = torch.empty_like(inputs["v"])
+    workspace = kda_prefill.RecurrentKDAPrefillWorkspace(inputs["q"].device)
+
+    def step(label):
+        expected_out, expected_state = _reference_kda_prefill(inputs)
+        out, state = _call(
+            inputs,
+            dt_bias=flat_dt_bias,
+            output=output,
+            output_final_state=True,
+            prefill_workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        _assert_elementwise(
+            out, expected_out, f"{label} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        _assert_elementwise(
+            state,
+            expected_state,
+            f"{label} final_state",
+            rtol=STATE_RTOL,
+            atol=STATE_ATOL,
+        )
+
+    step("cold call")
+    walks: list = []
+    original = kda_prefill._sm120_kda_prefill_rejection_reason
+
+    def spy(*args, **kwargs):
+        walks.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kda_prefill, "_sm120_kda_prefill_rejection_reason", spy)
+    for call in range(3):
+        step(f"warm call {call}")
+    assert len(walks) == 0, (
+        f"{len(walks)} warm calls re-walked the eligibility predicate"
+    )
+
+
+def test_sm120_repointed_plan_launches_on_the_buffers_it_was_pointed_at():
+    """Two threads sharing one shape-keyed plan each get their own results.
+
+    A plan is re-pointed at a caller's buffers and then launched.  Without the
+    launch lock spanning both steps, one thread's launch can run on the other
+    thread's binding and write its output into the other thread's buffer.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    workers, rounds = 2, 6
+    cases = []
+    with torch.inference_mode():
+        for index in range(workers):
+            inputs = _fresh_decomp_inputs(seed=SEED + 200 + index, initial_state=False)
+            expected, _ = _reference_kda_prefill(inputs)
+            cases.append((inputs, expected, torch.empty_like(inputs["v"])))
+        # Build the shared plan once before the threads race for it.
+        _call(cases[0][0], output=cases[0][2], output_final_state=False)
+        torch.cuda.synchronize()
+
+    barrier = threading.Barrier(workers)
+    failures: list = []
+
+    def worker(index):
+        inputs, expected, output = cases[index]
+        try:
+            with torch.inference_mode():
+                barrier.wait(timeout=60)
+                for round_ in range(rounds):
+                    out, _ = _call(inputs, output=output, output_final_state=False)
+                    torch.cuda.synchronize()
+                    _assert_elementwise(
+                        out,
+                        expected,
+                        f"worker {index} round {round_}",
+                        rtol=OUTPUT_RTOL,
+                        atol=OUTPUT_ATOL,
+                    )
+        except BaseException as exc:  # noqa: BLE001 -- reported by the main thread
+            failures.append((index, repr(exc)))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=300)
+    assert not failures, failures
+    assert len(sm120_prefill._SHAPE_PLANS) == 1, (
+        "the two threads did not share one plan"
+    )
+
+
+@torch.inference_mode()
+def test_sm120_rebind_refuses_a_different_state_presence():
+    """A plan built with a state cannot be pointed at a call without one.
+
+    The states' presence selects the compiled entry, so it is a property of
+    the shape key; the re-point re-checks it rather than trusting the caller.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill.runtime import KDAPrefillValidationError
+
+    sm120_prefill = _sm120_prefill()
+    decomp = sm120_prefill._variant_module("decomp")
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _fresh_decomp_inputs(seed=SEED + 300)
+    _call(inputs, output=torch.empty_like(inputs["v"]), output_final_state=True)
+    torch.cuda.synchronize()
+    ((module, plan),) = sm120_prefill._SHAPE_PLANS.values()
+    assert module is decomp
+    with pytest.raises(KDAPrefillValidationError):
+        decomp.rebind(
+            plan,
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            out=torch.empty_like(inputs["v"]),
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            initial_state=None,
+            final_state=None,
+        )
+
+
+@torch.inference_mode()
+def test_sm120_warm_memo_probe_declines_under_capture(monkeypatch):
+    """A warm memo never turns a refused capture into a replay.
+
+    Capture without a workspace is refused because the graph would record
+    addresses an evictable cache owns.  The dispatcher's memo probe runs before
+    that refusal, so it must decline under capture and let the full path raise
+    the refusal, not replay the memoized plan inside the graph.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _fresh_decomp_inputs(seed=SEED + 400)
+    output = torch.empty_like(inputs["v"])
+    _call(inputs, output=output, output_final_state=True)
+    torch.cuda.synchronize()
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="requires an explicit workspace"):
+        _call(inputs, output=output, output_final_state=True)
 
 
 def test_sm120_cache_clear_iterates_a_module_snapshot(monkeypatch):
@@ -1080,9 +1533,186 @@ def test_sm120_cute_dsl_request_names_the_reason_this_backend_refused():
         _call(inputs, backend="cute-dsl", seq_order=seq_order)
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("condition", ["gqa", "head_dim", "dt_bias"])
+def test_sm120_warm_probe_preserves_shape_rejection(condition):
+    """An unsupported shape reaches the named rejection before any reshape."""
+    _skip_if_not_sm120()
+    inputs = _make_inputs_sm120(seq_lens=[16], num_heads=4, packed=False, seed=SEED)
+    if condition == "gqa":
+        inputs["q"] = inputs["q"].repeat_interleave(2, dim=2)
+        reason = "GQA"
+    elif condition == "head_dim":
+        for name in ("q", "k", "v", "g", "dt_bias"):
+            inputs[name] = inputs[name][..., :64].contiguous()
+        reason = "head dimension"
+    else:
+        inputs["dt_bias"] = inputs["dt_bias"][:2].contiguous()
+        reason = "dt_bias"
+    inputs["dt_bias"] = inputs["dt_bias"].reshape(-1)
+    with pytest.raises(ValueError, match=reason):
+        _call(inputs, backend="cute-dsl", output=torch.empty_like(inputs["v"]))
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("capturing", [False, True])
+def test_sm120_ineligible_call_keeps_bound_workspace_usable(monkeypatch, capturing):
+    """A declined probe must not replace a previous call's state scratch."""
+    _skip_if_not_sm120()
+    from flashinfer import kda_prefill
+
+    inputs = _make_inputs_sm120(seq_lens=[16], num_heads=4, packed=False, seed=SEED)
+    workspace = kda_prefill.RecurrentKDAPrefillWorkspace(inputs["q"].device)
+    output = torch.empty_like(inputs["v"])
+    kwargs = dict(
+        backend="cute-dsl", prefill_workspace=workspace, output_final_state=True
+    )
+    expected_out, expected_state = _call(inputs, output=output, **kwargs)
+    expected_out, expected_state = expected_out.clone(), expected_state.clone()
+    scratch = workspace._sm120_state.state_scratch
+
+    invalid = _make_inputs_sm120(seq_lens=[16], num_heads=2, packed=False, seed=SEED)
+    invalid["g"] = invalid["g"].float()
+    with monkeypatch.context() as capture_patch:
+        capture_patch.setattr(
+            torch.cuda, "is_current_stream_capturing", lambda: capturing
+        )
+        with pytest.raises(ValueError, match="g must be a contiguous CUDA bfloat16"):
+            _call(invalid, output=torch.empty_like(invalid["v"]), **kwargs)
+    assert workspace._sm120_state.state_scratch is scratch
+
+    out, state = _call(inputs, output=output, **kwargs)
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("has_output", [False, True])
+def test_sm120_lookup_miss_does_not_allocate_or_read_offsets(monkeypatch, has_output):
+    """A lookup-only miss leaves allocation and offset reads to the full path."""
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(seq_lens=[16, 17], num_heads=2, packed=True, seed=SEED)
+    output = torch.empty_like(inputs["v"]) if has_output else None
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a lookup-only miss must not allocate or validate offsets")
+
+    monkeypatch.setattr(torch, "empty_like", unexpected)
+    monkeypatch.setattr(sm120_prefill, "validate_packed_offsets", unexpected)
+    assert (
+        sm120_prefill.run_kda_prefill_sm120(
+            **{name: value for name, value in inputs.items() if name != "seq_lens"},
+            output=output,
+            lookup_only=True,
+            lower_bound=-5.0,
+        )
+        is None
+    )
+
+
+def test_sm120_shape_plan_identity_hit_rebinds_after_another_thread(monkeypatch):
+    """An identity memo cannot replay a shape plan bound to another caller."""
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    decomp = sm120_prefill._variant_module("decomp")
+    stream = torch.cuda.current_stream()
+    with torch.inference_mode():
+        first = _fresh_decomp_inputs(SEED + 500, initial_state=False)
+        second = _fresh_decomp_inputs(SEED + 501, initial_state=False)
+        output = torch.empty_like(first["v"])
+        second_output = torch.empty_like(second["v"])
+        expected, _ = _reference_kda_prefill(first)
+        expected_second, _ = _reference_kda_prefill(second)
+        _call(first, output=output, output_final_state=False)
+        output.fill_(float("nan"))
+    rebound = threading.Event()
+    resume = threading.Event()
+    original = decomp.run_rebound
+
+    def pause_after_rebind(plan, **kwargs):
+        original(plan, **kwargs)
+        if kwargs["q"] is second["q"]:
+            rebound.set()
+            assert resume.wait(timeout=30)
+
+    def other_call():
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            _call(second, output=second_output, output_final_state=False)
+
+    monkeypatch.setattr(decomp, "run_rebound", pause_after_rebind)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(other_call)
+        try:
+            assert rebound.wait(timeout=30)
+            with torch.inference_mode(), torch.cuda.stream(stream):
+                _call(first, output=output, output_final_state=False)
+        finally:
+            resume.set()
+        pending.result(timeout=30)
+    stream.synchronize()
+    _assert_elementwise(
+        output, expected, "first caller output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+    )
+    # A late memo publication from the other thread must not poison its next call.
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        second_output.fill_(float("nan"))
+        _call(second, output=second_output, output_final_state=False)
+    stream.synchronize()
+    _assert_elementwise(
+        second_output,
+        expected_second,
+        "second caller output",
+        rtol=OUTPUT_RTOL,
+        atol=OUTPUT_ATOL,
+    )
+
+
 # ===========================================================================
 # Correctness through the public API.
 # ===========================================================================
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "seq_lens,packed", [([256] * 4, False), ([256] * 4, True), ([256, 65, 17, 0], True)]
+)
+@pytest.mark.parametrize("has_initial_state", [False, True])
+def test_recurrent_kda_prefill_sm120_uniform_dispatch_matches_reference(
+    seq_lens, packed, has_initial_state, monkeypatch
+):
+    """Exercise the re-fitted CTA line and ragged guard through public auto."""
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    resolved = []
+    resolve = sm120_prefill._resolve_variant
+
+    def record_variant(*args, **kwargs):
+        chosen = resolve(*args, **kwargs)
+        resolved.append(chosen)
+        return chosen
+
+    monkeypatch.setattr(sm120_prefill, "_resolve_variant", record_variant)
+    inputs = _make_inputs_sm120(
+        seq_lens=seq_lens,
+        num_heads=12,
+        packed=packed,
+        initial_state=has_initial_state,
+        seed=SEED,
+    )
+    expected_out, expected_state = _reference_kda_prefill(inputs)
+    out, state = _call(inputs, output_final_state=True, backend="auto")
+    key, _ = sm120_prefill.auto_profile(device=inputs["q"].device)
+    expected_variant = "fused" if key == 110 or len(set(seq_lens)) == 1 else "decomp"
+    assert resolved and set(resolved) == {expected_variant}
+    _assert_elementwise(out, expected_out, "output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+    assert state is not None
+    _assert_elementwise(
+        state, expected_state, "final_state", rtol=STATE_RTOL, atol=STATE_ATOL
+    )
 
 
 @torch.inference_mode()
@@ -1897,22 +2527,58 @@ def test_sm120_runtime_bounded_cache_evicts_from_the_lru_tail():
     assert cache.stats(device).evictions == 1
 
 
-def test_sm120_runtime_refuses_a_mismatched_persistent_cache_target(monkeypatch):
-    """An artifact must not be named for a target it was not built for.
+def test_sm120_runtime_labels_the_persistent_cache_with_its_target(monkeypatch):
+    """The artifact is named for the target it was built for, not for the DSL's guess.
 
-    This is the failure mode the explicit compile option exists to prevent:
-    ``JitSpecCuteDsl`` names its module directory from ``CUTE_DSL_ARCH`` or the
-    device, while the kernel is compiled for whatever option we passed. If
-    those disagree, the on-disk artifact claims one target and contains
-    another, and the next process loads it believing the name.
+    ``build_kernel`` compiles for ``sm_120a`` explicitly, so it hands that
+    target to the persistent cache rather than letting ``CUTE_DSL_ARCH`` or the
+    current device name the module directory and its ``meta.json``.
     """
+    pytest.importorskip("cutlass")
+    from flashinfer.jit import cute_dsl_core
     from flashinfer.kda_kernels.sm120_prefill import runtime
 
+    class DeviceGuard:
+        def __init__(self, device):
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    monkeypatch.setattr(runtime.torch.cuda, "device", DeviceGuard)
+    monkeypatch.setattr(cute_dsl_core, "_get_compile_arch", lambda: "sm100a")
+    seen = {}
+
+    def fake_build_and_load(module, kernel, compile_fn, extra_key_files=(), arch=None):
+        seen.update(module=module, kernel=kernel, arch=arch)
+        return compile_fn()
+
     monkeypatch.setattr(
-        "flashinfer.jit.cute_dsl_core._get_compile_arch", lambda: "sm100a"
+        cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build_and_load
     )
-    with pytest.raises(runtime.UnsupportedArchitectureError, match="sm120a"):
-        runtime._assert_cache_target_matches()
+    compiled = object()
+    assert (
+        runtime.build_kernel(
+            "target-test", lambda: compiled, device=torch.device("cuda", 0)
+        )
+        is compiled
+    )
+    assert seen["arch"] == runtime.SM120_CODE_TARGET
+    assert seen["module"] == runtime.JIT_MODULE_NAME
+
+    # With the explicit target the spec ignores what the DSL would have picked.
+    spec = cute_dsl_core.JitSpecCuteDsl(
+        runtime.JIT_MODULE_NAME,
+        "k",
+        lambda: None,
+        "sha",
+        arch=runtime.SM120_CODE_TARGET,
+    )
+    assert spec.module_dir_name == f"{runtime.JIT_MODULE_NAME}_sm120a_cute_dsl"
+    assert spec.expected_meta["arch"] == "sm120a"
 
 
 def test_sm120_runtime_build_kernel_uses_the_input_device(monkeypatch):
@@ -1937,13 +2603,10 @@ def test_sm120_runtime_build_kernel_uses_the_input_device(monkeypatch):
     monkeypatch.setattr(runtime.torch.cuda, "device", DeviceGuard)
     monkeypatch.setattr(
         cute_dsl_core,
-        "_get_compile_arch",
-        lambda: "sm120a" if active_devices else "sm100a",
-    )
-    monkeypatch.setattr(
-        cute_dsl_core,
         "build_and_load_cute_dsl_kernel",
-        lambda _module, _kernel, compile_fn, extra_key_files=(): compile_fn(),
+        lambda _module, _kernel, compile_fn, extra_key_files=(), arch=None: (
+            compile_fn()
+        ),
     )
 
     compiled = object()
