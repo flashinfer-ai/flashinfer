@@ -1558,6 +1558,69 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
 
 
 @pytest.mark.parametrize("gate", GATES)
+@pytest.mark.parametrize("H", [16, 32])
+@pytest.mark.parametrize(
+    "lengths, batch_tokens",
+    [((100, 126, 50), 226), ((100, 128, 50), 228)],
+    ids=["overhang", "aligned"],
+)
+def test_l2n_batched_replay_reads_no_unwritten_row_of_the_next_group(
+    lengths, batch_tokens: int, H: int, gate: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batched arena's replay with use_qk_l2norm_in_kernel=True on the serial route (H 32 on every
+    architecture, H 16 on sm_100a): the plain intra program of group 0 box-reads up to BT - 1 rows past the group
+    end of the per-call qn / kn (``"overhang"``: document 1 ends 62 rows into its last chunk), which group 1's prep
+    writes only later.  With every per-call float tensor and the arena filled with NaN, the replay before and after
+    a forward and a saved-set backward on the workspace gives finite gradients bitwise the per-call whole problem's,
+    itself the deterministic package's (``"aligned"``: the group ends on a chunk boundary, the control)."""
+    device = _l2n_device()
+    S, N = sum(lengths), len(lengths)
+    assert cake_backend.doc_batches(lengths, batch_tokens) == ((0, 2), (2, 3))
+    inputs = _l2n_inputs(lengths, H, device, gate)
+    names = _names(gate)
+    count = _Count()
+    ref_list = [t.clone() for t in _bwd(inputs, None, gate)]
+    ref = dict(zip(names, ref_list, strict=True))
+    count.grads(_bwd(inputs, None, gate, det=True), ref, gate, "det whole problem")
+    alloc = cake_backend._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = alloc(shape, dtype, dev)
+        if t.is_floating_point() and t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(cake_backend, "_alloc", nan_alloc)
+    arena = cake_backend.KdaArena(batch_tokens=batch_tokens)
+    for case in ("replay first", "replay after"):
+        ws = cake_backend.KdaWorkspace.for_problem(
+            S,
+            N,
+            H,
+            device,
+            arena=arena,
+            doc_lengths=lengths,
+            gate=gate,
+            l2n="fused",
+            deterministic=False,
+        )
+        ws.arena.fill_(0xFF)
+        kw = {"workspace": ws, "doc_lengths": lengths}
+        runs = []
+        if case == "replay after":
+            _, saved = _fwd(inputs, gate, **kw)
+            runs.append(("saved", _bwd(inputs, saved, gate, **kw)))
+        runs.append((case, _bwd(inputs, None, gate, **kw)))
+        for tag, got in runs:
+            for name, a in zip(names, got, strict=True):
+                assert bool(torch.isfinite(a).all()), (H, gate, tag, name)
+            count.grads(got, ref, gate, (H, gate, tag))
+        del ws
+    # the deterministic whole problem, the fresh replay, then a saved-set backward and the replay after it
+    assert count.n == 4 * len(names) > 0
+
+
+@pytest.mark.parametrize("gate", GATES)
 def test_l2n_packed_views_are_bitwise_the_deterministic_l2n(gate: str) -> None:
     """q / k as column slices of one packed projection output (NaN outside the views) give the deterministic
     package's contiguous-row results bit for bit: the forward, the saved set, the backward from it and the replay;

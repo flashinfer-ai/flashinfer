@@ -6111,6 +6111,19 @@ def _backward(
                     "deterministic pair); the groups share the problem's accumulators"
                 )
         _assert_doc_lengths(cu_seqlens, packing.lengths)
+        if l2n == "fused" and replay:
+            # the replay's plain intra program (the groups whose plan dispatches the table program) reads 64-row q / k
+            # boxes of the per-call qn / kn at each chunk's absolute chunk_bos and masks the rows past the chunk end
+            # by a zeroed gate factor (0 * NaN = NaN): a group's last chunk reaches up to BT - 1 rows of the next
+            # group, which only that group's prep writes (rows t < chunk_len), after this group ran.  Define them
+            # first; the next group's prep overwrites its real rows before any of its readers.  The fallback's
+            # qk_l2norm has already written every row here.
+            end = 0
+            for batch, ws_b in views_b[:-1]:
+                end += batch.S
+                if ws_b.plan.dispatched("table", path):
+                    lv["qn"][end : end + BT - 1].zero_()
+                    lv["kn"][end : end + BT - 1].zero_()
         # the groups build their own tables; their blocks of the saved states come by chain rank (from doc_lengths
         # on the host, :class:`_Packing`)
         from_saved = seg and not replay and (tape or light_states)
