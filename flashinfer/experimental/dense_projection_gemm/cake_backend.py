@@ -75,7 +75,10 @@ package's sibling on first use, never through an absolute ``flashinfer`` import;
 path had before #8046 that are not entry points (``ROW_RULES``, ``stream_k_plan``, ``wgrad_views``, the plan and
 prepared types ``GemmPlan`` / ``PreparedGemm`` / ``RouterPlan`` / ``PreparedRouterGemm``, ...) read through to the
 deterministic package (module ``__getattr__``); assigning one here does not change the deterministic package's.
-:func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages.
+:func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages; a convenience-path
+call that this package launches from its arenas, captured into a CUDA graph, stays valid until then (the arenas keep
+every buffer a launch was bound to, through growths and cache evictions); a call it hands to the deterministic package's
+convenience path follows that package's rule (:func:`clear_convenience_caches`).
 """
 
 from __future__ import annotations
@@ -146,7 +149,8 @@ def use_deterministic_backend(module: ModuleType) -> None:
     under another name, without the ``flashinfer`` package around it) vendors the deterministic package too and
     binds its ``cake_backend`` here before the first call that needs it.  Binding drops this package's convenience
     caches and arenas (:func:`_drop_convenience_entries`): their entries hold the plans and programs of the package
-    bound before."""
+    bound before.  Like :func:`clear_convenience_caches`, it invalidates the CUDA graphs that captured a
+    convenience-path call of this package."""
     missing = [
         name for key, name in DETERMINISTIC_NAMES.items() if not hasattr(module, name)
     ]
@@ -3009,6 +3013,13 @@ def _atomic_k2(
 # cached launch of ``_K2_SPLITK_CACHE`` / ``_K2_ATOMIC_CACHE`` that the entry point's path takes for the key and the
 # router-table memo and route it was routed under, so a call goes from its key to the bound launch.  After a launch
 # that did not complete, :func:`clear_convenience_caches` drops the arenas (fresh tickets on the next call).
+#
+# CUDA graphs.  A cached launch captured into a CUDA graph replays the workspace pointers it was bound with, so no
+# buffer of an arena is freed before :func:`clear_convenience_caches` (or :func:`use_deterministic_backend`) drops the
+# arenas: a growth retires the buffer it replaces into the arena (:class:`_AtomicArena`) instead of releasing it, and
+# an entry evicted from the caches leaves its arena in ``_ATOMIC_ARENAS``.  A captured graph therefore stays valid
+# until that call, which invalidates it.  The calls this path hands to the deterministic package's convenience path
+# keep that package's contract.
 
 #: workspace kind -> (dtype, zeroed when allocated)
 _ATOMIC_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
@@ -3034,14 +3045,22 @@ _ATOMIC_ARENA_MIN_ELEMS = 16
 @dataclass
 class _AtomicArena:
     """The workspace of every cached launch of this package on one (device index, raw stream): one buffer per kind
-    of ``_ATOMIC_ARENA_KINDS``, grown to the largest requirement seen and never shrunk (the deterministic package's
-    ``_Arena`` contract; a zeroed kind is allocated with ``torch.zeros`` on the current stream)."""
+    of ``_ATOMIC_ARENA_KINDS``, grown and never shrunk, as the deterministic package's ``_Arena`` (a zeroed kind is
+    allocated with ``torch.zeros`` on the current stream).
+
+    Unlike that arena, a growth retires the buffer it replaces (``retired``) instead of releasing it: a launch captured
+    into a CUDA graph replays the pointer it was bound with, and a launch in flight keeps using it, so every buffer of
+    the arena stays allocated until :func:`clear_convenience_caches` drops the arena.  A retired buffer keeps its zero
+    contract: the launches bound to it leave its tickets and counters zero.  A growth at least doubles the buffer, so
+    the buffers a kind retires hold fewer bytes than its live one, and a kind grows at most
+    ``ceil(log2(largest requirement / _ATOMIC_ARENA_MIN_ELEMS))`` times."""
 
     device: torch.device
     key: tuple[int, int]
     buffers: dict[str, torch.Tensor] = field(default_factory=dict, repr=False)
+    # the buffers growths replaced, kept for the launches (CUDA graphs) bound to them
+    retired: list[torch.Tensor] = field(default_factory=list, repr=False)
     version: int = 0
-    refs: int = 0
     lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -3050,24 +3069,32 @@ class _AtomicArena:
     stream_context: Any = field(default=None, repr=False, compare=False)
 
     def require(self, kind: str, numel: int) -> torch.Tensor:
-        """The buffer of ``kind`` with at least ``numel`` elements, grown when the present one is smaller (called
-        when an entry is planned, under ``_ATOMIC_PLAN_LOCK``); monotone."""
+        """The buffer of ``kind`` with at least ``numel`` elements, grown to at least twice the present one's when
+        that is smaller (called when an entry is planned, under ``_ATOMIC_PLAN_LOCK``; the replaced buffer is
+        retired); monotone."""
         buf = self.buffers.get(kind)
         numel = max(int(numel), _ATOMIC_ARENA_MIN_ELEMS)
         if buf is None or buf.numel() < numel:
+            if buf is not None:
+                numel = max(numel, 2 * buf.numel())
             dtype, zeroed = _ATOMIC_ARENA_KINDS[kind]
             new = (torch.zeros if zeroed else torch.empty)(
                 numel, device=self.device, dtype=dtype
             )
             buf = self.buffers.get(kind)
             if buf is None or buf.numel() < new.numel():
+                if buf is not None:
+                    self.retired.append(buf)
                 buf = self.buffers[kind] = new
             self.version += 1
         return buf
 
     def nbytes(self) -> int:
-        """Bytes the arena holds (every kind)."""
-        return sum(int(b.numel()) * b.element_size() for b in self.buffers.values())
+        """Bytes the arena holds (every kind, its live and its retired buffers)."""
+        return sum(
+            int(b.numel()) * b.element_size()
+            for b in (*self.buffers.values(), *self.retired)
+        )
 
 
 _ATOMIC_ARENAS: dict[tuple[int, int], _AtomicArena] = {}
@@ -3324,19 +3351,6 @@ class _CachedAtomic:
     memo: Any = field(default=None, repr=False)
 
 
-def _release_atomic_entry(
-    entry: Union[_CachedAtomic, _CachedSplitK2, _CachedDetK1, _CachedK2Entry],
-) -> None:
-    """``on_evict`` of the convenience caches: the arena of an evicted entry loses a reference and is released when
-    no cached entry uses it any more."""
-    arena = entry.arena
-    if arena is None:
-        return
-    arena.refs -= 1
-    if arena.refs <= 0 and _ATOMIC_ARENAS.get(arena.key) is arena:
-        del _ATOMIC_ARENAS[arena.key]
-
-
 #: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K2_ATOMIC_CACHE`,
 #: :data:`_K2_SPLITK_CACHE`, :data:`_K2_ENTRY_CACHE`).
 _CacheEntry = TypeVar(
@@ -3347,12 +3361,10 @@ _CacheEntry = TypeVar(
 def _cache_insert(
     cache: "OrderedDict[tuple, Any]", key: tuple, entry: _CacheEntry
 ) -> _CacheEntry:
+    """Insert ``entry`` under ``key`` (the deterministic package's ``_cache_put`` with its ``CONVENIENCE_CACHE_SIZE``
+    bound).  An evicted entry leaves its arena in ``_ATOMIC_ARENAS``: a CUDA graph may still replay its launch."""
     det = deterministic_backend()
-    if entry.arena is not None:
-        entry.arena.refs += 1
-    return det._cache_put(
-        cache, key, entry, det.CONVENIENCE_CACHE_SIZE, _release_atomic_entry
-    )
+    return det._cache_put(cache, key, entry, det.CONVENIENCE_CACHE_SIZE)
 
 
 def _k1_key(
@@ -4495,7 +4507,8 @@ def _k2_entry(
 
 def _drop_convenience_entries() -> None:
     """Drop this package's cached convenience-path launches, what the convenience path keeps from the router tables
-    (:func:`_router_memo`) and this package's workspace arenas."""
+    (:func:`_router_memo`) and this package's workspace arenas with their retired buffers: a CUDA graph that captured
+    a convenience-path launch of this package must not replay afterwards."""
     global _ROUTER_MEMO
     with _ATOMIC_PLAN_LOCK:
         _K1_ATOMIC_CACHE.clear()
@@ -4511,7 +4524,15 @@ def _drop_convenience_entries() -> None:
 def clear_convenience_caches() -> None:
     """Drop every cached convenience-path launch, what the convenience path keeps from the router tables
     (:func:`_router_memo`) and every workspace arena of both packages (this package's launches and the deterministic
-    package's)."""
+    package's).  This invalidates every CUDA graph that captured a convenience-path call: its replay would use freed
+    workspace, so capture such graphs again after it.  A captured ``deterministic=False`` convenience-path call that
+    this package launches from its arenas (its programs, and the deterministic programs it launches through its
+    binding) stays valid until then: its arena keeps every buffer a launch was bound to, through growths and cache
+    evictions.  A call this package hands to the deterministic package's convenience path (launch views its binding
+    cannot rebuild from the call's tensors, such as two operands that alias; a batched forward on that package's
+    swapped small-token program; ``torch.use_deterministic_algorithms(True, warn_only=True)``) follows that package's
+    rule: a CUDA graph captures its prepared launch, not its convenience path.  The graphs captured on one stream share
+    its arena: replay them one at a time, and not concurrently with calls on that stream."""
     _drop_convenience_entries()
     deterministic_backend().clear_convenience_caches()
 

@@ -26,9 +26,13 @@ limitations under the License.
 import ast
 import contextlib
 import dataclasses
+import functools
+import gc
 import inspect
 import json
+import os
 import re
+import subprocess
 import sys
 import threading
 import warnings
@@ -6567,10 +6571,11 @@ def test_router_entry_without_a_bound_launch_takes_the_entry_points_path(monkeyp
     assert len(path.calls) == 2
 
 
-def test_router_entry_cache_holds_its_arenas(monkeypatch):
-    """An entry of ``_K2_ENTRY_CACHE`` holds a reference to its launch's arena, as the launch's own entry does: an
-    arena's reference count is the number of cached entries of every cache that use it, eviction (the cache bound)
-    drops them, and an arena no entry uses any more is released."""
+def test_router_entry_cache_eviction_keeps_the_arenas(monkeypatch):
+    """An entry of ``_K2_ENTRY_CACHE`` uses its launch's arena, as the launch's own entry does; eviction (the cache
+    bound) drops entries but no arena: an arena outlives its last cached entry with every buffer it holds (a CUDA
+    graph may still replay a launch bound to them), a call on its stream plans into it again, and only
+    ``clear_convenience_caches`` drops it."""
     _cpu_k2_launches(monkeypatch)
     monkeypatch.setattr(det_backend, "CONVENIENCE_CACHE_SIZE", 3)
     W = torch.empty(256, 6144)
@@ -6583,25 +6588,31 @@ def test_router_entry_cache_holds_its_arenas(monkeypatch):
     def dgrad(T):
         G, out = torch.empty(T, 256), torch.empty(T, 6144)
         assert cake_backend.router_dgrad(G, W, out, deterministic=False) is out
-        arenas = list(cake_backend._ATOMIC_ARENAS.values())
-        for arena in arenas:
-            users = sum(e.arena is arena for c in caches for e in c.values())
-            assert arena.refs == users > 0
-        assert all(
-            any(e.arena is a for a in arenas) for c in caches for e in c.values()
-        )
-        return {a.key: a.refs for a in arenas}
+        arenas = cake_backend._ATOMIC_ARENAS
+        entries = [e for c in caches for e in c.values()]
+        assert all(arenas.get(e.arena.key) is e.arena for e in entries)
+        return {k: sum(e.arena is a for e in entries) for k, a in arenas.items()}
+
+    def held(arena):
+        return {id(b) for b in (*arena.buffers.values(), *arena.retired)}
 
     # past the hidden 6144 SIMT window of the input gradient (to 64 tokens): the deterministic program's binding
     for T in (128, 192, 256, 320, 384):
-        refs = dgrad(T)
-    assert len(caches[0]) == len(caches[1]) == 3 and refs == {(0, 0): 6}
+        users = dgrad(T)
+    assert len(caches[0]) == len(caches[1]) == 3 and users == {(0, 0): 6}
     monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 7)
     assert dgrad(128) == {(0, 0): 4, (0, 7): 2}  # an arena of the stream's own
+    arena7 = cake_backend._ATOMIC_ARENAS[(0, 7)]
+    buffers7 = held(arena7)
     monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 0)
     for T in (128, 192, 256):
-        refs = dgrad(T)
-    assert refs == {(0, 0): 6}  # evicted from both caches: released
+        users = dgrad(T)
+    # evicted from both caches: the arena of stream 7 stays, with its buffers
+    assert users == {(0, 0): 6, (0, 7): 0}
+    assert cake_backend._ATOMIC_ARENAS[(0, 7)] is arena7 and held(arena7) == buffers7
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 7)
+    assert dgrad(128) == {(0, 0): 4, (0, 7): 2}  # planned into the same arena again
+    assert cake_backend._ATOMIC_ARENAS[(0, 7)] is arena7 and held(arena7) == buffers7
     cake_backend.clear_convenience_caches()
     assert not cake_backend._ATOMIC_ARENAS and not any(caches)
 
@@ -6935,6 +6946,36 @@ def test_the_split_k_workspace_kinds():
     assert grown.numel() == 300 and not grown.any()
 
 
+def test_arena_growth_retires_the_replaced_buffers():
+    """A growth at least doubles a kind's buffer and retires the buffer it replaces (a CUDA graph or a launch in
+    flight may still use it): the retired buffers keep their storage and contents until ``clear_convenience_caches``
+    drops the arena, and hold fewer bytes than the live one; a requirement the live buffer meets grows nothing."""
+    arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))
+    first = arena.require("k1_tickets", 100)
+    first.view(torch.int32).fill_(7)  # stands for the state of a launch bound to it
+    assert not arena.retired and arena.version == 1
+    grown = arena.require("k1_tickets", 101)  # just larger: doubled
+    assert grown.numel() == 200 and not grown.to(torch.int64).any()
+    assert [id(b) for b in arena.retired] == [id(first)]
+    assert bool((first.view(torch.int32) == 7).all())
+    assert arena.require("k1_tickets", 150) is grown and arena.version == 2
+    larger = arena.require("k1_tickets", 1000)  # more than doubled: the requirement
+    assert larger.numel() == 1000
+    assert [id(b) for b in arena.retired] == [id(first), id(grown)]
+    for n in range(1001, 100_000, 997):  # a ragged requirement that keeps rising
+        arena.require("k1_tickets", n)
+    sizes = [int(b.numel()) for b in arena.retired]
+    assert sizes == [100, 200, 1000, 2000, 4000, 8000, 16000, 32000, 64000]
+    assert sum(sizes) < arena.buffers["k1_tickets"].numel() == 128000
+    stack = arena.require("k2_stack", 3 * 64 * 256)
+    assert arena.require("k2_stack", 3 * 65 * 256).numel() == 2 * stack.numel()
+    assert arena.retired[-1] is stack
+    assert arena.nbytes() == sum(
+        int(b.numel()) * b.element_size()
+        for b in (*arena.buffers.values(), *arena.retired)
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPU
 # ---------------------------------------------------------------------------
@@ -7109,45 +7150,48 @@ def _k1_prepare(G, X, out, arch, splits, block_n=None):
     return prepared
 
 
+def _force_k1_rule(monkeypatch, G, X, out, splits, block_n=None):
+    """The force of :func:`k1_rule` through ``monkeypatch``; returns the template."""
+    arch = det_backend.arch_for(out.device)
+    N, K = int(G.shape[1]), int(X.shape[1])
+    block_n = block_n or cake_backend.k1_block_n(N)
+    f32 = out.dtype == torch.float32
+    _require_template(arch, cake_backend.atomic_k1_template(block_n, f32))
+    key = (arch, 1, K, N, "f32" if f32 else "bf16")
+    monkeypatch.setitem(cake_backend.K1_MIN_SM_COUNT, arch, 0)
+    monkeypatch.delitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, raising=False)
+    monkeypatch.delitem(cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False)
+    monkeypatch.delitem(
+        cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS, key, raising=False
+    )
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (block_n, splits))
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_OVERRIDES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_RANGE_OVERRIDES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_TWO_SPLIT_RANGES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
+    cake_backend.clear_convenience_caches()
+    return cake_backend.atomic_k1_template(block_n, f32)
+
+
 @pytest.fixture
 def k1_rule(monkeypatch):
     """``k1_rule(G, X, out, splits)``: a verdict for the row (and no SM-count floor, excluded token counts, chain ranges
     or tables of exactly one SM count), so the convenience path runs this package's program at that split count;
     returns the template."""
-
-    def force(G, X, out, splits, block_n=None):
-        arch = det_backend.arch_for(out.device)
-        N, K = int(G.shape[1]), int(X.shape[1])
-        block_n = block_n or cake_backend.k1_block_n(N)
-        f32 = out.dtype == torch.float32
-        _require_template(arch, cake_backend.atomic_k1_template(block_n, f32))
-        key = (arch, 1, K, N, "f32" if f32 else "bf16")
-        monkeypatch.setitem(cake_backend.K1_MIN_SM_COUNT, arch, 0)
-        monkeypatch.delitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, raising=False)
-        monkeypatch.delitem(
-            cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False
-        )
-        monkeypatch.delitem(
-            cake_backend.K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS, key, raising=False
-        )
-        monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (block_n, splits))
-        monkeypatch.setattr(cake_backend, "K1_SPLIT_OVERRIDES_BY_SM", {})
-        monkeypatch.setattr(cake_backend, "K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM", {})
-        monkeypatch.setattr(cake_backend, "K1_SPLIT_RANGE_OVERRIDES_BY_SM", {})
-        monkeypatch.setattr(cake_backend, "K1_TWO_SPLIT_RANGES_BY_SM", {})
-        monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
-        monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
-        cake_backend.clear_convenience_caches()
-        return cake_backend.atomic_k1_template(block_n, f32)
-
-    yield force
+    yield functools.partial(_force_k1_rule, monkeypatch)
     cake_backend.clear_convenience_caches()
 
 
 def _arena_tickets_zero():
+    """Whether the K1 tickets and the deterministic program's slice counters of every arena hold zeros, live and
+    retired by a growth (both zero between complete launches)."""
     for arena in cake_backend._ATOMIC_ARENAS.values():
-        buf = arena.buffers.get("k1_tickets")
-        if buf is not None and buf.to(torch.int64).any():
+        bufs = [arena.buffers.get("k1_tickets"), arena.buffers.get("k1_det_counters")]
+        # an arena without a ``retired`` list (its growths release the buffer they replace): its live buffers only
+        bufs += [b for b in getattr(arena, "retired", ()) if b.dtype == torch.uint32]
+        if any(b is not None and b.to(torch.int64).any() for b in bufs):
             return False
     return True
 
@@ -7708,29 +7752,30 @@ def _router_case(op, X, W, G):
     return G.t(), X, torch.full((G.shape[1], X.shape[1]), float("nan"), device=X.device)
 
 
+def _force_router_rule(monkeypatch, op, A, B, spec):
+    """The force of :func:`router_rule` through ``monkeypatch``."""
+    arch = det_backend.arch_for(A.device)
+    if op == "fwd":
+        key = (arch, "kk", int(A.shape[1]), int(B.shape[1]))
+    elif op == "dgrad":
+        key = (arch, "kn", int(B.shape[1]), int(A.shape[1]))
+    else:
+        key = (arch, "nn_t", int(B.shape[1]), int(A.shape[0]))
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, spec)
+    # a forced verdict applies on this device whatever its SM count (also on a part with a table of its own)
+    sm_count = det_backend.device_facts(A.device).sm_count
+    monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+    tables = dict(cake_backend.ROUTER_RULES_BY_SM)
+    tables.pop((arch, sm_count), None)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+    cake_backend.clear_convenience_caches()
+
+
 @pytest.fixture
 def router_rule(monkeypatch):
     """``router_rule(A, B, spec)``: a verdict for the router row of ``(A, B)``, so the default plan runs this
     package's program with the partition ``spec`` (or the deterministic program with ``None``)."""
-
-    def force(op, A, B, spec):
-        arch = det_backend.arch_for(A.device)
-        if op == "fwd":
-            key = (arch, "kk", int(A.shape[1]), int(B.shape[1]))
-        elif op == "dgrad":
-            key = (arch, "kn", int(B.shape[1]), int(A.shape[1]))
-        else:
-            key = (arch, "nn_t", int(B.shape[1]), int(A.shape[0]))
-        monkeypatch.setitem(cake_backend.ROUTER_RULES, key, spec)
-        # a forced verdict applies on this device whatever its SM count (also on a part with a table of its own)
-        sm_count = det_backend.device_facts(A.device).sm_count
-        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
-        tables = dict(cake_backend.ROUTER_RULES_BY_SM)
-        tables.pop((arch, sm_count), None)
-        monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
-        cake_backend.clear_convenience_caches()
-
-    yield force
+    yield functools.partial(_force_router_rule, monkeypatch)
     cake_backend.clear_convenience_caches()
 
 
@@ -9873,3 +9918,294 @@ def test_gpu_prepared_k1_reset_counters():
     torch.cuda.synchronize()
     _k1_check(out, G.double().t() @ X.double())
     assert prepared.counters_are_zero()
+
+
+# ---------------------------------------------------------------------------
+# CUDA graphs of the convenience path: an arena keeps every buffer a captured launch is bound to
+# ---------------------------------------------------------------------------
+
+#: The convenience calls :func:`_graph_safety_scenario` captures, with the arena kinds their launches bind (the scenario
+#: asserts them): this package's K1 program (split slots and tickets), the deterministic K1 program through this
+#: package's binding (stream-K slabs and slice counters), this package's router program (the BF16x3 stack) and the
+#: deterministic router program through this package's binding (the stack and the split-K partials).
+GRAPH_SAFETY_KINDS = {
+    "k1_wgrad": {"k1_slots", "k1_tickets"},
+    "k1_forward": {"k1_det_ws", "k1_det_counters"},
+    "router_wgrad": {"k2_stack"},
+    "router_forward": {"k2_stack", "k2_splitk_partials"},
+}
+GRAPH_SAFETY_CASES = tuple(GRAPH_SAFETY_KINDS)
+#: ``(N, K, (T_small, T_large))`` of the k1_forward case: forwards whose deterministic plan splits K across stream-K
+#: units (partial slabs in ``k1_det_ws``) at both token counts on the 148- and 152-SM parts, the large one needing more
+#: slabs (the scenario asserts both).
+GRAPH_SAFETY_K1_FORWARD = (256, 4096, (256, 1000))
+#: Seconds a scenario process may take: a replay on freed workspace can fault, or spin on a counter it reads there.
+GRAPH_SAFETY_TIMEOUT = 300
+#: The byte the filler tensors of :func:`_graph_safety_scenario` hold.
+GRAPH_SAFETY_FILL = 0xA5
+
+
+def _graph_safety_k1_wgrad(row, T, device, seed, monkeypatch):
+    G, X, out = _k1_wgrad_inputs(row, T, torch.bfloat16, device, seed)
+    _force_k1_rule(monkeypatch, G, X, out, 2)
+
+    def call(o):
+        return cake_backend.projection_wgrad(G, X, o, deterministic=False)
+
+    def check(got, want):
+        # two splits: one add of two partials, bit for bit the eager result
+        assert torch.equal(got, want)
+        _k1_check(got, G.double().t() @ X.double(), "graph replay")
+
+    return call, out, check
+
+
+def _graph_safety_k1_forward(T, N, K, device, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+    X, W = _bf16((T, K), device, g), _bf16((N, K), device, g, K**-0.5)
+    out = torch.empty(T, N, device=device, dtype=torch.bfloat16)
+
+    def call(o):
+        return cake_backend.projection_forward(X, W, o, deterministic=False)
+
+    def check(got, want):
+        assert torch.equal(got, want)  # the deterministic program's bits
+
+    return call, out, check
+
+
+def _graph_safety_router(op, T, device, seed, monkeypatch):
+    X, W, G = _router_inputs(T, device, seed)
+    if op == "wgrad":
+        out = torch.empty(W.shape, device=device)
+        # a verdict for the row at every token count: this package's stream-K program with its BF16x3 stack.  It is
+        # set in the device's router table, a verdict table as shipped, so the call takes the router entry point's
+        # cache (_K2_ENTRY_CACHE) as with a shipped verdict; the plain dicts _force_router_rule binds are read on every
+        # call, which leaves that cache unused
+        arch = det_backend.arch_for(device)
+        sm_count = det_backend.device_facts(device).sm_count
+        table, _ = cake_backend.router_rules(arch, sm_count)
+        if table is cake_backend.ROUTER_RULES:
+            # a verdict of ROUTER_RULES applies on this device whatever its SM count
+            monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+        key = (arch, "nn_t", int(X.shape[1]), int(G.shape[1]))
+        monkeypatch.setitem(table, key, "pairs")
+        cake_backend.clear_convenience_caches()
+
+        def call(o):
+            return cake_backend.router_wgrad(G, X, o, deterministic=False)
+
+        def check(got, want):
+            assert bool(torch.isfinite(got).all())
+            assert _rel_fro(got, G.double().t() @ X.double()) <= ROUTER_REL_FRO_MAX
+
+    else:
+        out = torch.empty(T, W.shape[0], device=device)
+
+        def call(o):  # no forward verdict: the deterministic program and its partials
+            return cake_backend.router_forward(X, W, o, deterministic=False)
+
+        def check(got, want):
+            assert torch.equal(got, want)
+
+    return call, out, check
+
+
+def _graph_safety_calls(case, device, monkeypatch):
+    """``[small, large]``: two convenience calls of ``case`` (:data:`GRAPH_SAFETY_CASES`), each ``(call, out, check)``
+    -- ``call(o)`` makes the call into ``o``, ``check(got, want)`` asserts a replay's ``got`` against the eager result
+    ``want`` -- with the verdicts they need forced through ``monkeypatch``.  The large call needs more of the arena
+    kinds the small one binds."""
+    if case == "k1_wgrad":
+        return [
+            _graph_safety_k1_wgrad(row, 4097, device, SEED + 110 + i, monkeypatch)
+            for i, row in enumerate(("indexer_hw", "kv_a"))
+        ]
+    if case == "k1_forward":
+        N, K, tokens = GRAPH_SAFETY_K1_FORWARD
+        return [
+            _graph_safety_k1_forward(T, N, K, device, SEED + 112 + i)
+            for i, T in enumerate(tokens)
+        ]
+    op = case.split("_")[1]
+    return [
+        _graph_safety_router(op, T, device, SEED + 114 + i, monkeypatch)
+        for i, T in enumerate((1024, 16384) if op == "wgrad" else (4096, 16384))
+    ]
+
+
+def _graph_safety_bound(case, stream):
+    """Asserts that the cached launches of ``stream`` bind the arena kinds of ``case``."""
+    key = stream.cuda_stream
+    if case == "k1_wgrad":
+        entries = [e for k, e in cake_backend._K1_ATOMIC_CACHE.items() if k[1] == key]
+        assert entries and all(e.plan.splits == 2 and e.k1 for e in entries)
+    elif case == "k1_forward":
+        entries = [e for k, e in cake_backend._K1_DET_CACHE.items() if k[1] == key]
+        assert entries and all(e.k1 is not None for e in entries)
+        # stream-K partial slabs: the launch writes and reads k1_det_ws (a plan without them binds the 16-element floor
+        # and only adds 0 to dummy counters)
+        assert all(e.plan.ws_f32_elems > 0 for e in entries), [
+            (e.plan.template, e.plan.sk_units) for e in entries
+        ]
+    else:
+        entries = [e for k, e in cake_backend._K2_ENTRY_CACHE.items() if k[1] == key]
+        assert entries and all(e.launch is not None for e in entries)
+        if case == "router_wgrad":
+            assert all(e.atomic and e.launch.plan.simt is None for e in entries)
+        else:
+            assert all(e.launch.k2.partials_shape is not None for e in entries)
+
+
+def _graph_safety_scenario(case: str, mode: str) -> None:
+    """A convenience call of ``case`` captured into a CUDA graph on a stream ``s`` (after a warm-up call on ``s``, so
+    the capture plans and allocates nothing), then ``mode``: ``"grow"`` -- the larger call on ``s`` grows the arena,
+    and an eager call of the captured key binds the grown buffers (the replaced ones lose their last binding);
+    ``"evict"`` -- with a cache bound of 1, calls on another stream evict every entry of ``s`` (its arena loses its
+    last cached user); under ``"grow"`` at least one of the case's kinds must have a new live buffer.  Then tensors of
+    the sizes of the arena's buffers at capture, filled with :data:`GRAPH_SAFETY_FILL`, are allocated on ``s`` until one
+    takes such a buffer's address or the allocator has no cached block left (the caching allocator hands a freed block
+    out again on the stream it was freed on).  The replay must give the eager result and leave every filler
+    untouched."""
+    device, _ = _atomic_device_or_skip()
+    index = torch.cuda.current_device() if device.index is None else device.index
+    with pytest.MonkeyPatch.context() as mp:
+        small, large = _graph_safety_calls(case, device, mp)
+        call, out, check = small
+        s, s2 = torch.cuda.Stream(device), torch.cuda.Stream(device)
+        s.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(s):
+            want = call(out).clone()
+        s.synchronize()
+        _graph_safety_bound(case, s)
+        key = (index, s.cuda_stream)
+        # no reference to the arena or its buffers is kept here (it would keep them alive)
+        captured = [
+            (kind, b.data_ptr(), b.numel() * b.element_size())
+            for kind, b in cake_backend._ATOMIC_ARENAS[key].buffers.items()
+        ]
+        assert GRAPH_SAFETY_KINDS[case] <= {kind for kind, _, _ in captured}, captured
+        arena_id = id(cake_backend._ATOMIC_ARENAS[key])
+        print("GRAPH_SAFETY_CAPTURED", case, mode, captured, flush=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            call(out)
+        if mode == "grow":
+            with torch.cuda.stream(s):
+                large[0](large[1])
+                call(out)
+        else:
+            mp.setattr(det_backend, "CONVENIENCE_CACHE_SIZE", 1)
+            s2.wait_stream(s)
+            with torch.cuda.stream(s2):
+                for c, o, _ in (small, large):
+                    c(torch.empty_like(o))
+            caches = (
+                cake_backend._K1_ATOMIC_CACHE,
+                cake_backend._K1_DET_CACHE,
+                cake_backend._K2_ATOMIC_CACHE,
+                cake_backend._K2_SPLITK_CACHE,
+                cake_backend._K2_ENTRY_CACHE,
+            )
+            assert not any(k[1] == s.cuda_stream for c in caches for k in c)
+        torch.cuda.synchronize()
+        gc.collect()
+        live = cake_backend._ATOMIC_ARENAS.get(key)
+        # the captured kinds whose live buffer is no longer the one the graph was captured with
+        moved = sorted(
+            kind
+            for kind, ptr, _ in captured
+            if live is not None
+            and kind in GRAPH_SAFETY_KINDS[case]
+            and live.buffers[kind].data_ptr() != ptr
+        )
+        print(
+            "GRAPH_SAFETY_ARENA",
+            "kept" if id(live) == arena_id else "dropped",
+            {} if live is None else {k: b.nbytes for k, b in live.buffers.items()},
+            "moved",
+            moved,
+            flush=True,
+        )
+        live = None
+        if mode == "grow":
+            # the larger call replaced a buffer the captured launch is bound to
+            assert moved, captured
+        fillers, landed = [], []
+        with torch.cuda.stream(s):
+            for kind, ptr, nbytes in captured:
+                for _ in range(64):
+                    reserved = torch.cuda.memory_reserved(device)
+                    filler = torch.empty(nbytes, dtype=torch.uint8, device=device)
+                    filler.fill_(GRAPH_SAFETY_FILL)
+                    fillers.append(filler)
+                    if filler.data_ptr() == ptr:
+                        landed.append(kind)
+                        break
+                    if torch.cuda.memory_reserved(device) != reserved:
+                        break
+            out.fill_(float("nan"))
+            graph.replay()
+        s.synchronize()
+        print("GRAPH_SAFETY_FILLERS", len(fillers), "landed", landed, flush=True)
+        untouched = all(bool((f == GRAPH_SAFETY_FILL).all()) for f in fillers)
+        try:
+            check(out, want)
+            replay = "ok"
+        except AssertionError as error:
+            replay = f"wrong ({error!r})"[:300]
+        print(
+            "GRAPH_SAFETY_RESULT replay",
+            replay,
+            "fillers_untouched",
+            untouched,
+            flush=True,
+        )
+        assert replay == "ok" and untouched, (replay, untouched, landed)
+        if case.startswith("k1"):
+            assert _arena_tickets_zero()
+
+
+@pytest.mark.parametrize("mode", ["grow", "evict"])
+@pytest.mark.parametrize("case", GRAPH_SAFETY_CASES)
+def test_gpu_captured_convenience_call_keeps_its_workspace(case, mode):
+    """A convenience-path call captured into a CUDA graph stays valid until ``clear_convenience_caches``: after the
+    arena grows and the captured key is bound to the grown buffers, and after cache eviction drops every entry of the
+    capturing stream, its replay gives the eager result and writes nothing into tensors allocated since
+    (:func:`_graph_safety_scenario`, run in a child process with a timeout: a replay on freed workspace can fault or
+    spin).  The programs are built here first, so the timeout covers the scenario only."""
+    device, _ = _atomic_device_or_skip()
+    with pytest.MonkeyPatch.context() as mp:
+        for call, out, _ in _graph_safety_calls(case, device, mp):
+            call(out)
+        torch.cuda.synchronize()
+    cake_backend.clear_convenience_caches()
+    root = str(Path(__file__).resolve().parents[2])
+    code = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('graph_safety', sys.argv[1])\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "module._graph_safety_scenario(sys.argv[2], sys.argv[3])\n"
+        "print('GRAPH_SAFETY_OK')\n"
+    )
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([root, *filter(None, sys.path)]))
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", code, str(Path(__file__).resolve()), case, mode],
+            capture_output=True,
+            text=True,
+            timeout=GRAPH_SAFETY_TIMEOUT,
+            cwd=root,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as expired:
+        pytest.fail(
+            f"{case} / {mode}: no result in {GRAPH_SAFETY_TIMEOUT} s (a replay spinning on freed workspace); "
+            f"stdout {expired.stdout!r:.2000}"
+        )
+    assert r.returncode == 0 and "GRAPH_SAFETY_OK" in r.stdout, (
+        r.returncode,
+        r.stdout[-3000:],
+        r.stderr[-3000:],
+    )
