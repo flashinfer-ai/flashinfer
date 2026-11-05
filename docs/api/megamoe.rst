@@ -18,7 +18,7 @@ the MXFP4 weights on the block-scaled tensor-core MMA, quantises the clamped Swi
 output the same way and applies the routing weight in the top-k combine.
 ``transform_mxfp4_weights_for_mega_moe`` produces the SM120 layout when its inputs
 are on an SM120 device. ``intermediate_hidden`` must be a multiple of 256 and
-``hidden`` at most 7936, and ``num_max_tokens_per_rank`` at most 128: above
+``hidden`` at most 7936, and ``num_max_tokens_per_rank`` at most 256: above
 that, use the ``flashinfer.moe_ep`` SM120 MXFP4 x MXFP8 backends.
 
 Buffer and execution
