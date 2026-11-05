@@ -146,7 +146,10 @@ runs `wy_tc2`: the chains and outputs of `wy_tc` (the same bits) with a
 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
 on an SM where `wy_tc` fits four.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
-state.  The backward runs the adjoint scan, either `dv_local` plus a register
+state.  On `sm_107a`, a forward scan of one launch whose `segments x HV` CTAs
+take at most half the SMs runs `fwd_ho_vh2`: two CTAs per segment and value
+head, each the scan and output of one half of the value columns (the same
+bits).  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),
 which a host-side cost rule selects on the host-table route.  On that route a
 split `(64, 1)` plan runs the second pass of its adjoint scan on `dhu_tc2`,
@@ -166,7 +169,9 @@ On `sm_107a` (`CHAIN_PLAN`) each direction may then take a deeper `(64, 1)`
 split table (more segments than the chosen table), priced for the chain that
 runs it (`fwd_ho` for the forward, `dhu_tc2` for the adjoint) with R200 step
 times and fitted split costs, when it saves at least 2 us and prices at most
-0.95 of the chosen table; a serial table that
+0.95 of the chosen table; a forward table that runs `fwd_ho_vh2` is priced at
+0.75 of its `fwd_ho` chain time (measured on R200), so such a table can keep
+its form; a serial table that
 the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
 tables.  On `sm_100a`, `sm_103a` and `sm_107a` (`SPLIT_R_FORM`) a value-head
 group of three with the `tail_g3` tail also keeps the planner's `(64, 1)` split
