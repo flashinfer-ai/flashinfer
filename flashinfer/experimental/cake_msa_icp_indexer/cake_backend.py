@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 
@@ -135,6 +135,27 @@ def _vector(name: str, t: torch.Tensor, dtype: torch.dtype, size: int) -> None:
         raise ValueError(
             f"{name} must be a contiguous 1-D {dtype} tensor of {size} elements"
         )
+
+
+def _peer_rows(
+    peers: Sequence[torch.Tensor], world: int, shape: tuple, device: torch.device
+) -> None:
+    """Every rank's receive rows of a prefill publish, as tensors on the
+    publisher's device in rank order (``world`` of them)."""
+    if len(peers) != world:
+        raise ValueError(f"publish peer_rows must hold {world} tensors (one per rank)")
+    for p in peers:
+        if (
+            not isinstance(p, torch.Tensor)
+            or p.dtype != torch.int64
+            or tuple(p.shape) != tuple(shape)
+            or not p.is_contiguous()
+            or p.device != device
+        ):
+            raise ValueError(
+                f"publish peer_rows must be contiguous int64 {list(shape)} "
+                f"tensors on {device}"
+            )
 
 
 def _heads(h: int) -> None:
@@ -436,7 +457,8 @@ def prefill_publish_layout(
     as a peer publish, :func:`prefill_score_select` with ``publish``): one
     symmetric int64 allocation per rank of ``rows_shape = [3, W, hpr,
     capacity, 32]`` tagged rows (``rows_bytes`` bytes), zeroed once and never
-    reset, whose peer addresses are ``recv_bases`` (int64 ``[W]``); the
+    reset, passed to the publisher as every rank's view of them
+    (``peer_rows``, ``W`` tensors in rank order); the
     publisher's generation counters ``generations_shape = [3, H, capacity]``
     and the merge's ``expected_shape = [3, hpr, capacity]`` (int32, zeroed
     with the rows on every rank).  Slot ``s`` of a layer is its decode slot
@@ -953,7 +975,7 @@ def prefill_score_select(
     ``index_offset``, for every ``K`` of at least the plan's columns (half,
     rounded up, when ``compact``), without the score rows.
 
-    With ``publish`` (keys ``recv_bases``, ``generations``, ``slot``,
+    With ``publish`` (keys ``peer_rows``, ``generations``, ``slot``,
     ``t_base``, ``capacity``; :func:`prefill_publish_layout`) the same rows
     go to their owners' receive rows instead, as tagged words: row ``(h,
     t)`` to rank ``h / hpr``'s rows ``[slot, rank, h % hpr, t_base + t]``;
@@ -995,7 +1017,12 @@ def prefill_score_select(
             != (NUM_SLOT_SETS, h, int(publish["capacity"]))
         ):
             raise ValueError("publish generations must be contiguous int32 [3, H, capacity]")
-        _vector("recv_bases", publish["recv_bases"], torch.int64, tp)
+        _peer_rows(
+            publish["peer_rows"],
+            tp,
+            (NUM_SLOT_SETS, tp, hpr, int(publish["capacity"]), TAGGED_WORDS),
+            q.device,
+        )
         if publish["slot"] not in range(NUM_SLOT_SETS):
             raise ValueError("publish slot must be 0, 1 or 2")
         if not 0 <= publish["t_base"] <= publish["t_base"] + t <= publish["capacity"]:
@@ -1032,7 +1059,7 @@ def prefill_score_select(
         **(
             {}
             if publish is None
-            else {"recv_bases": publish["recv_bases"], "generations": publish["generations"]}
+            else {"generations": publish["generations"]}
         ),
     )
     arch = cake_jit.device_arch(dev)
@@ -1078,8 +1105,14 @@ def prefill_score_select(
         "force_end": force_end_blocks,
     }
     if publish is not None:
+        peers = publish["peer_rows"]
         values.update(
-            recv_bases=publish["recv_bases"],
+            # The owners' rows as the publisher's pointer parameters recv_0 ..
+            # recv_3 in rank order; those past the world are never stored to.
+            {
+                f"recv_{o}": peers[o] if o < tp else peers[0]
+                for o in range(NUM_INDEX_HEADS)
+            },
             generations=publish["generations"],
             t_base=int(publish["t_base"]),
             slot=int(publish["slot"]),

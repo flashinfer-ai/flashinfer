@@ -16,8 +16,8 @@ limitations under the License.
 The prefill exchange as a peer publish (``prefill_list_publish`` and
 ``merge_prefill_tagged``) against the carrier exchange and the CPU oracle, on
 one GPU: the ``W`` ranks of a TP2 / TP4 group run on one device, each with its
-own receive rows (``prefill_publish_layout``) whose addresses form every
-rank's ``recv_bases``, so a publisher stores into "peer" rows as over NVLink.
+own receive rows (``prefill_publish_layout``), which form every rank's
+``peer_rows``, so a publisher stores into "peer" rows as over NVLink.
 Every rank publishes every window of a step into the layer's slot, then every
 owner merges its slot: the merged ids equal the oracle's and the carrier path's
 word for word, over the prefill scenarios of every layout, several layers that
@@ -44,7 +44,7 @@ SLOT_ORDERS = {3: (0, 1, 2), 5: (0, 1, 0, 1, 2)}
 
 def _stores(lay: ref.IcpLayout, capacity: int, gen0: int) -> list[dict]:
     """Per rank: poisoned receive rows, its generation and expected counters
-    (every counter at ``gen0``), and the rows' addresses of every rank."""
+    (every counter at ``gen0``), and the rows of every rank (``peer_rows``)."""
     layout = cb.prefill_publish_layout(lay.tp, H // lay.tp, capacity)
     g = gen0 - (1 << 32) if gen0 >= 1 << 31 else gen0
     out = [
@@ -61,11 +61,9 @@ def _stores(lay: ref.IcpLayout, capacity: int, gen0: int) -> list[dict]:
         }
         for _ in range(lay.tp)
     ]
-    bases = torch.tensor(
-        [s["rows"].data_ptr() for s in out], dtype=torch.int64, device=DEV
-    )
+    peers = tuple(s["rows"] for s in out)
     for s in out:
-        s["recv_bases"] = bases
+        s["peer_rows"] = peers
     return out
 
 
@@ -88,7 +86,7 @@ def _layer(case, lay, inp, plans, pool, stores, outputs, errors, slot) -> None:
                 force_begin_blocks=case.init_blocks,
                 force_end_blocks=case.local_blocks,
                 publish={
-                    "recv_bases": stores[r]["recv_bases"],
+                    "peer_rows": stores[r]["peer_rows"],
                     "generations": stores[r]["generations"],
                     "slot": slot,
                     "t_base": w.start,

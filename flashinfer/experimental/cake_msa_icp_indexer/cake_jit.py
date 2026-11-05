@@ -127,7 +127,9 @@ LAUNCH_ARGUMENT = "enable_pdl"
 # ``work_info`` int64 plan storage, ``max_score`` / ``scores`` FP32
 # ``[T, H, K]`` score rows, ``pool`` the fused paths' sorted candidate lists,
 # ``carrier`` int32 ``[H, T, 33]`` prefill rows, ``recv_bases`` int64
-# ``[world]`` peer receive-slot addresses, ``errors`` int32 ``[1]`` timeout
+# ``[world]`` peer receive-slot addresses, ``recv_0`` .. ``recv_3`` the
+# owners' prefill publish rows (int64, rank order; those past the world are
+# never stored to), ``errors`` int32 ``[1]`` timeout
 # counter, ``generations`` int32 ``[3, H, capacity]`` publish counters,
 # ``recv`` the owner's receive rows of one slot set, ``expected`` int32
 # ``[hpr, capacity]`` merge counters, ``output`` int32 ``[T, hpr, 16]``,
@@ -150,6 +152,10 @@ LOGICAL_TENSORS = (
     "pool",
     "carrier",
     "recv_bases",
+    "recv_0",
+    "recv_1",
+    "recv_2",
+    "recv_3",
     "errors",
     "generations",
     "recv",

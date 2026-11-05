@@ -379,12 +379,21 @@ class MSAIcpIndexerPlan:
         layout = self.prefill_publish_layout
         want = {
             "rows": (torch.int64, layout["rows_shape"]),
-            "recv_bases": (torch.int64, (self.world_size,)),
             "generations": (torch.int32, layout["generations_shape"]),
             "expected": (torch.int32, layout["expected_shape"]),
         }
-        for field, (dtype, shape) in want.items():
-            t = getattr(publish, field, None)
+        peers = tuple(getattr(publish, "peer_rows", ()))
+        if len(peers) != self.world_size:
+            raise ValueError(
+                f"publish.peer_rows must hold {self.world_size} tensors"
+                " (one per rank)"
+            )
+        checks = [(f, getattr(publish, f, None), *w) for f, w in want.items()]
+        checks += [
+            (f"peer_rows[{p}]", t, torch.int64, layout["rows_shape"])
+            for p, t in enumerate(peers)
+        ]
+        for field, t, dtype, shape in checks:
             if (
                 not isinstance(t, torch.Tensor)
                 or t.device != self.device
@@ -655,7 +664,7 @@ class MSAIcpIndexerPlan:
 
         ``publish`` (the fused path only; :meth:`MSAIcpPrefillStep` passes
         it): instead of ``carrier_view``, the rows go to the owners' receive
-        rows of a :class:`MSAIcpPrefillPublish` (keys ``recv_bases``,
+        rows of a :class:`MSAIcpPrefillPublish` (keys ``peer_rows``,
         ``generations``, ``slot``, ``t_base``, ``capacity`` of
         :func:`~.cake_backend.prefill_score_select`)."""
         t = query.shape[0]
@@ -954,14 +963,15 @@ class MSAIcpPrefillPublish:
     """The caller's prefill publish storage (laid out by
     :func:`~.cake_backend.prefill_publish_layout`; all zeroed once on every
     rank, never reset): ``rows`` this rank's local view of its symmetric
-    receive rows (int64 ``[3, W, hpr, capacity, 32]``), ``recv_bases`` every
-    rank's address of its rows (int64 ``[W]``, peer order), ``generations``
-    the publisher's counters (int32 ``[3, H, capacity]``) and ``expected`` the
-    merge's (int32 ``[3, hpr, capacity]``).  The caller keeps the symmetric
+    receive rows (int64 ``[3, W, hpr, capacity, 32]``), ``peer_rows`` every
+    rank's rows as a tensor on this device (``W`` of them in rank order: the
+    symmetric allocation's peer views, entry ``rank`` this rank's own rows),
+    ``generations`` the publisher's counters (int32 ``[3, H, capacity]``) and
+    ``expected`` the merge's (int32 ``[3, hpr, capacity]``).  The caller keeps the symmetric
     allocation alive while any step uses it."""
 
     rows: torch.Tensor
-    recv_bases: torch.Tensor
+    peer_rows: tuple[torch.Tensor, ...]
     generations: torch.Tensor
     expected: torch.Tensor
 
@@ -1044,7 +1054,7 @@ class MSAIcpPrefillStep(_StepBase):
                 if pub is None
                 else {
                     "publish": {
-                        "recv_bases": pub.recv_bases,
+                        "peer_rows": pub.peer_rows,
                         "generations": pub.generations,
                         "slot": slot,
                         "t_base": start,
