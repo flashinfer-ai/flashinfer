@@ -1453,6 +1453,50 @@ def test_l2n_handoff_is_refused_by_the_node_and_the_saved_bytes() -> None:
             assert saved_bytes(c, H=H, checkpoint_handoff=True, **OFF) == light + hb
 
 
+def test_raw_gate_handoff_is_refused_by_the_node_and_the_saved_bytes() -> None:
+    """Nor does the hand-off engage in the raw gate mode, where the decision is the caller's: the autograd node
+    applied directly with ``handoff=True`` and ``use_gate_in_kernel=True`` raises ``ValueError`` before any forward,
+    with or without a recompute handle, and the saved-bytes query raises ``ValueError`` for
+    ``checkpoint_handoff=True`` with ``use_gate_in_kernel=True`` on a rank with tokens and on one without.  The same
+    calls with the activated gate reach the hand-off's forward and its bytes (the refusals are not vacuous)."""
+    H = 4
+    ctx = _cpu_ctx()
+    args = _args(_cpu_ops(ctx, H), ctx)
+    # scale, save_mode, boundary_mode, workspace, options
+    head = (None, "light", "saved", None, {})
+    reached: list = []
+
+    def stop(*_a, **_k):
+        reached.append(_a)
+        raise _Stop
+
+    refusal = "does not engage with use_gate_in_kernel=True"
+    apply = cake_kcp.ChunkKDAFunctionKcp.apply
+    raw = torch.zeros(H, dtype=torch.float32)
+    with pytest.MonkeyPatch.context() as m:
+        for name in ("_fwd_tape", "_fwd_handle", "chunk_kda_fwd_kcp", "_fwd_body"):
+            m.setattr(cake_kcp, name, stop)
+        for handle in (None, cake_kcp.RecomputeHandleKcp()):
+            # use_gate_in_kernel, A_log, dt_bias, lower_bound; use_qk_l2norm_in_kernel off
+            with pytest.raises(ValueError, match=refusal):
+                apply(*args, *head, handle, True, True, raw, raw, -5.0, False)
+            assert reached == [], handle
+        with pytest.raises(_Stop):
+            apply(*args, *head, None, True, False, None, None, None, False)
+        assert len(reached) == 1
+    saved_bytes = cake_kcp_plan.kda_saved_bytes_kcp
+    ctxs = [_cpu_ctx(rank=0), _cpu_zero_ctx(1)]
+    assert int(ctxs[0].T_r) > 0 and int(ctxs[1].T_r) == 0
+    for c in ctxs:
+        with pytest.raises(ValueError, match="use_gate_in_kernel=True"):
+            saved_bytes(c, H=H, checkpoint_handoff=True, use_gate_in_kernel=True)
+        hb = cake_kcp_plan.kda_handoff_bytes_kcp(c, H=H)
+        light = saved_bytes(c, H=H, saved_carry=False)
+        assert saved_bytes(c, H=H, checkpoint_handoff=True) == light + hb
+        # the light set of the raw mode is the activated gate's (the bytes do not depend on the mode)
+        assert saved_bytes(c, H=H, saved_carry=False, use_gate_in_kernel=True) == light
+
+
 # --------------------------------------------------------------------------- CPU rows: the values and the stage order
 
 
@@ -2087,129 +2131,6 @@ def test_l2n_fallback_stages_are_never_skipped() -> None:
     launches.clear()
     backend.stage("gate_epilogue", call(False, True))
     assert launches == []
-
-
-# PENDING(single-rank in-kernel Q/K L2 norm programs): delete these rows once the existing backend serves the mode
-# (they skip then; the W = 2 / 4 refusal rows force a reason and stay); the record-coverage row and the GPU rows below
-# take over.
-def _never(name: str, like=None):
-    """A raiser standing in for ``name``; with ``like``, it keeps that callable's signature, so the capability check
-    reads the same signature with the raiser in place."""
-
-    def fn(*_a, **_k):
-        raise AssertionError(f"{name} reached before the in-kernel Q/K L2 norm refusal")
-
-    return fn if like is None else functools.wraps(like, updated=())(fn)
-
-
-def test_l2n_kernel_path_raises_until_bound() -> None:
-    """While the existing backend lacks the mode's programs, every flag-on entry raises ``NotImplementedError`` with
-    one message (:data:`cake_kcp_plan.QK_L2NORM_PENDING` and the reason) on a rank with tokens and on a rank without,
-    before any workspace sizing, local arena plan or bind, existing-backend plan or collective (those raise
-    ``AssertionError`` here): a saving and a replay-mode forward, a replay-mode and a saved-mode backward, the
-    autograd entry with and without a recompute handle (each with a fresh workspace and with a flag-on workspace
-    checked on another architecture), ``WorkspaceKcp`` with and without a context, that workspace's ``ensure`` /
-    ``reserve`` on the CPU and on a CUDA device (its local arena bind replaced by a raiser), and the unpatched
-    workspace and saved byte queries (one context and a list)."""
-    missing = _l2n_missing()
-    if missing is None:
-        pytest.skip(
-            "the existing backend has the in-kernel Q/K L2 norm programs: delete this row"
-        )
-    real = cake_kcp_plan.qk_l2norm_missing
-    # the CUDA device of the refusal rows below reads as an architecture the existing backend does not serve yet
-    # (one exists while the check above fails); the workspace is built where the check passes, on another one
-    dev_arch = next(a for a in cake_jit.ARCHES if real("fused", "g", a) is not None)
-    other = next(a for a in cake_jit.ARCHES if a != dev_arch)
-    want = f"{cake_kcp_plan.QK_L2NORM_PENDING} ({real('fused', 'g', None)})"
-    want_dev = f"{cake_kcp_plan.QK_L2NORM_PENDING} ({real('fused', 'g', dev_arch)})"
-    H = 4
-    ctxs = (_cpu_ctx(), _cpu_zero_ctx())
-    for ctx in ctxs:
-        ops = _cpu_ops(ctx, H)
-        args = _args(ops, ctx)
-        with pytest.MonkeyPatch.context() as m:
-            # a flag-on workspace and saved set built where the check passes: on another architecture
-            m.setattr(cake_kcp_plan, "qk_l2norm_arch", lambda device=None: other)
-            m.setattr(
-                cake_kcp_plan,
-                "qk_l2norm_missing",
-                lambda mode="fused", gate="g", arch=None: (
-                    None if arch == other else real(mode, gate, arch)
-                ),
-            )
-            ws = cake_kcp.WorkspaceKcp(**L2N)
-            fwd = _prepared(ctx, ops, H, backward=False, workspace=ws, **L2N)
-            rstd = torch.zeros(2, int(ctx.T_r), H)
-            saved = _cpu_saved(fwd, qk_rstd=rstd, qk_l2norm=True)
-        with pytest.MonkeyPatch.context() as m:
-            for name in ("tables", "_size_pools", "_bind_local", "_local_plan"):
-                m.setattr(cake_kcp.WorkspaceKcp, name, _never(name))
-            for name in ("plan", "workspace_bytes", "KdaWorkspace"):
-                real_fn = getattr(cake_backend, name)
-                m.setattr(cake_backend, name, _never(f"cake_backend.{name}", real_fn))
-            # a CUDA device reads as dev_arch (no device is touched: the refusal comes first)
-            m.setattr(
-                cake_kcp_plan,
-                "qk_l2norm_arch",
-                lambda device=None: (
-                    dev_arch
-                    if device is not None and torch.device(device).type == "cuda"
-                    else None
-                ),
-            )
-            dout = ops["dout"]
-            handle = cake_kcp.RecomputeHandleKcp
-            calls = {
-                "fwd": lambda: cake_kcp.chunk_kda_fwd_kcp(*args, **L2N, **ND),
-                "fwd_ws": lambda: cake_kcp.chunk_kda_fwd_kcp(
-                    *args, workspace=ws, **L2N, **ND
-                ),
-                "fwd_replay": lambda: cake_kcp.chunk_kda_fwd_kcp(
-                    *args, boundary_mode="replay", **L2N, **ND
-                ),
-                "bwd_replay": lambda: cake_kcp.chunk_kda_bwd_kcp(
-                    *args, dout, **L2N, **ND
-                ),
-                "bwd_saved_ws": lambda: cake_kcp.chunk_kda_bwd_kcp(
-                    *args, dout, saved=saved, workspace=ws, **L2N, **ND
-                ),
-                "autograd": lambda: cake_kcp.chunk_kda_kcp(*args, **L2N, **ND),
-                "autograd_ws": lambda: cake_kcp.chunk_kda_kcp(
-                    *args, workspace=ws, **L2N, **ND
-                ),
-                "autograd_handle": lambda: cake_kcp.chunk_kda_kcp(
-                    *args, recompute_handle=handle(), **L2N, **ND
-                ),
-                "workspace": lambda: cake_kcp.WorkspaceKcp(**L2N),
-                "workspace_ctx": lambda: cake_kcp.WorkspaceKcp(ctx, H, **L2N),
-                "workspace_ctx_lazy": lambda: cake_kcp.WorkspaceKcp(
-                    ctx, H, allocate=False, **L2N
-                ),
-                "ensure": lambda: ws.ensure(ctx, H),
-                "reserve": lambda: ws.reserve([ctx], H),
-                "workspace_bytes": lambda: cake_kcp_plan.kda_workspace_bytes_kcp(
-                    ctx, H=H, **L2N
-                ),
-                "workspace_bytes_list": lambda: (
-                    cake_kcp_plan.kda_workspace_bytes_kcp(list(ctxs), H=H, **L2N)
-                ),
-                "saved_bytes": lambda: cake_kcp_plan.kda_saved_bytes_kcp(
-                    ctx, H=H, **L2N
-                ),
-            }
-            for name, fn in calls.items():
-                with pytest.raises(NotImplementedError) as info:
-                    fn()
-                assert str(info.value) == want, (name, int(ctx.T_r), str(info.value))
-            cuda = torch.device("cuda", 0)
-            for name, fn in (
-                ("ensure_cuda", lambda: ws.ensure(ctx, H, device=cuda)),
-                ("reserve_cuda", lambda: ws.reserve([ctx], H, device=cuda)),
-            ):
-                with pytest.raises(NotImplementedError) as info:
-                    fn()
-                assert str(info.value) == want_dev, (name, int(ctx.T_r))
 
 
 # W = 2 / 4 CPU process groups (gloo), one rank without tokens in each

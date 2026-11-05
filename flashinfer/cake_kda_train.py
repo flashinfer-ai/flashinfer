@@ -38,27 +38,29 @@ a ``bool`` (``TypeError``):
   runs the deterministic package and warns once per process.
 
 Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
-``lower_bound``; FlashInfer #7816) runs on both packages: the entries forward the
-keywords to the package of the call's mode, ``chunk_kda_bwd`` then returns seven
-tensors (``dA_log`` / ``ddt_bias`` added), and the workspace and its byte query
-take ``use_gate_in_kernel``.  The raw mode has no ``S1`` pair: with
+``lower_bound``; FlashInfer #7816) runs on both packages: the entries forward
+the keywords to the package of the call's mode, ``chunk_kda_bwd`` then returns
+seven tensors (``dA_log`` / ``ddt_bias`` added), and the workspace and its byte
+query take ``use_gate_in_kernel``.  The raw mode has no ``S1`` pair: with
 ``deterministic=False`` it runs the deterministic package's raw-mode programs in
-the same order, so ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` and ``dg`` are
-bitwise the deterministic package's raw mode, but for the reduce of ``dA_log`` /
-``ddt_bias``.  On SM107 that reduce is the deterministic package's too (bitwise
-results).  On SM100 / SM103 with the in-kernel Q/K L2 norm off (with it the
-reduce is the deterministic package's on every architecture, below) the backward
-adds the per-chunk parameter partials in FP64 in no fixed order and rounds the sums to FP32 once, so ``dA_log`` /
-``ddt_bias`` can differ from run to run and from the deterministic package:
-from run to run by one FP32 ulp at most while the FP64 sum's order error stays
-below half an FP32 ulp of the result (only per-chunk terms that nearly cancel
-exceed it), and their error against an FP64 reference stays within the
-deterministic package's plus the FP64 sum's own error;
-its workspace then also holds the FP64 accumulators (2 KiB per head; 16 KiB per
-head on SM100 from 32 heads), which the byte query counts.  Under torch's
-deterministic algorithms such a call runs the deterministic package, as above.
-Both packages' saved sets carry the gate mode and ``lower_bound``, so either
-backward reads the other's raw set.
+the same order (a tape backward may run the non-deterministic package's w-only
+WY twin in place of the WY program, writing the same ``w``), so ``out``, ``dq``,
+``dk``, ``dv``, ``dbeta`` and ``dg`` are bitwise the deterministic package's raw
+mode, but for the reduce of ``dA_log`` / ``ddt_bias``.  On SM107 that reduce is
+the deterministic package's too (bitwise results).  On SM100 / SM103 with the
+in-kernel Q/K L2 norm off (with it the reduce is the deterministic package's on
+every architecture, below) the backward adds the per-chunk parameter partials in
+FP64 in no fixed order and rounds the sums to FP32 once, so
+``dA_log`` / ``ddt_bias`` can differ from run to run and from the deterministic
+package: from run to run by one FP32 ulp at most while the FP64 sum's order
+error stays below half an FP32 ulp of the result (only per-chunk terms that
+nearly cancel exceed it), and their error against an FP64 reference stays within
+the deterministic package's plus the FP64 sum's own error; its workspace then
+also holds the FP64 accumulators (2 KiB per head; 16 KiB per head on SM100 from
+32 heads), which the byte query counts.  Under torch's deterministic algorithms
+such a call runs the deterministic package, as above.  Both packages' saved sets
+carry the gate mode and ``lower_bound``, so either backward reads the other's
+raw set.
 
 The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``: raw ``q`` / ``k``
 in, normalized inside the kernels; FlashInfer #7817) runs on both packages, in

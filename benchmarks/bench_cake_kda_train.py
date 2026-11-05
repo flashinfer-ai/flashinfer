@@ -70,8 +70,9 @@ flash-linear-attention's ``chunk_kda(use_gate_in_kernel=True, ...)``, whose
 ``out`` the row compares with the non-deterministic arm's
 (``fla_raw_out_vs_nd``: the relative RMS difference; an adapter that drops a
 gate term shows here).  This package's raw mode runs the deterministic
-package's programs in the same order (no path runs an S1 pair) but for the
-parameter-gradient reduce: on ``sm_100a`` / ``sm_103a`` its backward runs an
+package's programs in the same order (no path runs an S1 pair; a tape backward
+may run this package's w-only WY twin in place of the WY program, writing the
+same ``w``) but for the parameter-gradient reduce: on ``sm_100a`` / ``sm_103a`` its backward runs an
 ``R1c`` pair (the GLM intra program adds the per-chunk partials in FP64 into
 the workspace's accumulators, its cast rounds them once), on ``sm_107a`` and
 with ``--l2n`` on every architecture the deterministic pair.  A raw row reports ``r1c`` (the pair's GLM intra and cast

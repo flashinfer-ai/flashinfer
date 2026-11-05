@@ -2624,10 +2624,10 @@ def kda_saved_bytes_kcp(
     set of every call the checkpoint hand-off does not engage on; ``True`` is the saved set of a forward that keeps
     the hand-off's tape set -- plus :func:`kda_handoff_bytes_kcp`, without the carry plane term -- that is, of a
     checkpointed call with ``checkpoint_handoff="on"``, or ``"auto"`` where :func:`kcp_handoff_auto_refusal` admits
-    it.  A rank without tokens keeps no tape set, nor does a call with the in-kernel Q / K L2 norm (the hand-off
-    does not engage with it): query them with ``False`` (``True`` with ``use_qk_l2norm_in_kernel=True`` raises
-    ``ValueError``).  The flag is that decision, not the entry's mode: a value that is not a ``bool`` raises
-    ``TypeError``."""
+    it.  A rank without tokens keeps no tape set, nor does a call in the raw gate mode or with the in-kernel Q / K
+    L2 norm (the hand-off engages with neither): query them with ``False`` (``True`` with
+    ``use_gate_in_kernel=True`` or ``use_qk_l2norm_in_kernel=True`` raises ``ValueError``).  The flag is that
+    decision, not the entry's mode: a value that is not a ``bool`` raises ``TypeError``."""
     l2n = check_qk_l2norm(use_qk_l2norm_in_kernel)
     if not isinstance(use_gate_in_kernel, bool):
         raise ValueError(
@@ -2641,6 +2641,11 @@ def kda_saved_bytes_kcp(
     if checkpoint_handoff and l2n:
         raise ValueError(
             "checkpoint_handoff=True: the checkpoint hand-off does not engage with use_qk_l2norm_in_kernel=True "
+            "(no tape set is kept); query the saved set with checkpoint_handoff=False"
+        )
+    if checkpoint_handoff and use_gate_in_kernel:
+        raise ValueError(
+            "checkpoint_handoff=True: the checkpoint hand-off does not engage with use_gate_in_kernel=True "
             "(no tape set is kept); query the saved set with checkpoint_handoff=False"
         )
     _check_save_mode(save_mode)

@@ -7703,9 +7703,9 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
     KCP saved set, which records the mode and ``lower_bound``, and returns the gradients of the raw gate, ``A_log``
     and ``dt_bias`` (the parameter gradients: this rank's partial sums, :func:`chunk_kda_bwd_kcp`).  In-kernel Q / K
     L2 norm (``use_qk_l2norm_in_kernel``): the node keeps the caller's raw ``q`` / ``k`` (strided views stay views)
-    and the saved set with its ``qk_rstd``, and returns the gradients of the raw ``q`` / ``k``; the checkpoint
-    hand-off does not engage with it (:func:`chunk_kda_kcp` never decides one), so ``handoff=True`` with
-    ``use_qk_l2norm_in_kernel=True`` raises ``ValueError`` before any work."""
+    and the saved set with its ``qk_rstd``, and returns the gradients of the raw ``q`` / ``k``.  The checkpoint
+    hand-off engages with neither mode (:func:`chunk_kda_kcp` never decides one), so ``handoff=True`` with
+    ``use_gate_in_kernel=True`` or ``use_qk_l2norm_in_kernel=True`` raises ``ValueError`` before any work."""
 
     @staticmethod
     def forward(
@@ -7734,6 +7734,12 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
             # decides a hand-off with the in-kernel Q / K L2 norm
             raise ValueError(
                 "the checkpoint hand-off (handoff=True) does not engage with use_qk_l2norm_in_kernel=True"
+            )
+        if handoff and use_gate_in_kernel:
+            # the hand-off's forward takes the activated gate and keeps no raw-gate set: chunk_kda_kcp never decides
+            # a hand-off in the raw gate mode
+            raise ValueError(
+                "the checkpoint hand-off (handoff=True) does not engage with use_gate_in_kernel=True"
             )
         gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
         # the checkpoint hand-off: chunk_kda_kcp's decision, made once per checkpointed call (both passes alike)
