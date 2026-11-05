@@ -1326,6 +1326,13 @@ def test_tuning_buckets_off_grid_top_bucket_matches_inference_key(monkeypatch):
     with autotune(tune_mode=True, tuning_buckets=buckets, round_up=True):
         tuner.choose_one("off_grid_top_bucket_test", [runner], config, tune_inputs)
 
+    keys = {
+        k.nearest_profile[0][0]
+        for k in tuner.profiling_cache
+        if k.custom_op == "off_grid_top_bucket_test"
+    }
+    assert keys == {8, 16, 32}, f"Expected the op's keys {{8, 16, 32}}, got {keys}"
+
     infer_inputs = [torch.empty((24, 16), dtype=torch.float32)]
     _, tactic = tuner.choose_one(
         "off_grid_top_bucket_test", [runner], config, infer_inputs
@@ -1989,9 +1996,9 @@ def test_choose_one_above_overridden_top_bucket_uses_largest_tuned_profile(
     monkeypatch,
 ):
     """Tuning under autotune(tuning_buckets=hybrid(N), round_up=True) stores
-    the top bucket N under N, while the op's own mapper sends runtime sizes
-    above the previous bucket to the next power of two.  Those lookups (and
-    sizes above N) must use the profile tuned at N, not the fallback."""
+    the top bucket N under the op's own key for N (8192 here), so 5000 and 6144
+    hit it directly.  Larger sizes (20000 -> 32768) must still use the profile
+    tuned at N, not the default tactic."""
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
     config = TuningConfig(
@@ -2022,15 +2029,15 @@ def test_choose_one_above_overridden_top_bucket_uses_largest_tuned_profile(
     monkeypatch.setattr(
         autotuner_module.logger, "info", lambda msg, *a, **k: messages.append(msg)
     )
-    # 3000 -> 3072 (tuned); 5000 and 6144 -> 8192 and 20000 -> 32768, all
-    # above the top tuned bucket 6144.
+    # 3000 -> 3072 and 5000, 6144 -> 8192 are tuned; 20000 -> 32768 is above
+    # the top tuned key 8192.
     for num_tokens, expected_tactic in ((3000, 1), (5000, 2), (6144, 2), (20000, 2)):
         _, tactic = tuner.choose_one(
             "top_bucket_test", [runner], config, [torch.empty((num_tokens, 16))]
         )
         assert tactic == expected_tactic, f"num_tokens={num_tokens}: got {tactic}"
-    # Logged once per requested profile: 8192 and 32768.
-    assert len([m for m in messages if "above the largest tuned bucket" in m]) == 2
+    # Logged once, for 32768; 8192 is now a direct hit.
+    assert len([m for m in messages if "above the largest tuned bucket" in m]) == 1
 
 
 def test_search_cache_top_bucket_fallback_only_above_tuned_range():
