@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import functools
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import logging
 import os
 import struct
@@ -206,6 +206,12 @@ def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
 _CUBLASLT_ALGO_BYTES = 64
 _CUBLASLT_MAX_ALGOS = 100
+# Counts launches where cuBLASLt rejected the tuned descriptor for the actual
+# problem and the heuristic default ran instead.  A non-zero count means
+# "reported as tuned, executed untuned" -- benchmarks and tests read it to tell
+# a real tuned hit from a rematerialization.  Keyed by descriptor.
+_CUBLASLT_TACTIC_REMATERIALIZED: "Counter[tuple]" = Counter()
+_CUBLASLT_REMATERIALIZE_WARNED: set = set()
 _CUBLASLT_ALGO_FORMAT = "8Q"
 _CUBLASLT_ALGO_CACHE_MAX = 256
 
@@ -286,21 +292,35 @@ def _cublaslt_algo_arg(tactic) -> Optional[torch.Tensor]:
 
 
 def _check_cublaslt_descriptor_ran(used_descriptor: int, tactic) -> None:
-    """Disqualify a profiled descriptor that does not apply to the profiled problem.
+    """Account for a descriptor that did not apply to the problem it was run on.
 
-    Outside profiling, a descriptor that cuBLASLt rejects for the actual
-    problem (e.g. tuned at another M of the bucket, or persisted by another
-    cuBLASLt version) runs the heuristic default instead.
+    During profiling the descriptor is disqualified: raising makes the
+    autotuner record ``inf`` for it instead of timing the heuristic default
+    under its name.  Outside profiling the heuristic default has already run
+    (e.g. the descriptor was tuned at another M of the bucket, or persisted by
+    another cuBLASLt); the launch is counted in
+    ``_CUBLASLT_TACTIC_REMATERIALIZED`` and warned about once per descriptor,
+    so a launch reported as tuned but executed untuned leaves a trace.
 
     The heuristic default itself (``tactic == -1``) is never a rejected
     descriptor: the autotuner times it as a candidate of its own (the default
     races the tuned tactics in ``autotune_v2`` contexts).
     """
-    if tactic == -1 or used_descriptor or not is_in_profile_measurement():
+    if tactic == -1 or used_descriptor:
         return
-    raise RuntimeError(
-        f"cuBLASLt algorithm {tactic!r} does not apply to the profiled problem."
-    )
+    if is_in_profile_measurement():
+        raise RuntimeError(
+            f"cuBLASLt algorithm {tactic!r} does not apply to the profiled problem."
+        )
+    _CUBLASLT_TACTIC_REMATERIALIZED[tactic] += 1
+    if tactic not in _CUBLASLT_REMATERIALIZE_WARNED:
+        _CUBLASLT_REMATERIALIZE_WARNED.add(tactic)
+        warnings.warn(
+            f"cuBLASLt rejected the tuned algorithm {tactic!r} for this problem; "
+            "the heuristic default ran instead, so this launch is NOT running "
+            "the tuned algorithm.  Tune this shape, or narrow the tuning buckets.",
+            stacklevel=3,
+        )
 
 
 # Error messages

@@ -199,10 +199,14 @@ inline cublasStatus_t resolve_algo(cublasLtHandle_t lt_handle, cublasLtMatmulDes
  * \brief Memo of resolve_algo() per (descriptor, exact problem).
  *
  * Keeps cublasLtMatmulAlgoCheck and the heuristic query off the steady-state path: after
- * the first call for a problem, a lookup returns the algorithm to run.
+ * the first call for a problem, a lookup returns the algorithm to run. The memo is bounded:
+ * once it holds kMaxEntries it is cleared, and the next call for each problem resolves again
+ * (host-side queries, safe under CUDA graph capture).
  */
 class ResolvedAlgoCache {
  public:
+  static constexpr size_t kMaxEntries = 4096;
+
   // The key is the problem fields followed by the descriptor bytes (none for the heuristic
   // default); the caller lists every field that affects the algorithm's validity.
   static std::string make_key(const void* algo_desc, std::initializer_list<int64_t> problem) {
@@ -233,6 +237,9 @@ class ResolvedAlgoCache {
     FLASHINFER_CUBLAS_CALL(resolve_algo(lt_handle, matmul_desc, a_layout, b_layout, d_layout,
                                         workspace_size_in_bytes, algo_desc, resolved));
     std::lock_guard<std::mutex> lock(mutex_);
+    if (entries_.size() >= kMaxEntries) {
+      entries_.clear();
+    }
     entries_.emplace(key, *resolved);
     return CUBLAS_STATUS_SUCCESS;
   }

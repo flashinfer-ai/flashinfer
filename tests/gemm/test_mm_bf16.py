@@ -399,7 +399,7 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     )
 
 
-def test_cublaslt_bf16_runner_zero_algos():
+def test_cublaslt_bf16_runner_zero_algos(monkeypatch):
     """No candidate algorithms means nothing to profile; the default still runs."""
     from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
     from flashinfer.utils import get_compute_capability
@@ -418,7 +418,8 @@ def test_cublaslt_bf16_runner_zero_algos():
     workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     inputs = [a, b, None, None, out, workspace]
 
-    runner._get_algos = lambda _inputs: []
+    # The runner is memoized; monkeypatch so the stub does not outlive the test.
+    monkeypatch.setattr(runner, "_get_algos", lambda _inputs: [], raising=False)
     assert runner.get_valid_tactics(inputs, None) == []
     runner.forward(inputs)
     cos_sim = F.cosine_similarity((a @ b).reshape(-1), out.reshape(-1), dim=0)

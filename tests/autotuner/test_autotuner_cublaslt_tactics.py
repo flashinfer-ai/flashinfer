@@ -11,6 +11,8 @@ The serialization tests run on CPU; the rest need a GPU.
 """
 
 import json
+import warnings
+from collections import Counter
 
 import pytest
 import torch
@@ -390,8 +392,13 @@ def _runner_and_inputs(backend, m):
 
 
 @pytest.mark.parametrize("backend", ["cublas", "cublaslt"])
-def test_invalid_descriptor_runs_heuristic_default(backend, descriptor_runs):
+def test_invalid_descriptor_runs_heuristic_default(
+    backend, descriptor_runs, monkeypatch
+):
     _skip_unless_backend(backend)
+    rematerialized = Counter()
+    monkeypatch.setattr(gemm_base, "_CUBLASLT_TACTIC_REMATERIALIZED", rematerialized)
+    monkeypatch.setattr(gemm_base, "_CUBLASLT_REMATERIALIZE_WARNED", set())
     problem, runner, inputs = _runner_and_inputs(backend, 300)
     corrupted = [
         (2**64 - 1,) * 8,
@@ -399,16 +406,28 @@ def test_invalid_descriptor_runs_heuristic_default(backend, descriptor_runs):
     ]
     for tactic in corrupted:
         assert runner.validate_tactic(inputs, tactic)
+        # Outside profiling the heuristic default runs; the launch is counted
+        # and warned about once per descriptor.
         problem.out.zero_()
-        runner.forward(inputs, tactic=tactic)
+        with pytest.warns(UserWarning, match="rejected the tuned algorithm"):
+            runner.forward(inputs, tactic=tactic)
         torch.cuda.synchronize()
         problem.check()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            runner.forward(inputs, tactic=tactic)
+        assert not [
+            w for w in caught if "rejected the tuned algorithm" in str(w.message)
+        ]
+        assert rematerialized[tactic] == 2
+        # During profiling the descriptor is disqualified instead.
         with (
             _profile_measurement_scope(),
             pytest.raises(RuntimeError, match="does not apply"),
         ):
             runner.forward(inputs, tactic=tactic)
-    assert [used for used, _ in descriptor_runs] == [0] * (2 * len(corrupted))
+        assert rematerialized[tactic] == 2
+    assert [used for used, _ in descriptor_runs] == [0] * (3 * len(corrupted))
 
     # Descriptors enumerated with a workspace, run without one: those that
     # need workspace fall back, the others run as given.
