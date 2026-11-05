@@ -127,56 +127,57 @@ def test_float16_state_rejected():
         )
 
 
+@pytest.mark.parametrize("accepted", [False, True])
 @pytest.mark.parametrize("num_spec_tokens", [1, 3])
-def test_fp32_state_spec_decode_matches_bf16_kernel(num_spec_tokens):
+def test_fp32_state_spec_decode_matches_reference(num_spec_tokens, accepted):
     N, H, HV, T = 4, 16, 16, 1 + num_spec_tokens
     gen = torch.Generator(device="cpu").manual_seed(1)
 
     def r(*s):
-        return torch.rand(*s, generator=gen).to(torch.bfloat16).cuda()
+        return torch.randn(*s, generator=gen).to(torch.bfloat16).cuda()
 
-    q, k = r(1, N * T, H, K), r(1, N * T, H, K)
-    v = r(1, N * T, HV, K)
-    g = (
-        F.logsigmoid(torch.randn(1, N * T, HV, K, generator=gen))
-        .to(torch.bfloat16)
-        .cuda()
-    )
-    beta = r(1, N * T, HV).sigmoid()
+    q, k, v = r(1, N * T, H, K), r(1, N * T, H, K), r(1, N * T, HV, K)
+    g = (-torch.rand(1, N * T, HV, K, generator=gen)).to(torch.bfloat16).cuda()
+    beta = torch.rand(1, N * T, HV, generator=gen).to(torch.bfloat16).cuda()
     pool32 = (torch.randn(N * T + 5, HV, K, K, generator=gen) * 0.1).cuda()
-    # a bf16-representable initial state makes the two dtypes start identical
-    pool32 = pool32.bfloat16().float()
+    pool = pool32.clone()
     idx = torch.arange(N * T, dtype=torch.int32).reshape(N, T).cuda()
     cu = torch.arange(0, N * T + 1, T, dtype=torch.int32, device="cuda")
+    nat = torch.tensor([1, 2, T, 1][:N], dtype=torch.int32).cuda() if accepted else None
+    extra = {"num_accepted_tokens": nat} if accepted else {}
+    scale = K**-0.5
 
-    outs, pools = {}, {}
-    for dt in (torch.bfloat16, torch.float32):
-        pool = pool32.to(dt).clone()
-        outs[dt], _ = recurrent_kda(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=pool,
-            cu_seqlens=cu,
-            ssm_state_indices=idx,
-            num_spec_tokens=num_spec_tokens,
-            use_qk_l2norm_in_kernel=True,
-        )
-        pools[dt] = pool
+    out, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=pool,
+        cu_seqlens=cu,
+        ssm_state_indices=idx,
+        num_spec_tokens=num_spec_tokens,
+        use_qk_l2norm_in_kernel=True,
+        **extra,
+    )
     torch.cuda.synchronize()
-    assert pools[torch.float32].dtype == torch.float32
-    torch.testing.assert_close(
-        outs[torch.float32].float(), outs[torch.bfloat16].float(), atol=1e-1, rtol=5e-2
-    )
-    torch.testing.assert_close(
-        pools[torch.float32][: N * T],
-        pools[torch.bfloat16][: N * T].float(),
-        atol=1e-1,
-        rtol=5e-2,
-    )
-    assert torch.equal(pools[torch.float32][N * T :], pool32[N * T :])
+    assert pool.dtype == torch.float32
+
+    for b in range(N):
+        start = max(int(nat[b]) - 1, 0) if accepted else 0
+        state = pool32[int(idx[b, start])]
+        for t in range(T):
+            n = b * T + t
+            ref_o, state = _reference_step(
+                q[0, n], k[0, n], v[0, n], g[0, n], beta[0, n], state, scale
+            )
+            torch.testing.assert_close(out[0, n].float(), ref_o, atol=3e-2, rtol=3e-2)
+            if t >= start:
+                torch.testing.assert_close(
+                    pool[int(idx[b, t])], state, atol=1e-4, rtol=1e-4
+                )
+    assert torch.equal(pool[N * T :], pool32[N * T :])
 
 
 @pytest.mark.parametrize("B", [1, 8])
