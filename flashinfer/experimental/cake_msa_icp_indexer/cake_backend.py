@@ -470,7 +470,12 @@ def prefill_publish_layout(
     shape = (NUM_SLOT_SETS, world_size, heads_per_rank, capacity, TAGGED_WORDS)
     return {
         "rows_shape": shape,
-        "rows_bytes": 8 * NUM_SLOT_SETS * world_size * heads_per_rank * capacity * TAGGED_WORDS,
+        "rows_bytes": 8
+        * NUM_SLOT_SETS
+        * world_size
+        * heads_per_rank
+        * capacity
+        * TAGGED_WORDS,
         "generations_shape": (NUM_SLOT_SETS, world_size * heads_per_rank, capacity),
         "expected_shape": (NUM_SLOT_SETS, heads_per_rank, capacity),
     }
@@ -1013,10 +1018,11 @@ def prefill_score_select(
         if (
             pub_gens.dtype != torch.int32
             or not pub_gens.is_contiguous()
-            or tuple(pub_gens.shape)
-            != (NUM_SLOT_SETS, h, int(publish["capacity"]))
+            or tuple(pub_gens.shape) != (NUM_SLOT_SETS, h, int(publish["capacity"]))
         ):
-            raise ValueError("publish generations must be contiguous int32 [3, H, capacity]")
+            raise ValueError(
+                "publish generations must be contiguous int32 [3, H, capacity]"
+            )
         _peer_rows(
             publish["peer_rows"],
             tp,
@@ -1056,16 +1062,14 @@ def prefill_score_select(
         pool=pool,
         carrier=carrier,
         work_range=plan.packed_work_range,
-        **(
-            {}
-            if publish is None
-            else {"generations": publish["generations"]}
-        ),
+        **({} if publish is None else {"generations": publish["generations"]}),
     )
     arch = cake_jit.device_arch(dev)
     scorer = cake_jit.route("score_topk16", rows, arch, page=page_size)
     merger = cake_jit.route(
-        "prefill_list_carrier" if publish is None else "prefill_list_publish", None, arch
+        "prefill_list_carrier" if publish is None else "prefill_list_publish",
+        None,
+        arch,
     )
     values = {
         # The TMA descriptors read FP8 bytes.

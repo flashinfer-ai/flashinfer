@@ -106,7 +106,9 @@ def _layer(case, lay, inp, plans, pool, stores, outputs, errors, slot) -> None:
         )
 
 
-def _run(case, lay, *, layers: int, gen0: int, graph: bool, what: str, fast: bool = False) -> None:
+def _run(
+    case, lay, *, layers: int, gen0: int, graph: bool, what: str, fast: bool = False
+) -> None:
     exp = base.prefill_expect(case, lay, fast=fast, with_global=not fast)
     inp = base.prefill_case_inputs(case, lay)
     windows = case.windows()
@@ -133,7 +135,9 @@ def _run(case, lay, *, layers: int, gen0: int, graph: bool, what: str, fast: boo
     def check(tag: str) -> None:
         torch.cuda.synchronize()
         for o in range(lay.tp):
-            base.assert_words(outputs[o], exp.outputs[o], f"{what} {tag}: owner {o} merged ids")
+            base.assert_words(
+                outputs[o], exp.outputs[o], f"{what} {tag}: owner {o} merged ids"
+            )
         if exp.global_output is not None:
             base.assert_words(
                 torch.cat([o.cpu() for o in outputs], dim=1),
@@ -165,8 +169,12 @@ def _run(case, lay, *, layers: int, gen0: int, graph: bool, what: str, fast: boo
             for _ in range(n):
                 want = (want + 1) & 0xFFFFFFFF or 1
             w32 = want - (1 << 32) if want >= 1 << 31 else want
-            assert bool((gens[slot] == w32).all()), f"{what}: rank {r} slot {slot} generations"
-            assert bool((exp_slots[slot] == w32).all()), f"{what}: rank {r} slot {slot} expected"
+            assert bool((gens[slot] == w32).all()), (
+                f"{what}: rank {r} slot {slot} generations"
+            )
+            assert bool((exp_slots[slot] == w32).all()), (
+                f"{what}: rank {r} slot {slot} expected"
+            )
 
 
 @pytest.mark.parametrize("scenario", base.PREFILL_SCENARIOS)
@@ -174,7 +182,15 @@ def _run(case, lay, *, layers: int, gen0: int, graph: bool, what: str, fast: boo
 def test_publish_matches_the_oracle(lay: ref.IcpLayout, scenario: str) -> None:
     """Every prefill scenario: three layers (one per slot set), eager."""
     case, fast = base._make_prefill(lay.page_size, scenario)
-    _run(case, lay, layers=3, gen0=0, graph=False, what=f"{case.label} {lay.name} publish", fast=fast)
+    _run(
+        case,
+        lay,
+        layers=3,
+        gen0=0,
+        graph=False,
+        what=f"{case.label} {lay.name} publish",
+        fast=fast,
+    )
 
 
 @pytest.mark.parametrize("lay", base.LAYOUTS, ids=base.LAYOUT_IDS)
@@ -191,4 +207,11 @@ def test_publish_replays_wrap_and_rotate(lay: ref.IcpLayout) -> None:
         chunk=64,
         seed=31,
     )
-    _run(case, lay, layers=5, gen0=0xFFFFFFFE, graph=True, what=f"{lay.name} publish wrap")
+    _run(
+        case,
+        lay,
+        layers=5,
+        gen0=0xFFFFFFFE,
+        graph=True,
+        what=f"{lay.name} publish wrap",
+    )

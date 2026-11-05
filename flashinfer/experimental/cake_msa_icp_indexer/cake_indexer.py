@@ -385,8 +385,7 @@ class MSAIcpIndexerPlan:
         peers = tuple(getattr(publish, "peer_rows", ()))
         if len(peers) != self.world_size:
             raise ValueError(
-                f"publish.peer_rows must hold {self.world_size} tensors"
-                " (one per rank)"
+                f"publish.peer_rows must hold {self.world_size} tensors (one per rank)"
             )
         checks = [(f, getattr(publish, f, None), *w) for f, w in want.items()]
         checks += [
@@ -670,7 +669,9 @@ class MSAIcpIndexerPlan:
         t = query.shape[0]
         fused = self.prefill_window_fused(t, window_plan, pool)
         if publish is not None and not fused:
-            raise ValueError("a prefill publish needs the fused path (a pool and a long window)")
+            raise ValueError(
+                "a prefill publish needs the fused path (a pool and a long window)"
+            )
         if fused:
             cb.prefill_score_select(
                 query,
@@ -779,7 +780,9 @@ class MSAIcpIndexerPlan:
         if publish is not None:
             self.check_prefill_publish(publish)
             if output.shape[0] > self.max_num_batched_tokens:
-                raise ValueError("a published step holds at most max_num_batched_tokens tokens")
+                raise ValueError(
+                    "a published step holds at most max_num_batched_tokens tokens"
+                )
             pool = local_kwargs.get("pool")
             if not all(
                 self.prefill_window_fused(int(end) - int(start), plan, pool)
@@ -1039,7 +1042,9 @@ class MSAIcpPrefillStep(_StepBase):
         if not self.publishes:
             return None
         if slot not in _SLOTS:
-            raise ValueError("a publishing prefill step needs the layer's slot (0, 1 or 2)")
+            raise ValueError(
+                "a publishing prefill step needs the layer's slot (0, 1 or 2)"
+            )
         return int(slot)
 
     def _per_call_local(
@@ -1090,7 +1095,11 @@ class MSAIcpPrefillStep(_StepBase):
         return prepared
 
     def local(
-        self, index_q: torch.Tensor, index_k: torch.Tensor, *, slot: Optional[int] = None
+        self,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        slot: Optional[int] = None,
     ) -> None:
         """Score and select every window of this layer: ``index_q`` holds the
         step's ``T`` prefill query tokens ``[T, H, 128]``, ``index_k`` this
@@ -1143,7 +1152,11 @@ class MSAIcpPrefillStep(_StepBase):
         cj.launch_recorded(calls, self.device_index)
 
     def record(
-        self, index_q: torch.Tensor, index_k: torch.Tensor, *, slot: Optional[int] = None
+        self,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        slot: Optional[int] = None,
     ) -> list[cj.RecordedLaunch]:
         """Prepare the step without launching (the first layer's host checks)
         and return its launches: every window's, then the merge's."""
