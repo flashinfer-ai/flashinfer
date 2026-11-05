@@ -774,7 +774,7 @@ Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
     :members:
 
 Low-Precision Implementation Primitives
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The following internal helpers support numerical tests, trace definitions,
 and kernel benchmarks. They are not exported from ``flashinfer.comm``;
