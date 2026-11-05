@@ -42,6 +42,7 @@ import pathlib
 import random
 import re
 import threading
+import types
 
 import pytest
 import torch
@@ -5471,3 +5472,102 @@ def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_t
         assert kcp.kept_registry_size() == 0
     for n in ("out",) + CKPT_GRADS:
         assert torch.equal(arms[1][n], arms[0][n]), n
+
+
+# --------------------------------------------------------------------------- host launch path: stream binding
+# Host data only: what a launch binds for tvm-ffi and what the forward re-derives per call.  The launches, their
+# records, grids and arguments are not changed by any of them.
+
+
+def test_launch_binds_the_current_stream_through_use_raw_stream(monkeypatch) -> None:
+    """``cake_backend.run_module`` with a counting stand-in for ``tvm_ffi`` (only ``use_raw_stream``) and a set current
+    stream (CPU): every launch enters one ``use_raw_stream(device, raw)`` context on the current stream's device and
+    raw handle and launches inside it; a stream switch (another device's stream) binds that stream; a launch on
+    another thread binds its own; an exception from the launch leaves no binding behind."""
+    be = _package("cake_backend")
+    state = {"stream": (0, 11), "enters": 0, "bound": [], "launched": []}
+
+    class _Context:
+        def __init__(self, device, raw):
+            self.stream = (device[1], raw)  # the stand-in device is ("cuda", index)
+
+        def __enter__(self):
+            state["enters"] += 1
+            state["bound"].append(self.stream)
+            return self
+
+        def __exit__(self, *exc):
+            state["bound"].pop()
+
+    monkeypatch.setattr(be, "tvm_ffi", types.SimpleNamespace(use_raw_stream=_Context))
+    monkeypatch.setattr(be, "_ffi_device", lambda index: ("cuda", index))
+    monkeypatch.setattr(be, "_current_stream", lambda: state["stream"])
+    name = "fwd_prep"
+    values = {n: n for n, _axis in be._argument_plan(name) if n is not None}
+
+    def entry(*a):
+        state["launched"].append(state["bound"][-1] if state["bound"] else None)
+        if state.get("raise"):
+            raise RuntimeError("inside the launch")
+
+    module = types.SimpleNamespace(**{be.record(name)["ffi_entry"]: entry})
+
+    def launch() -> None:
+        be.run_module(name, values, grid=(1, 1, 1), device_index=0, module=module)
+
+    def enters_after(fn) -> int:
+        n = state["enters"]
+        fn()
+        return state["enters"] - n
+
+    assert enters_after(launch) == 1 and state["launched"][-1] == (0, 11)
+    assert enters_after(launch) == 1 and state["bound"] == []
+    state["stream"] = (1, 22)
+    assert enters_after(launch) == 1 and state["launched"][-1] == (1, 22)
+    state["stream"] = (0, 11)
+    worker = threading.Thread(target=launch)
+    assert enters_after(lambda: (worker.start(), worker.join())) == 1
+    assert state["launched"][-1] == (0, 11)
+    state["raise"] = True
+    with pytest.raises(RuntimeError, match="inside the launch"):
+        launch()
+    assert state["bound"] == [] and state["launched"][-1] == (0, 11)
+
+
+def test_stream_context_sets_the_ffi_stream_of_the_device() -> None:
+    """``cake_backend.stream_context((index, raw))`` with the real ``tvm_ffi``: inside, tvm-ffi's current stream of CUDA
+    device ``index`` is ``raw``, another device's stream is untouched, nested contexts restore in order and the
+    previous stream is back after the outermost one; ``_ffi_device`` builds each device once.  With CUDA: for torch's
+    current stream (the default one and a side stream) the stream it binds is the one ``tvm_ffi.use_torch_stream()``
+    binds."""
+    import tvm_ffi
+
+    be = _package("cake_backend")
+    dev0, dev1 = tvm_ffi.device("cuda", 0), tvm_ffi.device("cuda", 1)
+    before0, before1 = tvm_ffi.get_raw_stream(dev0), tvm_ffi.get_raw_stream(dev1)
+    with be.stream_context((0, 0x1234)):
+        assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        assert tvm_ffi.get_raw_stream(dev1) == before1
+        with be.stream_context((1, 0x5678)):
+            assert tvm_ffi.get_raw_stream(dev1) == 0x5678
+            assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        with be.stream_context((0, 0x9ABC)):
+            assert tvm_ffi.get_raw_stream(dev0) == 0x9ABC
+        assert tvm_ffi.get_raw_stream(dev0) == 0x1234
+        assert tvm_ffi.get_raw_stream(dev1) == before1
+    assert tvm_ffi.get_raw_stream(dev0) == before0
+    assert be._ffi_device(0) is be._ffi_device(0)
+    d1 = be._ffi_device(1)
+    assert (d1.dlpack_device_type(), d1.index) == (dev1.dlpack_device_type(), 1)
+    if not torch.cuda.is_available():
+        return
+    index = torch.cuda.current_device()
+    dev = tvm_ffi.device("cuda", index)
+    side = torch.cuda.Stream()
+    for stream in (torch.cuda.current_stream(), side):
+        with torch.cuda.stream(stream):
+            with tvm_ffi.use_torch_stream():
+                want = tvm_ffi.get_raw_stream(dev)
+            with be.stream_context(be._current_stream()):
+                got = tvm_ffi.get_raw_stream(dev)
+        assert got == want == stream.cuda_stream, (got, want, stream)
