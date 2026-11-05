@@ -48,16 +48,25 @@ per session by :func:`resolve_producer_variant`: the default of the session's
 architecture and world size unless ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT``
 overrides it -- ``auto``, ``shipped`` (the baseline build) or a delivered build
 name; rank-uniform, checked collectively): SM100 groups of 8 ranks run the
-``bulk_ow256`` build (wide operand loads, bulk row stores), SM100 groups of 4
-ranks and SM103 groups of 8 or 4 ranks the ``ow256`` build (wide operand loads),
-SM107 groups of 4 ranks the ``bulk`` build (bulk row stores), groups of 2 ranks
-and SM90 the baseline build.  Every build stores identical bits; the wide-load
-builds require 32-byte-aligned ``cos_sin`` and norm-weight bases
-(:meth:`CakeQkvExchangeSession._validate` refuses a misaligned view and names
-the opt-out).  Wherever a variant is the default, the baseline build of the
-same tile width is delivered too, so the opt-out always launches a delivered
-program; a build that is not delivered for the session's tile width raises and
-names the delivered ones.
+``bulk_ow256_fma`` build (wide operand loads, bulk row stores and the fused
+multiply-add epilogue), SM100 groups of 4 ranks and SM103 groups of 8 or 4 ranks
+the ``ow256_fma`` build (wide operand loads and the fused multiply-add
+epilogue), SM100 and SM103 groups of 2 ranks the ``fma`` build (the fused
+multiply-add epilogue), SM107 groups of 4 ranks the ``bulk`` build (bulk row
+stores), the other groups and SM90 the baseline build.  The builds without the
+fused multiply-add epilogue store identical bits; an ``fma`` build rounds the
+norm and RoPE multiply-adds once, so its stored bits can differ from theirs
+within the kernel's accuracy tolerance.  Every build requires ``cos_sin`` and
+the norm weights to start at 16-byte-aligned addresses (the Blackwell builds
+read them with 16-byte vector loads), the wide-load builds at 32-byte-aligned
+ones (:meth:`CakeQkvExchangeSession._validate` refuses a misaligned view; for
+the 32-byte bases it names the opt-out).  Wherever a variant is the
+default, the baseline build of the same tile width is delivered too, so the
+opt-out always launches a delivered program.  A default build that is not
+delivered for the session's tile width (the two-rank ``fma`` build at
+``block_n=128``) yields to the baseline build; a build named by the environment
+variable that is not delivered for the tile width raises and names the
+delivered ones.
 
 Group scaling (``plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``, resolved once per
 session by :func:`resolve_group_m_scale`: the default of the architecture and
@@ -425,9 +434,12 @@ def resolve_producer_variant(
     arch: str, world_size: int, block_n: int
 ) -> tuple[str, str]:
     """The producer build of a session on ``arch`` with ``world_size`` ranks and tile width ``block_n``: the
-    (architecture, world size) default unless :data:`PRODUCER_VARIANT_ENV` overrides it.  Returns ``(variant,
-    source)`` with ``source`` ``"default"`` or ``"env"``.  Fails closed when the build is delivered for neither pair
-    flag of the tile width, naming the environment variable, the ``shipped`` opt-out and the delivered builds."""
+    (architecture, world size) default unless :data:`PRODUCER_VARIANT_ENV` overrides it.  A default build that the
+    route table delivers for other tile widths only (the two-rank ``fma`` build at ``block_n=128``, for example)
+    yields to the baseline build, which is delivered beside every variant.  Returns ``(variant, source)`` with
+    ``source`` ``"default"`` or ``"env"``.  Fails closed when the build is delivered for neither pair flag of the
+    tile width (a build named by the environment variable, or a default build delivered for no tile width), naming
+    the environment variable, the ``shipped`` opt-out and the delivered builds."""
 
     override = producer_variant_from_env()
     if override is None:
@@ -438,6 +450,17 @@ def resolve_producer_variant(
         pair: loader.delivered_producer_variants(arch, block_n, pair)
         for pair in (False, True)
     }
+    if (
+        source == "default"
+        and not any(variant in names for names in delivered.values())
+        and any(loader.SHIPPED_VARIANT in names for names in delivered.values())
+        and any(
+            loader.has_producer(arch, other, pair, variant)
+            for other in plans.BLOCK_N_CHOICES
+            for pair in (False, True)
+        )
+    ):
+        variant = loader.SHIPPED_VARIANT
     if not any(variant in names for names in delivered.values()):
         raise ValueError(
             f"producer build {variant or PRODUCER_VARIANT_SHIPPED!r} ({source}) is not delivered for {arch} at "
@@ -1209,9 +1232,20 @@ class CakeQkvExchangeSession:
             raise ValueError(
                 f"batch * s_local = {rows} exceeds the session's max_tokens={self.max_tokens}"
             )
-        # The wide-operand-load builds read ``cos_sin`` and the norm weights through 32-byte-aligned bases (the
-        # rows are 512 B by the shape check above); a misaligned view of a larger tensor must be refused here, the
-        # kernel does not check it.
+        # Every build reads ``cos_sin`` and the norm weights through 16-byte-aligned bases (the Blackwell builds with
+        # 16-byte vector loads), the wide-operand-load builds through 32-byte-aligned bases (the rows are 512 B by
+        # the shape check above); a misaligned view of a larger tensor must be refused here, the kernel does not
+        # check it.
+        for name, tensor in (
+            ("cos_sin", cos_sin),
+            ("q_norm_weight", q_scale),
+            ("k_norm_weight", k_scale),
+        ):
+            if tensor.data_ptr() % 16:
+                raise ValueError(
+                    f"{name} must start at a 16-byte-aligned address (data_ptr % 16 = {tensor.data_ptr() % 16}); "
+                    "pass a contiguous tensor that starts at its allocation"
+                )
         if loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[self.producer_variant] == 256:
             for name, tensor in (
                 ("cos_sin", cos_sin),
