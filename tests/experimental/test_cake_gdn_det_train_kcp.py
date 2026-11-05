@@ -5474,7 +5474,7 @@ def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_t
         assert torch.equal(arms[1][n], arms[0][n]), n
 
 
-# --------------------------------------------------------------------------- host launch path: stream binding
+# --------------------------------------------------------------------------- host launch path: stream binding, registry answers, chunk tokens
 # Host data only: what a launch binds for tvm-ffi and what the forward re-derives per call.  The launches, their
 # records, grids and arguments are not changed by any of them.
 
@@ -5571,3 +5571,120 @@ def test_stream_context_sets_the_ffi_stream_of_the_device() -> None:
             with be.stream_context(be._current_stream()):
                 got = tvm_ffi.get_raw_stream(dev)
         assert got == want == stream.cuda_stream, (got, want, stream)
+
+
+def test_registry_answers_are_derived_once_per_registry_identity(monkeypatch) -> None:
+    """``l2n_records_shipped`` / ``fused_o_shipped(arch)`` answer as their derivation from the registry and derive it
+    once per registry identity: a repeated question reads no record; another ``records_of_program``, another record
+    table (a copy of the same records), a table of another size, another registry (a stand-in) or another
+    architecture is derived again; a registry without a record table is derived on every call."""
+    kcp = _package("cake_kcp")
+    jit = _package("cake_jit")
+    real = jit.records_of_program
+    calls: list[str] = []
+    # the real registry's answers, kept before records_of_program is replaced: another lookup is another key
+    kcp.l2n_records_shipped()
+    kcp.fused_o_shipped(None)
+
+    def counting(program):
+        calls.append(program)
+        return real(program)
+
+    def want_l2n(lookup) -> bool:
+        try:
+            return all(lookup(p) for p in kcp.L2N_PROGRAMS)
+        except ValueError:
+            return False
+
+    def want_fused(modules, lookup, arch) -> bool:
+        try:
+            names = lookup("kcp_fwdh_out")
+        except ValueError:
+            return False
+        forms = {
+            int(modules[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in modules[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    def derives(fn) -> int:
+        n = len(calls)
+        fn()
+        return len(calls) - n
+
+    monkeypatch.setattr(jit, "records_of_program", counting)
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) == 0
+    assert kcp.l2n_records_shipped() == want_l2n(real)
+    for arch in (None, *jit.ARCHES, "sm_00"):
+        assert derives(lambda a=arch: kcp.fused_o_shipped(a)) == 1, arch
+        assert derives(lambda a=arch: kcp.fused_o_shipped(a)) == 0, arch
+        assert kcp.fused_o_shipped(arch) == want_fused(jit.MODULES, real, arch), arch
+    # the same records in another table
+    monkeypatch.setattr(jit, "MODULES", dict(jit.MODULES))
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.fused_o_shipped(None)) == 1
+    del jit.MODULES[next(iter(jit.MODULES))]  # a table of another size
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) == 0
+
+    # stand-in registries: the answer is the stand-in's
+    def form(ctas: int) -> dict:
+        return {
+            "program": "kcp_fwdh_out",
+            "grid_rule": {"ctas_per_head": ctas},
+            "arches": ["sm_x"],
+        }
+
+    def registry(table) -> types.SimpleNamespace:
+        def lookup(program):
+            calls.append(program)
+            if program not in kcp.PROGRAMS:
+                raise ValueError(program)
+            return tuple(n for n, r in table.items() if r["program"] == program)
+
+        return types.SimpleNamespace(MODULES=table, records_of_program=lookup)
+
+    both = registry({"a": form(1), "b": form(2)})
+    for stand_in, fused in ((both, True), (registry({"a": form(1)}), False)):
+        monkeypatch.setattr(kcp, "_registry", lambda s=stand_in: s)
+        assert derives(lambda: kcp.fused_o_shipped("sm_x")) == 1
+        assert kcp.fused_o_shipped("sm_x") is fused
+        assert kcp.fused_o_shipped("sm_y") is False
+        assert derives(lambda: kcp.l2n_records_shipped()) > 0
+        assert kcp.l2n_records_shipped() is False
+    both.MODULES["c"] = form(1)  # the same table, grown
+    monkeypatch.setattr(kcp, "_registry", lambda: both)
+    assert derives(lambda: kcp.fused_o_shipped("sm_x")) == 1
+    tableless = types.SimpleNamespace(
+        MODULES=None, records_of_program=both.records_of_program
+    )
+    monkeypatch.setattr(kcp, "_registry", lambda: tableless)
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+    assert derives(lambda: kcp.l2n_records_shipped()) > 0
+
+
+def test_chunk_tokens_follow_the_contexts_chunk_table(monkeypatch) -> None:
+    """``_chunk_tokens`` (the in-kernel L2 norm's coverage check) is the table's sum, kept in the context's cache with
+    the table it was taken over: another table object is summed again, a list or a context without a cache dict is
+    summed per call and never kept; ``_prepare`` refuses a coverage other than the call's tokens."""
+    kcp, ctx, ops = _ckpt_setup()
+    key = ("kcp_chunk_tokens",)
+    stub = types.SimpleNamespace(_caches={})
+    t1, t2 = (64, 64, 10), (64, 64, 11)
+    assert kcp._chunk_tokens(stub, t1) == 138 and stub._caches[key] == (t1, 138)
+    assert kcp._chunk_tokens(stub, t1) == 138
+    assert kcp._chunk_tokens(stub, t2) == 139 and stub._caches[key][0] is t2
+    assert kcp._chunk_tokens(stub, [64, 1]) == 65 and stub._caches[key][0] is t2
+    for other in (types.SimpleNamespace(), types.SimpleNamespace(_caches=None)):
+        assert kcp._chunk_tokens(other, t1) == 138
+    # the real context: its own table, kept once; a wrong coverage is refused
+    out = _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+    assert ctx._caches[key] == (ctx.chunk_len, sum(ctx.chunk_len))
+    assert ctx._caches[key][0] is ctx.chunk_len
+    again = _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+    assert all(torch.equal(out[k], again[k]) for k in out)
+    monkeypatch.setattr(kcp, "_chunk_tokens", lambda c, table: sum(table) - 1)
+    with pytest.raises(ValueError, match="chunks cover"):
+        _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
