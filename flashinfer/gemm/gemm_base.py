@@ -7385,11 +7385,11 @@ def _use_sm107_mxfp8_cute_dsl(
 _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, tuple] = {}
 
 
-def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
+def _cute_dsl_gemm_mxfp8_sm107_runner(enable_pdl: bool, out_dtype: torch.dtype):
     """CuTe-DSL mm_mxfp8 runner for Sm107BlockScaledPersistentDenseGemmKernel.
 
-    Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m). The
-    kernel has no PDL support, so unlike the SM100 runner it takes no enable_pdl.
+    Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m).
+    ``enable_pdl`` launches the kernel with programmatic dependent launch.
     """
     import cutlass
 
@@ -7406,7 +7406,7 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
     class CuteDSLMxfp8Sm107GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype),)
+            return (str(out.dtype), enable_pdl)
 
         def get_valid_tactics(
             self,
@@ -7457,12 +7457,20 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
 
             compiled_gemm, _ = _compile_block_scaled_gemm(
                 _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE,
-                (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype),
+                (
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    swap_ab,
+                    mma_inst_shape_m,
+                    enable_pdl,
+                    out_dtype,
+                ),
                 lambda: Sm107Kernel(
                     sf_vec_size,
                     (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXFP8_MMA_INST_SHAPE_K),
                     (mma_tiler_mn[0], mma_tiler_mn[1], _SM107_MXFP8_MMA_TILER_K),
                     cluster_shape_mn,
+                    enable_pdl=enable_pdl,
                 ),
                 ab_cutlass_dtype=cutlass.Float8E4M3FN,
                 sf_dtype=cutlass.Float8E8M0FNU,
@@ -7624,7 +7632,7 @@ def _cute_dsl_mxfp8_runners_sm107(
     """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default."""
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
-    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
+    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(enable_pdl=True, out_dtype=out_dtype)
     low_m = _cute_dsl_gemm_mxfp8_runner(10, 7, True, out_dtype, low_m_only=True)
     a, b, _, _, _, out, _ = inputs
     m, k = a.shape
