@@ -929,37 +929,39 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: another rank owns to that rank (``st.async``, counted on the owner's barrier), adds the ``splits`` partials of its
 #: own quads in cluster-rank order and stores them once, and no CTA leaves before every CTA of the cluster received
 #: its quads.  No workspace, no ticket, no atomic: the same bits on every run.  On 152-SM sm_100a parts the FP32 rows
-#: ``4096`` / ``5120 -> 32``, ``48``, ``64`` and ``128`` run it from 1024 tokens up where the other tables run one or
-#: two splits of 64-wide tiles of the CTA-pair program or the deterministic program.  The ranges were measured on two
-#: GB200 parts at 1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576 and 32768 tokens against that routing (the plan
-#: this module gives the part), with cold L2 and the GPU span of the operation (CUPTI), in one process per GPU and in
-#: both launch orders: a range's program was faster in every run and in each part's median, and no more than 3 %
-#: slower than that routing next to a kernel holding 8, 16 or 32 SMs on another stream (and without it, after the same
-#: one-block gate).  A row's ranges cover runs of consecutive measured token counts at which some program passed,
-#: from the first to the last of a run (``4096 -> 128``: 2048 to 12288, and 32768 alone); a measured token count takes
-#: the fastest program that passed there, and a token count between two consecutive measured ones takes the lower
-#: one's program where that program passed at both, else the upper one's, which passed at both.  Below 1024 and above
-#: 32768 tokens (not measured), ``4096 -> 128`` at 1024 and from 12289 to 32767 tokens, ``5120 -> 48`` above 24576
-#: tokens and ``5120 -> 128`` above 6144 tokens (measured where a measured token count lies there: not faster) and
-#: every other part keep the routing of the other tables.  The output met the deterministic package's FP32 budget against FP64 (relative
-#: Frobenius error at most 5e-5, max error at most 1e-3 times the largest reference element) in every one of 20 runs
-#: of 10 seeds at every measured token count, for every tile and cluster size measured.  The protocol, the measured
-#: token counts and the times are in the 152-SM cluster table of the README.
+#: ``4096`` / ``5120 -> 32``, ``48``, ``64`` and ``128`` run it in the ranges below, where the other tables run one or
+#: two splits of 64-wide tiles of the CTA-pair program or the deterministic program.  A measured token count's program
+#: is the fastest of the tile widths and cluster sizes that passed a first screen there (two GB200 parts), and a token
+#: count between two consecutive screened ones takes the lower one's program where that program passed at both, else
+#: the upper one's.  The ranges were then measured with this table, on two GB200 parts, at 1024, 2048, 3072, 4096,
+#: 6144, 8192, 12288, 16384, 24576 and 32768 tokens against that routing (the plan this module gives the part without
+#: the table), with cold L2 and the GPU span (CUPTI), in one process per GPU pinned to its own cores, both launch
+#: orders and two runs per launch order on each part.  A measured token count passed where, on both parts, the
+#: operation alone was faster in every run (paired median below 0.99, sign test), no more than 3 % slower than that
+#: routing next to a kernel holding 8, 16 or 32 SMs on another stream, and the training step (forward, input and
+#: weight gradient) and the step with the forward recomputed were, in CUDA graphs and launched eagerly, each no slower
+#: than that routing (median of the runs at most 1.013 times, no run slower than the slowest run of the routing
+#: against itself).  A row's ranges run from a passing measured token count to a passing measured token count and
+#: hold no measured token count that failed; every other token count, part and row keeps the routing of the other
+#: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16383 tokens,
+#: ``4096 -> 128`` below 4096 and above 8192 tokens, ``5120 -> 64`` from 2049 to 4095 and above 24576 tokens,
+#: ``5120 -> 48`` above 24576 tokens, ``5120 -> 128`` above 6144 tokens, every row below 1024 and above 32768 tokens).
+#: The output met the deterministic package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max
+#: error at most 1e-3 times the largest reference element) in every one of 20 runs of 10 seeds at every measured
+#: token count.  The protocol, the measured token counts and the times are in the 152-SM cluster table of the README.
 # fmt: off
 K1_DSM_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
 ] = {
     ("sm_100a", 152): {
-        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 6143, (32, 3)), (6144, 32768, (32, 2))),
-        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 32768, (64, 3)),),
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
+        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
         ("sm_100a", 1, 4096, 64, "f32"): ((1024, 32768, (64, 3)),),
-        ("sm_100a", 1, 4096, 128, "f32"): (
-            (2048, 4095, (128, 2)), (4096, 6144, (64, 2)), (6145, 12288, (128, 3)), (32768, 32768, (128, 4)),
-        ),
+        ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 3))),
         ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
         ("sm_100a", 1, 5120, 48, "f32"): ((1024, 24576, (64, 2)),),
-        ("sm_100a", 1, 5120, 64, "f32"): ((1024, 32768, (64, 2)),),
+        ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
         ("sm_100a", 1, 5120, 128, "f32"): ((1024, 6144, (128, 2)),),
     },
 }

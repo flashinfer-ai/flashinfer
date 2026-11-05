@@ -135,7 +135,7 @@ hold, the token count takes the next window that holds it.  The measured parts h
 
 | architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
-| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) from 1024 to 4096 tokens (the 152-SM two-split table).  FP32 on 152 SMs, first: `4096 -> 32` (64, 1) from 256 to 2048 tokens, `4096 -> 128` (64, 1) from 256 to 3328 tokens, at every K-block count (the 152-SM one-split table).  FP32 on 152 SMs, before all of these: the cluster program of the 152-SM cluster table (`4096 -> 32, 48, 64` and `5120 -> 32, 64` from 1024 to 32768 tokens, `4096 -> 128` from 2048 to 12288 and at 32768, `5120 -> 48` from 1024 to 24576, `5120 -> 128` from 1024 to 6144) | 256 experts on 152 SMs, in the token windows of the forward SIMT table: the cluster SIMT program (hidden 4096 from 1 to 160 tokens, hidden 5120 and 6144 from 1 to 192: `"simt_c8_kg4_l32_e8t4"` 1 to 8, `"simt_c8_kg4_l32_e8t16"` 9 to 16, `"simt_c8_ffma_l16_e16t32"` 17 to 96, `"simt_c8_ffma_l16_e16t64"` 97 to 128, `"simt_c8_ffma_l16_e16t32"` from 129).  Every other token count and SM count: deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program (hidden 4096 `"simt_n128m64s2"` from 1 to 224 tokens, hidden 5120 and 6144 `"simt_n64m64s2"` from 1 to 256 tokens) and hidden 5120 `"H0.5x3"` (10240 to 16384 tokens); on 148 SMs the SIMT programs of the 148-SM SIMT table below (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256 tokens); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count, hidden 4096 above 224 tokens and hidden 6144 above 256 tokens: deterministic (6 splits) |
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed); FP32 on 152 SMs: (64, 2) from 1024 to 4096 tokens (the 152-SM two-split table).  FP32 on 152 SMs, first: `4096 -> 32` (64, 1) from 256 to 2048 tokens, `4096 -> 128` (64, 1) from 256 to 3328 tokens, at every K-block count (the 152-SM one-split table).  FP32 on 152 SMs, before all of these: the cluster program of the 152-SM cluster table (`4096 -> 32` from 1024 to 2048 and from 6144 to 32768 tokens, `4096 -> 48` from 1024 to 2048, from 4096 to 8192 and from 16384 to 32768, `4096 -> 64` and `5120 -> 32` from 1024 to 32768, `4096 -> 128` from 4096 to 8192, `5120 -> 48` from 1024 to 24576, `5120 -> 64` from 1024 to 2048 and from 4096 to 24576, `5120 -> 128` from 1024 to 6144) | 256 experts on 152 SMs, in the token windows of the forward SIMT table: the cluster SIMT program (hidden 4096 from 1 to 160 tokens, hidden 5120 and 6144 from 1 to 192: `"simt_c8_kg4_l32_e8t4"` 1 to 8, `"simt_c8_kg4_l32_e8t16"` 9 to 16, `"simt_c8_ffma_l16_e16t32"` 17 to 96, `"simt_c8_ffma_l16_e16t64"` 97 to 128, `"simt_c8_ffma_l16_e16t32"` from 129).  Every other token count and SM count: deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program (hidden 4096 `"simt_n128m64s2"` from 1 to 224 tokens, hidden 5120 and 6144 `"simt_n64m64s2"` from 1 to 256 tokens) and hidden 5120 `"H0.5x3"` (10240 to 16384 tokens); on 148 SMs the SIMT programs of the 148-SM SIMT table below (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256 tokens); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count, hidden 4096 above 224 tokens and hidden 6144 above 256 tokens: deterministic (6 splits) |
 | `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed); `4096 -> 128` FP32 on 152 SMs: (64, 2) from 1024 to 6144 tokens (the 152-SM two-split table).  FP32 on 152 SMs, first: `4096 -> 32` (64, 1) from 256 to 2048 tokens, `4096 -> 128` (64, 1) from 256 to 2816 tokens, at every K-block count (the 152-SM one-split table) | 256 experts on 152 SMs, in the token windows of the forward SIMT table: the cluster SIMT program from 1 to 192 tokens at hidden 4096, 5120 and 6144 (`"simt_c8_kg4_l32_e8t4"` 1 to 16, `"simt_c8_ffma_l16_e16t32"` 17 to 96, `"simt_c8_ffma_l16_e16t64"` 97 to 128, `"simt_c8_ffma_l16_e16t32"` 129 to 192).  Every other token count and SM count: deterministic (4 splits) | 256 experts, in the token windows of the router window tables: on 152 SMs the SIMT program `"simt_n64m64s2"` (hidden 4096 from 1 to 288 tokens, hidden 5120 from 1 to 192 tokens, hidden 6144 from 1 to 256 tokens), hidden 4096 `"H1x4p44"`, hidden 5120 `"H0.5x3"` and hidden 6144 `"H1x5p44"` (the head/tail program with the BF16 parts of `A` in tensor memory); on 148 SMs the SIMT programs of the 148-SM SIMT table below (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256 tokens); hidden 5120 `"waves"` on every other SM count where it applies.  Every other token count and SM count: deterministic (6 splits) |
 | `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2) (FP32 at odd block counts from 1025 to 8192 tokens: on exactly 216 SMs, the odd-block K1 table); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1` (on exactly 216 SMs at 16172 to 16384 tokens: (192, 1) `p = 1`, the row-major-store program, 176 CTAs); `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table (the four FP32 rows with one split: from 40961 tokens up, `5120 -> 1024` from 32769; on more than 216 SMs from 961 tokens up).  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the router window tables: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
 | `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024`, `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel the head/tail program missed at both hidden sizes on the parts at full SM clock |
@@ -366,44 +366,55 @@ deterministic program's (reported, not a rule).*
 
 | K1 row `d_in -> d_out`: (`block_n`, `splits`) | tokens | measured token counts: time (us); routing / cluster; deterministic / cluster |
 |---|---|---|
-| `4096 -> 32`: (32, 3) | 1024 to 6143 | 1024: 5.50; 1.291; 2.122.  2048: 7.04; 1.282; 1.845.  4096: 9.60; 1.240; 1.663 |
-| `4096 -> 32`: (32, 2) | 6144 to 32768 | 6144: 12.13; 1.172; 1.567.  8192: 14.37; 1.140; 1.225.  12288: 19.55; 1.095; 1.155.  16384: 24.48; 1.075; 1.129.  24576: 34.21; 1.048; 1.088.  32768: 44.51; 1.034; 1.084 |
-| `4096 -> 48`: (64, 3) | 1024 to 32768 | 1024: 6.53; 1.289; 1.779.  2048: 7.49; 1.359; 1.761.  4096: 10.02; 1.252; 1.597.  6144: 12.64; 1.180; 1.519.  8192: 14.82; 1.151; 1.199.  12288: 19.71; 1.125; 1.156.  16384: 24.86; 1.081; 1.111.  24576: 34.94; 1.050; 1.078.  32768: 44.58; 1.044; 1.087 |
-| `4096 -> 64`: (64, 3) | 1024 to 32768 | 1024: 6.05; 1.386; 1.889.  2048: 7.52; 1.328; 1.749.  4096: 10.02; 1.246; 1.597.  6144: 12.42; 1.183; 1.495.  8192: 15.10; 1.136; 1.175.  12288: 19.71; 1.117; 1.153.  16384: 25.86; 1.047; 1.077.  24576: 34.40; 1.061; 1.099.  32768: 45.41; 1.033; 1.060 |
-| `4096 -> 128`: (128, 2) | 2048 to 4095 | 2048: 9.09; 1.004; 1.489 |
-| `4096 -> 128`: (64, 2) | 4096 to 6144 | 4096: 10.75; 1.190; 1.506.  6144: 13.41; 1.461; 1.463 |
-| `4096 -> 128`: (128, 3) | 6145 to 12288 | 8192: 17.76; 1.029; 1.032.  12288: 23.04; 1.040; 1.039 |
-| `4096 -> 128`: (128, 4) | 32768 | 32768: 47.81; 1.050; 1.049 |
-| `5120 -> 32`: (32, 2) | 1024 to 32768 | 1024: 6.08; 1.405; 1.421.  2048: 7.74; 1.289; 1.347.  4096: 10.78; 1.214; 1.403.  6144: 13.66; 1.176; 1.501.  8192: 17.70; 1.143; 1.235.  12288: 23.14; 1.090; 1.268.  16384: 28.77; 1.079; 1.139.  24576: 40.77; 1.050; 1.104.  32768: 52.54; 1.043; 1.093 |
-| `5120 -> 48`: (64, 2) | 1024 to 24576 | 1024: 7.07; 1.249; 1.247.  2048: 8.48; 1.249; 1.245.  4096: 11.33; 1.198; 1.350.  6144: 14.30; 1.150; 1.438.  8192: 17.98; 1.133; 1.240.  12288: 23.84; 1.074; 1.259.  16384: 29.95; 1.053; 1.104.  24576: 42.88; 1.019; 1.069 |
-| `5120 -> 64`: (64, 2) | 1024 to 32768 | 1024: 6.46; 1.282; 1.282.  2048: 8.35; 1.253; 1.253.  4096: 11.49; 1.203; 1.309.  6144: 14.34; 1.145; 1.438.  8192: 17.41; 1.132; 1.131.  12288: 23.78; 1.090; 1.125.  16384: 29.76; 1.069; 1.137.  24576: 42.37; 1.034; 1.125.  32768: 55.23; 1.013; 1.130 |
-| `5120 -> 128`: (128, 2) | 1024 to 6144 | 1024: 7.52; 1.128; 1.128.  2048: 9.38; 1.130; 1.130.  4096: 13.02; 1.179; 1.179.  6144: 16.54; 1.257; 1.259 |
+| `4096 -> 32`: (32, 3) | 1024 to 2048 | 1024: 5.66; 1.260; 2.079.  2048: 7.26; 1.263; 1.830 |
+| `4096 -> 32`: (32, 2) | 6144 to 32768 | 6144: 12.20; 1.175; 1.567.  8192: 14.59; 1.140; 1.230.  12288: 19.70; 1.097; 1.166.  16384: 24.38; 1.073; 1.132.  24576: 34.46; 1.040; 1.093.  32768: 44.50; 1.032; 1.071 |
+| `4096 -> 48`: (64, 3) | 1024 to 2048 | 1024: 6.58; 1.319; 1.804.  2048: 7.76; 1.312; 1.720 |
+| `4096 -> 48`: (64, 3) | 4096 to 8192 | 4096: 10.19; 1.237; 1.568.  6144: 12.74; 1.176; 1.505.  8192: 15.22; 1.136; 1.185 |
+| `4096 -> 48`: (64, 3) | 16384 to 32768 | 16384: 25.06; 1.074; 1.120.  24576: 34.86; 1.052; 1.084.  32768: 45.02; 1.042; 1.067 |
+| `4096 -> 64`: (64, 3) | 1024 to 32768 | 1024: 6.09; 1.399; 1.898.  2048: 7.68; 1.311; 1.710.  3072: 9.20; 1.223; 1.557.  4096: 10.22; 1.234; 1.558.  6144: 12.91; 1.159; 1.473.  8192: 15.02; 1.152; 1.189.  12288: 20.31; 1.097; 1.133.  16384: 25.36; 1.060; 1.087.  24576: 35.01; 1.048; 1.081.  32768: 45.27; 1.038; 1.075 |
+| `4096 -> 128`: (64, 2) | 4096 to 6144 | 4096: 10.89; 1.194; 1.528.  6144: 13.55; 1.462; 1.466 |
+| `4096 -> 128`: (128, 3) | 6145 to 8192 | 8192: 17.66; 1.044; 1.044 |
+| `5120 -> 32`: (32, 2) | 1024 to 32768 | 1024: 6.10; 1.385; 1.446.  2048: 7.80; 1.296; 1.351.  3072: 9.42; 1.239; 1.345.  4096: 10.93; 1.206; 1.387.  6144: 13.88; 1.163; 1.478.  8192: 17.22; 1.128; 1.279.  12288: 23.00; 1.096; 1.281.  16384: 29.13; 1.072; 1.123.  24576: 41.17; 1.047; 1.092.  32768: 52.92; 1.035; 1.076 |
+| `5120 -> 48`: (64, 2) | 1024 to 24576 | 1024: 7.14; 1.258; 1.262.  2048: 8.43; 1.261; 1.262.  3072: 9.96; 1.231; 1.288.  4096: 11.42; 1.200; 1.344.  6144: 14.48; 1.153; 1.430.  8192: 17.78; 1.122; 1.257.  12288: 23.98; 1.073; 1.252.  16384: 30.00; 1.064; 1.102.  24576: 42.53; 1.029; 1.068 |
+| `5120 -> 64`: (64, 2) | 1024 to 2048 | 1024: 6.54; 1.283; 1.284.  2048: 8.23; 1.275; 1.277 |
+| `5120 -> 64`: (64, 2) | 4096 to 24576 | 4096: 11.37; 1.205; 1.334.  6144: 14.38; 1.155; 1.425.  8192: 17.62; 1.131; 1.132.  12288: 23.67; 1.088; 1.130.  16384: 29.79; 1.064; 1.132.  24576: 42.30; 1.035; 1.127 |
+| `5120 -> 128`: (128, 2) | 1024 to 6144 | 1024: 7.54; 1.129; 1.135.  2048: 9.54; 1.118; 1.117.  3072: 11.36; 1.132; 1.132.  4096: 13.08; 1.176; 1.176.  6144: 16.74; 1.239; 1.238 |
 
-*Table: the 152-SM cluster table (`K1_DSM_RANGES_BY_SM` on `sm_100a` parts of exactly 152 SMs): the FP32 rows
-`4096` / `5120 -> 32, 48, 64, 128` run the cluster program `dense_proj_gemm_dsm_nn_n<block_n>_f32_t_s<splits>` (tiles
-of 128 `d_in` columns by `block_n` `d_out` rows, one cluster of `splits` CTAs per tile, CTA `s` taking the `s`-th of
+*Table: the 152-SM cluster table (`K1_DSM_RANGES_BY_SM` on `sm_100a` parts of exactly 152 SMs): the FP32 rows `4096`
+/ `5120 -> 32, 48, 64, 128` run the cluster program `dense_proj_gemm_dsm_nn_n<block_n>_f32_t_s<splits>` (tiles of 128
+`d_in` columns by `block_n` `d_out` rows, one cluster of `splits` CTAs per tile, CTA `s` taking the `s`-th of
 `splits` contiguous runs of the tile's 64-token K blocks; each CTA sends the 4-column quads of its FP32 partial that
 another rank owns to that rank in distributed shared memory, adds the `splits` partials of its own quads in
 cluster-rank order and stores them once; no CTA leaves before every CTA of the cluster received its quads) at every
 token count of a range, before every other K1 table.  It replaces the routing of the other tables there (one or two
-splits of 64-wide tiles of the CTA-pair program, or the deterministic program).  Measured on two GB200 parts (152
-SMs) at 1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576 and 32768 tokens against that routing (the plan this package
-gives the part) and against the deterministic program: CUPTI span of the operation, cold L2, 40 warm-up and 400 timed
-launches per cell, one process per GPU pinned to its own cores, both launch orders, two runs per part; time = the
-median of the samples of the four runs.  A range's program was faster than the routing in every run and in each part's median,
-and no more than 3 % slower than the routing next to a kernel holding 8, 16 or 32 SMs on another stream (and without
-it, after the same one-block gate), on both parts.  Of the tile widths and cluster sizes measured (32, 64 and 128 wide,
-clusters of 2 to 4 CTAs) a measured token count takes the fastest that passed; a row's ranges cover runs of
-consecutive measured token counts at which some program passed, and a token count between two consecutive measured
-ones takes the lower one's program where that program passed at both, else the upper one's, which passed at both.  Not in a range (the routing of the other tables holds): below 1024 tokens and above
-32768 (not measured), `4096 -> 128` at 1024, 16384 and 24576 tokens (measured; no tile passed) and the token counts
-between 12288 and 32768 (not measured), `5120 -> 48` at 32768 tokens and above 24576, `5120 -> 128` from 8192 tokens
-(measured, not faster than the routing), and every other part, SM count included.  Its output met the deterministic
-package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max error at most 1e-3 times the largest
-reference element) in every one of 20 runs of 10 seeds at every measured token count for every tile and cluster
-size measured (worst relative Frobenius error 1.86e-5, at 32768 tokens; it grows about linearly with the token
-count).  The cluster program sums a tile's partials in a fixed order, so it repeats bit for bit (3000 launches per
-measured configuration at 128 to 1024 tokens, data).*
+splits of 64-wide tiles of the CTA-pair program, or the deterministic program).  Of the tile widths and cluster sizes
+screened on two GB200 parts (32, 64 and 128 wide, clusters of 2 to 4 CTAs) a screened token count takes the fastest
+that passed the screen, and a token count between two consecutive screened ones takes the lower one's program where
+that program passed at both, else the upper one's, which passed at both.  With this table, the rows were measured on
+two GB200 parts (152 SMs) at 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576 and 32768 tokens against that
+routing (the plan this package gives the part without the table) and against the deterministic program: CUPTI span,
+cold L2, one process per GPU pinned to its own cores, both launch orders, two runs per launch order on each part (all
+rows in one process, and one process per row); time = the median over the eight runs of each run's median, operation
+alone in CUDA graph replays.  A measured token count is in a range when, on both parts, the operation alone was
+faster than the routing in every run, eagerly and in CUDA graphs (paired median below 0.99 and a sign test), no more
+than 3 % slower than the routing next to a kernel holding 8, 16 or 32 SMs on another stream (and without it, after
+the same one-block gate), and the training step (forward, input gradient and weight gradient) and the step with the
+forward recomputed, eagerly and in CUDA graphs, were no slower than with the routing (median of the runs at most
+1.013 times the routing's, and no run slower than the slowest run of the routing against itself).  A row's ranges run
+from a passing measured token count to a passing one and hold no failing one.  Not in a range (the routing of the
+other tables holds): below 1024 and above 32768 tokens (not measured); `4096 -> 32` from 2049 to 6143 tokens and
+`4096 -> 48` from 2049 to 4095 and from 8193 to 16383 (at 3072 and 4096, and at 3072 and 12288 tokens, an eager step
+or step with the forward recomputed had a run slower than the routing's slowest run against itself); `4096 -> 128`
+below 4096 tokens and above 8192 (1024, 16384 and 24576: no program passed the screen; 2048, 3072 and 12288: the
+operation alone was not faster in every run, or a step had such a run; 32768: 1.51 to 1.55 times the routing next to
+a kernel holding SMs); `5120 -> 64` from 2049 to 4095 and above 24576 tokens (3072: a step had such a run; 32768: the
+operation alone was not faster in every run); `5120 -> 48` above 24576 and `5120 -> 128` above 6144 tokens (screened:
+not faster); and every other part, SM count included.  Its output met the deterministic package's FP32 budget against
+FP64 (relative Frobenius error at most 5e-5, max error at most 1e-3 times the largest reference element) in every one
+of 20 runs of 10 seeds at every measured token count on both parts (in the ranges: worst relative Frobenius error
+1.86e-5, at 32768 tokens; worst max error 2.06e-5 times the largest reference element; the error grows about linearly
+with the token count).  The cluster program sums a tile's partials in a fixed order, so it repeats bit for bit (3000
+launches per measured configuration at 128 to 1024 tokens, data).*
 
 | K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 208 SMs | 212 SMs | 216 SMs |
 |---|---|---|---|
@@ -961,7 +972,7 @@ left it as an alias of the renamed modules.  The names keep their spelling and, 
 | `GemmPlan`, `PreparedGemm` | `DetGemmPlan`, `PreparedDetGemm` | read through; `deterministic=False` plans `AtomicGemmPlan`, `PreparedAtomicGemm` |
 | `RouterPlan`, `PreparedRouterGemm` | `RouterDetPlan`, `PreparedRouterDetGemm` | read through; `deterministic=False` plans `AtomicRouterPlan`, `PreparedAtomicRouterGemm` |
 | every other module name (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | the same name | read through to the deterministic package |
-| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `dense_proj_gemm_atomic_nn_n192_f32` (row-major store, `sm_107a`), `dense_proj_gemm_dsm_nn_n<32\|64\|128>_f32_t_s<2\|3\|4>` (the K1 cluster programs, `sm_100a`), `router_fp32_gemm_atomic_{kk,nn_t,nn_t_ht_c3_nreg}`, `router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg` (`sm_103a`) |
+| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `dense_proj_gemm_atomic_nn_n192_f32` (row-major store, `sm_107a`), `dense_proj_gemm_dsm_nn_n<32\|64\|128>_f32_t_s<2\|3>` (the K1 cluster programs, `sm_100a`), `router_fp32_gemm_atomic_{kk,nn_t,nn_t_ht_c3_nreg}`, `router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg` (`sm_103a`) |
 
 *Table: the names before #8046, their deterministic names, and what this path offers
 (`cake_backend.DETERMINISTIC_NAMES`).*
