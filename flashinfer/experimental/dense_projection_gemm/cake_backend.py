@@ -392,40 +392,41 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: from 65536 tokens on 152 SMs (the 148-SM entry is in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`), where the split
 #: program's output missed the BF16 budget for some seed and the deterministic program's did too (10 seeds per token
 #: count on a 148-SM B200 part; the deterministic plan of these rows is the same on 148 and 152 SMs).  sm_100a
-#: ``5120 -> 32`` BF16 runs the deterministic program from 49153 tokens: there the split program's output missed the
-#: BF16 budget for one of 10 seeds and the deterministic program's met it on every seed (provisional: 36865 to 57345
-#: tokens are measured next).  The sm_103a BF16 entries of ``5120 -> 32``, ``5120 -> 64`` and ``5120 -> 128`` start at
-#: 45058 tokens and that of ``5120 -> 48`` at 49153: their split program's output met the BF16 budget on every seed at
-#: 32768 tokens (30 seeds on two parts) and at every measured token count up to 45057 tokens (``5120 -> 48``: 49152) on
-#: a 152-SM GB300 part (10 seeds, 20 runs each), and missed it for some seed at the next measured token count, 47105
-#: (``5120 -> 48``: 49153), where the deterministic program's output missed it too; the row keeps the deterministic
-#: program from there up (the split program misses it on every seed at 65536 tokens, 30 seeds on two parts).  Unmeasured
-#: token counts keep the verdict: below 512, above 65536 (except the rows with open-ended entries), between two measured
-#: token counts with different outcomes, and on parts with fewer than 152 SMs (148-SM parts: their own entries in
-#: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The sm_107a entries are single token counts of the deterministic
-#: package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for ``4096 -> 1024``), which give the
-#: row a faster deterministic plan there, and 16231 tokens of ``5120 -> 1024`` BF16 on 216 SMs (measured in the same
-#: runs; the deterministic plan there is the row's plan at every token count).  The other single 216-SM token counts
-#: (512 and 65536) come from a re-measurement of chosen points at 512, 8192, 32768 and 65536 tokens on two 216-SM parts
-#: per point under the rule of the sm_100a / sm_103a entries (the protocol is in the sm_107a K1 token table of the
-#: README); their neighbouring token counts were not measured.  On 208, 212 and 216 SMs the window entries come from a
-#: re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1 token table of
-#: the README): a measured token count is an entry where the row's program failed the rule above in some run, or left
-#: the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio of the
-#: medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  The open-ended
-#: sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows ``4096 -> 512``, ``4096 -> 1024``,
-#: ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961 tokens up because their one-split
-#: program's FP64 relative Frobenius error exceeds the deterministic package's FP32 error budget (5e-5) on every seed
-#: there.  That program adds the whole token reduction of an output in one chain, and its error grows about linearly
-#: with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the same program and accumulation order as
-#: on 216 SMs; the error does not depend on the SM count) against an FP64 reference, each row on two parts, 5 seeds, at
-#: 512 to 65536 tokens: within the budget on every seed up to 40960 tokens (1.86e-5 at 16384 tokens, 3.77e-5 at 32768)
-#: and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens, where the deterministic program's is
-#: 3.8e-5).  The range has no upper bound: the error keeps growing with the token count.  The token counts between 40960
-#: and 45056 run the deterministic program too (not measured).  From 961 tokens (16 K blocks) up the deterministic
-#: program of these rows cuts the token reduction into units of ``ceil(blocks / 2)`` K blocks and adds the partials in a
-#: fixed order (its automatic two-way split); there the one-split program's error is 2.0 to 2.4 times the deterministic
-#: program's (reported); up to 960 tokens the two give the same bits.
+#: ``5120 -> 32`` BF16 keeps its entry from 65537 tokens: measured with 10 seeds (20 runs each) at 32769 to 65025
+#: tokens, its split program's output met the BF16 budget on every seed up to 49153 tokens on a 152-SM GB200 part, and
+#: from 53249 tokens both programs missed it for some seed on that part and on a 148-SM B200 part (the 148-SM entry from
+#: 49153 tokens is in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The sm_103a BF16 entries of ``5120 -> 32``,
+#: ``5120 -> 64`` and ``5120 -> 128`` start at 45058 tokens and that of ``5120 -> 48`` at 49153: their split program's
+#: output met the BF16 budget on every seed at 32768 tokens (30 seeds on two parts) and at every measured token count up
+#: to 45057 tokens (``5120 -> 48``: 49152) on a 152-SM GB300 part (10 seeds, 20 runs each), and missed it for some seed
+#: at the next measured token count, 47105 (``5120 -> 48``: 49153), where the deterministic program's output missed it
+#: too; the row keeps the deterministic program from there up (the split program misses it on every seed at 65536
+#: tokens, 30 seeds on two parts).  Unmeasured token counts keep the verdict: below 512, above 65536 (except the rows
+#: with open-ended entries), between two measured token counts with different outcomes, and on parts with fewer than 152
+#: SMs (148-SM parts: their own entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The sm_107a entries are single
+#: token counts of the deterministic package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for
+#: ``4096 -> 1024``), which give the row a faster deterministic plan there, and 16231 tokens of ``5120 -> 1024`` BF16 on
+#: 216 SMs (measured in the same runs; the deterministic plan there is the row's plan at every token count).  The other
+#: single 216-SM token counts (512 and 65536) come from a re-measurement of chosen points at 512, 8192, 32768 and 65536
+#: tokens on two 216-SM parts per point under the rule of the sm_100a / sm_103a entries (the protocol is in the sm_107a
+#: K1 token table of the README); their neighbouring token counts were not measured.  On 208, 212 and 216 SMs the window
+#: entries come from a re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the
+#: sm_107a K1 token table of the README): a measured token count is an entry where the row's program failed the rule
+#: above in some run, or left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic
+#: program (ratio of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).
+#: The open-ended sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows ``4096 -> 512``,
+#: ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961 tokens up because
+#: their one-split program's FP64 relative Frobenius error exceeds the deterministic package's FP32 error budget (5e-5)
+#: on every seed there.  That program adds the whole token reduction of an output in one chain, and its error grows
+#: about linearly with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the same program and
+#: accumulation order as on 216 SMs; the error does not depend on the SM count) against an FP64 reference, each row on
+#: two parts, 5 seeds, at 512 to 65536 tokens: within the budget on every seed up to 40960 tokens (1.86e-5 at 16384
+#: tokens, 3.77e-5 at 32768) and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens, where the
+#: deterministic program's is 3.8e-5).  The range has no upper bound: the error keeps growing with the token count.  The
+#: token counts between 40960 and 45056 run the deterministic program too (not measured).  From 961 tokens (16 K blocks)
+#: up the deterministic program of these rows cuts the token reduction into units of ``ceil(blocks / 2)`` K blocks and
+#: adds the partials in a fixed order (its automatic two-way split); there the one-split program's error is 2.0 to 2.4
+#: times the deterministic program's (reported); up to 960 tokens the two give the same bits.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -435,7 +436,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_100a", 1, 4096, 48, "f32"): ((152, 512, 512),),
     ("sm_100a", 1, 4096, 64, "bf16"): ((152, 512, 512), (152, 65536, None)),
     ("sm_100a", 1, 4096, 64, "f32"): ((152, 512, 512),),
-    ("sm_100a", 1, 5120, 32, "bf16"): ((148, 49153, None), (152, 512, 512)),
+    ("sm_100a", 1, 5120, 32, "bf16"): ((148, 65537, None), (152, 512, 512)),
     ("sm_100a", 1, 5120, 32, "f32"): ((152, 512, 512),),
     ("sm_100a", 1, 5120, 48, "bf16"): ((148, 49153, None), (152, 512, 2048)),
     ("sm_100a", 1, 5120, 48, "f32"): ((152, 512, 2048),),
@@ -514,8 +515,11 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: the backward pass or the checkpointed step 1 % faster (sm_100a: the backward pass up to 3.5 % slower); where it spans
 #: an odd number (65537, 65538, 65600 and 65665 tokens) its BF16 output and the deterministic program's both miss the
 #: budget for some seed, and its FP32 output (a relative Frobenius error 2.1 to 2.3 % above the deterministic program's:
-#: reported) misses the FP32 budget on every seed from 98305 tokens, as the deterministic program's does.  Unmeasured
-#: token counts keep the verdict.
+#: reported) misses the FP32 budget on every seed from 98305 tokens, as the deterministic program's does.  sm_100a
+#: ``5120 -> 32`` BF16 runs the deterministic program from 49153 tokens on 148 SMs: on a 148-SM B200 part (10 seeds, 20
+#: runs each) its split program's output met the BF16 budget on every seed at 32769 to 45057 tokens and missed it for
+#: one of 10 seeds at 49153 tokens, where the deterministic program's met it on every seed; from 53249 tokens both
+#: programs missed it for some seed.  Unmeasured token counts keep the verdict.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -526,6 +530,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
         ("sm_100a", 1, 4096, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, None)),
         ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, None)),
+        ("sm_100a", 1, 5120, 32, "bf16"): ((49153, None),),
         ("sm_100a", 1, 5120, 48, "bf16"): ((512, 2048),),
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),

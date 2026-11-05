@@ -1708,6 +1708,7 @@ K1_148_EXCLUDED_TOKENS = {
     ("sm_100a", 4096, 48, "f32"): ((512, 512),),
     ("sm_100a", 4096, 64, "bf16"): ((512, 512), (65536, None)),
     ("sm_100a", 4096, 64, "f32"): ((512, 512), (65536, None)),
+    ("sm_100a", 5120, 32, "bf16"): ((49153, None),),
     ("sm_100a", 5120, 48, "bf16"): ((512, 2048),),
     ("sm_100a", 5120, 48, "f32"): ((512, 512),),
     ("sm_100a", 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
@@ -1723,8 +1724,9 @@ K1_148_EXCLUDED_TOKENS = {
     ("sm_103a", 6144, 128, "bf16"): ((512, 8192),),
     ("sm_103a", 6144, 128, "f32"): ((512, 8192),),
 }
-#: The measured token counts of the 148-SM audit.
-K1_148_MEASURED_TOKENS = (512, 1024, 2048, 4096, 8192, 16231, 32768, 65536)
+#: The measured token counts of the 148-SM audit (49153: a point of the FP64 error grid of sm_100a ``5120 -> 32`` BF16,
+#: 10 seeds at 32769 to 65025 tokens).
+K1_148_MEASURED_TOKENS = (512, 1024, 2048, 4096, 8192, 16231, 32768, 49153, 65536)
 
 
 def test_k1_exact_sm_count_exclusions(monkeypatch):
