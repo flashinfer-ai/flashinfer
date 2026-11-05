@@ -2935,25 +2935,15 @@ def test_router_units_policy(monkeypatch):
                 cake_backend.router_units("nn_t", arch=arch, sm_count=sms, **wgrad5120)
                 is None
             )
-    # few tokens at hidden 5120 on sm_100a and sm_103a: the compensated SIMT program with the 64 x 64 tile on 152 SMs
-    # (no partition); on 153 SMs, where that window does not hold, the "waves" partition below it (100 tokens, 4 K
-    # blocks: three waves of the 76 CTA pairs, at most one unit per (tile, K block) step -> 160 units)
+    # few tokens at hidden 5120: the "waves" partition on sm_100a and sm_103a (100 tokens, 4 K blocks: three waves of
+    # the 76 CTA pairs, at most one unit per (tile, K block) step -> 160 units), no SIMT program
     for arch in ("sm_100a", "sm_103a"):
-        assert cake_backend.router_simt(
-            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
-        ) == (64, 64, 2, 4)
-        assert (
-            cake_backend.router_partition(
-                "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
-            )
-            is None
-        )
         assert cake_backend.router_partition(
-            "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=100
+            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
         ) == (160, 0, 0)
         assert (
             cake_backend.router_simt(
-                "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=100
+                "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
             )
             is None
         )
@@ -3094,15 +3084,10 @@ def _force_failed_router_windows(monkeypatch, arch, keep) -> int:
 # hold, the token count takes the next window that holds it
 # fmt: off
 ROUTER_WGRAD_WINDOWS = {
-    ("sm_100a", 4096): ((1, 192, "simt_n64m64s2g4"),),
-    ("sm_100a", 5120): ((1, 160, "simt_n64m64s2g4"), (1, 128, "waves")),
-    ("sm_100a", 6144): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_103a", 4096): ((1, 192, "simt_n64m64s2g4"),),
-    ("sm_103a", 5120): ((1, 160, "simt_n64m64s2g4"), (1, 160, "waves")),
-    ("sm_103a", 6144): ((1, 160, "simt_n64m64s2g4"),),
+    ("sm_100a", 5120): ((1, 128, "waves"),),
+    ("sm_103a", 5120): ((1, 160, "waves"),),
     ("sm_107a", 5120): ((16172, 16384, "H0.5x4"),),
 }
-# fmt: on
 # the parts with a router table of their own (ROUTER_RULES_BY_SM) and their weight-gradient windows,
 # (arch, sm_count, hidden) -> ((first, last, spec), ...)
 ROUTER_BY_SM_PARTS = {
@@ -3111,38 +3096,33 @@ ROUTER_BY_SM_PARTS = {
     ("sm_107a", 208),
     ("sm_107a", 212),
 }
-# fmt: off
-ROUTER_WGRAD_WINDOWS_BY_SM = {
-    ("sm_100a", 148, 4096): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_100a", 148, 5120): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_100a", 148, 6144): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_103a", 148, 4096): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_103a", 148, 5120): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_103a", 148, 6144): ((1, 192, "simt_n64m64s2g4"),),
-    ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
-    ("sm_107a", 212, 4096): ((1, 192, "simt_n128m64s2g4"),),
-    ("sm_107a", 212, 5120): ((1, 256, "simt_n128m64s2g4"), (16172, 16384, "H0.5x4")),
-    ("sm_107a", 212, 6144): (
-        (1, 128, "simt_n128m64s2g4"), (129, 160, "simt_n64m64s2g4"), (16172, 16384, "H0.5x4"),
+# the compensated SIMT windows of 148-SM sm_100a / sm_103a parts (the same on both): the Dot2 form to 17 tokens, one
+# Kahan step per product to 32, then Kahan groups of four K steps
+_WGRAD_WINDOWS_148 = {
+    4096: (
+        (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
+        (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
     ),
+    5120: ((1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4")),
+    6144: ((1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4")),
+}
+ROUTER_WGRAD_WINDOWS_BY_SM = {
+    **{
+        (arch, 148, hidden): windows
+        for arch in ("sm_100a", "sm_103a")
+        for hidden, windows in _WGRAD_WINDOWS_148.items()
+    },
+    ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", 212, 5120): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", 212, 6144): ((16172, 16384, "H0.5x4"),),
 }
 # fmt: on
 # the input gradient's compensated SIMT windows (256 experts), (arch, sm_count, hidden) -> ((first, last, spec), ...):
-# 148-SM and 152-SM sm_100a / sm_103a parts and 212-SM sm_107a parts; every other part and token count runs the
-# deterministic program
+# 148-SM sm_100a / sm_103a parts; every other part and token count runs the deterministic program
 ROUTER_DGRAD_WINDOWS = {
-    **{
-        (arch, sms, hidden): ((1, 64 if hidden == 4096 else 32, "simt_n64m32s4g4"),)
-        for arch in ("sm_100a", "sm_103a")
-        for sms in (148, 152)
-        for hidden in (4096, 5120, 6144)
-    },
-    **{
-        ("sm_107a", 212, hidden): (
-            (1, 32 if hidden == 6144 else 64, "simt_n64m32s8g4"),
-        )
-        for hidden in (4096, 5120, 6144)
-    },
+    (arch, 148, hidden): ((1, 32, "simt_n64m32s4g4"),)
+    for arch in ("sm_100a", "sm_103a")
+    for hidden in (4096, 5120, 6144)
 }
 
 
@@ -3221,14 +3201,13 @@ def test_router_wgrad_token_windows(arch):
                 if not str(spec).startswith("simt_"):
                     assert simt is None, (hidden, T, sms)
     if arch in ("sm_100a", "sm_103a"):
-        # the smallest measured "waves" count (two K blocks: 80 units) on 153 SMs, where the SIMT window above it does
-        # not hold: no SIMT program
+        # the smallest measured "waves" count (two K blocks: 80 units), no SIMT program
         assert cake_backend.router_partition(
-            "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=64
+            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
         ) == (80, 0, 0)
         assert (
             cake_backend.router_simt(
-                "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=64
+                "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
             )
             is None
         )
@@ -3260,9 +3239,10 @@ def test_router_windows_failing_the_accuracy_rule_run_the_deterministic_plan():
     :data:`FAILED_ROUTER_WINDOWS_BY_SM` on 212-SM sm_107a parts) run the plan the row takes without them, at the first
     and the last token count of each window, one token inside each and a token count in the middle, also on 148 SMs
     (152-SM windows) and on 208 and 216 SMs (212-SM windows): never their plain SIMT program or their partition.  A
-    token count a shipped compensated SIMT window holds (:func:`_shipped_router_spec`) runs that window's program
-    (its tile has a Kahan group); every other one runs the deterministic program -- no partition, no SIMT program,
-    the planner keeps the row on the deterministic program."""
+    token count a shipped compensated SIMT window of a 148-SM part holds (:func:`_shipped_router_spec`) runs that
+    window's program; at hidden 5120 up to 128 tokens on sm_100a and up to 160 on sm_103a a 152-SM part keeps the
+    row's "waves" window; every other one runs the deterministic program -- no partition, no SIMT program, the
+    planner keeps the row on the deterministic program."""
     failed = []
     for (arch, sms, layout, hidden), windows in _failed_router_window_rows():
         if (arch, sms) in cake_backend.ROUTER_RULES_BY_SM:
@@ -3271,7 +3251,7 @@ def test_router_windows_failing_the_accuracy_rule_run_the_deterministic_plan():
             assert sms == 152
             failed.append((arch, (148, sms), layout, hidden, windows))
     assert {f[0] for f in failed} == {"sm_100a", "sm_103a", "sm_107a"}
-    checked = compensated = 0
+    checked = compensated = kept = 0
     for arch, sm_counts, layout, hidden, windows in failed:
         for first, last, _spec in windows:
             for T in sorted({first, first + 1, (first + last) // 2, last - 1, last}):
@@ -3283,14 +3263,27 @@ def test_router_windows_failing_the_accuracy_rule_run_the_deterministic_plan():
                     simt = cake_backend.router_simt(layout, **kw)
                     part = cake_backend.router_partition(layout, **kw)
                     assert spec == want, (kw, layout, spec)
-                    if want is not None:
+                    if str(want).startswith("simt_"):
                         # a shipped compensated SIMT window holds the token count
                         tile = cake_backend.router_simt_tile(want)
                         assert tile is not None and len(tile) == 4, (kw, layout, want)
                         assert simt == tile and part is None, (kw, layout)
                         compensated += 1
                         continue
-                    assert simt is None and part is None, (kw, layout)
+                    assert simt is None, (kw, layout)
+                    if want == "waves":
+                        k_iters = -(-T // 32)
+                        units = cake_backend.router_waves(
+                            hidden // 256, 2, k_iters, sms
+                        )
+                        assert units is not None, kw
+                        units = cake_backend.router_units_of(
+                            units, hidden // 256, 2, k_iters, sms
+                        )
+                        assert part == (units, 0, 0), kw
+                        kept += 1
+                        continue
+                    assert part is None, (kw, layout)
                     if layout == "nn_t":
                         # stride-0 views: the layout classes of G.t() and X
                         A = torch.empty(1, N).expand(K, N).t()
@@ -3303,7 +3296,54 @@ def test_router_windows_failing_the_accuracy_rule_run_the_deterministic_plan():
                     )
                     assert plan is None, (kw, layout, reason)
                     checked += 1
-    assert checked > 150 and compensated > 50
+    # compensated: 1, 2 and the middle token count of the 152-SM sm_100a weight-gradient windows from one token at
+    # each hidden size, 1 and 2 of the input-gradient windows at hidden 4096 and 5120 and 1, 2 and 32 at 6144 (148 SMs)
+    assert checked > 150 and kept and compensated == 3 * 3 + 2 + 2 + 3
+
+
+def _plan_router_row(layout, arch, sm_count, hidden, T, experts=256):
+    """``plan_atomic_router`` of the weight gradient (``nn_t``: ``G.t() @ X``) or the input gradient (``kn``: ``G @
+    W``) of a router of ``hidden`` columns and ``experts`` experts at ``T`` tokens on a part of ``sm_count`` SMs."""
+    G = torch.zeros(T, experts)
+    if layout == "nn_t":
+        args = (G.t(), torch.zeros(T, hidden), torch.zeros(experts, hidden))
+    else:
+        args = (G, torch.zeros(experts, hidden), torch.zeros(T, hidden))
+    return cake_backend.plan_atomic_router(*args, arch=arch, sm_count=sm_count)
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_router_148_sm_simt_windows_plan_their_registered_programs(arch):
+    """On a 148-SM part each of the 15 compensated SIMT windows of its table (:data:`ROUTER_WGRAD_WINDOWS_BY_SM`,
+    :data:`ROUTER_DGRAD_WINDOWS`) plans, at its first, middle and last token count, the program of its tile and form,
+    which this checkout registers for ``arch``.  One token past a row's last window, and every one of these token
+    counts on 152 SMs, take no SIMT program (the deterministic program, or on 152 SMs at hidden 5120 the "waves"
+    partition)."""
+    windows_seen = planned = 0
+    for hidden in (4096, 5120, 6144):
+        for layout, windows in (
+            ("nn_t", ROUTER_WGRAD_WINDOWS_BY_SM[(arch, 148, hidden)]),
+            ("kn", ROUTER_DGRAD_WINDOWS[(arch, 148, hidden)]),
+        ):
+            for first, last, spec in windows:
+                windows_seen += 1
+                tile = cake_backend.router_simt_tile(spec)
+                assert tile is not None and len(tile) == 4, spec
+                template = cake_backend.router_simt_template(tile, layout)
+                assert template in cake_jit.KERNELS[arch], (spec, template)
+                for T in sorted({first, (first + last) // 2, last}):
+                    plan, reason = _plan_router_row(layout, arch, 148, hidden, T)
+                    assert plan is not None, (layout, hidden, T, reason)
+                    assert plan.simt == tile, (layout, hidden, T, plan.simt)
+                    assert plan.template == template, (layout, hidden, T)
+                    plan, _ = _plan_router_row(layout, arch, 152, hidden, T)
+                    assert plan is None or plan.simt is None, (layout, hidden, T)
+                    planned += 1
+            past = windows[-1][1] + 1
+            plan, _ = _plan_router_row(layout, arch, 148, hidden, past)
+            assert plan is None, (layout, hidden, past)
+    # first, middle and last token count of each window (three different ones each)
+    assert windows_seen == 15 and planned == 3 * 15
 
 
 def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
@@ -3359,12 +3399,17 @@ def test_router_simt_specs_name_their_tiles_and_templates():
     """A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>"`` names its tile and the template of its program on
     a weight-gradient row (``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>``) and on an input-gradient row
     (``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>``); a compensated one ``"simt_n<tile_n>m<tile_m>s<slices>
-    g<group>"`` names the tile with its group and the compensated program (``router_fp32_gemm_simt_kahan_...g<group>``,
-    ``router_fp32_dgrad_simt_kahan_...g<group>``); every other spec is none, and the forward has no SIMT program."""
+    <form>"`` (``g<group>`` or ``dot2``) names the tile with its form and the compensated program
+    (``router_fp32_gemm_simt_kahan_...g<group>``, without the suffix for ``g1``;
+    ``router_fp32_gemm_simt_kahan_dot2_...``; ``router_fp32_dgrad_simt_kahan_...g<group>``); every other spec is none,
+    the Dot2 form is the weight gradient's only, and the forward has no SIMT program."""
     assert cake_backend.router_simt_tile("simt_n64m64s4") == (64, 64, 4)
     assert cake_backend.router_simt_tile("simt_n128m64s2") == (128, 64, 2)
-    assert cake_backend.router_simt_tile("simt_n64m64s2g4") == (64, 64, 2, 4)
-    assert cake_backend.router_simt_tile("simt_n64m32s8g4") == (64, 32, 8, 4)
+    assert cake_backend.router_simt_tile("simt_n64m64s2g4") == (64, 64, 2, "g4")
+    assert cake_backend.router_simt_tile("simt_n128m64s2g4") == (128, 64, 2, "g4")
+    assert cake_backend.router_simt_tile("simt_n64m64s2g1") == (64, 64, 2, "g1")
+    assert cake_backend.router_simt_tile("simt_n64m64s2dot2") == (64, 64, 2, "dot2")
+    assert cake_backend.router_simt_tile("simt_n64m32s4g4") == (64, 32, 4, "g4")
     for spec in (
         None,
         3,
@@ -3377,31 +3422,32 @@ def test_router_simt_specs_name_their_tiles_and_templates():
         "simt_n64m64s2g",
         "simt_n64m64s2g4x",
         "simt_n64m64g4",
+        "simt_n64m64s2dot",
+        "simt_n64m64s2dot3",
+        "simt_n64m64s2g4dot2",
     ):
         assert cake_backend.router_simt_tile(spec) is None, spec
     # the compensated programs the windows name
-    assert (
-        cake_backend.router_simt_template((64, 64, 2, 4))
-        == "router_fp32_gemm_simt_kahan_n64m64s2g4"
-    )
-    assert (
-        cake_backend.router_simt_template((128, 64, 2, 4))
-        == "router_fp32_gemm_simt_kahan_n128m64s2g4"
-    )
-    assert (
-        cake_backend.router_simt_template((64, 32, 4, 4), "kn")
-        == "router_fp32_dgrad_simt_kahan_m32n64s4g4"
-    )
-    assert cake_backend.router_simt_template(
-        cake_backend.router_simt_tile("simt_n64m32s8g4"), "kn"
-    ) == ("router_fp32_dgrad_simt_kahan_m32n64s8g4")
-    assert cake_backend.router_simt_template((64, 64, 2, 4)).startswith(
-        cake_jit.TEMPLATE_PREFIXES[3]
-    )
+    for spec, layout, template in (
+        ("simt_n64m64s2dot2", "nn_t", "router_fp32_gemm_simt_kahan_dot2_n64m64s2"),
+        ("simt_n64m64s2g1", "nn_t", "router_fp32_gemm_simt_kahan_n64m64s2"),
+        ("simt_n64m64s2g4", "nn_t", "router_fp32_gemm_simt_kahan_n64m64s2g4"),
+        ("simt_n128m64s2g4", "nn_t", "router_fp32_gemm_simt_kahan_n128m64s2g4"),
+        ("simt_n64m32s4g4", "kn", "router_fp32_dgrad_simt_kahan_m32n64s4g4"),
+    ):
+        tile = cake_backend.router_simt_tile(spec)
+        assert cake_backend.router_simt_template(tile, layout) == template, spec
+        prefix = cake_jit.TEMPLATE_PREFIXES[3 if layout == "nn_t" else 4]
+        assert template.startswith(prefix), spec
     with pytest.raises(ValueError, match="not a SIMT tile"):
-        cake_backend.router_simt_template((64, 64, 2, 4, 1))
+        cake_backend.router_simt_template((64, 64, 2, "g4", 1))
+    for form in (4, "g0", "g", "dot", "x4"):
+        with pytest.raises(ValueError, match="not a SIMT tile"):
+            cake_backend.router_simt_template((64, 64, 2, form))
     with pytest.raises(ValueError, match="no SIMT program"):
-        cake_backend.router_simt_template((64, 64, 2, 4), "kk")
+        cake_backend.router_simt_template((64, 64, 2, "g4"), "kk")
+    with pytest.raises(ValueError, match="the Dot2 form is the weight gradient's"):
+        cake_backend.router_simt_template((64, 32, 4, "dot2"), "kn")
     assert (
         cake_backend.router_simt_template((128, 64, 2))
         == "router_fp32_gemm_simt_n128m64s2"
@@ -3611,8 +3657,8 @@ def test_k2_planner_plans_the_simt_router(monkeypatch):
 
 def _dgrad_simt_windows(forced) -> dict:
     """The input gradient's SIMT windows, ``(arch, SM count, hidden) -> ((first, last, tile), ...)`` (256 experts): as
-    shipped the compensated windows (:data:`ROUTER_DGRAD_WINDOWS`); with ``forced``, the windows of 152-SM sm_100a and
-    212-SM sm_107a parts that missed the accuracy rule (:func:`_failed_router_window_rows`) before them."""
+    shipped the compensated windows of 148-SM parts (:data:`ROUTER_DGRAD_WINDOWS`); with ``forced``, also the windows
+    of 152-SM sm_100a and 212-SM sm_107a parts that missed the accuracy rule (:func:`_failed_router_window_rows`)."""
     windows = {key: rows for key, rows in ROUTER_DGRAD_WINDOWS.items()}
     if forced:
         for (arch, sms, layout, hidden), rows in _failed_router_window_rows():
@@ -3633,8 +3679,8 @@ def test_router_simt_windows_of_the_input_gradient(monkeypatch):
     every token count of the window, on the SM count of its table only; one token past the window, a caller's split
     count, another SM count or architecture, another expert count and a hidden size the tile does not divide run the
     deterministic program, and ``router_partition`` gives none (the input gradient has no stream-K program).  As
-    shipped the compensated windows of 148-SM and 152-SM sm_100a / sm_103a parts and 212-SM sm_107a parts; the plain
-    windows that missed the accuracy rule (152-SM sm_100a and 212-SM sm_107a parts) are checked forced before them."""
+    shipped the compensated windows of 148-SM sm_100a / sm_103a parts; the plain windows that missed the accuracy rule
+    (152-SM sm_100a and 212-SM sm_107a parts) are checked forced too."""
     tokens = (1, 17, 32, 63, 64, 65, 96, 127, 128, 129, 192, 256, 1000, 16231)
     for forced in (False, True):
         if forced:
@@ -3665,14 +3711,10 @@ def test_router_simt_windows_of_the_input_gradient(monkeypatch):
                         seen += want is not None
                         other = dict(kw, K=128)
                         assert cake_backend.router_simt("kn", **other) is None
-        # shipped: five token counts from 1 to 64 at hidden 4096 and three from 1 to 32 at hidden 5120 and 6144 on
-        # each 148-SM and 152-SM sm_100a / sm_103a part, five from 1 to 64 at hidden 4096 and 5120 and three from 1 to
-        # 32 at hidden 6144 on the 212-SM sm_107a part; forced: nine token counts from 1 to 128 at hidden 4096 and
-        # 5120 and five from 1 to 64 at hidden 6144 on the 152-SM sm_100a part and on the 212-SM sm_107a part
-        shipped_seen = 4 * (5 + 3 + 3) + (5 + 5 + 3)
-        assert seen == (
-            shipped_seen - 11 - 13 + 2 * (9 + 9 + 5) if forced else shipped_seen
-        )
+        # shipped: three token counts from 1 to 32 at each hidden size on each 148-SM sm_100a / sm_103a part; forced
+        # in addition: nine token counts from 1 to 128 at hidden 4096 and 5120 and five from 1 to 64 at hidden 6144 on
+        # the 152-SM sm_100a part and on the 212-SM sm_107a part
+        assert seen == 2 * 3 * 3 + (2 * (9 + 9 + 5) if forced else 0)
     # a hidden size the tile does not divide: the deterministic program
     monkeypatch.setitem(
         cake_backend.ROUTER_RULES,
@@ -3785,9 +3827,9 @@ def test_k2_planner_plans_the_simt_input_gradient(monkeypatch):
     G4, out4 = torch.zeros(129, E), torch.zeros(129, hidden)
     plan, reason = cake_backend.plan_atomic_router(G4, W, out4, **kw)
     assert plan is None and "kn class runs the deterministic program" in reason
-    # another part (a 216-SM sm_107a part has no input-gradient window)
+    # another part (a 152-SM sm_103a part has no input-gradient window)
     plan, reason = cake_backend.plan_atomic_router(
-        G, W, out, arch="sm_107a", sm_count=216
+        G, W, out, arch="sm_103a", sm_count=152
     )
     assert plan is None and "kn class runs the deterministic program" in reason
 
@@ -5745,9 +5787,11 @@ def test_k2_memo_under_concurrent_table_changes(monkeypatch):
 
 
 # (arch, SM count) of the measured router tables: ROUTER_RULES on 152-SM GB200 / GB300 and 216-SM R200 parts,
-# ROUTER_RULES_BY_SM on 208-SM and 212-SM R200 parts
+# ROUTER_RULES_BY_SM on 148-SM B200 / B300 and 208-SM and 212-SM R200 parts
 ROUTER_TABLE_PARTS = (
+    ("sm_100a", 148),
     ("sm_100a", 152),
+    ("sm_103a", 148),
     ("sm_103a", 152),
     ("sm_107a", 208),
     ("sm_107a", 212),
@@ -5758,9 +5802,9 @@ ROUTER_TABLE_PARTS = (
 def test_router_rule_spec_reads_the_table_of_the_sm_count(monkeypatch):
     """The convenience path's no-verdict check reads the router table of the device's SM count (``router_rules``):
     ``ROUTER_RULES`` on 152 SMs (sm_100a, sm_103a) and 216 SMs (sm_107a), the part's own table of
-    ``ROUTER_RULES_BY_SM`` on 208 and 212 SMs (sm_107a).  At every row of that table and the edges of its windows the
-    spec is the table's, ``None`` exactly where the device's planner keeps the row on the deterministic program for
-    want of a verdict; a verdict in only one table is seen on exactly its SM count."""
+    ``ROUTER_RULES_BY_SM`` on 148 SMs (sm_100a, sm_103a) and 208 and 212 SMs (sm_107a).  At every row of that table
+    and the edges of its windows the spec is the table's, ``None`` exactly where the device's planner keeps the row on
+    the deterministic program for want of a verdict; a verdict in only one table is seen on exactly its SM count."""
     _register(
         monkeypatch,
         "sm_107a",
@@ -5865,22 +5909,6 @@ def test_k2_key_is_the_convenience_key(splits):
         ) == det_backend.convenience_key(3, 77, ("k2", splits), A, B, out)
 
 
-def _drop_simt_windows(monkeypatch, arch: str, hidden: int) -> None:
-    """Drop the compensated SIMT windows of ``arch``'s 256-expert weight-gradient row at ``hidden`` from
-    :data:`ROUTER_RULES` (the 152-SM verdicts): a token count they held takes the next window that holds it
-    (``"waves"`` at hidden 5120 from 1 to 128 tokens on ``sm_100a``, to 160 on ``sm_103a``)."""
-    key = (arch, "nn_t", hidden, 256)
-    monkeypatch.setitem(
-        cake_backend.ROUTER_RULES,
-        key,
-        tuple(
-            window
-            for window in cake_backend.ROUTER_RULES[key]
-            if not str(window[2]).startswith("simt_")
-        ),
-    )
-
-
 def _same_arguments(got: list, want: list) -> None:
     assert len(got) == len(want)
     for i, (g, w) in enumerate(zip(got, want, strict=True)):
@@ -5912,9 +5940,6 @@ def test_k2_bound_arguments_are_the_ordered_arguments(monkeypatch, case):
         )
     elif case == "fwd_two_splits":
         splits = 2
-    else:
-        # "waves", with the compensated SIMT window of the same token counts in front of it dropped
-        _drop_simt_windows(monkeypatch, arch, H)
     X, W = torch.empty(T, H), torch.empty(256, H)
     G = (
         torch.empty(T, 256 + 16)[:, :256]
@@ -6014,8 +6039,7 @@ def _cpu_k2_launches(monkeypatch, arch="sm_103a"):
 
 # A router entry point's call on a 152-SM sm_103a part: (op, T, hidden, splits, padded out, padded G, whether it runs
 # this package's program -- else the deterministic program through this package's binding); the head/tail case runs
-# with the "H0.5x3" window that missed the accuracy rule forced (FAILED_ROUTER_WINDOWS), the "waves" cases with the
-# compensated SIMT window in front of "waves" dropped (_drop_simt_windows)
+# with the "H0.5x3" window that missed the accuracy rule forced (FAILED_ROUTER_WINDOWS)
 # fmt: off
 ROUTER_ENTRY_CASES = {
     "fwd": ("fwd", 64, 5120, None, False, False, False),
@@ -6069,8 +6093,6 @@ def test_router_entry_points_launch_their_paths_launches(monkeypatch, case):
         monkeypatch.setitem(
             cake_backend.ROUTER_RULES, (*key, 256), FAILED_ROUTER_WINDOWS[key]
         )
-    elif case in ("wgrad_waves", "wgrad_torch_chain"):
-        _drop_simt_windows(monkeypatch, "sm_103a", 5120)
     call, out = _router_entry_call(case)
     with monkeypatch.context() as m:
         m.setattr(cake_backend, "_k2_entry", lambda *args: None)
@@ -7795,8 +7817,8 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(monkeypatch, hidden, T
     ``ROUTER_REL_FRO_MAX``.  On whole tiles (one unit per tile) it stores the bits of the three-chunk-buffer head/tail
     program at the same partition, which are the deterministic program's one-split result.  On a part of that
     architecture with another SM count, where the windows do not hold (``router_rules``: :data:`ROUTER_RULES` off
-    :data:`ROUTER_SM_COUNT`, e.g. 148-SM sm_103a), the default plan is the deterministic program.  Skips on any other
-    device and outside the part's windows."""
+    :data:`ROUTER_SM_COUNT`, e.g. 148-SM sm_103a, or a table of its own with no window at that token count), the
+    default plan is the deterministic program.  Skips on any other device and outside the part's windows."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     ts = cake_backend.router_head_tail_template(arch, sm_count)
@@ -7809,13 +7831,22 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(monkeypatch, hidden, T
     spec = cake_backend._router_rule_spec(
         "nn_t", arch=arch, sm_count=sm_count, M=hidden, N=256, K=T
     )
-    if cake_backend.router_head_tail(spec) is None:
+    home = cake_backend.ROUTER_SM_COUNT.get(arch, sm_count)
+    home_spec = cake_backend._router_rule_spec(
+        "nn_t", arch=arch, sm_count=home, M=hidden, N=256, K=T
+    )
+    on_table = cake_backend.router_head_tail(spec) is not None
+    if not on_table and (
+        spec is not None
+        or home == sm_count
+        or cake_backend.router_head_tail(home_spec) is None
+    ):
         pytest.skip(
             f"no head/tail window of {arch} on {sm_count} SMs at {hidden}, T={T}"
         )
     X, W, G = _router_inputs(T, device, SEED + 30, K=hidden)
     A, B, out = _router_case("wgrad", X, W, G)
-    if not cake_backend.router_rules(arch, sm_count)[1]:
+    if not on_table or not cake_backend.router_rules(arch, sm_count)[1]:
         plan, reason = cake_backend.plan_atomic_router(
             A, B, out, arch=arch, sm_count=sm_count
         )
@@ -7867,14 +7898,20 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(monkeypatch, hidden, T
     assert torch.equal(stores[ts], stores[c3]) and torch.equal(stores[ts], det_out)
 
 
-#: The SIMT programs' tiles ``(tile_n, tile_m, slices)``, compensated ``(tile_n, tile_m, slices, group)``, a test
+#: The SIMT programs' tiles ``(tile_n, tile_m, slices)``, compensated ``(tile_n, tile_m, slices, form)``, a test
 #: forces (each runs where this checkout registers it).
-SIMT_TILES = ((64, 64, 2), (128, 64, 2), (64, 64, 2, 4), (128, 64, 2, 4))
+SIMT_TILES = (
+    (64, 64, 2),
+    (128, 64, 2),
+    (64, 64, 2, "dot2"),
+    (64, 64, 2, "g1"),
+    (64, 64, 2, "g4"),
+    (128, 64, 2, "g4"),
+)
 
 
 def _simt_spec(tile) -> str:
-    spec = "simt_n{}m{}s{}".format(*tile[:3])
-    return spec + "".join(f"g{group}" for group in tile[3:])
+    return "simt_n{}m{}s{}".format(*tile[:3]) + "".join(tile[3:])
 
 
 def _simt_device_or_skip(tile) -> tuple[torch.device, str, str]:
@@ -8024,15 +8061,9 @@ def test_gpu_router_simt_program_waits_for_an_early_producer(router_rule):
     assert {key[2][1][1] for key in cake_backend._K2_ATOMIC_CACHE} == {0, 1}
 
 
-#: The input gradient's SIMT tiles ``(tile_n, tile_m, slices)``, compensated ``(tile_n, tile_m, slices, group)``, a
+#: The input gradient's SIMT tiles ``(tile_n, tile_m, slices)``, compensated ``(tile_n, tile_m, slices, form)``, a
 #: test forces (each runs where this checkout registers it).
-DGRAD_SIMT_TILES = (
-    (64, 32, 4),
-    (64, 32, 8),
-    (64, 64, 4),
-    (64, 32, 4, 4),
-    (64, 32, 8, 4),
-)
+DGRAD_SIMT_TILES = ((64, 32, 4), (64, 32, 8), (64, 64, 4), (64, 32, 4, "g4"))
 
 
 def _dgrad_simt_device_or_skip(tile) -> tuple[torch.device, str, str]:
@@ -8285,13 +8316,14 @@ def _device_simt_windows(arch, sm_count, layout) -> list:
 @pytest.mark.parametrize("op", ["wgrad", "dgrad"])
 def test_gpu_router_shipped_simt_windows_keep_the_fp64_rule(monkeypatch, op):
     """Unforced (``deterministic=False``, no split count), at the first and the last token count of each shipped
-    compensated SIMT window that holds on this device (148-SM and 152-SM sm_100a / sm_103a parts, 212-SM sm_107a
-    parts; :func:`_device_simt_windows`) and two seeds: the planner gives the window's compensated program; three
-    calls into a NaN-poisoned ``out`` give finite values and the same bits; the relative Frobenius error against FP64
-    of the exact operands is within ``ROUTER_REL_FRO_MAX`` and at most 1.02 times that of the plan the row takes
-    without its SIMT windows (the deterministic program or, at hidden 5120 on 152 SMs, the "waves" partition) -- the
-    accuracy rule of the windows.  One token past a window takes another plan.  On every other part (216-SM sm_107a,
-    an SM count without measured windows) no token count of these windows runs a SIMT program."""
+    compensated SIMT window that holds on this device (148-SM sm_100a / sm_103a parts; :func:`_device_simt_windows`)
+    and two seeds: the planner gives the window's compensated program; three calls into a NaN-poisoned ``out`` give
+    finite values and the same bits; the relative Frobenius error against FP64 of the exact operands is within
+    ``ROUTER_REL_FRO_MAX`` (the accuracy rule of the windows) and every element within the error bound of a sum of
+    ``K`` FP32 products in any order (``gamma_K`` times the sum of the products' magnitudes).  The ratio to the error
+    of the plan the row takes without its SIMT windows (the deterministic program) is printed, not checked.  One
+    token past a window takes another plan.  On every other part no token count of these windows runs a SIMT
+    program."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     layout = "nn_t" if op == "wgrad" else "kn"
@@ -8360,7 +8392,10 @@ def test_gpu_router_shipped_simt_windows_keep_the_fp64_rule(monkeypatch, op):
                     f"rel_fro {err:.4e}, without the window {base_err:.4e}, ratio {err / base_err:.4f}"
                 )
                 assert err <= ROUTER_REL_FRO_MAX, (hidden, T, err)
-                assert err <= 1.02 * base_err, (hidden, T, err, base_err)
+                k = A.shape[-1]
+                gamma = k * 2.0**-24 / (1 - k * 2.0**-24)
+                bound = gamma * (A.double().abs() @ B.double().abs())
+                assert bool(((got.double() - ref).abs() <= bound).all()), (hidden, T)
                 ran += 1
         # one token past the window: another plan
         M, N, K = _router_launch_dims(layout, hidden, 256, last + 1)
@@ -8768,8 +8803,9 @@ def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding():
 
 def test_gpu_router_token_windows_run_at_their_edges():
     """Unforced (``deterministic=False``, no split count): at the first and the last token count of every token window
-    of a router weight-gradient row of this architecture (the smallest measured count, 64, for a window that starts
-    at one token) the prepared launch runs the program the planner gives -- the SIMT program of a SIMT window and
+    of a router weight-gradient row of this architecture (the smallest measured count, 64, for a window other than
+    SIMT that starts at one token; a SIMT window runs from its first token count) the prepared launch runs the
+    program the planner gives -- the SIMT program of a SIMT window and
     the partition of a head/tail window on the measured SM count, a "waves" window's partition where
     :func:`cake_backend.router_waves` gives one and no SIMT window holds the token count -- and meets the gate; one
     token outside every window, or on another SM count, it runs the deterministic launch."""
@@ -8784,9 +8820,13 @@ def test_gpu_router_token_windows_run_at_their_edges():
         if rule_arch != arch or layout != "nn_t" or not isinstance(rule, tuple):
             continue
         for first, last, spec in rule:
+            if cake_backend.router_simt_tile(spec) is None:
+                first_run = max(first, 64)
+            else:
+                first_run = first
             for T, inside in (
                 (first - 1, False),
-                (max(first, 64), True),
+                (first_run, True),
                 (last, True),
                 (last + 1, False),
             ):
@@ -8854,8 +8894,8 @@ def test_gpu_router_windows_failing_the_accuracy_rule_give_the_deterministic_bit
     """Unforced (``deterministic=False``, no split count): at the first and the last token count of each router window
     of this architecture that missed the accuracy rule (:func:`_failed_router_window_rows`; 64 for a window that starts
     at one token) where this device's planner gives the row neither a partition nor a SIMT program -- every one of
-    them but those a shipped compensated SIMT window holds and, on 148-SM and 152-SM parts, the hidden 5120 "waves"
-    windows -- the weight gradient and the input gradient give the deterministic program's bits through this
+    them but those a shipped compensated SIMT window of a 148-SM part holds and, on 152-SM parts, the hidden 5120
+    "waves" windows -- the weight gradient and the input gradient give the deterministic program's bits through this
     package's binding, and no launch of this package's programs is prepared (a row whose shipped window holds the token
     count keeps a cached entry without a plan).  No token count runs the plain SIMT program of a window that missed."""
     device, arch = _atomic_device_or_skip()

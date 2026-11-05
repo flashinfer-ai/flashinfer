@@ -51,8 +51,8 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
   - the K2 weight and input gradients in the SIMT token windows of their rows in the router tables
     (:func:`router_rules`, :func:`router_simt`): a compensated exact-FP32 program on the CUDA cores over the FP32
     operands read in place, every element of ``out`` stored once (other bits than the deterministic program's BF16x3
-    emulation, with no more FP64 error); the input gradient's every other row and token count runs the deterministic
-    program (one split).
+    emulation, within the deterministic package's router FP64 budget); the input gradient's every other row and token
+    count runs the deterministic program (one split).
 
   Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
   both modes: a recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input
@@ -1273,18 +1273,18 @@ class _VerdictTable(dict):
 #: partition spec -- ``"waves"`` (:func:`router_waves`), a head/tail spec ``"H<f>x<k>"`` or ``"H<f>x<k>p<h>"`` (the
 #: weight gradient's head/tail program, :func:`router_partition_of`) or one of :func:`router_units_of` (``"forward"``,
 #: ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's stream-K program, a SIMT spec
-#: ``"simt_n<tile_n>m<tile_m>s<slices>g<group>"`` the compensated exact-FP32 program of the row's layout on the CUDA
-#: cores (the weight gradient's or the input gradient's, :func:`router_simt`); ``None`` runs the deterministic program
-#: (its production split count).  A rule is ``None``, token windows ``((min_tokens, max_tokens, spec), ...)`` -- the
-#: spec of the window that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the
-#: input gradient); every other token count runs the deterministic program -- or a spec alone, at every token count (the
-#: plan a test or a measurement forces; no row ships one).  A window carries a spec only where that partition was faster
-#: than the deterministic package's shipped plan in every measurement run at the token counts measured in it (one
-#: long-lived process and a fresh process per token count): a one-sided paired sign test (p < 0.05) with a median time
-#: ratio below 0.99, in eager launches and in CUDA graph replays, and no more than 3 % slower than that plan next to a
-#: kernel holding 8, 16 or 32 SMs on another stream -- in the same launch order, and also with this partition launched
-#: before that kernel against the deterministic plan launched after it.  A window ends at a measured token count; one
-#: that starts at a single token keeps the plan below its smallest measured count (64 tokens) unmeasured.  A token count
+#: ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"`` the exact-FP32 program (plain, or compensated with a form) of the
+#: row's layout on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (its production
+#: split count).  A rule is ``None``, token windows ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window
+#: that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
+#: every other token count runs the deterministic program -- or a spec alone, at every token count (the plan a test or a
+#: measurement forces; no row ships one).  A window carries a spec only where that partition was faster than the
+#: deterministic package's shipped plan in every measurement run at the token counts measured in it (one long-lived
+#: process and a fresh process per token count): a one-sided paired sign test (p < 0.05) with a median time ratio below
+#: 0.99, in eager launches and in CUDA graph replays, and no more than 3 % slower than that plan next to a kernel
+#: holding 8, 16 or 32 SMs on another stream -- in the same launch order, and also with this partition launched before
+#: that kernel against the deterministic plan launched after it.  A window ends at a measured token count; one that
+#: starts at a single token keeps the plan below its smallest measured count (64 tokens) unmeasured.  A token count
 #: outside the windows was not measured or missed, a ``None`` entry is a measured row that missed, a row without an
 #: entry was not measured: all of them run the deterministic program, and so does every window but a ``"waves"`` one on
 #: a device whose SM count is not the measured one, :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a
@@ -1300,58 +1300,43 @@ ROUTER_RULES: dict[
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
     # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.  A
-    # window also keeps the FP64 error of the plan the row takes without it: for every seed (10 seeds per token count,
-    # at the first, the last and inner token counts of the window) a relative Frobenius error against FP64 of the
-    # exact operands, worst of 20 runs, at most 1.02 times that plan's.
-    # Few tokens on sm_100a and sm_103a: the compensated SIMT program with the 64 x 64 tile in two K slices
-    # ("simt_n64m64s2g4", 1.75 FP32 instructions per product; 0.60 to 0.96 times the error of the plan without the
-    # window), from 1 to 192 tokens at hidden 4096 and from 1 to 160 at hidden 5120 and 6144.  It was faster than that
-    # plan at every measured count of the windows, alone, in CUDA graphs next to a resident kernel and in the backward
-    # pass and the checkpointed step; one K block (32 tokens) past each window it was more than 3 % slower next to a
-    # resident kernel (two CTAs of 128 threads per SM: a second wave) or slowed the backward pass or the checkpointed
-    # step by more than 1.3 %.  At hidden 5120 it takes the token counts of the "waves" window, which it was faster
-    # than.
+    # window keeps the deterministic package's router budget: for every seed (10 seeds per token count, at the first,
+    # the last and inner token counts of the window) a relative Frobenius error against FP64 of the exact operands,
+    # worst of 20 runs, at most 2e-6.  Its ratio to the error of the plan the row takes without the window is reported
+    # data, not a gate; the ratios below are the reasons these rows were left out under the earlier 1.02 rule.
     # Hidden 5120 on sm_100a / sm_103a: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens,
     # and on sm_103a at 192; more than 3 % slower than it next to a resident kernel at every measured count from 224
     # to 10240 tokens), on sm_103a up to 160 tokens: from 161 tokens (six K blocks, more (tile, K block) steps than
-    # units) its error was 1.026 to 1.040 times the deterministic plan's.  It holds these token counts on parts
-    # where the SIMT window does not (another SM count).
-    # Faster than the deterministic plan but with more error, so these rows run the deterministic plan: the plain
-    # SIMT program on 152-SM sm_100a parts (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256: 2.23
-    # to 2.54 times the error of the plan without the window at 113 to 256 tokens, the FP32 products of each slice
-    # summed in one FFMA chain along the tokens); the head/tail program at hidden 4096 on sm_100a ("H1x5p44", 10240 to
-    # 16384 tokens: 1.18 to 1.20 times) and on sm_103a ("H1x4p44", 20480 to 49152 tokens: 1.20 to 1.29 times), hidden
-    # 5120 ("H0.5x3", sm_100a 10240 to 32768 tokens: up to 1.027 times at 10240 and 16384; sm_103a 16172 to 32768
-    # tokens: up to 1.021 times at 24576) and hidden 6144 on sm_103a ("H1x5p44", 16172 to 20480 tokens: 1.35 to 1.40
-    # times).
+    # units) its error was 1.026 to 1.040 times the deterministic plan's.
+    # Faster than the deterministic plan but with more error, so these rows run the deterministic plan: the SIMT
+    # program on 152-SM sm_100a parts (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256: 2.23 to
+    # 2.54 times the error of the plan without the window at 113 to 256 tokens, the FP32 products of each slice summed
+    # in one FFMA chain along the tokens); the head/tail program at hidden 4096 on sm_100a ("H1x5p44", 10240 to 16384
+    # tokens: 1.18 to 1.20 times) and on sm_103a ("H1x4p44", 20480 to 49152 tokens: 1.20 to 1.29 times), hidden 5120
+    # ("H0.5x3", sm_100a 10240 to 32768 tokens: up to 1.027 times at 10240 and 16384; sm_103a 16172 to 32768 tokens:
+    # up to 1.021 times at 24576) and hidden 6144 on sm_103a ("H1x5p44", 16172 to 20480 tokens: 1.35 to 1.40 times).
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
     # the head spans wait for), at 6144 it left the backward pass no faster
-    ("sm_100a", "nn_t", 4096, 256): ((1, 192, "simt_n64m64s2g4"),),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 160, "simt_n64m64s2g4"), (1, 128, "waves")),
-    ("sm_100a", "nn_t", 6144, 256): ((1, 160, "simt_n64m64s2g4"),),
-    ("sm_103a", "nn_t", 4096, 256): ((1, 192, "simt_n64m64s2g4"),),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 160, "simt_n64m64s2g4"), (1, 160, "waves")),
-    ("sm_103a", "nn_t", 6144, 256): ((1, 160, "simt_n64m64s2g4"),),
+    ("sm_100a", "nn_t", 4096, 256): None,
+    ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"),),
+    ("sm_100a", "nn_t", 6144, 256): None,
+    ("sm_103a", "nn_t", 4096, 256): None,
+    ("sm_103a", "nn_t", 5120, 256): ((1, 160, "waves"),),
+    ("sm_103a", "nn_t", 6144, 256): None,
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
-    # the input gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) parts: the compensated SIMT program
-    # with the 32 x 64 tile in four slices ("simt_n64m32s4g4", 128 threads, one CTA per 32 tokens and 64 hidden
-    # columns; 0.54 to 0.67 times the deterministic program's error) up to 64 tokens at hidden 4096 and up to 32 at
-    # hidden 5120 and 6144 (measured at 1, 32 and 64 tokens and at 96; from 33 tokens, two row tiles, it was faster by
-    # 1 to 3 % only at hidden 5120 and slowed the checkpointed step at hidden 6144; from 65 tokens more than 3 % slower
-    # next to a resident kernel).  The plain SIMT program was faster up to 128 tokens on sm_100a, but its relative
-    # Frobenius error against FP64 was 1.66 to 2.07 times the deterministic program's (10 seeds per token count; the
-    # FP32 products of each slice summed in one FFMA chain).  216-SM sm_107a parts keep the deterministic program
-    # (not measured)
-    ("sm_100a", "kn", 4096, 256): ((1, 64, "simt_n64m32s4g4"),),
-    ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
-    ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
-    ("sm_103a", "kn", 4096, 256): ((1, 64, "simt_n64m32s4g4"),),
-    ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
-    ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
+    # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096
+    # and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144: the SIMT program with the 32 x 64 tile in four slices was
+    # faster than the deterministic program up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144, but
+    # its relative Frobenius error against FP64 was 1.66 to 2.07 times the deterministic program's (10 seeds per token
+    # count; the FP32 products of each slice summed in one FFMA chain), so these rows run the deterministic
+    # program.  sm_103a and 216-SM sm_107a parts keep the deterministic program (not measured)
+    ("sm_100a", "kn", 4096, 256): None,
+    ("sm_100a", "kn", 5120, 256): None,
+    ("sm_100a", "kn", 6144, 256): None,
 })
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
@@ -1372,22 +1357,27 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: 216 SMs.  The "H0.5x4" windows of 212 SMs keep the FP64 error rule of :data:`ROUTER_RULES` (0.94 to 0.98 times the
 #: deterministic plan's error at 16172, 16231 and 16384 tokens).  A part's table may also hold rows
 #: :data:`ROUTER_RULES` has no entry for, measured on that SM count only.  Faster than the deterministic plan but with
-#: more error, so they left the 212-SM table: the weight gradient's plain SIMT program with the 128 x 64 tile (hidden
-#: 4096 and 5120 from 1 to 256 tokens, hidden 6144 from 1 to 192: 1.99 to 2.66 times the deterministic plan's error at
-#: 97 to 256 tokens) and the input gradient's plain SIMT programs (the 32 x 64 tile in eight slices up to 64 tokens
-#: and, at hidden 4096 and 5120, the 64 x 64 tile in four slices from 65 to 128 tokens: 1.30 to 1.86 times the
-#: deterministic program's error).
-#: The compensated SIMT windows (spec ``"simt_n<tile_n>m<tile_m>s<slices>g<group>"``, :data:`ROUTER_RULES`) of the
-#: 148-SM B200 (sm_100a) and B300 (sm_103a) tables and of the 212-SM table were measured on one node of each part
-#: under the rule of :data:`ROUTER_RULES` (both launch orders, eager and CUDA graphs, next to a kernel holding 8, 16
-#: or 32 SMs, the backward pass and the checkpointed step; the FP64 error at most 1.02 times the deterministic
-#: plan's, 10 seeds per token count).  148 SMs: the weight gradient's 64 x 64 tile from 1 to 160 tokens (on sm_103a
-#: up to 192 at hidden 6144), the input gradient's 32 x 64 tile in four slices up to 64 tokens at hidden 4096 and up
-#: to 32 at hidden 5120 and 6144.  212 SMs, where a CTA of these programs takes a whole SM: the weight gradient's
-#: 128 x 64 tile in two slices (256 threads) from 1 to 192 tokens at hidden 4096, to 256 at hidden 5120 and to 128 at
-#: hidden 6144, where the 64 x 64 tile takes 129 to 160 tokens; the input gradient's 32 x 64 tile in eight slices
-#: (256 threads) up to 64 tokens at hidden 4096 and 5120 and up to 32 at hidden 6144.  They are narrower and 15 to
-#: 41 % slower than the plain SIMT windows they replace, which missed the FP64 error rule.
+#: more error, so these rows run the deterministic plan on 212 SMs: the weight gradient's SIMT program with the
+#: 128 x 64 tile (hidden 4096 and 5120 from 1 to 256 tokens, hidden 6144 from 1 to 192: 1.99 to 2.66 times the
+#: deterministic plan's error at 97 to 256 tokens) and the input gradient's SIMT programs (the 32 x 64 tile in eight
+#: slices up to 64 tokens and, at hidden 4096 and 5120, the 64 x 64 tile in four slices from 65 to 128 tokens: 1.30 to
+#: 1.86 times the deterministic program's error).
+#: The 148-SM B200 (sm_100a) and B300 (sm_103a) tables hold the compensated SIMT windows (specs
+#: ``"simt_n<tile_n>m<tile_m>s<slices>g<group>"`` / ``"...dot2"``, :func:`router_simt_template`), measured on one node
+#: of each part under the rule of :data:`ROUTER_RULES` (both launch orders, eager and CUDA graphs, next to a kernel
+#: holding 8, 16 or 32 SMs, the backward pass and the checkpointed step, each window at its first, last and inner token
+#: counts).
+#: The weight gradient takes the 64 x 64 tile in two slices in the Dot2 form from 1 to 17 tokens and with one Kahan step
+#: per product from 18 to 32; from 33 tokens Kahan groups of four K steps, the 64 x 64 tile to 160 tokens at hidden 5120
+#: and 6144, and at hidden 4096 the 128 x 64 tile from 33 to 48 and 65 to 112 tokens and the 64 x 64 tile from 49 to 64
+#: and 113 to 160.  The input gradient takes the 32 x 64 tile in four slices with Kahan groups of four K steps up to 32
+#: tokens.  Every window's program keeps the router budget: a relative Frobenius error against FP64 of at most 5.2e-8
+#: at the 105 measured token counts of each part's windows (10 seeds, worst of 20 runs; 0.55 to 1.009 times the
+#: deterministic program's).  Past the windows the programs missed the rule: the input gradient at 33 tokens (3.3 %
+#: slower next to a resident kernel at hidden 4096; the backward pass or the checkpointed step 1.3 to 2.7 % slower at
+#: hidden 5120 and 6144), the weight gradient at 176 tokens (3.6 to 6.0 % slower next to a resident kernel at hidden
+#: 4096 and 6144; the backward pass or the checkpointed step 2.4 to 3.5 % slower at hidden 5120, 4.0 % at 192 tokens).
+#: Every other row and token count of these parts runs the deterministic program.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -1395,19 +1385,33 @@ ROUTER_RULES_BY_SM: dict[
 ] = _VerdictTable({
     ("sm_100a", 148): _VerdictTable({
         ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
-        ("sm_100a", "nn_t", 4096, 256): ((1, 160, "simt_n64m64s2g4"),),
-        ("sm_100a", "nn_t", 5120, 256): ((1, 160, "simt_n64m64s2g4"),),
-        ("sm_100a", "nn_t", 6144, 256): ((1, 160, "simt_n64m64s2g4"),),
-        ("sm_100a", "kn", 4096, 256): ((1, 64, "simt_n64m32s4g4"),),
+        ("sm_100a", "nn_t", 4096, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
+            (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_100a", "nn_t", 5120, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_100a", "nn_t", 6144, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_100a", "kn", 4096, 256): ((1, 32, "simt_n64m32s4g4"),),
         ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
         ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
     }),
     ("sm_103a", 148): _VerdictTable({
         ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
-        ("sm_103a", "nn_t", 4096, 256): ((1, 160, "simt_n64m64s2g4"),),
-        ("sm_103a", "nn_t", 5120, 256): ((1, 160, "simt_n64m64s2g4"),),
-        ("sm_103a", "nn_t", 6144, 256): ((1, 192, "simt_n64m64s2g4"),),
-        ("sm_103a", "kn", 4096, 256): ((1, 64, "simt_n64m32s4g4"),),
+        ("sm_103a", "nn_t", 4096, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 48, "simt_n128m64s2g4"),
+            (49, 64, "simt_n64m64s2g4"), (65, 112, "simt_n128m64s2g4"), (113, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_103a", "nn_t", 5120, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_103a", "nn_t", 6144, 256): (
+            (1, 17, "simt_n64m64s2dot2"), (18, 32, "simt_n64m64s2g1"), (33, 160, "simt_n64m64s2g4"),
+        ),
+        ("sm_103a", "kn", 4096, 256): ((1, 32, "simt_n64m32s4g4"),),
         ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s4g4"),),
         ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s4g4"),),
     }),
@@ -1419,14 +1423,12 @@ ROUTER_RULES_BY_SM: dict[
     }),
     ("sm_107a", 212): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-        ("sm_107a", "nn_t", 4096, 256): ((1, 192, "simt_n128m64s2g4"),),
-        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2g4"), (16172, 16384, "H0.5x4")),
-        ("sm_107a", "nn_t", 6144, 256): (
-            (1, 128, "simt_n128m64s2g4"), (129, 160, "simt_n64m64s2g4"), (16172, 16384, "H0.5x4"),
-        ),
-        ("sm_107a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8g4"),),
-        ("sm_107a", "kn", 5120, 256): ((1, 64, "simt_n64m32s8g4"),),
-        ("sm_107a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8g4"),),
+        ("sm_107a", "nn_t", 4096, 256): None,
+        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 6144, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "kn", 4096, 256): None,
+        ("sm_107a", "kn", 5120, 256): None,
+        ("sm_107a", "kn", 6144, 256): None,
     }),
 })
 # fmt: on
@@ -1452,21 +1454,28 @@ ROUTER_HEAD_TAIL_TEMPLATES_BY_SM: dict[tuple[str, int], str] = {
     ("sm_107a", 212): "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
-#: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>[g<group>]"``: an exact-FP32 program on the CUDA cores with
-#: one CTA per ``tile_n x tile_m`` tile of ``out`` over the whole K range: ``slices`` slices of the CTA each take every
-#: ``slices``-th 16-element K block and add in slice order.  No BF16 parts, no split of K across CTAs: every element of
-#: ``out`` is stored once, its bits fixed by ``K`` and the program.  Without ``g<group>`` the plain program (one FFMA
-#: per product: ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` on a weight-gradient row, ``nn_t``, and
-#: ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` on an input-gradient row, ``kn``; no table ships one);
-#: with it the compensated program (``router_fp32_gemm_simt_kahan_n<tile_n>m<tile_m>s<slices>g<group>`` /
-#: ``router_fp32_dgrad_simt_kahan_m<tile_m>n<tile_n>s<slices>g<group>``): per output and group of ``group``
-#: consecutive K steps of a slice one FMA chain from the negated compensation and one Kahan add of a sum and its
-#: compensation, the slices merged in slice order by TwoSum with their compensations (``(group + 3) / group`` FP32
-#: instructions per product, every one rounded to nearest without flush).  The weight gradient runs
-#: ``out[N, M] = B[K, N].T @ A[K, M]`` of the swapped launch (``A`` the activations, ``B`` the output gradient), the
-#: input gradient ``out[M, N] = A[M, K] @ B[K, N]`` (``A`` the output gradient, ``B`` the router weight; ``tile_m``
-#: token rows by ``tile_n`` hidden columns).
-_ROUTER_SIMT_SPEC = re.compile(r"simt_n(\d+)m(\d+)s(\d+)(?:g(\d+))?")
+#: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"``: an exact-FP32 program on the CUDA cores with one
+#: CTA per ``tile_n x tile_m`` tile of ``out`` over the whole K range: ``slices`` slices of the CTA each take every
+#: ``slices``-th K block (16 elements; 8 in the Dot2 form) and add in slice order.  No BF16 parts, no split of K across
+#: CTAs: every element of ``out`` is stored once, its bits fixed by ``K`` and the program.  Without a form the plain
+#: program (one FFMA per product: ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` on a weight-gradient row,
+#: ``nn_t``, and ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` on an input-gradient row, ``kn``); with one a
+#: compensated program, each slice keeping a sum and its compensation and the slices merged in slice order by TwoSum
+#: with their compensations (every FP32 instruction rounded to nearest without flush):
+#:
+#: * ``g<group>``: per output and group of ``group`` consecutive K steps of a slice one FMA chain from the negated
+#:   compensation and one Kahan add (``(group + 3) / group`` FP32 instructions per product), the program
+#:   ``router_fp32_gemm_simt_kahan_n<tile_n>m<tile_m>s<slices>g<group>`` /
+#:   ``router_fp32_dgrad_simt_kahan_m<tile_m>n<tile_n>s<slices>g<group>`` -- for ``g1``, one Kahan step per product,
+#:   without the ``g1`` suffix;
+#: * ``dot2`` (weight gradient): each product rounded once with its exact error kept, a TwoSum into the sum and both
+#:   errors into the compensation, in blocks of 8 rows without the rows past ``K`` (10 FP32 instructions per product),
+#:   the program ``router_fp32_gemm_simt_kahan_dot2_n<tile_n>m<tile_m>s<slices>``.
+#:
+#: The weight gradient runs ``out[N, M] = B[K, N].T @ A[K, M]`` of the swapped launch (``A`` the activations, ``B`` the
+#: output gradient), the input gradient ``out[M, N] = A[M, K] @ B[K, N]`` (``A`` the output gradient, ``B`` the router
+#: weight; ``tile_m`` token rows by ``tile_n`` hidden columns).
+_ROUTER_SIMT_SPEC = re.compile(r"simt_n(\d+)m(\d+)s(\d+)(g\d+|dot2)?")
 #: The K rows of a SIMT program's block (its ``k_iters`` count them).
 ROUTER_SIMT_BLOCK_K = 16
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
@@ -1555,34 +1564,49 @@ def router_head_pairs(spec: Union[str, int, None]) -> Optional[int]:
     return None
 
 
-def router_simt_tile(spec: Union[str, int, None]) -> Optional[tuple[int, ...]]:
+def router_simt_tile(
+    spec: Union[str, int, None],
+) -> Optional[tuple[Union[int, str], ...]]:
     """The tile of a SIMT window spec: ``(tile_n, tile_m, slices)`` of a plain spec
-    ``"simt_n<tile_n>m<tile_m>s<slices>"``, ``(tile_n, tile_m, slices, group)`` of a compensated one
-    ``"simt_n<tile_n>m<tile_m>s<slices>g<group>"``; else ``None``."""
+    ``"simt_n<tile_n>m<tile_m>s<slices>"``, ``(tile_n, tile_m, slices, form)`` of a compensated one (``form``
+    ``"g<group>"`` or ``"dot2"``); else ``None``."""
     if isinstance(spec, str):
         match = _ROUTER_SIMT_SPEC.fullmatch(spec)
         if match:
-            return tuple(int(g) for g in match.groups() if g is not None)
+            tile_n, tile_m, slices, form = match.groups()
+            tile = (int(tile_n), int(tile_m), int(slices))
+            return tile if form is None else (*tile, form)
     return None
 
 
-def router_simt_template(tile: tuple[int, ...], layout: str = "nn_t") -> str:
+def router_simt_template(
+    tile: tuple[Union[int, str], ...], layout: str = "nn_t"
+) -> str:
     """The template of the SIMT program of the tile ``(tile_n, tile_m, slices)`` (plain) or ``(tile_n, tile_m, slices,
-    group)`` (compensated) of the layout class ``layout``: the weight gradient's
+    form)`` (compensated, :func:`router_simt_tile`) of the layout class ``layout``: the weight gradient's
     ``router_fp32_gemm_simt_n<tile_n>m<tile_m>s<slices>`` / ``router_fp32_gemm_simt_kahan_n<tile_n>m<tile_m>s<slices>
-    g<group>`` (``nn_t``), the input gradient's ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` /
+    g<group>`` (``g1``: no suffix) / ``router_fp32_gemm_simt_kahan_dot2_n<tile_n>m<tile_m>s<slices>`` (``nn_t``), the
+    input gradient's ``router_fp32_dgrad_simt_m<tile_m>n<tile_n>s<slices>`` /
     ``router_fp32_dgrad_simt_kahan_m<tile_m>n<tile_n>s<slices>g<group>`` (``kn``)."""
-    tile_n, tile_m, slices, *group = (int(t) for t in tile)
-    if len(group) > 1:
+    if len(tile) not in (3, 4):
         raise ValueError(f"router_simt_template: {tile!r} is not a SIMT tile")
-    kahan, suffix = ("kahan_", f"g{group[0]}") if group else ("", "")
+    tile_n, tile_m, slices = (int(t) for t in tile[:3])
+    form = str(tile[3]) if len(tile) == 4 else None
+    if form is not None and not re.fullmatch(r"g[1-9]\d*|dot2", form):
+        raise ValueError(f"router_simt_template: {tile!r} is not a SIMT tile")
+    if layout not in ("nn_t", "kn"):
+        raise ValueError(
+            f"router_simt_template: no SIMT program of the {layout!r} class"
+        )
+    if form == "dot2" and layout == "kn":
+        raise ValueError(
+            f"router_simt_template: {tile!r}: the Dot2 form is the weight gradient's"
+        )
+    kahan = "" if form is None else "kahan_dot2_" if form == "dot2" else "kahan_"
+    suffix = "" if form in (None, "dot2", "g1") else form
     if layout == "kn":
         return (
             f"{cake_jit.TEMPLATE_PREFIXES[4]}{kahan}m{tile_m}n{tile_n}s{slices}{suffix}"
-        )
-    if layout != "nn_t":
-        raise ValueError(
-            f"router_simt_template: no SIMT program of the {layout!r} class"
         )
     return f"{cake_jit.TEMPLATE_PREFIXES[3]}{kahan}n{tile_n}m{tile_m}s{slices}{suffix}"
 
@@ -1829,7 +1853,7 @@ def router_simt(
     K: int,
     sm_count: int,
     splits: Optional[int] = None,
-) -> Optional[tuple[int, ...]]:
+) -> Optional[tuple[Union[int, str], ...]]:
     """The tile (:func:`router_simt_tile`) of the SIMT program a launch ``[M, N] = [M, K] @ [K, N]`` runs on a device of
     ``sm_count`` SMs: the weight gradient's (the swapped GEMM: ``M`` hidden, ``N`` experts, ``K`` tokens; layout class
     ``nn_t``) when the tile divides ``M`` and ``N``, the input gradient's (``M`` tokens, ``N`` hidden, ``K`` experts;
@@ -1846,7 +1870,11 @@ def router_simt(
     tile = router_simt_tile(
         _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
     )
-    if tile is None or int(N) % tile[0] or (layout == "nn_t" and int(M) % tile[1]):
+    if (
+        tile is None
+        or int(N) % int(tile[0])
+        or (layout == "nn_t" and int(M) % int(tile[1]))
+    ):
         return None
     return tile
 
@@ -1878,7 +1906,7 @@ class AtomicRouterPlan:
     template: str
     head_spans: int = 0
     head_steps: int = 0
-    simt: Optional[tuple[int, ...]] = None
+    simt: Optional[tuple[Union[int, str], ...]] = None
     lda: int = 0
     ldb: int = 0
 
@@ -2031,7 +2059,7 @@ def plan_atomic_router(
         template = router_simt_template(simt, layout)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
-        tile_n, tile_m = simt[0], simt[1]
+        tile_n, tile_m = int(simt[0]), int(simt[1])
         return (
             AtomicRouterPlan(
                 M=M_eff,

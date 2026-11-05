@@ -114,8 +114,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
-kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, float* __restrict__ B, float* __restrict__ out, int M, int N, int K, int lda, int ldb, int ldo)
+__global__ __launch_bounds__(256) void
+kernel_cake_dense_projection_gemm_76101e06998d32442800(float* __restrict__ A, float* __restrict__ B, float* __restrict__ out, int M, int N, int K, int lda, int ldb, int ldo)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -141,17 +141,17 @@ kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, fl
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    int slice_id = tid / 64;
-    int st = tid % 64;
+    int slice_id = tid / 128;
+    int st = tid % 128;
     int tx = st % 8;
     int ty = st / 8;
     unsigned int b_lo = (unsigned int)(ty * 16);
-    unsigned int b_hi = (unsigned int)((32 + ty * 4) * 4);
+    unsigned int b_hi = (unsigned int)((64 + ty * 4) * 4);
     unsigned int a_lo = (unsigned int)(tx * 16);
     unsigned int a_hi = (unsigned int)((32 + tx * 4) * 4);
     int m0 = blockIdx.x * 64;
-    int n0 = blockIdx.y * 64;
-    unsigned int ring = smem_addr + (unsigned int)(slice_id * 16384);
+    int n0 = blockIdx.y * 128;
+    unsigned int ring = smem_addr + (unsigned int)(slice_id * 24576);
     float2 acc[32];
     float2 comp[32];
     #pragma unroll
@@ -166,55 +166,55 @@ kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, fl
         unsigned int fill = ring + 0;
         #pragma unroll
         for (int c = 0; c < 4; c++) {
-            int bv = c * 64 + st;
-            int bk = k0 + bv / 16;
+            int bv = c * 128 + st;
+            int bk = k0 + bv / 32;
             int _min_0 = ((bk) < (K - 1) ? (bk) : (K - 1));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(fill + (unsigned int)(bv * 16)), "l"(B + ((long long)_min_0 * (long long)ldb + (long long)(n0 + bv % 16 * 4))), "r"((bk < K) ? 16 : 0));
+                :: "r"(fill + (unsigned int)(bv * 16)), "l"(B + ((long long)_min_0 * (long long)ldb + (long long)(n0 + bv % 32 * 4))), "r"((bk < K) ? 16 : 0));
         }
         #pragma unroll
-        for (int c_1 = 0; c_1 < 4; c_1++) {
-            int av = c_1 * 64 + st;
+        for (int c_1 = 0; c_1 < 2; c_1++) {
+            int av = c_1 * 128 + st;
             int ak = k0 + av / 16;
             int _min_1 = ((ak) < (K - 1) ? (ak) : (K - 1));
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(fill + (unsigned int)(4096 + av * 16)), "l"(A + ((long long)_min_1 * (long long)lda + (long long)(m0 + av % 16 * 4))), "r"((ak < K) ? 16 : 0));
+                :: "r"(fill + (unsigned int)(8192 + av * 16)), "l"(A + ((long long)_min_1 * (long long)lda + (long long)(m0 + av % 16 * 4))), "r"((ak < K) ? 16 : 0));
         }
     }
     asm volatile("cp.async.commit_group;");
     for (int i = 0; i < mine; i++) {
         if (i + 1 < mine) {
             int k0_1 = (slice_id + (i + 1) * 2) * 16;
-            unsigned int fill_1 = ring + (unsigned int)((i + 1) % 2 * 8192);
+            unsigned int fill_1 = ring + (unsigned int)((i + 1) % 2 * 12288);
             #pragma unroll
             for (int c_2 = 0; c_2 < 4; c_2++) {
-                int bv_1 = c_2 * 64 + st;
-                int bk_1 = k0_1 + bv_1 / 16;
+                int bv_1 = c_2 * 128 + st;
+                int bk_1 = k0_1 + bv_1 / 32;
                 int _min_2 = ((bk_1) < (K - 1) ? (bk_1) : (K - 1));
                 asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                    :: "r"(fill_1 + (unsigned int)(bv_1 * 16)), "l"(B + ((long long)_min_2 * (long long)ldb + (long long)(n0 + bv_1 % 16 * 4))), "r"((bk_1 < K) ? 16 : 0));
+                    :: "r"(fill_1 + (unsigned int)(bv_1 * 16)), "l"(B + ((long long)_min_2 * (long long)ldb + (long long)(n0 + bv_1 % 32 * 4))), "r"((bk_1 < K) ? 16 : 0));
             }
             #pragma unroll
-            for (int c_3 = 0; c_3 < 4; c_3++) {
-                int av_1 = c_3 * 64 + st;
+            for (int c_3 = 0; c_3 < 2; c_3++) {
+                int av_1 = c_3 * 128 + st;
                 int ak_1 = k0_1 + av_1 / 16;
                 int _min_3 = ((ak_1) < (K - 1) ? (ak_1) : (K - 1));
                 asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                    :: "r"(fill_1 + (unsigned int)(4096 + av_1 * 16)), "l"(A + ((long long)_min_3 * (long long)lda + (long long)(m0 + av_1 % 16 * 4))), "r"((ak_1 < K) ? 16 : 0));
+                    :: "r"(fill_1 + (unsigned int)(8192 + av_1 * 16)), "l"(A + ((long long)_min_3 * (long long)lda + (long long)(m0 + av_1 % 16 * 4))), "r"((ak_1 < K) ? 16 : 0));
             }
         }
         asm volatile("cp.async.commit_group;");
         asm volatile("cp.async.wait_group 1;");
-        asm volatile("barrier.sync %0, 64;" :: "r"(slice_id + 1) : "memory");
-        unsigned int cur = ring + (unsigned int)(i % 2 * 8192);
+        asm volatile("barrier.sync %0, 128;" :: "r"(slice_id + 1) : "memory");
+        unsigned int cur = ring + (unsigned int)(i % 2 * 12288);
         #pragma unroll
         for (int g = 0; g < 4; g++) {
             float bn[32];
             float am[32];
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                unsigned int b_row = cur + (unsigned int)((g * 4 + j) * 256);
-                unsigned int a_row = cur + (unsigned int)(4096 + (g * 4 + j) * 256);
+                unsigned int b_row = cur + (unsigned int)((g * 4 + j) * 512);
+                unsigned int a_row = cur + (unsigned int)(8192 + (g * 4 + j) * 256);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&bn[j * 8])), "=r"(*reinterpret_cast<uint32_t*>(&bn[(j * 8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bn[(j * 8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bn[(j * 8) + 3]))
                     : "r"(b_row + b_lo));
@@ -243,7 +243,7 @@ kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, fl
                 }
             }
         }
-        asm volatile("barrier.sync %0, 64;" :: "r"(slice_id + 1) : "memory");
+        asm volatile("barrier.sync %0, 128;" :: "r"(slice_id + 1) : "memory");
     }
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
@@ -253,17 +253,17 @@ kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, fl
         #pragma unroll
         for (int h = 0; h < 2; h++) {
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(park + (unsigned int)((r_1 * 2 + h) * (32 * 16))), "r"(__as_u32(acc[r_1 * 4 + h * 2].x)), "r"(__as_u32(acc[r_1 * 4 + h * 2].y)), "r"(__as_u32(acc[r_1 * 4 + h * 2 + 1].x)), "r"(__as_u32(acc[r_1 * 4 + h * 2 + 1].y)) : "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(park + (unsigned int)(32768 + (r_1 * 2 + h) * (32 * 16))), "r"(__as_u32(comp[r_1 * 4 + h * 2].x)), "r"(__as_u32(comp[r_1 * 4 + h * 2].y)), "r"(__as_u32(comp[r_1 * 4 + h * 2 + 1].x)), "r"(__as_u32(comp[r_1 * 4 + h * 2 + 1].y)) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(park + (unsigned int)(65536 + (r_1 * 2 + h) * (32 * 16))), "r"(__as_u32(comp[r_1 * 4 + h * 2].x)), "r"(__as_u32(comp[r_1 * 4 + h * 2].y)), "r"(__as_u32(comp[r_1 * 4 + h * 2 + 1].x)), "r"(__as_u32(comp[r_1 * 4 + h * 2 + 1].y)) : "memory");
         }
     }
     __syncthreads();
     #pragma unroll
     for (int c_4 = 0; c_4 < 8; c_4++) {
-        int v = c_4 * 128 + tid;
+        int v = c_4 * 256 + tid;
         int n = v / 16;
         int mc = v % 16;
-        int pst = n % 32 / 4 * 8 + mc % 8;
-        int prow = n / 32 * 4 + n % 4;
+        int pst = n % 64 / 4 * 8 + mc % 8;
+        int prow = n / 64 * 4 + n % 4;
         int chunk = (pst / 32 * 16 + prow * 2 + mc / 8) * 32 + pst % 32;
         float total[4];
         float err[4];
@@ -272,7 +272,7 @@ kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, fl
             : "r"(smem_addr + (unsigned int)(chunk * 16)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&err[0])), "=r"(*reinterpret_cast<uint32_t*>(&err[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&err[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&err[(0) + 3]))
-            : "r"(smem_addr + (unsigned int)(32768 + chunk * 16)));
+            : "r"(smem_addr + (unsigned int)(65536 + chunk * 16)));
         #pragma unroll
         for (int e_1 = 0; e_1 < 4; e_1++) {
             float _neg_4;
@@ -285,10 +285,10 @@ kernel_cake_dense_projection_gemm_813850a5a2fdf149f765(float* __restrict__ A, fl
             float pcomp[4];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&part[0])), "=r"(*reinterpret_cast<uint32_t*>(&part[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&part[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&part[(0) + 3]))
-                : "r"(smem_addr + (unsigned int)(q * 16384 + chunk * 16)));
+                : "r"(smem_addr + (unsigned int)(q * 32768 + chunk * 16)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&pcomp[0])), "=r"(*reinterpret_cast<uint32_t*>(&pcomp[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pcomp[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pcomp[(0) + 3]))
-                : "r"(smem_addr + (unsigned int)(32768 + q * 16384 + chunk * 16)));
+                : "r"(smem_addr + (unsigned int)(65536 + q * 32768 + chunk * 16)));
             #pragma unroll
             for (int e_2 = 0; e_2 < 4; e_2++) {
                 float x;
