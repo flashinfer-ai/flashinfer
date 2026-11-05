@@ -15,7 +15,8 @@ limitations under the License.
 
 CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake_gdn_det_train_kcp``: the package-local plan
 module against ``cake_kda_train.cake_kcp_plan`` (field-identical partitions and contexts on the step-0 rows with
-``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing counts and
+``H := HV``, except the b1 buffer with maps, ``B1_DM_FIELDS``, which has this package's own dense layout; the KDA
+package is imported HERE only, never by the package), the per-rank crossing counts and
 exchange bytes against the rows of record, the table builders (pool addressing, segment lists, chains), head
 ownership incl. the padded ``(HV, W) = (3, 2)`` case, the byte queries, the registry seed, and the fake backend
 against the FP64 reference (bitwise repeatable, saved == replay).
@@ -243,11 +244,12 @@ def _sha(obj) -> str:
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     """Result 1: ``cake_gdn_det_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
-    step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
-    fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the exchange bytes of
-    ``gdn_det_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they share,
-    ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected explicitly
-    here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
+    step-0 row (partition, every rank's context and head plan at ``H := HV``), except the b1 buffer with maps
+    (``B1_DM_FIELDS`` and its split / table keys, checked here for tile coverage and offset range instead), and
+    reproduces the row's recorded fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the
+    exchange bytes of ``gdn_det_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they
+    share, ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected
+    explicitly here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     kp = importlib.import_module(
         "flashinfer.experimental.cake_kda_train.cake_kcp_plan"
     )  # the test only
@@ -1331,8 +1333,8 @@ def test_byte_queries(W) -> None:
         assert maps["b1_m"] == {"send": s * n_io, "recv": N_io * s_owner}
         assert cb["b1_m"] == {"send": 0, "recv": 0}
         assert maps["B3"] == cb["B3"]  # the replay never re-sends maps
-        # "b1" = the plan's split tables = the design form (no padding at (6, W)): the d_f plane of the
-        # crossing-in slots + the map plane of the fragments crossing in and out
+        # "b1" = the plan's split tables = the design form (both count any padding; none at (6, W)): the d_f
+        # plane of the crossing-in slots + the map plane of the fragments crossing in and out
         assert maps["b1"] == maps["b1_design"]
         assert maps["b1"] == {
             "send": s * (ctx.n_in + n_io),
@@ -1524,6 +1526,104 @@ def test_byte_queries(W) -> None:
             "per_rank": records,
         },
     )
+
+
+# Three ranks, two documents.  Rank 1 holds the last fragment of document 0 (crossing in only: in_slot 0) before a
+# middle fragment of document 1 (crossing in and out: in_slot 1, io_slot 0), so there the index of the b1 map plane
+# (io_slot) differs from the crossing-in index (in_slot).  Contiguous layouts never give such a rank.
+B1_MAP_CU = (0, 200, 500)
+B1_MAP_FRAGMENTS = (
+    ((0, 0, 100), (1, 0, 100)),
+    ((0, 100, 100), (1, 100, 100)),
+    ((1, 200, 100),),
+)
+
+
+@pytest.mark.parametrize("HV", (4, 5))
+def test_b1_map_plane_index_on_a_middle_fragment(HV) -> None:
+    """The b1 buffer with maps (``save_transfer=False``) is indexed by ``io_slot`` in its ``M_f^T`` plane, not by
+    ``in_slot``.  Pinned on every rank of :data:`B1_MAP_FRAGMENTS`: ``b1_m_index``, the send / receive split sizes,
+    the ``d_f`` and ``M_f^T`` tiles (every send tile written once; only the padding tiles of the padded owner stay
+    unwritten), the owner offsets ``adj_m_off_b1`` (where rank 1's map lands after the all-to-all) and the byte
+    query (``b1 == b1_design``, padding included).  ``HV = 4``: ``Hg = 2``, owners ``(2, 2, 0)``; ``HV = 5``: owners
+    ``(2, 2, 1)``, owner 2 padded by one tile per slot."""
+    W = 3
+    part = gp.partition_det_kcp(
+        torch.tensor(B1_MAP_CU, dtype=torch.int64), W, fragments=B1_MAP_FRAGMENTS
+    )
+    ctxs = [
+        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        for r in range(W)
+    ]
+    hps = [ctx.heads(HV) for ctx in ctxs]
+    assert tuple(ctxs[1].in_slot) == (0, 1)
+    assert [tuple(hp.n_io_by_rank) for hp in hps] == [(0, 1, 0)] * W
+    # b1_m_index per segment: the io_slot at segment 0 of a fragment crossing in and out, else -1
+    per_slot = ((-1, -1), (-1, 0), (-1,))
+    for r, hp in enumerate(hps):
+        want = [v if p == 0 else -1 for v in per_slot[r] for p in range(hp.P)]
+        assert list(hp.b1_m_index) == want, r
+    # split sizes in tiles: send [dst owner j] = (n_in + n_io) Hg_pad_j, receive [src i] = (n_in_i + n_io_i) Hg
+    send = {
+        4: ((0, 0, 0), (6, 6, 0), (2, 2, 0)),
+        5: ((0, 0, 0), (6, 6, 6), (2, 2, 2)),
+    }[HV]
+    recv = {4: ((0, 6, 2), (0, 6, 2), (0, 0, 0)), 5: ((0, 6, 2),) * W}[HV]
+    for r, hp in enumerate(hps):
+        b1_send, b1_recv = hp.b1_splits(True)
+        assert all(x % gp.TILE == 0 for x in (*b1_send, *b1_recv))
+        assert tuple(x // gp.TILE for x in b1_send) == send[r], r
+        assert tuple(x // gp.TILE for x in b1_recv) == recv[r], r
+    assert all(send[i][j] == recv[j][i] for i in range(W) for j in range(W))
+    # send tiles: the d_f plane by in_slot, then the M_f^T plane by io_slot, per owner block
+    d_tiles = {
+        4: ((), ((0, 1, 6, 7), (2, 3, 8, 9)), ((0, 1, 2, 3),)),
+        5: ((), ((0, 1, 6, 7, 12), (2, 3, 8, 9, 14)), ((0, 1, 2, 3, 4),)),
+    }[HV]
+    m_tiles = {
+        4: ((), ((4, 5, 10, 11),), ()),
+        5: ((), ((4, 5, 10, 11, 16),), ()),
+    }[HV]
+    never_written = {4: ((), (), ()), 5: ((), (13, 15, 17), (5,))}[HV]
+    for r, hp in enumerate(hps):
+        assert hp.b1_d_tile_dm == d_tiles[r] and hp.b1_m_tile_dm == m_tiles[r], r
+        written = [
+            t
+            for rows in (hp.b1_d_tile_dm, hp.b1_m_tile_dm)
+            for row in rows
+            for t in row
+        ]
+        assert len(written) == len(set(written)), r  # no send tile written twice
+        n_tiles = sum(hp.b1_splits(True)[0]) // gp.TILE
+        assert sorted((*written, *never_written[r])) == list(range(n_tiles)), r
+    # owner side: the adjoint chains (doc 0: rank 1 slot 0; doc 1: rank 2 slot 0, rank 1 slot 1) read the map of
+    # rank 1's middle fragment behind rank 1's n_in = 2 d_f slots
+    for o, hp in enumerate(hps):
+        if hp.Hg_r == 0:
+            assert list(hp.adj_m_off_b1) == []
+            continue
+        assert list(hp.adj_m_off_b1) == [-1, -1, 4 * gp.TILE], o
+        sent = hps[1].b1_m_tile_dm[0][o * hp.Hg] * gp.TILE - sum(
+            hps[1].b1_splits(True)[0][:o]
+        )
+        assert hp.adj_m_off_b1[2] - sum(hp.b1_splits(True)[1][:1]) == sent, o
+    for r, (ctx, hp) in enumerate(zip(ctxs, hps, strict=True)):
+        maps = gb.gdn_det_comm_bytes_kcp(
+            ctx, H_qk=1, HV=HV, C=C_CONV, save_transfer=False
+        )
+        b1_send, b1_recv = hp.b1_splits(True)
+        assert (
+            maps["b1"]
+            == maps["b1_design"]
+            == {"send": sum(b1_send) * 4, "recv": sum(b1_recv) * 4}
+        ), r
+        pad = maps["padding"]["b1"]  # inside b1_design, not on top of it
+        n_io, N_io = hp.n_io_by_rank[r], sum(hp.n_io_by_rank)
+        s_owner = hp.Hg_r * gp.STATE_TILE_BYTES
+        assert maps["b1_design"] == {
+            "send": (ctx.n_in + n_io) * HV * gp.STATE_TILE_BYTES + pad["send"],
+            "recv": (ctx.N_in + N_io) * s_owner + pad["recv"],
+        }, r
 
 
 # --------------------------------------------------------------------------- registry seed and package hygiene

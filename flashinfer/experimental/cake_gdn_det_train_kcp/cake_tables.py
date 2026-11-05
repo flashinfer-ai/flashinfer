@@ -339,7 +339,7 @@ def owner_chains(hp: KcpHeadPlan) -> dict[str, ChainTables]:
     the fragments ``f2 .. f(n-1)`` with ``Mop = M_f`` read from the c1 ``M_f^T`` tiles (``transpose_m = 0``); the
     state entering each element and the final state are the ``S_in`` of the element's fragment and of ``fn``,
     published into the c2 send layout.  ``adj_b1`` / ``adj_c1``: from ``X0 = d_{fn}`` over ``f(n-1) .. f2`` with
-    ``Mop = M_f^T`` (``transpose_m = 1``), the maps read from the b1 pairs (``adj_b1``: ``save_transfer=False``) or
+    ``Mop = M_f^T`` (``transpose_m = 1``), the maps read from the b1 map plane (``adj_b1``: ``save_transfer=False``) or
     from the saved c1 receive tensor (``adj_c1``: ``save_transfer=True``, or the replay); the entering / final
     states are the ``dS_out`` of the predecessors, published into the b2 send layout."""
     hs = hp.hg_stride

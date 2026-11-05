@@ -36,8 +36,9 @@ travel on b1), ``Hg = ceil(HV / W)`` the heads per owner.
   crossing-in / crossing-out fragment of the group, with
   ``s_owner = Hg_r * 128 * 128 * 4``.  ``b1`` reports the bytes of the plan's
   b1 split tables (``hp.b1_splits``: what the host allocates and the collective
-  moves): ``d_f`` plane + map plane, equal to ``b1_design`` up to the
-  padding.  Halo: ``rows * C * 2`` forward (BF16 ``x`` history rows), ``rows * C * 4`` backward (FP32 ``dpre`` rows).  ``B1`` =
+  moves): ``d_f`` plane + map plane; ``b1_design`` is the same total built
+  from the fragment counts (the padded owner slots included, so ``b1`` ==
+  ``b1_design``).  Halo: ``rows * C * 2`` forward (BF16 ``x`` history rows), ``rows * C * 4`` backward (FP32 ``dpre`` rows).  ``B1`` =
   forward (c1 + c2 + halo_fwd), ``B2`` = backward from the saved context
   (b1 + b2 + halo_bwd), ``B3`` = the replayed forward + the backward with b1 in
   its offsets-only form.  ``H_qk`` enters the exchange terms only through the
@@ -228,7 +229,7 @@ def gdn_det_comm_bytes_kcp(
     b1_buf_send, b1_buf_recv = hp.b1_splits(
         with_maps
     )  # the plan's split tables (allocated buffers)
-    b1_design = {  # the b1 traffic without padding (d_f plane + re-sent maps)
+    b1_design = {  # d_f plane + re-sent maps from the counts, padding included (= b1)
         "send": b1_d["send"] + b1_m["send"],
         "recv": b1_d["recv"] + b1_m["recv"],
     }
