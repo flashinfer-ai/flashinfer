@@ -211,6 +211,10 @@ def transform_mxfp4_weights_for_mega_moe(
     """
     p1 = l1_weights[0]
     if p1.is_cuda and torch.cuda.get_device_capability(p1.device)[0] == 12:
+        if torch.cuda.get_device_capability(p1.device) != (12, 0):
+            raise RuntimeError(
+                "SM120 MXFP4 MegaMoE requires compute capability 12.0 (sm_120a)"
+            )
         p2 = l2_weights[0]
         if p1.ndim != 3 or p2.ndim != 3 or p1.shape[0] != p2.shape[0]:
             raise ValueError("L1 and L2 must contain the same expert count")

@@ -143,11 +143,15 @@ def _worker(rank, args):
         elif args.routing == "empty":
             idx.fill_(-1)
         elif args.routing == "invalid":
-            # out-of-range ids (one above 32 bits) and ids repeated within a token
-            idx[0::4, 1] = experts + 5
-            idx[1::4, 2] = 1 << 40
-            idx[2::4, 3] = idx[2::4, 0]
-            idx[3::4, 4] = idx[3::4, 2]
+            # out-of-range ids (one above 32 bits) and ids repeated within a token,
+            # each case only where top-k has the slots it writes
+            if topk > 1:
+                idx[0::4, 1] = experts + 5
+                idx[2::4, 1] = idx[2::4, 0]
+            if topk > 2:
+                idx[1::4, 2] = 1 << 40
+            if topk > 4:
+                idx[3::4, 4] = idx[3::4, 2]
         ref_idx = _effective_routes(idx, experts)
         x_in = x.float() / 128
         expected, counts = _reference(
@@ -229,7 +233,7 @@ def _args(**overrides):
 
 def _sm120_gpus(n):
     return torch.cuda.device_count() >= n and all(
-        torch.cuda.get_device_capability(i)[0] == 12 for i in range(n)
+        torch.cuda.get_device_capability(i) == (12, 0) for i in range(n)
     )
 
 
