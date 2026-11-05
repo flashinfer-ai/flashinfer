@@ -390,6 +390,21 @@ def merge_args(
     )
 
 
+def publish_rows(tp: int, *, t: int = 6, device=META) -> dict:
+    """A prefill publish of ``fused_prefill_args``' 6 tokens into slot 1 of
+    every rank's receive rows (``prefill_publish_layout``, capacity ``t``)."""
+    layout = cb.prefill_publish_layout(tp, H // tp, t)
+    return dict(
+        peer_rows=tuple(
+            _t(layout["rows_shape"], torch.int64, device) for _ in range(tp)
+        ),
+        generations=_t(layout["generations_shape"], torch.int32, device),
+        slot=1,
+        t_base=0,
+        capacity=t,
+    )
+
+
 def plan_device_args(batch: int = 3, total_q: int = 300, device=META) -> dict:
     i32 = lambda n: _t((n,), torch.int32, device)  # noqa: E731
     storage = ref.plan_storage(H, total_q, batch)
@@ -561,6 +576,8 @@ def test_records_are_well_formed() -> None:
         "merge_prefill": ("tokens_per_cta_by_head",),
         "merge_tagged": ("tokens_per_cta_by_head",),
         "prefill_list_carrier": ("tokens_per_cta_by_head",),
+        "prefill_list_publish": ("tokens_per_cta_by_head",),
+        "merge_prefill_tagged": ("tokens_per_cta_by_head",),
         "plan": cake_jit.GRID_RULES,
     }
     for role in DEVICE_COUNT_ROLES:
@@ -746,6 +763,7 @@ DEVICE_COUNT_ROLES = (
     "merge",
     "merge_legacy",
     "merge_prefill",
+    "merge_prefill_tagged",
 )
 _TOKEN_COUNT_ENTRIES = frozenset(
     (
@@ -781,6 +799,11 @@ def _drive_every_role(arch: str) -> None:
         _call(msa_ops.msa_icp_decode_index_score_sharded, decode_args(page, tp))
         if cake_jit.has_role("score_topk16", arch):
             _call(msa_ops.msa_icp_prefill_score_select, fused_prefill_args(page, tp))
+            # the prefill exchange as a peer publish (the facade's step)
+            cb.prefill_score_select(
+                **{**fused_prefill_args(page, tp), "carrier": None},
+                publish=publish_rows(tp),
+            )
         if cake_jit.has_role("decode_topk", arch):
             for tagged in (False, True):
                 _call(
@@ -794,6 +817,10 @@ def _drive_every_role(arch: str) -> None:
             _call(msa_ops.msa_icp_topk_select_publish, publish_args(tp, tagged=tagged))
             _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, tagged=tagged))
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, prefill=True))
+        _call(
+            msa_ops.msa_icp_merge_candidates,
+            merge_args(tp, tagged=True, prefill=True),
+        )
         # legacy decode merges of 8+ tokens take the one-token-per-CTA program
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, t=9, cap=9))
         # the facade's tagged decode merge polls first (merge_tagged)
@@ -2249,7 +2276,10 @@ def test_merge_rejects_invalid_metadata(fake) -> None:
     a = merge_args(2, t=5, cap=8)
     _expect_rejected(fake, e, _with(a, prefill=True, enable_pdl=True), "prefill")
     _expect_rejected(
-        fake, e, _with(merge_args(2, tagged=True), prefill=True), "prefill"
+        fake,
+        e,
+        _with(merge_args(2, tagged=True), prefill=True, enable_pdl=True),
+        "prefill",
     )
     _expect_rejected(
         fake, e, _with(a, recv_slot=_t((2, 2, 8 * 33), torch.int32)), "recv_slot"
