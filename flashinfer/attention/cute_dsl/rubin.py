@@ -14,11 +14,54 @@
 """Rubin plans for the public ragged prefill wrapper."""
 
 import math
+import numbers
+import struct
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
 from ...utils import check_shape_dtype_device, get_compute_capability
+
+
+def _finite_fp32_scale(name, value, *, positive=False):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a finite host scalar representable in FP32")
+    try:
+        value = float(value)
+        rounded = struct.unpack("f", struct.pack("f", value))[0]
+    except OverflowError:
+        raise ValueError(f"{name} must be finite and representable in FP32") from None
+    if not math.isfinite(value) or not math.isfinite(rounded):
+        raise ValueError(f"{name} must be finite and representable in FP32")
+    if positive and rounded <= 0:
+        raise ValueError(f"{name} must remain positive after FP32 conversion")
+    return value
+
+
+def _validate_rubin_fmha_scales(sm_scale, scale_q, scale_k, scale_v, scale_o):
+    """Validate host arithmetic before empty-row writes or an FMHA launch."""
+    sm_scale, scale_q, scale_k, scale_v, scale_o = (
+        _finite_fp32_scale(name, value)
+        for name, value in (
+            ("sm_scale", sm_scale if sm_scale is not None else 1.0 / math.sqrt(192)),
+            ("q_scale", scale_q),
+            ("k_scale", scale_k),
+            ("v_scale", scale_v),
+            ("o_scale", scale_o),
+        )
+    )
+    if scale_o == 0:
+        raise ValueError("o_scale must be nonzero")
+    # Nonpositive kernel scales invalidate online rescaling and masked logits.
+    # Check the effective FP32 values; individual factors may be signed or tiny.
+    score = _finite_fp32_scale(
+        "effective softmax scale", scale_q * scale_k * sm_scale, positive=True
+    )
+    score_log2 = _finite_fp32_scale(
+        "base-2 softmax scale", score * math.log2(math.e), positive=True
+    )
+    output = _finite_fp32_scale("effective output scale", scale_v / scale_o)
+    return score, score_log2, output
 
 
 def _validate_rubin_outputs(q, k, v, out, lse=None, lse_out=None) -> None:
@@ -133,8 +176,8 @@ class RubinPrefillPlan:
     def _graph_signature(self) -> Tuple[int, int, int, int, int, bool, float]:
         return (
             self.batch_size,
-            self.q_len,
-            self.kv_len,
+            self.q_len if self.is_grouped else self.total_q_len,
+            self.kv_len if self.is_grouped else self.total_kv_len,
             self.num_qo_heads,
             self.num_kv_heads,
             self.causal,
@@ -151,21 +194,34 @@ class RubinPrefillPlan:
         causal: bool,
         sm_scale: Optional[float],
     ) -> None:
-        """Compare a validated request with the installed grouped graph plan."""
+        """Compare a validated request with the installed graph configuration."""
         if self._graph_signature() != (
             len(qo_indptr_host) - 1,
-            int(qo_indptr_host[1] - qo_indptr_host[0]),
-            int(kv_indptr_host[1] - kv_indptr_host[0]),
+            int(qo_indptr_host[1]) if self.is_grouped else int(qo_indptr_host[-1]),
+            int(kv_indptr_host[1]) if self.is_grouped else int(kv_indptr_host[-1]),
             num_qo_heads,
             num_kv_heads,
             causal,
             sm_scale if sm_scale is not None else 1.0 / math.sqrt(192),
         ):
+            lengths = (
+                "fixed sequence lengths"
+                if self.is_grouped
+                else "fixed total Q length and fixed total KV length"
+            )
             raise ValueError(
-                "Rubin GQA CUDA-graph plans have fixed sequence lengths; "
-                "replanning with a different configuration is not supported. "
-                "Create a new wrapper and keep "
-                "the captured plan's indptr buffers unchanged."
+                f"Rubin CUDA-graph plans require {lengths}, batch size, head counts, "
+                "causal mode and softmax scale; create a new wrapper to change "
+                "the configuration."
+            )
+
+    def check_legacy_options(self, causal: bool, sm_scale: Optional[float]) -> None:
+        """Reject legacy overrides that the installed plan cannot honor."""
+        normalized_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(192)
+        if causal != self.causal or normalized_scale != self.sm_scale:
+            raise ValueError(
+                "Rubin forward causal and sm_scale must match plan(); "
+                "call plan() to change the configuration."
             )
 
     @staticmethod
@@ -275,6 +331,8 @@ class RubinPrefillPlan:
                 raise ValueError(
                     f"{name} must start at zero and contain nondecreasing signed 32-bit offsets"
                 )
+        if num_qo_heads == num_kv_heads and len(qo_indptr_host) - 1 > 65535:
+            raise ValueError("Rubin FMHA requires batch_size <= 65535")
         if num_qo_heads != num_kv_heads:
             if (len(qo_indptr_host) - 1) * num_kv_heads > 65535:
                 raise ValueError(
@@ -403,6 +461,19 @@ class RubinPrefillPlan:
             )
         else:
             from .fmha import cute_dsl_fmha_ragged_prefill
+
+            _validate_rubin_fmha_scales(
+                self.sm_scale,
+                q_scale if q_scale is not None else 1.0,
+                k_scale if k_scale is not None else 1.0,
+                v_scale if v_scale is not None else 1.0,
+                o_scale if o_scale is not None else 1.0,
+            )
+
+            # Graph plans fix the total query length, so no replay can give
+            # this empty launch work. A zero-sized FMHA grid is invalid.
+            if self.total_q_len == 0:
+                return
 
             # FMHA skips empty KV rows. Neutralize their output without host
             # synchronization; graph replay may change which rows are empty.

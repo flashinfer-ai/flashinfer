@@ -423,8 +423,11 @@ def cute_dsl_fmha_ragged_prefill(
     )
 
     if backend == "cute-dsl-rubin":
-        from .rubin import _validate_rubin_fmha
+        from .rubin import _validate_rubin_fmha, _validate_rubin_fmha_scales
 
+        scale_softmax, scale_softmax_log2, scale_output = _validate_rubin_fmha_scales(
+            sm_scale, scale_q, scale_k, scale_v, scale_o
+        )
         _validate_rubin_fmha(
             q,
             k,
@@ -526,12 +529,13 @@ def cute_dsl_fmha_ragged_prefill(
             enable_tvm_ffi = True
 
     # Compute scale factors
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    log2_e = math.log2(math.exp(1.0))
-    scale_softmax = scale_q * scale_k * sm_scale
-    scale_softmax_log2 = scale_softmax * log2_e
-    scale_output = scale_v / scale_o
+    if backend != "cute-dsl-rubin":
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(D)
+        log2_e = math.log2(math.exp(1.0))
+        scale_softmax = scale_q * scale_k * sm_scale
+        scale_softmax_log2 = scale_softmax * log2_e
+        scale_output = scale_v / scale_o
 
     # Max seq lengths for problem_size (prefer pre-computed values for CUDA graph compat)
     if max_qo_len is None:

@@ -5978,6 +5978,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lengths; causal attention additionally requires query length <= KV
         length. This configuration supports dense and causal masks only.
 
+        Equal-head Rubin scales must be finite host scalars within FP32 range.
+        The effective ``q_scale * k_scale * sm_scale`` and its base-2 conversion
+        must remain positive and finite in FP32. Individual factors may be signed.
+        The output scale ``v_scale / o_scale`` may be signed or zero, but
+        ``o_scale`` must be nonzero and the quotient must remain finite in FP32.
+
         For grouped-head SM107 CUDA graphs, call :meth:`plan` before capture
         and keep both indptr buffers unchanged for the graph's lifetime.
         Replanning with the same batch size, lengths, head counts, mask and
@@ -5985,11 +5991,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         configuration requires a new wrapper, even before capture.
 
         Equal-head Rubin CUDA-graph plans allow ragged lengths to change within
-        the fixed batch size and initial query capacity, but require the same
-        total KV length on every replan, even before capture. Changing the total
-        KV length requires a new wrapper. Before capture, run an eager warmup
-        with the same device, head count, mask and LSE presence and at least one
-        sequence with positive query and KV lengths. An all-inactive eager run
+        fixed total Q and KV lengths. Batch size, head counts, causal mode and
+        effective softmax scale must also stay fixed on every replan, even
+        before capture. Changing these requires a new wrapper. Before capture,
+        run an eager warmup with the same device, head count, mask and LSE
+        presence and at least one sequence with positive query and KV lengths.
+        An all-inactive eager run
         skips kernel compilation and does not warm up the capture configuration.
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
@@ -6009,8 +6016,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
-        self._head_dim_qk = head_dim_qk
-        self._head_dim_vo = head_dim_vo
+        if self._backend != "cute-dsl-rubin":
+            self._head_dim_qk = head_dim_qk
+            self._head_dim_vo = head_dim_vo
 
         if use_token_head_sf:
             if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -6051,7 +6059,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "use_token_head_sf is only supported with backend='fa2', "
                     f"got backend={self._requested_backend!r}"
                 )
-        self._use_token_head_sf = use_token_head_sf
+        if self._backend != "cute-dsl-rubin":
+            self._use_token_head_sf = use_token_head_sf
         if (
             self._jit_module is not None
             and self._jit_use_token_head_sf != use_token_head_sf
@@ -6109,29 +6118,39 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 o_indptr=o_indptr,
             )
 
+            if self.is_cuda_graph_enabled:
+                # Check before installing cached counts or copying metadata;
+                # a rejected initial plan must remain retryable.
+                if len(qo_indptr_host) - 1 != self._fixed_batch_size:
+                    raise ValueError("The batch size must be fixed in CUDA-graph mode")
+                for name, buffer in (
+                    ("qo_indptr_buf", self._qo_indptr_buf),
+                    ("kv_indptr_buf", self._kv_indptr_buf),
+                ):
+                    if buffer.dtype not in (torch.int32, torch.int64):
+                        raise ValueError(f"Rubin {name} must have int32 or int64 dtype")
+
         if (
             self.is_cuda_graph_enabled
             and self._backend == "cute-dsl-rubin"
             and self._plan_info is not None
         ):
             current_plan = cast("RubinPrefillPlan", self._plan_info)
+            # Validate configuration before touching captured buffers or state.
+            current_plan.check_replan(
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
             if current_plan.is_grouped:
-                # Validation above must precede reuse; neither a rejected nor
-                # an equivalent replan may modify captured buffers or handles.
-                current_plan.check_replan(
-                    qo_indptr_host=qo_indptr_host,
-                    kv_indptr_host=kv_indptr_host,
-                    num_qo_heads=num_qo_heads,
-                    num_kv_heads=num_kv_heads,
-                    causal=causal,
-                    sm_scale=sm_scale,
-                )
                 return
-            if int(kv_indptr_host[-1]) != current_plan.total_kv_len:
-                raise ValueError(
-                    "Rubin FMHA CUDA-graph plans require a fixed total KV length; "
-                    "create a new wrapper to change the total KV length."
-                )
+        if self._backend == "cute-dsl-rubin":
+            self._head_dim_qk = head_dim_qk
+            self._head_dim_vo = head_dim_vo
+            self._use_token_head_sf = use_token_head_sf
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
             raise ValueError(
@@ -6853,6 +6872,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
+        if self._backend == "cute-dsl-rubin":
+            cast("RubinPrefillPlan", self._plan_info).check_legacy_options(
+                causal, sm_scale
+            )
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
@@ -7644,6 +7667,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
+        if self._backend == "cute-dsl-rubin":
+            cast("RubinPrefillPlan", self._plan_info).check_legacy_options(
+                causal, sm_scale
+            )
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction

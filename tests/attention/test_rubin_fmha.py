@@ -80,7 +80,20 @@ def inputs(q_lens, kv_lens, offset=False):
     )
 
 
-def reference(q, k, v, q_lens, kv_lens, causal):
+def reference(
+    q,
+    k,
+    v,
+    q_lens,
+    kv_lens,
+    causal,
+    *,
+    sm_scale=SM_SCALE,
+    q_scale=SCALE_Q,
+    k_scale=SCALE_K,
+    v_scale=SCALE_V,
+    o_scale=SCALE_O,
+):
     out = torch.zeros((*q.shape[:2], 128), device=q.device, dtype=torch.float32)
     lse = torch.full(q.shape[:2], -float("inf"), device=q.device, dtype=torch.float32)
     q_offset = kv_offset = 0
@@ -89,7 +102,7 @@ def reference(q, k, v, q_lens, kv_lens, causal):
             qs = slice(q_offset, q_offset + q_len)
             ks = slice(kv_offset, kv_offset + kv_len)
             logits = torch.einsum("qhd,khd->hqk", q[qs].float(), k[ks].float())
-            logits *= SCALE_Q * SCALE_K * SM_SCALE
+            logits *= q_scale * k_scale * sm_scale
             if causal:
                 query_position = torch.arange(q_len, device=q.device)[:, None]
                 key_position = torch.arange(kv_len, device=q.device)[None, :]
@@ -103,7 +116,7 @@ def reference(q, k, v, q_lens, kv_lens, causal):
                 torch.isfinite(log_norm)[..., None], torch.softmax(logits, dim=-1), 0
             )
             out[qs] = torch.einsum("hqk,khd->qhd", probabilities, v[ks].float()) * (
-                SCALE_V / SCALE_O
+                v_scale / o_scale
             )
             lse[qs] = log_norm.transpose(0, 1) / math.log(2)
         q_offset += q_len
@@ -258,6 +271,29 @@ def batch_wrapper(q_lens, kv_lens, *, causal, graph=False):
     return attn, q_ptr, kv_ptr
 
 
+def warmup_batch_graph(*, causal, with_lse):
+    q, k, v = inputs([1], [128])
+    attn, _, _ = batch_wrapper([1], [128], causal=causal)
+    attn.run(q, k, v, return_lse=with_lse)
+
+
+def review_plan(attn, q_lens, kv_lens, **overrides):
+    params = dict(
+        qo_indptr=indptr(q_lens),
+        kv_indptr=indptr(kv_lens),
+        num_qo_heads=HEADS,
+        num_kv_heads=HEADS,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    params.update(overrides)
+    attn.plan(**params)
+
+
 def test_batch_pdl_hint():
     q_lens, kv_lens = [0, 3, 17, 129], [9, 0, 1, 257]
     q, k, v = inputs(q_lens, kv_lens)
@@ -306,6 +342,9 @@ def test_batch_graph_retains_ragged_lengths(q_lens, initial_kv):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        # All-inactive metadata never launches eagerly; warm the same compiled
+        # specialization with a positive Q/KV sequence before capture.
+        warmup_batch_graph(causal=True, with_lse=True)
         call()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
@@ -338,6 +377,7 @@ def test_batch_graph_all_empty_kv():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        warmup_batch_graph(causal=True, with_lse=False)
         call()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
@@ -740,3 +780,245 @@ def test_generic_cute_dsl_keeps_existing_artifact_route(monkeypatch):
         torch.bfloat16,
         192,
     )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["q-shrink", "q-grow", "batch", "heads", "causal", "sm-scale", "head-dim"],
+)
+def test_review_graph_replan_preserves_execution(change):
+    q_lens, kv_lens = [3, 5], [0, 128]
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, q_ptr, kv_ptr = batch_wrapper(q_lens, kv_lens, causal=True, graph=True)
+    original_q, original_kv = q_ptr.clone(), kv_ptr.clone()
+    scales = dict(q_scale=SCALE_Q, k_scale=SCALE_K, v_scale=SCALE_V, o_scale=SCALE_O)
+    out = torch.empty((*q.shape[:2], 128), device=q.device, dtype=torch.bfloat16)
+    lse = torch.empty(q.shape[:2], device=q.device)
+    call = functools.partial(
+        attn.run, q, k, v, out=out, lse=lse, return_lse=True, **scales
+    )
+    new_q, new_kv, overrides = [5, 3], [128, 0], {}
+    if change == "q-shrink":
+        new_q = [1, 3]
+    elif change == "q-grow":
+        new_q = [5, 4]
+    elif change == "batch":
+        new_q, new_kv = [7], [128]
+    elif change == "heads":
+        overrides = dict(num_qo_heads=8, num_kv_heads=8)
+    elif change == "causal":
+        overrides = dict(causal=False)
+    elif change == "sm-scale":
+        overrides = dict(sm_scale=0.5 * SM_SCALE)
+    elif change == "head-dim":
+        overrides = dict(head_dim_vo=64)
+
+    def reject_replan():
+        # A missing refusal stops the test before unsafe metadata is replayed.
+        with pytest.raises(ValueError):
+            review_plan(attn, new_q, new_kv, **overrides)
+        torch.testing.assert_close(q_ptr, original_q)
+        torch.testing.assert_close(kv_ptr, original_kv)
+        # Implicit allocation also exercises cached row count and head dimension.
+        actual, actual_lse = attn.run(q, k, v, return_lse=True, **scales)
+        assert_outputs(actual, actual_lse, *reference(q, k, v, q_lens, kv_lens, True))
+
+    reject_replan()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            call()
+    torch.cuda.current_stream().wait_stream(stream)
+    reject_replan()
+    out.fill_(19)
+    lse.fill_(19)
+    graph.replay()
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+
+    # Explicit/default scale equivalence and fixed-total redistribution remain valid.
+    q_lens, kv_lens = [5, 3], [128, 0]
+    review_plan(attn, q_lens, kv_lens, sm_scale=SM_SCALE)
+    call()
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+    out.fill_(19)
+    lse.fill_(19)
+    graph.replay()
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+
+
+def test_review_equal_head_batch_grid_rejection_preserves_plan():
+    q_lens, kv_lens = [3], [128]
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, _, _ = batch_wrapper(q_lens, kv_lens, causal=True)
+    # Metadata alone exercises the invalid launch grid, without a large Q/K/V
+    # allocation or launching the unsupported batch on the baseline.
+    ptr = torch.arange(65537, dtype=torch.int32)
+    with pytest.raises(ValueError, match="(?i)(batch|65535)"):
+        review_plan(attn, [], [], qo_indptr=ptr, kv_indptr=ptr)
+    out, lse = attn.run(
+        q,
+        k,
+        v,
+        return_lse=True,
+        q_scale=SCALE_Q,
+        k_scale=SCALE_K,
+        v_scale=SCALE_V,
+        o_scale=SCALE_O,
+    )
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+
+
+@pytest.mark.parametrize(
+    "plan_scale,scales",
+    [
+        (1e39, {}),
+        (SM_SCALE, {"q_scale": -1e39}),
+        (SM_SCALE, {"k_scale": math.inf}),
+        (SM_SCALE, {"v_scale": math.nan}),
+        (SM_SCALE, {"o_scale": 1e39}),
+        (1e38, {"q_scale": 4.0}),
+        (3e38, {}),
+        (SM_SCALE, {"v_scale": 3e38, "o_scale": 0.5}),
+        (SM_SCALE, {"o_scale": 0.0}),
+    ],
+    ids=[
+        "sm-input",
+        "q-input",
+        "k-inf",
+        "v-nan",
+        "o-input",
+        "score",
+        "base2",
+        "output",
+        "zero-divisor",
+    ],
+)
+def test_review_equal_head_invalid_scales_before_writes(plan_scale, scales):
+    # Eager all-inactive rows avoid launching an invalid scale on the baseline.
+    q, k, v = inputs([3], [0])
+    attn, _, _ = batch_wrapper([3], [0], causal=True)
+    out = torch.full((*q.shape[:2], 128), 19.0, device=q.device, dtype=torch.bfloat16)
+    lse = torch.full(q.shape[:2], 19.0, device=q.device)
+    with pytest.raises(ValueError, match="(?i)scale"):
+        review_plan(attn, [3], [0], sm_scale=plan_scale)
+        attn.run(q, k, v, out=out, lse=lse, return_lse=True, **scales)
+    torch.testing.assert_close(out, torch.full_like(out, 19))
+    torch.testing.assert_close(lse, torch.full_like(lse, 19))
+
+
+@pytest.mark.parametrize(
+    "sm_scale,q_scale,k_scale",
+    [
+        (-SM_SCALE, SCALE_Q, SCALE_K),
+        (0.0, SCALE_Q, SCALE_K),
+        (SM_SCALE, 0.0, SCALE_K),
+        (SM_SCALE, SCALE_Q, 0.0),
+        (1e-50, SCALE_Q, SCALE_K),
+        (SM_SCALE, 1e-30, 1e-30),
+    ],
+    ids=[
+        "negative-score",
+        "zero-sm",
+        "zero-q",
+        "zero-k",
+        "underflow-sm",
+        "underflow-product",
+    ],
+)
+@pytest.mark.parametrize("kv_len", [0, 128], ids=["inactive", "active"])
+def test_review_equal_head_nonpositive_score_rejected_before_writes(
+    sm_scale, q_scale, k_scale, kv_len
+):
+    q_lens, kv_lens = [3], [kv_len]
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, _, _ = batch_wrapper(q_lens, kv_lens, causal=False)
+    # The effective score depends on runtime Q/K factors, so plan accepts the
+    # individual finite sm_scale and run must reject before either output write.
+    review_plan(attn, q_lens, kv_lens, causal=False, sm_scale=sm_scale)
+    out = torch.full((*q.shape[:2], 128), 19.0, device=q.device, dtype=torch.bfloat16)
+    lse = torch.full(q.shape[:2], 19.0, device=q.device)
+    with pytest.raises(ValueError, match="(?i)scale"):
+        attn.run(
+            q,
+            k,
+            v,
+            out=out,
+            lse=lse,
+            return_lse=True,
+            q_scale=q_scale,
+            k_scale=k_scale,
+        )
+    torch.testing.assert_close(out, torch.full_like(out, 19))
+    torch.testing.assert_close(lse, torch.full_like(lse, 19))
+
+
+@pytest.mark.parametrize("with_lse", [False, True])
+def test_review_zero_q_graph_capture(with_lse):
+    q, k, v = inputs([0], [128])
+    attn, _, _ = batch_wrapper([0], [128], causal=True, graph=True)
+    out = torch.empty((0, HEADS, 128), device=q.device, dtype=torch.bfloat16)
+    lse = torch.empty((0, HEADS), device=q.device) if with_lse else None
+    call = functools.partial(attn.run, q, k, v, out=out, lse=lse, return_lse=with_lse)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        warmup_batch_graph(causal=True, with_lse=with_lse)
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            call()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out.shape == (0, HEADS, 128)
+    if with_lse:
+        assert lse.shape == (0, HEADS)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(q_scale=-SCALE_Q, k_scale=-SCALE_K),
+        dict(sm_scale=-SM_SCALE, q_scale=-SCALE_Q),
+        dict(v_scale=-SCALE_V),
+        dict(o_scale=-SCALE_O),
+        dict(v_scale=0.0),
+        dict(q_scale=1e-50, k_scale=1e25),
+    ],
+    ids=[
+        "negative-qk",
+        "negative-sm-q",
+        "negative-v",
+        "negative-o",
+        "zero-v",
+        "compensated-tiny-q",
+    ],
+)
+@pytest.mark.parametrize(
+    "causal,q_lens,kv_lens",
+    [(False, [3], [128]), (True, [3, 5], [0, 129])],
+    ids=["noncausal", "causal-partial-kv"],
+)
+def test_review_equal_head_supported_scale_controls(overrides, causal, q_lens, kv_lens):
+    scales = dict(
+        sm_scale=SM_SCALE,
+        q_scale=SCALE_Q,
+        k_scale=SCALE_K,
+        v_scale=SCALE_V,
+        o_scale=SCALE_O,
+    )
+    scales.update(overrides)
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, _, _ = batch_wrapper(q_lens, kv_lens, causal=causal)
+    review_plan(attn, q_lens, kv_lens, causal=causal, sm_scale=scales["sm_scale"])
+    out, lse = attn.run(
+        q,
+        k,
+        v,
+        return_lse=True,
+        **{key: value for key, value in scales.items() if key != "sm_scale"},
+    )
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, causal, **scales))

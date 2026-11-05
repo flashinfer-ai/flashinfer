@@ -536,8 +536,9 @@ def test_public_plan_accepts_replacement_tensors_and_reuses_output(sm107):
     assert_outputs(out, None, *reference(q, k, v))
 
 
-def test_graph_plan_retry_after_preparation_failure(sm107):
-    q, k, v = inputs(batch=2, q_len=17, kv_len=129, ratio=2)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_review_graph_plan_retry_after_preparation_failure(sm107, ratio):
+    q, k, v = inputs(batch=2, q_len=17, kv_len=129, ratio=ratio)
     q_ptr = torch.tensor([0, 17, 34], dtype=torch.int32)
     kv_ptr = torch.tensor([0, 129, 258], dtype=torch.int32)
     attn = BatchPrefillWithRaggedKVCacheWrapper(
@@ -551,7 +552,7 @@ def test_graph_plan_retry_after_preparation_failure(sm107):
         qo_indptr=q_ptr,
         kv_indptr=kv_ptr,
         num_qo_heads=16,
-        num_kv_heads=8,
+        num_kv_heads=16 // ratio,
         head_dim_qk=192,
         head_dim_vo=128,
         causal=True,
@@ -562,8 +563,9 @@ def test_graph_plan_retry_after_preparation_failure(sm107):
 
     wrong_batch_params = dict(
         params,
-        qo_indptr=torch.tensor([0, 17, 34, 51], dtype=torch.int32),
-        kv_indptr=torch.tensor([0, 129, 258, 387], dtype=torch.int32),
+        # A smaller invalid first batch must not install a too-small Q capacity.
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 129], dtype=torch.int32),
     )
     with pytest.raises(ValueError, match="(?i)(batch size|batch_size)"):
         attn.plan(**wrong_batch_params)
@@ -1001,3 +1003,119 @@ def test_public_d192_unsupported_options(sm107, option, value):
         (ValueError, NotImplementedError), match="(?i)(Rubin|192|cute-dsl|integer)"
     ):
         attn.plan(**params)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("method", ["forward", "forward_return_lse"])
+@pytest.mark.parametrize("change", ["causal", "sm_scale"])
+def test_review_legacy_overrides_rejected_without_state_mutation(
+    sm107, ratio, method, change
+):
+    q, k, v = inputs(batch=1, q_len=17, kv_len=129, ratio=ratio)
+    attn, _, _ = make_batch(q, k, causal=True)
+    before = attn._causal, attn._sm_scale
+    controls = dict(causal=True, sm_scale=None)
+    controls[change] = False if change == "causal" else 0.5 / math.sqrt(192)
+    with pytest.raises(ValueError, match="(?i)(causal|scale|plan)"):
+        getattr(attn, method)(
+            q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), **controls
+        )
+    assert (attn._causal, attn._sm_scale) == before
+    out, lse = outputs(q)
+    run_public(q, k, v, out, lse=lse, attn=attn)
+    assert_outputs(out, lse, *reference(q, k, v, causal=True))
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("method", ["forward", "forward_return_lse"])
+def test_review_legacy_default_scale_equivalence(sm107, ratio, method):
+    q, k, v = inputs(batch=1, q_len=17, kv_len=129, ratio=ratio)
+    # Test both explicit-to-default and default-to-explicit normalization.
+    for planned, override in [(None, 1 / math.sqrt(192)), (1 / math.sqrt(192), None)]:
+        attn, _, _ = make_batch(q, k, causal=True, sm_scale=planned)
+        result = getattr(attn, method)(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            causal=True,
+            sm_scale=override,
+        )
+        out, lse = result if method == "forward_return_lse" else (result, None)
+        assert_outputs(
+            out.view(*q.shape[:-1], 128),
+            lse.view(q.shape[:-1]) if lse is not None else None,
+            *reference(q, k, v, causal=True),
+        )
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("destination", ["q", "kv"])
+def test_review_graph_indptr_destination_dtype_rejected_before_copy(
+    sm107, ratio, destination
+):
+    source_q = torch.tensor([0, 129, 258], dtype=torch.int32)
+    source_kv = torch.tensor([0, 257, 514], dtype=torch.int32)
+    q_ptr = torch.full(
+        (3,), 7, device="cuda", dtype=torch.uint8 if destination == "q" else torch.int32
+    )
+    kv_ptr = torch.full(
+        (3,),
+        11,
+        device="cuda",
+        dtype=torch.uint8 if destination == "kv" else torch.int32,
+    )
+    attn = BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="cute-dsl-rubin",
+        use_cuda_graph=True,
+        qo_indptr_buf=q_ptr,
+        kv_indptr_buf=kv_ptr,
+    )
+    with pytest.raises(ValueError, match="(?i)(int32|int64|dtype|integer)"):
+        attn.plan(
+            source_q,
+            source_kv,
+            16,
+            16 // ratio,
+            192,
+            head_dim_vo=128,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+    # The valid source offsets exceed uint8; silent copies would truncate them.
+    torch.testing.assert_close(q_ptr, torch.full_like(q_ptr, 7))
+    torch.testing.assert_close(kv_ptr, torch.full_like(kv_ptr, 11))
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_review_graph_indptr_destination_integer_types(sm107, ratio, dtype):
+    q, k, v = inputs(batch=2, q_len=129, kv_len=257, ratio=ratio)
+    source_q = torch.tensor([0, 129, 258], dtype=torch.int32)
+    source_kv = torch.tensor([0, 257, 514], dtype=torch.int32)
+    q_ptr = torch.empty(3, device="cuda", dtype=dtype)
+    kv_ptr = torch.empty(3, device="cuda", dtype=dtype)
+    attn = BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="cute-dsl-rubin",
+        use_cuda_graph=True,
+        qo_indptr_buf=q_ptr,
+        kv_indptr_buf=kv_ptr,
+    )
+    attn.plan(
+        source_q,
+        source_kv,
+        16,
+        16 // ratio,
+        192,
+        head_dim_vo=128,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    torch.testing.assert_close(q_ptr, source_q.to(device="cuda", dtype=dtype))
+    torch.testing.assert_close(kv_ptr, source_kv.to(device="cuda", dtype=dtype))
+    out, lse = outputs(q)
+    run_public(q, k, v, out, lse=lse, attn=attn)
+    assert_outputs(out, lse, *reference(q, k, v))
