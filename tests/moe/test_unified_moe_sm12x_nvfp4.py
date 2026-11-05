@@ -50,20 +50,22 @@ def test_nvfp4_torch_oracle_rounding_and_limit():
 
 @pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
 @pytest.mark.parametrize(
-    "model,activation,tokens,enable_pdl,input_scale,shape_override",
+    "model,activation,tokens,enable_pdl,input_scale,shape_override,per_expert_scales",
     [
-        ("qwen30b", ActivationType.Swiglu, 8, False, 1.0, (512, 512, 4, 2)),
-        ("qwen30b", ActivationType.Swiglu, 129, True, 1.0, (512, 512, 4, 2)),
-        ("qwen30b", ActivationType.Swiglu, 257, False, 1.0, (512, 512, 4, 2)),
-        ("dsv4", ActivationType.Swiglu, 16, False, 16.0, (512, 512, 4, 2)),
-        ("dsv4", ActivationType.Swiglu, 129, True, 16.0, (512, 512, 4, 2)),
-        ("qwen30b", ActivationType.Situ, 16, True, 1.0, (512, 512, 4, 2)),
-        ("nemotron", ActivationType.Relu2, 129, False, 1.0, (512, 512, 4, 2)),
-        ("nemotron", ActivationType.Relu2, 129, False, 1.0, (512, 1856, 4, 2)),
+        ("qwen30b", ActivationType.Swiglu, 8, False, 1.0, (512, 512, 4, 2), False),
+        ("qwen30b", ActivationType.Swiglu, 129, True, 1.0, (512, 512, 4, 2), False),
+        ("qwen30b", ActivationType.Swiglu, 257, False, 1.0, (512, 512, 4, 2), False),
+        ("dsv4", ActivationType.Swiglu, 16, False, 16.0, (512, 512, 4, 2), False),
+        ("dsv4", ActivationType.Swiglu, 129, True, 16.0, (512, 512, 4, 2), False),
+        ("qwen30b", ActivationType.Situ, 16, True, 1.0, (512, 512, 4, 2), False),
+        ("nemotron", ActivationType.Relu2, 129, False, 1.0, (512, 512, 4, 2), False),
+        ("nemotron", ActivationType.Relu2, 129, False, 1.0, (512, 1856, 4, 2), False),
+        ("qwen30b", ActivationType.Swiglu, 8, False, 1.0, (512, 512, 4, 2), True),
+        ("dsv4", ActivationType.Swiglu, 129, True, 16.0, (512, 512, 4, 2), True),
     ],
 )
 def test_sm12x_nvfp4_native_chain(
-    model, activation, tokens, enable_pdl, input_scale, shape_override
+    model, activation, tokens, enable_pdl, input_scale, shape_override, per_expert_scales
 ):
     if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
         pytest.skip("requires an SM120a device")
@@ -75,6 +77,7 @@ def test_sm12x_nvfp4_native_chain(
         activation=activation,
         padded_routes=True,
         input_scale=input_scale,
+        per_expert_scales=per_expert_scales,
     )
     immutable = data.input_hashes()
     data.check(data.native(enable_pdl).clone())
