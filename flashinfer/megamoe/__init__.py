@@ -87,7 +87,8 @@ _SM120_MAX_TOKENS_PER_RANK = 256
 
 
 def _is_sm120() -> bool:
-    return torch.cuda.get_device_capability()[0] == 12
+    # the SM120 module is built for sm_120a only, which runs on compute capability 12.0 exactly
+    return torch.cuda.get_device_capability() == (12, 0)
 
 
 def _sm120_layout(ranks, experts, capacity, topk, hidden, intermediate):
