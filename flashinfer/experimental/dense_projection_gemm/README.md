@@ -261,7 +261,7 @@ at 512 tokens on `6144 -> 32`, at 2048 on `5120 -> 64`, at 8192 on `5120 -> 128`
 | `sm_100a` `5120 -> 32` FP32 | 148 SMs and more | 65538 and up |
 | `sm_100a` `5120 -> 48` FP32 | 148 SMs and more | 65538 and up |
 | `sm_103a` `4096 -> 32` FP32 | 148 SMs and more | 65538 and up |
-| `sm_103a` `4096 -> 48` FP32 | 152 SMs and more | 14338 to 32767*; 65538 and up |
+| `sm_103a` `4096 -> 48` FP32 | 152 SMs and more | 14338 to 32767‡; 65538 and up |
 
 *Table: the odd-block K1 table (`K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS`): these rows run the deterministic program at a
 token count of the third column that spans an odd number of 64-token K blocks (`ceil(T / 64)` odd); an even number, and
@@ -275,7 +275,7 @@ tokens, `sm_100a` on a 148-SM B200 part and `sm_103a` on a 148-SM B300 part, the
 the same on 148 and 152 SMs; `sm_100a` `5120 -> 32` and `5120 -> 48` at 12337 to 65537 tokens), so those token counts
 run the two-split program; q was 1.03 to 1.15, 1.021 to 1.024 at 65537 tokens and 1.007 to 1.075 for the `5120` rows
 (data).  From 98305 tokens up both programs miss the FP32 budget at an odd count; no odd token count from 65538 to 98304
-was measured, and the rows run the deterministic program at an odd count from 65538 tokens up.  Marked *: a range from
+was measured, and the rows run the deterministic program at an odd count from 65538 tokens up.  Marked ‡: a range from
 the time, not the budget: on a 152-SM GB300 part, at odd block counts the two-split program of `sm_103a` `4096 -> 48`
 left the checkpointed step 2.0 to 2.3 % slower in graph replays at 16173 tokens (two measurements), the backward pass
 1.6 and 2.0 % slower in eager launches at 20481 and 28673 tokens, and failed the K1 rule in one of 8 groups at 18433
