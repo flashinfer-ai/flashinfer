@@ -24,6 +24,10 @@ indices, scores = dsa_indexer_det_topk(q, k, w, cu_seqlens_q, cu_seqlens_k,
                                    max_seqlen_q=None, max_seqlen_k=None,
                                    workspace_buffer=None, indices=None, scores=None)
 nbytes = dsa_indexer_det_topk_workspace_size(T, Tkv, S, top_k=2048, ratio=1, device=q.device)
+
+# the FP8 form (opt-in): float8_e4m3fn q / k, per-key FP32 k_scale, every other scale folded into w
+indices, scores = dsa_indexer_det_topk(q_fp8, k_fp8, w, cu_seqlens_q, cu_seqlens_k, k_scale=k_scale)
+nbytes = dsa_indexer_det_topk_workspace_size(T, Tkv, S, device=q.device, dtype=torch.float8_e4m3fn)
 ```
 
 The previous names `dsa_indexer_topk` and `dsa_indexer_topk_workspace_size`,
@@ -41,7 +45,8 @@ available as aliases of the same objects.
 | `cu_seqlens_q`, `cu_seqlens_k` | `[S + 1]` int32, device | independent query and key segment boundaries (not read on the host) |
 | `q_causal_offsets` | optional `[S]` int64, device | per-segment query offsets |
 | `top_k` | int, `1 <= top_k <= 4096` | output slots per query (default 2048) |
-| `softmax_scale` | positive float | logit scale (default `128 ** -0.5`) |
+| `softmax_scale` | positive float | logit scale (default `128 ** -0.5`); `None` for the FP8 form |
+| `k_scale` | optional `[Tkv]` FP32, contiguous | the FP8 form's per-key scales (see "FP8 form"); BF16 calls take none |
 | `ratio` | positive int | key compression ratio (normally 1) |
 | `max_seqlen_q` | optional int | host mirror of the longest query segment; accepted, not read by any launch decision |
 | `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
@@ -93,6 +98,71 @@ equal-score tie goes to the larger key id, and the written score keeps the
 computed bits -- it is never canonicalised.  The reference in
 `tests/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
 model, so the bit-exact test cases compare like with like.
+
+## FP8 form
+
+The FP8 form is opt-in and selected by the input dtype: `q [T, 32, 128]` and
+`k [Tkv, 128]` both `torch.float8_e4m3fn` (the same layout rules as BF16; a
+row stride that is a multiple of 16 elements), `k_scale [Tkv]` FP32
+(contiguous, on the device of `q`), `w [T, 32]` FP32 carrying every other
+scale (the query scale, the softmax scale and the head weights), and
+`softmax_scale=None` (the programs take 1.0).  Mixed q / k dtypes,
+`float8_e5m2` and `q_scale` are rejected; a BF16 call keeps its default
+behaviour and rejects `k_scale`.  The score is
+
+```
+s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
+```
+
+* **Dot product**: the e4m3 x e4m3 products are exact and accumulate in FP32
+  on the tensor cores: four K = 32 steps over `d = 0 .. 127` on `sm_100a` /
+  `sm_103a`, the order of DeepGEMM's `fp8_mqa_logits`, whose logits these
+  programs reproduce bit for bit; two K = 64 steps on `sm_107a`, whose logits
+  can differ from DeepGEMM's in the last bits.
+* **Head reduction**: the sum over the heads of `w[t, h] * relu(logit)` and
+  its product with `k_scale[j]` are FP32; the tests bound the score like the
+  BF16 form (`gamma_n * A` against an FP64 score of the e4m3 inputs, `A`
+  scaled by `|k_scale[j]|`).
+* **Invariance**: every FP8 program of one architecture computes the same ids
+  and score bits (program-dispatch invariance holds per form and
+  architecture).  FP8 results are not BF16 results of the dequantized
+  inputs, and `sm_107a` results can differ from `sm_100a` / `sm_103a` results
+  in the last bits.
+* **Programs**: `sm_100a` / `sm_103a` register the `narrow`, `l6`,
+  `split_narrow` and `split_l6` scan programs, each with its longest-first
+  segment order copy (`:lsf`); `sm_107a` registers `narrow`, `l6` and
+  `split_narrow`.  Keys carry the form tag before the order suffix:
+  `scan:<kind>:u<n>:s0:f1:fp8[:lsf]`.  The merge and finalize programs are
+  the BF16 form's.  Launches are non-PDL and non-cooperative, like BF16.
+* **Dispatch**: the architecture's FP8 record is its BF16 `POLICY` record with
+  the fields of `cake_jit.POLICY_FP8[arch]` replaced
+  (`cake_policy.fp8_policy_record`); `POLICY_FP8` names every architecture's
+  FP8 `static_scan_kinds` itself.
+  `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
+  and maps the decided kind to a registered FP8 kind
+  (`FP8_KIND_FALLBACK`: `wide` / `pair_wide` / `pair_l6` -> `l6`, the largest
+  FP8 unit, `pair_narrow` -> `narrow`, `split_wide` -> `split_narrow`, and
+  `split_l6` -> `split_narrow` where no FP8 `split_l6` program is registered); the program
+  runs without a CTA pair, in the plain unit order, in its sampled-fit form,
+  with the decided tile unroll where an FP8 program of it is registered
+  (else the smallest registered one) and in the longest-first order where
+  the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its
+  own `sample_class_rule` class and `check_period_kind_overrides` period
+  (`cake_policy.fallback_knobs`): an `l6` program run for a `wide` decision
+  samples like an `l6` decision; explicit knobs stay.  On `sm_107a` every FP8
+  kind keeps the static unit enumeration (`static_scan_kinds`): no ticket
+  tail, nothing zeroed.  An architecture without FP8 programs raises
+  `NotImplementedError`.
+* **Workspace**: `dsa_indexer_det_topk_workspace_size(...,
+  dtype=torch.float8_e4m3fn)` bounds the FP8 programs' workspace; the
+  default `dtype=torch.bfloat16` returns the BF16 bound unchanged.  A
+  `wide` / `pair_wide` decision runs the FP8 `l6` unit, 6 queries per unit
+  rather than the narrow unit's 4, so its FP8 bound has 1.5x the scan
+  entries of the narrow fallback: an FP8 buffer sized for such a call before this
+  fallback is rejected (`workspace_buffer needs N bytes`) and must be sized
+  again with this function.
+* **Prepared runners** bind `k_scale` with `q` / `k`: new values written into
+  it are read by the next run.
 
 ## Visibility
 
@@ -216,10 +286,14 @@ that writes the registry verifies the record against them before it is frozen.
 * **No host synchronization**: the segment boundaries and offsets are read on
   the device only; the host uses `T`, `Tkv`, `S`, `ratio`, `top_k`, the SM
   count and the strides.  The eager entry point allocates the outputs and the
-  workspace (unless supplied) through the caching allocator and zeroes the
-  ticket tail of a supplied workspace once per call (none on a static call:
+  workspace (unless supplied) through the caching allocator; the scan binding
+  zeroes the ticket tail of a supplied workspace right before every scan
+  launch, in the same host call (none on a static call:
   where the shape alone bounds the work units by the grid,
-  `cake_policy.ticket_static_path`, the scan never touches the ticket word);
+  `cake_policy.ticket_static_path`, the scan never touches the ticket word;
+  none for a program of the `static_scan_kinds` of its form's record, which
+  keeps the static unit enumeration on every call: on `sm_107a` the BF16 l6
+  and CTA-pair l6 programs and every FP8 program);
   the prepared runner (`cake_backend.prepare_dsa_indexer_det_topk`) allocates nothing at launch
   and is CUDA-graph capturable.
 * **Launch structure**: scan, optional merge, finalize (see above).  No
@@ -264,7 +338,7 @@ per entry.  `csrc/.clang-format` disables formatting so the digests stay valid.
   units: one kernel per program or per group of programs that differ only in
   their constants (a scan lever-twin group, the rank-finalize programs of one
   window form, the CUB finalize programs) and one binding per launcher text
-  (the 51 scan programs share 6 bindings, the 25 rank-finalize programs 4, the
+  (the 70 scan programs share 8 bindings, the 25 rank-finalize programs 4, the
   5 CUB finalize programs 1; the merge program has its own).  A shared kernel
   source names its kernel `CAKE_PROGRAM_KERNEL` and reads its constants (the
   window, block size, tile unroll and snake order) from `CAKE_INDEXER_<KNOB>`; a
@@ -290,9 +364,20 @@ recorded token counts; tile-boundary neighbours; changing shapes; bitwise
 repeatability, partition-knob and program-dispatch invariance; strided `k`;
 non-finite inputs; CUDA-graph capture; the workspace bound).  The host-only
 tests (registry shape, dispatch policy, validation, binding, the reference
-itself) run without a GPU.  Benchmark: `benchmarks/bench_cake_dsa_indexer.py`
+itself) run without a GPU.  The FP8 form has its own suite,
+`tests/experimental/test_cake_dsa_indexer_fp8.py`: host-only key grammar,
+FP8 record, kind mapping and reachability of every registered FP8 key,
+validation and BF16 plan / workspace identity; on the GPU, accuracy against
+an FP64 reference of the e4m3 inputs under the `gamma_n A` bound with exact
+ids up to near ties, bitwise program-dispatch invariance over every
+registered FP8 key, the prepared runner's `k_scale` binding, the per-form
+ticket decision and, where `deep_gemm` imports on `sm_100a` / `sm_103a`, a
+bitwise comparison of the logits with `deep_gemm.fp8_mqa_logits`.  Benchmark: `benchmarks/bench_cake_dsa_indexer.py`
 (paired AB / BA / interleaved CUPTI spans of the complete operator against two
 torch + FlashInfer compositions; both baseline arms are reconstructions of the
 training stack's chunked scoring / coarse top-k / rescoring path written for
 this benchmark, not the stack's own kernels, so their absolute numbers are
-speed references only).
+speed references only).  `--form fp8` times the FP8 form against the BF16
+form on the same data dequantized to BF16 and, where they import, DeepGEMM's
+`fp8_mqa_logits` followed by FlashInfer's exact deterministic top-k
+(`--rows fp8`: the FP8 shape set).

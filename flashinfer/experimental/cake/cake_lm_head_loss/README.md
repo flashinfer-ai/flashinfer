@@ -12,7 +12,9 @@ of the family: https://github.com/flashinfer-ai/flashinfer/issues/5680.
 Both the API and the backend are experimental: no compatibility guarantee,
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
-built for `sm_107a`, under the base dispatch rules).  The feature does not participate in automatic
+built for `sm_107a`, with SM103's GEMM tile rule tables except the long chunks'
+3-deep dX operand ring; its zero-gradient row skip keeps the generic 4097-row
+floor and the slice rule's dX slice counts).  The feature does not participate in automatic
 backend selection, autotuning or trace-apply.  Its libraries are loaded
 prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").
@@ -147,12 +149,22 @@ stream with a device-side assertion, `check_temperature=True` raises
 `temperature` other than `None`, so a call without one runs the entries
 without a temperature parameter).
 
-* `logp`, `lse` and `dW` are the deterministic entry's bits for the same call.
-  `dX` is formed from the same `dz` and the same products; a chunk of more than
-  one dX slice adds them in the unordered reduction below.
-* The zero-gradient row skip (below) does not run with a temperature: the
-  backward runs the uncounted forms over every row in the forward's order, as
-  a call without a temperature does below `zero_dlogp_min_rows`.
+* `logp` and `lse` are the deterministic entry's bits for the same call, and
+  so is `dW` when no valid row has a zero `dlogp`.  `dX` is formed from the
+  same `dz` and the same products; a chunk of more than one dX slice adds them
+  in the unordered reduction below.
+* The zero-gradient row skip (below) runs with a temperature too: the
+  temperature rows follow the skip's row order (a per-token temperature is
+  gathered from the caller's `[T]` tensor, which the autograd entry keeps for
+  the backward), the `dz` recompute runs the counted temperature form
+  `gemm_logits_dz_dcnt_tau` (no work on the rows past the chunk's count; the
+  same `dz` bits as `gemm_logits_dz_tau` on the rows before it) and the
+  K-sliced dX reductions and the weight-gradient GEMMs run their `_dcnt`
+  forms.  A record without the counted temperature form, or
+  `set_zero_dlogp_temperature_dz_counted(False)`, runs `gemm_logits_dz_tau`
+  over every row of the chunk instead (a zero `dlogp` gives `dz = 0`).  With
+  zero-gradient rows `dW` sums the live rows in the new row order (bits may
+  differ from the deterministic entry's within the accuracy budgets).
 * `memory_mode="budget"` and `num_valid_rows` take a temperature;
   `memory_mode="keep_logits"` takes none (`ValueError`), and
   `chunked_lm_head_loss` has no `temperature` keyword.
@@ -185,8 +197,8 @@ support path:
   order they finish (round to nearest, subnormals kept): an unordered FP32 sum
   within the accuracy budgets.  Every other shape, SM count and architecture
   runs one slice.  The split tail (the last wave's work items run as half
-  items) runs on the architectures with split forms (`sm_100a`, `sm_103a`)
-  and keeps the bits.
+  items) runs on the architectures with split forms (`sm_100a`, `sm_103a`,
+  `sm_107a`) and keeps the bits.
 * Sparse dW zero fill (global mode): the BF16 `dW [V, H]` is zeroed as FP32
   words (a 4-byte fill): the same bits.
 
@@ -205,7 +217,8 @@ By architecture: `sm_100a` (B200) is tested on the device.  On
 `sm_103a` (GB300) the rule has no cell, so the dense dX runs one slice
 everywhere (the deterministic bits); the support tests, forced two to four
 slices included, pass on GB300.  On `sm_107a` (R200) the rule has no cell
-either: the dense dX runs one slice everywhere.
+either: the dense dX runs one slice everywhere, with the split tail as on
+`sm_103a`.
 
 Accuracy on B200, worst of 20 runs against the FP64 oracle: the production
 row at H 5120 (T 16231, V 152064, chunks of 4096 and 3943 rows, two slices on
@@ -256,7 +269,8 @@ the previous value; an entry call reads them once):
 | `cake_backend.set_dx_slice_policy` | `"det"` | the dX slice rule (see "Kernel structure of one token chunk"); part of every binding key |
 | `cake_backend.set_dx_red_min_rows` | `0` | a chunk of fewer rows keeps one K slice (the plain store); part of every binding key |
 | `cake_backend.set_zero_weight_min_rows` | `4096` | a call of fewer rows `T` keeps its zero-weight rows in the chunk loop (see "Zero-weight policy rows") |
-| `cake_backend.set_zero_dlogp_min_rows` | `4097` | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; `None` turns the skip off (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
+| `cake_backend.set_zero_dlogp_min_rows` | per architecture: `1946` on sm_100a, `3891` on sm_103a, `4097` elsewhere (sm_107a included) | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; an integer or `None` (the skip off) applies to every architecture; with no override set the setter returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, which passed back restores the per-architecture default (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
+| `cake_backend.set_zero_dlogp_temperature_dz_counted` | `True` | under the zero-gradient row skip a call with a temperature runs the counted temperature form of the dz arm (`gemm_logits_dz_dcnt_tau`); `False` runs the uncounted one over every row (the same outputs); part of the backward binding key |
 | `cake_backend.set_gradient_placement` | `"auto"` | where the loss entries (`chunked_lm_head_loss` of both modules, every form) run the dX / dW GEMMs. `"auto"`: a call no backward can follow (grad mode off, or neither `X` nor `W` trainable) computes the loss (and `logp`) only; inside a non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks innermost) the checkpointed forward computes the loss only and saves its inputs, and the recomputation in the backward runs the fused forward and hands the gradient accumulators to the checkpointed call's backward, so a checkpointed step forms them once and keeps no FP32 accumulator from the forward to the backward (paired per checkpoint frame and graph by call order and checked against the inputs' metadata and the call's options; without a handed result the backward runs the fused forward itself, with a `RuntimeWarning`); other hooks innermost (CPU offload), torch's deterministic algorithms, or a torch whose checkpoint lacks those hooks keep the fused forward. Under selective activation checkpointing (`context_fn` of `create_selective_checkpoint_contexts`, whose recomputation replays the checkpointed forward's operators by position) every entry of this package -- the loss, log-probability (default, budget, kept logits, with a temperature) and candidate-support entries -- runs its forward with all active torch dispatch modes popped, the checkpoint's and any user mode on the stack (a `FlopCounterMode` does not see the entry's operators; a tracing mode such as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake inputs and fails loudly), and behaves as in a plain non-reentrant checkpoint; the per-device constant cells and the calling thread's count cells and `arange` constant are formed outside active dispatch modes. `"forward"`: every call with a trainable input forms the gradients in its forward (the previous behavior). The same kernels on the same operands either way: the same loss, `logp` and dW bits, and dX up to the order of its unordered K-slice reduction (the same bits with one dX slice) |
 | `cake_backend.set_dx_fill_side_stream` | `False` | `True`: a remembered binding issues the `-0.0` fill of `dX_acc` on the calling thread's fill stream (its own allocator pool, joined before the first dX GEMM), so it runs beside the queued chunk-0 logits GEMM; not under CUDA graph capture, not in the prepared runner; `True` keeps up to `T * H * 4` bytes more reserved in the fill stream's pool |
 
@@ -349,6 +363,17 @@ it handles these rows on the device, without a host synchronization:
   same set of launches for every `dlogp` and a CUDA graph capture of the
   backward replays for other `dlogp` values.  A chunk with no live row runs
   its launches without their GEMM work.
+* The one-slice dX plain store has no counted form, so on the architectures
+  of `DX_COUNTED_MIN_SLICES_BY_ARCH` (sm_100a and sm_103a: two slices) the
+  call's plan runs every dX chunk the slice rule gives one slice as a
+  two-slice K-sliced reduction in its counted form
+  (`cake_backend.counted_dx_slices`): the chunk computes no row past its
+  count.  The chunks, the other chunks' slices and the other GEMMs' forms do
+  not change.  Not raised: an
+  explicit dX `k_slices` in `gemm_tuning`, a record that serves one slice, a
+  vocabulary of one K step, and a plan whose two-slice forms would have no
+  counted form (it keeps the slice rule's counts).  sm_107a keeps the slice
+  rule's counts.
 * The fused dX finalize writes exact `+0` rows for the zero-gradient rows (as
   for an ignored row); `dX` of a live row is the same mathematics as without
   the skip.  `dW` sums the same nonzero products over the live rows in the new
@@ -357,9 +382,15 @@ it handles these rows on the device, without a host synchronization:
   (the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
   `dX`, the fused dX finalize, on a record that registers the `_dcnt` forms
   and the partition kernel, and of at least
-  `cake_backend.zero_dlogp_min_rows()` valid rows (default 4097, one row
-  above a default 4096-row chunk: a one-chunk backward is too short to repay
-  the partition launch; `set_zero_dlogp_min_rows`; `None` = never).  The
+  `cake_backend.zero_dlogp_min_rows(device)` valid rows, the floor of the
+  call's CUDA device index: the override of `set_zero_dlogp_min_rows` when
+  one is set (an integer, or `None` = never, on every architecture), else the
+  architecture's default floor -- `ZERO_DLOGP_MIN_ROWS_BY_ARCH` (the table
+  below), and `ZERO_DLOGP_MIN_ROWS_DEFAULT` = 4097 (one row above a default
+  4096-row chunk) elsewhere, sm_107a included.  With no override set the setter
+  returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`; passing it back (or a copy or
+  an unpickled copy of it) restores the per-architecture default, and
+  `zero_dlogp_min_rows()` without a device returns 4097.  The
   call's plan decides: under the skip the last chunk's bf16 fused cast runs
   its counted form -- the counted TMA-epilogue form
   (`gemm_dw_cast_bf16_tma_dcnt`) where the plan without the skip takes the
@@ -376,10 +407,32 @@ the row falls within the 63 rows after a chunk's live rows (the weight-gradient
 GEMM's last 64-row K step), and not elsewhere.  Its `dX` row is an exact zero
 either way.
 
+Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
+
+| architecture | floor | chosen from |
+| --- | --- | --- |
+| sm_100a (B200) | 1946 (T = 2048 with 5 % ignored rows) | timing on B200 at 1946 and 3891 valid rows |
+| sm_103a (GB300) | 3891 (T = 4096 with 5 % ignored rows) | timing on GB300 at 1946 and 3891 valid rows |
+| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not timed below one default chunk |
+
+The per-architecture floors put one-chunk backwards from the floor (1946 valid
+rows on sm_100a, 3891 on sm_103a) to 4096 valid rows on the skip, which the
+generic 4097 floor keeps off it.  On those calls: the `dW` bits can differ
+from the call without the skip (the new row order; within the accuracy
+budgets, the same bits run to run); a
+non-finite `X` row of a zero-gradient row makes `dW` NaN only within the
+63-row window above, as for the skip at 4097 rows and more; and the call holds
+the partition's int32 outputs (12 bytes per valid row plus 4 per row of T,
+about 31 KB at T = 2048 with 1946 valid rows) for the whole backward, so its peak
+memory is that much higher than without the skip.
+`set_zero_dlogp_min_rows(4097)` keeps every architecture at the generic floor.
+
 Not applied: `compact_rows=False`, a backward that recounts its valid rows,
-the kept-logits entry, `memory_mode="budget"`, a call with a temperature, the
-prepared runner and the reference backend.  The one-slice dX chunks (the plain store) compute every
-row of the chunk.
+the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
+reference backend.  A call with a temperature takes the skip with its own
+plan (above): the counted temperature form of the dz arm and the counted dX /
+dW GEMMs.  A one-slice dX chunk (the plain store; on sm_107a, or pinned
+with `gemm_tuning`) computes every row of the chunk.
 
 ## Kernel structure of one token chunk
 
@@ -476,10 +529,18 @@ import is the JIT fallback of `cake_build.py`.
   reduction forms pass this package's support tests on GB300.
 * `sm_107a`: the `sm_107a` record registers every stage of the `sm_103a`
   record, each program built for `sm_107a` (the deterministic family's
-  `sm_107a` programs under this package's prefix and the `sm_103a` reduction
-  forms).  No per-architecture rule table lists `sm_107a`, so its rules reach
-  the device-count logits forms and the 256-wide dX tiles of the structural
-  forms, as on the deterministic package.
+  `sm_107a` programs under this package's prefix, the `sm_103a` reduction
+  forms and the zero-gradient row skip's counted forms and partition kernel).
+  The per-architecture GEMM tile rule tables give `sm_107a` the `sm_103a`
+  entries (the logits and weight-gradient raster heights, the weight-gradient
+  blocked raster, the split-tail and swapped dX tiles), except the 3-deep dX
+  operand ring of the long chunks (`DX_LONG_CHUNK_STAGES`): on `sm_107a` those
+  chunks keep the table ring depth.  The zero-gradient row skip is not one of
+  them: `ZERO_DLOGP_MIN_ROWS_BY_ARCH` has no `sm_107a` entry, so `sm_107a`
+  keeps the generic 4097-row floor (`ZERO_DLOGP_MIN_ROWS_DEFAULT`; `sm_103a`:
+  3891). `dw_cast_tma_rule`
+  bounds `sm_107a` as `sm_103a` (1792 rows): a short last chunk takes the
+  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.
 * Temperature of the log-probability entry
   (https://github.com/flashinfer-ai/flashinfer/issues/7637): the
   deterministic package's four temperature forms per architecture (the row

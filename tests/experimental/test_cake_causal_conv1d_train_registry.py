@@ -15,7 +15,8 @@ limitations under the License.
 
 The single-rank registry (``cake_jit``) of the non-deterministic causal convolution training package against the
 deterministic package's: the forward records are the deterministic forward programs (only their names differ),
-every backward route keeps the deterministic route's programs and selection, each backward program is ONE
+every backward route keeps the deterministic route's programs and selection (but where a channel-band program takes
+the lowest channel counts of its twin, the program of the route it shares a body with), each backward program is ONE
 ordinary launch (no reduce program) that owns an ``accumulators`` workspace (FP32, or FP64 on the ``_fp32g``
 routes; ``[C, 4]`` taps then ``[C]`` bias words; uint32 ticket counters per channel tile), and the workspace byte
 layout and size depend on ``C`` and the route only.  The ``deterministic`` keyword of every public entry point,
@@ -70,6 +71,7 @@ CHANNELS = (
     512,
     768,
     1024,
+    1032,
     1160,
     1280,
     1344,
@@ -83,6 +85,17 @@ CHANNELS = (
 )
 # 262143 / 262144: both sides of the sm_107a token-floored backward program's floor.
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340, 262143, 262144)
+# The deterministic package's programs this package does not have: the row-group backward program of route ``bwd``
+# on sm_107a (264 <= C < 512) and the SM-wide row-group programs of route ``bwd`` on sm_100a and sm_103a (channel
+# bands of 264 <= C < 512, from a token floor).  Every other record pairs with this package's at the same route
+# position.
+DET_ONLY = frozenset(
+    {
+        "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "cake_causal_conv1d_det_train_e057357c655024d4ff1d",
+        "cake_causal_conv1d_det_train_baca4c969c783d07d81f",
+    }
+)
 
 
 @contextmanager
@@ -100,17 +113,60 @@ def _args(record: dict) -> set[str]:
     return {name for kind, name in record["arg_plan"] if kind != "grid"}
 
 
+def _det_route(arch: str, kind: str) -> list[str]:
+    """The deterministic route of ``(arch, kind)`` without its :data:`DET_ONLY` programs."""
+
+    return [name for name in det_jit.ROUTES[arch][kind] if name not in DET_ONLY]
+
+
 def _pairs(role: str):
-    """``(arch, kind, new record name, det record name)`` of every route of ``role``, in route order."""
+    """``(arch, kind, new record name, det record name)`` of every route of ``role``, in route order: the
+    deterministic route's programs, position for position (the route's channel-band programs follow them, see
+    :func:`_bands`)."""
 
     for arch in ARCHES:
         for kind in cake_jit.KINDS:
             if cake_jit.route_role(kind) != role:
                 continue
-            new, det = cake_jit.ROUTES[arch][kind], det_jit.ROUTES[arch][kind]
-            assert len(new) == len(det), (arch, kind)
-            for name, det_name in zip(new, det, strict=True):
+            new, det = cake_jit.ROUTES[arch][kind], _det_route(arch, kind)
+            assert len(new) >= len(det), (arch, kind)
+            for name, det_name in zip(new[: len(det)], det, strict=True):
                 yield arch, kind, name, det_name
+
+
+def _channels(registry, name: str, arch: str) -> int | None:
+    """The lowest channel threshold of a program's rule on ``arch``: a deterministic program the det-only programs
+    split into several channel bands runs here from the first of them."""
+
+    rule = registry.select_rule(registry.MODULES[name])
+    value = None if rule is None else rule["channels"].get(arch)
+    return value[0] if isinstance(value, list) else value
+
+
+def _bands():
+    """``(arch, kind, band name, twin name, det twin name)`` of every channel-band program: a program a route lists
+    after the deterministic route's programs.  Its twin is the program of the route whose channel threshold on
+    ``arch`` is no longer the deterministic one: the band program owns the twin's lowest channel counts there, from
+    the deterministic threshold up to the twin's new one."""
+
+    for arch in ARCHES:
+        for kind in cake_jit.KINDS:
+            new, det = cake_jit.ROUTES[arch][kind], _det_route(arch, kind)
+            moved = [
+                (name, det_name)
+                for name, det_name in zip(new[: len(det)], det, strict=True)
+                if _channels(cake_jit, name, arch) != _channels(det_jit, det_name, arch)
+            ]
+            for band in new[len(det) :]:
+                (twin,) = [
+                    pair
+                    for pair in moved
+                    if _channels(det_jit, pair[1], arch)
+                    == _channels(cake_jit, band, arch)
+                ]
+                moved.remove(twin)
+                yield arch, kind, band, *twin
+            assert not moved, (arch, kind, moved)
 
 
 @pytest.mark.cpu_only
@@ -173,6 +229,7 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
     tap count."""
 
     vocabulary = set(cake_jit.LOGICAL_TENSORS) | set(cake_jit.LOGICAL_SCALARS)
+    twins = {twin: band_arch for band_arch, _, _, twin, _ in _bands()}
     for arch, kind, name, det_name in _pairs("bwd"):
         record, det = cake_jit.MODULES[name], det_jit.MODULES[det_name]
         bias = "bias" in kind
@@ -213,7 +270,16 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
             isinstance(launch["dynamic_smem_bytes"], int)
             and launch["dynamic_smem_bytes"] >= 0
         )
-        assert cake_jit.select_rule(record) == det_jit.select_rule(det), label
+        # A twin keeps the deterministic rule but on the architecture of its channel-band program.
+        det_rule = det_jit.select_rule(det)
+        if det_rule is not None:
+            channels = {
+                a: _channels(det_jit, det_name, a) for a in det_rule["channels"]
+            }
+            det_rule = {**det_rule, "channels": channels}
+        if name in twins:
+            det_rule["channels"][twins[name]] = _channels(cake_jit, name, twins[name])
+        assert cake_jit.select_rule(record) == det_rule, label
         rule = dict(record["workspace_rule"])
         assert "slots" in rule, label  # required: the package never defaults it
         slots = rule.pop("slots")
@@ -230,18 +296,67 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("arch", ARCHES)
-def test_selection_matches_the_deterministic_package(arch) -> None:
-    """A call selects the program at the same route position as the deterministic package for every ``(S, C)``,
-    and plans the same scalars (``y`` / ``dx`` keep their per-element arithmetic)."""
+def test_channel_band_programs_take_their_twins_lowest_channels() -> None:
+    """A channel-band program ships for one architecture: its record is its twin's under its own name, architecture
+    and selection rule (the rendered occupancy and shared memory aside).  It owns the calls from the deterministic
+    program's channel threshold, and the twin those from a higher one, so the route still runs one program per
+    ``(S, C)``."""
 
+    bands = list(_bands())
+    assert {(arch, kind) for arch, kind, *_ in bands} == {
+        ("sm_107a", "bwd"),
+        ("sm_107a", "bwd_bias"),
+        ("sm_107a", "bwd_fp32g"),
+    }
+    for arch, kind, band, twin, det_twin in bands:
+        record, twin_record = cake_jit.MODULES[band], cake_jit.MODULES[twin]
+        label = (arch, kind, band)
+        assert band not in det_jit.MODULES and record["arches"] == [arch], label
+        assert record["library"] == record["kernel"] == band, label
+        assert record["kernel_symbol"] == f"kernel_{band}", label
+        threshold = _channels(cake_jit, band, arch)
+        assert threshold == _channels(det_jit, det_twin, arch), label
+        assert threshold < _channels(cake_jit, twin, arch), label
+        assert cake_jit.select_rule(record) == {
+            "channels": {arch: threshold},
+            "kind": "channels_at_least",
+        }, label
+        grid, twin_grid = record["grid_rule"], twin_record["grid_rule"]
+        assert grid["grid_mult"] == {arch: twin_grid["grid_mult"][arch]}, label
+        derived = ("grid_mult", "ctas_per_sm")
+        assert _strip(grid, *derived) == _strip(twin_grid, *derived), label
+        launch = _strip(record["launch"], "dynamic_smem_bytes")
+        assert launch == _strip(twin_record["launch"], "dynamic_smem_bytes"), label
+        own = ("arches", "select_rule", "grid_rule", "launch", *NAME_FIELDS)
+        assert _strip(record, *own) == _strip(twin_record, *own), label
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_selection_matches_the_deterministic_package(arch, monkeypatch) -> None:
+    """A call selects the program at the same route position as the deterministic package for every ``(S, C)``,
+    and plans the same scalars (``y`` / ``dx`` keep their per-element arithmetic).  Where the deterministic package
+    selects a det-only program, this package selects what the deterministic package selects without its det-only
+    records."""
+
+    twin_of = {
+        band: twin for band_arch, _, band, twin, _ in _bands() if band_arch == arch
+    }
+    det_only_hits = set()
     for kind in cake_jit.KINDS:
-        new, det = cake_jit.ROUTES[arch][kind], det_jit.ROUTES[arch][kind]
+        new, det = cake_jit.ROUTES[arch][kind], _det_route(arch, kind)
         for C in CHANNELS:
             for S in TOKENS:
                 (name,) = cake_jit.selected_modules(arch, kind, C=C, S=S)
                 (det_name,) = det_jit.selected_modules(arch, kind, C=C, S=S)
-                assert new.index(name) == det.index(det_name), (arch, kind, C, S)
+                if det_name in DET_ONLY:
+                    det_only_hits.add(det_name)
+                    with monkeypatch.context() as m:
+                        m.setitem(det_jit.ROUTES[arch], kind, det)
+                        (det_name,) = det_jit.selected_modules(arch, kind, C=C, S=S)
+                # A channel-band program serves its twin's route position.
+                position = new.index(twin_of.get(name, name))
+                assert position == det.index(det_name), (arch, kind, C, S)
                 record, det_record = cake_jit.MODULES[name], det_jit.MODULES[det_name]
                 geometry = record["grid_rule"]["geometry"]
                 assert cake_jit.plan(
@@ -253,6 +368,10 @@ def test_selection_matches_the_deterministic_package(arch) -> None:
                     geometry=det_record["grid_rule"]["geometry"],
                     role=det_record["role"],
                 ), (arch, kind, C, S)
+    det_only_routed = {
+        name for name in DET_ONLY if arch in det_jit.MODULES[name]["arches"]
+    }
+    assert det_only_hits == det_only_routed, arch
 
 
 def _align16(n: int) -> int:

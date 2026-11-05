@@ -669,6 +669,36 @@ def test_l2n_plans_need_l2n_records(arch: str) -> None:
         cake_backend.plan(256, 1, 2, 148, arch, l2n="on")
 
 
+@pytest.mark.parametrize("arch", list(cake_jit.ARCHES))
+def test_fallback_replay_counts_no_qk_apply(arch: str) -> None:
+    """The fallback plan selects a ``qk_apply`` record on the replay path too (the KCP's local backward plans on
+    that path), but the replay normalizes q / k with ``qk_l2norm`` and never launches ``qk_apply``: the replay's
+    stages and launch count leave it out, while the saved-set paths keep it and launch no ``qk_l2norm``."""
+    try:
+        cake_backend.plan(256, 1, 2, 148, arch, l2n="fallback")
+    except ValueError:
+        pytest.skip(f"this build ships no fallback records for {arch}")
+    for S, N, H in ((256, 1, 2), (5000, 3, 16), (64 * 40, 300, 64)):
+        p = cake_backend.plan(S, N, H, 148, arch, l2n="fallback")
+        assert p.dispatched("qk_apply", "replay") and p.dispatched(
+            "qk_l2norm", "replay"
+        )
+        selected = {s for s, r in p.records["replay"].items() if r is not None}
+        assert set(p.stages("replay")) == selected - {"qk_apply"}
+        assert "qk_l2norm" in p.stages("replay") and "qk_pullback" in p.stages("replay")
+        for path in ("light", "tape"):
+            assert "qk_apply" in p.stages(path) and "qk_l2norm" not in p.stages(path)
+        try:
+            fused = cake_backend.plan(S, N, H, 148, arch, l2n="fused")
+        except ValueError:
+            continue
+        # the fused class runs the same stages but the token-local ones: the fallback replay adds exactly the
+        # normalize and the pullback launches
+        assert p.launch_count("replay") == fused.launch_count("replay") + p.launches(
+            "qk_l2norm", "replay"
+        ) + p.launches("qk_pullback", "replay")
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # device rows (skip without an exported device or without the l2n records of its architecture)
 
@@ -1038,6 +1068,42 @@ def test_l2n_fused_equals_the_fallback_route(shape) -> None:
         assert _bits(a).equal(_bits(b)), "replay"
 
 
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
+def test_l2n_fallback_launch_counts_are_the_launches(shape) -> None:
+    """On the fallback route ``Plan.launch_count`` is the number of programs each backward launches: the saved-set
+    backward applies the saved rstd (``qk_apply``), the replay recomputes it (``qk_l2norm``) and launches no
+    ``qk_apply`` although its plan selects one."""
+    device = _l2n_device("fallback")
+    lengths, H = shape
+    inputs = _l2n_inputs(lengths, H, device)
+    S, N = sum(lengths), len(lengths)
+    launched: list[str] = []
+
+    def recording(name, values, *, grid, device_index):
+        launched.append(name)
+        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+    ws = cake_backend.KdaDetWorkspace.for_problem(
+        S, N, H, device, launcher=recording, l2n="fallback"
+    )
+    p = ws.plan
+    _, saved = _fwd(inputs, workspace=ws)
+    launched.clear()
+    _bwd(inputs, saved, workspace=ws)
+    torch.cuda.synchronize(device)
+    assert len(launched) == p.launch_count("bwd")
+    assert p.record("qk_apply", p.light_path) in launched
+    launched.clear()
+    _bwd(inputs, None, workspace=ws)
+    torch.cuda.synchronize(device)
+    assert len(launched) == p.launch_count("replay")
+    assert p.dispatched("qk_apply", "replay")
+    assert p.record("qk_apply", "replay") not in launched
+    assert p.record("qk_l2norm", "replay") in launched
+
+
 @pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
 @pytest.mark.parametrize("save_mode", ["light", "tape"])
 @pytest.mark.parametrize("mode", ["fused", "fallback"])
@@ -1219,3 +1285,53 @@ def test_l2n_refusals_on_device() -> None:
     ]
     with pytest.raises(ValueError, match="never copied"):
         _fwd(dict(inputs, q=bad_q))
+
+
+@pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
+@pytest.mark.parametrize("H", [16, 32])
+@pytest.mark.parametrize(
+    "lengths, batch_tokens",
+    [((100, 126, 50), 226), ((100, 128, 50), 228)],
+    ids=["overhang", "aligned"],
+)
+def test_l2n_batched_replay_reads_no_unwritten_row_of_the_next_group(
+    lengths, batch_tokens: int, H: int, raw_gate: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batched arena's replay with use_qk_l2norm_in_kernel=True on the serial route (H 32 on every
+    architecture, H 16 on sm_100a): the plain intra program of group 0 box-reads up to BT - 1 rows past the group
+    end of the per-call qn / kn (``"overhang"``: document 1 ends 62 rows into its last chunk), which group 1's
+    prep writes only later.  With every per-call float tensor and the arena filled with NaN, the replay before and
+    after a forward and a saved-set backward on the workspace gives finite gradients bitwise the per-call whole
+    problem's (``"aligned"``: the group ends on a chunk boundary, the control)."""
+    device = _l2n_device()
+    gate = "raw" if raw_gate else "g"
+    S, N = sum(lengths), len(lengths)
+    assert cake_backend.doc_batches(lengths, batch_tokens) == ((0, 2), (2, 3))
+    inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
+    ref = [t.clone() for t in _bwd(inputs, None, raw_gate)]
+    alloc = cake_backend._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = alloc(shape, dtype, dev)
+        if t.is_floating_point() and t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(cake_backend, "_alloc", nan_alloc)
+    arena = cake_backend.KdaDetArena(batch_tokens=batch_tokens)
+    for case in ("replay first", "replay after"):
+        ws = cake_backend.KdaDetWorkspace.for_problem(
+            S, N, H, device, arena=arena, doc_lengths=lengths, gate=gate, l2n="fused"
+        )
+        ws.arena.fill_(0xFF)
+        kw = {"workspace": ws, "doc_lengths": lengths}
+        runs = []
+        if case == "replay after":
+            _, saved = _fwd(inputs, raw_gate, **kw)
+            runs.append(("saved", _bwd(inputs, saved, raw_gate, **kw)))
+        runs.append((case, _bwd(inputs, None, raw_gate, **kw)))
+        for tag, got in runs:
+            for i, (a, b) in enumerate(zip(got, ref, strict=True)):
+                assert bool(torch.isfinite(a).all()), (H, gate, tag, i)
+                assert _bits(a).equal(_bits(b)), (H, gate, tag, i)
+        del ws

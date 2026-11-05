@@ -201,9 +201,16 @@ FUSED_L2N_RECORDS = {
     "bwd_prep_g8_noqg_nokb_l2n": "bwd_prep_g8_noqg_nokb_raw_l2n",
     "glm_intra_l2n": "glm_intra_raw_l2n",
 }
-# The fused class's sm_103a forward intra program (fwd_intra v37: v35 with the norm in one pass over both tiles, every
-# output v35's bit for bit): a g record of its own with no raw twin, selected where its sibling is on sm_103a alone
-FUSED_L2N_SM103 = {"fwd_intra_v37_l2n": "fwd_intra_l2n"}
+# The fused class's sm_103a programs (fwd_intra v37: v35 with the norm in one pass over both tiles, every output v35's
+# bit for bit; glm_intra v30: v27 with the norm's pullback eight lanes per row, every output v27's bit for bit): each a
+# g record of its own with no raw twin, selected where its sibling is on sm_103a alone
+FUSED_L2N_SM103 = {
+    "fwd_intra_v37_l2n": "fwd_intra_l2n",
+    "glm_intra_v30_l2n": "glm_intra_l2n",
+}
+# The fused class's saved-rstd twin (glm_bwd_prep v11_g8): a g record the KCP backward launches by name in place of
+# its record (the replay prep) when it reads the saved rstd, on sm_100a / sm_103a; its rule admits no problem
+FUSED_L2N_TWINS = {"bwd_prep_g8_replay_saved_l2n": "bwd_prep_g8_replay_l2n"}
 RAW_GLM_INTRA = "glm_intra_raw"
 RAW_FINALIZE = "param_finalize"
 # the raw operands the raw records bind in place of the activated gate g (the TMA reader of the forward takes the
@@ -359,6 +366,7 @@ SELECT_KINDS = (
     "arch_in",
     "path_in",
     "l2n_in",  # the in-kernel Q/K L2 norm mode (#7817)
+    "saved_rstd_twin",  # a record launched by name in place of another, never selected (#7817)
 )
 GRID_KINDS = (
     "fixed",
@@ -377,13 +385,18 @@ GRID_KINDS = (
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
 # carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a, the fused
-# ones on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18)
+# ones on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18), the fused gradient's hints-off builds on sm_107a,
+# the one architecture their rule admits, and the replay prep's saved-rstd twin on sm_100a / sm_103a
 RECORD_ARCHES = {
     "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
     "glm_intra_v18": ("sm_107a",),
     "gate_epilogue": ("sm_100a",),
     "fwd_intra_v37_l2n": ("sm_103a",),
+    "glm_intra_v30_l2n": ("sm_103a",),
+    "dqkg_davq_nohint": ("sm_107a",),
+    "dqkg_int_davq_nohint": ("sm_107a",),
+    "bwd_prep_g8_replay_saved_l2n": ("sm_100a", "sm_103a"),
 }
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -478,10 +491,10 @@ def _route_rule(route: str) -> dict:
 def test_registry_records_are_well_formed() -> None:
     # the 67 g-mode records, the 8 raw-gate ones (each raw record its own library), the 3 programs of the
     # in-kernel Q/K L2 norm's fallback route and its 2 GLM intra capture forms (g, raw), and the 14 records of its
-    # fused class (FUSED_L2N_RECORDS: 7 g, 7 raw, each its own library) and its sm_103a forward intra form
-    # (FUSED_L2N_SM103)
-    assert len(cake_jit.MODULES) == 95
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 93
+    # fused class (FUSED_L2N_RECORDS: 7 g, 7 raw, each its own library), its sm_103a forward intra and GLM intra
+    # forms (FUSED_L2N_SM103) and the replay prep's saved-rstd twin (FUSED_L2N_TWINS)
+    assert len(cake_jit.MODULES) == 97
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 95
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert frozenset(cake_jit.GATE_STAGES) == GATE_STAGES
@@ -1122,7 +1135,7 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
         assert g_fused == tuple(
             n
             for n in modules
-            if (n in FUSED_L2N_RECORDS or n in FUSED_L2N_SM103)
+            if (n in FUSED_L2N_RECORDS or n in FUSED_L2N_SM103 or n in FUSED_L2N_TWINS)
             and modules[n]["stage"] == stage
         )
         assert fused_only(cake_jit.records_of_stage(stage, "raw")) == tuple(
@@ -1970,10 +1983,12 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
     fused_preps = tuple(f"{name}_l2n" for name in preps)
 
     def l2n_class(gate: str, fused: bool) -> tuple[str, ...]:
+        # the saved-rstd twin (FUSED_L2N_TWINS) is no plan's form: test_the_saved_rstd_twin_of_the_replay_prep
         return tuple(
             n
             for n in cake_jit.records_of_stage("bwd_prep", gate)
             if (cake_jit.MODULES[n].get("l2n", ["off"]) == ["fused"]) == fused
+            and n not in FUSED_L2N_TWINS
         )
 
     assert l2n_class("g", False) == preps
@@ -2033,14 +2048,14 @@ def test_the_fused_gradient_turns_its_l2_hints_off_on_the_large_sm107a_rows() ->
     # The fused gradient's L2 prefetch and evict-first hints cost about 6 % on the sm_107a rows from 16 heads, so
     # its dAqk-hosting forms ship a second build there with the hints off (the `_nohint` records: the same kernel,
     # launch and operands; the hint thresholds beyond any head count).  The registry dispatches them on sm_107a
-    # from 16 heads alone, on either route (its 16-head rows are segmented ones); the other architectures keep the
-    # hinted builds.
+    # from 16 heads alone, on either route (its 16-head rows are segmented ones), and ships them for sm_107a alone;
+    # the other architectures keep the hinted builds.
     for name in ("dqkg_davq_nohint", "dqkg_int_davq_nohint"):
         record = cake_jit.MODULES[name]
         hinted = cake_jit.MODULES[name[: -len("_nohint")]]
         assert record["stage"] == hinted["stage"] == "dqkg"
         assert record["library"] != hinted["library"]
-        assert record["arches"] == hinted["arches"] == list(ARCHES)
+        assert record["arches"] == ["sm_107a"] and hinted["arches"] == list(ARCHES)
         assert record["logical"] == hinted["logical"]
         assert record["arg_plan"] == hinted["arg_plan"]
         assert record["launch"] == hinted["launch"]
@@ -3684,16 +3699,17 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 93 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs, the 5 of the Q/K L2 norm's
-    # fallback route and the 15 of its fused class), each built for the architectures its record delivers (88 on
-    # all three, the five of RECORD_ARCHES on one each: 269 libraries); the KCP programs have their own package.
+    # The 95 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs, the 5 of the Q/K L2 norm's
+    # fallback route and the 17 of its fused class), each built for the architectures its record delivers (86 on
+    # all three, eight of RECORD_ARCHES on one each, the saved-rstd twin on two: 268 libraries); the KCP programs
+    # have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 269
-    assert len(names) == len(set(names)) == 269
+    assert len(train_libraries) == 268
+    assert len(names) == len(set(names)) == 268
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -8625,3 +8641,46 @@ def test_raw_gate_arena_and_per_call_content_never_reach_a_result(
             monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
             for t, r in zip(got, replay, strict=True):
                 assert _bits_equal(t, r), (case, "replay")
+
+
+def test_the_saved_rstd_twin_of_the_replay_prep() -> None:
+    """The replay prep's saved-rstd twin (#7817, glm_bwd_prep v11_g8): the KCP backward launches it by name in place
+    of ``bwd_prep_g8_replay_l2n`` when it reads the saved rstd (``read_rstd = 1``).  It serves its record's stage,
+    gate class, ``l2n`` modes, grid rule, kernel plan and logical arguments with the same block, cluster and PDL
+    attribute, ships on sm_100a / sm_103a (sm_107a keeps the record alone) under a library of its own, and its rule
+    ``saved_rstd_twin`` admits no problem: every plan selects what it selects without it."""
+    modules = cake_jit.MODULES
+    for twin, name in FUSED_L2N_TWINS.items():
+        rec, trec = modules[name], modules[twin]
+        for key in ("stage", "l2n", "grid_rule", "arg_plan", "logical", "ffi_entry"):
+            assert trec[key] == rec[key], (twin, key)
+        assert trec.get("gate", "g") == rec.get("gate", "g") == "g", twin
+        assert trec["l2n"] == ["fused"], twin
+        assert trec["select_rule"] == {"kind": "saved_rstd_twin"}, twin
+        assert list(trec["arches"]) == ["sm_100a", "sm_103a"], twin
+        assert set(trec["arches"]) < set(rec["arches"]), twin
+        for key in ("block", "cluster", "use_pdl"):
+            assert trec["launch"][key] == rec["launch"][key], (twin, key)
+        assert trec["library"] != rec["library"], twin
+        selected = 0
+        for arch in ARCHES:
+            for path in PATHS:
+                for docs in (1, 8, 300):
+                    for heads in (16, 64):
+                        for l2n in ("off", "fused", "fallback"):
+                            try:
+                                picked = cake_jit.select_record(
+                                    trec["stage"],
+                                    num_chunks_pad=264,
+                                    num_seqs=docs,
+                                    num_heads=heads,
+                                    sm_count=148,
+                                    arch=arch,
+                                    path=path,
+                                    l2n=l2n,
+                                )
+                            except ValueError:
+                                continue  # the stage does not run on this path
+                            selected += 1
+                            assert picked != twin, (arch, path, docs, heads, l2n)
+        assert selected

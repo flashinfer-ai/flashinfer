@@ -2,3 +2,10 @@ import BIKernels.GEMM
 import BIKernels.GEMMConfig
 import BIKernels.Export
 import BIKernels.Cases
+import BIKernels.Canon
+import BIKernels.Semantics
+import BIKernels.Support
+import BIKernels.MXQuant
+import BIKernels.Quant
+import BIKernels.QuantExport
+import BIKernels.QuantCases

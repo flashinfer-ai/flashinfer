@@ -364,6 +364,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
         offsets: cute.Tensor,
         stream,
     ):
+        """Build FC2 descriptors and launch the weighted token-scatter epilogue.
+
+        Packed scale storage is sized in the recast operand's element units.
+        """
         cfg = self.cfg
         tiledmma = cfg.mma.make_tiled_mma(cfg.TILE)
         tiled_r2s = cfg.epi.make_tiled_r2s(tiledmma)
@@ -377,8 +381,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
         gW = cute.make_tensor(
             gB_e.iterator, cute.make_layout((N, K, E), stride=(K, 1, N * K))
         )
-        m_padded_sf = cute.size(gSFA_u8, mode=[1])
         sf_dtype = cfg.load_sf.sf_dtype
+        # The uint8 storage packs four UE8M0 scales into each Int32 row.
+        # Use the recast element extent for the TMA shape and K-plane stride.
+        m_padded_sf = cute.size(cute.recast_tensor(gSFA_u8, sf_dtype), mode=[1])
         t_a, t_b = gA, gW
         gSFA = cute.make_tensor(
             cute.recast_ptr(gSFA_u8.iterator, dtype=sf_dtype),

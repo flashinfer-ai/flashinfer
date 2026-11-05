@@ -167,6 +167,20 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
 
 
 @pytest.mark.cpu_only
+def test_post_fc2_routing_weights_reach_sm107_nvfp4_tuner(monkeypatch):
+    received = []
+    monkeypatch.setattr(
+        tune.importlib,
+        "import_module",
+        lambda *args: SimpleNamespace(run_tuning=lambda args: received.append(args)),
+    )
+    tune.main([*_GEOMETRY, "--arch", "sm107", "--no-apply-routing-weights-before-fc2"])
+    (args,) = received
+    assert args.do_finalize
+    assert not args.apply_routing_weights_before_fc2
+
+
+@pytest.mark.cpu_only
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
     received = []
     monkeypatch.setattr(

@@ -221,6 +221,9 @@ for _path in ("light", "light_states", "tape"):
         s for s in _PATH_STAGES["replay"] if s not in ("fwd_intra", "qk_l2norm")
     )
 del _path
+# Stages the replay path selects a record for but never launches (:meth:`Plan.stages`): the fallback's
+# ``qk_apply`` reads a saved rstd, which the replay recomputes with ``qk_l2norm`` instead.
+_REPLAY_UNLAUNCHED = ("qk_apply",)
 
 # A launcher takes a record name, the logical argument values, the plan grid and the device index and runs the
 # program (``cake_jit.run_module``).  The workspace holds one so a diagnostic harness can run the same composition
@@ -549,13 +552,18 @@ class Plan:
 
     def stages(self, path: str) -> tuple[str, ...]:
         """The stages ``path`` launches on this plan, in registry order (the tables included; ``seg_carry`` on the
-        segmented route)."""
+        segmented route).  The in-kernel Q/K L2 norm fallback's replay normalizes q / k with ``qk_l2norm`` (it
+        writes the rstd) and launches no ``qk_apply``: the plan keeps that record among the replay path's records (the
+        KCP's local backward plans on that path), but this module does not launch it there."""
         self._records(path)
         return tuple(
             stage
             for stage in _PATH_STAGES[path]
             if (stage == "seg_carry" and self.recur == "seg")
-            or self.dispatched(stage, path)
+            or (
+                self.dispatched(stage, path)
+                and not (path == "replay" and stage in _REPLAY_UNLAUNCHED)
+            )
         )
 
     def launch_count(self, path: str, *, tables: bool = True) -> int:
@@ -5108,6 +5116,19 @@ def _backward(
                 mode
             )  # every group's layout fits the arena, or ValueError before any launch
         _assert_doc_lengths(cu_seqlens, packing.lengths)
+        if l2n == "fused" and replay:
+            # the replay's plain intra program (the groups whose plan dispatches the table program) reads 64-row q / k
+            # boxes of the per-call qn / kn at each chunk's absolute chunk_bos and masks the rows past the chunk end
+            # by a zeroed gate factor (0 * NaN = NaN): a group's last chunk reaches up to BT - 1 rows of the next
+            # group, which only that group's prep writes (rows t < chunk_len), after this group ran.  Define them
+            # first; the next group's prep overwrites its real rows before any of its readers.  The fallback's
+            # qk_l2norm has already written every row here.
+            end = 0
+            for batch, ws_b in views_b[:-1]:
+                end += batch.S
+                if ws_b.plan.dispatched("table", path):
+                    lv["qn"][end : end + BT - 1].zero_()
+                    lv["kn"][end : end + BT - 1].zero_()
         # the groups build their own tables; their blocks of the saved states come by chain rank (from doc_lengths
         # on the host, :class:`_Packing`)
         from_saved = seg and not replay and (tape or light_states)

@@ -69,6 +69,8 @@ def make_kernel_selector(
     arch,
     name,
     sm_count,
+    *,
+    cluster_capacities=(),
 ):
     """Return shape selection over captured catalogs and shortlist profiles."""
     from .catalog import can_implement, select_kernels as select_catalog
@@ -107,6 +109,7 @@ def make_kernel_selector(
             experts=experts,
             topk=topk,
             sm_count=sm_count,
+            cluster_capacities=cluster_capacities,
         )
 
     return select_kernels
