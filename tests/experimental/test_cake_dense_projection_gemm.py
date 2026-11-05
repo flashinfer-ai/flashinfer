@@ -1710,7 +1710,6 @@ K1_148_EXCLUDED_TOKENS = {
     ("sm_100a", 4096, 48, "f32"): ((512, 512),),
     ("sm_100a", 4096, 64, "bf16"): ((512, 512), (65536, None)),
     ("sm_100a", 4096, 64, "f32"): ((512, 512), (65536, None)),
-    ("sm_100a", 5120, 32, "bf16"): ((49153, None),),
     ("sm_100a", 5120, 48, "bf16"): ((512, 2048),),
     ("sm_100a", 5120, 48, "f32"): ((512, 512),),
     ("sm_100a", 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
@@ -1726,8 +1725,8 @@ K1_148_EXCLUDED_TOKENS = {
     ("sm_103a", 6144, 128, "bf16"): ((512, 8192),),
     ("sm_103a", 6144, 128, "f32"): ((512, 8192),),
 }
-#: The measured token counts of the 148-SM audit (40961, 47105, 49152 and 49153: points of the 10-seed FP64 error grids
-#: of sm_100a ``5120 -> 32`` and sm_103a ``5120 -> 48`` / ``5120 -> 64`` BF16).
+#: The measured token counts of the 148-SM audit (40961, 47105 and 49152: points of the 10-seed FP64 error grid of
+#: sm_103a ``5120 -> 48`` / ``5120 -> 64`` BF16).
 K1_148_MEASURED_TOKENS = (
     512,
     1024,
@@ -1739,7 +1738,6 @@ K1_148_MEASURED_TOKENS = (
     40961,
     47105,
     49152,
-    49153,
     65536,
 )
 
@@ -8457,6 +8455,17 @@ def _k1_with_chain_ranges(arch, sm_count, key, T, want):
     return (chain[0], 1), chain[1]
 
 
+#: Edge token counts of the GPU edge test at which the deterministic program itself misses the BF16 budget for some
+#: seed (measured, 10 seeds), so the budget does not choose the route there: ``(arch, sm_count, key, T) -> T'``.  The
+#: edge asserts the route only, and the accuracy rule runs at ``T'``, the nearest measured token count of the same
+#: range at which the deterministic program met the budget on every seed on the measured parts (``None``: none).
+K1_P1_EDGES = {
+    ("sm_103a", 148, ("sm_103a", 1, 4096, 32, "bf16"), 65535): 45057,
+    ("sm_103a", 148, ("sm_103a", 1, 5120, 48, "bf16"), 49152): None,
+    ("sm_103a", 148, ("sm_103a", 1, 5120, 64, "bf16"), 49153): None,
+}
+
+
 def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` or
@@ -8468,8 +8477,10 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
     a part of exactly the SM count of a table of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` (148-SM ``sm_100a`` /
     ``sm_103a`` parts) the reverse: the deterministic program with its bits at both ends of a range, the row's program
     one token outside it.  An edge inside a range of :data:`K1_CHAIN_RANGES_BY_SM` for the part runs that range's
-    program of several chains instead (:func:`_k1_with_chain_ranges`), under the same FP64 rule.  A part of any other SM
-    count skips."""
+    program of several chains instead (:func:`_k1_with_chain_ranges`), under the same FP64 rule.  At an edge of
+    ``K1_P1_EDGES`` the deterministic program itself misses the BF16 budget for some seed: the edge asserts the route
+    only, and the FP64 rule runs at the entry's token count of the same range instead (none: no check).  A part of any
+    other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -8496,8 +8507,21 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
             ), (key, T)
             _assert_ran(prepared.launch, prepared.module_name)
             torch.cuda.synchronize()
-            _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt} {T}")
             ran += 1
+            at = K1_P1_EDGES.get((arch, sm_count, key, T), T)
+            if at is None:
+                continue
+            if at != T:
+                G, X = _bf16((at, N), device, g), _bf16((at, M), device, g)
+                out = torch.full((N, M), float("nan"), device=device, dtype=out_dtype)
+                prepared = cake_backend.prepare_projection_wgrad(
+                    G, X, out, deterministic=False
+                )
+                assert isinstance(prepared, cake_backend.PreparedAtomicGemm), (key, at)
+                assert (prepared.plan.block_n, prepared.plan.splits) == plan, (key, at)
+                _assert_ran(prepared.launch, prepared.module_name)
+                torch.cuda.synchronize()
+            _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt} {at}")
         else:
             assert plan is None, (key, T)
             assert not isinstance(prepared, cake_backend.PreparedAtomicGemm), (key, T)

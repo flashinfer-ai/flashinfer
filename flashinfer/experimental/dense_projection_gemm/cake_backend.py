@@ -392,16 +392,16 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: from 65536 tokens on 152 SMs (the 148-SM entry is in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`), where the split
 #: program's output missed the BF16 budget for some seed and the deterministic program's did too (10 seeds per token
 #: count on a 148-SM B200 part; the deterministic plan of these rows is the same on 148 and 152 SMs).  sm_100a
-#: ``5120 -> 32`` BF16 keeps its entry from 65537 tokens: measured with 10 seeds (20 runs each) at 32769 to 65025
-#: tokens, its split program's output met the BF16 budget on every seed up to 49153 tokens on a 152-SM GB200 part, and
-#: from 53249 tokens both programs missed it for some seed on that part and on a 148-SM B200 part (the 148-SM entry from
-#: 49153 tokens is in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The sm_103a BF16 entries of ``5120 -> 32``,
-#: ``5120 -> 64`` and ``5120 -> 128`` start at 45058 tokens: their split program's output met the BF16 budget on every
-#: seed at 32768 tokens (30 seeds on two parts) and at every measured token count up to 45057 tokens on a 152-SM GB300
-#: part (10 seeds, 20 runs each), and missed it for some seed at the next measured token count, 47105, where the
-#: deterministic program's output missed it too; the row keeps the deterministic program from there up (the split
-#: program misses it on every seed at 65536 tokens, 30 seeds on two parts).  That of ``5120 -> 48`` starts at 40961
-#: tokens: on the 152-SM part its split program's output met the budget on every seed up to 49152 tokens (the
+#: ``5120 -> 32`` BF16 keeps its entry from 65537 tokens: measured with 10 seeds (20 runs each) at 32769 to 65025 tokens
+#: on a 148-SM B200 part and two 152-SM GB200 parts (finer from 45569 to 49665 tokens), both programs met the BF16
+#: budget on every seed up to 46593 tokens, and from 47105 tokens each missed it for some seed at some token counts,
+#: neither more accurate at every one; the budget does not choose a program there.  The sm_103a BF16 entries of
+#: ``5120 -> 32``, ``5120 -> 64`` and ``5120 -> 128`` start at 45058 tokens: their split program's output met the BF16
+#: budget on every seed at 32768 tokens (30 seeds on two parts) and at every measured token count up to 45057 tokens on
+#: a 152-SM GB300 part (10 seeds, 20 runs each), and missed it for some seed at the next measured token count, 47105,
+#: where the deterministic program's output missed it too; the row keeps the deterministic program from there up (the
+#: split program misses it on every seed at 65536 tokens, 30 seeds on two parts).  That of ``5120 -> 48`` starts at
+#: 40961 tokens: on the 152-SM part its split program's output met the budget on every seed up to 49152 tokens (the
 #: deterministic program's missed it for one seed at 45057 and at 49152 tokens), but on a 148-SM B300 part, which runs
 #: the same program, it missed it for one of 10 seeds at 40961 and at 40962 tokens while the deterministic program's met
 #: it on every seed; from 49153 tokens both miss it on the 152-SM part.  Unmeasured token counts keep the verdict: below
@@ -519,16 +519,13 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: the backward pass or the checkpointed step 1 % faster (sm_100a: the backward pass up to 3.5 % slower); where it spans
 #: an odd number (65537, 65538, 65600 and 65665 tokens) its BF16 output and the deterministic program's both miss the
 #: budget for some seed, and its FP32 output (a relative Frobenius error 2.1 to 2.3 % above the deterministic program's:
-#: reported) misses the FP32 budget on every seed from 98305 tokens, as the deterministic program's does.  sm_100a
-#: ``5120 -> 32`` BF16 runs the deterministic program from 49153 tokens on 148 SMs: on a 148-SM B200 part (10 seeds, 20
-#: runs each) its split program's output met the BF16 budget on every seed at 32769 to 45057 tokens and missed it for
-#: one of 10 seeds at 49153 tokens, where the deterministic program's met it on every seed; from 53249 tokens both
-#: programs missed it for some seed.  sm_103a ``5120 -> 48`` BF16 runs the deterministic program at 40961 to 49151
-#: tokens and ``5120 -> 64`` BF16 at 47105 to 49152 tokens on 148 SMs: on a 148-SM B300 part (10 seeds, 20 runs each, at
-#: 36865 to 61441 tokens) their split program's output missed the BF16 budget for one of 10 seeds at 40961 and at 40962
-#: tokens (``5120 -> 64``: 47105) where the deterministic program's met it on every seed (``5120 -> 48`` met it at 41985
-#: to 47105 tokens inside its range), and from 49152 tokens (``5120 -> 64``: 49153) both programs missed it for some
-#: seed, so the split program stays there.  Unmeasured token counts keep the verdict.
+#: reported) misses the FP32 budget on every seed from 98305 tokens, as the deterministic program's does.  sm_103a
+#: ``5120 -> 48`` BF16 runs the deterministic program at 40961 to 49151 tokens and ``5120 -> 64`` BF16 at 47105 to 49152
+#: tokens on 148 SMs: on a 148-SM B300 part (10 seeds, 20 runs each, at 36865 to 61441 tokens) their split program's
+#: output missed the BF16 budget for one of 10 seeds at 40961 and at 40962 tokens (``5120 -> 64``: 47105) where the
+#: deterministic program's met it on every seed (``5120 -> 48`` met it at 41985 to 47105 tokens inside its range), and
+#: from 49152 tokens (``5120 -> 64``: 49153) both programs missed it for some seed, so the split program stays there.
+#: Unmeasured token counts keep the verdict.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -539,7 +536,6 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
         ("sm_100a", 1, 4096, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, None)),
         ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, None)),
-        ("sm_100a", 1, 5120, 32, "bf16"): ((49153, None),),
         ("sm_100a", 1, 5120, 48, "bf16"): ((512, 2048),),
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
