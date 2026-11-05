@@ -397,21 +397,31 @@ kernel_cake_kda_det_train_5e6f3ba0b9b429241ab2_kcp(const __grid_constant__ CUten
                 #pragma unroll
                 for (int q_4 = 0; q_4 < 2; q_4++) {
                     {
-                        uint4 _uv4_4 = *reinterpret_cast<const uint4*>(u + u_next + (long long)(lane_half * 16 + q_4 * 8));
-                        u_pk[q_4 * 4 + 0] = _uv4_4.x;
-                        u_pk[q_4 * 4 + 1] = _uv4_4.y;
-                        u_pk[q_4 * 4 + 2] = _uv4_4.z;
-                        u_pk[q_4 * 4 + 3] = _uv4_4.w;
+                        uint32_t _uv4_4_0;
+                        uint32_t _uv4_4_1;
+                        uint32_t _uv4_4_2;
+                        uint32_t _uv4_4_3;
+                        asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_uv4_4_0), "=r"(_uv4_4_1), "=r"(_uv4_4_2), "=r"(_uv4_4_3) : "l"((const void*)(u + (u_next + (long long)(lane_half * 16 + q_4 * 8)))) : "memory");
+                        u_pk[q_4 * 4 + 0] = _uv4_4_0;
+                        u_pk[q_4 * 4 + 1] = _uv4_4_1;
+                        u_pk[q_4 * 4 + 2] = _uv4_4_2;
+                        u_pk[q_4 * 4 + 3] = _uv4_4_3;
                     }
                 }
                 #pragma unroll
                 for (int q_5 = 0; q_5 < 2; q_5++) {
                     {
-                        uint4 _uv4_5 = *reinterpret_cast<const uint4*>(u + u_next + (long long)(32 + lane_half * 16 + q_5 * 8));
-                        u_pk[8 + q_5 * 4 + 0] = _uv4_5.x;
-                        u_pk[8 + q_5 * 4 + 1] = _uv4_5.y;
-                        u_pk[8 + q_5 * 4 + 2] = _uv4_5.z;
-                        u_pk[8 + q_5 * 4 + 3] = _uv4_5.w;
+                        uint32_t _uv4_5_0;
+                        uint32_t _uv4_5_1;
+                        uint32_t _uv4_5_2;
+                        uint32_t _uv4_5_3;
+                        asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_uv4_5_0), "=r"(_uv4_5_1), "=r"(_uv4_5_2), "=r"(_uv4_5_3) : "l"((const void*)(u + (u_next + (long long)(32 + lane_half * 16 + q_5 * 8)))) : "memory");
+                        u_pk[8 + q_5 * 4 + 0] = _uv4_5_0;
+                        u_pk[8 + q_5 * 4 + 1] = _uv4_5_1;
+                        u_pk[8 + q_5 * 4 + 2] = _uv4_5_2;
+                        u_pk[8 + q_5 * 4 + 3] = _uv4_5_3;
                     }
                 }
             }
@@ -544,21 +554,31 @@ kernel_cake_kda_det_train_5e6f3ba0b9b429241ab2_kcp(const __grid_constant__ CUten
                     #pragma unroll
                     for (int q_12 = 0; q_12 < 2; q_12++) {
                         {
-                            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(u + u_base + (long long)(64 * num_heads * 128) + (long long)(lane_half * 16 + q_12 * 8));
-                            u_pk[q_12 * 4 + 0] = _uv4_6.x;
-                            u_pk[q_12 * 4 + 1] = _uv4_6.y;
-                            u_pk[q_12 * 4 + 2] = _uv4_6.z;
-                            u_pk[q_12 * 4 + 3] = _uv4_6.w;
+                            uint32_t _uv4_6_0;
+                            uint32_t _uv4_6_1;
+                            uint32_t _uv4_6_2;
+                            uint32_t _uv4_6_3;
+                            asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                : "=r"(_uv4_6_0), "=r"(_uv4_6_1), "=r"(_uv4_6_2), "=r"(_uv4_6_3) : "l"((const void*)(u + (u_base + (long long)(64 * num_heads * 128) + (long long)(lane_half * 16 + q_12 * 8)))) : "memory");
+                            u_pk[q_12 * 4 + 0] = _uv4_6_0;
+                            u_pk[q_12 * 4 + 1] = _uv4_6_1;
+                            u_pk[q_12 * 4 + 2] = _uv4_6_2;
+                            u_pk[q_12 * 4 + 3] = _uv4_6_3;
                         }
                     }
                     #pragma unroll
                     for (int q_13 = 0; q_13 < 2; q_13++) {
                         {
-                            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(u + u_base + (long long)(64 * num_heads * 128) + (long long)(32 + lane_half * 16 + q_13 * 8));
-                            u_pk[8 + q_13 * 4 + 0] = _uv4_7.x;
-                            u_pk[8 + q_13 * 4 + 1] = _uv4_7.y;
-                            u_pk[8 + q_13 * 4 + 2] = _uv4_7.z;
-                            u_pk[8 + q_13 * 4 + 3] = _uv4_7.w;
+                            uint32_t _uv4_7_0;
+                            uint32_t _uv4_7_1;
+                            uint32_t _uv4_7_2;
+                            uint32_t _uv4_7_3;
+                            asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                : "=r"(_uv4_7_0), "=r"(_uv4_7_1), "=r"(_uv4_7_2), "=r"(_uv4_7_3) : "l"((const void*)(u + (u_base + (long long)(64 * num_heads * 128) + (long long)(32 + lane_half * 16 + q_13 * 8)))) : "memory");
+                            u_pk[8 + q_13 * 4 + 0] = _uv4_7_0;
+                            u_pk[8 + q_13 * 4 + 1] = _uv4_7_1;
+                            u_pk[8 + q_13 * 4 + 2] = _uv4_7_2;
+                            u_pk[8 + q_13 * 4 + 3] = _uv4_7_3;
                         }
                     }
                 }
