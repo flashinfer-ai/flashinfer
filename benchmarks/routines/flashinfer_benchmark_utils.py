@@ -155,6 +155,25 @@ output_column_dict = {
         "weight_dtype",
         "has_z",
         "dt_softplus",
+        # linattn (2026-10): mode-defining knobs of the SSU spec-decode /
+        # quantized-state paths and of ssd_combined / checkpointing_ssu /
+        # replayssm_materialize. Existing SSU lines write the defaults
+        # (varlen=False, algorithm=auto, ...).
+        "varlen",
+        "algorithm",
+        "intermediate_states",
+        "disable_state_update",
+        "dst_checkpoint_step",
+        "philox_rounds",
+        "ssm_seqlen",
+        "chunk_size",
+        "max_window",
+        "prev_tokens",
+        "num_layers",
+        "replay_prefix_len",
+        "active_requests",
+        # Which library kernel produced the row (cuda_sm100, cuda:two-kernel, ...).
+        "mamba_kernel",
     ],
     "gdn": [
         "num_q_heads",
@@ -165,6 +184,11 @@ output_column_dict = {
         "pool_mode",
         "update_state",
         "use_qk_l2norm",
+        # linattn (2026-10): kernel family that ran (= backend name for explicit
+        # backends; for 'flashinfer' what the library picked) and the
+        # non-default workload knobs (initial state, ragged, indices, ...).
+        "gdn_kernel",
+        "gdn_flags",
     ],
     "kda": [
         # Which variant the policy chose, and whether this device's thresholds
@@ -176,6 +200,14 @@ output_column_dict = {
         "sm_count",
         "packed",
         "has_initial_state",
+        # linattn (2026-10)
+        "ragged",
+        "gate_mode",
+        "lower_bound",
+        "beta_is_logit",
+        "num_spec_tokens",
+        "state_pool",
+        "verify_caches",
     ],
     "msa": [
         "topk",
@@ -325,14 +357,27 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+        "ssd_combined",
+        "checkpointing_ssu",
+        "replayssm_materialize",
     ],
     "gdn": [
         "gated_delta_rule_decode",
         "gated_delta_rule_mtp",
         "chunk_gated_delta_rule",
+        "chunk_gated_delta_rule2",
+        "chunk_gated_delta_product",
+        "gated_delta_rule_mtp_ucache",
+        "gated_delta_rule_mtp_ucache_flush",
+        "gdn_fused_decode_step",
+        "gated_delta_rule_replayssm_commit",
     ],
     "kda": [
         "recurrent_kda_prefill",
+        "recurrent_kda_decode",
+        "recurrent_kda_output_only",
+        "fused_kda_decode",
+        "packed_fused_kda_decode",
     ],
     "sparse_attention": [
         "MSAProxyScore",
@@ -1178,9 +1223,11 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
-    # MAMBA
+    # MAMBA (linattn 2026-10). Cake backends are out of scope and not listed.
+    # flashinfer: the base CUDA module is built for major 8 only
+    # (jit/mamba/selective_state_update.py), so 7.5 runs triton only.
     "selective_state_update": {
-        "7.5": ["flashinfer", "triton"],
+        "7.5": ["triton"],
         "8.0": ["flashinfer", "triton"],
         "8.6": ["flashinfer", "triton"],
         "8.9": ["flashinfer", "triton"],
@@ -1192,7 +1239,51 @@ routine_cc_to_supported_backends = {
         "12.0": ["flashinfer", "triton"],
         "12.1": ["flashinfer", "triton"],
     },
-    # GDN (Gated Delta Net)
+    # cute-dsl: SSDCombined(backend="cute") accepts cc major 10/11
+    # (mamba/ssd_combined.py SSDCombined guard). 11.0 is guard-backed only.
+    "ssd_combined": {
+        "10.0": ["cute-dsl", "triton"],
+        "10.3": ["cute-dsl", "triton"],
+        "10.7": ["cute-dsl", "triton"],
+        "11.0": ["cute-dsl", "triton"],
+    },
+    # CUDA JIT built for majors 8-12 (jit/mamba/checkpointing_ssu.py,
+    # jit/mamba/replayssm_materialize.py). Rows other than 10.0/10.7 are
+    # guard-backed, not hardware-validated.
+    "checkpointing_ssu": {
+        cc: ["flashinfer", "flashinfer-monolith", "flashinfer-two-kernel", "triton"]
+        for cc in (
+            "8.0",
+            "8.6",
+            "8.9",
+            "9.0",
+            "10.0",
+            "10.3",
+            "10.7",
+            "11.0",
+            "12.0",
+            "12.1",
+        )
+    },
+    "replayssm_materialize": {
+        cc: ["flashinfer"]
+        for cc in (
+            "8.0",
+            "8.6",
+            "8.9",
+            "9.0",
+            "10.0",
+            "10.3",
+            "10.7",
+            "11.0",
+            "12.0",
+            "12.1",
+        )
+    },
+    # GDN (Gated Delta Net). Backend names are defined in routines/gdn.py
+    # (ROUTINE_BACKENDS). The CuTe-DSL decode kernels have no cc guard; 11.0/12.x
+    # stay triton-only until observed. rubin / rubin_ugpu: backend="rubin"
+    # raises off cc 10.7 (gdn_decode.py gated_delta_rule_decode_pretranspose).
     "gated_delta_rule_decode": {
         "7.5": [],
         "8.0": [],
@@ -1212,39 +1303,84 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": ["flashinfer", "triton"],
-        "10.0": ["flashinfer", "triton"],
-        "10.3": ["flashinfer", "triton"],
-        "10.7": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "cute-dsl", "cute-dsl-wy", "triton"],
+        "10.3": ["flashinfer", "cute-dsl", "cute-dsl-wy", "triton"],
+        "10.7": ["flashinfer", "cute-dsl", "cute-dsl-wy", "triton"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],
     },
+    # CuTe-DSL (+CP) prefill: cc majors 8/9/10/12 (gdn_prefill.py
+    # chunk_gated_delta_rule arch dispatch; SM8x since #5109); major 10 needs
+    # CUDA >= 13. 8.x/9.0/12.x cute-dsl rows are guard-backed. cudnn needs
+    # nvidia-cudnn-frontend >= 1.31.
     "chunk_gated_delta_rule": {
         "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": ["flashinfer", "fla"],
-        "10.0": ["flashinfer", "fla"],
-        "10.3": ["flashinfer", "fla"],
-        "10.7": ["flashinfer"],
+        "8.0": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "8.6": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "8.9": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "9.0": ["flashinfer", "cute-dsl", "cute-dsl-cp", "fla"],
+        "10.0": ["flashinfer", "cute-dsl", "cute-dsl-cp", "cudnn", "fla"],
+        "10.3": ["flashinfer", "cute-dsl", "cute-dsl-cp", "cudnn", "fla"],
+        "10.7": ["flashinfer", "cute-dsl", "cute-dsl-cp", "cudnn", "fla"],
         "11.0": [],
-        "12.0": [],
-        "12.1": [],
+        "12.0": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "12.1": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
     },
-    # KDA prefill on SM120a only. The SM100-family Cake prefill backend is a
-    # different kernel with a different contract and is not benchmarked here;
-    # listing it under 10.0/10.3 would put two unrelated implementations in one
-    # column.
+    # cuDNN-only APIs (gdn2_prefill.py, gdp_prefill.py; cake for GDP is out of scope).
+    "chunk_gated_delta_rule2": {
+        "10.0": ["cudnn"],
+        "10.3": ["cudnn"],
+        "10.7": ["cudnn"],
+    },
+    "chunk_gated_delta_product": {
+        "10.0": ["cudnn"],
+        "10.3": ["cudnn"],
+        "10.7": ["cudnn"],
+    },
+    "gated_delta_rule_mtp_ucache": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    "gated_delta_rule_mtp_ucache_flush": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    # Specialized kernels are registered for SM120 only (experimental
+    # gdn_fused_decode_specialized.py); on 10.x 'flashinfer' would time the
+    # composable torch path, so no 10.x row. 12.0 is guard-backed.
+    "gdn_fused_decode_step": {
+        "12.0": ["flashinfer", "specialized"],
+    },
+    # ReplaySSM fold: gdn_kernels/gdn_replayssm_spec_fold.py requires cc major 10
+    # (accepts 10.7 although its message says SM100/SM103).
+    "gated_delta_rule_replayssm_commit": {
+        "10.0": ["flashinfer", "simt", "tcgen05"],
+        "10.3": ["flashinfer", "simt", "tcgen05"],
+        "10.7": ["flashinfer", "simt", "tcgen05"],
+    },
+    # KDA. small-BH and persistent prefill gate on exactly (10,0)/(10,3); the
+    # CuTe BT16 prefill also takes (10,7) (kda_prefill_cute.py); "ptx" is
+    # (10,3)-only (kda_prefill_ptx.py). "cudnn" needs
+    # nvidia-cudnn-frontend >= 1.31. 12.0 is the SM120 CuTe backend.
     "recurrent_kda_prefill": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["flashinfer"],
-        "10.3": [],
-        "10.7": [],
+        "10.0": ["flashinfer", "cute-dsl", "cute-dsl-persistent", "small-bh", "cudnn"],
+        "10.3": [
+            "flashinfer",
+            "cute-dsl",
+            "cute-dsl-persistent",
+            "ptx",
+            "small-bh",
+            "cudnn",
+        ],
+        "10.7": ["flashinfer", "cute-dsl", "cudnn"],
         "11.0": [],
         "12.0": [
             "flashinfer",
@@ -1254,6 +1390,28 @@ routine_cc_to_supported_backends = {
             "flash-kda",
         ],
         "12.1": [],
+    },
+    # CuTe-DSL decode has no cc gate (T=1 fast path: (10,0)/(10,3)/(10,7)).
+    "recurrent_kda_decode": {
+        "10.0": ["flashinfer", "cute-dsl"],
+        "10.3": ["flashinfer", "cute-dsl"],
+        "10.7": ["flashinfer", "cute-dsl"],
+    },
+    "recurrent_kda_output_only": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    "fused_kda_decode": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    # T>1 is the SM10x CuTe multitoken kernel (cc major 10).
+    "packed_fused_kda_decode": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
     },
 }
 
