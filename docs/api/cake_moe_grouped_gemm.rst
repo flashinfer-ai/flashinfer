@@ -38,7 +38,9 @@ Numerical contract of ``deterministic=False``
 
 Only the run-to-run bitwise reproducibility of the weight gradient ``dW`` is relaxed.  The
 forward ``Y`` and the data gradient ``dX`` are bitwise the deterministic package's (copies
-of the same programs), and so is ``dW`` wherever the 256-wide k tile runs.  With the
+of the same programs; on sm_100a the data gradient's L2 evict-first twin is the package's
+own build of the deterministic wide program, whose cache policy changes no arithmetic), and
+so is ``dW`` wherever the 256-wide k tile runs.  With the
 512-wide k tile, the tiles of the last partial wave are split into k-step units over the
 clusters; each unit adds its fp32 accumulator into the tile's fp32 sum with unordered
 reductions, and the last unit to arrive rounds the sum once and stores it, in the same
@@ -166,7 +168,7 @@ feature                                         sm_100a         sm_103a         
 =============================================== =============== =============== ===============
 ``fwd`` / ``dgrad`` 256- and 512-column tiles   domain schedule domain schedule static schedule
 ``fwd`` evict-first / 3-3 head-tail twin        -- / --         -- / yes        yes / --
-``dgrad`` evict-first / 3-3 head-tail twin      -- / --         -- / yes        yes / --
+``dgrad`` evict-first / 3-3 head-tail twin      yes / --        -- / yes        yes / --
 ``dgrad`` probed queue split                    yes             yes             --
 ``wgrad`` 256-wide k tile, ordered tail reduce  yes             yes             yes
 ``wgrad`` 512-wide k tile, unordered split tail yes             yes             yes
