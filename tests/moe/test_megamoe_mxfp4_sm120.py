@@ -53,6 +53,17 @@ def _mxfp8(t):
     ).reshape_as(t)
 
 
+def _effective_routes(idx, experts):
+    """The kernel's view of top-k ids: out-of-range ids and repeats of an earlier slot of the same
+    token are masked (-1), like an explicit -1."""
+    idx = idx.clone()
+    idx[(idx < 0) | (idx >= experts)] = -1
+    for k in range(1, idx.shape[1]):
+        repeat = (idx[:, :k] == idx[:, k : k + 1]).any(1) & (idx[:, k] >= 0)
+        idx[repeat, k] = -1
+    return idx
+
+
 def _reference(x, idx, weights, w1, w2, gs1, gs2, rank, local_experts, quantize=True):
     all_x, all_idx, all_weights = _gather(x), _gather(idx), _gather(weights)
     all_x = _mxfp8(all_x) if quantize else all_x
@@ -131,12 +142,19 @@ def _worker(rank, args):
             idx[::3, -1] = -1
         elif args.routing == "empty":
             idx.fill_(-1)
+        elif args.routing == "invalid":
+            # out-of-range ids (one above 32 bits) and ids repeated within a token
+            idx[0::4, 1] = experts + 5
+            idx[1::4, 2] = 1 << 40
+            idx[2::4, 3] = idx[2::4, 0]
+            idx[3::4, 4] = idx[3::4, 2]
+        ref_idx = _effective_routes(idx, experts)
         x_in = x.float() / 128
         expected, counts = _reference(
-            x_in, idx, routing, ref1, ref2, gs1, gs2, rank, epr
+            x_in, ref_idx, routing, ref1, ref2, gs1, gs2, rank, epr
         )
         exact, _ = _reference(
-            x_in, idx, routing, ref1, ref2, gs1, gs2, rank, epr, quantize=False
+            x_in, ref_idx, routing, ref1, ref2, gs1, gs2, rank, epr, quantize=False
         )
         stats = torch.zeros(epr, dtype=torch.int32, device="cuda")
         buffer.stage(x, sf, idx, routing)
@@ -210,8 +228,8 @@ def _args(**overrides):
 
 
 def _sm120_gpus(n):
-    return (
-        torch.cuda.device_count() >= n and torch.cuda.get_device_capability()[0] == 12
+    return torch.cuda.device_count() >= n and all(
+        torch.cuda.get_device_capability(i)[0] == 12 for i in range(n)
     )
 
 
@@ -222,12 +240,20 @@ def test_megamoe_mxfp4_sm120(ep):
     _run(_args(ep=ep))
 
 
-@pytest.mark.parametrize("routing", ["hot", "empty"])
+@pytest.mark.parametrize("routing", ["hot", "empty", "invalid"])
 def test_megamoe_mxfp4_sm120_skewed_routing(routing):
-    """Every route on the same experts, and every route masked."""
+    """Every route on the same experts, every route masked, and out-of-range or repeated ids."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
     _run(_args(routing=routing, repeats=3))
+
+
+@pytest.mark.parametrize("hidden", [256, 768])
+def test_megamoe_mxfp4_sm120_hidden_widths(hidden):
+    """Hidden sizes whose MXFP8 scale row (hidden / 32 bytes) is not a multiple of 16 bytes."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    _run(_args(hidden=hidden, tokens=[1, 20, 64]))
 
 
 def test_megamoe_mxfp4_sm120_production_shape():
@@ -247,7 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument(
-        "--routing", choices=["random", "hot", "empty"], default="random"
+        "--routing", choices=["random", "hot", "empty", "invalid"], default="random"
     )
     parser.add_argument("--repeats", type=int, default=2)
     _run(parser.parse_args())

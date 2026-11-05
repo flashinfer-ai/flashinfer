@@ -80,6 +80,10 @@ _SM120_MAX_RANKS = 8
 _SM120_MAX_TOPK = 8
 _SM120_MAX_LOCAL_EXPERTS = 256
 _SM120_MAX_HIDDEN = 7936  # the dispatch stages one MXFP8 row (hidden + hidden / 32 bytes) in 8 KB of shared memory
+# The SM120 kernel multiplies 8 tokens per weight tile, a decode-size design. Up to 128 tokens per rank it
+# beats the moe_ep SM120 MXFP4 backends on RTX 6000D (DeepSeek-V4-Flash, EP4 and EP8); at 256 it no
+# longer does, so larger batches (prefill) belong on moe_ep.
+_SM120_MAX_TOKENS_PER_RANK = 128
 
 
 def _is_sm120() -> bool:
@@ -333,8 +337,12 @@ class MegaMoESymmBuffer:
             )
         if intermediate_hidden <= 0 or intermediate_hidden % 256:
             raise ValueError("intermediate_hidden must be a multiple of 256 on SM120")
-        if num_max_tokens_per_rank <= 0:
-            raise ValueError("num_max_tokens_per_rank must be positive")
+        if not 0 < num_max_tokens_per_rank <= _SM120_MAX_TOKENS_PER_RANK:
+            raise ValueError(
+                f"SM120 MegaMoE is a decode kernel: num_max_tokens_per_rank must be in "
+                f"[1, {_SM120_MAX_TOKENS_PER_RANK}]; use flashinfer.moe_ep (SM120 MXFP4 x MXFP8 "
+                f"cutedsl / cake) for larger batches"
+            )
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -374,9 +382,9 @@ class MegaMoESymmBuffer:
         )
 
     def error(self) -> int:
-        """SM120: the kernel's error word, 0 while every spin wait completed. A wait that times out
-        (a rank that never entered the call) records its code here and the kernel exits instead of
-        hanging. Synchronizes with the device."""
+        """SM120: the error word of the last call, 0 when every spin wait completed. A wait that
+        times out (a rank that never entered the call) records its code here and the kernel exits
+        instead of hanging; each call clears it on entry. Synchronizes with the device."""
         if not self.sm120:
             raise ValueError("error() is available on the SM120 path only")
         ctr = self._view(self._offsets[-1], (_SM120_COUNTER_INTS,), torch.int32)
@@ -745,16 +753,19 @@ def mxfp4_mega_moe(
 
     Notes
     -----
-    All tensors must be contiguous and on the buffer's CUDA device. The rank
-    count must be a power of two from 1 to 32. Every rank must invoke the kernel
-    in matching order; MXFP4 always uses the fused family.
+    All tensors must be contiguous and on the buffer's CUDA device. On SM90 the
+    rank count must be a power of two from 1 to 32. Every rank must invoke the
+    kernel in matching order; MXFP4 always uses the fused family.
 
     On SM120 one host's ranks (1 to 8) take part over PCIe peer-to-peer; the
     weights come from :func:`transform_mxfp4_weights_for_mega_moe` on the same
-    device. The kernel targets decode-size batches: its expert pools hold
-    ``num_max_tokens_per_rank`` rows per (local expert, source rank), so the
-    buffer grows with that capacity. A rank whose peers never enter the call
-    records an error code (:meth:`MegaMoESymmBuffer.error`) instead of hanging.
+    device. The kernel targets decode-size batches: ``num_max_tokens_per_rank``
+    is limited to 128 (beyond that the ``flashinfer.moe_ep`` SM120 backends are
+    faster), and the expert pools hold that many rows per (local expert, source
+    rank). Top-k ids outside ``[0, num_experts)`` and
+    repeats of an earlier id of the same token are treated as masked (-1). A
+    rank whose peers never enter the call records an error code
+    (:meth:`MegaMoESymmBuffer.error`) instead of hanging.
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
