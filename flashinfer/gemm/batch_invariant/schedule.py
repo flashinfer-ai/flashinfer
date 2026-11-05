@@ -32,6 +32,9 @@ def all_valid_configs(
     return enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
 
 
+#: How many records of a ranking are kept per (shape, layout, format, part): the autotuner's candidate count. A cached
+#: entry holds that prefix, not the whole ranked space (M changes almost every call in serving).
+RANK_CACHE_TOPK = 10
 SPLIT_MIN_CTAS = 256  # below this many N tiles at 32 wide, a K split is considered
 SPLIT_MAX_CHUNKS = 128
 SPLIT_MIN_KC = 256  # elements of K per chunk at least
@@ -81,6 +84,7 @@ def rank_topk(
     generated Lean cases), never a device's queried numbers. Empty when nothing implements the shape."""
     import dataclasses
 
+    from .blocks.operands import can_implement
     from .heuristic import rank
 
     ranked: List[GemmConfig] = [
@@ -96,19 +100,23 @@ def rank_topk(
             family,
             in_fmt=in_fmt,
             nominal=nominal,
+            topk=max(k, RANK_CACHE_TOPK),
         )
-    ]  # distinct by construction (the enumerated space has no duplicates)
-    present = set(ranked)
+    ]  # the best max(k, RANK_CACHE_TOPK) records, distinct by construction (the enumerated space has no duplicates)
     seen: set = set()
     out: List[GemmConfig] = []
     # the best ceil(k/2) records, each followed by its raster twin when the space has it: the one knob the estimate does
-    # not price is hedged for free by the autotuner; then the rank order fills the list
+    # not price is hedged for free by the autotuner; then the rank order fills the list. The raster order is a knob of
+    # every enumerated record, so the twin is a member exactly when the body accepts it (`can_implement`); the truncated
+    # ranking is not consulted for membership.
     for rec in ranked[: -(-k // 2)]:
         twin = dataclasses.replace(
             rec, raster_along="n" if rec.raster_along == "m" else "m"
         )
         for cand in (rec, twin):
-            if cand in present and cand not in seen:
+            if cand not in seen and (
+                cand is rec or can_implement(cand, M, N, K, b_major, chunks, in_fmt)
+            ):
                 out.append(cand)
                 seen.add(cand)
     for rec in ranked:

@@ -812,6 +812,16 @@ def test_chunk_count_must_be_positive():
     assert not can_implement(forced, 16, 4096, 4096, "n", 1)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
         mm_bf16_batch_invariant(a, b, config=forced, chunks=1)
+    # the output may not alias an operand (the bits would depend on which CTA runs first)
+    buf = torch.empty(16, 4096, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        mm_bf16_batch_invariant(buf, b, out=buf)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
+    ):
+        mm_bf16_batch_invariant(a, b, out=b[:16])
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
         mm_bf16_batch_invariant(a, b, chunks=0)
 

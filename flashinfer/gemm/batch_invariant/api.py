@@ -820,6 +820,10 @@ def bmm_fp8_batch_invariant(
             B_scale,
         )
         return out
+    if workspace is None:
+        # one fp32 workspace for every batch element, reused in stream order (one element's launches complete before the
+        # next element's are issued on the same stream), instead of an allocation per element
+        workspace = torch.empty(C * M * N, dtype=torch.float32, device=A.device)
     for i in range(b):  # the split classes: one launch of the class per batch element
         _run(
             A[i],
