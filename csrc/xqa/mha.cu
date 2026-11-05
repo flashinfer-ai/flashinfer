@@ -1663,8 +1663,7 @@ CUBIN_EXPORT __global__
       pair.produced.~TaskBarrier();
       pair.consumed.~TaskBarrier();
     }
-    if (ctaThrdId < gemm1NbWarpGrps * nbVBuffers)
-      (smem.vBarrier(0, 0) + ctaThrdId)->~TaskBarrier();
+    if (ctaThrdId < gemm1NbWarpGrps * nbVBuffers) (smem.vBarrier(0, 0) + ctaThrdId)->~TaskBarrier();
     if (ctaThrdId < gemm1NbWarpGrps) smem.warpGrpBar(ctaThrdId)->~TaskBarrier();
   }
 #endif
@@ -1824,8 +1823,7 @@ CUBIN_EXPORT __global__
 
 #if FLASHINFER_XQA_TASKS
   uint32_t const logicalCacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
-  uint32_t const cacheSeqLen =
-      mha::min(logicalCacheSeqLen, task.end_tile * ctaTile.x);
+  uint32_t const cacheSeqLen = mha::min(logicalCacheSeqLen, task.end_tile * ctaTile.x);
 #else
   uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #endif

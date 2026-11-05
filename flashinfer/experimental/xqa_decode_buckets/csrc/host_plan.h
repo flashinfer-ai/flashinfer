@@ -3,19 +3,24 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+
 #include "task_geometry.h"
 
 // The host and device planners write this same compact descriptor ABI.
-struct XQABucketTask { int request, begin, end, stride; };
-struct XQABucketRange { int begin, count; };
-struct XQABucketSpan { int begin, end; };
+struct XQABucketTask {
+  int request, begin, end, stride;
+};
+struct XQABucketRange {
+  int begin, count;
+};
+struct XQABucketSpan {
+  int begin, end;
+};
 
 namespace flashinfer::xqa_buckets {
 constexpr int MaxBatch = 32;
 constexpr int Tile = 256;
-constexpr int max_table_width(int page_size) {
-  return (0x7fffffff - (Tile - 1)) / page_size;
-}
+constexpr int max_table_width(int page_size) { return (0x7fffffff - (Tile - 1)) / page_size; }
 
 inline int64_t descriptor_words(int batch, int ctas) {
   return int64_t(6) * (int64_t(ctas) + batch);
@@ -24,12 +29,11 @@ inline int64_t descriptor_words(int batch, int ctas) {
 // Caller validates storage size/type. No CUDA calls or allocation occur here.
 // Keep the ownership arithmetic identical to assign; only its execution moves
 // to the CPU. The GPU planner retains its parallel task/span fill.
-inline void plan_host(const int* lengths, int* storage, int batch, int ctas,
-                      int table_width, bool aligned, int page_size = 32, int q_len_per_req = 1) {
+inline void plan_host(const int* lengths, int* storage, int batch, int ctas, int table_width,
+                      bool aligned, int page_size = 32, int q_len_per_req = 1) {
   if (batch < 1 || batch > MaxBatch || ctas < batch || ctas > INT32_MAX - MaxBatch ||
-      (page_size != 16 && page_size != 32 && page_size != 64) ||
-      table_width < 1 || table_width > max_table_width(page_size) ||
-      q_len_per_req < 1 || q_len_per_req > 5)
+      (page_size != 16 && page_size != 32 && page_size != 64) || table_width < 1 ||
+      table_width > max_table_width(page_size) || q_len_per_req < 1 || q_len_per_req > 5)
     throw std::invalid_argument("Invalid host bucket plan geometry");
   int prefix[MaxBatch + 1] = {}, base[MaxBatch + 1] = {}, first[MaxBatch];
   for (int r = 0; r < batch; ++r) {
@@ -47,7 +51,10 @@ inline void plan_host(const int* lengths, int* storage, int batch, int ctas,
     while (lo < hi) {
       int mid = (lo + hi) / 2, count = 0;
       for (int r = 0; r < batch; ++r) count += ceil_div(prefix[r + 1] - prefix[r], mid);
-      if (count <= ctas) hi = mid; else lo = mid + 1;
+      if (count <= ctas)
+        hi = mid;
+      else
+        lo = mid + 1;
     }
     budget = lo;
   }
@@ -62,19 +69,19 @@ inline void plan_host(const int* lengths, int* storage, int batch, int ctas,
   for (int r = 0; r < batch; ++r) {
     int n = prefix[r + 1] - prefix[r];
     first[r] = prefix[r] / budget;
-    int count = aligned ? ceil_div(n, budget) :
-        (n ? (prefix[r + 1] - 1) / budget - first[r] + 1 : 0);
+    int count =
+        aligned ? ceil_div(n, budget) : (n ? (prefix[r + 1] - 1) / budget - first[r] + 1 : 0);
     requests[r] = {base[r], count};
     base[r + 1] = base[r] + count;
     max_parts = std::max(max_parts, count);
     for (int ordinal = 0; ordinal < count; ++ordinal) {
       if (aligned) {
         tasks[base[r] + ordinal] = {r, aligned_boundary(ordinal, n, count),
-                                   aligned_boundary(ordinal + 1, n, count), 1};
+                                    aligned_boundary(ordinal + 1, n, count), 1};
       } else {
         int bucket = first[r] + ordinal;
         tasks[base[r] + ordinal] = {r, std::max(prefix[r], bucket * budget) - prefix[r],
-            std::min(prefix[r + 1], (bucket + 1) * budget) - prefix[r], 1};
+                                    std::min(prefix[r + 1], (bucket + 1) * budget) - prefix[r], 1};
       }
     }
   }
@@ -96,7 +103,7 @@ inline void plan_host(const int* lengths, int* storage, int batch, int ctas,
     int last_req = first_req;
     while (last_req + 1 < batch && prefix[last_req + 1] < hi) ++last_req;
     spans[bucket] = {base[first_req] + bucket - first[first_req],
-                    base[last_req] + bucket - first[last_req] + 1};
+                     base[last_req] + bucket - first[last_req] + 1};
   }
 }
 }  // namespace flashinfer::xqa_buckets

@@ -3,7 +3,9 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+
 #include <cstdint>
+
 #include "host_plan.h"
 struct XQATaskContext {
   uint32_t request, head_group, slot, begin_tile, end_tile;
@@ -46,10 +48,10 @@ struct ComputeParams {
 };
 
 static_assert(ctaSize == 256 && ctaShapeInWarps.x == 4 && ctaShapeInWarps.y == 1 &&
-              ctaShapeInWarps.z == 2 && grpLoadV && nbVBuffers == 2 &&
-              gemm1NbWarpGrps == 1 && nbHeadSplits == 1 && headElems == 256 &&
-              (headGrpSize == 4 || headGrpSize == 6 || headGrpSize == 8) &&
-              BEAM_WIDTH == 1 && USE_CUSTOM_BARRIER == 1,
+                  ctaShapeInWarps.z == 2 && grpLoadV && nbVBuffers == 2 && gemm1NbWarpGrps == 1 &&
+                  nbHeadSplits == 1 && headElems == 256 &&
+                  (headGrpSize == 4 || headGrpSize == 6 || headGrpSize == 8) && BEAM_WIDTH == 1 &&
+                  USE_CUSTOM_BARRIER == 1,
               "Task/barrier ownership supports the declared R4,R6,R8/D256 core");
 #if SPEC_DEC
 static_assert((rowsPerBlock == 16 || rowsPerBlock == 32) && !IS_SPEC_DEC_TREE,
@@ -59,12 +61,14 @@ static_assert(warpTile.y == 16, "Single-query compute retains the native M16 til
 #endif
 static_assert(ctaTile.x == Tile);
 static_assert((tokensPerPage == 16 || tokensPerPage == 32 || tokensPerPage == 64) &&
-              Tile % tokensPerPage == 0, "Supported page sizes must divide the KV tile");
+                  Tile % tokensPerPage == 0,
+              "Supported page sizes must divide the KV tile");
 static_assert(!FLASHINFER_XQA_DIRECT_TASKS || !FLASHINFER_XQA_PERSISTENT_TASKS,
               "Direct geometry uses the nonpersistent one-task core");
 static_assert(sizeof(SharedMem::Barrier) == 8 &&
-              (sizeof(SharedMem::xBarriers) / sizeof(CtaBarrierPair)) * 2 +
-                  ctaShapeInWarps.y + SharedMem::nbOtherBarriers == 12);
+              (sizeof(SharedMem::xBarriers) / sizeof(CtaBarrierPair)) * 2 + ctaShapeInWarps.y +
+                      SharedMem::nbOtherBarriers ==
+                  12);
 
 __device__ __forceinline__ int ceildiv(int a, int b) { return (a + b - 1) / b; }
 
@@ -73,17 +77,18 @@ __global__ void assign(PlanParams p) {
   __shared__ int budget, slots;
   if (threadIdx.x == 0) {
     prefix[0] = base[0] = 0;
-    for (int r = 0; r < p.batch; ++r)
-      prefix[r + 1] = prefix[r] + ceildiv(p.lengths[r], Tile);
+    for (int r = 0; r < p.batch; ++r) prefix[r + 1] = prefix[r] + ceildiv(p.lengths[r], Tile);
     budget = max(1, ceildiv(prefix[p.batch], p.ctas));
     if (p.aligned) {
       int lo = 1, hi = 1;
       for (int r = 0; r < p.batch; ++r) hi = max(hi, prefix[r + 1] - prefix[r]);
       while (lo < hi) {
         int mid = (lo + hi) / 2, count = 0;
-        for (int r = 0; r < p.batch; ++r)
-          count += ceildiv(prefix[r + 1] - prefix[r], mid);
-        if (count <= p.ctas) hi = mid; else lo = mid + 1;
+        for (int r = 0; r < p.batch; ++r) count += ceildiv(prefix[r + 1] - prefix[r], mid);
+        if (count <= p.ctas)
+          hi = mid;
+        else
+          lo = mid + 1;
       }
       budget = lo;
     }
@@ -91,8 +96,8 @@ __global__ void assign(PlanParams p) {
     for (int r = 0; r < p.batch; ++r) {
       int n = prefix[r + 1] - prefix[r];
       first[r] = prefix[r] / budget;
-      int count = p.aligned ? ceildiv(n, budget) :
-          (n ? (prefix[r + 1] - 1) / budget - first[r] + 1 : 0);
+      int count =
+          p.aligned ? ceildiv(n, budget) : (n ? (prefix[r + 1] - 1) / budget - first[r] + 1 : 0);
       p.requests[r] = {base[r], count};
       base[r + 1] = base[r] + count;
       max_parts = max(max_parts, count);
@@ -111,11 +116,11 @@ __global__ void assign(PlanParams p) {
     if (p.aligned) {
       int count = base[r + 1] - base[r];
       p.tasks[slot] = {r, aligned_boundary(ordinal, n, count),
-                     aligned_boundary(ordinal + 1, n, count), 1};
+                       aligned_boundary(ordinal + 1, n, count), 1};
     } else {
       int bucket = first[r] + ordinal;
       p.tasks[slot] = {r, max(prefix[r], bucket * budget) - prefix[r],
-                     min(prefix[r + 1], (bucket + 1) * budget) - prefix[r], 1};
+                       min(prefix[r + 1], (bucket + 1) * budget) - prefix[r], 1};
     }
   }
   // Compact slots are monotonic in global bucket, so these spans partition them.
@@ -125,28 +130,36 @@ __global__ void assign(PlanParams p) {
       continue;
     }
     int lo = bucket * budget, hi = min(prefix[p.batch], lo + budget);
-    if (lo >= hi) { p.buckets[bucket] = {0, 0}; continue; }
+    if (lo >= hi) {
+      p.buckets[bucket] = {0, 0};
+      continue;
+    }
     int first_req = 0;
     while (first_req + 1 < p.batch && prefix[first_req + 1] <= lo) ++first_req;
     int last_req = first_req;
     while (last_req + 1 < p.batch && prefix[last_req + 1] < hi) ++last_req;
     p.buckets[bucket] = {base[first_req] + bucket - first[first_req],
-                        base[last_req] + bucket - first[last_req] + 1};
+                         base[last_req] + bucket - first[last_req] + 1};
   }
 }
 
-__device__ __forceinline__ void clear_empty(ComputeParams const& p, int request, int group, int tid) {
+__device__ __forceinline__ void clear_empty(ComputeParams const& p, int request, int group,
+                                            int tid) {
 #if SPEC_DEC
   int head = group / p.row_groups, begin = (group % p.row_groups) * int(warpTile.y);
   int rows = min(int(warpTile.y), p.q_tokens * int(headGrpSize) - begin);
   for (int i = tid; i < rows * 256; i += 256) {
-    int row = begin + i / 256, token = row / headGrpSize, qhead = head * headGrpSize + row % headGrpSize;
-    uint64_t index = ((uint64_t(request) * p.q_tokens + token) * p.kv_heads * headGrpSize + qhead) * 256 + i % 256;
+    int row = begin + i / 256, token = row / headGrpSize,
+        qhead = head * headGrpSize + row % headGrpSize;
+    uint64_t index =
+        ((uint64_t(request) * p.q_tokens + token) * p.kv_heads * headGrpSize + qhead) * 256 +
+        i % 256;
     p.output[index] = __float2bfloat16_rn(0.f);
   }
 #else
   for (int i = tid; i < headGrpSize * 256; i += 256)
-    p.output[(uint64_t(request) * p.kv_heads + group) * headGrpSize * 256 + i] = __float2bfloat16_rn(0.f);
+    p.output[(uint64_t(request) * p.kv_heads + group) * headGrpSize * 256 + i] =
+        __float2bfloat16_rn(0.f);
 #endif
   if (tid == 0) p.semaphores[request * p.groups + group] = 0;
 }
@@ -179,7 +192,7 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
   int total_slots = plan.batch == 1 ? count : plan.ctas;
   int slot = base + owner;
   XQABucketTask task{request, direct_boundary(owner, tiles, count),
-                            direct_boundary(owner + 1, tiles, count), 1};
+                     direct_boundary(owner + 1, tiles, count), 1};
   XQABucketRange range{base, count};
 #elif FLASHINFER_XQA_PERSISTENT_TASKS
   XQABucketSpan span = plan.buckets[owner];
@@ -190,55 +203,66 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
   if (slot >= plan.header[1]) return;
 #endif
 #if !FLASHINFER_XQA_DIRECT_TASKS
-    XQABucketTask task = plan.tasks[slot];
-    XQABucketRange range = plan.requests[task.request];
-    int total_slots = plan.header[1];
+  XQABucketTask task = plan.tasks[slot];
+  XQABucketRange range = plan.requests[task.request];
+  int total_slots = plan.header[1];
 #endif
-    // Every group shares descriptors but owns a compact, disjoint live scratch
-    // interval. The H=1 layout is exactly the original layout.
-    int group_base = group * total_slots;
-    int head_group = SPEC_DEC ? group / p.row_groups : group;
-    XQATaskContext context{uint32_t(task.request), uint32_t(head_group), uint32_t(group_base + slot),
-        uint32_t(task.begin), uint32_t(task.end), uint32_t(group_base + range.begin),
-        uint32_t(range.count), uint32_t(total_slots * p.groups), p.qscale, p.vscale,
+  // Every group shares descriptors but owns a compact, disjoint live scratch
+  // interval. The H=1 layout is exactly the original layout.
+  int group_base = group * total_slots;
+  int head_group = SPEC_DEC ? group / p.row_groups : group;
+  XQATaskContext context{uint32_t(task.request),
+                         uint32_t(head_group),
+                         uint32_t(group_base + slot),
+                         uint32_t(task.begin),
+                         uint32_t(task.end),
+                         uint32_t(group_base + range.begin),
+                         uint32_t(range.count),
+                         uint32_t(total_slots * p.groups),
+                         p.qscale,
+                         p.vscale,
 #if FLASHINFER_XQA_PERSISTENT_TASKS
-        uint32_t(reused)
+                         uint32_t(reused)
 #else
-        0
+                           0
 #endif
 #if SPEC_DEC
-        , uint32_t(group), uint32_t(p.groups), uint32_t((group % p.row_groups) * warpTile.y)
+                             ,
+                         uint32_t(group),
+                         uint32_t(p.groups),
+                         uint32_t((group % p.row_groups) * warpTile.y)
 #endif
-    };
-    KVCacheList<true> cache{reinterpret_cast<GMemCacheHead*>(const_cast<uint8_t*>(p.k)),
-        reinterpret_cast<GMemCacheHead*>(const_cast<uint8_t*>(p.v)),
-        reinterpret_cast<GMemCacheHeadSf*>(const_cast<uint8_t*>(p.ks)),
-        reinterpret_cast<GMemCacheHeadSf*>(const_cast<uint8_t*>(p.vs)),
-        reinterpret_cast<const KVCachePageIndex*>(p.table),
-        reinterpret_cast<const uint32_t*>(plan.lengths), uint32_t(p.table_width)};
-    kernel_mha_impl(context,
+  };
+  KVCacheList<true> cache{reinterpret_cast<GMemCacheHead*>(const_cast<uint8_t*>(p.k)),
+                          reinterpret_cast<GMemCacheHead*>(const_cast<uint8_t*>(p.v)),
+                          reinterpret_cast<GMemCacheHeadSf*>(const_cast<uint8_t*>(p.ks)),
+                          reinterpret_cast<GMemCacheHeadSf*>(const_cast<uint8_t*>(p.vs)),
+                          reinterpret_cast<const KVCachePageIndex*>(p.table),
+                          reinterpret_cast<const uint32_t*>(plan.lengths),
+                          uint32_t(p.table_width)};
+  kernel_mha_impl(
+      context,
 #if SPEC_DEC
-        p.q_tokens, p.kv_heads, headGrpSize, nullptr,
+      p.q_tokens, p.kv_heads, headGrpSize, nullptr,
 #else
         p.kv_heads,
 #endif
-        1.f, nullptr, reinterpret_cast<OutputHead*>(p.output), reinterpret_cast<const IOHead*>(p.q),
+      1.f, nullptr, reinterpret_cast<OutputHead*>(p.output), reinterpret_cast<const IOHead*>(p.q),
 #if SPEC_DEC
-        reinterpret_cast<const MaskType*>(p.mask),
+      reinterpret_cast<const MaskType*>(p.mask),
 #endif
-        nullptr, cache, plan.batch, 1.f, nullptr,
-        uint32_t(p.kv_page / sizeof(GMemCacheHead)), uint32_t(p.kv_token / sizeof(GMemCacheHead)),
-        uint32_t(p.kv_head / sizeof(GMemCacheHead)),
-        uint32_t(p.sf_page / sizeof(GMemCacheHeadSf)), uint32_t(p.sf_token / sizeof(GMemCacheHeadSf)),
-        uint32_t(p.sf_head / sizeof(GMemCacheHeadSf)),
-        reinterpret_cast<uint32_t*>(p.semaphores), p.scratch);
+      nullptr, cache, plan.batch, 1.f, nullptr, uint32_t(p.kv_page / sizeof(GMemCacheHead)),
+      uint32_t(p.kv_token / sizeof(GMemCacheHead)), uint32_t(p.kv_head / sizeof(GMemCacheHead)),
+      uint32_t(p.sf_page / sizeof(GMemCacheHeadSf)), uint32_t(p.sf_token / sizeof(GMemCacheHeadSf)),
+      uint32_t(p.sf_head / sizeof(GMemCacheHeadSf)), reinterpret_cast<uint32_t*>(p.semaphores),
+      p.scratch);
 #if FLASHINFER_XQA_PERSISTENT_TASKS
-    // Join every producer/consumer before the next task reinitializes barriers.
-    ldgsts::commitGroup();
-    ldgsts::waitGroup<0>();
-    __syncthreads();
-    reused = true;
-  }
+  // Join every producer/consumer before the next task reinitializes barriers.
+  ldgsts::commitGroup();
+  ldgsts::waitGroup<0>();
+  __syncthreads();
+  reused = true;
+}
 #endif
 }
 

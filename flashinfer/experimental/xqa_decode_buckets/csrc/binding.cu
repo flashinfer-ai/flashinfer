@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "tvm_ffi_utils.h"
 #include "bucket.cuh"
+#include "tvm_ffi_utils.h"
 
 namespace buckets = flashinfer::xqa_buckets;
 
@@ -14,7 +14,7 @@ void check_tensor(TensorView t, DLDataType dtype, DLDevice device, int64_t eleme
 }
 
 buckets::PlanParams plan_params(TensorView lengths, TensorView tasks, TensorView requests,
-                               TensorView spans, TensorView header, int64_t ctas, bool aligned) {
+                                TensorView spans, TensorView header, int64_t ctas, bool aligned) {
   int64_t batch = lengths.numel();
   TVM_FFI_ICHECK(batch >= 1 && batch <= buckets::MaxBatch && ctas >= batch &&
                  ctas <= INT32_MAX - buckets::MaxBatch);
@@ -40,8 +40,11 @@ buckets::PlanParams plan_params(TensorView lengths, TensorView tasks, TensorView
   return {static_cast<const int*>(lengths.data_ptr()),
           static_cast<XQABucketTask*>(tasks.data_ptr()),
           static_cast<XQABucketRange*>(requests.data_ptr()),
-          static_cast<XQABucketSpan*>(spans.data_ptr()), static_cast<int*>(header.data_ptr()),
-          int(batch), int(ctas), int(aligned)};
+          static_cast<XQABucketSpan*>(spans.data_ptr()),
+          static_cast<int*>(header.data_ptr()),
+          int(batch),
+          int(ctas),
+          int(aligned)};
 }
 }  // namespace
 
@@ -52,13 +55,13 @@ void bucket_plan(TensorView lengths, TensorView tasks, TensorView requests, Tens
 #else
   auto p = plan_params(lengths, tasks, requests, spans, header, ctas, aligned);
   ffi::CUDADeviceGuard device_guard(lengths.device().device_id);
-  buckets::assign<<<1, 128, 0, get_stream(lengths.device())>>>(p);
+  buckets::assign<<<1, 128, 0, get_stream(lengths.device())> > >(p);
   checkCuda(cudaPeekAtLastError());
 #endif
 }
 
-void bucket_plan_host(TensorView lengths, TensorView descriptors, int64_t ctas,
-                      int64_t table_width, bool aligned, int64_t q_tokens) {
+void bucket_plan_host(TensorView lengths, TensorView descriptors, int64_t ctas, int64_t table_width,
+                      bool aligned, int64_t q_tokens) {
   CHECK_CPU(lengths);
   CHECK_CPU(descriptors);
   CHECK_CONTIGUOUS(lengths);
@@ -97,12 +100,12 @@ void bucket_configure(TensorView resources) {
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(resources.dtype()), int64_code);
   TVM_FFI_ICHECK_EQ(resources.numel(), 4);
   checkCuda(cudaFuncSetAttribute(buckets::compute, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                sizeof(SharedMem)));
+                                 sizeof(SharedMem)));
   cudaFuncAttributes attributes;
   checkCuda(cudaFuncGetAttributes(&attributes, buckets::compute));
   int resident = 0;
   checkCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, buckets::compute, 256,
-                                                       sizeof(SharedMem)));
+                                                          sizeof(SharedMem)));
   auto* out = static_cast<int64_t*>(resources.data_ptr());
   out[0] = attributes.numRegs;
   out[1] = sizeof(SharedMem);
@@ -112,9 +115,9 @@ void bucket_configure(TensorView resources) {
 
 void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, TensorView vs,
                     TensorView table, TensorView lengths, TensorView tasks, TensorView requests,
-                    TensorView spans, TensorView header, TensorView mask, TensorView semaphores, TensorView scratch,
-                    TensorView output, int64_t ctas, bool aligned, double bmm1_scale,
-                    double bmm2_scale, bool enable_pdl, int64_t q_tokens) {
+                    TensorView spans, TensorView header, TensorView mask, TensorView semaphores,
+                    TensorView scratch, TensorView output, int64_t ctas, bool aligned,
+                    double bmm1_scale, double bmm2_scale, bool enable_pdl, int64_t q_tokens) {
   auto plan = plan_params(lengths, tasks, requests, spans, header, ctas, aligned);
   auto device = q.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
@@ -182,28 +185,41 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
   TVM_FFI_ICHECK(k.stride(0) == v.stride(0) && k.stride(1) == v.stride(1) &&
                  k.stride(2) == v.stride(2) && ks.stride(0) == vs.stride(0) &&
                  ks.stride(1) == vs.stride(1) && ks.stride(2) == vs.stride(2));
-  TVM_FFI_ICHECK(k.stride(0) % sizeof(GMemCacheHead) == 0 &&
-                 k.stride(1) % sizeof(GMemCacheHead) == 0 &&
-                 ks.stride(0) % sizeof(GMemCacheHeadSf) == 0 &&
-                 ks.stride(1) % sizeof(GMemCacheHeadSf) == 0);
+  TVM_FFI_ICHECK(
+      k.stride(0) % sizeof(GMemCacheHead) == 0 && k.stride(1) % sizeof(GMemCacheHead) == 0 &&
+      ks.stride(0) % sizeof(GMemCacheHeadSf) == 0 && ks.stride(1) % sizeof(GMemCacheHeadSf) == 0);
   TVM_FFI_ICHECK(std::isfinite(bmm1_scale) && std::isfinite(bmm2_scale));
-  buckets::ComputeParams p{plan, static_cast<const __nv_bfloat16*>(q.data_ptr()),
-      static_cast<const uint8_t*>(k.data_ptr()), static_cast<const uint8_t*>(v.data_ptr()),
-      static_cast<const uint8_t*>(ks.data_ptr()), static_cast<const uint8_t*>(vs.data_ptr()),
-      static_cast<const uint32_t*>(mask.data_ptr()),
-      static_cast<const int*>(table.data_ptr()), static_cast<int*>(semaphores.data_ptr()),
-      static_cast<uint8_t*>(scratch.data_ptr()), static_cast<__nv_bfloat16*>(output.data_ptr()),
-      int(table.size(1)), int(heads), int(q_tokens), int(row_groups), int(groups),
-      k.stride(0), k.stride(1), k.stride(2),
-      ks.stride(0), ks.stride(1), ks.stride(2),
-      float(bmm1_scale), float(bmm2_scale)};
+  buckets::ComputeParams p{plan,
+                           static_cast<const __nv_bfloat16*>(q.data_ptr()),
+                           static_cast<const uint8_t*>(k.data_ptr()),
+                           static_cast<const uint8_t*>(v.data_ptr()),
+                           static_cast<const uint8_t*>(ks.data_ptr()),
+                           static_cast<const uint8_t*>(vs.data_ptr()),
+                           static_cast<const uint32_t*>(mask.data_ptr()),
+                           static_cast<const int*>(table.data_ptr()),
+                           static_cast<int*>(semaphores.data_ptr()),
+                           static_cast<uint8_t*>(scratch.data_ptr()),
+                           static_cast<__nv_bfloat16*>(output.data_ptr()),
+                           int(table.size(1)),
+                           int(heads),
+                           int(q_tokens),
+                           int(row_groups),
+                           int(groups),
+                           k.stride(0),
+                           k.stride(1),
+                           k.stride(2),
+                           ks.stride(0),
+                           ks.stride(1),
+                           ks.stride(2),
+                           float(bmm1_scale),
+                           float(bmm2_scale)};
 #if FLASHINFER_XQA_DIRECT_TASKS
   dim3 grid(ctas / plan.batch, groups, plan.batch);
 #else
   dim3 grid(ctas, groups);
 #endif
-  auto config = makeLaunchConfig(grid, dim3(128, 1, 2), sizeof(SharedMem),
-                                 get_stream(device), enable_pdl);
+  auto config =
+      makeLaunchConfig(grid, dim3(128, 1, 2), sizeof(SharedMem), get_stream(device), enable_pdl);
   checkCuda(cudaLaunchKernelEx(&config, buckets::compute, p));
   checkCuda(cudaPeekAtLastError());
 }

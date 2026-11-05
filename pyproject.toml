@@ -368,4 +368,3 @@ ignore = [
 "flashinfer/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
 "tests/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
 "benchmarks/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
-
