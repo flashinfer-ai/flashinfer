@@ -74,9 +74,11 @@ def test_shared_source_and_prepared_contract():
         validate_shared_backend(payload, backend._kernel_config)
 
 
-def test_shared_layer_construction_retains_both_weight_sets():
+def test_shared_layer_construction_retains_both_weight_sets(monkeypatch):
     from flashinfer.moe_ep import MegaConfig, MoEEpLayer
 
+    # This test prepares CPU weights without creating a device workspace.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     backend, bootstrap, fleet = _backend()
     layer = MoEEpLayer(
         bootstrap, fleet, _source(), backend=MegaConfig(backend._kernel_config)

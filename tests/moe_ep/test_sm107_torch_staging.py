@@ -178,6 +178,7 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     ws._destroyed = False
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._shared_weights = None
     ws.x = torch.empty(
         4, 64 if kind == "nvfp4" else 128, device="cuda", dtype=cfg.torch_act_data_dtype
     )

@@ -4,6 +4,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.arch_rubin
+
 
 def _mainloop(tile, *, shared):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
