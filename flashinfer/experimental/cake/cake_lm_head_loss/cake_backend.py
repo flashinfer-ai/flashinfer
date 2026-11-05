@@ -289,8 +289,9 @@ GRAD_WEIGHT_DTYPES = (torch.bfloat16, torch.float32)
 # ``mode`` scalar of ``row_finalize`` / ``loss_reduce``: which per-row quantities the stage forms.
 MODE_CE, MODE_POLICY, MODE_EXTERNAL, MODE_NONE = 0, 1, 2, 3
 WORKSPACE_ALIGN = 256
-# One registry record and its build.json libraries per architecture (SM107 runs SM103's programs, built for sm_107a,
-# under the base dispatch rules: no per-architecture rule table lists sm_107a).
+# One registry record and its build.json libraries per architecture (SM107 runs SM103's programs, built for sm_107a;
+# the per-architecture GEMM tile rule tables give sm_107a the sm_103a entries, except DX_LONG_CHUNK_STAGES; the
+# zero-gradient row skip keeps the generic 4097-row floor on sm_107a: ZERO_DLOGP_MIN_ROWS_BY_ARCH has no entry for it).
 SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
@@ -650,20 +651,28 @@ RASTER_RULE_MIN_ROWS = 2049
 RASTER_WIDE_GROUPS = {
     "sm_100a": (16, 32),
     "sm_103a": (16, 32),
+    "sm_107a": (16, 32),
 }  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture
 DW_LONG_CHUNK_GROUP_M = 16  # weight-gradient group_m of the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
 DW_LONG_CHUNK_GROUPS = {
     "sm_100a": DW_LONG_CHUNK_GROUP_M,
     "sm_103a": DW_LONG_CHUNK_GROUP_M,
+    "sm_107a": DW_LONG_CHUNK_GROUP_M,
 }  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
 DW_LONG_CHUNK_MIN_ROWS = 4097
 LOGITS_LONG_RASTER_GROUPS = {
     "sm_100a": 16,
     "sm_103a": 16,
+    "sm_107a": 16,
 }  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
 LOGITS_LONG_RASTER_MIN_ROWS = (
     3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
 )
+# sm_107a is not listed: its long chunks keep the table ring depth (DX_WIDE_TILE_STAGES).  Timed on FlashInfer main
+# f2a5262c (#8612) with the sm_107a table entries patched in at run time (PyTorch 2.14.1+cu130, nvcc 13.4), CUPTI
+# per-launch cycles at z = 0, one run on each of three 212-SM R200 nodes, T 16231, C 8192, cross-entropy and plain /
+# temperature log-prob: the dX GEMM launches of a call took 18853-19014 kcycles in total on the 3-deep ring and
+# 17851-18145 kcycles on the 4-deep ring (the split-tail dX form the shipped tables select).
 DX_LONG_CHUNK_STAGES = {
     "sm_100a": 3,
     "sm_103a": 3,
@@ -672,6 +681,7 @@ DX_WIDE_TILE_STAGES = 4  # the 512-wide dX tile's table ring depth (an explicit 
 DW_BLOCK_GROUPS = {
     "sm_100a": 12,
     "sm_103a": 12,
+    "sm_107a": 12,
 }  # column tiles per raster block of the weight-gradient accumulate / fp32 fused cast at the C 4096 chunk, per architecture
 DW_BLOCK_MIN_ROWS = RASTER_RULE_MIN_ROWS  # 2049
 DW_BLOCK_MAX_ROWS = (
@@ -700,12 +710,16 @@ DX_K_SLICES_MAX = 4  # the deterministic slice rule's largest count (:func:`reco
 DX_SPLIT_ARCHES = (
     "sm_100a",
     "sm_103a",
+    "sm_107a",
 )
 DX_SPLIT_LONG_RING_ARCHES = (
     "sm_103a",
-)  # architectures whose long-chunk ring (``_st3``) also takes the split (the deterministic package's list)
+    "sm_107a",
+)  # architectures whose long-chunk ring (``_st3``) also takes the split (the deterministic package's list, plus sm_107a,
+#    where only an explicit ``stages`` pin selects the ring)
 DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
     "sm_103a",
+    "sm_107a",
 )  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
 DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
@@ -716,7 +730,7 @@ DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
 # of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
 # over the same K slices in the same K order.
-DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a", "sm_107a")
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),

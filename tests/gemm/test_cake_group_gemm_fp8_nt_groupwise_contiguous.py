@@ -1005,6 +1005,7 @@ BLOCK_SCALED_CASES = [
     ([95, 97, 2, 193, 0, 100], 384, 128, 96),
     ([100, 0, 3, 69, 64, 129, 1, 97], 1024, 1024, 64),
     ([200, 150, 0, 97, 64, 1, 129, 300], 1024, 1024, 64),
+    ([100, 0, 3, 69, 64, 129, 1, 97], 1024, 256, 32),
 ]
 
 
@@ -1490,6 +1491,8 @@ def test_block_scaled_swap_small_block_rule_on_sm_100a():
     # The layouts of BS_SWAP_SM100_SMALL_KEEP keep the other swap-AB routes.
     for m, n, k, alignment in BS_SWAP_SM100_SMALL_KEEP:
         assert small(m, n, k, alignment=alignment, sm_count=148) is None
+    # (896, 1024, 512, 64) is not one of them: 28 * 8 = 224 one-CTA tiles.
+    assert rule(896, 1024, 512, alignment=64, sm_count=148) == BS_SWAP_C1_ROUTE
     assert rule(384, 3072, 1024, alignment=32, sm_count=148) == BS_SWAP_RP32_ROUTE
     assert rule(512, 2560, 2048, alignment=32, sm_count=148) == BS_SWAP_RUN32_ROUTE
     assert rule(512, 2048, 2048, alignment=64, sm_count=148) == BS_SWAP_RP32_ROUTE
@@ -1517,6 +1520,7 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     small = functools.partial(bs_swap_small_route, arch="sm_103a")
     rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_103a")
     assert sorted(BS_SWAP_SM103_SMALL_ADMIT) == [
+        (768, 1024, 256, 32),
         (896, 1024, 512, 64),
         (1024, 1024, 512, 32),
         (1152, 256, 1536, 32),
@@ -1531,7 +1535,8 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
                 BS_SWAP_C1_ROUTE
             )
         assert small(m, n, k, alignment=alignment, sm_count=None) is None
-        # sm_100a does not read the table: 72, 156, 224 and 256 tiles exceed 3 * 20.
+        # sm_100a does not read the table: 72, 156, 192, 224 and 256 tiles
+        # exceed 3 * 20.
         assert (
             bs_swap_small_route(
                 m, n, k, alignment=alignment, arch="sm_100a", sm_count=20
@@ -1548,6 +1553,10 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
         (1024, 512, 64),
         (896, 1024, 64),
         (896, 512, 32),
+        (640, 256, 32),
+        (896, 256, 32),
+        (768, 128, 32),
+        (768, 256, 64),
     ):
         assert rule(m, 1024, k, alignment=alignment, sm_count=152) == (
             BS_SWAP_RP32_ROUTE
@@ -1575,6 +1584,9 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
     route, grid = plan(1152, 256, 1536, alignment=32, num_groups=16, arch="sm_103a")
     assert route == BS_SWAP_C1_ROUTE and grid == (72, 1, 1)
+    # 24 * 8 = 192 tiles on 152 SMs.
+    route, grid = plan(768, 1024, 256, alignment=32, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
 
 
 def test_block_scaled_swap_bm64_admit_on_sm_103a():
@@ -1716,6 +1728,9 @@ def test_launch_plan_takes_the_small_block_routes_on_sm_100a():
     )
     # 12 * 32 = 384 one-CTA tiles on 148 CTAs.
     route, grid = plan(384, 4096, 1024, sm_count=148, alignment=32, num_groups=8)
+    assert route == BS_SWAP_C1_ROUTE and grid == (148, 1, 1)
+    # 28 * 8 = 224 one-CTA tiles on 148 CTAs.
+    route, grid = plan(896, 1024, 512, sm_count=148, alignment=64, num_groups=8)
     assert route == BS_SWAP_C1_ROUTE and grid == (148, 1, 1)
     # 20 * 8 = 160 tiles of 32 x 256 rows on 74 two-CTA clusters.
     route, grid = plan(640, 2048, 2048, sm_count=148, alignment=32, num_groups=8)
@@ -2034,6 +2049,25 @@ BLOCK_SCALED_SMALL_CASES = [
         128,
         {"sm_100a": BS_SWAP_C1_ROUTE},
         id="c1_sm100_n384_single_run",
+    ),
+    # The table layouts: 896 rows at alignment 64 (not in
+    # BS_SWAP_SM100_SMALL_KEEP: 28 * 8 = 224 one-CTA tiles on 148 SMs) and
+    # 768 rows at alignment 32 (in BS_SWAP_SM103_SMALL_ADMIT: 24 * 8 = 192 tiles).
+    pytest.param(
+        [40, 77, 0, 3, 100, 1, 65, 30],
+        1024,
+        512,
+        64,
+        {"sm_100a": BS_SWAP_C1_ROUTE},
+        id="c1_sm100_m896_a64_k512",
+    ),
+    pytest.param(
+        [130, 0, 7, 61, 96, 33, 1, 100],
+        1024,
+        256,
+        32,
+        {"sm_103a": BS_SWAP_C1_ROUTE},
+        id="c1_sm103_m768_a32_k256",
     ),
 ]
 

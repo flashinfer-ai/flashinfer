@@ -1177,7 +1177,7 @@ SHORT_FORWARD_ROWS_PER_SM = {"sm_100a": 12, "sm_103a": 12, "sm_107a": 59}
 MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
 LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
 # The rows per SM from which an architecture runs the extra-long forward.
-XLONG_FORWARD_ROWS_PER_SM = {"sm_103a": 3000}
+XLONG_FORWARD_ROWS_PER_SM = {"sm_103a": 3000, "sm_107a": 1740}
 # Forward inputs around and past the short, the mid and the long forward's
 # thresholds: (tokens, heads, layout); ``heads=None`` takes ``threshold * SMs
 # + tokens`` rows (the short threshold for ``flat-short``, the mid one for
@@ -1201,6 +1201,9 @@ LONG_FORWARD_CASES = [
     pytest.param(-1, None, "flat-xlong", id="xlong-threshold-1"),
     pytest.param(0, None, "flat-xlong", id="xlong-threshold"),
     pytest.param(1, None, "flat-xlong", id="xlong-threshold+1"),
+    pytest.param(7685, 48, "contiguous", id="7685x48"),
+    pytest.param(7685, 48, "projection", id="7685x48-projection"),
+    pytest.param(7685, 48, "head_major", id="7685x48-head_major"),
     pytest.param(9500, 48, "contiguous", id="9500x48"),
     pytest.param(9500, 48, "projection", id="9500x48-projection"),
     pytest.param(9500, 48, "head_major", id="9500x48-head_major"),

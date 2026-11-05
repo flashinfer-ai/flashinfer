@@ -853,10 +853,7 @@ class MoERunner(TunableRunner):
             resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
         )
 
-    # Anything the profiled tensor shapes cannot reveal has to be listed here.
-    # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
-    # which excludes runner_hash. Shapes already in the profile are omitted.
-
+    # Persisted key (no runner_hash), so rank-invariant; __hash__ adds the EP offset.
     def _cache_key_extras(self) -> tuple:
         """Return stable tactic inputs absent from profiled tensor shapes."""
         routing = self.config.routing
@@ -875,7 +872,6 @@ class MoERunner(TunableRunner):
             int(routing.top_k),
             int(routing.num_experts),
             int(local_num_experts),
-            int(experts.local_expert_offset),
             int(experts.intermediate_size),
             # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
@@ -895,7 +891,10 @@ class MoERunner(TunableRunner):
         )
 
     def __hash__(self) -> int:
-        return hash(self._cache_key_extras())
+        # In-memory only: EP ranks must share persisted entries (#6082).
+        return hash(
+            (self._cache_key_extras(), int(self.config.experts.local_expert_offset))
+        )
 
     def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         """Optional tactic-pool identity, stable for packed and profiling inputs."""
@@ -7824,22 +7823,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         per_token_scale = None
         if is_fp4:
+            # MXFP4xMXFP8 keeps the compact TRT-LLM UE8M0 row here;
+            # PrimsTsMxfp4Mxfp8MoERunner pads it to the GEMM's row stride.
             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
-            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
-                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
-                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
-                # Padding happens on every pack_inputs, including the hot
-                # forward path: one allocation, fill, and copy per call, so
-                # the public activation pack can stay the shared TRT-LLM layout.
-                from flashinfer.prims_ts.moe.runner import (
-                    _pad_mxfp8_linear_scale_for_prims,
-                )
-
-                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
-                    hidden_states_scale,
-                    num_tokens=num_tokens,
-                    hidden_size=hidden_size,
-                ).view(torch.float8_e4m3fn)
             if is_nvfp4:
                 if self._per_token and act.per_token_scale is None:
                     raise RuntimeError(
@@ -10724,7 +10710,7 @@ class _GroupedGemmStageRunner(TunableRunner):
         return (*self.parent._cache_key_extras(), "stage", self.stage)
 
     def __hash__(self) -> int:
-        return hash(self.get_cache_key_extras([]))
+        return hash((hash(self.parent), "stage", self.stage))
 
 
 def __getattr__(name: str):

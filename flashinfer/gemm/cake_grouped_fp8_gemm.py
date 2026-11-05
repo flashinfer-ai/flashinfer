@@ -507,7 +507,6 @@ BS_SWAP_SM100_SMALL_KEEP = frozenset(
         (640, 1024, 768, 32),
         (640, 1024, 1024, 32),
         (768, 1536, 1024, 32),
-        (896, 1024, 512, 64),
         (896, 1280, 1024, 64),
         (1152, 512, 256, 32),
         (1152, 1024, 512, 32),
@@ -520,6 +519,7 @@ BS_SWAP_SM100_SMALL_KEEP = frozenset(
 # one-CTA program was faster there than the routes the rule selects.
 BS_SWAP_SM103_SMALL_ADMIT = frozenset(
     {
+        (768, 1024, 256, 32),
         (896, 1024, 512, 64),
         (1024, 1024, 512, 32),
         (1152, 256, 1536, 32),

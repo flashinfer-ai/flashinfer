@@ -1079,8 +1079,9 @@ def test_backward_cta_rule(rows, sm_count):
         assert grid == (ctas, 1, 1)
 
 
-# The long and mid roles each architecture routes, with the rows per SM they
-# run from.
+# The extra-long, long and mid roles each architecture routes, with the rows
+# per SM they run from (sm_107a: the extra-long forward from the long forward's
+# 1740, no long forward).
 TIER_ROUTES = {
     "sm_100a": {
         "fwd_long": 2400,
@@ -1096,7 +1097,7 @@ TIER_ROUTES = {
         "bwd_f32_long": 1280,
     },
     "sm_107a": {
-        "fwd_long": 1740,
+        "fwd_xlong": 1740,
         "fwd_mid": 800,
         "bwd_bf16_long": 1024,
         "bwd_f32_long": 1024,
@@ -1234,8 +1235,8 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
             got = loader.module_for_rows("sm_107a", role, rows, sm_count)
             assert got == loader.ROUTES["sm_107a"][role + tier], (role, rows)
     # the forward on sm_107a: the short forward up to 59 rows per SM, the
-    # forward above, then the mid forward from 800 rows per SM, then the long
-    # forward from 1740
+    # forward above, then the mid forward from 800 rows per SM, then the
+    # extra-long forward from 1740 (sm_107a routes no long forward)
     routes = loader.ROUTES["sm_107a"]
     for rows, role in (
         (1, "fwd_short"),
@@ -1245,9 +1246,11 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         (800 * sm_count - 1, "fwd"),
         (800 * sm_count, "fwd_mid"),
         (1740 * sm_count - 1, "fwd_mid"),
-        (1740 * sm_count, "fwd_long"),
+        (1740 * sm_count, "fwd_xlong"),
+        (2**31 - 1, "fwd_xlong"),
     ):
         assert loader.module_for_rows("sm_107a", "fwd", rows, sm_count) == routes[role]
+    assert "fwd_long" not in routes
 
 
 # (rows, SMs, CTAs) of the long forward: 32-row blocks, the fewest whole waves
@@ -1271,7 +1274,7 @@ LONG_FORWARD_GRIDS = [
 def test_long_forward_grid_is_whole_waves_of_at_most_six_blocks_a_cta(
     rows, sm_count, ctas
 ):
-    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+    for arch in ("sm_100a", "sm_103a"):
         name = loader.ROUTES[arch]["fwd_long"]
         assert name == loader.ROUTES["sm_100a"]["fwd_long"]
     record = loader.MODULES[name]
@@ -1279,10 +1282,13 @@ def test_long_forward_grid_is_whole_waves_of_at_most_six_blocks_a_cta(
         "ctas_per_sm": 3,
         "kind": "persistent_row_blocks",
         "max_blocks_per_cta": 6,
-        "min_rows_per_sm": {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740},
+        "min_rows_per_sm": {"sm_100a": 2400, "sm_103a": 2400},
         "rows_per_block": 32,
     }
-    assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
+    assert record["arches"] == ["sm_100a", "sm_103a"]
+    # sm_107a's extra-long forward launches the same grid
+    xlong = loader.MODULES[loader.ROUTES["sm_107a"]["fwd_xlong"]]
+    assert loader.launch_grid(xlong, rows=rows, sm_count=sm_count) == (ctas, 1, 1)
     grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
     assert grid == (ctas, 1, 1)
     blocks, wave = -(-rows // 32), 3 * sm_count
@@ -1299,21 +1305,32 @@ def test_long_forward_grid_is_whole_waves_of_at_most_six_blocks_a_cta(
     )
 
 
-def test_extra_long_forward_is_the_long_forwards_grid_from_3000_rows_per_sm():
-    # sm_103a's extra-long forward: the long forward's grid rule (32-row blocks,
+def test_extra_long_forward_is_the_long_forwards_grid_from_its_rows_per_sm():
+    # the extra-long forward: the long forward's grid rule (32-row blocks,
     # whole waves of 3 CTAs per SM walking at most 6 blocks) from 3000 rows per
-    # SM, 256 threads, no PDL
+    # SM on sm_103a and from 1740 on sm_107a (the long forward's start there),
+    # 256 threads, no PDL
     name = loader.ROUTES["sm_103a"]["fwd_xlong"]
+    assert loader.ROUTES["sm_107a"]["fwd_xlong"] == name
     assert "fwd_xlong" not in loader.ROUTES["sm_100a"]
-    assert "fwd_xlong" not in loader.ROUTES["sm_107a"]
     record = loader.MODULES[name]
-    assert record["arches"] == ["sm_103a"] and record["role"] == "fwd_xlong"
-    long_rule = loader.MODULES[loader.ROUTES["sm_103a"]["fwd_long"]]["grid_rule"]
-    assert record["grid_rule"] == {**long_rule, "min_rows_per_sm": {"sm_103a": 3000}}
+    assert record["arches"] == ["sm_103a", "sm_107a"]
+    assert record["role"] == "fwd_xlong"
+    long_record = loader.MODULES[loader.ROUTES["sm_103a"]["fwd_long"]]
+    assert record["grid_rule"] == {
+        **long_record["grid_rule"],
+        "min_rows_per_sm": {"sm_103a": 3000, "sm_107a": 1740},
+    }
     assert record["launch"]["block"] == (256, 1, 1)
     assert record["launch"]["use_pdl"] is False
-    for rows, sm_count in ((3000 * 152, 152), (32737 * 48, 152), (2**31 - 1, 152)):
-        long_record = loader.MODULES[loader.ROUTES["sm_103a"]["fwd_long"]]
+    for rows, sm_count in (
+        (3000 * 152, 152),
+        (32737 * 48, 152),
+        (2**31 - 1, 152),
+        (1740 * 212, 212),
+        (32737 * 48, 212),
+        (2**31 - 1, 216),
+    ):
         assert loader.launch_grid(
             record, rows=rows, sm_count=sm_count
         ) == loader.launch_grid(long_record, rows=rows, sm_count=sm_count)

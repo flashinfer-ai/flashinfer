@@ -68,11 +68,10 @@ grid needs a second, short wave: with `slots = 6 x SMs` and
 `CTAs = chunks x H`, the plain prep runs for `slots < CTAs <= 2.5 x slots`
 (`sm_100a`, `sm_103a`; `sm_107a` has no plain-prep band and runs `prep_tma`
 for every grid), and
-for Q or K not 16-byte aligned.  Both preps give the same bits.  On `sm_100a`
-and `sm_103a` the WY stage runs `wy_tc2`: the chains and outputs of `wy_tc`
-(the same bits) with a 64-column TMEM accumulator and packed shared-memory
-operands, so five CTAs fit on an SM where `wy_tc` fits four; `sm_107a` runs
-`wy_tc`.  A long sequence can be
+for Q or K not 16-byte aligned.  Both preps give the same bits.  The WY stage
+runs `wy_tc2`: the chains and outputs of `wy_tc` (the same bits) with a
+64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
+on an SM where `wy_tc` fits four.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
 state.  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),

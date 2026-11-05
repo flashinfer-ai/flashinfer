@@ -316,17 +316,27 @@ def gen_ulysses_lowp_module() -> JitSpec:
     #
     # SM89 (Ada L40S / RTX 4090) uses the same Q_GROUP=32 / K_GROUP=64 tile
     # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
-    # source file covers both architectures.  We emit a fat binary with both
-    # gencodes so UlyssesLowpSageLayout.is_supported() returns True on either.
-    from .core import sm120a_nvcc_flags
+    # source file covers both architectures. Only emit requested targets:
+    # each AOT provider must contain binaries compatible with its own arch.
+    # A multi-device JIT context may still request both architectures.
+    from .core import check_cuda_arch, sm89_nvcc_flags, sm120a_nvcc_flags
 
-    sm89_gencode = "-gencode=arch=compute_89,code=sm_89"
+    # Preserve gen_jit_spec's retry when import-time device detection was empty.
+    check_cuda_arch()
+    targets = current_compilation_context.TARGET_CUDA_ARCHS
+    nvcc_flags = []
+    if (8, "9") in targets:
+        nvcc_flags.extend(sm89_nvcc_flags)
+    if targets & {(12, "0"), (12, "0a"), (12, "0f")}:
+        nvcc_flags.extend(sm120a_nvcc_flags)
+    if not nvcc_flags:
+        raise RuntimeError("Ulysses Lowp requires an SM89 or SM120 compilation target.")
     return gen_jit_spec(
         "ulysses_lowp",
         [
             jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
         ],
-        extra_cuda_cflags=[sm89_gencode] + sm120a_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
