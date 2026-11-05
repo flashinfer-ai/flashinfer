@@ -358,6 +358,16 @@ def _programs_exported() -> bool:
         return bool(libraries)
 
 
+def _forward_arena_tapes(backend: str, device, T_r: int) -> tuple[str, ...]:
+    """The forward tapes an eager light, saved-boundary forward leaves in a caller's arena: the output walk's two
+    (``FWD_TAPES_ARENA_AFTER_FUSED``) where the forward folds #5 into its tape walks (``cake_kcp._fuse_o``: tokens and
+    the registry's output-walk records for this backend's architecture), else the four #5 reads."""
+    arch = None if backend == "fake" else _mod("cake_backend").device_arch(device.index)
+    if T_r > 0 and kcp.fused_o_shipped(arch):
+        return kcp.FWD_TAPES_ARENA_AFTER_FUSED
+    return kcp.FWD_TAPES_ARENA_AFTER_FWD
+
+
 def _backend_name() -> str:
     name = os.environ.get("KCP_TEST_BACKEND")
     if name:
@@ -927,7 +937,13 @@ def _kept_record(T_r: int) -> dict:
     replay); a rank without tokens has no tapes and runs the replay form as before."""
     bwd = kcp.LAST_CALL["bwd"]
     seq = list(bwd["sequence"])
-    forward_programs = {"fwd_prep", "kcp_fwdh_offset", "kcp_fwdh_tape", "fwd_o"}
+    forward_programs = {
+        "fwd_prep",
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "fwd_o",
+    }
     first_local = next(
         (s_ for s_ in seq if s_ in kcp.LOCAL_PROGRAMS or s_ in forward_programs), None
     )
@@ -1386,11 +1402,14 @@ def _run_rank(
             leaf.grad = None
         torch.cuda.synchronize(device)
         gc.collect()
+        arena_after = _forward_arena_tapes(backend, device, int(q.shape[0]))
         if wsp is not None:
             # the warm-up backward's replay re-bound the arena tapes an eager forward drops before its output
-            # (FWD_DEAD_BEFORE_O); start from the state a forward leaves so the delta is the output alone
-            for name in kcp.FWD_DEAD_BEFORE_O + kcp.FWD_DEAD_AFTER_PREP:
-                wsp.release_tape(name)
+            # (FWD_DEAD_BEFORE_O; a fused forward binds no h / v_new either); start from the state a forward
+            # leaves so the delta is the output alone
+            for name in kcp.FWD_TAPES:
+                if name not in arena_after:
+                    wsp.release_tape(name)
             for name in kcp.FWD_DEAD_POOLS:
                 wsp.release_pool(name)
             torch.cuda.synchronize(device)
@@ -1438,12 +1457,13 @@ def _run_rank(
             )
         out.backward(dout)
         if wsp is not None and form == "caller_ws_kept":
-            # a kept backward leaves the caller's arena as a forward leaves it: of the forward tapes only the four
-            # #5 reads are bound (no dead tape, no kept tape beyond them), no entry survives the backward
+            # a kept backward leaves the caller's arena as a forward leaves it: of the forward tapes only the ones
+            # the forward leaves are bound (the four #5 reads; a fused forward's two), no dead tape, no kept tape
+            # beyond them, no entry survives the backward
             dbg["arena_tapes_after_backward"] = sorted(wsp._tapes)
             flags["kept_ws_as_forward_leaves"] = (
                 set(wsp._tapes) & set(kcp.FWD_TAPES)
-            ) <= set(kcp.FWD_TAPES_ARENA_AFTER_FWD) and kcp.kept_registry_size() == 0
+            ) <= set(arena_after) and kcp.kept_registry_size() == 0
         del out, leaves
     info["retained_bytes"] = retained
     info["retained_block_bytes"] = retained_block
@@ -2537,8 +2557,11 @@ V1_LIBRARIES = {
     "kcp_transfer_walk_plain_tf32": "cake_gdn_det_train_efbba796414578cbd8b5_kcp",
 }
 # sha256 over the sorted lines "<file> <sha256>\n" of the 36 csrc files (<library>_kernel.cu / _binding.cu) of the
-# 18 records above at FlashInfer 615a65850 (the package before the norm)
-V1_CSRC_DIGEST = "8ba3ceacd195fcc2794ed799da319fb9648abef343ca4502af1282e043a0cf97"
+# 18 records above as regenerated with the output walk: kernel text only changed from the package before the norm
+# (FlashInfer 615a65850), with the same bindings and the same SASS on sm_100a / sm_103a / sm_107a
+V1_CSRC_DIGEST = "a3b9ca82cf1ce9953813e288b5310a715080eeeb203d9a14af8910cf504a618a"
+# The output walk (#2 with #5 folded in): no v1 record, launched by the norm-off and the norm-on forward alike.
+NORM_OFF_EXTRA_RECORDS = ("kcp_fwdh_out", "kcp_fwdh_out_vh64")
 L2N_SKIP = (
     "the in-kernel Q/K L2 norm records (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply) are not in the shipped registry "
     "yet: use_qk_l2norm_in_kernel cannot run on the kernel backend"
@@ -2693,7 +2716,8 @@ def _run_rank_l2n(
             **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
         }
 
-    # norm off unchanged: pinned v1 identities and bytes; the norm-off route launches only v1 records
+    # norm off unchanged: pinned v1 identities and bytes; the norm-off route launches only v1 records and the output
+    # walk (a program of both routes, new beside the v1 records; NORM_OFF_EXTRA_RECORDS)
     jit = _mod("cake_jit")
     flags["norm_off_libraries_pinned"] = all(
         ({**jit.MODULES, **jit.TEST_MODULES}.get(n) or {}).get("library") == lib
@@ -2712,7 +2736,7 @@ def _run_rank_l2n(
     flags["norm_off_bitwise_unchanged"] = (
         flags["norm_off_libraries_pinned"]
         and flags["norm_off_csrc_bytes_pinned"]
-        and used <= set(V1_LIBRARIES)
+        and used <= set(V1_LIBRARIES) | set(NORM_OFF_EXTRA_RECORDS)
         and not res_off["fwd"]["qk_l2norm"]
     )
 
