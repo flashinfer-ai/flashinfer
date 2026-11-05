@@ -28,7 +28,7 @@ struct alignas(128) Shared {
   uint8_t k[3][2][64 * 128];  // (stage, feature-half, candidate, feature)
   uint8_t v[3][64 * 128];     // (stage, candidate, feature)
   uint8_t k_sf[2][64 * 16];   // (tile parity, candidate, 32-feature scale group)
-  uint8_t v_sf[2][64 * 16];   // Same scales, transposed in 4x4 byte blocks for PV.
+  uint8_t v_sf[2][64 * 16];   // Same (candidate, feature-group) layout as the cache.
   float scores[2][32 * 64];  // (tile parity, head, candidate), swizzled below.
   Pipeline::SharedStorage k_pipeline, v_pipeline;
 };
@@ -157,26 +157,13 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
-      // Prefetch SF[candidate, feature-group] and transpose 4x4 byte blocks
-      // in registers before waiting for FREE. Only scale factors take this
-      // register path; the V payload still goes directly GMEM -> SMEM via cp.async.
+      // Prefetch SF[candidate, feature-group] in cache order before waiting
+      // for FREE. Each lane retains one candidate's 16 scale bytes in registers;
+      // the V payload still goes directly GMEM -> SMEM via cp.async.
       int sf_id = (warp % 2) ? id_hi : id_lo;
       uint4 packed = sf_id >= 0
           ? *reinterpret_cast<const uint4*>(cache + size_t(sf_id) * stride + 512)
           : make_uint4(0, 0, 0, 0);
-      auto words = make_tensor(make_rmem_ptr(reinterpret_cast<uint32_t*>(&packed)), Layout<_4>{});
-      auto rSF = make_tensor<uint32_t>(Layout<_4>{});
-      #pragma unroll
-      for (int g = 0; g < 4; ++g) {
-        uint32_t w = words(g);
-        uint32_t a = __shfl_sync(0xffffffff, w, lane & ~3);
-        uint32_t b = __shfl_sync(0xffffffff, w, (lane & ~3) + 1);
-        uint32_t c = __shfl_sync(0xffffffff, w, (lane & ~3) + 2);
-        uint32_t d = __shfl_sync(0xffffffff, w, (lane & ~3) + 3);
-        int shift = (lane & 3) * 8;
-        rSF(g) = ((a >> shift) & 255) | (((b >> shift) & 255) << 8)
-            | (((c >> shift) & 255) << 16) | (((d >> shift) & 255) << 24);
-      }
       #pragma unroll 1
       for (int micro = 0; micro < 4; ++micro) {
         // Wait for the consumers to release this payload slot before any STS.
@@ -184,10 +171,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         v_pipeline.producer_acquire(write_state);
         const int stage = write_state.index();
         if (micro == 0) {
-          #pragma unroll
-          for (int g = 0; g < 4; ++g) {
-            *reinterpret_cast<uint32_t*>(sm.v_sf[tile & 1] + (g * 16 + loader_tid / 4) * 16 + (lane & 3) * 4) = rSF(g);
-          }
+          *reinterpret_cast<uint4*>(sm.v_sf[tile & 1] + loader_tid * 16) = packed;
         }
         uint8_t* dst = sm.v[stage];
         const int feature_base = micro * 128;
@@ -417,21 +401,22 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       }
       // Visit all 16 output-feature groups (32 features each). Four groups
       // consume one 128-feature V microtile, followed by its FREE release.
-      auto rVScale = make_tensor<uint32_t>(Shape<_2, _4>{});  // (group-in-micro, candidate-quartet)
+      // A native-layout word holds four adjacent feature-group scales for one
+      // candidate. Load it once per microtile and select its byte per group.
+      auto rVScale = make_tensor<uint32_t>(Shape<_8, _2>{});  // (candidate fragment, K tile)
       #pragma unroll
       for (int group = 0; group < 16; ++group) {
         const int micro = group / 4;
         const int stage = read_state.index();
         if (group % 4 == 0) {
           v_pipeline.consumer_wait(read_state);
-        }
-        if (group % 2 == 0) {
           #pragma unroll
-          for (int pack = 0; pack < 4; ++pack) {
-            int n = get<1>(tPcP((pack % 2) * 4, 0, pack / 2));
-            auto sSF = make_tensor(make_smem_ptr(reinterpret_cast<const uint32_t*>(
-                sm.v_sf[slot] + (micro * 16 + n / 4) * 16 + (group % 4 / 2) * 8)), Layout<_2>{});
-            copy_aligned(sSF, rVScale(_, pack));
+          for (int k = 0; k < 2; ++k) {
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) {
+              int n = get<1>(tPcP(v, 0, k));
+              rVScale(v, k) = *reinterpret_cast<const uint32_t*>(sm.v_sf[slot] + n * 16 + micro * 4);
+            }
           }
         }
         // Fold V's per-candidate scale into P for this output-feature group:
@@ -441,14 +426,8 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
         #pragma unroll
         for (int k = 0; k < 2; ++k) {
           #pragma unroll
-          for (int quartet = 0; quartet < 2; ++quartet) {
-            uint32_t scales = rVScale(group % 2, k * 2 + quartet);
-            #pragma unroll
-            for (int byte = 0; byte < 4; ++byte) {
-              int v = quartet * 4 + byte;
-              rScaled(v, 0, k) = rP(v, 0, k) * ue8((scales >> (byte * 8)) & 255);
-            }
-          }
+          for (int v = 0; v < 8; ++v)
+            rScaled(v, 0, k) = rP(v, 0, k) * ue8((rVScale(v, k) >> ((group % 4) * 8)) & 255);
         }
         // B's K mode is (candidate=32, candidate-group=2). Keep the
         // 64-candidate load tile independent of the P quantization extent.
