@@ -161,8 +161,9 @@ FORMS = (BF16, FP8)
 # The FP8 scan programs exist for the narrow, l6 and split kinds only, with no snake order and in the sampled-fit form.
 # An FP8 call runs the decision procedure of ``select_program`` under the FP8 record (``fp8_policy_record``); a decided
 # kind without an FP8 program runs the FP8 program of the kind below (same unit geometry where it has one, unpaired).
-# A wide unit (8 queries) runs the l6 unit (6 queries), the largest FP8 unit: per key tile it reads K once for 6 queries
-# rather than for the narrow unit's 4.
+# An unsplit wide unit (8 queries, unpaired or a CTA pair) runs the l6 unit (6 queries), the largest FP8 unit: per key
+# tile it reads K once for 6 queries rather than for the narrow unit's 4.  A split wide unit (sm_107a only) runs
+# split_narrow: no architecture that splits wide units registers an FP8 split_l6 program.
 FP8_KIND_FALLBACK = {
     "wide": "l6",
     "pair_l6": "l6",
@@ -239,8 +240,9 @@ def sample_class_for(
     shift_knob: bool,
 ) -> tuple[int, int]:
     """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
-    record's ``sample_class_rule``, from the call's ``tiles`` / ``shift``: the wide-unit programs take the rule's shift,
-    the tiny dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count.  A knob
+    record's ``sample_class_rule``, from the call's ``tiles`` / ``shift``: the wide-unit programs take the rule's shift on
+    packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny dispatch class (packed calls of short query
+    segments and few mean unit tiles) also its tile count.  A knob
     the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rule or with sampling off nothing changes."""
     class_rule = policy.sample_class_rule
     T, S = int(num_queries), int(num_segments)

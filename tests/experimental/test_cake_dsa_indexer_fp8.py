@@ -437,7 +437,8 @@ def test_fp8_wide_call_runs_the_l6_program(arch, grid):
 def test_fp8_wide_fallback_takes_the_sampling_class_of_l6():
     """s2_4x2k_packed on sm_100a (four segments of 2048 queries over 229376 keys, the longest 100352): the BF16 record
     plans a wide unit with the wide-unit sample shift of ``sample_class_rule``; the FP8 l6 program that runs instead
-    takes the l6 kind's shift and check period, as an l6 decision of the call would.  Explicit knobs stay."""
+    takes the l6 kind's shift, as an l6 decision of the call would (sm_100a's record keys no check period on the kind:
+    the next test covers sm_103a's).  Explicit knobs stay."""
     keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_100a") or ())
     if not any(scan_key_form(k) == FP8 for k in keys):
         pytest.skip("this checkout registers no FP8 scan program for sm_100a")
@@ -464,6 +465,44 @@ def test_fp8_wide_fallback_takes_the_sampling_class_of_l6():
         policy, sample_shift_permille=500, check_period=8, **call
     )
     assert (knobbed.sample_shift_permille, knobbed.check_period) == (500, 8)
+
+
+def test_fp8_wide_fallback_takes_the_check_period_of_l6_on_sm103a():
+    """sm_103a's record overrides the wide kind's check period (``check_period_kind_overrides``): the FP8 l6 program
+    run for a wide decision takes the l6 period instead.  The unsampled wide decisions of the geometry grid whose two
+    periods differ must exist, and each one runs with the l6 period."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_103a") or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip("this checkout registers no FP8 scan program for sm_103a")
+    policy = _fp8_policy("sm_103a")
+    programs = fp8_scan_programs(keys)
+    seen = 0
+    for T, Tkv, S, ratio, top_k in _geometries(policy):
+        call = dict(
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=ratio,
+            top_k=top_k,
+            grid=152,
+            sample_tiles_max=0,
+            scan_keys=keys,
+        )
+        decided = select_program(policy, **call)
+        if decided.physical_kind not in ("wide", "pair_wide"):
+            continue
+        wide = policy.check_period_for(top_k, decided.cand_cap, decided.kind)
+        l6 = policy.check_period_for(top_k, decided.cand_cap, "l6")
+        if wide == l6:
+            continue
+        c = select_fp8_program(policy, fp8_programs=programs, **call)
+        where = (T, Tkv, S, ratio, top_k)
+        assert decided.check_period == wide, where
+        assert (c.physical_kind, c.check_period) == ("l6", l6), where
+        seen += 1
+    assert seen, (
+        "no unsampled wide decision of the grid has a check period other than l6's"
+    )
 
 
 def test_bf16_plans_and_workspace_bounds_are_the_unchanged_procedure():

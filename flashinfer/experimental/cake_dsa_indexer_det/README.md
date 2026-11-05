@@ -155,7 +155,12 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   `NotImplementedError`.
 * **Workspace**: `dsa_indexer_det_topk_workspace_size(...,
   dtype=torch.float8_e4m3fn)` bounds the FP8 programs' workspace; the
-  default `dtype=torch.bfloat16` returns the BF16 bound unchanged.
+  default `dtype=torch.bfloat16` returns the BF16 bound unchanged.  A
+  `wide` / `pair_wide` decision runs the FP8 `l6` unit, 6 queries per unit
+  rather than the narrow unit's 4, so its FP8 bound has 1.5x the scan
+  entries of the narrow fallback: an FP8 buffer sized for such a call before this
+  fallback is rejected (`workspace_buffer needs N bytes`) and must be sized
+  again with this function.
 * **Prepared runners** bind `k_scale` with `q` / `k`: new values written into
   it are read by the next run.
 

@@ -112,10 +112,12 @@ rows; ``--rows fp8`` (the default of the mode) names ``P1``, ``glm2k_16k``
 ``s2_4x2k_packed`` (four segments of 2048 queries over 18432, 43008, 67584
 and 100352 keys) and ``s3_cold16k`` (16384 over 16384), top-k 2048, causal.
 Arms: ``cake_fp8`` (this backend's FP8 form; ``cake_fp8_aa`` /
-``cake_fp8_nosample`` as above; ``cake_fp8_wn`` under the previous kind
-fallback, which ran a wide decision on the narrow program; ``cake_fp8_l6`` /
+``cake_fp8_nosample`` as above; ``cake_fp8_wn`` the previous FP8 dispatch,
+which ran a wide decision on the narrow program with the wide decision's
+sampled first threshold and check period; ``cake_fp8_l6`` /
 ``cake_fp8_narrow`` on the l6 / narrow program on every row, and
-``cake_l6_all`` the BF16 form on the l6 program on every row), ``cake`` (the
+``cake_l6_all`` the BF16 form on the l6 program where the architecture
+registers the l6 key the row composes), ``cake`` (the
 BF16 form on the same data dequantized to BF16: ``q`` exactly, ``bf16(k * k_scale)``, the same ``w``,
 ``softmax_scale = 1``), ``deepgemm_topk`` (stock DeepGEMM FP8 MQA logits with
 FP32 per-key scales and FP32 logits: ``deep_gemm.fp8_mqa_logits``, or
@@ -864,16 +866,21 @@ def forced_policy(backend, overrides: dict):
 
 @contextlib.contextmanager
 def forced_fp8_fallback(backend, overrides: dict):
-    """Replace entries of the FP8 kind fallback (``cake_policy.FP8_KIND_FALLBACK``, which ``select_fp8_program`` reads at
-    every call) for an arm built inside this scope; the original entries are restored on exit."""
-    table = sys.modules[backend.select_fp8_program.__module__].FP8_KIND_FALLBACK
-    saved = dict(table)
+    """The previous FP8 dispatch for an arm built inside this scope: entries of the FP8 kind fallback
+    (``cake_policy.FP8_KIND_FALLBACK``) replaced, and the fallback program run with the decided kind's sampled first
+    threshold and check period (``cake_policy.fallback_knobs`` made the identity).  ``select_fp8_program`` reads both
+    module globals at every call; the originals are restored on exit."""
+    module = sys.modules[backend.select_fp8_program.__module__]
+    table = module.FP8_KIND_FALLBACK
+    saved, saved_knobs = dict(table), module.fallback_knobs
     table.update(overrides)
+    module.fallback_knobs = lambda policy, choice, physical, call: choice
     try:
         yield
     finally:
         table.clear()
         table.update(saved)
+        module.fallback_knobs = saved_knobs
 
 
 class CakeArm(Arm):
@@ -1161,14 +1168,17 @@ NARROW = {"l6_rule": None, "pair_rule": None, "wide_rule": [1e18, 1e18]}
 # sm_100a a top_k <= 512 row runs the same programs with twice the candidate buffers (the same bits) in this build; the
 # sm_103a record carries this floor already (there the arm is a second A/A twin)
 FLOOR16K = {"cand_cap_floor": 16384, "cand_cap_floor_rule": None}
-# FP8 dispatch measurements: every row on the single-CTA l6 program (no pair, no wide-first, a wide rule no call meets),
-# in either form
+# FP8 dispatch measurements: every row on the single-CTA l6 program (no pair, no wide-first, a wide rule no call meets)
+# where the architecture registers the l6 key the row composes (sm_107a has no BF16 snake-order l6 program in the plain
+# fit form: a causal single-segment BF16 row above 512 mean unit tiles has none), and every FP8 row on the narrow
+# program (NARROW without the unpaired-l6 preference, which sm_107a's record applies to packed and short-unit calls)
 L6_ALL = {
     "l6_rule": [1e9, 0],
     "pair_rule": None,
     "wide_first_rule": None,
     "wide_rule": [1e18, 1e18],
 }
+FP8_NARROW = {**NARROW, "l6_solo_rule": None, "l6_solo_unsampled_max_queries": None}
 # the FP8 kind fallback before a wide decision ran the FP8 l6 program: the narrow program
 FP8_FALLBACK_NARROW = {"wide": "narrow", "pair_wide": "narrow"}
 
@@ -1232,7 +1242,7 @@ ARMS = {
     "cake_fp8_aa": _cake("cake_fp8_aa"),
     "cake_fp8_nosample": _cake("cake_fp8_nosample", knobs=NOSAMPLE),
     "cake_fp8_l6": _cake("cake_fp8_l6", policy=L6_ALL),
-    "cake_fp8_narrow": _cake("cake_fp8_narrow", policy=NARROW),
+    "cake_fp8_narrow": _cake("cake_fp8_narrow", policy=FP8_NARROW),
     "cake_fp8_wn": _cake("cake_fp8_wn", fp8_fallback=FP8_FALLBACK_NARROW),
     "cake_l6_all": _cake("cake_l6_all", policy=L6_ALL),
     DeepGemmArm.name: DeepGemmArm,
