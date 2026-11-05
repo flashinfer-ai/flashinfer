@@ -73,8 +73,8 @@ gate term shows here).  This package's raw mode runs the deterministic
 package's programs in the same order (no path runs an S1 pair) but for the
 parameter-gradient reduce: on ``sm_100a`` / ``sm_103a`` its backward runs an
 ``R1c`` pair (the GLM intra program adds the per-chunk partials in FP64 into
-the workspace's accumulators, its cast rounds them once), on ``sm_107a`` the
-deterministic pair.  A raw row reports ``r1c`` (the pair's GLM intra and cast
+the workspace's accumulators, its cast rounds them once), on ``sm_107a`` and
+with ``--l2n`` on every architecture the deterministic pair.  A raw row reports ``r1c`` (the pair's GLM intra and cast
 records and replica count; ``None`` on ``sm_107a``), ``param_acc_bytes`` (the
 nd workspace's FP64 accumulators, outside its arena ``workspace_bytes``),
 ``raw_partials_bytes`` (the per-call partials and scratch the deterministic

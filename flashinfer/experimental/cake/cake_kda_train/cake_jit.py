@@ -57,7 +57,8 @@ class twins ``dqkg_raw`` / ``dqkg_int_raw`` / ``dqkg_davq_raw`` /
 / ``dqkg_davq_l2n`` / ``dqkg_int_davq_l2n``, one program per three records, and
 the ``_nohint`` forms ``dqkg_davq_nohint_raw`` / ``dqkg_davq_nohint_l2n`` and
 ``dqkg_int_davq_nohint_raw`` / ``dqkg_int_davq_nohint_l2n``, one program per
-pair); every other library has one record.  Four records
+pair; ``param_finalize`` and ``param_finalize_l2n``, one program); every other
+library has one record.  Four records
 launch with the programmatic-stream-serialization attribute
 (``launch["use_pdl"]``: ``fwdh_p3_o_ov`` / ``fwdh_p3_o_ov_id`` and their
 token-row twins ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``, the pass 2 of
@@ -171,7 +172,8 @@ pair ``dqkg`` / ``dqkg_int`` with ``glm_intra`` / ``glm_intra_v14`` /
                sm_107a: glm_intra_raw and param_finalize
     l2n modes  deterministic pair (the dqkg l2n class or raw class, the
                deterministic l2n GLM intra record) on every architecture,
-               path and row
+               path and row; raw mode: param_finalize_l2n (the
+               deterministic param_finalize) on every architecture
 
 The ``sm_107a`` ``S1`` rows are provisional.  Returning them to the
 deterministic pair takes: removing ``dqkg_davq_nohint_v24``,
@@ -242,12 +244,15 @@ class's ``"fused"`` / ``"fallback"`` records (``dqkg_l2n``, ``dqkg_int_l2n``,
 ``dqkg_davq_l2n``, ``dqkg_int_davq_l2n``, ``dqkg_davq_nohint_l2n``,
 ``dqkg_int_davq_nohint_l2n``) are the deterministic package's ``dqkg``
 records with their rules, each sharing its program with the raw-class
-record of the same build, and the raw class serves every mode.  An l2n
-mode launches the deterministic package's programs, in either gate mode (but
-for raw mode's parameter-gradient reduce on ``sm_100a`` / ``sm_103a``, whose
-plans the pairing guard refuses: there the ``R1c`` casts replace the
-deterministic ``param_finalize``); a tape backward may launch the tape WY twin
-below (``wy`` is no l2n stage) in place of ``wy_bwd``, writing the same ``w``.
+record of the same build, and the raw class serves every mode.  The raw
+class's l2n GLM intra programs write the deterministic per-chunk partials, so
+the parameter-gradient reduce is an l2n stage too: ``param_finalize_l2n``
+(``"fused"`` / ``"fallback"``) is the deterministic package's
+``param_finalize`` record on every architecture, sharing its program with
+``param_finalize``, and the ``R1c`` pairs serve the flag-off mode alone.  So
+an l2n mode launches the deterministic package's programs on every row, in
+either gate mode; a tape backward may launch the tape WY twin below (``wy`` is
+no l2n stage) in place of ``wy_bwd``, writing the same ``w``.
 
 The checkpoint hand-off's intra twins (:data:`HANDOFF_TWINS`): ``fwd_intra_v19``
 and ``fwd_intra_v20`` are the programs of ``fwd_intra_v14`` and ``fwd_intra``
@@ -400,6 +405,9 @@ OPTIONAL_STAGES = (
 # ``dqkg`` is one here: no GLM intra program of an l2n mode adds the ``q * dq``
 # term, so the S1 records serve ``"off"`` alone and an l2n mode selects the
 # deterministic fused gradient (its g-class ``_l2n`` records and the raw class).
+# So is ``param_finalize``: the raw class's l2n GLM intra programs write the
+# deterministic per-chunk partials, so an l2n mode selects ``param_finalize_l2n``
+# (the deterministic record) and the R1c casts serve ``"off"`` alone.
 L2N_MODES = ("off", "fused", "fallback")
 L2N_STAGES = frozenset(
     {
@@ -410,6 +418,7 @@ L2N_STAGES = frozenset(
         "qk_l2norm",
         "qk_apply",
         "qk_pullback",
+        "param_finalize",
     }
 )
 # The stages whose records are filtered by the call's gate mode (a record's
@@ -10580,6 +10589,55 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "param_finalize",
         "variant": "cast_r8",
     },
+    "param_finalize_l2n": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "dA_part"],
+            ["buffer", "db_part"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "part2"],
+            ["parameter", "seg_cap"],
+            ["buffer", "ticket"],
+            ["buffer", "dA_log"],
+            ["buffer", "ddt_bias"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "head_chunk_blocks", "per_cta": 128},
+        "kernel_symbol": "kernel_cake_kda_train_9788763cb8ed232f13b4",
+        "l2n": ["fused", "fallback"],
+        "launch": {
+            "block": (1024, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16512,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_9788763cb8ed232f13b4",
+        "logical": {
+            "dA_log": "dA_log",
+            "dA_part": "dA_part",
+            "db_part": "db_part",
+            "ddt_bias": "ddt_bias",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "part2": "part2",
+            "seg_cap": "seg_cap",
+            "seq_chunk_start": "seq_chunk_start",
+            "ticket": "ticket",
+        },
+        "select_rule": {
+            "kind": "path_in",
+            "paths": ["light", "light_states", "tape", "replay"],
+        },
+        "stage": "param_finalize",
+        "variant": "l2n",
+    },
     "qk_l2norm": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -10760,8 +10818,9 @@ HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
 # The R1c pairs of the raw gate, GLM intra record -> its cast: the GLM intra program adds the parameter-gradient terms
 # in FP64 into ``param_acc`` and the cast rounds them to ``dA_log`` / ``ddt_bias`` and zeroes them.  On every backward
 # path of a raw plan the glm_intra and param_finalize records pair this way or are a deterministic GLM intra
-# record (``glm_intra_raw``, or an l2n mode's) and ``param_finalize`` (cake_backend._check_pairs).
-# ``R1C_STRIPES`` is each GLM intra record's replica count, the leading extent of ``param_acc``.
+# record (``glm_intra_raw``, or an l2n mode's) and a deterministic ``param_finalize`` record (``param_finalize``,
+# ``param_finalize_l2n``) (cake_backend._check_pairs).  ``R1C_STRIPES`` is each GLM intra record's replica
+# count, the leading extent of ``param_acc``.
 R1C_PAIRS = {
     "glm_intra_v20c": "param_finalize_cast",
     "glm_intra_v20c_r8": "param_finalize_cast_r8",

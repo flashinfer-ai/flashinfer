@@ -69,7 +69,9 @@ backend are experimental: no compatibility guarantee.
   gradient are bitwise those of the deterministic package.  On `sm_107a` the
   per-rank parameter partial sums are bitwise too; on `sm_100a` / `sm_103a`
   they come from the `R1c` pairs (an unordered FP64 sum rounded once to FP32)
-  and can differ by about one FP32 ulp from run to run (below).
+  and can differ by about one FP32 ulp from run to run (below), with the
+  in-kernel q / k L2 norm off: its modes run the deterministic reduce
+  (`param_finalize_l2n`) on every architecture.
 * The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) runs on
   this package too ("In-kernel Q / K L2 norm" below): the rank's local stages
   take the single-rank package's records of the mode, copies of the

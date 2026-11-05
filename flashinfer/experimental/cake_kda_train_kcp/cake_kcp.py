@@ -42,7 +42,8 @@ backwards run the same programs and are bitwise equal, and ``out``, ``dq``,
 ``dk``, ``dv`` and ``dbeta`` are bitwise those of the deterministic package;
 ``dg`` differs from it by FP32 rounding on the ``S1`` rows.  The one unordered
 reduction is the raw gate mode's parameter-gradient reduce on ``sm_100a`` /
-``sm_103a`` (the ``R1c`` pairs, "Raw gate mode" below): its FP64 additions
+``sm_103a`` with the in-kernel Q/K L2 norm off (the ``R1c`` pairs, "Raw gate
+mode" below): its FP64 additions
 arrive in no fixed order, so a rank's ``dA_log`` / ``ddt_bias`` can differ from
 run to run, and only that backward raises torch's deterministic-algorithms
 alert (on every rank, before any exchange; eagerly and on a graph replay).
@@ -279,6 +280,10 @@ exchange.  :func:`reduce_gate_param_grads_kcp` still fixes the cross-rank
 order: every rank gets the same bits from the same partials (which then vary
 from run to run, so the sum does too, by a few FP32 ulps that grow with the
 world size: each partial by about one ulp, each addition rounding either way).
+With the in-kernel Q / K L2 norm (below) the raw backward runs the deterministic
+pair on every architecture (the l2n GLM intra program and
+``param_finalize_l2n``, the deterministic ``param_finalize``), so its partial
+sums are bitwise the deterministic route's and it raises no alert.
 The checkpoint hand-off does not engage in raw mode (:func:`chunk_kda_kcp`).
 
 In-kernel Q / K L2 norm (FlashInfer issue #7817; keyword-only
@@ -6042,13 +6047,16 @@ def _gate_key_flags(gate_args: dict[str, Any]) -> tuple[Any, ...]:
     return ("raw", lb if isinstance(lb, (int, float)) else repr(lb))
 
 
-def _alert_r1c(device: torch.device, H: int) -> None:
+def _alert_r1c(device: torch.device, H: int, l2n: bool = False) -> None:
     """PyTorch's non-determinism alert (``cake_backend._alert_r1c``) for a raw gate backward whose local stages run an
-    ``R1c`` pair (the unordered FP64 parameter-gradient reduce on ``sm_100a`` / ``sm_103a``).  The decision reads the
-    device's architecture and ``H`` alone (``cake_backend._r1c_alert_due``), never the rank's tokens, so every rank of
-    the group, one without tokens included, raises (or warns) together before any collective: a rank that raised
-    alone would leave its peers waiting in the exchange."""
-    cake_backend._alert_r1c(device, int(H), "chunk_kda_bwd_kcp")
+    ``R1c`` pair (the unordered FP64 parameter-gradient reduce on ``sm_100a`` / ``sm_103a`` with the in-kernel Q/K L2
+    norm off; ``l2n``: the call's flag, whose modes run ``param_finalize_l2n``, no ``R1c`` pair).  The decision reads
+    the device's architecture, ``H`` and the flag alone (``cake_backend._r1c_alert_due``), never the rank's tokens, so
+    every rank of the group, one without tokens included, raises (or warns) together before any collective: a rank
+    that raised alone would leave its peers waiting in the exchange."""
+    cake_backend._alert_r1c(
+        device, int(H), "chunk_kda_bwd_kcp", "fused" if l2n else "off"
+    )
 
 
 def _l2n_key_flags(l2n: bool) -> tuple[Any, ...]:
@@ -6171,7 +6179,7 @@ def _prepare(
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
     if backward and gate == "raw" and alert:
         # before anything is allocated, exchanged or launched; every rank decides alike (_alert_r1c)
-        _alert_r1c(device, H)
+        _alert_r1c(device, H, l2n)
     if not l2n:
         workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, device)
     # the in-kernel Q / K L2 norm's capability on this device, before the workspace binds anything: rank-independent
@@ -6546,11 +6554,13 @@ def chunk_kda_bwd_kcp(
     ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is a workspace of the other mode.  The raw
     mode runs the deterministic package's raw records but for the parameter-gradient reduce: every output and the
     raw gate's gradient are bitwise those of ``chunk_kda_det_bwd_kcp`` on the same rank, and so are the parameter
-    partial sums on ``sm_107a``.  On ``sm_100a`` / ``sm_103a`` the local stages reduce them with an ``R1c`` pair (an
-    unordered FP64 sum rounded once to FP32), so they can differ by about one FP32 ulp from run to run and from the
-    deterministic route (module docstring); under ``torch.use_deterministic_algorithms(True)`` such a call raises
-    ``RuntimeError`` (a ``UserWarning`` with ``warn_only=True``) on every rank before it allocates, exchanges or
-    launches anything (the decision reads the architecture and ``H`` alone).
+    partial sums on ``sm_107a`` (and on every architecture with ``use_qk_l2norm_in_kernel=True``: the deterministic
+    ``param_finalize``, as ``param_finalize_l2n``).  On ``sm_100a`` / ``sm_103a`` with the flag off the local stages
+    reduce them with an ``R1c`` pair (an unordered FP64 sum rounded once to FP32), so they can differ by about one
+    FP32 ulp from run to run and from the deterministic route (module docstring); under
+    ``torch.use_deterministic_algorithms(True)`` such a call raises ``RuntimeError`` (a ``UserWarning`` with
+    ``warn_only=True``) on every rank before it allocates, exchanges or launches anything (the decision reads the
+    architecture, ``H`` and the flag alone).
 
     ``use_qk_l2norm_in_kernel=True`` (the forward's; issue #7817): the same seven / five tensors, ``dq`` / ``dk`` the
     gradients of the raw ``q`` / ``k`` (contiguous, ranked like ``q``), the FP32 pullback fused into their final BF16
@@ -6599,7 +6609,7 @@ def chunk_kda_bwd_kcp(
     if entry is not None and entry.graph is not None:
         if use_gate_in_kernel:
             # the key matched a call whose operands were checked: q's head axis is H
-            _alert_r1c(q.device, int(q.shape[-2]))
+            _alert_r1c(q.device, int(q.shape[-2]), l2n)
             # the graph's R1c launches add into the local arena's accumulators: zeroed first where an eager backward
             # stopped before its cast (or a capture left them marked)
             local = getattr(workspace, "local", None)

@@ -456,8 +456,10 @@ RECORD_ARCHES = {
 # are copied, record for record.
 DET_RECORDS_NOT_LAUNCHED = frozenset(("dqkg_davq_nohint", "dqkg_int_davq_nohint"))
 # The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel``): the modes, and the stages that select within the class of
-# the call's mode (a record's ``l2n``, ``["off"]`` when absent) -- the deterministic package's and the fused gradient,
-# whose S1 records serve ``"off"`` alone (no GLM intra program of an l2n mode adds the ``q * dq`` term).
+# the call's mode (a record's ``l2n``, ``["off"]`` when absent) -- the deterministic package's, the fused gradient,
+# whose S1 records serve ``"off"`` alone (no GLM intra program of an l2n mode adds the ``q * dq`` term), and the
+# parameter finalize, whose R1c casts serve ``"off"`` alone (an l2n mode's raw GLM intra program writes the
+# deterministic per-chunk partials, which ``param_finalize_l2n`` reduces).
 L2N_MODES = ("off", "fused", "fallback")
 L2N_ON = ("fused", "fallback")
 L2N_STAGES = frozenset(
@@ -469,6 +471,7 @@ L2N_STAGES = frozenset(
         "qk_apply",
         "qk_pullback",
         "dqkg",
+        "param_finalize",
     }
 )
 # The token-local stages of the fallback route: dispatched in the "fallback" mode alone.
@@ -503,9 +506,13 @@ L2N_DQKG = {
     "dqkg_int_davq_nohint_l2n": "dqkg_int_davq_nohint",
 }
 L2N_DQKG_RAW = {name: f"{det}_raw" for name, det in L2N_DQKG.items()}
-# The deterministic record of every copied record (the fused gradient's raw and l2n classes: their RAW_DQKG /
-# L2N_DQKG record; every other copy: its own name).
-DET_SOURCE = {**RAW_DQKG, **L2N_DQKG}
+# The parameter finalize of the raw class's l2n modes, record -> the deterministic record it copies (rule, plan,
+# architectures and program, shared with the narrowed ``param_finalize``): the R1c casts finish the R1c programs'
+# FP64 sums alone, so an l2n mode's raw backward takes the deterministic finalize on every architecture.
+L2N_PARAM = {"param_finalize_l2n": "param_finalize"}
+# The deterministic record of every copied record (the fused gradient's raw and l2n classes and the l2n parameter
+# finalize: their RAW_DQKG / L2N_DQKG / L2N_PARAM record; every other copy: its own name).
+DET_SOURCE = {**RAW_DQKG, **L2N_DQKG, **L2N_PARAM}
 # The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
 # internal beta (``beta_int``); no path selects them, the hand-off's recompute launches one in place of its record.
 HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
@@ -546,7 +553,7 @@ def _r1c_glm(arch: str, h: int) -> str | None:
 
 
 # The registry's size: the deterministic package's 97 records, less those, plus the seven S1 records, the hand-off
-# twins, the tape WY twin, the fused gradient's raw and l2n classes and the R1c pairs.
+# twins, the tape WY twin, the fused gradient's raw and l2n classes, the R1c pairs and the l2n parameter finalize.
 MODULE_COUNT = (
     97
     - len(DET_RECORDS_NOT_LAUNCHED)
@@ -556,6 +563,7 @@ MODULE_COUNT = (
     + len(RAW_DQKG)
     + len(R1C_RECORDS)
     + len(L2N_DQKG)
+    + len(L2N_PARAM)
 )
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -676,9 +684,10 @@ L2N_UNFUSED = {"kind": "l2n_in", "modes": ["off", "fallback"]}
 def test_registry_records_are_well_formed() -> None:
     # the deterministic package's records (their own copies, the in-kernel Q/K L2 norm's among them) less the
     # deterministic forms no g-mode cell of this package launches, plus the S1 records, the hand-off twins, the tape
-    # WY twin, the fused gradient's raw and l2n classes and the R1c pairs; twelve libraries are shared (see the twins
-    # below): the two pairs of the deterministic package, the four raw-class fused gradient records with their
-    # g-class records and the six l2n-class ones with their raw-class records
+    # WY twin, the fused gradient's raw and l2n classes, the R1c pairs and the l2n parameter finalize; thirteen
+    # libraries are shared (see the twins below): the two pairs of the deterministic package, the four raw-class fused
+    # gradient records with their g-class records, the six l2n-class ones with their raw-class records and the l2n
+    # parameter finalize with param_finalize
     assert cake_jit.HANDOFF_TWINS == HANDOFF_TWINS
     assert cake_jit.TAPE_TWINS == TAPE_TWINS
     assert cake_jit.R1C_PAIRS == R1C_PAIRS and cake_jit.R1C_STRIPES == R1C_STRIPES
@@ -694,11 +703,12 @@ def test_registry_records_are_well_formed() -> None:
         | set(RAW_DQKG)
         | R1C_RECORDS
         | set(L2N_DQKG)
+        | set(L2N_PARAM)
     )
-    assert len(cake_jit.MODULES) == MODULE_COUNT == 121
+    assert len(cake_jit.MODULES) == MODULE_COUNT == 122
     assert (
         len({r["library"] for r in cake_jit.MODULES.values()})
-        == (MODULE_COUNT - 2 - len(RAW_DQKG_SHARED) - len(L2N_DQKG))
+        == (MODULE_COUNT - 2 - len(RAW_DQKG_SHARED) - len(L2N_DQKG) - len(L2N_PARAM))
         == 109
     )
     assert set(cake_jit.S1_RECORDS) == S1_RECORDS and len(cake_jit.S1_RECORDS) == 7
@@ -802,6 +812,7 @@ def test_registry_records_are_well_formed() -> None:
                 for l2n, raw in L2N_DQKG_RAW.items()
                 if raw not in RAW_DQKG_SHARED
             ),
+            *({l2n, det} for l2n, det in L2N_PARAM.items()),
         ), name
         # only a gate stage's records name a class
         assert record.get("gate", "g") in (
@@ -1463,16 +1474,18 @@ def test_the_raw_class_is_the_deterministic_raw_class() -> None:
     record: of its ``RAW_DQKG`` record, with the class, its own variant and every in-kernel Q/K L2 norm mode) under
     the copied library, every deterministic raw-class record has its copy (the in-kernel Q/K L2 norm's among them,
     with the deterministic record's ``l2n``), the deterministic parameter-gradient pair (``R1C_NARROWED``) differs
-    only in its architectures and rule, narrowed to ``sm_107a``, and the gate epilogue keeps the deterministic
-    record's g class."""
+    only in its architectures and rule, narrowed to ``sm_107a``, ``param_finalize_l2n`` (:data:`L2N_PARAM`) is the
+    deterministic ``param_finalize`` with its architectures and rule, serving the l2n modes, and the gate epilogue
+    keeps the deterministic record's g class."""
     renamed = {"library", "kernel_symbol"}
     raw = {name for name, rec in cake_jit.MODULES.items() if rec.get("gate") == "raw"}
     det_raw = {
         name for name, rec in det_jit.MODULES.items() if rec.get("gate") == "raw"
     }
     assert not det_raw & DET_RECORDS_NOT_LAUNCHED
-    assert raw == det_raw | set(RAW_DQKG) | R1C_RECORDS
+    assert raw == det_raw | set(RAW_DQKG) | R1C_RECORDS | set(L2N_PARAM)
     assert not det_raw & R1C_RECORDS and set(R1C_NARROWED) <= det_raw
+    assert not det_raw & set(L2N_PARAM) and set(L2N_PARAM.values()) <= det_raw
     assert set(RAW_DQKG.values()) <= {
         name for name, rec in det_jit.MODULES.items() if rec["stage"] == "dqkg"
     }
@@ -1484,7 +1497,7 @@ def test_the_raw_class_is_the_deterministic_raw_class() -> None:
     } <= raw
     checked = 0
     for name in sorted((raw - R1C_RECORDS) | {"gate_epilogue"}):
-        record, twin = cake_jit.MODULES[name], det_jit.MODULES[RAW_DQKG.get(name, name)]
+        record, twin = cake_jit.MODULES[name], det_jit.MODULES[DET_SOURCE.get(name, name)]
         assert record["library"] == twin["library"].replace(
             "cake_kda_det_train_", "cake_kda_train_"
         ), name
@@ -1498,11 +1511,15 @@ def test_the_raw_class_is_the_deterministic_raw_class() -> None:
             )
         if name in R1C_NARROWED:
             expected.update(_r1c_narrowed(name, twin))
+        if name in L2N_PARAM:
+            # the deterministic record un-narrowed: its architectures and rule, the l2n modes alone
+            assert "l2n" not in twin and twin["variant"] is None, name
+            expected.update(variant="l2n", l2n=list(L2N_ON))
         assert {
             key: value for key, value in record.items() if key not in renamed
         } == expected, name
         checked += 1
-    assert checked == len(raw) - len(R1C_RECORDS) + 1 > len(R1C_NARROWED)
+    assert checked == len(raw) - len(R1C_RECORDS) + 1 > len(R1C_NARROWED) + len(L2N_PARAM)
     # the narrowed forms, spelled out
     assert cake_jit.MODULES["glm_intra_raw"]["select_rule"] == {
         "kind": "arch_in",
@@ -1692,6 +1709,20 @@ def test_the_l2n_class_is_the_deterministic_l2n_class() -> None:
                 assert record.get("l2n", ["off"]) == ["off"], name
             else:
                 assert name in det_l2n or name in L2N_DQKG, name
+    # the parameter finalize of the l2n modes: the deterministic param_finalize (L2N_PARAM); the narrowed
+    # deterministic finalize and the R1c casts serve the flag-off mode alone
+    for name in cake_jit.records_of_stage("param_finalize", "raw"):
+        record = cake_jit.MODULES[name]
+        if name in L2N_PARAM:
+            assert record["l2n"] == list(L2N_ON), name
+        else:
+            assert "l2n" not in record and serves(record, "off"), name
+    for mode in L2N_ON:
+        assert [
+            name
+            for name in cake_jit.records_of_stage("param_finalize", "raw")
+            if serves(cake_jit.MODULES[name], mode)
+        ] == list(L2N_PARAM), mode
 
 
 # the memory reports' in-kernel Q/K L2 norm fields (#7817): the mode, then its byte counts
@@ -1814,10 +1845,12 @@ def test_records_of_stage_filters_the_gate_stages_by_class() -> None:
         "glm_intra_v20c_r8",
     )
     assert cake_jit.records_of_stage("param_finalize") == ()
+    # the deterministic finalize (sm_107a, off), the R1c casts (off) and the l2n modes' deterministic finalize
     assert cake_jit.records_of_stage("param_finalize", "raw") == (
         "param_finalize",
         "param_finalize_cast",
         "param_finalize_cast_r8",
+        "param_finalize_l2n",
     )
     assert cake_jit.records_of_stage("gate_epilogue", "raw") == ()
     with pytest.raises(ValueError, match="gate 'activated' is not one of"):
@@ -4599,8 +4632,9 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     names = [entry["name"] for entry in libraries]
     # The programs of cake_jit.MODULES, each built for the architectures its record delivers (all three but the
     # records of RECORD_ARCHES; the library twins, fwdh_v3 / fwdh_p3, wy_bwd / wy_fwd_rows, the four raw-class
-    # fused gradient records with their g-class records and the six l2n-class ones with their raw-class records,
-    # are built once per architecture); the KCP programs have their own package.
+    # fused gradient records with their g-class records, the six l2n-class ones with their raw-class records and the
+    # l2n parameter finalize with param_finalize, are built once per architecture); the KCP programs have their own
+    # package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
@@ -4610,10 +4644,15 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
         sum(len(RECORD_ARCHES.get(name, ARCHES)) for name in cake_jit.MODULES)
         - (2 + len(RAW_DQKG_SHARED)) * len(ARCHES)
         - sum(len(RECORD_ARCHES.get(name, ARCHES)) for name in L2N_DQKG)
+        - sum(
+            len(set(RECORD_ARCHES.get(name, ARCHES)) & set(RECORD_ARCHES[det]))
+            for name, det in L2N_PARAM.items()
+        )
     )
-    # 227 entries before the in-kernel Q/K L2 norm's copies, plus its 58 (19 programs x 3 architectures and the
-    # sm_103a forward intra form); the l2n class of the fused gradient adds no build
-    assert count == 285
+    # 229 entries before the in-kernel Q/K L2 norm's copies, plus its 61 (19 programs x 3 architectures, the sm_103a
+    # forward intra and GLM intra forms and the replay prep's saved-rstd twin on sm_100a / sm_103a); the l2n class of
+    # the fused gradient adds no build, the l2n parameter finalize two (param_finalize's program on sm_100a / sm_103a)
+    assert count == 292
     assert len(train_libraries) == count
     assert len(names) == len(set(names)) == count
     for entry in libraries:
@@ -4649,14 +4688,14 @@ def _det_manifest_or_skip() -> dict:
 def test_copied_programs_are_the_deterministic_packages_sources(
     manifest: dict,
 ) -> None:
-    """Every record but the S1 ones, the hand-off twins and the tape WY twin is a copy of the deterministic
-    package's record of the same name (a raw-class or l2n-class fused gradient record: of its ``RAW_DQKG`` /
-    ``L2N_DQKG`` record): the same digest in its library name (the package prefix aside), stage, launch, operands
-    and grid, and (outside the g class of the two pair stages with the in-kernel Q/K L2 norm off, whose rules route
-    the S1 cells) the same rule and architectures; each of its libraries has the deterministic library's flags and
-    sources, byte for byte once the package name in them is replaced.  The S1 programs, the twins and the R1c pairs
-    are the only new code (the deterministic raw parameter-gradient pair keeps its programs, narrowed to
-    ``sm_107a``)."""
+    """Every record but the S1 ones, the hand-off twins and the tape WY twin is a copy of the deterministic package's
+    record of the same name (a raw-class or l2n-class fused gradient record: of its ``RAW_DQKG`` / ``L2N_DQKG`` record;
+    ``param_finalize_l2n``: of ``param_finalize``): the same digest in its library name (the package prefix aside),
+    stage, launch, operands and grid, and (outside the g class of the two pair stages with the in-kernel Q/K L2 norm
+    off, whose rules route the S1 cells) the same rule and architectures; each of its libraries has the deterministic
+    library's flags and sources, byte for byte once the package name in them is replaced.  The S1 programs, the twins
+    and the R1c pairs are the only new code (the deterministic raw parameter-gradient pair keeps its programs, narrowed
+    to ``sm_107a``)."""
     det_manifest = _det_manifest_or_skip()
     det_dir = Path(det_jit.__file__).resolve().parent
     ours = {entry["name"]: entry for entry in manifest["libraries"]}
@@ -4683,6 +4722,10 @@ def test_copied_programs_are_the_deterministic_packages_sources(
         elif name in L2N_DQKG:
             assert record["variant"] == name.removeprefix("dqkg_"), name
             assert "gate" not in record and "gate" not in twin, name
+            assert record["l2n"] == list(L2N_ON) and "l2n" not in twin, name
+        elif name in L2N_PARAM:
+            assert record["variant"] == "l2n" and twin["variant"] is None, name
+            assert record["gate"] == twin["gate"] == "raw", name
             assert record["l2n"] == list(L2N_ON) and "l2n" not in twin, name
         else:
             assert record["variant"] == twin["variant"], name

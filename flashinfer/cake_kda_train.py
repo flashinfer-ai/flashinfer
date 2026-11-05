@@ -46,8 +46,9 @@ take ``use_gate_in_kernel``.  The raw mode has no ``S1`` pair: with
 the same order, so ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` and ``dg`` are
 bitwise the deterministic package's raw mode, but for the reduce of ``dA_log`` /
 ``ddt_bias``.  On SM107 that reduce is the deterministic package's too (bitwise
-results).  On SM100 / SM103 the backward adds the per-chunk parameter partials in
-FP64 in no fixed order and rounds the sums to FP32 once, so ``dA_log`` /
+results).  On SM100 / SM103 with the in-kernel Q/K L2 norm off (with it the
+reduce is the deterministic package's on every architecture, below) the backward
+adds the per-chunk parameter partials in FP64 in no fixed order and rounds the sums to FP32 once, so ``dA_log`` /
 ``ddt_bias`` can differ from run to run and from the deterministic package:
 from run to run by one FP32 ulp at most while the FP64 sum's order error stays
 below half an FP32 ulp of the result (only per-chunk terms that nearly cancel

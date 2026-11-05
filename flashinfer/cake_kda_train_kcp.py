@@ -103,8 +103,9 @@ the rank-local stages run the non-deterministic single-rank package's raw
 records, copies of the deterministic raw programs on every row but for the
 parameter-gradient reduce, so every output and the raw gate's gradient are
 bitwise those of ``deterministic=True``.  On SM107 the parameter partial sums
-are bitwise too.  On SM100 / SM103 each rank adds its per-chunk parameter
-partials in FP64 in no fixed order and rounds the sums to FP32 once, so its
+are bitwise too.  On SM100 / SM103 with the in-kernel q / k L2 norm off (with
+it the reduce is the deterministic package's on every architecture, below) each
+rank adds its per-chunk parameter partials in FP64 in no fixed order and rounds the sums to FP32 once, so its
 partial sums can differ from run to run and from ``deterministic=True``: from
 run to run by one FP32 ulp at most while the FP64 sum's order error stays below
 half an FP32 ulp of the result (only per-chunk terms that nearly cancel exceed

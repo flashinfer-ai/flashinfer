@@ -131,7 +131,8 @@ mode runs the deterministic raw programs in the same order but for the
 parameter-gradient reduce, so the agreement step requires ``out``, ``dq``,
 ``dk``, ``dv``, ``dbeta`` and the raw gate's ``dg`` (and the convolution's) to
 have the deterministic arm's bit pattern.  On ``sm_107a`` the per-rank
-``dA_log`` / ``ddt_bias`` partials and their cross-rank sums must too.  On
+``dA_log`` / ``ddt_bias`` partials and their cross-rank sums must too, and so
+must they on every architecture with ``--l2n`` (the deterministic reduce).  On
 ``sm_100a`` / ``sm_103a`` (``r1c``) each rank reduces its partials with an
 ``R1c`` pair (an FP64 sum in no fixed order, rounded once), so they can differ
 from the deterministic arm's by an FP32 ulp: the step records their largest

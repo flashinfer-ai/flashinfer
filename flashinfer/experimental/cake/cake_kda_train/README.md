@@ -192,11 +192,10 @@ backward outside the capture on the workspace before the next replay.
 | `sm_107a` | the deterministic pair `glm_intra_raw` + `param_finalize` |
 
 `R1c` serves the raw rows with the in-kernel q / k L2 norm off.  In an l2n
-mode the raw backward runs the deterministic l2n GLM intra program
-(`glm_intra_raw_l2n`, or the fallback route's capture form) on every
-architecture; on `sm_100a` / `sm_103a` the pairing guard refuses such a plan
-(the `R1c` casts finish the FP64 accumulators of the `R1c` GLM intra programs
-alone, not the deterministic per-chunk partials).
+mode the raw backward runs the deterministic pair on every architecture: the
+deterministic l2n GLM intra program (`glm_intra_raw_l2n`, or the fallback
+route's capture form) and `param_finalize_l2n`, the deterministic
+`param_finalize` (see "Registry").
 
 The in-kernel q / k L2 norm has no `S1` pair either: no GLM intra program of
 its modes (`glm_intra_l2n`, `glm_intra_raw_l2n` and the fallback route's
@@ -237,12 +236,13 @@ Its backward runs the deterministic fused gradient on every row: in g mode the
   the result (only per-chunk terms that nearly cancel exceed it), and their
   error against the FP64 reference stays within the deterministic package's
   plus the FP64 sum's own error.
-- With the in-kernel q / k L2 norm, in either gate mode (the raw gate mode on
-  `sm_107a`, see `R1c` above), every output (the outputs above, the raw gate
-  mode's `dA_log` / `ddt_bias` included, and the saved `qk_rstd`) is bitwise
-  the deterministic package's in the same mode, on the same paths and
-  architectures: the same programs run in the same order (the tape path's WY
-  twin below writes the same `w`).
+- With the in-kernel q / k L2 norm, in either gate mode, every output (the
+  outputs above, the raw gate mode's `dA_log` / `ddt_bias` included, and the
+  saved `qk_rstd`) is bitwise the deterministic package's in the same mode,
+  on the same paths and architectures: the same programs run in the same
+  order (the raw gate mode's parameter reduce is the deterministic
+  `param_finalize`, as `param_finalize_l2n`; the tape path's WY twin below
+  writes the same `w`).
 
 ## Checkpoint hand-off
 
@@ -360,7 +360,7 @@ digest under this package's prefix.
 
 ## Registry
 
-121 records naming 109 programs.  The records of the
+122 records naming 109 programs.  The records of the
 deterministic package are copied under this package's prefix, with these
 changes:
 
@@ -379,20 +379,21 @@ changes:
 | `dqkg_raw`, `dqkg_int_raw`, `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`, `dqkg_int_davq_nohint_raw` | new: the raw gate mode's `dqkg` class (`gate: "raw"`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so the raw mode selects the deterministic fused gradient on every row (on the deterministic records' architectures: the `_nohint` forms on `sm_107a`, the others on all three) |
 | `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_replay_saved_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_v30_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | the in-kernel Q/K L2 norm's records, unchanged (`fwd_intra_v37_l2n` and `glm_intra_v30_l2n` on `sm_103a`, the saved-rstd twin `bwd_prep_g8_replay_saved_l2n` on `sm_100a` / `sm_103a`, the others on all three architectures; no path selects the twin) |
 | `dqkg_l2n`, `dqkg_int_l2n`, `dqkg_davq_l2n`, `dqkg_int_davq_l2n`, `dqkg_davq_nohint_l2n`, `dqkg_int_davq_nohint_l2n` | new: the in-kernel Q/K L2 norm's `dqkg` records of the g class (`l2n: ["fused", "fallback"]`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so an l2n mode selects the deterministic pair on every row; each shares its program with the raw class record of the same build |
+| `param_finalize_l2n` | new: the in-kernel Q/K L2 norm's `param_finalize` record of the raw class (`l2n: ["fused", "fallback"]`), the deterministic package's `param_finalize` record and its rule on all three architectures, so the raw gate mode's l2n backward finishes the deterministic GLM intra programs' partials as the deterministic package does; it shares its program with `param_finalize` |
 | `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
 | `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
 
 The stages of `cake_jit.GATE_STAGES` select among the records of the call's
 gate mode (a record's `gate`, `"g"` when absent), and the stages of
-`cake_jit.L2N_STAGES` (the deterministic package's and `dqkg`) among the
-records of the call's in-kernel Q/K L2 norm mode (a record's `l2n`, `["off"]`
-when absent).  The copies of the plain records keep the deterministic
-records' `l2n` modes; the `S1` records, the `R1c` GLM intra records and the
-hand-off twins serve `"off"` alone; the raw class's `dqkg` records serve every
-mode, as do the tape WY twin (its stage `wy` is no l2n stage) and the
-`param_finalize` records (no l2n stage either).
+`cake_jit.L2N_STAGES` (the deterministic package's, `dqkg` and
+`param_finalize`) among the records of the call's in-kernel Q/K L2 norm
+mode (a record's `l2n`, `["off"]` when absent).  The copies of the plain
+records keep the deterministic records' `l2n` modes; the `S1` records, the
+`R1c` records and the hand-off twins serve `"off"` alone; the raw class's
+`dqkg` records serve every mode, as does the tape WY twin (its stage `wy` is
+no l2n stage).
 
-`build.json` has 290 entries: 97 on `sm_100a`, 96 on `sm_103a` and 97 on
+`build.json` has 292 entries: 98 on `sm_100a`, 97 on `sm_103a` and 97 on
 `sm_107a`.
 
 ## Layout of this package

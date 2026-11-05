@@ -43,8 +43,9 @@ has the deterministic package's format (the forward programs are the same).
 The raw gate mode (below) runs the deterministic fused gradient on every row:
 there ``out`` and every gradient but ``dA_log`` / ``ddt_bias`` are bitwise the
 deterministic package's, and on ``sm_107a`` those two are bitwise too.  On
-``sm_100a`` / ``sm_103a`` the raw backward reduces ``dA_log`` / ``ddt_bias``
-with the ``R1c`` pairs (:data:`cake_jit.R1C_PAIRS`): an unordered FP64 sum,
+``sm_100a`` / ``sm_103a`` the raw backward with the in-kernel Q/K L2 norm off
+reduces ``dA_log`` / ``ddt_bias`` with the ``R1c`` pairs
+(:data:`cake_jit.R1C_PAIRS`): an unordered FP64 sum,
 rounded once to FP32, so the two can differ from run to run and from the
 deterministic package (from run to run by one FP32 ulp at most while the FP64
 sum's order error stays below half an FP32 ulp of the result; only per-chunk
@@ -52,8 +53,10 @@ terms that nearly cancel exceed it); that backward alone raises PyTorch's
 non-determinism alert under ``torch.use_deterministic_algorithms(True)``
 (:func:`_alert_nondeterministic`).
 The in-kernel Q/K L2 norm (below) runs the deterministic package's l2n
-records, so its outputs are bitwise the deterministic package's in the same
-mode.
+records, raw mode's parameter-gradient reduce included (``param_finalize_l2n``,
+the deterministic ``param_finalize``, on every architecture), so its outputs
+are bitwise the deterministic package's in the same mode and its raw backward
+raises no non-determinism alert.
 
 Operands (one packed batch of documents, GLM-5.3-Flash geometry): ``q, k, v``
 BF16 ``[1, S, H, 128]`` (``q`` / ``k`` L2-normalized by the caller), ``g`` FP32
@@ -566,21 +569,21 @@ class Plan:
     every stage of the path (:data:`cake_jit.PATHS`; ``light_states`` on the segmented route only) to the registry
     record its ``select_rule`` admits (``None`` for an optional stage the path or route does not launch) and
     ``grids`` every selected record to its launch grids, one per launch of the record by its stage
-    (``cake_jit.launch_grid``).  ``gate`` is the gate mode the records serve (``cake_jit.GATES``: ``"g"`` the
-    activated FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel``): the stages of
-    ``cake_jit.GATE_STAGES`` select within that class, every other stage selects the same record in both modes;
-    in raw mode ``gate_fused`` is True on every architecture (no raw gate epilogue), ``param_finalize`` runs once
-    per backward and the fused gradient is the deterministic package's on every row (no ``S1`` record); on
-    ``sm_100a`` / ``sm_103a`` the ``glm_intra`` and ``param_finalize`` records are an ``R1c`` pair
-    (:data:`cake_jit.R1C_PAIRS`, :func:`_r1c_stripes`), on ``sm_107a`` ``glm_intra_raw`` and ``param_finalize``.  The
-    forward layouts do not depend on it.  ``l2n`` is the in-kernel Q/K L2 norm mode the records serve
-    (:data:`L2N_MODES`: ``"off"``, the caller's normalized q / k; ``"fused"``, the default of
-    ``use_qk_l2norm_in_kernel=True``: the first q / k reader of every path normalizes and GLM intra pulls the
-    gradients back; ``"fallback"``, the token-local ``qk_l2norm`` / ``qk_apply`` / ``qk_pullback`` stages around the
-    plain readers, a test route only): the stages of ``cake_jit.L2N_STAGES`` select within that class (the fused
-    gradient among them: its l2n class is the deterministic package's records, no ``S1`` record); every l2n mode
-    fuses the gate epilogue (``gate_fused`` True on every architecture) and the forward layouts carry the transient
-    ``qn`` / ``kn`` views.
+    (``cake_jit.launch_grid``).  ``gate`` is the gate mode the records serve (``cake_jit.GATES``: ``"g"`` the activated
+    FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel``): the stages of ``cake_jit.GATE_STAGES`` select
+    within that class, every other stage selects the same record in both modes; in raw mode ``gate_fused`` is True on
+    every architecture (no raw gate epilogue), ``param_finalize`` runs once per backward and the fused gradient is the
+    deterministic package's on every row (no ``S1`` record); on ``sm_100a`` / ``sm_103a`` the ``glm_intra`` and
+    ``param_finalize`` records are an ``R1c`` pair (:data:`cake_jit.R1C_PAIRS`, :func:`_r1c_stripes`), on ``sm_107a``
+    ``glm_intra_raw`` and ``param_finalize``; in an l2n mode, on every architecture, the deterministic l2n GLM intra
+    record and ``param_finalize_l2n`` (the deterministic ``param_finalize``).  The forward layouts do not depend on it.
+    ``l2n`` is the in-kernel Q/K L2 norm mode the records serve (:data:`L2N_MODES`: ``"off"``, the caller's normalized
+    q / k; ``"fused"``, the default of ``use_qk_l2norm_in_kernel=True``: the first q / k reader of every path normalizes
+    and GLM intra pulls the gradients back; ``"fallback"``, the token-local
+    ``qk_l2norm`` / ``qk_apply`` / ``qk_pullback`` stages around the plain readers, a test route only): the stages of
+    ``cake_jit.L2N_STAGES`` select within that class (the fused gradient among them: its l2n class is the deterministic
+    package's records, no ``S1`` record); every l2n mode fuses the gate epilogue (``gate_fused`` True on every
+    architecture) and the forward layouts carry the transient ``qn`` / ``kn`` views.
     """
 
     S: int
@@ -1102,12 +1105,25 @@ def _check_pairs(
     (:data:`cake_jit.R1C_PAIRS`) must be followed by its own cast and ``glm_intra_raw`` by ``param_finalize``.  The
     ``R1c`` program's FP64 sums in ``param_acc`` are read by its cast alone (whose replica count is the GLM intra
     record's, :data:`cake_jit.R1C_STRIPES`), and ``param_finalize`` reads the per-chunk partials only
-    ``glm_intra_raw`` writes; any other pair reads values nothing wrote.  In g mode no ``R1c`` record may be
-    selected."""
+    ``glm_intra_raw`` writes; any other pair reads values nothing wrote.  In an l2n mode no ``R1c`` record may be
+    selected (the ``R1c`` pairs serve the flag-off mode alone): the l2n GLM intra program (``glm_intra_raw_l2n``, or
+    the fallback route's capture form) writes the deterministic per-chunk partials, which ``param_finalize_l2n`` (the
+    deterministic ``param_finalize``, on every architecture) reads.  In g mode no ``R1c`` record may be selected."""
     for path, by_stage in records.items():
         if "dqkg" not in by_stage:
             continue
         dqkg, glm = by_stage["dqkg"], by_stage["glm_intra"]
+        r1c = [
+            name
+            for name in (glm, by_stage.get("param_finalize"))
+            if name in cake_jit.R1C_PAIRS or name in cake_jit.R1C_PAIRS.values()
+        ]
+        if r1c and l2n != "off":
+            raise ValueError(
+                f"plan: path {path!r} selects the R1c record(s) {r1c} in l2n mode {l2n!r} ({arch}, H={H}); the R1c "
+                "pairs serve the flag-off mode alone (an l2n mode's raw backward runs the deterministic l2n GLM intra "
+                "program and param_finalize_l2n)"
+            )
         if gate == "raw" or l2n != "off":
             s1 = [name for name in (dqkg, glm) if name in cake_jit.S1_RECORDS]
             if s1 and gate == "raw":
@@ -1122,20 +1138,17 @@ def _check_pairs(
                 )
             if gate == "raw":
                 fin = by_stage.get("param_finalize")
-                want = cake_jit.R1C_PAIRS.get(glm, "param_finalize")
+                want = cake_jit.R1C_PAIRS.get(
+                    glm, "param_finalize" if l2n == "off" else "param_finalize_l2n"
+                )
                 if fin != want:
                     raise ValueError(
                         f"plan: path {path!r} pairs glm_intra record {glm!r} with param_finalize record {fin!r} in "
-                        f"raw gate mode ({arch}, H={H}); it must be {want!r}: the R1c GLM intra program's FP64 sums "
-                        "are read by its cast alone, and a cast after glm_intra_raw (or param_finalize after an R1c "
-                        "program) reads accumulators (partials) nothing wrote"
+                        f"raw gate mode, l2n mode {l2n!r} ({arch}, H={H}); it must be {want!r}: the R1c GLM intra "
+                        "program's FP64 sums are read by its cast alone, and a cast after a deterministic GLM intra "
+                        "program (or param_finalize after an R1c program) reads accumulators (partials) nothing wrote"
                     )
             continue
-        r1c = [
-            name
-            for name in (glm, by_stage.get("param_finalize"))
-            if name in cake_jit.R1C_PAIRS or name in cake_jit.R1C_PAIRS.values()
-        ]
         if r1c:
             raise ValueError(
                 f"plan: path {path!r} selects the R1c record(s) {r1c} in g mode ({arch}, H={H}); the R1c pairs "
@@ -2346,10 +2359,11 @@ def _r1c_rule_kinds() -> set[str]:
     return kinds
 
 
-def _r1c_alert_due(arch: str, H: int, sm_count: int) -> bool:
-    """Whether a raw backward of ``H`` heads on ``arch`` runs an ``R1c`` pair (and so alerts under torch's
-    deterministic algorithms, :func:`_alert_nondeterministic`): the selection of the plan of a one-chunk problem of
-    ``H`` heads.  The ``R1c`` records' rules read the architecture, the head count and the path alone
+def _r1c_alert_due(arch: str, H: int, sm_count: int, l2n: str = "off") -> bool:
+    """Whether a raw backward of ``H`` heads on ``arch`` in the in-kernel Q/K L2 norm mode ``l2n`` runs an ``R1c``
+    pair (and so alerts under torch's deterministic algorithms, :func:`_alert_nondeterministic`): the selection of
+    the plan of a one-chunk problem of ``H`` heads in that mode (an l2n mode runs ``param_finalize_l2n``, no
+    ``R1c`` pair).  The ``R1c`` records' rules read the architecture, the head count and the path alone
     (:data:`_R1C_RULE_KINDS`; ``RuntimeError`` otherwise, raised alike on every rank), so every problem of ``H``
     heads selects the same pair, and the context-parallel route's ranks, whose local problems differ, decide alike
     (a decision one rank took alone could leave its peers waiting in a collective)."""
@@ -2361,15 +2375,16 @@ def _r1c_alert_due(arch: str, H: int, sm_count: int) -> bool:
             f"architecture, the head count and the path alone ({sorted(_R1C_RULE_KINDS)})"
         )
     return (
-        _r1c_stripes(plan(BT, 1, int(H), int(sm_count), arch, gate="raw")) is not None
+        _r1c_stripes(plan(BT, 1, int(H), int(sm_count), arch, gate="raw", l2n=l2n))
+        is not None
     )
 
 
-def _alert_r1c(device: torch.device, H: int, entry: str) -> None:
-    """:func:`_alert_nondeterministic` for a raw gate backward of ``H`` heads on ``device`` that runs an ``R1c``
-    pair (:func:`_r1c_alert_due`); nothing while torch's deterministic algorithms are off (the device and the
-    registry are then not consulted), and nothing on a device that is not a CUDA device or that no record targets
-    (the call is refused later by its device check)."""
+def _alert_r1c(device: torch.device, H: int, entry: str, l2n: str = "off") -> None:
+    """:func:`_alert_nondeterministic` for a raw gate backward of ``H`` heads on ``device`` in the in-kernel Q/K L2 norm
+    mode ``l2n`` that runs an ``R1c`` pair (:func:`_r1c_alert_due`); nothing while torch's deterministic algorithms are
+    off (the device and the registry are then not consulted), and nothing on a device that is not a CUDA device or that
+    no record targets (the call is refused later by its device check)."""
     if not torch.are_deterministic_algorithms_enabled():
         return
     device = torch.device(device)
@@ -2377,7 +2392,7 @@ def _alert_r1c(device: torch.device, H: int, entry: str) -> None:
         return
     index = device.index if device.index is not None else torch.cuda.current_device()
     arch = cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(index)))
-    if arch is not None and _r1c_alert_due(arch, H, cake_jit.sm_count(index)):
+    if arch is not None and _r1c_alert_due(arch, H, cake_jit.sm_count(index), l2n):
         _alert_nondeterministic(entry)
 
 
@@ -5656,7 +5671,7 @@ def _bwd_call(
     if gp is not None:
         # the raw backward's R1c pair reduces dA_log / ddt_bias in no fixed order: under torch's deterministic
         # algorithms it is refused (or warned about) here, before anything is allocated or launched
-        _alert_r1c(v.device, H, "chunk_kda_bwd")
+        _alert_r1c(v.device, H, "chunk_kda_bwd", l2n)
     option = (
         arena
         if arena is not None
