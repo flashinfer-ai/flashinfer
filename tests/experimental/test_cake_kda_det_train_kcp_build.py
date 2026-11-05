@@ -121,6 +121,7 @@ PLANS = {
     "kcp_fwdh_offset_vh64": FWDH_PLAN,
     "kcp_fwdh_tape": FWDH_PLAN,
     "kcp_dhu_offset": DHU_PLAN,
+    "kcp_dhu_offset_overlap": DHU_PLAN,
     "kcp_dhu_offset_vh64": DHU_PLAN,
     "kcp_dhu_tape": DHU_PLAN,
     "kcp_transfer_walk": TRANSFER_PLAN,
@@ -134,6 +135,9 @@ PLANS = {
     "kcp_fwdh_tape_full": FWDH_PLAN,
     "kcp_dhu_tape_full": DHU_PLAN,
 }
+# Launch block of the records that are not 192 threads wide (the merge records: MERGE_RECORDS); the full-width fwdh
+# offset walk runs the split-role schedule (four state, four decay, one TMA and one MMA warp).
+BLOCKS = {"kcp_fwdh_offset": 320}
 # The identity rule: ``cake_kda_det_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
 # then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
 # The digest hashes the source module path the program shipped under, so the digests are those of the previous names
@@ -141,8 +145,8 @@ PLANS = {
 _W = "sm100_sm103_sm107"
 IDENTITIES = {
     "kcp_fwdh_offset": (
-        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
-        {"program": "offset"},
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_v2_kcp",
+        {"program": "offset", "tile_prefetch": 0},
     ),
     "kcp_fwdh_offset_vh64": (
         f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
@@ -155,6 +159,10 @@ IDENTITIES = {
     "kcp_dhu_offset": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
         {"program": "offset"},
+    ),
+    "kcp_dhu_offset_overlap": (
+        f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_det_dhu_v2_kcp",
+        {"program": "offset", "tile_prefetch": 0},
     ),
     "kcp_dhu_offset_vh64": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
@@ -249,7 +257,7 @@ def test_record_matches_the_frozen_abi(name: str) -> None:
     assert record["launch"]["block"] == (
         (MERGE_RECORDS[name][1], 1, 1)
         if record["program"] == "kcp_affine_merge"
-        else (192, 1, 1)
+        else (BLOCKS.get(name, 192), 1, 1)
     )
     if record["program"] == "kcp_affine_merge":
         assert record["grid_rule"] == {
@@ -459,6 +467,51 @@ def test_walk_form_rules_and_records() -> None:
         "kind": "walk_form",
     }
     assert kcp_jit.MODULES["kcp_fwdh_tape"]["select_rule"] == {"kind": "always"}
+
+
+def test_walk_heads_selection() -> None:
+    # the full-width adjoint offset walk: the plain build up to 63 heads, the overlap-schedule build from 64 (the W4
+    # rows); its split form and the forward offset walk keep the walk_form rule
+    assert kcp_jit.WALK_HEADS_RULE == {
+        "kcp_dhu_offset": ((63, "kcp_dhu_offset"), (None, "kcp_dhu_offset_overlap"))
+    }
+    for name in ("kcp_dhu_offset", "kcp_dhu_offset_overlap"):
+        assert kcp_jit.MODULES[name]["select_rule"] == {
+            "form": "full",
+            "kind": "walk_heads",
+        }
+        assert kcp_jit.MODULES[name]["grid_rule"] == {"kind": "kcp_segments_heads"}
+    for heads, record in (
+        (1, "kcp_dhu_offset"),
+        (4, "kcp_dhu_offset"),
+        (63, "kcp_dhu_offset"),
+        (64, "kcp_dhu_offset_overlap"),
+        (128, "kcp_dhu_offset_overlap"),
+    ):
+        assert kcp_jit.walk_heads_record("kcp_dhu_offset", heads) == record
+        assert (
+            kcp_jit.select_record("kcp_dhu_offset", form="full", num_heads=heads)
+            == record
+        )
+        assert (
+            kcp_jit.select_record("kcp_dhu_offset", form="split", num_heads=heads)
+            == "kcp_dhu_offset_vh64"
+        )
+        assert (
+            kcp_jit.select_record("kcp_fwdh_offset", form="full", num_heads=heads)
+            == "kcp_fwdh_offset"
+        )
+    assert kcp_jit.launch_grid("kcp_dhu_offset_overlap", n_walk=3, num_heads=64) == (
+        192,
+        1,
+        1,
+    )
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_dhu_offset", form="full")  # the head count is needed
+    with pytest.raises(ValueError):
+        kcp_jit.walk_heads_record("kcp_dhu_offset", 0)
+    with pytest.raises(ValueError):
+        kcp_jit.walk_heads_record("kcp_fwdh_offset", 64)
 
 
 def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:

@@ -490,18 +490,17 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
 
 
 DET_PREFIX, PREFIX = "cake_kda_det_train_", "cake_kda_train_"
-# The affine merge is the one program whose builds differ between the two packages: the deterministic package ships
-# register-blocked merge builds selected by its MERGE_RULE; this package keeps its two column-block builds (c8, c16).
-# Every other record and unit is the deterministic package's under this package's names.
-MERGE = "kcp_affine_merge"
-OWN_MERGE = {
+# The records whose builds differ between the two packages: the deterministic package ships newer builds of the
+# affine merge (selected by its MERGE_RULE) and of the full-width offset walks (the adjoint one beside the plain build,
+# selected by its WALK_HEADS_RULE); this package keeps its own builds of these records.  The deterministic package's
+# extra records belong to those programs.  Every other record and unit is the deterministic package's under this
+# package's names.
+OWN = {
+    "kcp_fwdh_offset": PREFIX + "7658fcc297c6fd906d53_kcp",
+    "kcp_dhu_offset": PREFIX + "1c66573e87150245374b_kcp",
     "kcp_affine_merge_c8": PREFIX + "c6958a0a4ed5cb55a9a1_kcp",
     "kcp_affine_merge_c16": PREFIX + "89f5ff59f03eb170e3bf_kcp",
 }
-
-
-def _merge_records(table: dict) -> set[str]:
-    return {name for name, record in table.items() if record["program"] == MERGE}
 
 
 def _library_stem(name: str) -> str:
@@ -522,21 +521,20 @@ def _renamed(value):
 def test_the_records_are_the_deterministic_records_under_this_packages_names() -> None:
     """The KCP programs have no non-deterministic form: both tables hold the deterministic package's records, every
     field equal but the library stem and the kernel symbol, which carry the same twenty hex digits under this
-    package's prefix; no library or kernel symbol of this package is one of the deterministic package's.  The affine
-    merge records are this package's own column-block builds."""
+    package's prefix; no library or kernel symbol of this package is one of the deterministic package's.  The records
+    of ``OWN`` are this package's own builds."""
+    own_programs = {kcp_jit.MODULES[name]["program"] for name in OWN}
     for table in ("MODULES", "TEST_MODULES"):
         ours, theirs = getattr(kcp_jit, table), getattr(det_kcp_jit, table)
-        assert set(ours) - _merge_records(ours) == set(theirs) - _merge_records(
-            theirs
-        ), table
+        assert set(ours) <= set(theirs), table
+        assert {theirs[n]["program"] for n in set(theirs) - set(ours)} <= own_programs
         for name, record in ours.items():
             assert record["library"].startswith(PREFIX), name
-            if record["program"] != MERGE:
+            if name in OWN:
+                assert record["library"] == OWN[name], name
+            else:
                 assert record == _renamed(theirs[name]), (table, name)
-    assert {
-        name: kcp_jit.MODULES[name]["library"]
-        for name in _merge_records(kcp_jit.MODULES)
-    } == OWN_MERGE
+    assert set(OWN) <= set(kcp_jit.MODULES)
     ours = {r["library"] for r in _records().values()}
     theirs = {
         r["library"]
@@ -554,25 +552,26 @@ def test_the_units_are_the_deterministic_units_under_this_packages_names(
 ) -> None:
     """Every library of this package's manifest is the deterministic package's library of the same digits: the same
     architecture, flags and entry, and sources whose text is the deterministic unit's with the deterministic prefix
-    renamed (file names, kernel symbols, binding namespaces); nothing else differs.  The affine merge libraries, which
-    differ between the two packages, are left out on both sides."""
+    renamed (file names, kernel symbols, binding namespaces); nothing else differs.  The libraries of the records whose
+    builds differ between the two packages (``OWN``, and the deterministic package's extra records) are left out on
+    both sides."""
     det_dir = Path(det_kcp_jit.__file__).resolve().parent
     path, det_path = PACKAGE_DIR / manifest, det_dir / manifest
     if not path.is_file() or not det_path.is_file():
         pytest.skip(f"{manifest} is not rendered in both packages here")
-    own_merge = {kcp_jit.MODULES[n]["library"] for n in _merge_records(kcp_jit.MODULES)}
-    det_merge = {
-        det_kcp_jit.MODULES[n]["library"] for n in _merge_records(det_kcp_jit.MODULES)
-    }
+    own = set(OWN.values())
+    det_records = {**det_kcp_jit.MODULES, **det_kcp_jit.TEST_MODULES}
+    left_out = set(OWN) | (set(det_records) - set(_records()))
+    det_own = {det_records[n]["library"] for n in left_out if n in det_records}
     ours = {
         e["name"]: e
         for e in json.loads(path.read_text())["libraries"]
-        if _library_stem(e["name"]) not in own_merge
+        if _library_stem(e["name"]) not in own
     }
     theirs = {
         _renamed(e["name"]): e
         for e in json.loads(det_path.read_text())["libraries"]
-        if _library_stem(e["name"]) not in det_merge
+        if _library_stem(e["name"]) not in det_own
     }
     assert set(ours) == set(theirs), manifest
     for name, entry in ours.items():

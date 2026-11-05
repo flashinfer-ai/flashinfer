@@ -2401,6 +2401,11 @@ class _FiPrograms:
             if rule == "fit":
                 if walk_form == "split":
                     record += "_vh64"
+                elif record in getattr(jit, "WALK_HEADS_RULE", {}):
+                    # the full-width record the head-count rule names (the ABI carries the head count)
+                    record = jit.walk_heads_record(
+                        record, int(abi[ABI_PARAMS[program].index("num_heads")])
+                    )
             elif walk_form in ("full", "split") and walk_form != rule:
                 record += f"_{walk_form}"
             if walk_form == "split":  # two CTAs per segment and head
