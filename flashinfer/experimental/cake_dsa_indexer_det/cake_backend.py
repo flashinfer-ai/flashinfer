@@ -708,7 +708,7 @@ def plan_dsa_indexer_det_topk(
         _check_int("finalize_threads", finalize_threads, 1)
     if max_seqlen_k is not None:
         _check_max_seqlen_k(max_seqlen_k, int(num_keys), int(num_segments))
-    call = dict(
+    call: dict[str, Any] = dict(
         num_queries=int(num_queries),
         num_keys=int(num_keys),
         num_segments=int(num_segments),
