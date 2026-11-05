@@ -2108,6 +2108,51 @@ class AutoTuner:
                 )
         return ok
 
+    def _drop_blocklisted_file_configs(self, source: str) -> int:
+        """Forget loaded cache-file entries whose tactic is blocklisted.
+
+        A cache file tuned before a tactic was added to the tactics blocklist
+        still records that tactic as the winner.  Serving it would defeat the
+        blocklist, so such entries are dropped and become cache misses: they
+        are re-profiled (without the listed tactics) inside a tuning context
+        and fall back to the runner's default tactic otherwise.  The dropped
+        keys are also invalidated so the next :meth:`save_configs` does not
+        revive them from disk.  Returns the number of entries dropped.
+        """
+        blocklist = self._blocklist
+        if not blocklist.is_loaded:
+            return 0
+        dropped = 0
+        with self._lock:
+            if not self._file_configs:
+                return 0
+            for op_key in blocklist.summary():
+                # Blocklist keys are "custom_op::RunnerClass"; custom_op may
+                # itself contain "::" (e.g. "flashinfer::op"), the class name
+                # cannot.  file_key is str((custom_op, runner_class, ...)).
+                if "::" not in op_key:
+                    continue
+                custom_op, runner_name = op_key.rsplit("::", 1)
+                prefix = f"({custom_op!r}, {runner_name!r}, "
+                for file_key in [k for k in self._file_configs if k.startswith(prefix)]:
+                    stored_runner, tactic = self._file_configs[file_key]
+                    if stored_runner != runner_name or not blocklist.is_blocked(
+                        custom_op, runner_name, tactic
+                    ):
+                        continue
+                    del self._file_configs[file_key]
+                    self._file_config_policies.pop(file_key, None)
+                    self._invalidated_file_keys.add(file_key)
+                    dropped += 1
+        if dropped:
+            logger.warning(
+                f"[Autotuner]: Dropped {dropped} cached config(s) from {source} "
+                f"whose tactic is in the tactics blocklist "
+                f"({blocklist.loaded_path}). They will be re-tuned when "
+                "autotuning is enabled."
+            )
+        return dropped
+
     @property
     def _active_managed_store(self):
         """The store lookups/publishes target right now.
@@ -2475,6 +2520,18 @@ class AutoTuner:
                                 and "runner_mismatch" not in rejections
                             ):
                                 rejections.append("runner_mismatch")
+                            continue
+                        if self._blocklist.is_blocked(custom_op, runner_name, tactic):
+                            # The blocklist was loaded after this cache file
+                            # (load_configs already drops listed entries).
+                            self._drop_blocklisted_file_configs(
+                                "previously loaded cache files"
+                            )
+                            if (
+                                rejections is not None
+                                and "blocklisted_tactic" not in rejections
+                            ):
+                                rejections.append("blocklisted_tactic")
                             continue
                         if not self._tactic_still_valid(
                             runners[r_id],
@@ -5147,9 +5204,11 @@ class AutoTuner:
                 "cuDNN config(s) using integer plan-index tactics. They will "
                 "be re-tuned when autotuning is enabled."
             )
+        dropped_blocklisted = self._drop_blocklisted_file_configs(path)
 
         logger.info(
-            f"[Autotuner]: Loaded {len(configs) - skipped_legacy_cudnn_tactics} "
+            f"[Autotuner]: Loaded "
+            f"{len(configs) - skipped_legacy_cudnn_tactics - dropped_blocklisted} "
             f"configs from {path}"
         )
         return True
