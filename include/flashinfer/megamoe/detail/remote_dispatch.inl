@@ -80,7 +80,9 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
   }
 };
 
-// SM 0 after the grid sync: compact header + puts, one remote node at a time.
+// SM 0 after the grid sync, one remote node at a time: warp 0 ships the packed
+// rows while both warps compact the lists; the header goes last and carries
+// the signal, which orders every earlier put on the same context before it.
 const auto remote_send = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     if (sm_idx != 0) return;
@@ -88,10 +90,27 @@ const auto remote_send = [&]() {
 #pragma unroll 1
     for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
       const uint32_t node = node_of_remote_index(j);
+      const uint32_t at = remote_links.peers[j].node_at_mirror;
       auto* header = remote.outbound_header(j);
       auto* counts = remote.header_expert_counts(header);
       auto* starts = remote.header_expert_starts(header);
       auto* entries = remote.header_entries(header);
+      const uint32_t num_packed = *remote.packed_token_count(j);
+      if (thread_idx == 0) remote.header_control(header)[0] = num_packed;
+      if (warp_idx == 0 and num_packed > 0) {
+        auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
+        auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
+        io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
+                    false, nullptr, 0);
+        io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset,
+                    static_cast<uint64_t>(num_packed) * kSFBytes, lane_idx, false, nullptr, 0);
+        io.put_warp(j, dst_block + idx_block_offset, src_block + idx_block_offset,
+                    math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kIdxBytes, 16),
+                    lane_idx, false, nullptr, 0);
+        io.put_warp(j, dst_block + weights_block_offset, src_block + weights_block_offset,
+                    math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kWeightBytes, 16),
+                    lane_idx, false, nullptr, 0);
+      }
       for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads)
         counts[e] = static_cast<uint32_t>(
             *workspace.get_expert_send_count_ptr(node * kNumExpertsPerNode + e) & 0xffffffffu);
@@ -102,42 +121,19 @@ const auto remote_send = [&]() {
           starts[e] = running;
           running += counts[e];
         }
-        remote.header_control(header)[0] = *remote.packed_token_count(j);
         remote.header_control(header)[1] = running;
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
       const uint32_t num_entries = remote.header_control(header)[1];
-      const uint32_t num_packed = remote.header_control(header)[0];
       // Compaction: one warp per expert, lanes over its entries.
       for (uint32_t e = warp_idx; e < kNumExpertsPerNode; e += kNumDispatchWarps) {
         const auto* src = remote.list_scratch(j, e);
         for (uint32_t k = lane_idx; k < counts[e]; k += 32) entries[starts[e] + k] = src[k];
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      if (warp_idx == 0) {
-        const uint32_t at = remote_links.peers[j].node_at_mirror;
-        auto* dst_header = remote.inbox_header(at);
-        auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
-        auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
-        io.put_warp(j, dst_header, header, remote.header_used_bytes(num_entries), lane_idx, false,
-                    nullptr, 0);
-        if (num_packed > 0) {
-          io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
-                      false, nullptr, 0);
-          io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset,
-                      static_cast<uint64_t>(num_packed) * kSFBytes, lane_idx, false, nullptr, 0);
-          io.put_warp(j, dst_block + idx_block_offset, src_block + idx_block_offset,
-                      math::align<uint64_t>(static_cast<uint64_t>(num_packed) * kIdxBytes, 16),
-                      lane_idx, false, nullptr, 0);
-        }
-        // The weights put carries the signal; with no packed token it is a
-        // 16-byte put of the (unused) first weight slot so the signal still lands.
-        io.put_warp(j, dst_block + weights_block_offset, src_block + weights_block_offset,
-                    math::align<uint64_t>(static_cast<uint64_t>(cute::max(num_packed, 1u)) *
-                                              kWeightBytes,
-                                          16),
+      if (warp_idx == 0)
+        io.put_warp(j, remote.inbox_header(at), header, remote.header_used_bytes(num_entries),
                     lane_idx, true, remote.inbox_flag(at), comm::remote_inbox_signal(at));
-      }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
     }
   }

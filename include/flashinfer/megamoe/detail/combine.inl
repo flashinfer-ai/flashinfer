@@ -18,21 +18,13 @@ for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; token_
                                                    token_idx * kNumTopk + lane_idx))
                           : -1;
 #if defined(FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES)
-  // Slots whose experts live on other nodes were reduced there and come back
-  // as one row per node, read through the extra mask bits above the top-k.
-  FI_MEGAMOE_STATIC_ASSERT(kNumTopk + kNumRemoteNodes <= 32, "Top-k plus remote nodes must fit a warp");
-  uint32_t total_mask = __ballot_sync(
+  // Slots whose experts live on other nodes were reduced there; their rows are
+  // added by `remote_add_returns` after this pass, so the return latency hides
+  // behind the node-local reduction.
+  const uint32_t total_mask = __ballot_sync(
       0xffffffff, stored_topk_slot_idx >= 0 and
                       (kNumRemoteNodes == 0 or
                        node_of_expert(static_cast<uint32_t>(stored_topk_slot_idx)) == my_node));
-  int32_t remote_slots[kNumRemoteNodes > 0 ? kNumRemoteNodes : 1];
-  if constexpr (kNumRemoteNodes > 0) {
-#pragma unroll
-    for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
-      remote_slots[j] = remote.packed_slot_map(j)[token_idx];
-      if (remote_slots[j] >= 0) total_mask |= 1u << (kNumTopk + j);
-    }
-  }
 #else
   const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 #endif
@@ -46,22 +38,11 @@ for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; token_
         const uint32_t slot_idx = __ffs(mask) - 1;
         mask ^= 1 << slot_idx;
         if (cute::elect_one_sync()) {
-          const uint8_t* src_ptr =
-              math::advance_ptr<uint8_t>(combine_token_buffer.get_rank_buffer(
-                                             slot_idx < kNumTopk ? slot_idx : 0u)
+          const auto src_ptr =
+              math::advance_ptr<uint8_t>(combine_token_buffer.get_rank_buffer(slot_idx)
                                              .get_data_buffer(token_idx)
                                              .get_base_ptr(),
                                          chunk_byte_offset);
-#if defined(FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES)
-          if constexpr (kNumRemoteNodes > 0) {
-            if (slot_idx >= kNumTopk) {
-              const uint32_t j = slot_idx - kNumTopk;
-              src_ptr = static_cast<const uint8_t*>(remote.return_inbox(j)) +
-                        static_cast<uint64_t>(remote_slots[j]) * kNumHiddenBytes +
-                        chunk_byte_offset;
-            }
-          }
-#endif
           ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i],
                            kNumChunkBytes);
           ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);

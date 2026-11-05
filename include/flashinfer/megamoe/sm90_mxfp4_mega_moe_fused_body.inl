@@ -1531,8 +1531,9 @@ if (warp_idx < kNumDispatchWarps) {
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
 #include <flashinfer/megamoe/detail/remote_combine.inl>
+  // Mirror duty first (the other node waits on it), then this node's slots,
+  // then the rows that came back.
   remote_return();
-  remote_wait_return();
 
 // These are function fragments: sizing declarations must precede the combine body.
 // clang-format off
@@ -1540,7 +1541,9 @@ if (warp_idx < kNumDispatchWarps) {
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
 #undef FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES
-  // clang-format on
+// clang-format on
+  remote_wait_return();
+  remote_add_returns();
 }
 #else
 if (blockIdx.x == 0 and threadIdx.x == 0)
