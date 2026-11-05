@@ -6652,15 +6652,41 @@ def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]
 # autograd
 
 
+# torch.utils.checkpoint's two pack hooks (the original forward's, the recompute's): their module and qualified names,
+# the same in torch 2.13 and 2.14; torch 2.14 also marks both ``_checkpoint_internal``, torch 2.13 has no marker
+_CHECKPOINT_HOOK_MODULE = "torch.utils.checkpoint"
+_CHECKPOINT_PACK_HOOKS = (
+    "_checkpoint_hook.__init__.<locals>.pack_hook",
+    "_recomputation_hook.__init__.<locals>.pack_hook",
+)
+
+
+def _checkpoint_pack(pack: Any) -> bool:
+    """Whether ``pack`` is one of torch's non-reentrant checkpoint pack hooks: marked ``_checkpoint_internal``
+    (torch >= 2.14), or -- unwrapped from ``torch._dynamo.disable`` -- named like one (torch 2.13, no marker)."""
+    if getattr(pack, "_checkpoint_internal", False):
+        return True
+    fn = (
+        getattr(pack, "_torchdynamo_orig_callable", None)
+        or getattr(pack, "__wrapped__", None)
+        or pack
+    )
+    return (
+        getattr(fn, "__module__", None) == _CHECKPOINT_HOOK_MODULE
+        and getattr(fn, "__qualname__", None) in _CHECKPOINT_PACK_HOOKS
+    )
+
+
 def _in_checkpoint() -> bool:
     """Whether this forward runs under ``torch.utils.checkpoint(use_reentrant=False)``: the top saved-tensors hook pair
-    is a checkpoint-internal one -- the original forward's pack hook and the recompute's alike (the hook stack torch
-    reads for the tensors this node saves).  ``False`` when the binding is absent (then both forwards see ``False``)."""
+    is a checkpoint-internal one (:func:`_checkpoint_pack`) -- the original forward's pack hook and the recompute's
+    alike (the hook stack torch reads for the tensors this node saves).  ``False`` when the binding is absent (then
+    both forwards see ``False``)."""
     try:
         top = torch._C._autograd._top_saved_tensors_default_hooks(False)
     except Exception:  # noqa: BLE001 - no hook-stack binding: an ordinary forward
         return False
-    return top is not None and bool(getattr(top[0], "_checkpoint_internal", False))
+    return top is not None and _checkpoint_pack(top[0])
 
 
 # (id(opts), save mode) -> (opts, its twin with that save mode): the checkpoint form of a call's options, made once

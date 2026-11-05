@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import inspect
 import math
 
 import pytest
@@ -74,6 +75,22 @@ REPLAY = "fwd_prep_replay_l2n"
 L2N = dict(use_qk_l2norm_in_kernel=True)
 CU = [0, 100, 740, 817, 1000]
 PREP_OUTS = ("w", "u", "aqk", "g_cum", "rowscale", "qscale", "gamma")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
 
 
 def _raw_inputs(
@@ -389,6 +406,45 @@ def test_light_akk_autograd_checkpoint_and_replay_boundary() -> None:
         and got["bwd"]["akk_source"] is None
         and REPLAY not in got["bwd"]["sequence"]
     )
+
+
+def test_checkpoint_detection_reads_the_marker_or_the_hook_names() -> None:
+    """The checkpoint form of the mode reads torch's pack hooks (:func:`_in_checkpoint`): torch 2.14 marks them
+    ``_checkpoint_internal``, torch 2.13 does not, so they are also recognised by module and qualified name.  Both
+    forwards of a non-reentrant checkpoint (the original and the recompute) see the checkpoint; no hooks and a user's
+    hooks do not.  The running torch's two hooks carry the pinned names, and a marker-free stand-in is recognised by
+    those names alone (the torch 2.13 path), never by the name in another module."""
+    seen = []
+
+    def fn(x):
+        top = torch._C._autograd._top_saved_tensors_default_hooks(False)
+        seen.append((kcp._in_checkpoint(), top[0]))
+        return x * x
+
+    from torch.utils.checkpoint import checkpoint
+
+    x = torch.ones(4, requires_grad=True)
+    checkpoint(fn, x, use_reentrant=False).sum().backward()
+    assert [inside for inside, _pack in seen] == [True, True]
+    names = {
+        (inspect.unwrap(pack).__module__, inspect.unwrap(pack).__qualname__)
+        for _inside, pack in seen
+    }
+    assert names == {
+        (kcp._CHECKPOINT_HOOK_MODULE, n) for n in kcp._CHECKPOINT_PACK_HOOKS
+    }
+
+    def pack_hook(t):
+        return t
+
+    for name in kcp._CHECKPOINT_PACK_HOOKS:
+        pack_hook.__module__, pack_hook.__qualname__ = kcp._CHECKPOINT_HOOK_MODULE, name
+        assert kcp._checkpoint_pack(pack_hook), name
+    pack_hook.__module__ = __name__
+    assert not kcp._checkpoint_pack(pack_hook)
+    assert not kcp._in_checkpoint()
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+        assert not kcp._in_checkpoint()
 
 
 def test_saved_tape_reaches_the_gradients() -> None:

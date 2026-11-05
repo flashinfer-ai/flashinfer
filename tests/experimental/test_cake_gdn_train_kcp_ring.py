@@ -117,11 +117,21 @@ def _pass(kcp, ctx, ops, **o) -> tuple[dict[str, torch.Tensor], list[str]]:
     return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dbeta": dbeta, "dg": dg}, seq
 
 
+def _few_cpu_threads() -> None:
+    """Each rank process runs the CPU emulation's many small ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool (one per rank) and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize)
+    spend far more time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so every rank runs
+    with at most 2 threads (8 for the four ranks) and oneDNN off; the rank process ends with the test."""
+    torch.set_num_threads(min(torch.get_num_threads(), 2))
+    torch.backends.mkldnn.enabled = False
+
+
 def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=W
     )
     try:
+        _few_cpu_threads()
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
         part = plan.partition_kcp(torch.tensor(cu, dtype=torch.int64), W, "contiguous")
@@ -197,6 +207,7 @@ def _rank_full(rank: int, init_file: str) -> None:
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=W
     )
     try:
+        _few_cpu_threads()
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
         part = plan.partition_kcp(
