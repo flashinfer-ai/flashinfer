@@ -1750,12 +1750,13 @@ def _cell_tag(N: int, K: int, B: int, expected_m: int) -> Optional[str]:
 
 
 # SM107a cells (216 SMs): the masked BLOCK_N program of each (B, em4) cell of the
-# N=128 K=512, N=512 K=128 and N=7168 K=2048 geometries, em4 = ``_em4(expected_m)``
-# (measured on the 216-SM board).  N=128 K=512 and N=512 K=128 route every key
-# through their cells (``_SM107A_CELL_NEAREST``); an N=7168 K=2048 key without a
-# cell takes that geometry's bands.  Tags: BLOCK_N and K tile (k128 where the
-# geometry's band program of the same BLOCK_N tiles K by 256), ``once`` / ``lean``
-# the masked_m-once and lean-epilogue forms beside a band program of that BLOCK_N.
+# N=128 K=512, N=512 K=128, N=4096 K=7168 and N=7168 K=2048 geometries,
+# em4 = ``_em4(expected_m)`` (measured on the 216-SM board).  N=128 K=512 and
+# N=512 K=128 route every key through their cells (``_SM107A_CELL_NEAREST``); an
+# N=4096 K=7168 or N=7168 K=2048 key without a cell takes that geometry's bands.
+# Tags: BLOCK_N and K tile (k128 where the geometry's band program of the same
+# BLOCK_N tiles K by 256), ``once`` / ``lean`` the masked_m-once and lean-epilogue
+# forms beside a band program of that BLOCK_N.
 # fmt: off
 _SM107A_CELL_STAGES: dict[str, tuple[Any, ...]] = {
     "bn32_k128": ("cake_batch_deepgemm_fp8_8b23de2910ac4218c0b5", "masked_bn", 32, 128),
@@ -1831,6 +1832,22 @@ _SM107A_CELLS: dict[tuple[int, int], dict[str, tuple[tuple[int, int], ...]]] = {
             (56, 108), (64, 64), (64, 108), (72, 108), (112, 108), (120, 108),
             (128, 54), (128, 108), (160, 108), (176, 108), (192, 108), (200, 108),
             (208, 108), (212, 108), (224, 108),
+        ),
+    },
+    (4096, 7168): {
+        "bn64": (
+            (1, 215),
+        ),
+        "bn112": (
+            (64, 1),
+        ),
+        "bn144": (
+            (32, 6), (64, 2), (64, 7), (64, 8),
+        ),
+        "bn240_k128": (
+            (1, 4096), (1, 4871), (1, 11585), (1, 13777), (2, 9742), (2, 11585), (8, 1218),
+            (8, 1448), (8, 1722), (8, 2435), (8, 2896), (32, 3), (64, 3), (64, 4), (64, 5),
+            (64, 6),
         ),
     },
     (7168, 2048): {
@@ -2125,9 +2142,9 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_442708989397f5a42bd2", "masked_bn", 128, 128),
           {"sm_100a": ((75, None),),
            "sm_103a": ((77, None),)}),
-    # SM107a: the masked family alone.  N=128 K=512, N=512 K=128 and N=7168
-    # K=2048 by their (B, em4) cells (``_SM107A_CELLS``); N=4096 K=7168 and the
-    # N=7168 K=2048 keys without a cell by the (N, K) bands of
+    # SM107a: the masked family alone.  N=128 K=512, N=512 K=128, N=4096 K=7168
+    # and N=7168 K=2048 by their (B, em4) cells (``_SM107A_CELLS``); the N=4096
+    # K=7168 and N=7168 K=2048 keys without a cell by the (N, K) bands of
     # CTA = B * ceil(expected_m / 128) (measured on the 216-SM board).
     *(_cell(nk, tag) for nk, cells in _SM107A_CELLS.items() for tag in cells),
     # N=4096, K=7168.
