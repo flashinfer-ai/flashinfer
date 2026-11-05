@@ -41,6 +41,8 @@ CTA_GROUP = cake_backend.CTA_GROUP
 CTA_ROWS_CHOICES = cake_backend.CTA_ROWS_CHOICES
 EPI_WARPS = cake_backend.EPI_WARPS
 ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
+ROUTER_SPLIT_RULES = cake_backend.ROUTER_SPLIT_RULES
+router_splits = cake_backend.router_splits
 ROW_RULES = cake_backend.ROW_RULES
 SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
 SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
@@ -5556,6 +5558,98 @@ def test_router_planner_refuses_a_misaligned_out_of_a_single_split_row_major_sto
         plan_router_fp32_det_gemm(G, W, _offset_out(T, K, 1))
     assert plan_router_fp32_det_gemm(X, W.t(), _offset_out(T, N, 1))[0].splits == 4
     assert plan_router_fp32_det_gemm(G.t(), X, _offset_out(N, K, 1))[0].splits == 6
+
+
+def test_router_split_rules_are_measured_windows_and_resolve_by_device():
+    """Every ``ROUTER_SPLIT_RULES`` count names a measured device class (``sm_100a`` / ``sm_103a`` at 148 or 152
+    SMs) and a ``kk`` / ``nn_t`` row in the T 16129-16384 window; ``router_splits`` returns it inside the window
+    and the layout's default outside it, for another SM count or N, and without a device."""
+    assert ROUTER_SPLIT_RULES
+    for (arch, sm_count, layout, H), windows in ROUTER_SPLIT_RULES.items():
+        assert arch in ("sm_100a", "sm_103a") and sm_count in (148, 152), arch
+        assert layout in ("kk", "nn_t") and H in (4096, 5120, 6144), layout
+        for lo, hi, splits in windows:
+            assert (lo, hi) == (16129, 16384) and splits >= 1
+            assert splits != ROUTER_SPLITS[layout]
+            for T in (lo, 16172, 16231, hi):
+                M, K = (T, H) if layout == "kk" else (H, T)
+                assert router_splits(layout, M, 256, K, arch, sm_count) == splits
+            for T in (lo - 1, hi + 1):
+                M, K = (T, H) if layout == "kk" else (H, T)
+                assert (
+                    router_splits(layout, M, 256, K, arch, sm_count)
+                    == ROUTER_SPLITS[layout]
+                )
+            M, K = (16231, H) if layout == "kk" else (H, 16231)
+            assert router_splits(layout, M, 256, K, arch, 160) == ROUTER_SPLITS[layout]
+            assert (
+                router_splits(layout, M, 128, K, arch, sm_count)
+                == ROUTER_SPLITS[layout]
+            )
+            assert router_splits(layout, M, 256, K) == ROUTER_SPLITS[layout]
+            assert (
+                router_splits(layout, M, 256, K, "sm_107a", sm_count)
+                == ROUTER_SPLITS[layout]
+            )
+    assert router_splits("kn", 16231, 4096, 256, "sm_100a", 152) == ROUTER_SPLITS["kn"]
+    # a planner call on CPU tensors has no device: the layout's default count at every table row
+    for (_, _, layout, H), ((lo, _, _), *_) in ROUTER_SPLIT_RULES.items():
+        X, G = torch.empty(lo, H), torch.empty(lo, 256)
+        if layout == "kk":
+            A, B, out = X, torch.empty(256, H).t(), torch.empty(lo, 256)
+        else:
+            A, B, out = G.t(), X, torch.empty(256, H)
+        assert plan_router_fp32_det_gemm(A, B, out)[0].splits == ROUTER_SPLITS[layout]
+
+
+def test_router_split_rules_rows_plan_rerun_bit_exact_and_match_fp64_reference():
+    """On a device with ``ROUTER_SPLIT_RULES`` rows: the forward / weight-gradient row plans the table's count without
+    a caller's ``splits`` (prepared and eager), reruns bit for bit, meets the router budget against the FP64 reference
+    (rel_fro, forward top-8 agreement)."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    facts = cake_backend.device_facts(torch.device("cuda"))
+    keys = [k for k in ROUTER_SPLIT_RULES if k[:2] == (facts.arch, facts.sm_count)]
+    if not keys:
+        pytest.skip(
+            f"no ROUTER_SPLIT_RULES row for {facts.arch} at {facts.sm_count} SMs"
+        )
+    for _, _, layout, H in keys:
+        op = "fwd" if layout == "kk" else "wgrad"
+        (lo, hi, splits), *_ = ROUTER_SPLIT_RULES[
+            (facts.arch, facts.sm_count, layout, H)
+        ]
+        v = _router_inputs(op, 16231, seed=SEED + 23, K=H)
+        plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        _require_program(plan.template)
+        assert (plan.layout, plan.splits) == (layout, splits)
+        cake_backend.clear_convenience_caches()
+        prepared = prepare_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        assert prepared.splits == splits
+        first = prepared.launch().clone()
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(first, v["out"])
+        if op == "fwd":
+            eager = cake_backend.router_det_forward(v["X"], v["W"])
+        else:
+            eager = cake_backend.router_det_wgrad(v["G"], v["X"])
+        torch.cuda.synchronize()
+        assert torch.equal(eager, first)
+        expected = torch.matmul(v["A"].double(), v["B"].double())
+        rel_fro = float((first.double() - expected).abs().norm() / expected.norm())
+        assert bool(torch.isfinite(first).all()) and rel_fro <= ROUTER_REL_FRO_MAX, (
+            rel_fro
+        )
+        if op == "fwd":
+            ref_top = torch.topk(expected, 8, dim=1).indices.sort(dim=1).values
+            top = torch.topk(first.double(), 8, dim=1).indices.sort(dim=1).values
+            assert int((top != ref_top).any(dim=1).sum()) == 0
+        del v, expected, first, eager
+        torch.cuda.empty_cache()
 
 
 def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
