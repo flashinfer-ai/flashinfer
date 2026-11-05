@@ -157,21 +157,19 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
       // Cache all 64 sparse row IDs per loader warp, reused across feature slices.
       const int id_lo = tile_start + lane < length ? ids[tile_start + lane] : -1;
       const int id_hi = tile_start + lane + 32 < length ? ids[tile_start + lane + 32] : -1;
-      // Prefetch SF[candidate, feature-group] in cache order before waiting
-      // for FREE. Each lane retains one candidate's 16 scale bytes in registers;
-      // the V payload still goes directly GMEM -> SMEM via cp.async.
-      int sf_id = (warp % 2) ? id_hi : id_lo;
-      uint4 packed = sf_id >= 0
-          ? *reinterpret_cast<const uint4*>(cache + size_t(sf_id) * stride + 512)
-          : make_uint4(0, 0, 0, 0);
       #pragma unroll 1
       for (int micro = 0; micro < 4; ++micro) {
-        // Wait for the consumers to release this payload slot before any STS.
-        // Store the prefetched scale tile only on the first microtile.
+        // Acquire FREE before issuing async writes to scales or payload.
+        // Copy the scale tile only on the first microtile, in cache order.
         v_pipeline.producer_acquire(write_state);
         const int stage = write_state.index();
         if (micro == 0) {
-          *reinterpret_cast<uint4*>(sm.v_sf[tile & 1] + loader_tid * 16) = packed;
+          int id = (warp % 2) ? id_hi : id_lo;
+          uint8_t* dst = sm.v_sf[tile & 1] + loader_tid * 16;
+          uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+          const uint8_t* src = cache + size_t(max(id, 0)) * stride + 512;
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+              :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
         uint8_t* dst = sm.v[stage];
         const int feature_base = micro * 128;
@@ -184,7 +182,7 @@ __global__ __launch_bounds__(384, 1) void prefill(Params p) {
           asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
               :: "r"(address), "l"(src), "r"(id >= 0 ? 16 : 0) : "memory");
         }
-        // Publish the SF stores and async payload through the same READY
+        // Publish the async scale and payload copies through the same READY
         // handshake; hardware completes the copy-dependent arrival.
         v_pipeline.producer_commit(write_state, [](uint64_t const* barrier) {
           unsigned address = __shfl_sync(0xffffffff, cute::cast_smem_ptr_to_uint(barrier), 0);
