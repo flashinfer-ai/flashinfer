@@ -48,6 +48,7 @@ from ..jit.megamoe import (
     gen_megamoe_sm90_nvfp4_split_plan_module,
 )
 from ._jit import _get_jit_module
+from .transport import MegaMoENcclTransport
 from .eplb import MegaMoEExpertSlots
 from .heuristics import (
     CANDIDATE_BLOCK_M,
@@ -158,6 +159,10 @@ class MegaMoESymmBuffer:
         SwiGLU clamp value. Defaults to 10.0.
     fast_math : bool
         Use the family's fast-math policy. Defaults to True.
+    transport : MegaMoENcclTransport, optional
+        NCCL-window transport that owns the buffer memory. The default
+        allocates torch symmetric memory, which reaches ranks on one node
+        only; ranks on several nodes need the transport.
 
     Attributes
     ----------
@@ -179,9 +184,9 @@ class MegaMoESymmBuffer:
         intermediate_hidden: int,
         activation_clamp: float = 10.0,
         fast_math: bool = True,
+        transport: Optional["MegaMoENcclTransport"] = None,
     ) -> None:
         """Validate the geometry, allocate the symmetric buffer and expose this rank's staging views."""
-        import torch.distributed._symmetric_memory as symm_mem
 
         # Buffer geometry is format-independent; NVFP4 checks its narrower
         # deployment constraints when selecting a fused/split plan.
@@ -235,9 +240,19 @@ class MegaMoESymmBuffer:
         self.num_max_pool_tokens = layout[9]
         self.num_padded_sf_pool_tokens = layout[10]
 
-        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device="cuda")
-        self.handle = symm_mem.rendezvous(self.buffer, group=group)
-        self.buffer.zero_()
+        self.transport = transport
+        if transport is None:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device="cuda")
+            self.handle = symm_mem.rendezvous(self.buffer, group=group)
+            self.buffer.zero_()
+        else:
+            if transport.group is not group:
+                raise ValueError("the transport must belong to the buffer's process group")
+            self.window = transport.alloc_window(num_bytes)
+            self.buffer = transport.window_tensor(self.window, torch.int8)
+            self.handle = transport.peer_handle(self.window)
         group.barrier()
         torch.cuda.synchronize()
 

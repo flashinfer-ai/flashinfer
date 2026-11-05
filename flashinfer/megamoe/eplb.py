@@ -160,11 +160,19 @@ class MegaMoEExpertSlots:
                 f"the in-kernel planner needs {words['plan_smem_bytes']} bytes of shared "
                 f"memory for {num_ranks} ranks x {num_experts} experts, above the SM90 capacity"
             )
-        self.workspace = symm_mem.empty(
-            words["num_words"], dtype=torch.int32, device="cuda"
-        )
-        self._workspace_handle = symm_mem.rendezvous(self.workspace, group=group)
-        self.workspace.zero_()
+        transport = getattr(b, "transport", None)
+        if transport is None:
+            self.workspace = symm_mem.empty(
+                words["num_words"], dtype=torch.int32, device="cuda"
+            )
+            self._workspace_handle = symm_mem.rendezvous(self.workspace, group=group)
+            self.workspace.zero_()
+        else:
+            window = transport.alloc_window(words["num_words"] * 4)
+            self.workspace = transport.window_tensor(window, torch.int32)[
+                : words["num_words"]
+            ]
+            self._workspace_handle = transport.peer_handle(window)
         E, R, S = num_experts, num_ranks, num_redundant_slots
         self.slot_expert = self._words(words["slot_expert"], (R, S))
         self.copies = self._words(words["copies"], (E, R, 2))
@@ -191,9 +199,14 @@ class MegaMoEExpertSlots:
             offset = (offset + 255) // 256 * 256
             self._planes[name] = (offset, bytes_per_slot)
             offset += bytes_per_slot * self.num_slots_per_rank
-        self.arena = symm_mem.empty(offset, dtype=torch.uint8, device="cuda")
-        self._arena_handle = symm_mem.rendezvous(self.arena, group=group)
-        self.arena.zero_()
+        if transport is None:
+            self.arena = symm_mem.empty(offset, dtype=torch.uint8, device="cuda")
+            self._arena_handle = symm_mem.rendezvous(self.arena, group=group)
+            self.arena.zero_()
+        else:
+            window = transport.alloc_window(offset)
+            self.arena = transport.window_tensor(window, torch.uint8)[:offset]
+            self._arena_handle = transport.peer_handle(window)
         self.l1_weights = self._plane_view("l1_weights", *planes["l1_weights"])
         self.l2_weights = self._plane_view("l2_weights", *planes["l2_weights"])
         self.l1_global_scales = self._plane_view(

@@ -312,6 +312,53 @@ def gen_megamoe_sm90_layout_module() -> JitSpec:
     )
 
 
+def _nccl_paths():
+    """NCCL headers and the versioned library, from ``NCCL_HOME`` or the ``nvidia-nccl`` wheel."""
+    root = os.environ.get("NCCL_HOME")
+    home = Path(root).expanduser() if root else None
+    if home is None:
+        try:
+            import nvidia.nccl  # type: ignore[import-not-found]
+
+            home = Path(nvidia.nccl.__path__[0])
+        except (ImportError, AttributeError, IndexError):
+            home = None
+    if home is None:
+        raise FileNotFoundError(
+            "NCCL development files not found; set NCCL_HOME or install the nvidia-nccl wheel"
+        )
+    include = home / "include"
+    lib_dir = next(
+        (
+            path
+            for path in (home / "lib", home / "lib64", home)
+            if any(path.glob("libnccl.so*"))
+        ),
+        home / "lib",
+    )
+    libraries = sorted(lib_dir.glob("libnccl.so.*")) or sorted(lib_dir.glob("libnccl.so"))
+    if not (include / "nccl_device.h").is_file() or not libraries:
+        raise FileNotFoundError(
+            f"NCCL device API headers or libnccl not found under {home}"
+        )
+    return include, libraries[-1]
+
+
+def gen_megamoe_sm90_transport_module() -> JitSpec:
+    """JIT spec of the NCCL-window transport: symmetric windows, their load/store
+    peer pointers and the device communicator that carries inter-node puts."""
+    csrc = _csrc_dir()
+    include, library = _nccl_paths()
+    return gen_jit_spec(
+        "megamoe_sm90_transport",
+        [csrc / "megamoe_sm90_transport.cu"],
+        extra_include_paths=[csrc, jit_env.FLASHINFER_CSRC_DIR, include],
+        extra_cuda_cflags=["-std=c++20", "--expt-relaxed-constexpr"],
+        extra_cflags=["-std=c++20"],
+        extra_ldflags=[str(library), "-ldl"],
+    )
+
+
 def get_megamoe_sm90_mxfp4_uri(
     plan,
     num_sms,
