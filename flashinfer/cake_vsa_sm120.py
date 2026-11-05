@@ -184,6 +184,8 @@ def _choose(
             {max(_MIN_PART, -(-longest // k)) for k in _PART_DIVISORS}, reverse=True
         )
     kernels = [kernel] if kernel is not None else list(_COST)
+    if not sizes.numel():  # no row (no query block): nothing runs
+        return parts[0], kernels[0]
     return min(
         ((p, k) for p in parts for k in kernels),
         key=lambda pk: (
@@ -298,7 +300,7 @@ def plan_block_mask(
     mask = block_mask.to(device=device, dtype=torch.bool, non_blocking=True)
     counts = mask.sum(dim=-1, dtype=torch.int64)
     first = torch.cumsum(counts.reshape(-1), 0) - counts.reshape(-1)
-    index = _with_tail(torch.nonzero(mask.reshape(-1, mask.shape[-1]))[:, 1])
+    index = _with_tail(torch.nonzero(mask.flatten(0, 1))[:, 1])
     plan = build_work(counts, first.view_as(counts), group_size, num_sms, part, kernel)
     plan["q2k_index"] = index
     num_qo_heads, num_q_blocks, num_kv_blocks = mask.shape
@@ -385,6 +387,20 @@ def _no_lse(device: torch.device) -> torch.Tensor:
     return torch.empty((1,), dtype=torch.float32, device=device)
 
 
+def _overlaps(tensor: torch.Tensor, *others: torch.Tensor) -> bool:
+    """Whether the bytes ``tensor`` spans meet those of one of ``others``."""
+
+    def span(t: torch.Tensor) -> tuple[int, int]:
+        steps = zip(t.shape, t.stride(), strict=True)
+        extent = 1 + sum((n - 1) * s for n, s in steps)
+        return t.data_ptr(), t.data_ptr() + extent * t.element_size()
+
+    if tensor.numel() == 0:
+        return False
+    begin, end = span(tensor)
+    return any(o.numel() and o.data_ptr() < end and begin < span(o)[1] for o in others)
+
+
 def run(
     plan: dict[str, Any],
     q: torch.Tensor,
@@ -424,24 +440,41 @@ def run(
             f"{tuple(v.shape)}"
         )
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    # The kernel writes whole rows: a strided out / lse of the caller gets a
-    # contiguous buffer, copied back after the launch.
+    caller_out, caller_lse = out is not None, lse is not None
     if out is None:
         out = torch.empty_like(q)
     else:
         check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
-    out_buf = out if out.is_contiguous() else torch.empty_like(q)
-    lse_buf = _no_lse(q.device)
     if return_lse:
         if lse is None:
             lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
         else:
             check_shape_dtype_device(lse, q.shape[:2], torch.float32, q.device, "lse")
-        lse_buf = (
-            lse
-            if lse.is_contiguous()
-            else torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
-        )
+    if q.shape[0] == 0 or k.shape[0] == 0:
+        # No query or no KV block: every row is empty (O = 0, lse = -inf), as
+        # for an empty selection; the kernel cannot map a zero-length tensor.
+        out.zero_()
+        if return_lse:
+            lse.fill_(-math.inf)
+            return out, lse
+        return out
+    # The kernel stores whole rows of out (16-byte vectors) and lse while other
+    # work items still read q, k and v: a caller's out / lse that is strided,
+    # misaligned or shares memory with an input (lse: or with out) gets a
+    # buffer of its own, copied back after the launch, out first (the result
+    # of an out-of-place launch).
+    out_buf = out
+    if (
+        not out.is_contiguous()
+        or out.data_ptr() % 16
+        or (caller_out and _overlaps(out, q, k, v))
+    ):
+        out_buf = torch.empty_like(q)
+    lse_buf = _no_lse(q.device)
+    if return_lse:
+        lse_buf = lse
+        if not lse.is_contiguous() or (caller_lse and _overlaps(lse, q, k, v, out)):
+            lse_buf = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
     index = (

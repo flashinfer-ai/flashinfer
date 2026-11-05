@@ -165,6 +165,27 @@ def test_run_refuses_tensors_unlike_the_plan(tensor):
         cake_vsa_sm120.run(plan, q, k, v, None, None, None, False)
 
 
+@pytest.mark.parametrize("empty", ["kv", "q"])
+def test_run_without_kv_or_query_blocks_gives_empty_rows(empty):
+    """No KV block (or no query block): every row is empty, O = 0 and lse =
+    -inf, without a launch."""
+    mb, nb, hq, hkv = (3, 0, 4, 2) if empty == "kv" else (0, 5, 4, 2)
+    block_mask = torch.zeros(hq, mb, nb, dtype=torch.bool)
+    plan = cake_vsa_sm120.plan_block_mask(
+        block_mask, hq // hkv, 188, torch.device("cpu")
+    )
+    q = torch.randn(R * mb, hq, HEAD_DIM).bfloat16()
+    k = torch.randn(C * nb, hkv, HEAD_DIM).bfloat16()
+    v = torch.randn_like(k)
+    out = torch.full_like(q, float("nan"))
+    lse = torch.full((R * mb, hq), float("nan"))
+    got_out, got_lse = cake_vsa_sm120.run(plan, q, k, v, None, out, lse, True)
+    assert got_out is out and got_lse is lse
+    assert torch.all(out == 0) and torch.all(lse == float("-inf"))
+    fresh = cake_vsa_sm120.run(plan, q, k, v, None, None, None, False)
+    assert fresh.shape == q.shape and torch.all(fresh == 0)
+
+
 def _reference(q, k, v, block_mask, sm_scale):
     """FP32 dense attention under the per-QO-head block mask; empty rows give
     O = 0 and lse = -inf."""
@@ -290,6 +311,54 @@ def test_strided_out_and_lse_get_the_same_bits():
     assert got_out is out and got_lse is lse
     assert torch.equal(out, want_out) and torch.equal(lse, want_lse)
     assert torch.all(out_wide[:, hq:] == 7.0) and torch.all(lse_wide[:, :hq] == 7.0)
+
+
+@requires_sm12x
+@pytest.mark.parametrize(
+    "case", ["q", "k", "v", "lse_in_q", "lse_in_out", "out_unaligned"]
+)
+def test_out_and_lse_get_the_out_of_place_bits(case):
+    """An ``out`` that is ``q``, ``k`` or ``v`` itself, an ``lse`` in ``q``'s or
+    in a strided ``out``'s memory, or an ``out`` that is not 16-byte aligned
+    receives the bits of an out-of-place launch (main computed into a buffer
+    of its own and copied out, then lse).  The plan runs on one SM in many
+    waves with split rows, so a store into memory that a later work item
+    still reads would show."""
+    device = torch.device("cuda")
+    generator = torch.Generator().manual_seed(17)
+    dtype, h, m = torch.bfloat16, 4, 1024
+    q = torch.randn(m, h, HEAD_DIM, generator=generator).to(dtype).to(device)
+    k = torch.randn(m, h, HEAD_DIM, generator=generator).to(dtype).to(device)
+    v = torch.randn(m, h, HEAD_DIM, generator=generator).to(dtype).to(device)
+    block_mask = _ragged_mask(h, m // R, m // C, generator, device)
+    plan = cake_vsa_sm120.plan_block_mask(block_mask, 1, 1, device, part=2)
+    assert (plan["work"][:, 4] >= 0).any(), "a row is split"
+    want_out, want_lse = cake_vsa_sm120.run(plan, q, k, v, None, None, None, True)
+    inputs = {"q": q.clone(), "k": k.clone(), "v": v.clone()}
+    out = lse = None
+    if case in inputs:
+        out = inputs[case]
+    elif case == "lse_in_q":
+        lse = inputs["q"].view(torch.float32).view(-1)[: m * h].view(m, h)
+    elif case == "lse_in_out":
+        base = torch.empty(h * m * HEAD_DIM, dtype=dtype, device=device)
+        out = base.view(h, m, HEAD_DIM).transpose(0, 1)
+        lse = base.view(torch.float32)[: m * h].view(m, h)
+    else:
+        buffer = torch.empty(m * h * HEAD_DIM + 4, dtype=dtype, device=device)
+        out = buffer[4:].view(m, h, HEAD_DIM)
+        assert out.is_contiguous() and out.data_ptr() % 16
+    got_out, got_lse = cake_vsa_sm120.run(
+        plan, inputs["q"], inputs["k"], inputs["v"], None, out, lse, True
+    )
+    assert out is None or got_out is out
+    assert lse is None or got_lse is lse
+    assert torch.equal(got_lse, want_lse)
+    if case == "lse_in_out":
+        # lse is written last over head 0's first rows of out
+        assert torch.equal(got_out[:, 1:], want_out[:, 1:])
+    else:
+        assert torch.equal(got_out, want_out)
 
 
 @requires_sm12x
