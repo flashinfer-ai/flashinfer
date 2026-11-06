@@ -392,6 +392,8 @@ def _megakernel_config(
     pingpong=None,
     cluster_shape_mnk=None,
     tail_split_pairs: bool | None = None,
+    dispatch_pull_batch: int | None = None,
+    dispatch_pull_rotate: bool | None = None,
 ):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
@@ -423,6 +425,8 @@ def _megakernel_config(
         pingpong=pingpong,
         cluster_shape_mnk=cluster_shape_mnk,
         tail_split_pairs=tail_split_pairs,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -448,6 +452,8 @@ def _run_mega_layer(
     pingpong=None,
     cluster_shape_mnk=None,
     tail_split_pairs: bool | None = None,
+    dispatch_pull_batch: int | None = None,
+    dispatch_pull_rotate: bool | None = None,
     num_experts: int = 8,
     topk: int = 4,
     hidden: int = 2048,
@@ -501,6 +507,8 @@ def _run_mega_layer(
             pingpong=pingpong,
             cluster_shape_mnk=cluster_shape_mnk,
             tail_split_pairs=tail_split_pairs,
+            dispatch_pull_batch=dispatch_pull_batch,
+            dispatch_pull_rotate=dispatch_pull_rotate,
         )
     )
     runtime = bootstrap_moe_ep_runtime(
@@ -556,6 +564,8 @@ def _run_mega_layer(
                     pingpong=pingpong,
                     cluster_shape_mnk=cluster_shape_mnk,
                     tail_split_pairs=tail_split_pairs,
+                    dispatch_pull_batch=dispatch_pull_batch,
+                    dispatch_pull_rotate=dispatch_pull_rotate,
                 ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
@@ -578,6 +588,13 @@ def _run_mega_layer(
         y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
+        if dispatch_pull_batch is not None or dispatch_pull_rotate is not None:
+            # The pull schedule does not change outputs: check that the
+            # requested one reached the kernel (a batch takes the 4-slot buffer).
+            token_comm = mega._staged_workspace._frontend._mega.kernel.token_comm
+            assert token_comm.pull_batch == (dispatch_pull_batch or 1)
+            assert token_comm.pull_rotate == bool(dispatch_pull_rotate)
+            assert token_comm.compact_pull_buffer == (token_comm.pull_batch == 1)
 
         if capture_graph:
             graph = None
@@ -726,16 +743,17 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_token_back_matches_reference(
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "fp8_scale_mode,swap_ab,token_back_mode",
+    "fp8_scale_mode,swap_ab,token_back_mode,dispatch_pull_rotate",
     [
-        ("per_tensor", False, None),
-        ("blockwise", False, None),
-        ("per_tensor", True, None),
-        ("per_tensor", False, "reuse_dispatch_warps"),
+        ("per_tensor", False, None, None),
+        ("blockwise", False, None, None),
+        ("per_tensor", True, None, None),
+        ("per_tensor", False, "reuse_dispatch_warps", None),
+        ("per_tensor", True, None, True),
     ],
 )
 def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_matches_reference(
-    fp8_scale_mode, swap_ab, token_back_mode
+    fp8_scale_mode, swap_ab, token_back_mode, dispatch_pull_rotate
 ):
     """Wire-level top-k dedup is bit-exact with the reference.
 
@@ -743,7 +761,9 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_matches_reference(
     at least one rank, so the duplicate (carrier-table) path is exercised
     heavily; the payload bytes must match the non-dedup pull exactly.  The
     reuse_dispatch_warps case covers dedup sharing the dispatch warps with
-    the push-back token path.
+    the push-back token path.  The rotated pull still walks each warp's rows
+    in increasing order, so a duplicate keeps waiting only on a smaller
+    expert's row.
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -757,11 +777,12 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_matches_reference(
         swap_ab=swap_ab,
         token_back_mode=token_back_mode,
         dedup_dispatch=True,
+        dispatch_pull_rotate=dispatch_pull_rotate,
     )
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"({fp8_scale_mode}, swap_ab={swap_ab}, token_back={token_back_mode}, "
-        "dedup_dispatch) matches reference"
+        f"dedup_dispatch, rotate={dispatch_pull_rotate}) matches reference"
     )
 
 
@@ -845,13 +866,18 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back_small_hidden(
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
-@pytest.mark.parametrize("active_dispatch_warps", [2, 4])
-def test_moe_ep_sm90_pull_fp8_mega_layer_active_dispatch_warps(active_dispatch_warps):
+@pytest.mark.parametrize(
+    "active_dispatch_warps,dispatch_pull_batch", [(2, None), (4, None), (2, 2)]
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_active_dispatch_warps(
+    active_dispatch_warps, dispatch_pull_batch
+):
     """Non-default active pull-warp counts are bit-exact.
 
     The knob only re-partitions which dispatch warps issue the NVLink pulls
     (the default 2 is covered by every other case in this file), so all
-    three settings must reproduce the reference exactly.
+    three settings must reproduce the reference exactly.  The (2, 2) row
+    also keeps two rows in flight per warp in the 4-slot pull buffer.
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -863,24 +889,37 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_active_dispatch_warps(active_dispatch_w
         quantize_input=True,
         fp8_scale_mode="per_tensor",
         active_dispatch_warps=active_dispatch_warps,
+        dispatch_pull_batch=dispatch_pull_batch,
     )
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
-        f"(active_dispatch_warps={active_dispatch_warps}) matches reference"
+        f"(active_dispatch_warps={active_dispatch_warps}, "
+        f"dispatch_pull_batch={dispatch_pull_batch}) matches reference"
     )
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "fp8_scale_mode,swap_ab",
-    [("per_tensor", False), ("blockwise", False), ("per_tensor", True)],
+    "fp8_scale_mode,swap_ab,dispatch_pull",
+    [
+        ("per_tensor", False, None),
+        ("blockwise", False, None),
+        ("per_tensor", True, None),
+        # (rows in flight per dispatch warp, rotation)
+        ("per_tensor", False, (3, True)),
+        ("blockwise", True, (3, True)),
+        ("per_tensor", True, (1, True)),
+    ],
 )
-def test_moe_ep_sm90_pull_fp8_mega_layer_fold_producer_warps(fp8_scale_mode, swap_ab):
+def test_moe_ep_sm90_pull_fp8_mega_layer_fold_producer_warps(
+    fp8_scale_mode, swap_ab, dispatch_pull
+):
     """TMA-A/TMA-B/sched folded into the dispatch warpgroup (no epi_aux warp).
 
     Exercises the merged warp layout with early fc1_done publication across
-    the 1-WG / 2-WG non-swap kernels and the swap-AB kernel.
+    the 1-WG / 2-WG non-swap kernels and the swap-AB kernel, also with the
+    batched and rotated dispatch pull of the folded single dispatch warp.
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -893,10 +932,13 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_fold_producer_warps(fp8_scale_mode, swa
         fp8_scale_mode=fp8_scale_mode,
         swap_ab=swap_ab,
         fold_producer_warps=True,
+        dispatch_pull_batch=None if dispatch_pull is None else dispatch_pull[0],
+        dispatch_pull_rotate=None if dispatch_pull is None else dispatch_pull[1],
     )
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
-        f"(fold_producer_warps, {fp8_scale_mode}, swap_ab={swap_ab}) matches reference"
+        f"(fold_producer_warps, {fp8_scale_mode}, swap_ab={swap_ab}, "
+        f"dispatch_pull={dispatch_pull}) matches reference"
     )
 
 

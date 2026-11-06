@@ -203,7 +203,12 @@ then the heuristic table).  The autotune candidate set is the heuristic
 winner plus every geometry that wins some bucket of the table (19 today
 — tile / cluster / ping-pong together with the row's `group_hint` and
 `tail_split_pairs`, derived programmatically) crossed with both validated
-token-back modes — 38 candidates.
+token-back modes — 38 candidates.  From 1024 tokens per rank (one active
+dispatch warp, no `dedup_dispatch`), every `epi_warps` candidate also gets
+three dispatch-pull variants (rotation alone; three rows in flight in the
+4-slot buffer, without and with rotation; see `dispatch_pull_batch` below),
+ping-pong candidates the rotation only (batching never measured faster on
+them) — 81 candidates.
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
@@ -326,6 +331,27 @@ token-back modes — 38 candidates.
   pt2048 +2.3), blockwise −0.25% (no bucket beyond −1.2%); geomean e2e
   +0.55%, compute +0.79%.  Output-invariant; `False` restores the 4-slot
   buffer for A/B (`--no-compact-pull-buffer` on the bench).
+- `dispatch_pull_batch` (default 1) / `dispatch_pull_rotate` (default
+  False) — rows in flight per active dispatch warp, and the per-pass
+  rotation of the warp -> row assignment (pass k takes row
+  `k*G + (g + k) % G` of the G global dispatch warps).  Output-invariant
+  tactic fields, shared with packed FP4 (see SKILL.md).  A batch above 1
+  keeps its rows in the idle slots of the 4-slot buffer, so it needs
+  `compact_pull_buffer=False`, `epi_warps` token-back, no `dedup_dispatch`
+  or `grouped_token_back`, and batch x `active_dispatch_warps` <= 4;
+  rotation needs `epi_warps` token-back.  Left unset they follow the tactic
+  (the heuristic table keeps the serial, unrotated pull); an explicit value
+  wins, and an explicit batch above 1 takes the 4-slot buffer.  Measured
+  on H200 (1830 MHz, in-process A/B against the serial compact pull,
+  2026-11): H2560/I640/E512/top-10/EP2 per_tensor M64N256 cga(1,1,1) —
+  batch 3 + rotation 0.914 / 0.867 / 0.842 / 0.830 at 2048 / 4096 / 8192 /
+  16384 tokens per rank (0.964 at 1024), rotation alone 0.92-0.97;
+  blockwise M64N256 cga(2,2,1) — batch 3 without rotation 0.877 / 0.858 /
+  0.822 / 0.808 (1.003 at 1024); swap-AB ping-pong M128N128 — within
+  +-2% up to 8192, 0.95 at 16384.  On H7168/I3072/E384/top-6/EP4 the
+  4-slot buffer costs 21 KiB of AB-stage SMEM and the GEMM dominates:
+  rotation 0.99-1.01, batches 0.5-6.6% slower.  Hence autotune
+  candidates, not defaults.
 - `fold_producer_warps` (default True; requires `active_dispatch_warps == 1`)
   — folds the TMA-A / TMA-B / scheduler warps into the three idle
   dispatch-warpgroup slots and drops the separate producer warpgroup

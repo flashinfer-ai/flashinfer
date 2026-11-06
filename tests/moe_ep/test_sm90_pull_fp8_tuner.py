@@ -103,6 +103,22 @@ class TestIsValid:
             {**ok, "in_kernel_fc2_reduce": True},
             apply_routing_weights_before_fc2=False,
         )
+        # Batched dispatch pull: 4-slot buffer, epi_warps token-back, no
+        # dispatch dedup, batch x active dispatch warps <= 4.
+        batched = {**ok, "compact_pull_buffer": False, "dispatch_pull_batch": 3}
+        assert pkg.is_valid(batched)
+        assert not pkg.is_valid({**batched, "compact_pull_buffer": True})
+        assert not pkg.is_valid({**batched, "token_back_mode": "reuse_dispatch_warps"})
+        assert not pkg.is_valid({**batched, "dedup_dispatch": True})
+        assert not pkg.is_valid({**batched, "active_dispatch_warps": 2})
+        assert pkg.is_valid(
+            {**batched, "dispatch_pull_batch": 2, "active_dispatch_warps": 2}
+        )
+        # Rotation needs token-back in the epilogue warps.
+        assert pkg.is_valid({**ok, "dispatch_pull_rotate": True})
+        assert not pkg.is_valid(
+            {**ok, "dispatch_pull_rotate": True, "token_back_mode": "standalone_warps"}
+        )
 
     def test_iter_candidates_all_valid(self):
         pkg = _pkg()
@@ -115,14 +131,23 @@ class TestIsValid:
         assert seen > 0
 
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
-    def test_autotune_candidates(self, scale_mode):
+    @pytest.mark.parametrize("max_tokens", [512, 2048])
+    def test_autotune_candidates(self, scale_mode, max_tokens):
         pkg = _pkg()
-        cands = pkg.hopper_fp8_candidates(fp8_scale_mode=scale_mode, max_tokens=2048)
+        cands = pkg.hopper_fp8_candidates(
+            fp8_scale_mode=scale_mode, max_tokens=max_tokens
+        )
         # 16 sweep geometries x {epi_warps, reuse_dispatch_warps}.
         assert len(cands) >= 30
         assert all(pkg.is_valid(c) for c in cands)
         # heuristic winner leads (ties keep the established default).
-        assert cands[0] == pkg.default_knobs(2048, fp8_scale_mode=scale_mode)
+        assert cands[0] == pkg.default_knobs(max_tokens, fp8_scale_mode=scale_mode)
+        # Dispatch-pull variants of the epi_warps candidates for large buffers.
+        pull_keys = ("dispatch_pull_batch", "dispatch_pull_rotate")
+        pulled = [c for c in cands if any(k in c for k in pull_keys)]
+        assert bool(pulled) == (max_tokens >= 1024)
+        assert all(c["token_back_mode"] == "epi_warps" for c in pulled)
+        assert not any(c["pingpong"] and "dispatch_pull_batch" in c for c in pulled)
         # deduplicated.
         keys = [json.dumps(c, sort_keys=True, default=list) for c in cands]
         assert len(keys) == len(set(keys))

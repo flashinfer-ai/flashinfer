@@ -168,17 +168,26 @@ not picked them up):
   Dispatch-side token-back (`reuse_dispatch_warps` / `standalone_warps`)
   keeps one copy per half: that path can give intermittent run-to-run output
   differences without these changes too, which the shared copy made far more
-  frequent; the cause is open. Host side, MX/NV only: `compact_pull_buffer`, `dispatch_pull_batch`
-  and `dispatch_pull_rotate` are MX tactic and config fields (NV already had
-  the first; FP8 does not expose them), see
-  `shim/mxfp4_optimization.py::MXFP4_PULL_DEFAULTS`. A normalized tactic
-  omits them at their defaults. Explicit frontend values (and the MX
-  backend's `compact_pull_buffer`) override a cached or default tactic, as
-  `token_back_mode` does: an explicit compact buffer or dispatch-side
-  token-back drops the tactic's batch to 1 (dispatch-side token-back also
-  its rotation), and an explicit batch > 1 drops the tactic's compact buffer
-  and rejects a conflicting token-back, dedup or dispatch-warp layout. The
-  drop tree has none of this. When re-syncing, re-add the two token_comm
+  frequent; the cause is open. Host side: `compact_pull_buffer`,
+  `dispatch_pull_batch` and `dispatch_pull_rotate` are tactic and config
+  fields of MX/NV (defaults in `shim/mxfp4_optimization.py::MXFP4_PULL_DEFAULTS`;
+  NV already had the first) and of FP8 (defaults in
+  `shim/tuner.py::PULL_KNOB_DEFAULTS`, compact buffer on);
+  `shim/tuner.py::validate_dispatch_pull` holds the constraints for both. A
+  normalized MX tactic omits them at their defaults; the FP8 `apply_knobs`
+  resets omitted ones to the defaults. Explicit frontend values override a
+  cached or default tactic, as `token_back_mode` does. MX/NV (and the MX
+  backend's `compact_pull_buffer`): an explicit compact buffer or
+  dispatch-side token-back drops the tactic's batch to 1 (dispatch-side
+  token-back also its rotation), and an explicit batch > 1 drops the
+  tactic's compact buffer and rejects a conflicting token-back, dedup or
+  dispatch-warp layout. FP8, where `compact_pull_buffer` is a plain bool
+  that a tactic's value overrides: the caller's dispatch-side token-back,
+  `dedup_dispatch` or dispatch-warp count drops the tactic's batch to 1
+  (token-back also its rotation), and an explicit batch > 1 takes the
+  4-slot buffer. From 1024 tokens per rank the FP8 autotune adds pull
+  variants of its `epi_warps` candidates (`shim/autotune.py::_PULL_VARIANTS`).
+  The drop tree has none of this. When re-syncing, re-add the two token_comm
   knobs with their properties and the rotation check,
   `_choose_pull_token`, `_dispatch_pull_batched`, the `pull_batch > 1`
   branch at the pull call site and the serial loop's rotated row index;

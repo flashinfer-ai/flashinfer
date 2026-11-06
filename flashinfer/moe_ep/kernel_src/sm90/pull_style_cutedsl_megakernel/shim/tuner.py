@@ -18,7 +18,9 @@ Two knob classes (same taxonomy as the SM100 tree):
     ``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` / ``cluster_shape_mnk`` /
     ``fp8_accum_mode`` select numerically equivalent execution geometries,
     so they live in the perf class together with ``group_hint`` /
-    ``tail_split_pairs`` / ``flag_batch`` / ``epi_flag_batch``.
+    ``tail_split_pairs`` / ``flag_batch`` / ``epi_flag_batch`` and the
+    dispatch-pull fields (``compact_pull_buffer`` / ``dispatch_pull_batch`` /
+    ``dispatch_pull_rotate``).
 
 The built-in heuristic (:func:`default_knobs`) wraps the kernel drop's
 token-bucket table (``moe_hopper_fp8/heuristic_config.py``), so
@@ -81,6 +83,13 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "tail_split_pairs": (False, True),
     "flag_batch": (1, 2, 4, 8),
     "epi_flag_batch": ((1, 1), (2, 2), (2, 4), (4, 4), (4, 8)),
+    # Dispatch pull (output-invariant): the compact buffer (one slot per
+    # active dispatch warp), rows in flight per active dispatch warp, and the
+    # per-pass rotation of the warp -> row assignment.  See
+    # :func:`validate_dispatch_pull` for the legal combinations.
+    "compact_pull_buffer": (True, False),
+    "dispatch_pull_batch": (1, 2, 3, 4),
+    "dispatch_pull_rotate": (False, True),
 }
 
 # Geometry knob names resolved as one unit by the heuristic table / cache.
@@ -91,6 +100,55 @@ GEOMETRY_KNOBS = (
     "cluster_shape_mnk",
     "fp8_accum_mode",
 )
+
+# Dispatch-pull tactic fields and the values a tactic that omits them gets:
+# the compact buffer and the serial, unrotated pull.
+PULL_KNOB_DEFAULTS: Dict[str, Any] = {
+    "compact_pull_buffer": True,
+    "dispatch_pull_batch": 1,
+    "dispatch_pull_rotate": False,
+}
+
+
+def validate_dispatch_pull(
+    *,
+    compact_pull_buffer: bool,
+    dispatch_pull_batch: int,
+    dispatch_pull_rotate: bool,
+    token_back_mode: str,
+    dedup_dispatch: bool,
+    grouped_token_back: bool,
+    active_dispatch_warps: int,
+) -> None:
+    """Raise ``ValueError`` unless the dispatch-pull fields fit the layout.
+
+    A batch > 1 keeps its extra rows in the idle slots of the 4-slot pull
+    buffer of the serial ``epi_warps`` dispatch path; dispatch-side
+    token-back keeps the serial, unrotated pull loop.  Mirrors the kernel's
+    ``TokenInPullTokenBackPush`` checks; shared by the FP8 and packed-FP4
+    configs.
+    """
+    if type(dispatch_pull_batch) is not int or not 1 <= dispatch_pull_batch <= 4:
+        raise ValueError("dispatch_pull_batch must be an int in 1..4")
+    if type(dispatch_pull_rotate) is not bool:
+        raise ValueError("dispatch_pull_rotate must be a bool")
+    if dispatch_pull_rotate and token_back_mode != "epi_warps":
+        # Dispatch-side token-back keeps the unrotated serial pull loop.
+        raise ValueError("dispatch_pull_rotate requires token_back_mode='epi_warps'")
+    if dispatch_pull_batch > 1:
+        if compact_pull_buffer:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires compact_pull_buffer=False"
+            )
+        if token_back_mode != "epi_warps" or dedup_dispatch or grouped_token_back:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires token_back_mode='epi_warps' "
+                "without dedup_dispatch / grouped_token_back"
+            )
+        if dispatch_pull_batch * active_dispatch_warps > 4:
+            raise ValueError(
+                "dispatch_pull_batch * active_dispatch_warps must not exceed the 4 pull slots"
+            )
 
 
 def default_knobs(
@@ -187,6 +245,18 @@ def is_valid(
             return False
         if in_kernel or not apply_routing_weights_before_fc2:
             return False
+    pull = dict(PULL_KNOB_DEFAULTS)
+    pull.update((k, knobs[k]) for k in PULL_KNOB_DEFAULTS if k in knobs)
+    try:
+        validate_dispatch_pull(
+            **pull,
+            token_back_mode=knobs.get("token_back_mode") or "epi_warps",
+            dedup_dispatch=bool(knobs.get("dedup_dispatch", False)),
+            grouped_token_back=grouped,
+            active_dispatch_warps=knobs.get("active_dispatch_warps", 1),
+        )
+    except ValueError:
+        return False
     return True
 
 
@@ -233,8 +303,10 @@ __all__ = [
     "CORRECTNESS_KNOBS",
     "GEOMETRY_KNOBS",
     "PERF_KNOBS",
+    "PULL_KNOB_DEFAULTS",
     "default_knobs",
     "is_valid",
     "iter_candidates",
+    "validate_dispatch_pull",
     "with_knobs",
 ]
