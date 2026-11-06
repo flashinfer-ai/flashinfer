@@ -1,5 +1,5 @@
-"""JIT module generation for the SM90 FP4 MegaMoE paths and the SM120 MXFP4 decode MegaMoE
-(the ``flashinfer.moe_ep`` backend ``sm120_mxfp4_mxfp8_bf16_decode``).
+"""JIT module generation for the SM90 FP4 MegaMoE paths and the SM120 MXFP4 x MXFP8 nosync MegaMoE
+(the ``flashinfer.moe_ep`` backend ``sm120_mxfp4_mxfp8_bf16_nosync``).
 
 The kernel resolves its shared-memory layout, task schedule and dispatch
 protocol at compile time, so one module is built per (shape, plan) pair. The

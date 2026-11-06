@@ -22,7 +22,7 @@
 //
 // Compute core: mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale (E2M1 weights as A, E4M3
 // activations as B, UE8M0 scales per 32 on both): 16 weight rows x 8 tokens per MMA, weights loaded
-// global -> registers in a lane-fragment layout (flashinfer.moe_ep SM120 mxfp4_mxfp8_bf16_decode
+// global -> registers in a lane-fragment layout (flashinfer.moe_ep SM120 mxfp4_mxfp8_bf16_nosync
 // backend, weights.py). FC1 rows are interleaved per 16-row block (gate rows 8b..8b+7, then up rows
 // 8b..8b+7), so each SwiGLU pair lands in one thread.
 //

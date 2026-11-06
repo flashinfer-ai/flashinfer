@@ -1,4 +1,4 @@
-"""SM120 MXFP4 x MXFP8 MegaMoE timing (CUDA graph): the moe_ep SM120 backends (decode / cutedsl / cake) through
+"""SM120 MXFP4 x MXFP8 MegaMoE timing (CUDA graph): the moe_ep SM120 backends (nosync / cutedsl / cake) through
 MoEEpLayer, on the same weights, inputs and routes.
 
 Every backend takes BF16 activations; MoEEpLayer.stage_inputs quantizes them to MXFP8 once, outside the timed
@@ -85,15 +85,15 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
         w13_scale=s1.view(torch.float8_e8m0fnu),
         w2_scale=s2.view(torch.float8_e8m0fnu),
     )
-    if args.backend == "decode":
+    if args.backend == "nosync":
         from flashinfer.moe_ep import (
-            Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig as Config,
+            Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig as Config,
         )
 
         cfg = Config(
             intermediate_size=ih,
             top_k=topk,
-            transport=args.decode_transport,
+            transport=args.nosync_transport,
             tokens_per_item=args.tokens_per_item,
         )
     elif args.backend == "cutedsl":
@@ -251,9 +251,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--backend",
-        choices=["decode", "cutedsl", "cake"],
-        default="decode",
-        help="moe_ep backend sm120_mxfp4_mxfp8_bf16_decode / _cutedsl / _cake",
+        choices=["nosync", "cutedsl", "cake"],
+        default="nosync",
+        help="moe_ep backend sm120_mxfp4_mxfp8_bf16_nosync / _cutedsl / _cake",
     )
     parser.add_argument("--knobs", type=str, default="", help="cutedsl: JSON knobs")
     parser.add_argument(
@@ -264,13 +264,13 @@ if __name__ == "__main__":
         type=int,
         choices=[8, 16, 24, 32],
         default=None,
-        help="decode: force the work-item width (default: by routed rows per local expert)",
+        help="nosync: force the work-item width (default: by routed rows per local expert)",
     )
     parser.add_argument(
-        "--decode-transport",
+        "--nosync-transport",
         choices=["p2p", "nic", "auto"],
         default="p2p",
-        help="decode: transport",
+        help="nosync: transport",
     )
     args = parser.parse_args()
     if args.cold_l2 and args.repeats != 1:

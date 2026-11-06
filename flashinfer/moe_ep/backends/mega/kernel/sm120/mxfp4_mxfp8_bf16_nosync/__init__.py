@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM120 MXFP4 x MXFP8 decode MegaMoE backend: one persistent kernel per layer
+"""SM120 MXFP4 x MXFP8 nosync MegaMoE backend: one persistent kernel per layer
 (routing exchange, dispatch, FC1 + SwiGLU, FC2, combine) for up to 128 tokens per
 rank over PCIe peer-to-peer, or NCCL GIN for the pairs the transport assigns to
-the NIC."""
+the NIC.
 
-from .backend import Sm120Mxfp4Mxfp8DecodeMegaKernelBackend
-from .config import Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig
+"nosync": the kernel has no cross-rank barrier. Each producer writes an
+epoch-tagged flag into the consumer's memory after its data (release), and the
+consumer polls its own memory (acquire); over GIN the consumer counts signals
+per source instead. No remote atomics and no host-side synchronization."""
+
+from .backend import Sm120Mxfp4Mxfp8NosyncMegaKernelBackend
+from .config import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
 from .weights import preprocess_mega_weights
 
 __all__ = [
-    "Sm120Mxfp4Mxfp8DecodeMegaKernelBackend",
-    "Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig",
+    "Sm120Mxfp4Mxfp8NosyncMegaKernelBackend",
+    "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
     "preprocess_mega_weights",
 ]

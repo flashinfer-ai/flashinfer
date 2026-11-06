@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashInfer MegaKernelBackend for the SM120 MXFP4 x MXFP8 decode MegaMoE."""
+"""FlashInfer MegaKernelBackend for the SM120 MXFP4 x MXFP8 nosync MegaMoE."""
 
 from __future__ import annotations
 
@@ -33,14 +33,14 @@ from ..mxfp4_mxfp8_bf16_cake.cake_staging import (
     quantize_activations_k32,
     validate_forward_inputs,
 )
-from .config import Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig
+from .config import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
 from .weights import preprocess_mega_weights, validate_transformed_mega_weights
-from .workspace import DecodeWorkspace
+from .workspace import NosyncWorkspace
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
-KERNEL_NAME = "sm120_mxfp4_mxfp8_bf16_decode"
+KERNEL_NAME = "sm120_mxfp4_mxfp8_bf16_nosync"
 MAX_RANKS = 8
 MAX_TOP_K = 8
 MAX_LOCAL_EXPERTS = 256
@@ -54,13 +54,13 @@ MAX_TOKENS_PER_RANK = 128
 
 
 @register_mega_kernel(KERNEL_NAME)
-class Sm120Mxfp4Mxfp8DecodeMegaKernelBackend(MegaKernelBackend):
+class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
-    def __init__(self, config: Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig) -> None:
-        if not isinstance(config, Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig):
+    def __init__(self, config: Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig) -> None:
+        if not isinstance(config, Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig):
             raise TypeError(
-                f"{KERNEL_NAME} config must be Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig, "
+                f"{KERNEL_NAME} config must be Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig, "
                 f"got {type(config).__name__}"
             )
         super().__init__(config)
@@ -134,9 +134,9 @@ class Sm120Mxfp4Mxfp8DecodeMegaKernelBackend(MegaKernelBackend):
             local_experts=fleet_params.num_experts // bootstrap.world_size,
         )
 
-    def _allocate_workspace(self, fleet_params: FleetParams) -> DecodeWorkspace:
+    def _allocate_workspace(self, fleet_params: FleetParams) -> NosyncWorkspace:
         config = self._kernel_config
-        return DecodeWorkspace(
+        return NosyncWorkspace(
             group=self._ep_comm_group,
             rank=self.ep_rank,
             world_size=self.ep_world_size,
@@ -186,7 +186,7 @@ class Sm120Mxfp4Mxfp8DecodeMegaKernelBackend(MegaKernelBackend):
         """Rank-uniform bound on the next invocation's per-rank rows. The kernel takes each
         rank's row count as a launch argument and exchanges it on the device, so the bound
         is only checked; ranks may stage different row counts in the same call."""
-        ws: DecodeWorkspace = workspace
+        ws: NosyncWorkspace = workspace
         if compile_tokens_per_rank is not None and not (
             0 <= int(compile_tokens_per_rank) <= ws.capacity
         ):
@@ -201,7 +201,7 @@ class Sm120Mxfp4Mxfp8DecodeMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        ws: DecodeWorkspace = workspace
+        ws: NosyncWorkspace = workspace
         rows = int(t.hidden_states.shape[0])
         bound = ws.compile_tokens_per_rank
         if bound is not None and rows > bound:
@@ -234,7 +234,7 @@ class Sm120Mxfp4Mxfp8DecodeMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        ws: DecodeWorkspace = workspace
+        ws: NosyncWorkspace = workspace
         rows = ws.staged_rows
         launch_rows = max(rows, 1)
         direct = (
@@ -258,4 +258,4 @@ class Sm120Mxfp4Mxfp8DecodeMegaKernelBackend(MegaKernelBackend):
         return workspace.error()
 
 
-__all__ = ["KERNEL_NAME", "Sm120Mxfp4Mxfp8DecodeMegaKernelBackend"]
+__all__ = ["KERNEL_NAME", "Sm120Mxfp4Mxfp8NosyncMegaKernelBackend"]

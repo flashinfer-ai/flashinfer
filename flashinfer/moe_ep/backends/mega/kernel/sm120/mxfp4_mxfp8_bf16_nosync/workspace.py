@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Workspace of the SM120 decode MegaMoE backend.
+"""Workspace of the SM120 MXFP4 x MXFP8 nosync MegaMoE backend.
 
 One symmetric buffer per rank holds the staged inputs, the expert pools, the
 intermediate activations, the combine partials, the flags and the counters; the
@@ -134,7 +134,7 @@ class _DeviceBytes:
         }
 
 
-class DecodeWorkspace:
+class NosyncWorkspace:
     """Collective allocation (and rendezvous) over the EP group; must precede CUDA graph capture."""
 
     def __init__(
@@ -316,4 +316,4 @@ class DecodeWorkspace:
             session[0].megamoe_sm120_gin_session_close(session[1])
 
 
-__all__ = ["DecodeWorkspace", "buffer_layout", "kernel_module", "pool_row_bytes"]
+__all__ = ["NosyncWorkspace", "buffer_layout", "kernel_module", "pool_row_bytes"]

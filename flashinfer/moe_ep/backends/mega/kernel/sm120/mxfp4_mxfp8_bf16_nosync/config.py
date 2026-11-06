@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for the SM120 MXFP4 x MXFP8 decode MegaMoE backend."""
+"""Configuration for the SM120 MXFP4 x MXFP8 nosync MegaMoE backend."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ TOKENS_PER_ITEM = (8, 16, 24, 32)
 
 
 @dataclass
-class Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig:
+class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     """Static model and tuning parameters.
 
     ``intermediate_size`` is the post-SwiGLU width (the checkpoint's ``w13`` has
@@ -53,7 +53,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig:
 
     intermediate_size: int
     top_k: int
-    kernel_name: str = "sm120_mxfp4_mxfp8_bf16_decode"
+    kernel_name: str = "sm120_mxfp4_mxfp8_bf16_nosync"
     swiglu_limit: float = 10.0
     transport: str = "p2p"
     tokens_per_item: int | None = None
