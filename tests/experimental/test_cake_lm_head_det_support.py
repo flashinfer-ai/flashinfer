@@ -1924,7 +1924,7 @@ def test_public_support_entries():
     """The public entries are experimental, serve the cake backend only and pass every argument through."""
     import inspect
 
-    import flashinfer.chunked_lm_head as public
+    import flashinfer.cake_lm_head_det_train as public
 
     for name in (
         "cake_lm_head_det_train_support_logprob",
@@ -1941,14 +1941,16 @@ def test_public_support_entries():
             assert outer[p].default == inner[p].default, (name, p)
     X, W, ids, off = _base()
     with pytest.raises(ValueError, match="backend"):
-        public.cake_lm_head_det_train_support_logprob(X, W, ids, off, k_cap=3, backend=REF)
+        public.cake_lm_head_det_train_support_logprob(
+            X, W, ids, off, k_cap=3, backend=REF
+        )
     with pytest.raises(ValueError, match="use backend='reference'"):
         public.cake_lm_head_det_train_support_logprob(X, W, ids, off, k_cap=3)
 
 
 def test_cake_public_entries_match_the_backend():
     _require_cake()
-    import flashinfer.chunked_lm_head as public
+    import flashinfer.cake_lm_head_det_train as public
 
     inp = cuda_inputs(100, k_cap=16, labels=True, teacher=True, tau_form="hetero")
     args = (inp.X, inp.W, inp.support_ids, inp.support_offsets)

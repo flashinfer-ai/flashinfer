@@ -17,7 +17,7 @@ limitations under the License.
 """Benchmark the experimental Cake chunked LM-head + loss training kernels (SM100 / SM103).
 
 Times the forward, the backward and the whole training step (forward +
-backward, wrapper-inclusive) of ``flashinfer.chunked_lm_head`` on the
+backward, wrapper-inclusive) of ``flashinfer.cake_lm_head_det_train`` on the
 GLM-class geometry (``H = 6144``, ``V = 154880``, BF16 ``X`` / ``W``, int64
 labels with five percent ignored rows) over irregular token counts: the loss
 entry with the cross-entropy and the policy objective at chunks of 2048 /
@@ -83,9 +83,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
-from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
+from flashinfer import _cake_lm_head_train_knobs as _knobs  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.chunked_lm_head import (
+from flashinfer.cake_lm_head_det_train import (
     cake_lm_head_det_train_logprob,
     cake_lm_head_det_train_loss,
 )  # noqa: E402
@@ -502,7 +502,7 @@ class ArmCCEDefault(ArmCCE):
 
 
 class ArmCake(ArmAutograd):
-    """The public experimental entry points (``flashinfer.chunked_lm_head``, ``backend="cake"``); a
+    """The public experimental entry points (``flashinfer.cake_lm_head_det_train``, ``backend="cake"``); a
     log-probability row with a temperature passes the inputs' temperature argument as is (a Python number for the
     scalar form, the ``[T]`` tensor otherwise)."""
 
@@ -536,7 +536,7 @@ class ArmCake(ArmAutograd):
     def versions(self):
         # the switches this arm runs with: the public module's resolution of its FLASHINFER_CAKE_LM_HEAD_LOSS_*
         # variables (every keyword left at None), which it passes down to the backend
-        switches = public_lm_head._resolve_knobs(
+        switches = _knobs.resolve_knobs(
             compact_rows=None,
             fuse_dw_cast=None,
             dx_finalize=None,

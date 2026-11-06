@@ -14,10 +14,10 @@ automatic backend selection, autotuning or trace-apply.  Its libraries are
 loaded prebuilt from `aot/` when the package ships them and JIT-built by
 FlashInfer from `build.json` otherwise (see "Layout of this package").
 
-## Public entry points (`flashinfer/chunked_lm_head.py`)
+## Public entry points (`flashinfer/cake_lm_head_det_train.py`)
 
 ```python
-from flashinfer.chunked_lm_head import cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob
+from flashinfer.cake_lm_head_det_train import cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob
 
 loss = cake_lm_head_det_train_loss(X, W, labels, objective="ce", loss_div=loss_div, chunk_size=4096)
 loss, logp = cake_lm_head_det_train_loss(X, W, labels, objective="policy", infer_logp=infer_logp,
@@ -329,7 +329,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   launch helpers and per-device state of `cake_backend.py` and keep their
   own binding cache (`cake_backend_opt_in.BINDING_CACHE`, same settings).  A
   call with neither keyword runs `cake_backend.py`'s entry unchanged, with
-  its buffer lifetimes; the public entries of `flashinfer.chunked_lm_head`
+  its buffer lifetimes; the public entries of `flashinfer.cake_lm_head_det_train`
   run their argument checks first (`check_num_valid_rows`, which needs a
   count: `ValueError` without one; then `memory_mode` and `num_valid_rows`
   against `None`).  An explicit `memory_mode="fast"` without a count first
@@ -467,7 +467,7 @@ accepts `backend="cake"` only.
 ## Candidate-support entry points (`cake_support.py`)
 
 ```python
-from flashinfer.chunked_lm_head import (
+from flashinfer.cake_lm_head_det_train import (
     cake_lm_head_det_train_support_kl,
     cake_lm_head_det_train_support_logprob,
 )
@@ -559,7 +559,7 @@ log-probability forward and `logprob_dz` to its backward), `None` selecting the 
 (`cake_backend.compact_rows_default()` and friends return the constants); the
 autograd entries resolve every switch once in the forward.  **The package reads
 no environment variable.**  The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables are
-FlashInfer's own A/B knobs and are read by `flashinfer.chunked_lm_head` only: a
+FlashInfer's own A/B knobs and are read by `flashinfer.cake_lm_head_det_train` only: a
 switch keyword left at `None` there falls back to its variable and the resolved
 value is passed down; the two binding-cache variables are read when that
 module is imported and applied through `BINDING_CACHE.configure` when it first
@@ -573,7 +573,7 @@ entry is a process setting of the backend
 (`cake_backend.set_gradient_placement`, see "Public entry points"), neither a
 keyword nor a variable.
 
-| Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
+| Keyword (backend default) | Variable read by `flashinfer.cake_lm_head_det_train` | Parsing |
 | --- | --- | --- |
 | `compact_rows` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS` | `0` -> `False`, else `True` |
 | `fuse_dw_cast` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST` | `0` -> `False`, else `True` |

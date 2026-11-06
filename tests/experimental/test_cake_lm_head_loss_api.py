@@ -19,7 +19,7 @@ logprob,preload,support_logprob,support_kl}``: experimental dispatchers of the n
 ``deterministic=False`` is accepted: it runs that package with the same argument checks and environment fallbacks,
 also while torch's deterministic algorithms are on (the package's own alert decides; no fallback, no warning from the
 dispatcher).  Any other value, the default ``True`` included, is a ``ValueError`` naming the deterministic entry
-(``cake_lm_head_det_train_*``) before any package import or torch query.  The deterministic entries take no
+(``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_*``) before any package import or torch query.  The deterministic entries take no
 ``deterministic`` keyword (``TypeError``).  The host-layer tests replace the package by recorders; the device tests
 compare the bits of real calls.
 """
@@ -35,6 +35,7 @@ import torch
 import torch.utils.checkpoint
 
 import flashinfer.api_logging as api_logging
+import flashinfer.cake_lm_head_det_train as det_public
 import flashinfer.chunked_lm_head as public
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 
@@ -205,13 +206,14 @@ def _nd_calls(fake, entry):
 
 
 def test_entries_are_experimental_dispatchers():
-    """Each det-free entry is its own experimental function (not the deterministic object) with the deterministic
-    entry's feature, and every deterministic entry keeps its marking."""
+    """Each det-free entry is its own experimental function (not the deterministic object) with its module's
+    feature, and every deterministic entry keeps its marking and its own module's feature."""
     for entry, det in ENTRIES.items():
-        fn, det_fn = getattr(public, entry), getattr(public, det)
+        fn, det_fn = getattr(public, entry), getattr(det_public, det)
         assert fn is not det_fn, entry
         assert fn.is_experimental is True and det_fn.is_experimental is True, entry
-        assert fn.experimental_feature == det_fn.experimental_feature, entry
+        assert fn.experimental_feature == public._FEATURE, entry
+        assert det_fn.experimental_feature == det_public._FEATURE, det
         assert fn.__name__ == entry and "SM100" in fn.__doc__, entry
     for name in (
         "_det_loss",
@@ -234,7 +236,7 @@ def test_signatures_mirror_the_deterministic_entries():
     (displayed as before; only ``False`` is accepted); no deterministic entry has that keyword."""
     for entry, det in ENTRIES.items():
         params = dict(inspect.signature(getattr(public, entry)).parameters)
-        det_params = dict(inspect.signature(getattr(public, det)).parameters)
+        det_params = dict(inspect.signature(getattr(det_public, det)).parameters)
         mode = params.pop("deterministic")
         assert mode.kind is inspect.Parameter.KEYWORD_ONLY and mode.default is True
         assert mode.annotation in (bool, "bool"), entry
@@ -256,7 +258,7 @@ def test_any_mode_but_false_is_a_value_error_before_any_work(
     import (each patched to fail), and before the non-deterministic helper binds the call's other arguments."""
     fake = recorders
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", _fail)
-    monkeypatch.setattr(public, "_resolve_knobs", _fail)
+    monkeypatch.setattr(public._knobs, "resolve_knobs", _fail)
     for loader in ("_nd_backend", "_nd_backend_opt_in", "_nd_support"):
         monkeypatch.setattr(public, loader, _fail)
     for helper in HELPERS.values():
@@ -270,7 +272,7 @@ def test_any_mode_but_false_is_a_value_error_before_any_work(
         r"flashinfer\.experimental\.cake\.cake_lm_head_loss only; "
         r"pass deterministic=False for the non-deterministic path "
         rf"\(got deterministic={got}\); "
-        rf"the deterministic entry is flashinfer\.chunked_lm_head\.{det}$"
+        rf"the deterministic entry is flashinfer\.cake_lm_head_det_train\.{det}$"
     )
     with pytest.raises(ValueError, match=pattern):
         getattr(public, entry)(*args, **given)
@@ -433,7 +435,7 @@ def test_deterministic_entries_take_no_mode_keyword():
         "cake_lm_head_det_train_support_kl": (sup + (torch.zeros(4),), dict(k_cap=3)),
     }
     for det, (args, kwargs) in calls.items():
-        fn = getattr(public, det)
+        fn = getattr(det_public, det)
         assert "deterministic" not in inspect.signature(fn).parameters, det
         for value in (True, False):
             with pytest.raises(
@@ -677,7 +679,7 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", api_logging.ExperimentalWarning)
         for route, fn, mode, tuning in (
-            ("det", public.cake_lm_head_det_train_logprob, {}, None),
+            ("det", det_public.cake_lm_head_det_train_logprob, {}, None),
             ("nd", public.chunked_lm_head_logprob, dict(deterministic=False), None),
             (
                 "nd",
@@ -853,7 +855,7 @@ def test_device_false_temperature_through_the_public_entry():
         )
         same(
             run(public.chunked_lm_head_logprob, temperature=value, **nd_kw),
-            run(public.cake_lm_head_det_train_logprob, temperature=value),
+            run(det_public.cake_lm_head_det_train_logprob, temperature=value),
             ("vs deterministic", type(value).__name__),
             keys=("logp", "dW"),
         )

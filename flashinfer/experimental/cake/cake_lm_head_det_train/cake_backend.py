@@ -176,7 +176,7 @@ that it affects, ``None`` selecting the documented default (the
 ``*_default()`` functions); the binding cache is configured through
 :meth:`BindingCache.configure` and the loss entry's gradient placement through
 :func:`set_gradient_placement`.  This module reads no environment variable.
-FlashInfer's public wrapper (``flashinfer.chunked_lm_head``) owns the A/B
+FlashInfer's public wrapper (``flashinfer.cake_lm_head_det_train``) owns the A/B
 environment variables of the first six and passes the resolved values down;
 it leaves the log-probability arms at their defaults.
 """
@@ -1567,7 +1567,7 @@ def _dx_reduce(values: dict[str, Any]) -> None:
 
 # The switches below are keyword arguments of the entry points (``None`` = the documented default, the constant each
 # ``*_default()`` returns); this module reads no environment variable.  FlashInfer's public wrapper
-# (``flashinfer.chunked_lm_head``) owns the A/B environment variables of these switches and passes the resolved values
+# (``flashinfer.cake_lm_head_det_train``) owns the A/B environment variables of these switches and passes the resolved values
 # down.
 
 
@@ -7211,7 +7211,7 @@ def _values(entries: OrderedDict) -> list:
             continue
 
 
-# Enabled, 64 bindings.  ``flashinfer.chunked_lm_head`` applies its environment variables through
+# Enabled, 64 bindings.  ``flashinfer.cake_lm_head_det_train`` applies its environment variables through
 # :meth:`BindingCache.configure` on its first backend use; this module reads none.
 BINDING_CACHE = BindingCache()
 

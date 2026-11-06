@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import flashinfer.chunked_lm_head as public
+import flashinfer.cake_lm_head_det_train as public
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
 

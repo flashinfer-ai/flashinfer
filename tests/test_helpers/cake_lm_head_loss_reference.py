@@ -20,7 +20,7 @@ by ``tests/experimental/test_cake_lm_head_det_loss.py``,
 ``tests/experimental/test_cake_lm_head_det_loss_api.py`` and
 ``benchmarks/bench_cake_lm_head_det_loss.py``.
 
-Contract reproduced here (see ``flashinfer.chunked_lm_head``):
+Contract reproduced here (see ``flashinfer.cake_lm_head_det_train``):
 
 * ``z = X @ W^T`` is a BF16 GEMM (BF16 output of an FP32 accumulation),
   promoted to FP32; ``lse_t = logsumexp_v z[t, v]``; ``logp_t = z[t, y_t] -

@@ -15,7 +15,7 @@ limitations under the License.
 
 flashinfer public-API tests of the Cake chunked LM-head + loss package.
 
-The experimental entry points ``flashinfer.chunked_lm_head.cake_lm_head_det_train_loss`` and
+The experimental entry points ``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`` and
 ``cake_lm_head_det_train_logprob`` are thin wrappers over
 ``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend``: they carry the experimental
 marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
@@ -37,9 +37,10 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-import flashinfer.chunked_lm_head as public
+import flashinfer._cake_lm_head_train_knobs as knobs
+import flashinfer.cake_lm_head_det_train as public
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.chunked_lm_head import (
+from flashinfer.cake_lm_head_det_train import (
     cake_lm_head_det_train_logprob,
     cake_lm_head_det_train_loss,
 )
@@ -58,22 +59,22 @@ SEED = 20260930
 H_HOST, V_HOST = 256, 512
 # The switch keywords of both public entries and the variable each one falls back to.
 ENV_OF = {
-    "compact_rows": public.COMPACT_ROWS_ENV,
-    "fuse_dw_cast": public.FUSE_DW_CAST_ENV,
-    "dx_finalize": public.DX_FINALIZE_ENV,
-    "dw_stream": public.DW_STREAM_ENV,
-    "hidden_count": public.HIDDEN_COUNT_ENV,
-    "gemm_tuning": public.GEMM_TUNING_ENV,
+    "compact_rows": knobs.COMPACT_ROWS_ENV,
+    "fuse_dw_cast": knobs.FUSE_DW_CAST_ENV,
+    "dx_finalize": knobs.DX_FINALIZE_ENV,
+    "dw_stream": knobs.DW_STREAM_ENV,
+    "hidden_count": knobs.HIDDEN_COUNT_ENV,
+    "gemm_tuning": knobs.GEMM_TUNING_ENV,
 }
 SWITCHES = tuple(ENV_OF)
-CACHE_ENVS = (public.BINDING_CACHE_ENV, public.BINDING_CACHE_CAPACITY_ENV)
+CACHE_ENVS = (knobs.BINDING_CACHE_ENV, knobs.BINDING_CACHE_CAPACITY_ENV)
 
 
 def _knobs(**explicit):
     """The keywords the wrapper passes down for a call whose switches are ``explicit`` (every other one ``None``)."""
     given = {name: None for name in SWITCHES}
     given.update(explicit)
-    return public._resolve_knobs(**given)
+    return knobs.resolve_knobs(**given)
 
 
 def _clear(monkeypatch):
@@ -176,7 +177,7 @@ def test_public_api_switch_keywords():
     ):
         params = inspect.signature(fn).parameters
         assert all(params[name].default is None for name in SWITCHES), fn.__name__
-    named = {v for k, v in vars(public).items() if k.endswith("_ENV")}
+    named = {v for k, v in vars(knobs).items() if k.endswith("_ENV")}
     assert named == set(ENV_OF.values()) | set(CACHE_ENVS)
     assert all(v.startswith("FLASHINFER_CAKE_LM_HEAD_LOSS_") for v in named)
 
@@ -301,7 +302,7 @@ def test_public_api_temperature_keywords(monkeypatch):
     assert preload["temperature"].kind is inspect.Parameter.KEYWORD_ONLY
     assert preload["temperature"].default is False
     assert "temperature" in public.cake_lm_head_det_train_preload.__doc__
-    assert not any("TEMPERATURE" in k for k in vars(public) if k.endswith("_ENV"))
+    assert not any("TEMPERATURE" in k for k in vars(knobs) if k.endswith("_ENV"))
     seen = {}
 
     def spy(name):
@@ -401,13 +402,13 @@ def test_public_api_temperature_refuses_keep_logits(monkeypatch):
 def test_compact_rows_default_env(monkeypatch):
     _clear(monkeypatch)
     assert _knobs()["compact_rows"] is True  # unset: the backend's default
-    monkeypatch.setenv(public.COMPACT_ROWS_ENV, "0")
+    monkeypatch.setenv(knobs.COMPACT_ROWS_ENV, "0")
     assert _knobs()["compact_rows"] is False
     assert _knobs(compact_rows=True)["compact_rows"] is True  # the keyword wins
-    monkeypatch.setenv(public.COMPACT_ROWS_ENV, "1")
+    monkeypatch.setenv(knobs.COMPACT_ROWS_ENV, "1")
     assert _knobs()["compact_rows"] is True
     assert _knobs(compact_rows=False)["compact_rows"] is False
-    monkeypatch.setenv(public.COMPACT_ROWS_ENV, "off")
+    monkeypatch.setenv(knobs.COMPACT_ROWS_ENV, "off")
     assert _knobs()["compact_rows"] is True  # "0" is the only off value
 
 
@@ -417,13 +418,13 @@ def test_fuse_dw_cast_default_env(monkeypatch):
     assert "gemm_dw_cast_bf16" in stages_for_entry(
         "loss", fuse_dw_cast=_knobs()["fuse_dw_cast"]
     )
-    monkeypatch.setenv(public.FUSE_DW_CAST_ENV, "0")
+    monkeypatch.setenv(knobs.FUSE_DW_CAST_ENV, "0")
     assert _knobs()["fuse_dw_cast"] is False
     assert "gemm_dw_cast_bf16" not in stages_for_entry(
         "loss", fuse_dw_cast=_knobs()["fuse_dw_cast"]
     )
     assert _knobs(fuse_dw_cast=True)["fuse_dw_cast"] is True  # the keyword wins
-    monkeypatch.setenv(public.FUSE_DW_CAST_ENV, "1")
+    monkeypatch.setenv(knobs.FUSE_DW_CAST_ENV, "1")
     assert _knobs()["fuse_dw_cast"] is True
     assert _knobs(fuse_dw_cast=False)["fuse_dw_cast"] is False
 
@@ -431,10 +432,10 @@ def test_fuse_dw_cast_default_env(monkeypatch):
 def test_dx_finalize_default_env(monkeypatch):
     _clear(monkeypatch)
     assert _knobs()["dx_finalize"] is True
-    monkeypatch.setenv(public.DX_FINALIZE_ENV, "0")
+    monkeypatch.setenv(knobs.DX_FINALIZE_ENV, "0")
     assert _knobs()["dx_finalize"] is False
     assert _knobs(dx_finalize=True)["dx_finalize"] is True  # the keyword wins
-    monkeypatch.setenv(public.DX_FINALIZE_ENV, "1")
+    monkeypatch.setenv(knobs.DX_FINALIZE_ENV, "1")
     assert _knobs()["dx_finalize"] is True
     assert _knobs(dx_finalize=False)["dx_finalize"] is False
     assert cake_backend._resolve_dx_finalize(_knobs()["dx_finalize"]) is True
@@ -443,10 +444,10 @@ def test_dx_finalize_default_env(monkeypatch):
 def test_hidden_count_default_env(monkeypatch):
     _clear(monkeypatch)
     assert _knobs()["hidden_count"] is True
-    monkeypatch.setenv(public.HIDDEN_COUNT_ENV, "0")
+    monkeypatch.setenv(knobs.HIDDEN_COUNT_ENV, "0")
     assert _knobs()["hidden_count"] is False
     assert _knobs(hidden_count=True)["hidden_count"] is True  # the keyword wins
-    monkeypatch.setenv(public.HIDDEN_COUNT_ENV, "1")
+    monkeypatch.setenv(knobs.HIDDEN_COUNT_ENV, "1")
     assert _knobs()["hidden_count"] is True
     assert _knobs(hidden_count=False)["hidden_count"] is False
     assert cake_backend._resolve_hidden_count(_knobs()["hidden_count"]) is True
@@ -463,24 +464,24 @@ def test_dw_stream_default_env(monkeypatch):
         cake_backend.dw_side_stream(n, _knobs()["dw_stream"]) for n in (1, 2, 3, 8)
     ] == [False, False, True, True]
     for value in ("0", "false", "off", "no", " OFF "):
-        monkeypatch.setenv(public.DW_STREAM_ENV, value)
+        monkeypatch.setenv(knobs.DW_STREAM_ENV, value)
         assert _knobs()["dw_stream"] is False
         assert not any(
             cake_backend.dw_side_stream(n, _knobs()["dw_stream"]) for n in (1, 2, 3, 8)
         )
     for value in ("1", "true", "on", "yes", " On "):
-        monkeypatch.setenv(public.DW_STREAM_ENV, value)
+        monkeypatch.setenv(knobs.DW_STREAM_ENV, value)
         assert _knobs()["dw_stream"] is True
         assert [
             cake_backend.dw_side_stream(n, _knobs()["dw_stream"]) for n in (1, 2, 3)
         ] == [False, True, True]
     for value in ("auto", "AUTO", "", "anything-else"):
-        monkeypatch.setenv(public.DW_STREAM_ENV, value)
+        monkeypatch.setenv(knobs.DW_STREAM_ENV, value)
         assert _knobs()["dw_stream"] == "auto"
         assert [
             cake_backend.dw_side_stream(n, _knobs()["dw_stream"]) for n in (2, 3)
         ] == [False, True]
-    monkeypatch.setenv(public.DW_STREAM_ENV, "0")
+    monkeypatch.setenv(knobs.DW_STREAM_ENV, "0")
     assert _knobs(dw_stream=True)["dw_stream"] is True  # the keyword wins
     assert _knobs(dw_stream="auto")["dw_stream"] == "auto"
 
@@ -492,10 +493,10 @@ def test_gemm_tuning_default_env(monkeypatch):
     _clear(monkeypatch)
     assert _knobs()["gemm_tuning"] is None
     assert cake_backend._resolve_gemm_tuning(_knobs()["gemm_tuning"]) == {}
-    monkeypatch.setenv(public.GEMM_TUNING_ENV, "  ")
+    monkeypatch.setenv(knobs.GEMM_TUNING_ENV, "  ")
     assert _knobs()["gemm_tuning"] is None
     monkeypatch.setenv(
-        public.GEMM_TUNING_ENV, '{"logits": {"group_m": 16}, "dx": {"tile_n": 256}}'
+        knobs.GEMM_TUNING_ENV, '{"logits": {"group_m": 16}, "dx": {"tile_n": 256}}'
     )
     assert _knobs()["gemm_tuning"] == {"logits": {"group_m": 16}, "dx": {"tile_n": 256}}
     assert cake_backend._resolve_gemm_tuning(_knobs()["gemm_tuning"]) == {
@@ -503,20 +504,20 @@ def test_gemm_tuning_default_env(monkeypatch):
         "dx": {"tile_n": 256},
     }
     X, W, labels = _host_call()
-    monkeypatch.setenv(public.GEMM_TUNING_ENV, "not json")
+    monkeypatch.setenv(knobs.GEMM_TUNING_ENV, "not json")
     with pytest.raises(ValueError, match="JSON") as info:
         _knobs()
-    assert public.GEMM_TUNING_ENV in str(info.value)
+    assert knobs.GEMM_TUNING_ENV in str(info.value)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        with pytest.raises(ValueError, match=public.GEMM_TUNING_ENV):
+        with pytest.raises(ValueError, match=knobs.GEMM_TUNING_ENV):
             cake_lm_head_det_train_loss(X, W, labels, loss_div=1.0)
-        with pytest.raises(ValueError, match=public.GEMM_TUNING_ENV):
+        with pytest.raises(ValueError, match=knobs.GEMM_TUNING_ENV):
             cake_lm_head_det_train_logprob(X, W, labels)
-    monkeypatch.setenv(public.GEMM_TUNING_ENV, '["dx"]')
+    monkeypatch.setenv(knobs.GEMM_TUNING_ENV, '["dx"]')
     with pytest.raises(ValueError, match="JSON object"):
         _knobs()
-    monkeypatch.setenv(public.GEMM_TUNING_ENV, '{"dx": {"tile_n": 256}}')
+    monkeypatch.setenv(knobs.GEMM_TUNING_ENV, '{"dx": {"tile_n": 256}}')
     assert _knobs(gemm_tuning={})["gemm_tuning"] == {}  # the keyword wins
     common = dict(
         objective="ce",
@@ -539,7 +540,7 @@ def test_gemm_tuning_default_env(monkeypatch):
 
 
 def test_binding_cache_capacity_from_environment(monkeypatch):
-    """The two binding-cache variables are read when ``flashinfer.chunked_lm_head`` is imported (here: reloaded) and
+    """The two binding-cache variables are read when ``flashinfer.cake_lm_head_det_train`` is imported (here: reloaded) and
     applied through ``BindingCache.configure`` on the backend's live cache when the reloaded module first reaches
     the backend (``_cake_backend()``, the first call of either entry point): unset -> enabled, 64 bindings; a
     positive integer sets the capacity; ``..._BINDING_CACHE=0`` disables it; anything but a positive integer is a
@@ -554,28 +555,28 @@ def test_binding_cache_capacity_from_environment(monkeypatch):
         assert cake_backend.BINDING_CACHE is cache
         assert cache.enabled and cache.capacity == 64
         assert cache.capacity == cake_backend.BINDING_CACHE_DEFAULT_CAPACITY
-        monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, "5")
+        monkeypatch.setenv(knobs.BINDING_CACHE_CAPACITY_ENV, "5")
         assert BindingCache().capacity == 64  # the backend does not read the variable
         importlib.reload(public)
         assert cache.capacity == 64  # read at import, applied on first use
         public._cake_backend()
         assert cache.capacity == 5 and cache.enabled
-        monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, " ")
+        monkeypatch.setenv(knobs.BINDING_CACHE_CAPACITY_ENV, " ")
         importlib.reload(public)
         public._cake_backend()
         assert cache.capacity == 64
-        monkeypatch.setenv(public.BINDING_CACHE_ENV, "0")
+        monkeypatch.setenv(knobs.BINDING_CACHE_ENV, "0")
         importlib.reload(public)
         public._cake_backend()
         assert not cache.enabled and len(cache) == 0 and cache.capacity == 64
-        monkeypatch.setenv(public.BINDING_CACHE_ENV, "1")
-        monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, "3")
+        monkeypatch.setenv(knobs.BINDING_CACHE_ENV, "1")
+        monkeypatch.setenv(knobs.BINDING_CACHE_CAPACITY_ENV, "3")
         importlib.reload(public)
         public._cake_backend()
         assert cache.enabled and cache.capacity == 3
-        assert public._binding_cache_settings() == dict(enabled=True, capacity=3)
+        assert knobs.binding_cache_settings() == dict(enabled=True, capacity=3)
         for bad in ("0", "-1", "many", "2.5"):
-            monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, bad)
+            monkeypatch.setenv(knobs.BINDING_CACHE_CAPACITY_ENV, bad)
             with pytest.raises(ValueError, match="positive integer"):
                 importlib.reload(public)
             # a failed import reads nothing to apply: the cache is as it was
@@ -679,13 +680,13 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     casts = {"gemm_dw_cast_bf16", "gemm_dw_cast_bf16_tma"}
     base, base_streams, base_bound = run()
     assert base_streams == 2 and casts & set(base_bound) == {cast}  # the defaults
-    monkeypatch.setenv(public.DW_STREAM_ENV, "0")
+    monkeypatch.setenv(knobs.DW_STREAM_ENV, "0")
     off, off_streams, _ = run()
     assert off_streams == 1
     on, on_streams, _ = run(dw_stream=True)  # the keyword wins over the variable
     assert on_streams == 2
-    monkeypatch.delenv(public.DW_STREAM_ENV)
-    monkeypatch.setenv(public.FUSE_DW_CAST_ENV, "0")
+    monkeypatch.delenv(knobs.DW_STREAM_ENV)
+    monkeypatch.setenv(knobs.FUSE_DW_CAST_ENV, "0")
     unfused, _, unfused_bound = run()
     assert not casts & set(unfused_bound)
     assert "gemm_dw_acc" in unfused_bound and "scale_cast_bf16" in unfused_bound
@@ -732,7 +733,8 @@ def test_device_temperature_through_the_public_entry(monkeypatch):
         same(
             run(cake_lm_head_det_train_logprob, temperature=value),
             run(
-                cake_backend.cake_lm_head_det_train_logprob_temperature, temperature=value
+                cake_backend.cake_lm_head_det_train_logprob_temperature,
+                temperature=value,
             ),
             type(value).__name__,
         )

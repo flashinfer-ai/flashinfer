@@ -50,7 +50,7 @@ from tests.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named once, through ``cake_package``; nothing else of flashinfer is imported here (a
 # build that vendors the package under another import path runs this file unchanged after pointing the ``PACKAGES``
-# entry at it).  The tests of the public entry points ``flashinfer.chunked_lm_head`` -- their experimental marking and
+# entry at it).  The tests of the public entry points ``flashinfer.cake_lm_head_det_train`` -- their experimental marking and
 # the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_det_loss_api.py``.
 pkg = cake_package("cake.cake_lm_head_det_train")
 cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
@@ -194,7 +194,7 @@ def _run(
     **switches,
 ):
     """One forward + backward through the backend's autograd entry points (``backend="cake"`` runs the generated
-    program; the public module ``flashinfer.chunked_lm_head`` is a pass-through to these two functions, tested in
+    program; the public module ``flashinfer.cake_lm_head_det_train`` is a pass-through to these two functions, tested in
     ``test_cake_lm_head_det_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
     ``hidden_count``, ``gemm_tuning``; ``logprob_dz`` / ``logprob_lbl`` of the log-probability entry), passed
     through; ``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` call the opt-in module's entry points;
@@ -4223,7 +4223,9 @@ def test_zero_rows_return_zeros_without_binding(monkeypatch):
         )
     X = X0.clone().requires_grad_()
     Wt = W.clone().requires_grad_()
-    lp = cake_backend.cake_lm_head_det_train_logprob(X, Wt, labels0, backend="reference")
+    lp = cake_backend.cake_lm_head_det_train_logprob(
+        X, Wt, labels0, backend="reference"
+    )
     assert tuple(lp.shape) == (0,) and lp.dtype == torch.float32
     lp.sum().backward()
     assert tuple(X.grad.shape) == (0, H_HOST) and torch.all(Wt.grad == 0)
@@ -4395,7 +4397,7 @@ def test_valid_row_index_and_scatter():
 
 def test_switch_defaults_are_constants():
     """Every switch is a keyword whose ``None`` selects a constant, documented default; the package reads no
-    environment variable (the public module ``flashinfer.chunked_lm_head`` owns the A/B variables)."""
+    environment variable (the public module ``flashinfer.cake_lm_head_det_train`` owns the A/B variables)."""
     assert cake_backend.compact_rows_default() is True
     assert cake_backend._resolve_compact(None) is True
     assert cake_backend._resolve_compact(False) is False
@@ -4718,7 +4720,10 @@ def test_logprob_arm_switches_belong_to_the_logprob_entry():
         ),
         (
             "logprob_dz",
-            (cake_backend.backward_logprob, cake_backend.cake_lm_head_det_train_logprob),
+            (
+                cake_backend.backward_logprob,
+                cake_backend.cake_lm_head_det_train_logprob,
+            ),
         ),
     ):
         for fn in (*fns, prepare_lm_head_det_loss):
@@ -12607,7 +12612,9 @@ def test_device_checkpointed_logprob_keep_step_is_bitwise(glm_weight, entry):
 
     def head_default(a, b):
         return (
-            cake_backend.cake_lm_head_det_train_logprob(a, b, inp.labels, chunk_size=4096)
+            cake_backend.cake_lm_head_det_train_logprob(
+                a, b, inp.labels, chunk_size=4096
+            )
             * inp.dlogp
         ).sum()
 
