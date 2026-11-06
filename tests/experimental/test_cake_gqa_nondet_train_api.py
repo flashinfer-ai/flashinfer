@@ -13,12 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Public-API suite of ``flashinfer.gqa_train``, the experimental entry points of the Cake packed-varlen GQA training
-attention (head dimension 256).
+Public-API suite of ``flashinfer.cake_gqa_nondet_train``, the stable entry points of the Cake non-deterministic
+packed-varlen GQA training attention (head dimension 256).
 
-Without a device: every entry point is an experimental API, importing the module imports no backend, the module reads
-no environment variable, and every keyword of an entry point is the backend's keyword of the same name.  On SM100 /
-SM103: the entry points return the backend's results, the workspace helpers, and autograd with each ``dkv_acc`` form.
+Without a device: no entry point is an experimental API (no ``ExperimentalWarning``), importing the module imports no
+backend, the re-exported classes and types are the backend's objects (resolved on first access), the module reads no
+environment variable, and every keyword of an entry point is the backend's keyword of the same name.  On SM100 /
+SM103 / SM107: the entry points return the backend's results, the workspace helpers, and autograd with each
+``dkv_acc`` form, without an ``ExperimentalWarning``.
 """
 
 from __future__ import annotations
@@ -34,38 +36,56 @@ from pathlib import Path
 import pytest
 import torch
 
-import flashinfer.gqa_train as api
+import flashinfer.cake_gqa_nondet_train as api
 from flashinfer.api_logging import ExperimentalWarning
 
+BACKEND = "flashinfer.experimental.cake.cake_gqa_nondet_train"
 ENTRY_POINTS = (
-    "varlen_gqa_attention",
-    "varlen_gqa_attention_fwd",
-    "varlen_gqa_attention_bwd",
-    "gqa_train_workspace",
-    "gqa_train_workspace_bytes",
+    "cake_gqa_nondet",
+    "cake_gqa_nondet_train_forward",
+    "cake_gqa_nondet_train_backward",
+    "cake_gqa_nondet_train_workspace",
+    "cake_gqa_nondet_train_workspace_bytes",
 )
-# Facade name -> the backend function it forwards to.
+# Backend classes and types the module re-exports, resolved on first access.
+BACKEND_OBJECTS = (
+    "CakeGQANondetDkvAccSource",
+    "CakeGQANondetFunction",
+    "CakeGQANondetWorkspace",
+)
+# Facade name -> the backend function it forwards to (the same name).
 BACKEND_NAMES = {
-    "varlen_gqa_attention": "varlen_gqa_attention",
-    "varlen_gqa_attention_fwd": "gqa_attention_fwd",
-    "varlen_gqa_attention_bwd": "gqa_attention_bwd",
-    "gqa_train_workspace_bytes": "workspace_bytes",
+    "cake_gqa_nondet": "cake_gqa_nondet",
+    "cake_gqa_nondet_train_forward": "cake_gqa_nondet_train_forward",
+    "cake_gqa_nondet_train_backward": "cake_gqa_nondet_train_backward",
+    "cake_gqa_nondet_train_workspace_bytes": "cake_gqa_nondet_train_workspace_bytes",
 }
 D = 256
 SCALE = 0.0625
 
 
-def test_entry_points_are_experimental() -> None:
-    assert sorted(api.__all__) == sorted(ENTRY_POINTS)
+def test_entry_points_are_stable_apis() -> None:
+    assert sorted(api.__all__) == sorted(ENTRY_POINTS + BACKEND_OBJECTS)
     for name in ENTRY_POINTS:
-        assert getattr(api, name).is_experimental is True, name
+        assert getattr(getattr(api, name), "is_experimental", False) is False, name
+
+
+def test_reexported_objects_are_the_backend_objects() -> None:
+    from flashinfer.experimental.cake.cake_gqa_nondet_train import cake_backend
+
+    for name in BACKEND_OBJECTS:
+        assert getattr(api, name) is getattr(cake_backend, name), name
+    assert set(BACKEND_OBJECTS) <= set(dir(api))
+    with pytest.raises(AttributeError):
+        api.varlen_gqa_attention  # noqa: B018
 
 
 def test_importing_the_module_imports_no_backend() -> None:
     code = (
         "import sys\n"
-        "import flashinfer.gqa_train\n"
-        "print(any(m.startswith('flashinfer.experimental.cake_gqa_train') for m in sys.modules))\n"
+        "import flashinfer.cake_gqa_nondet_train as api\n"
+        "names = dir(api)\n"
+        f"print(any(m.startswith({BACKEND!r}) for m in sys.modules))\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
@@ -85,7 +105,7 @@ def test_the_module_reads_no_environment_variable() -> None:
 
 
 def test_keywords_match_the_backend() -> None:
-    from flashinfer.experimental.cake_gqa_train import cake_backend
+    from flashinfer.experimental.cake.cake_gqa_nondet_train import cake_backend
 
     for facade, backend in BACKEND_NAMES.items():
         ours = inspect.signature(inspect.unwrap(getattr(api, facade))).parameters
@@ -95,8 +115,12 @@ def test_keywords_match_the_backend() -> None:
             assert param.kind == theirs[name].kind, (facade, name)
             if param.default is not inspect.Parameter.empty:
                 assert param.default == theirs[name].default, (facade, name)
-    workspace = inspect.signature(inspect.unwrap(api.gqa_train_workspace)).parameters
-    assert list(workspace) == list(inspect.signature(cake_backend.Workspace).parameters)
+    workspace = inspect.signature(
+        inspect.unwrap(api.cake_gqa_nondet_train_workspace)
+    ).parameters
+    assert list(workspace) == list(
+        inspect.signature(cake_backend.CakeGQANondetWorkspace).parameters
+    )
 
 
 def _device_or_skip() -> torch.device:
@@ -106,7 +130,7 @@ def _device_or_skip() -> torch.device:
         (10, 7),
     ):
         pytest.skip("the Cake GQA training attention ships for SM100 / SM103 / SM107")
-    from flashinfer.experimental.cake_gqa_train import cake_jit
+    from flashinfer.experimental.cake.cake_gqa_nondet_train import cake_jit
 
     if not (Path(cake_jit.__file__).parent / "build.json").is_file():
         pytest.skip("the package has no build.json yet (not exported)")
@@ -135,20 +159,20 @@ def _inputs(q_lens, k_lens, device, h_q=24, h_kv=4):
 
 def test_entry_points_return_the_backend_results() -> None:
     device = _device_or_skip()
-    from flashinfer.experimental.cake_gqa_train import cake_backend
+    from flashinfer.experimental.cake.cake_gqa_nondet_train import cake_backend
 
     q, k, v, dout, cu_q, cu_k = _inputs((300, 77), (1000, 0), device)
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        out, lse = api.varlen_gqa_attention_fwd(
+        warnings.simplefilter("error", ExperimentalWarning)
+        out, lse = api.cake_gqa_nondet_train_forward(
             q, k, v, cu_q, cu_k, softmax_scale=SCALE
         )
-        ref_out, ref_lse = cake_backend.gqa_attention_fwd(
+        ref_out, ref_lse = cake_backend.cake_gqa_nondet_train_forward(
             q, k, v, cu_q, cu_k, softmax_scale=SCALE
         )
         assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
         assert bool((lse[:, 300:] == -math.inf).all())
-        dq, dk, dv = api.varlen_gqa_attention_bwd(
+        dq, dk, dv = api.cake_gqa_nondet_train_backward(
             q,
             k,
             v,
@@ -160,7 +184,7 @@ def test_entry_points_return_the_backend_results() -> None:
             softmax_scale=SCALE,
             dkv_dtype=torch.float32,
         )
-        _rdq, rdk, rdv = cake_backend.gqa_attention_bwd(
+        _rdq, rdk, rdv = cake_backend.cake_gqa_nondet_train_backward(
             q,
             k,
             v,
@@ -176,12 +200,12 @@ def test_entry_points_return_the_backend_results() -> None:
             dk.dtype == torch.float32 and torch.equal(dk, rdk) and torch.equal(dv, rdv)
         )
         assert dq.dtype == torch.bfloat16 and dq.shape == q.shape
-        ws = api.gqa_train_workspace(device)
-        assert ws.nbytes == 0
-        api.varlen_gqa_attention(q, k, v, cu_q, cu_k, workspace=ws)
-        assert api.gqa_train_workspace_bytes(
+        ws = api.cake_gqa_nondet_train_workspace(device)
+        assert isinstance(ws, api.CakeGQANondetWorkspace) and ws.nbytes == 0
+        api.cake_gqa_nondet(q, k, v, cu_q, cu_k, workspace=ws)
+        assert api.cake_gqa_nondet_train_workspace_bytes(
             377, 24, 2
-        ) == cake_backend.workspace_bytes(377, 24, 2)
+        ) == cake_backend.cake_gqa_nondet_train_workspace_bytes(377, 24, 2)
 
 
 @pytest.mark.parametrize("form", ("none", "window", "rowmap"))
@@ -204,8 +228,8 @@ def test_autograd_dkv_forms(form) -> None:
 
     leaves = [t.clone().requires_grad_() for t in (q, k, v)]
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        out = api.varlen_gqa_attention(
+        warnings.simplefilter("error", ExperimentalWarning)
+        out = api.cake_gqa_nondet(
             *leaves,
             cu_q,
             cu_k,
@@ -213,11 +237,13 @@ def test_autograd_dkv_forms(form) -> None:
             dkv_acc=None if form == "none" else dkv_acc,
         )
         out.backward(dout)
-        _, rdk, rdv = api.varlen_gqa_attention_bwd(
+        _, rdk, rdv = api.cake_gqa_nondet_train_backward(
             q,
             k,
             v,
-            *api.varlen_gqa_attention_fwd(q, k, v, cu_q, cu_k, softmax_scale=SCALE),
+            *api.cake_gqa_nondet_train_forward(
+                q, k, v, cu_q, cu_k, softmax_scale=SCALE
+            ),
             dout,
             cu_q,
             cu_k,

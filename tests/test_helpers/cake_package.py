@@ -58,7 +58,8 @@ PACKAGES: dict[str, str] = {
     "sm110_xqa": "flashinfer.experimental.sm110_xqa",
     "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
     "cake.cake_gdn_train": "flashinfer.experimental.cake.cake_gdn_train",
-    "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
+    # the non-deterministic GQA HD256 training package; its key carries the namespace
+    "cake.cake_gqa_nondet_train": "flashinfer.experimental.cake.cake_gqa_nondet_train",
     "cake.cake_mhc_train": "flashinfer.experimental.cake.cake_mhc_train_backend",
     "cake_causal_conv1d_nondet_train": "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
 }
