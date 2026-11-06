@@ -67,6 +67,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.utils as utils
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
@@ -74,8 +75,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL, dsl_user_op, if_generate
-from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import BaseDSL, if_generate
 
 # Production path: diagnostics remain in the frozen baseline bundle.
 
@@ -162,13 +162,9 @@ def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None
     cute.arch.mbarrier_wait(mbar_ptr, phase)
 
 
-@dsl_user_op
+@cute.jit
 def _wait_cluster_mbarrier_acquire(
-    mbar_ptr: "cute.Pointer",
-    phase: "cutlass.Int32",
-    *,
-    loc=None,
-    ip=None,
+    mbar_ptr: cute.Pointer, phase: cutlass.Int32
 ) -> None:
     """``mbarrier.try_wait.parity.acquire.cluster`` spin on a local mbarrier.
 
@@ -176,25 +172,14 @@ def _wait_cluster_mbarrier_acquire(
     thread via ``st.async`` (its complete-tx releases at cluster scope). The
     default ``.acquire.cta`` wait only synchronizes with releases by this
     CTA's own threads (and its own async proxy), so the plain wait gives no
-    happens-before edge to the peer's store. Used only on the corr RAW site.
+    happens-before edge to the peer's store. ``cute.arch.mbarrier_wait`` has
+    no scope argument, so this uses the Primitives ``mbarrier_try_wait_parity``
+    with ``MBarrierScope.CLUSTER``. Used only on the corr RAW site.
     """
-    llvm.inline_asm(
-        None,
-        [
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
-            phase.ir_value(loc=loc, ip=ip),
-        ],
-        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
-        "P1, [$0], $1, 10000000;\n\t"
-        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 @cute.jit
