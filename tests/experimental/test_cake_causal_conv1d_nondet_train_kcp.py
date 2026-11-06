@@ -116,7 +116,9 @@ def test_forward_is_the_deterministic_forward(name, lens, cuts, C):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
     y, hist = _fwd(p.x_local, p.w, p.ctx)
-    y_det, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
     assert torch.equal(_bits(y), _bits(y_det)) and torch.equal(
         _bits(hist), _bits(hist_det)
     )
@@ -134,8 +136,10 @@ def test_backward_repeats_dx_bitwise_dweight_within_budget(
     p = _problem(lens, cuts, C, device)
     _, hist = _fwd(p.x_local, p.w, p.ctx)
     _, dx_ref, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
-    _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_backward_kcp(
+    _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
     worst_ref = worst_det = 0.0
@@ -256,8 +260,10 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
     assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
     monkeypatch.undo()
-    _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_det, _ = det_kcp.cake_causal_conv1d_det_backward_kcp(
+    _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    dx_det, _ = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
     assert torch.equal(dx, dx_det) and torch.isfinite(dw).all()
@@ -317,10 +323,10 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
         for C, expected in rows:
             p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
             _, hist = _fwd(p.x_local, p.w, p.ctx)
-            _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(
+            _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
                 p.x_local, p.w, p.ctx
             )
-            dx_det, _ = det_kcp.cake_causal_conv1d_det_backward_kcp(
+            dx_det, _ = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
                 p.x_local, p.w, p.ctx, p.dy_local, hist_det
             )
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
@@ -447,8 +453,10 @@ def test_checkpoint_and_recompute_handle(
     monkeypatch.undo()
     assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay"}
     assert _same(plain, direct) and _same(got, plain)
-    _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_backward_kcp(
+    _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
     assert torch.equal(_bits(got["dx"]), _bits(dx_det))

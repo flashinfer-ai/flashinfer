@@ -719,12 +719,12 @@ def _entry_lock(root: Path, entry: Path):
     """
     lock_file = None
     try:
-        import fcntl
+        import _flashinfer_filelock as filelock
 
         lock_dir = root / ".locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_file = (lock_dir / f"{entry.parent.name}-{entry.name}.lock").open("a+b")
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        filelock.lock(lock_file.fileno())
     except (ImportError, OSError) as exc:
         if lock_file is not None:
             lock_file.close()

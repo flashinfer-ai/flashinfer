@@ -17,7 +17,7 @@ Context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU traini
 non-deterministic package: thin stable entry points over the experimental backend module
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp`` (imported on first use).  The deterministic
 KCP package is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp` (``cake_causal_conv1d_det_kcp``,
-``cake_causal_conv1d_det_multi_kcp``, ``RecomputeHandleDetKcp``); this module never runs it.
+``cake_causal_conv1d_det_kcp_multi``, ``CakeCausalConv1dDetKcpRecomputeHandle``); this module never runs it.
 
 Numerical mode (the same rule as every non-deterministic training package): the module name chooses the package,
 and no entry point takes a mode keyword.  "torch deterministic mode" is ``torch.use_deterministic_algorithms(True)``,
@@ -46,8 +46,8 @@ run to run (its cross-rank reduction remains the framework's).  The package is c
 recompute (``torch.utils.checkpoint``, reentrant or not) runs the same package.
 
 Name map (the deterministic package -> this module): ``cake_causal_conv1d_det_kcp`` ->
-:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_multi_kcp`` ->
-:func:`cake_causal_conv1d_nondet_kcp_multi`, ``RecomputeHandleDetKcp`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
+:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_kcp_multi`` ->
+:func:`cake_causal_conv1d_nondet_kcp_multi`, ``CakeCausalConv1dDetKcpRecomputeHandle`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
 (any object with an ``entries`` dict serves either package)::
 
     from flashinfer.cake_causal_conv1d_nondet_train_kcp import (

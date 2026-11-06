@@ -314,7 +314,7 @@ def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
-# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` has the same registry shape
+# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` has the same registry shape
 # (``PROGRAMS`` + ``ROUTES`` with per-stage specializations).
 refs_moe_grouped_gemm = refs_moe_grouped_det_gemm
 
@@ -387,8 +387,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_det_train_backend",
-        "flashinfer/cake_causal_conv1d_det_train_backend",
+        "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
+        "flashinfer/experimental/cake/cake_causal_conv1d_det_train",
         "cake_jit.py",
         refs_with_kcp,
     ),
@@ -517,14 +517,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_moe_grouped_det_gemm",
-        "flashinfer/experimental/cake_moe_grouped_det_gemm",
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train",
         "cake_jit.py",
         refs_moe_grouped_det_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_moe_grouped_gemm",
-        "flashinfer/experimental/cake/cake_moe_grouped_gemm",
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train",
         "cake_jit.py",
         refs_moe_grouped_gemm,
     ),

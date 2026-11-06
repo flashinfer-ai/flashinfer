@@ -504,7 +504,7 @@ def test_gpu_new_path_is_bitwise_the_previous_path(device, knobs, p_class) -> No
         assert len(a) == 18
         for i, (x, y) in enumerate(zip(a, b, strict=True)):
             assert torch.equal(x, y), (i, ws_new is None)
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     gen = torch.Generator(device=device).manual_seed(7)
     x = torch.randn(new.T_r, C_CONV, device=device, generator=gen).to(torch.bfloat16)
@@ -512,8 +512,8 @@ def test_gpu_new_path_is_bitwise_the_previous_path(device, knobs, p_class) -> No
     dy = torch.randn(new.T_r, C_CONV, device=device, generator=gen).to(torch.bfloat16)
     res = []
     for ctx in (new, old):
-        y, hist = conv.cake_causal_conv1d_det_forward_kcp(x, w, ctx)
-        dx, dw = conv.cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist)
+        y, hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+        dx, dw = conv.cake_causal_conv1d_det_train_kcp_backward(x, w, ctx, dy, hist)
         res.append((y, dx, dw))
     for x_, y_ in zip(*res, strict=True):
         assert torch.equal(x_, y_)
@@ -597,7 +597,7 @@ def test_gpu_side_stream_preparation_is_ordered(device, form, hook) -> None:
     copy itself (``ctx.wait_ready()``, an event wait): the context's wait record for the compute stream is empty
     before the pack and set after it, and the results are bitwise those of a context prepared on an idle device.
     Without that ordering the kernels would read the blob before its copy."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     H = 2
     part = kp.cake_kda_nondet_train_kcp_partition(list(CU), 1)
@@ -614,8 +614,11 @@ def test_gpu_side_stream_preparation_is_ordered(device, form, hook) -> None:
 
     def pack(ctx):
         if hook == "conv":
-            y, hist = conv.cake_causal_conv1d_det_forward_kcp(x, w, ctx)
-            return (y, *conv.cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist))
+            y, hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+            return (
+                y,
+                *conv.cake_causal_conv1d_det_train_kcp_backward(x, w, ctx, dy, hist),
+            )
         return _passes(ctx, o, None)
 
     ref = pack(ref_ctx)
@@ -656,7 +659,7 @@ def test_gpu_conv_halo_orders_a_cached_context_on_every_stream(device) -> None:
     copy: the blob reuses a block of P's pool that holds zeros (a call reading the tables before the copy sees empty
     fragments and leaves its sentinel-filled output unwritten).  Both outputs are bitwise the reference, and the
     context's wait record names A and B (``wait_event`` plus ``record_stream`` of the blob on each)."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     part = kp.cake_kda_nondet_train_kcp_partition(list(CU), 1)
     ref_ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device)
@@ -666,7 +669,7 @@ def test_gpu_conv_halo_orders_a_cached_context_on_every_stream(device) -> None:
         torch.bfloat16
     )
     w = (0.5 * torch.randn(C_CONV, 4, device=device, generator=gen)).contiguous()
-    y_ref, _ = conv.cake_causal_conv1d_det_forward_kcp(x, w, ref_ctx)
+    y_ref, _ = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, ref_ctx)
     torch.cuda.synchronize(device)
     prep, a_stream, b_stream = (torch.cuda.Stream(device) for _ in range(3))
     with torch.cuda.stream(prep):
@@ -684,7 +687,7 @@ def test_gpu_conv_halo_orders_a_cached_context_on_every_stream(device) -> None:
             out = torch.full(
                 tuple(y_ref.shape), 7.0, dtype=torch.bfloat16, device=device
             )
-            y, _hist = conv.cake_causal_conv1d_det_forward_kcp(x, w, ctx, out=out)
+            y, _hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx, out=out)
         outs.append(y)
     for s in (a_stream, b_stream):
         assert ctx._waited.get(s.cuda_stream, 0) >= 1, s
@@ -710,7 +713,7 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
     ``workspace=None`` keeps nothing once the conv module's host cache is cleared: the context, its table sets and
     its blobs are freed by reference counting alone (the cycle collector disabled; the table set holds its context
     through a weak proxy) and ``memory_allocated`` returns to its level after the first step."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     H = 2
     part = kp.cake_kda_nondet_train_kcp_partition(list(CU), 1)
@@ -725,7 +728,7 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
 
     def step(checkpointed: bool):
         ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device, heads=H)
-        y, _hist = conv.cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+        y, _hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
         if checkpointed:
             res = tuple(t.detach().clone() for t in (y, *_passes(ctx, o, None)))
         else:
@@ -759,7 +762,7 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
         assert isinstance(tb.ctx, weakref.ProxyType)
         return res, [weakref.ref(ctx), weakref.ref(tb)]
 
-    conv.host_cache_clear()
+    conv.cake_causal_conv1d_det_train_kcp_host_cache_clear()
     gc.collect()
     enabled = gc.isenabled()
     gc.disable()
@@ -767,14 +770,14 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
         for i in range(2):
             _res, refs = step(checkpointed=False)
             del _res
-            conv.host_cache_clear()
+            conv.cake_causal_conv1d_det_train_kcp_host_cache_clear()
             torch.cuda.synchronize(device)
             assert all(r() is None for r in refs), (i, _holders(refs))
     finally:
         if enabled:
             gc.enable()
     first, refs = step(checkpointed=True)
-    conv.host_cache_clear()
+    conv.cake_causal_conv1d_det_train_kcp_host_cache_clear()
     gc.collect()
     torch.cuda.synchronize(device)
     assert all(r() is None for r in refs), "the first step's context is retained"
@@ -783,7 +786,7 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
         res, refs = step(checkpointed=True)
         assert all(torch.equal(a, b) for a, b in zip(first, res, strict=True)), i
         del res
-        conv.host_cache_clear()
+        conv.cake_causal_conv1d_det_train_kcp_host_cache_clear()
         gc.collect()
         torch.cuda.synchronize(device)
         assert all(r() is None for r in refs), (i, "a context is retained")

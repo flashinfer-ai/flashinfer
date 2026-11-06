@@ -16,7 +16,7 @@ from types import ModuleType
 PACKAGES: dict[str, str] = {
     "cake_rmsnorm_det_train": "flashinfer.cake_rmsnorm_det_train_backend",
     "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
-    "cake_causal_conv1d_det_train": "flashinfer.cake_causal_conv1d_det_train_backend",
+    "cake_causal_conv1d_det_train": "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
     "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
     "cake_rmsnorm_silu_gate_det_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
     "cake_rmsnorm_silu_gate_nondet_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train",
@@ -29,11 +29,10 @@ PACKAGES: dict[str, str] = {
     "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
+    "cake_moe_grouped_gemm_det_train": "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train",
+    "cake_moe_grouped_gemm_nondet_train": "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train",
     "cake_dense_gemm_det_train": "flashinfer.experimental.cake.cake_dense_gemm_det_train",
     "cake_dense_gemm_nondet_train": "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
-    "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
-    # the non-deterministic package (deterministic=False); its key carries the namespace
-    "cake.cake_moe_grouped_gemm": "flashinfer.experimental.cake.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake.cake_kda_det_train": "flashinfer.experimental.cake.cake_kda_det_train",
     "cake.cake_kda_nondet_train": "flashinfer.experimental.cake.cake_kda_nondet_train",

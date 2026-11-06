@@ -57,7 +57,7 @@ skip = ["build", "3rdparty", "dist", ".venv"]
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["build_backend", "build_utils"]
+py-modules = ["build_backend", "build_utils", "_flashinfer_filelock"]
 
 [tool.setuptools.dynamic]
 version = { attr = "flashinfer._build_meta.__version__" }
@@ -90,7 +90,7 @@ exclude = [
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_det_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
-"flashinfer.cake_causal_conv1d_det_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_causal_conv1d_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.cake_ulysses_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_fused_qk_rope_append_backend" = ["csrc/**", "build.json"]
@@ -193,9 +193,9 @@ exclude = [
 # exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
 "flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
-"flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
-# Generated sources of its non-deterministic counterpart (deterministic=False).
-"flashinfer.experimental.cake.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train" = ["csrc/**", "build.json"]
+# Generated sources of its non-deterministic counterpart.
+"flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train" = ["csrc/**", "build.json"]
 # Generated sources for the deterministic SM100a/SM103a/SM107a dense GEMM training backend
 # (flashinfer.cake_dense_gemm_det_train).
 "flashinfer.experimental.cake.cake_dense_gemm_det_train" = ["csrc/**", "build.json"]
