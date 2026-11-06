@@ -5925,7 +5925,9 @@ def _graph_release(pinned: Any) -> int:
     be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
     dropped.  A pinned plan view of the arena ``pinned`` (:func:`_plan_view`, the same ``arena`` tensor) matches
     too."""
-    arena = pinned.arena if isinstance(pinned, cake_backend.CakeKDADetWorkspace) else None
+    arena = (
+        pinned.arena if isinstance(pinned, cake_backend.CakeKDADetWorkspace) else None
+    )
     stale = [
         key
         for key, e in _GRAPHS.items()

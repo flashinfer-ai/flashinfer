@@ -27,7 +27,6 @@ import warnings
 
 import pytest
 
-import flashinfer.cake_kda_det_train as det_api
 import flashinfer.cake_kda_det_train_kcp as kcp_api
 from flashinfer.api_logging import ExperimentalWarning
 
