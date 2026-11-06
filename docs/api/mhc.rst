@@ -18,6 +18,19 @@ mixing with a fixed ``HC=4`` sub-head layout.
 Training mHC (Cake)
 -------------------
 
+.. note::
+
+   Every public name of the deterministic package ``flashinfer.cake_mhc_det_train``
+   and of its backends ``flashinfer.cake_mhc_det_train_backend`` and
+   ``flashinfer.cake_mhc_det_train_head_backend`` contains ``det``, and its entry
+   points take no ``deterministic`` keyword. FlashInfer 0.7.3 named this package
+   ``flashinfer.cake_mhc_train`` (with ``flashinfer.cake_mhc_train_*`` and
+   ``CakeMHCTrain*`` at the top level). Those names are removed, with no alias:
+   replace ``cake_mhc_train`` with ``cake_mhc_det_train`` and ``CakeMHCTrain``
+   with ``CakeMHCDetTrain``. The names without ``det`` now belong only to the
+   selectable-mode module ``flashinfer.experimental.cake.cake_mhc_train``
+   described below.
+
 Four-stream mHC training forward / backward for hidden sizes 4096, 5120 and
 7168 on SM100 and SM103 (4096 on SM107); each call takes the hidden size ``H``
 from ``X`` ``[T, 4, H]``: the forward mapping, coefficients and collapse
@@ -172,11 +185,9 @@ Names: ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<name>`` ->
 ``flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<name>``,
 ``is_cake_mhc_det_train_supported`` -> ``is_cake_mhc_train_supported`` and
 ``CakeMHCDetTrain<Node>Function`` -> ``CakeMHCTrain<Node>Function`` (the
-non-deterministic package's nodes). The legacy module
-``flashinfer.cake_mhc_train`` keeps the same ``cake_mhc_train_*`` names as
-aliases of the deterministic objects, without a ``deterministic`` keyword.
+non-deterministic package's nodes).
 
-.. currentmodule:: flashinfer.cake_mhc_train
+.. currentmodule:: flashinfer.experimental.cake.cake_mhc_train
 
 .. autosummary::
     :toctree: ../generated
@@ -188,6 +199,3 @@ aliases of the deterministic objects, without a ``deterministic`` keyword.
     cake_mhc_train_backward_finish
     cake_mhc_train_prepare
     cake_mhc_train_finish
-    cake_mhc_train_head_forward
-    cake_mhc_train_head_backward
-    cake_mhc_train_head

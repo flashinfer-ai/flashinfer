@@ -66,6 +66,17 @@ without launching.  Calls of different hidden sizes may be mixed in one
 process.  Every behaviour
 switch is a keyword argument with its default in the docstring.
 
+Names and mode: this is the deterministic package.  Every public name of this
+module and of its backends (``flashinfer.cake_mhc_det_train_backend``,
+``flashinfer.cake_mhc_det_train_head_backend``) carries ``det``, except the
+generic ``ARCHES``, ``SUPPORTED_COMPUTE_CAPABILITIES``,
+``TENSOR_ALIGNMENT_BYTES``, ``WORKSPACE_ALIGNMENT_BYTES``, ``route_key`` and
+``route_modules``.  FlashInfer has no other spelling of these objects
+(0.7.3's ``flashinfer.cake_mhc_train`` names are removed, with no alias).  The
+entry points take no ``deterministic`` keyword and run unchanged under
+``torch.use_deterministic_algorithms(True)``.  The non-deterministic mode is
+``flashinfer.experimental.cake.cake_mhc_train``.
+
 Usage::
 
     U, stats = cake_mhc_det_train_forward_prepare(X, fn, scale, base)
