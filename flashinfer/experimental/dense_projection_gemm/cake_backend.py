@@ -73,7 +73,7 @@ Every compute entry point takes the keyword-only argument ``deterministic: bool 
   :data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another plan of
   those programs: the single-CTA program, every tile's whole K in one CTA.
 * Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K
-  program at three or more splits, a K2 stream-K partition that gives an element more than two partials -- raises
+  program of CTA pairs at three or more splits, a K2 stream-K partition that gives an element more than two partials -- raises
   PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError``, or with
   ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order launches (every other route)
   do not alert.  The PyTorch setting never changes which program a call runs.
@@ -232,8 +232,8 @@ def _warning_stacklevel() -> int:
 
 def _alert_order_varying(launch: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, raised right before this package
-    launches ``launch``, a program whose result can vary run to run (the K1 split-K program at three or more splits,
-    a K2 stream-K partition that gives an element more than two partials), while PyTorch's deterministic algorithms
+    launches ``launch``, a program whose result can vary run to run (the K1 split-K program of CTA pairs at three or
+    more splits, a K2 stream-K partition that gives an element more than two partials), while PyTorch's deterministic algorithms
     are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
     warn_only=True)``, after which the launch runs; nothing otherwise.  The alert of PyTorch's own operators (PyTorch
     exposes no public Python entry for it).  Fixed-order launches do not call it, and it never changes the program
@@ -1308,8 +1308,9 @@ class AtomicGemmPlan:
     @property
     def reproducible(self) -> bool:
         """Whether the result repeats bit for bit: one split stores whole tiles (its chains added in order), two add
-        ``own + other`` (one add of two values); three or more add the partials in the order the splits finish."""
-        return self.splits <= 2
+        ``own + other`` (one add of two values), the cluster program (``dsm``) adds its splits in cluster-rank order;
+        three or more splits of the CTA-pair program add the partials in the order the splits finish."""
+        return self.dsm or self.splits <= 2
 
     @property
     def grid(self) -> tuple[int, int, int]:

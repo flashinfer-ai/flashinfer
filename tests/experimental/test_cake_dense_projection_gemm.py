@@ -7657,6 +7657,38 @@ def test_a_fixed_order_prepared_launch_does_not_alert(
     with _no_warnings():
         assert launch.launch() is launch.out
     assert all(len(r.calls) == 1 for r in recorders)
+    if k == "k1":
+        # the cluster program at three splits: its splits are added in cluster-rank order
+        launch.plan = dataclasses.replace(launch.plan, splits=3, dsm=True)
+        assert launch.plan.reproducible
+        with _no_warnings():
+            assert launch.launch() is launch.out
+        assert all(len(r.calls) == 2 for r in recorders)
+
+
+def test_the_cluster_program_does_not_alert(monkeypatch, torch_determinism):
+    """The shipped cluster row ``4096 -> 64`` FP32 at 2048 tokens on a 152-SM ``sm_100a`` part (three splits, added in
+    cluster-rank order) runs without an alert under ``torch.use_deterministic_algorithms(True)``: the planning call,
+    the call from the cached key and the prepared launch (CPU binding, nothing loaded or launched)."""
+    entry_fn = _cpu_k1_launches(monkeypatch, "sm_100a")
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16, T = torch.bfloat16, 2048
+    X, G = torch.empty(T, 4096, dtype=bf16), torch.empty(T, 64, dtype=bf16)
+    out_w = torch.empty(64, 4096)
+    torch.use_deterministic_algorithms(True)
+    with _no_warnings():
+        for _ in range(2):
+            assert (
+                cake_backend.projection_wgrad(G, X, out_w, deterministic=False) is out_w
+            )
+        prepared = cake_backend.prepare_projection_wgrad(
+            G, X, out_w, deterministic=False
+        )
+        assert prepared.launch() is out_w
+    ((_, atomic),) = cake_backend._K1_ATOMIC_CACHE.items()
+    assert atomic.plan.dsm and atomic.plan.splits == 3 and not atomic.order_varying
+    assert prepared.plan.dsm and prepared.plan.reproducible
+    assert len(entry_fn.calls) == 3
 
 
 @pytest.mark.parametrize("splits", [2, 3])
