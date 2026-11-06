@@ -117,7 +117,14 @@ def _worker(rank, args):
     epr = experts // ep
     generator = torch.Generator(device="cuda").manual_seed(7919 + rank)
     buffer = MegaMoESymmBuffer(
-        dist.group.WORLD, experts, args.capacity, topk, h, ih, fast_math=True
+        dist.group.WORLD,
+        experts,
+        args.capacity,
+        topk,
+        h,
+        ih,
+        fast_math=True,
+        transport=args.transport,
     )
     assert buffer.prewarm() == 1
     gs1 = torch.linspace(0.73, 1.37, epr, device="cuda")
@@ -167,6 +174,7 @@ def _worker(rank, args):
             cumulative_local_expert_recv_stats=stats,
             l1_global_scales=gs1,
             l2_global_scales=gs2,
+            sm120_tokens_per_item=args.tokens_per_item,
         )
         for repetition in range(args.repeats):
             mxfp4_mega_moe(y, w1, w2, buffer, **kwargs)
@@ -226,6 +234,8 @@ def _args(**overrides):
         tokens=[1, 8, 20, 64, 128],
         routing="random",
         repeats=2,
+        transport="p2p",
+        tokens_per_item=None,
     )
     args.update(overrides)
     return argparse.Namespace(**args)
@@ -283,6 +293,38 @@ def test_megamoe_mxfp4_sm120_model_shapes(ep, hidden, intermediate, experts, top
     )
 
 
+@pytest.mark.parametrize("tokens_per_item", [8, 16, 24, 32])
+def test_megamoe_mxfp4_sm120_tokens_per_item(tokens_per_item):
+    """Every work-item width, forced, at token counts below and above it."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    _run(_args(tokens=[1, 20, 64, 128], tokens_per_item=tokens_per_item))
+
+
+# The NIC transport needs NCCL 2.30.7 with GIN on the host's network; opt in where it exists.
+_NIC = os.environ.get("FLASHINFER_TEST_MEGAMOE_SM120_NIC") == "1"
+
+
+@pytest.mark.parametrize("ep", [2, 4, 8])
+@pytest.mark.parametrize("routing", ["random", "hot", "empty", "invalid"])
+def test_megamoe_mxfp4_sm120_nic_transport(ep, routing):
+    """Every pair over NCCL GIN (transport="nic"): same results as P2P."""
+    if not _NIC:
+        pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
+    if not _sm120_gpus(ep):
+        pytest.skip(f"requires {ep} SM120 GPUs")
+    _run(_args(ep=ep, routing=routing, repeats=3, transport="nic"))
+
+
+def test_megamoe_mxfp4_sm120_auto_transport():
+    """transport="auto": P2P where NCCL maps the pair, GIN elsewhere."""
+    if not _NIC:
+        pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
+    if not _sm120_gpus(8):
+        pytest.skip("requires 8 SM120 GPUs")
+    _run(_args(ep=8, hidden=4096, intermediate=2048, transport="auto"))
+
+
 def test_megamoe_mxfp4_sm120_production_shape():
     """DeepSeek-V4-Flash routed experts (H4096, I2048, 256 experts, top-6), EP4, up to the 128 tokens/rank cap."""
     if not _sm120_gpus(4):
@@ -303,4 +345,8 @@ if __name__ == "__main__":
         "--routing", choices=["random", "hot", "empty", "invalid"], default="random"
     )
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--transport", choices=["p2p", "nic", "auto"], default="p2p")
+    parser.add_argument(
+        "--tokens-per-item", type=int, choices=[8, 16, 24, 32], default=None
+    )
     _run(parser.parse_args())
