@@ -178,6 +178,18 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    "CakeCausalConv1dDetFunction": (
+        ".cake_causal_conv1d_det_train",
+        "CakeCausalConv1dDetFunction",
+    ),
+    "cake_causal_conv1d_det_train_backward_workspace_bytes": (
+        ".cake_causal_conv1d_det_train",
+        "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    ),
+    "cake_causal_conv1d_det_train_forward_workspace_bytes": (
+        ".cake_causal_conv1d_det_train",
+        "cake_causal_conv1d_det_train_forward_workspace_bytes",
+    ),
 }
 
 
@@ -347,9 +359,9 @@ from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
 from . import (
     cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
 )
-from .cake_causal_conv1d_det_train import (
-    CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,
-)
+
+# CakeCausalConv1dDetFunction and the workspace-bytes helpers are served by
+# ``_LAZY_EXPORTS`` above: they live in the backend package under flashinfer/experimental/cake/.
 from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det as cake_causal_conv1d_det,
 )
@@ -357,13 +369,7 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_backward as cake_causal_conv1d_det_train_backward,
 )
 from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_det_train_backward_workspace_bytes,
-)
-from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward as cake_causal_conv1d_det_train_forward,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
 )
 
 from .cake_mhc_det_train import (

@@ -69,7 +69,7 @@ on the context object's identity (the entry pins the context) and, inside it,
 on ``(kind, S, C, device, cu_seqlens_local_cpu)`` -- host integers of the
 context and the shapes of the call, never a tensor's contents; it holds at most
 ``HOST_CACHE_MAX = 64`` contexts (the oldest dropped) and
-:func:`host_cache_clear` empties it; ``_FFI_DEVICES`` caches the FFI device per
+:func:`cake_causal_conv1d_det_train_kcp_host_cache_clear` empties it; ``_FFI_DEVICES`` caches the FFI device per
 device index.  The operand checks, the gather, the exchange, its wait and the
 kernel launches run as before with the same arguments on the same stream, so
 no bit changes; a replayed graph (``graph="replay"``) contains no host work.
@@ -84,7 +84,7 @@ fixed-order ``dweight`` reduction; a cooperative grid starts only when all its
 CTAs fit at once, so it waits for every kernel of another stream that occupies
 an SM.  ``cooperative=False`` runs the ``kcp_bwd_split`` record: the same token
 loop as an ordinary launch ``ctas_per_sm x (SM count - reserve_sms)`` CTAs wide
-(:func:`launch_grid`), writing per-CTA partial rows, then the record's ``reduce``
+(:func:`_launch_grid`), writing per-CTA partial rows, then the record's ``reduce``
 program (the zero-history package's fixed-order reduction, programmatically
 dependent on the main program) on the same stream.  It starts beside one
 small-carveout kernel of another stream per reserved SM; more such kernels
@@ -96,7 +96,7 @@ The form is fixed per call: every rank of a group may choose it on its own
 (it changes no collective).
 
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
-#7818): with ``recompute_handle=`` (:class:`RecomputeHandleDetKcp`, or any object
+#7818): with ``recompute_handle=`` (:class:`CakeCausalConv1dDetKcpRecomputeHandle`, or any object
 with an ``entries`` dict) the original forward exchanges as always and stores
 its history pool ``hist`` (the saved set's own tensor, key ``"conv"``) in the
 handle; torch's recompute of that forward inside the backward binds it and
@@ -107,7 +107,7 @@ rows).  The forward exchange is a collective: every rank of ``ctx.group`` passes
 a handle for the same call or none, created at the same checkpoint nesting
 level (no check is made; a mismatch hangs or corrupts data).
 
-Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d_det_multi_kcp(xs, weights, ctx)`` runs
+Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d_det_kcp_multi(xs, weights, ctx)`` runs
 the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per direction
 instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single`` and are copied out into
 each tensor's own contiguous pool after the wait, and each tensor then runs the single call's kernels with the
@@ -154,13 +154,13 @@ TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate
 GRAPH_MODES = (
     "off",
     "replay",
-)  # graph replay: keyed CUDA-graph capture / replay of the halo calls; public keyword graph= since an earlier revision
+)  # graph replay: keyed CUDA-graph capture / replay of the halo calls (keyword graph= or the test knob)
 GRAPH_DEFAULT = (
     "off"  # shipped: the eager path; the public keyword graph="replay" opts in per call
 )
 
 
-def launch_grid(
+def _launch_grid(
     record: dict[str, Any],
     *,
     device_index: int,
@@ -340,7 +340,7 @@ def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor,
 #     no collective; the entry stays (``retain_graph`` / a second backward replays it again);
 #   * an entry outside the backward -> raise (a handle reused across micro-steps or for a second convolution).
 # Graph replay (keyword or knob) and a forward inside a CUDA-graph capture are refused with a handle, in the
-# autograd Function itself (``_handle_refusals``), so ``CakeCausalConv1dDetFunctionKcp.apply`` refuses like the wrapper.
+# autograd Function itself (``_handle_refusals``), so ``CakeCausalConv1dDetKcpFunction.apply`` refuses like the wrapper.
 # The ranks are not checked against each other: the forward exchange is a collective, so every rank of the group
 # must take the same branch (all with a handle at the same nesting level, or all without).
 
@@ -350,7 +350,7 @@ _GRAPH_TASK_ID_BINDING = getattr(torch._C, "_current_graph_task_id", None)
 _GRAPH_TASK_ID_USABLE: Optional[bool] = None  # None = not checked yet
 
 
-class RecomputeHandleDetKcp:
+class CakeCausalConv1dDetKcpRecomputeHandle:
     """The boundary tensors of one checkpointed call, carried from its original forward to torch's recompute of that
     forward, so the recompute runs without cross-rank communication.
 
@@ -360,7 +360,7 @@ class RecomputeHandleDetKcp:
         def layer(x, weight, handle):
             return cake_causal_conv1d_det_kcp(x, weight, ctx, recompute_handle=handle)
 
-        y = torch.utils.checkpoint.checkpoint(layer, x, w, RecomputeHandleDetKcp(), use_reentrant=False)
+        y = torch.utils.checkpoint.checkpoint(layer, x, w, CakeCausalConv1dDetKcpRecomputeHandle(), use_reentrant=False)
 
     ``entries`` maps an operation key to that operation's entry: ``"conv"`` is this package's (the forward's history
     pool ``hist``, the very tensor the saved set holds); other packages that accept a handle with an ``entries`` dict
@@ -430,7 +430,7 @@ def _handle_refusals(graph: Optional[str], handle: Any) -> None:
         )
     if not isinstance(getattr(handle, "entries", None), dict):
         raise TypeError(
-            f"recompute_handle must carry an 'entries' dict (RecomputeHandleDetKcp), got {type(handle).__name__}"
+            f"recompute_handle must carry an 'entries' dict (CakeCausalConv1dDetKcpRecomputeHandle), got {type(handle).__name__}"
         )
 
 
@@ -440,7 +440,7 @@ def _handle_lookup(handle: Any) -> Optional[dict[str, Any]]:
     entries = getattr(handle, "entries", None)
     if not isinstance(entries, dict):
         raise TypeError(
-            f"recompute_handle must carry an 'entries' dict (RecomputeHandleDetKcp), got {type(handle).__name__}"
+            f"recompute_handle must carry an 'entries' dict (CakeCausalConv1dDetKcpRecomputeHandle), got {type(handle).__name__}"
         )
     in_backward = _kcp_in_backward()
     entry = entries.get(HANDLE_KEY)
@@ -449,7 +449,7 @@ def _handle_lookup(handle: Any) -> Optional[dict[str, Any]]:
     if not in_backward:
         raise RuntimeError(
             "recompute_handle: the handle already holds a 'conv' entry outside the backward -- a handle serves one "
-            "convolution call of one micro-step; create a new RecomputeHandleDetKcp per call and micro-step"
+            "convolution call of one micro-step; create a new CakeCausalConv1dDetKcpRecomputeHandle per call and micro-step"
         )
     return entry
 
@@ -464,7 +464,7 @@ def _handle_hist(
         raise ValueError("recompute_handle: the 'conv' entry holds no hist tensor")
     if entry.get("ctx") is not ctx:
         raise ValueError(
-            "recompute_handle: the 'conv' entry belongs to another ContextDetKcp"
+            "recompute_handle: the 'conv' entry belongs to another KCP context"
         )
     S = int(x_local.shape[-2]) if x_local.ndim >= 2 else -1
     C = int(x_local.shape[-1]) if x_local.ndim >= 1 else -1
@@ -496,7 +496,7 @@ def _handle_hist(
 # The public keyword ``graph="replay"`` of :func:`cake_causal_conv1d_det_kcp` and of the forward / backward below (shipped
 # ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private ``_set_test_knobs({"graph": "replay"})`` (accepted
 # only with ``CAKE_KCP_TEST_KNOBS=1``; a keyword contradicting an active knob is a ``ValueError``) -- makes
-# :func:`cake_causal_conv1d_det_forward_kcp` / :func:`cake_causal_conv1d_det_backward_kcp` run their first call of a
+# :func:`cake_causal_conv1d_det_train_kcp_forward` / :func:`cake_causal_conv1d_det_train_kcp_backward` run their first call of a
 # validity key (kind, the context object, its world size, and the shape / stride / dtype / data pointer of every
 # operand and caller-owned output) eagerly, capture the second call into a ``torch.cuda.CUDAGraph`` (replayed once)
 # and replay the graph on every later call of the key: the halo gather, the ``all_to_all_single``, its wait and the
@@ -506,7 +506,7 @@ def _handle_hist(
 # pointer-stable and consume the outputs before the next call of the same layer.  This module keeps its own cache
 # (no import of the KDA host module); ``GRAPH_STATS`` counts the events and ``LAST_CALL[kind]`` says how the last
 # forward / backward ran (keyword or knob).  Every captured graph keeps its fresh tensors in a private pool (one per
-# cached key; at most GRAPH_CACHE_MAX keys, the oldest dropped first); ``graph_cache_clear()`` releases them and must run
+# cached key; at most GRAPH_CACHE_MAX keys, the oldest dropped first); ``cake_causal_conv1d_det_train_kcp_graph_cache_clear()`` releases them and must run
 # before ``torch.distributed.destroy_process_group()`` (a graph holding the NCCL collective blocks ``ncclCommDestroy``).
 
 # Trimmed host path; shipped default:
@@ -544,7 +544,7 @@ def _host_cache_entry(ctx: Any, key: tuple) -> dict[str, Any]:
     return entry
 
 
-def host_cache_clear() -> int:
+def cake_causal_conv1d_det_train_kcp_host_cache_clear() -> int:
     """Drop the trimmed host path's per-context cache; returns the number of contexts dropped."""
     n = len(_HOST_CACHE)
     _HOST_CACHE.clear()
@@ -754,7 +754,7 @@ def _graph_entry(
     return e
 
 
-def graph_cache_clear() -> int:
+def cake_causal_conv1d_det_train_kcp_graph_cache_clear() -> int:
     """Drop every cached graph with its static buffers and private memory pool; returns the number of entries dropped.
 
     A graph that captured a NCCL collective (the halo ``all_to_all_single`` here) must be destroyed before the process group
@@ -814,7 +814,7 @@ def _graph_run(
     return result
 
 
-def cake_causal_conv1d_det_forward_kcp(
+def cake_causal_conv1d_det_train_kcp_forward(
     x_local: torch.Tensor,
     weight: torch.Tensor,
     ctx: Any,
@@ -825,13 +825,13 @@ def cake_causal_conv1d_det_forward_kcp(
     r"""The KCP forward: ``y`` of the rank's fragments, and the history pool ``hist`` it used (saved for the backward).
 
     ``x_local`` BF16 ``[T_r, C]`` (or ``[1, T_r, C]``) contiguous, the rank's fragments back to back in the order of
-    ``ctx.cu_seqlens_local``; ``weight`` FP32 ``[C, 4]``; ``ctx`` a ``ContextDetKcp`` (its halo plan ``ctx.halo``, the
+    ``ctx.cu_seqlens_local``; ``weight`` FP32 ``[C, 4]``; ``ctx`` a KCP context (its halo plan ``ctx.halo``, the
     device tables ``ctx.halo_tables`` and the process group ``ctx.group``).  Every rank of the group calls this
     function once per layer, in the same order: the forward halo exchange is a collective (a rank without tokens
     joins it with empty splits and returns empty outputs).  ``hist`` is a fresh ``[n_hist_rows, C]`` BF16 tensor
     (``[1, C]`` when the rank receives no row).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
     ``"replay"``): keyed CUDA-graph capture / replay of this call (the graph-replay option; see the section comment
-    above: pointer-stable operands, private pools, eager fallback, :func:`graph_cache_clear`).
+    above: pointer-stable operands, private pools, eager fallback, :func:`cake_causal_conv1d_det_train_kcp_graph_cache_clear`).
     """
 
     mode = _graph_mode(graph)
@@ -852,7 +852,7 @@ def _kcp_forward(
     out: Optional[torch.Tensor] = None,
     _hist: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The forward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_det_forward_kcp`.  ``_hist``:
+    """The forward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_det_train_kcp_forward`.  ``_hist``:
     the history pool a recompute handle stored (checked by :func:`_handle_hist`): no gather, no exchange, no wait;
     the kernel launch is the same."""
 
@@ -898,7 +898,7 @@ def _kcp_forward(
     device_index = _device_index(device)
     record = _loader.MODULES[name]
     scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    if scalars["n_ch_tiles"] > launch_grid(record, device_index=device_index)[0]:
+    if scalars["n_ch_tiles"] > _launch_grid(record, device_index=device_index)[0]:
         raise ValueError(
             f"C={C} spans more channel tiles than the forward's grid on this device holds"
         )
@@ -966,7 +966,7 @@ def _fwd_host(
             scalars = plan(
                 S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
             )
-            grid = launch_grid(record, device_index=device_index)
+            grid = _launch_grid(record, device_index=device_index)
             if scalars["n_ch_tiles"] > grid[0]:
                 raise ValueError(
                     f"C={C} spans more channel tiles than the forward's grid on this device holds"
@@ -1048,7 +1048,7 @@ def _kcp_forward_trim(
     return y, hist
 
 
-def cake_causal_conv1d_det_backward_kcp(
+def cake_causal_conv1d_det_train_kcp_backward(
     x_local: torch.Tensor,
     weight: torch.Tensor,
     ctx: Any,
@@ -1106,7 +1106,7 @@ def _kcp_backward(
     dweight: Optional[torch.Tensor] = None,
     cooperative: bool = COOPERATIVE_DEFAULT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The backward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_det_backward_kcp`."""
+    """The backward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_det_train_kcp_backward`."""
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
@@ -1206,7 +1206,7 @@ def _kcp_backward(
     names = selected_modules(arch, _bwd_kind(cooperative), C=C, S=S)
     record = _loader.MODULES[names[0]]
     scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    grid_x = launch_grid(record, device_index=device_index)[0]
+    grid_x = _launch_grid(record, device_index=device_index)[0]
     if scalars["n_ch_tiles"] > grid_x:
         raise ValueError(
             f"C={C} spans more channel tiles than the backward's grid on this device holds"
@@ -1232,12 +1232,12 @@ def _kcp_backward(
     if work is not None:
         work.wait()
     for name in names:
-        # the grid of :func:`launch_grid` (less the record's reserved SMs): the one the partial rows are sized for
+        # the grid of :func:`_launch_grid` (less the record's reserved SMs): the one the partial rows are sized for
         run_module(
             name,
             values,
             device_index=device_index,
-            grid=launch_grid(_loader.MODULES[name], device_index=device_index),
+            grid=_launch_grid(_loader.MODULES[name], device_index=device_index),
         )
     reduce = _reduce_plan(record, C, grid_x, device_index)
     if reduce is not None:
@@ -1347,7 +1347,7 @@ def _bwd_host(
             scalars = plan(
                 S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
             )
-            grid_x = launch_grid(record, device_index=device_index)[0]
+            grid_x = _launch_grid(record, device_index=device_index)[0]
             if scalars["n_ch_tiles"] > grid_x:
                 raise ValueError(
                     f"C={C} spans more channel tiles than the backward's grid on this device holds"
@@ -1358,7 +1358,7 @@ def _bwd_host(
             e["launches"] = tuple(
                 _launch_plan(
                     name,
-                    launch_grid(_loader.MODULES[name], device_index=device_index),
+                    _launch_grid(_loader.MODULES[name], device_index=device_index),
                     device_index,
                 )
                 for name in names
@@ -1500,20 +1500,20 @@ def _kcp_backward_trim(
     return dx_out, dw_out
 
 
-class CakeCausalConv1dDetFunctionKcp(torch.autograd.Function):
+class CakeCausalConv1dDetKcpFunction(torch.autograd.Function):
     """Autograd wrapper: the forward saves ``(x_local, weight)`` and the history pool ``hist`` (no second exchange in
     the backward); the backward runs the head program, the backward halo exchange and the main backward program.
-    ``handle``: a recompute handle (see :class:`RecomputeHandleDetKcp`): the original forward stores ``hist`` in it, the
+    ``handle``: a recompute handle (see :class:`CakeCausalConv1dDetKcpRecomputeHandle`): the original forward stores ``hist`` in it, the
     recompute binds it and exchanges nothing; the saved set is the same three tensors either way.  A handle is
     refused with graph replay (keyword or knob) and inside a CUDA-graph capture.  ``cooperative``: the main backward
-    program's launch form (a bool, see :func:`cake_causal_conv1d_det_backward_kcp`)."""
+    program's launch form (a bool, see :func:`cake_causal_conv1d_det_train_kcp_backward`)."""
 
     @staticmethod
     def forward(
         fn_ctx, x_local, weight, ctx, graph=None, handle=None, cooperative=None
     ):
         if handle is None:
-            y, hist = cake_causal_conv1d_det_forward_kcp(
+            y, hist = cake_causal_conv1d_det_train_kcp_forward(
                 x_local, weight, ctx, graph=graph
             )
         else:
@@ -1546,7 +1546,7 @@ class CakeCausalConv1dDetFunctionKcp(torch.autograd.Function):
         if grad_y is None:
             grad_y = torch.zeros_like(x_local)
         dy = grad_y.to(torch.bfloat16).contiguous()
-        dx, dweight = cake_causal_conv1d_det_backward_kcp(
+        dx, dweight = cake_causal_conv1d_det_train_kcp_backward(
             x_local,
             weight,
             fn_ctx.kcp,
@@ -1576,19 +1576,19 @@ def cake_causal_conv1d_det_kcp(
         order of ``ctx.cu_seqlens_local``.
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps; ``weight[c, 3]`` multiplies the current token.
-    ctx : ContextDetKcp
-        The rank's context (``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``): fragment table, halo
+    ctx : KCP context
+        The rank's KCP context (built by the calling family's KCP context builder): fragment table, halo
         plan, process group.  Every rank of the group calls this function once per layer, in the same order.
     graph : str, optional
         ``None`` (the shipped default ``GRAPH_DEFAULT`` = ``"off"``, the eager path) or ``"replay"``: keyed CUDA-graph
         capture / replay of this call.  The first call of a validity key (this
         context, its world size, and the shape / stride / dtype / data pointer of ``x_local`` and ``weight``) runs
         eagerly, the second is captured, every later one replays the graph (bitwise the eager result).  Requirements:
-        pointer-stable operands and the same ``ContextDetKcp`` per layer, outputs consumed before the next call of the
+        pointer-stable operands and the same KCP context per layer, outputs consumed before the next call of the
         same layer (a replay overwrites the graph's static tensors); any other key runs eagerly (``GRAPH_STATS``,
         ``LAST_CALL``).  Each cached key pins a private memory pool (at most ``GRAPH_CACHE_MAX`` keys); call
-        :func:`graph_cache_clear` before ``torch.distributed.destroy_process_group()``.
-    recompute_handle : RecomputeHandleDetKcp, optional
+        :func:`cake_causal_conv1d_det_train_kcp_graph_cache_clear` before ``torch.distributed.destroy_process_group()``.
+    recompute_handle : CakeCausalConv1dDetKcpRecomputeHandle, optional
         ``None`` (default): unchanged.  A handle (any object with an ``entries`` dict): the checkpoint recompute of
         this call exchanges nothing -- the original forward stores its history pool under ``"conv"`` and torch's
         recompute inside the backward binds it (bitwise the exchanging recompute); the backward still exchanges.
@@ -1622,7 +1622,7 @@ def cake_causal_conv1d_det_kcp(
     if recompute_handle is not None:
         _handle_refusals(graph, recompute_handle)
     # Always six inputs: the backward returns six gradients.
-    return CakeCausalConv1dDetFunctionKcp.apply(
+    return CakeCausalConv1dDetKcpFunction.apply(
         x_local, weight, ctx, graph, recompute_handle, coop
     )
 
@@ -1678,7 +1678,7 @@ def _unpack(recv: torch.Tensor, widths: list[int]) -> list[torch.Tensor]:
     return blocks
 
 
-def cake_causal_conv1d_det_multi_forward_kcp(
+def cake_causal_conv1d_det_train_kcp_multi_forward(
     xs: Any,
     weights: Any,
     ctx: Any,
@@ -1687,13 +1687,13 @@ def cake_causal_conv1d_det_multi_forward_kcp(
     graph: Optional[str] = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     r"""The KCP forward of several convolutions of one layer with one halo exchange: ``(ys, hists)``, bitwise
-    ``cake_causal_conv1d_det_forward_kcp(xs[i], weights[i], ctx)`` per tensor.
+    ``cake_causal_conv1d_det_train_kcp_forward(xs[i], weights[i], ctx)`` per tensor.
 
     ``xs`` BF16 ``[T_r, C_i]`` (or ``[1, T_r, C_i]``) contiguous tensors of the rank's fragments (the channel counts
     may differ); ``weights`` FP32 ``[C_i, 4]``; ``outs`` optional preallocated outputs.  Every rank of ``ctx.group``
     calls this function once per layer, in the same order, with the same number of tensors and the same channel
     counts: the one forward exchange is a collective.  ``hists[i]`` is a fresh contiguous ``[n_hist_rows, C_i]``
-    BF16 pool (the saved tensor of tensor ``i``).  ``graph`` as in :func:`cake_causal_conv1d_det_forward_kcp` (the
+    BF16 pool (the saved tensor of tensor ``i``).  ``graph`` as in :func:`cake_causal_conv1d_det_train_kcp_forward` (the
     validity key holds every operand).
     """
 
@@ -1762,7 +1762,7 @@ def _kcp_forward_multi(
     return ys, tuple(hists)
 
 
-def cake_causal_conv1d_det_multi_backward_kcp(
+def cake_causal_conv1d_det_train_kcp_multi_backward(
     xs: Any,
     weights: Any,
     ctx: Any,
@@ -1775,13 +1775,13 @@ def cake_causal_conv1d_det_multi_backward_kcp(
     cooperative: Optional[bool] = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     r"""The KCP backward of several convolutions of one layer with one halo exchange: ``(dxs, dweights)``, bitwise
-    ``cake_causal_conv1d_det_backward_kcp(xs[i], weights[i], ctx, dys[i], hists[i])`` per tensor.
+    ``cake_causal_conv1d_det_train_kcp_backward(xs[i], weights[i], ctx, dys[i], hists[i])`` per tensor.
 
     The head programs of every tensor run first, their send rows travel packed in one exchange, and after the wait
     each tensor's received rows are copied out and folded by that tensor's main backward programs (own partial
     workspace, fixed order).  ``hists`` are the forward's pools.  Every rank calls this function once per layer, in
     the same order.  ``graph`` and ``cooperative`` (one launch form for every tensor) as in
-    :func:`cake_causal_conv1d_det_backward_kcp`.
+    :func:`cake_causal_conv1d_det_train_kcp_backward`.
     """
 
     xs, weights, _ = _multi_operands(xs, weights, None)
@@ -1836,7 +1836,7 @@ def _kcp_backward_multi(
     cooperative: bool = COOPERATIVE_DEFAULT,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """The multi backward's host flow (eagerly or inside a capture): see
-    :func:`cake_causal_conv1d_det_multi_backward_kcp`."""
+    :func:`cake_causal_conv1d_det_train_kcp_multi_backward`."""
 
     device = _require_tensor(xs[0], "xs[0]").device
     _wait_ready(ctx)
@@ -1902,7 +1902,7 @@ def _handle_hists(
         )
     if entry.get("ctx") is not ctx:
         raise ValueError(
-            "recompute_handle: the 'conv' entry belongs to another ContextDetKcp"
+            "recompute_handle: the 'conv' entry belongs to another KCP context"
         )
     return tuple(
         _handle_hist(
@@ -1921,10 +1921,10 @@ def _handle_hists(
     )
 
 
-class CakeCausalConv1dDetMultiFunctionKcp(torch.autograd.Function):
+class CakeCausalConv1dDetKcpMultiFunction(torch.autograd.Function):
     """Autograd wrapper of several convolutions with one halo exchange per direction: ``apply(ctx, graph, handle,
     n, *xs, *weights[, cooperative])`` returns the ``n`` outputs; the forward saves ``(*xs, *weights, *hists)``; the
-    backward runs :func:`cake_causal_conv1d_det_multi_backward_kcp` (the optional trailing ``cooperative``: its launch
+    backward runs :func:`cake_causal_conv1d_det_train_kcp_multi_backward` (the optional trailing ``cooperative``: its launch
     form, ``None`` or a bool).  ``handle``: one recompute handle for the call, whose ``"conv"``
     entry holds the ``n`` pools (the saved set's own tensors): the recompute binds them and exchanges nothing.
     Refused with graph replay (keyword or knob) and inside a CUDA-graph capture, like the single call."""
@@ -1938,7 +1938,7 @@ class CakeCausalConv1dDetMultiFunctionKcp(torch.autograd.Function):
         cooperative = tensors[2 * n] if len(tensors) == 2 * n + 1 else None
         xs, weights = list(tensors[:n]), list(tensors[n : 2 * n])
         if handle is None:
-            ys, hists = cake_causal_conv1d_det_multi_forward_kcp(
+            ys, hists = cake_causal_conv1d_det_train_kcp_multi_forward(
                 xs, weights, ctx, graph=graph
             )
         else:
@@ -1978,7 +1978,7 @@ class CakeCausalConv1dDetMultiFunctionKcp(torch.autograd.Function):
             (torch.zeros_like(x) if g is None else g).to(torch.bfloat16).contiguous()
             for g, x in zip(grad_ys, xs, strict=True)
         ]
-        dxs, dweights = cake_causal_conv1d_det_multi_backward_kcp(
+        dxs, dweights = cake_causal_conv1d_det_train_kcp_multi_backward(
             xs,
             weights,
             fn_ctx.kcp,
@@ -1991,7 +1991,7 @@ class CakeCausalConv1dDetMultiFunctionKcp(torch.autograd.Function):
         return (None, None, None, None, *dxs, *dweights, None)
 
 
-def cake_causal_conv1d_det_multi_kcp(
+def cake_causal_conv1d_det_kcp_multi(
     xs: Any,
     weights: Any,
     ctx: Any,
@@ -2014,14 +2014,14 @@ def cake_causal_conv1d_det_multi_kcp(
         order of ``ctx.cu_seqlens_local``; the channel counts may differ.
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
-    ctx : ContextDetKcp
+    ctx : KCP context
         The rank's context, as in :func:`cake_causal_conv1d_det_kcp`.  Every rank of the group calls this function once
         per layer, in the same order, with the same tensor count and channel counts.  The ranks are not compared
         (that would cost a collective): a different count, channel count or order hangs the exchange or silently
         corrupts the history rows, as a mismatch of the single entry's per-rank contract does.
     graph : str, optional
         As in :func:`cake_causal_conv1d_det_kcp` (keyed CUDA-graph capture / replay; the key holds every operand).
-    recompute_handle : RecomputeHandleDetKcp, optional
+    recompute_handle : CakeCausalConv1dDetKcpRecomputeHandle, optional
         ``None`` (default): unchanged.  One handle for the whole call: the original forward stores the ``n`` history
         pools under ``"conv"``, torch's recompute inside the backward binds them and exchanges nothing; the backward
         still exchanges once.  Same rules as :func:`cake_causal_conv1d_det_kcp` (one handle per call and micro-step,
@@ -2043,7 +2043,7 @@ def cake_causal_conv1d_det_multi_kcp(
     xs, weights, _ = _multi_operands(xs, weights, None)
     if recompute_handle is not None:
         _handle_refusals(graph, recompute_handle)
-    return CakeCausalConv1dDetMultiFunctionKcp.apply(
+    return CakeCausalConv1dDetKcpMultiFunction.apply(
         ctx, graph, recompute_handle, len(xs), *xs, *weights, coop
     )
 
@@ -2054,15 +2054,16 @@ __all__ = [
     "GRAPH_DEFAULT",
     "GRAPH_STATS",
     "HANDLE_KEY",
-    "RecomputeHandleDetKcp",
+    "CakeCausalConv1dDetKcpRecomputeHandle",
     "LAST_CALL",
-    "graph_cache_clear",
-    "CakeCausalConv1dDetFunctionKcp",
+    "cake_causal_conv1d_det_train_kcp_graph_cache_clear",
+    "cake_causal_conv1d_det_train_kcp_host_cache_clear",
+    "CakeCausalConv1dDetKcpFunction",
     "cake_causal_conv1d_det_kcp",
-    "cake_causal_conv1d_det_backward_kcp",
-    "cake_causal_conv1d_det_forward_kcp",
-    "CakeCausalConv1dDetMultiFunctionKcp",
-    "cake_causal_conv1d_det_multi_kcp",
-    "cake_causal_conv1d_det_multi_backward_kcp",
-    "cake_causal_conv1d_det_multi_forward_kcp",
+    "cake_causal_conv1d_det_train_kcp_backward",
+    "cake_causal_conv1d_det_train_kcp_forward",
+    "CakeCausalConv1dDetKcpMultiFunction",
+    "cake_causal_conv1d_det_kcp_multi",
+    "cake_causal_conv1d_det_train_kcp_multi_backward",
+    "cake_causal_conv1d_det_train_kcp_multi_forward",
 ]

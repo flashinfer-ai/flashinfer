@@ -474,7 +474,7 @@ MODULES: dict[str, dict[str, Any]] = {
         # ``reduce`` program sums the partial rows in the fixed order.  3 CTAs
         # per SM (168 registers at 128 threads, the launch bound); the grid is
         # the co-resident CTA count less the ``reserve_sms`` SMs
-        # (:func:`.kcp.launch_grid`).  The fallback program of the route (no
+        # (:func:`.kcp._launch_grid`).  The fallback program of the route (no
         # ``select_rule``).  Besides ``dx``
         # and ``dw`` it writes the predecessors' tail derivatives
         # ``dpre_tail`` (FP32 ``[n_tail_rows, C]``) at the rows

@@ -148,8 +148,10 @@ the halo collective of the KDA step's context.
     :toctree: ../generated
 
     cake_causal_conv1d_det_kcp
-    cake_causal_conv1d_det_multi_kcp
-    RecomputeHandleDetKcp
+    cake_causal_conv1d_det_kcp_multi
+    CakeCausalConv1dDetKcpFunction
+    CakeCausalConv1dDetKcpMultiFunction
+    CakeCausalConv1dDetKcpRecomputeHandle
 
 Training causal conv1d with a selectable numerical mode (Cake, experimental)
 ----------------------------------------------------------------------------

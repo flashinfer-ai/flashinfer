@@ -383,8 +383,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_det_train_backend",
-        "flashinfer/cake_causal_conv1d_det_train_backend",
+        "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
+        "flashinfer/experimental/cake/cake_causal_conv1d_det_train",
         "cake_jit.py",
         refs_with_kcp,
     ),
