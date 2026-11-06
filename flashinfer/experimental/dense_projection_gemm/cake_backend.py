@@ -43,6 +43,12 @@ Every compute entry point takes the keyword-only argument ``deterministic: bool 
     reads the tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row
     runs the deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row
     repeats bit for bit; three or more add in the order the splits finish;
+  - the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 152-SM ``sm_100a``
+    parts, in that table's token ranges), before every other K1 table: a cluster program
+    (:func:`k1_dsm_plan`) whose ``S`` CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's
+    distributed shared memory -- each CTA sends the column quads another rank owns to that rank, adds the ``S``
+    partials of its own quads in cluster-rank order and stores them once (no workspace, no ticket; the same bits on
+    every run);
   - the K2 weight gradient (and a forward given an explicit split count): a stream-K partition of the (tile, K
     block) steps into ``units`` spans, alike or a head/tail partition of long head spans and short tail spans
     (:func:`router_partition` reads the measured verdicts and token windows of :data:`ROUTER_RULES`; every other row
@@ -330,6 +336,7 @@ ROUTER_BLOCK_M = 128  # rows per CTA of a router tile (256 per CTA pair)
 ROUTER_BLOCK_N = 128  # columns per router tile
 ROUTER_BLOCK_K = 32  # fp32 elements per router K block
 K1_PAIR_ROWS = 256  # rows of a K1 tile (a CTA pair, 2 x 128)
+K1_DSM_ROWS = 128  # rows of a K1 cluster-program tile (one CTA per K range)
 K1_BLOCK_K = 64  # K elements per K1 K block
 K1_COUNTER_WORDS = 512  # ticket words per K1 tile: 16 epilogue warp slices x 32 lanes
 K1_BLOCK_N_CHOICES = (64, 128, 192, 256)
@@ -961,6 +968,54 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
     },
 }
 # fmt: on
+#: Token ranges at which a row runs this package's cluster program on the parts of exactly one SM count,
+#: ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, splits)), ...)}`` (keys as in
+#: :data:`K1_SPLIT_RULES`; FP32 rows only): a token count from ``min_tokens`` to ``max_tokens`` runs the program
+#: :func:`dsm_k1_template` names -- ``L x m_tiles x n_tiles`` tiles of 128 ``d_in`` columns by ``block_n`` ``d_out``
+#: rows, each tile one cluster of ``splits`` CTAs, CTA ``s`` taking the ``s``-th of ``splits`` contiguous runs of the
+#: tile's 64-element K blocks -- in place of the routing of every other K1 table (:func:`k1_dsm_plan`, before
+#: :func:`k1_chain_plan` and the one-split ranges); every other token count, part and row keeps that routing.  The
+#: CTAs of a cluster meet in its distributed shared memory: each sends the 4-column quads of its partial tile that
+#: another rank owns to that rank (``st.async``, counted on the owner's barrier), adds the ``splits`` partials of its
+#: own quads in cluster-rank order and stores them once, and no CTA leaves before every CTA of the cluster received
+#: its quads.  No workspace, no ticket, no atomic: the same bits on every run.  On 152-SM sm_100a parts the FP32 rows
+#: ``4096`` / ``5120 -> 32``, ``48``, ``64`` and ``128`` run it in the ranges below, where the other tables run one or
+#: two splits of 64-wide tiles of the CTA-pair program or the deterministic program.  A measured token count's program
+#: is the fastest of the tile widths and cluster sizes that passed a first screen there (two GB200 parts), and a token
+#: count between two consecutive screened ones takes the lower one's program where that program passed at both, else
+#: the upper one's.  The ranges were then measured with this table, on two GB200 parts, at 1024, 2048, 3072, 4096,
+#: 6144, 8192, 12288, 16384, 24576 and 32768 tokens against that routing (the plan this module gives the part without
+#: the table), with cold L2 and the GPU span (CUPTI), in one process per GPU pinned to its own cores, both launch
+#: orders and two runs per launch order on each part.  A measured token count passed where, on both parts, the
+#: operation alone was faster in every run (paired median below 0.99, sign test), no more than 3 % slower than that
+#: routing next to a kernel holding 8, 16 or 32 SMs on another stream, and the training step (forward, input and
+#: weight gradient) and the step with the forward recomputed were, in CUDA graphs and launched eagerly, each no slower
+#: than that routing (median of the runs at most 1.013 times, no run slower than the slowest run of the routing
+#: against itself).  A row's ranges run from a passing measured token count to a passing measured token count and
+#: hold no measured token count that failed; every other token count, part and row keeps the routing of the other
+#: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16383 tokens,
+#: ``4096 -> 128`` below 4096 and above 8192 tokens, ``5120 -> 64`` from 2049 to 4095 and above 24576 tokens,
+#: ``5120 -> 48`` above 24576 tokens, ``5120 -> 128`` above 6144 tokens, every row below 1024 and above 32768 tokens).
+#: The output met the deterministic package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max
+#: error at most 1e-3 times the largest reference element) in every one of 20 runs of 10 seeds at every measured
+#: token count.  The protocol, the measured token counts and the times are in the 152-SM cluster table of the README.
+# fmt: off
+K1_DSM_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
+] = {
+    ("sm_100a", 152): {
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
+        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
+        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 32768, (64, 3)),),
+        ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 3))),
+        ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_100a", 1, 5120, 48, "f32"): ((1024, 24576, (64, 2)),),
+        ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
+        ("sm_100a", 1, 5120, 128, "f32"): ((1024, 6144, (128, 2)),),
+    },
+}
+# fmt: on
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
@@ -973,6 +1028,29 @@ def k1_chains_fit(chains: int, K: int) -> bool:
     """Whether ``chains`` accumulation chains each get at least one 64-element K block of ``K`` (``chains * 64 <= K +
     63``, the program's requirement)."""
     return int(chains) >= 1 and int(chains) * K1_BLOCK_K <= int(K) + K1_BLOCK_K - 1
+
+
+def k1_dsm_plan(
+    *,
+    arch: str,
+    L: int,
+    M: int,
+    N: int,
+    K: int,
+    out_f32: bool,
+    sm_count: int,
+) -> Optional[tuple[int, int]]:
+    """``(block_n, splits)`` of the cluster program the row runs at ``K`` on a device of exactly ``sm_count`` SMs
+    (its range in :data:`K1_DSM_RANGES_BY_SM`), or ``None``: the row keeps the routing of :func:`k1_plan` -- outside
+    those ranges, or at a ``K`` with fewer 64-element K blocks than CTAs in the cluster (:func:`k1_splits_fit`).
+    ``M``, ``N`` and ``K`` as in :func:`k1_plan`; :func:`plan_atomic_gemm` asks this function before
+    :func:`k1_plan`."""
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    part = (arch, int(sm_count))
+    for lo, hi, (block_n, splits) in K1_DSM_RANGES_BY_SM.get(part, {}).get(key, ()):
+        if lo <= int(K) <= hi:
+            return (int(block_n), int(splits)) if k1_splits_fit(splits, K) else None
+    return None
 
 
 def k1_chain_plan(
@@ -1174,6 +1252,13 @@ def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
     )
 
 
+def dsm_k1_template(block_n: int, splits: int) -> str:
+    """The registry template of this package's K1 cluster program (both operands MN-major, FP32 out, transposed
+    store): ``block_n`` ``d_out`` rows per tile and ``splits`` CTAs per cluster, one K range each
+    (:data:`K1_DSM_RANGES_BY_SM`)."""
+    return f"{cake_jit.TEMPLATE_PREFIXES[7]}nn_n{int(block_n)}_f32_t_s{int(splits)}"
+
+
 # ---------------------------------------------------------------------------
 # K1 planning
 # ---------------------------------------------------------------------------
@@ -1185,8 +1270,11 @@ class AtomicGemmPlan:
     B[l, k, n]`` (``out_t``), or the row-major-store GEMM ``out[l, m, n]`` (``out_t`` false: the widths of
     :data:`K1_ROW_MAJOR_BLOCK_N`), over the launch's ``[L, K, M]`` / ``[L, K, N]`` operand views, ``L x m_tiles x
     n_tiles`` tiles of ``256 x block_n`` each cut into ``splits`` K ranges (or, at one split, its K blocks into
-    ``chains`` accumulation chains), walked persistently by at most ``sm_pairs`` CTA pairs.  ``M`` and ``N`` are the
-    launch's.  ``transposed_out`` is the caller's: the launch takes the caller's
+    ``chains`` accumulation chains), walked persistently by at most ``sm_pairs`` CTA pairs.  With ``dsm``, the
+    cluster program instead (:func:`k1_dsm_plan`; transposed store, FP32 out): ``L x m_tiles x n_tiles`` tiles of
+    ``128 x block_n``, each one cluster of ``splits`` CTAs (a K range each, the partials summed in the cluster's
+    shared memory), ``splits`` CTAs per tile and no workspace.  ``M`` and ``N`` are the launch's.
+    ``transposed_out`` is the caller's: the launch takes the caller's
     operands exchanged (``swapped``) when its store form differs from the caller's output layout."""
 
     L: int
@@ -1203,6 +1291,7 @@ class AtomicGemmPlan:
     template: str
     out_t: bool = True
     chains: int = 1
+    dsm: bool = False
 
     @property
     def swapped(self) -> bool:
@@ -1224,21 +1313,30 @@ class AtomicGemmPlan:
 
     @property
     def grid(self) -> tuple[int, int, int]:
+        if self.dsm:
+            return (self.items, 1, 1)
         return (2 * min(self.items, self.sm_pairs), 1, 1)
+
+    @property
+    def workspace(self) -> bool:
+        """Whether the launch uses the split workspace and the tickets: the CTA-pair program at more than one split
+        (the cluster program sums its splits in shared memory)."""
+        return self.splits > 1 and not self.dsm
 
     @property
     def ws_f32_elems(self) -> int:
         """FP32 elements of the split workspace: one ``256 x block_n`` slot per tile and split (none with one
-        split).  A launch writes every slot it reads except the padding columns of a partial tile (``N`` not a
-        multiple of ``block_n``), which the last split reads and discards (they never reach ``out``); the workspace
-        is zeroed when allocated, so no read is of uninitialised memory, and needs no memset per launch."""
-        return self.items * K1_PAIR_ROWS * self.block_n if self.splits > 1 else 0
+        split, nor for the cluster program).  A launch writes every slot it reads except the padding columns of a
+        partial tile (``N`` not a multiple of ``block_n``), which the last split reads and discards (they never reach
+        ``out``); the workspace is zeroed when allocated, so no read is of uninitialised memory, and needs no memset
+        per launch."""
+        return self.items * K1_PAIR_ROWS * self.block_n if self.workspace else 0
 
     @property
     def counters_u32(self) -> int:
-        """Ticket words: one per tile, epilogue warp slice and lane (none with one split).  Zero when allocated;
-        every complete launch leaves them zero."""
-        return self.tiles * K1_COUNTER_WORDS if self.splits > 1 else 0
+        """Ticket words: one per tile, epilogue warp slice and lane (none with one split, nor for the cluster
+        program).  Zero when allocated; every complete launch leaves them zero."""
+        return self.tiles * K1_COUNTER_WORDS if self.workspace else 0
 
 
 def _k1_out_strides(out3: torch.Tensor) -> tuple[int, int]:
@@ -1277,8 +1375,11 @@ def plan_atomic_gemm(
     for ``arch``, or the planner (:func:`k1_plan`).  An explicit ``splits`` / ``block_n`` replaces the planner's
     choice (the other one from the planner, else ``1`` split / :func:`k1_block_n`) and runs this package's program of
     that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
-    registry allow it.  The planner's choice runs :func:`k1_chain_plan`'s accumulation chains where it has them; an
-    explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names more, at one split.
+    registry allow it.  The planner's choice is first :func:`k1_dsm_plan`'s cluster program where the row has a
+    range of :data:`K1_DSM_RANGES_BY_SM` (a plan with ``dsm``; ``None`` when this checkout does not register its
+    template for ``arch``), then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s accumulation chains where it has
+    them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names more, at one
+    split, and never the cluster program.
     Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an explicit choice the
     program cannot run."""
     det = deterministic_backend()
@@ -1330,6 +1431,30 @@ def plan_atomic_gemm(
     out_f32 = out.dtype == torch.float32
     c = 1 if chains is None else int(chains)
     if splits is None and block_n is None and chains is None:
+        dsm = k1_dsm_plan(
+            arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+        )
+        if dsm is not None:
+            bn, p = dsm
+            template = dsm_k1_template(bn, p)
+            if template not in cake_jit.KERNELS.get(arch, {}):
+                return (*none, f"{template} is not registered for {arch}")
+            plan = AtomicGemmPlan(
+                L=L,
+                M=M_,
+                N=N_,
+                K=K,
+                out_f32=out_f32,
+                transposed_out=bool(transposed_out),
+                block_n=bn,
+                splits=p,
+                m_tiles=_ceil_div(M_, K1_DSM_ROWS),
+                n_tiles=_ceil_div(N_, bn),
+                sm_pairs=max(1, int(sm_count) // 2),
+                template=template,
+                dsm=True,
+            )
+            return plan, a_launch, b_launch, O3, ""
         choice = k1_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
         )
@@ -2974,13 +3099,13 @@ class PreparedAtomicGemm:
 
     def counters_are_zero(self) -> bool:
         """Whether the tickets hold zeros (a device-to-host read: tests and checks only)."""
-        if self.plan.splits == 1:
+        if not self.plan.workspace:
             return True
         return not bool(self.tensors["counters"].view(torch.int32).any())
 
     def reset_counters(self) -> None:
         """Zero the tickets on the current stream (after a launch that did not complete)."""
-        if self.plan.splits > 1:
+        if self.plan.workspace:
             self.tensors["counters"].view(torch.int32).zero_()
 
     def launch(self) -> torch.Tensor:
@@ -3080,7 +3205,7 @@ def _prepare_atomic_k1(
 ) -> PreparedAtomicGemm:
     det = deterministic_backend()
     device = out.device
-    if plan.splits > 1:
+    if plan.workspace:
         # zeroed once: the last split reads the never-written padding columns of a partial tile (and discards them)
         ws = torch.zeros(plan.ws_f32_elems, device=device, dtype=torch.float32)
         counters = torch.zeros(plan.counters_u32, device=device, dtype=torch.uint32)
@@ -4085,7 +4210,7 @@ def _launch_cached_atomic_k1(
                         entry.arena, entry.k1 = bound.arena, bound.k1
                 else:
                     arena = None
-                    if plan.splits > 1:
+                    if plan.workspace:
                         arena = _atomic_arena_for(index, stream, device)
                         arena.require("k1_slots", plan.ws_f32_elems)
                         arena.require("k1_tickets", plan.counters_u32)

@@ -251,9 +251,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
         }
     }
 
-    // Publish explicit kernel-setup mbarrier initialization.
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-
     __syncwarp();
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");

@@ -262,8 +262,8 @@ from typing import (
 )
 
 import torch
-import torch.utils.checkpoint as _torch_checkpoint
 import torch.utils._python_dispatch as _torch_dispatch
+import torch.utils.checkpoint as _torch_checkpoint
 
 from .cake_jit import (
     BASE_STAGES,
@@ -377,6 +377,12 @@ STAGE_TENSORS = {
         stage: ("A", "B", "C", "STATS_OUT", "WS", "CNT")
         for stage in GEMM_STAGES
         if stage.endswith("_dcnt")
+    },
+    # the accumulate's cast at the last live chunk also reads the next chunk's count cell
+    **{
+        stage: ("A", "B", "C", "STATS_OUT", "WS", "CNT", "CNT_NEXT")
+        for stage in GEMM_STAGES
+        if stage.startswith("gemm_dw_acc") and stage.endswith("_lc_dcnt")
     },
     "gemm_logits_dz_dcnt": (
         "A",
@@ -740,7 +746,7 @@ _TUNING_KNOBS = {
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
     r"(?P<mcnt>_mcnt)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<split>_split)?(?P<swab>_swab)?"
-    r"(?P<gn>_gn)?(?P<tma>_tma)?(?P<dcnt>_dcnt)?(?P<tau>_tau)?"
+    r"(?P<gn>_gn)?(?P<tma>_tma)?(?P<lc>_lc)?(?P<dcnt>_dcnt)?(?P<tau>_tau)?"
 )
 STAGE_KNOBS = (
     "count",
@@ -750,6 +756,7 @@ STAGE_KNOBS = (
     "swab",
     "blocked",
     "epi_store",
+    "live_cast",
     "dcnt",
     "temperature",
 )
@@ -763,6 +770,15 @@ STAGE_KNOBS = (
 # The bases that have the form (not the swapped dX tile, not the accumulate's TMA epilogue; the bf16 fused cast's TMA
 # store has it too, :data:`DW_CAST_TMA_DCNT_STAGE`):
 DCNT_BASES = ("gemm_logits_dz", "gemm_dx_red", "gemm_dw_acc", "gemm_dw_cast_bf16")
+# The cast at the last live chunk (``_lc``, before ``_dcnt``; :attr:`Plan.live_cast`): under the skip the live rows of a
+# backward's chunks are a prefix (:func:`zero_dlogp_partition`), so the counted weight-gradient accumulate of every
+# chunk but the last reads the next chunk's count cell too (``CNT_NEXT``): with a live next chunk it adds its FP32 tile
+# into the sum as the counted accumulate does; else it writes ``bf16(g * (sum + tile))`` (``bf16(g * tile)`` on a first
+# chunk) into the bf16 gradient and leaves the sum, and the counted deferred cast of the last chunk (per-thread or TMA
+# store) writes nothing when that chunk has no K step.  So exactly one program writes the gradient and a backward whose
+# trailing chunks hold no live row runs no cast-only pass.  The bases that have the form (the accumulate on its 1-D or
+# 2-D raster, not its TMA epilogue; the bf16 fused cast in both stores):
+DW_LIVE_CAST_BASES = ("gemm_dw_acc", "gemm_dw_cast_bf16")
 
 
 def stage_variant(
@@ -775,10 +791,11 @@ def stage_variant(
     swab: bool = False,
     blocked: bool = False,
     epi_store: Optional[str] = None,
+    live_cast: bool = False,
     dcnt: bool = False,
 ) -> str:
     """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
-    order ``_mcnt``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``, ``_dcnt``; ``split``: the wide
+    order ``_mcnt``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``, ``_lc``, ``_dcnt``; ``split``: the wide
     dX tile with its last wave's trailing items run as half items (:func:`dx_split_rule`); ``swab``: the wide dX tile
     with swapped operands at the table ring depth (:func:`dx_swab_rule`); a default output (the host-bound row
     count, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
@@ -789,7 +806,8 @@ def stage_variant(
     (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
     TMA store (:func:`dw_cast_tma_rule`); ``dcnt``: the form bounded by the device count of the chunk's live rows
     (:data:`DCNT_BASES`, the zero-gradient row skip; the bf16 fused cast's TMA store has one too,
-    :data:`DW_CAST_TMA_DCNT_STAGE`).  The slice count, the raster height and the block width
+    :data:`DW_CAST_TMA_DCNT_STAGE`); ``live_cast``: the cast at the last live chunk of a counted weight-gradient form
+    (:data:`DW_LIVE_CAST_BASES`, with ``dcnt`` only).  The slice count, the raster height and the block width
     themselves are launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
@@ -842,11 +860,25 @@ def stage_variant(
                 f"{base}: the only epilogue variants are the weight-gradient accumulate's TMA reduce-add and the bf16 fused cast's TMA store, got {epi_store!r}"
             )
         name += "_tma"
+    if live_cast:
+        if (
+            not dcnt
+            or base not in DW_LIVE_CAST_BASES
+            or (name.endswith("_tma") and base != "gemm_dw_cast_bf16")
+        ):
+            raise ValueError(
+                f"{base}: the cast at the last live chunk exists for the counted forms of {DW_LIVE_CAST_BASES} only "
+                "(not the accumulate's TMA epilogue)"
+            )
+        name += "_lc"
     if dcnt:
         if (
             base not in DCNT_BASES
             or swab
-            or (name.endswith("_tma") and base != "gemm_dw_cast_bf16")
+            or (
+                name.removesuffix("_lc").endswith("_tma")
+                and base != "gemm_dw_cast_bf16"
+            )
         ):
             raise ValueError(
                 f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or the accumulate's TMA-epilogue forms)"
@@ -894,6 +926,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
         swab=bool(m["swab"]),
         blocked=bool(m["gn"]),
         epi_store="tma" if m["tma"] else None,
+        live_cast=bool(m["lc"]),
         dcnt=bool(m["dcnt"]),
         temperature=bool(m["tau"]),
     )
@@ -903,7 +936,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
 
 
 def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {count, tile_n, stages, split, swab, blocked, epi_store, dcnt, temperature})`` of a stage name (the inverse of
+    """``(base, {count, tile_n, stages, split, swab, blocked, epi_store, live_cast, dcnt, temperature})`` of a stage name (the inverse of
     :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
     base, knobs = _parse_stage(stage)
     return base, dict(knobs)
@@ -3912,6 +3945,11 @@ class Plan:
     # reductions and the weight-gradient GEMMs run their ``_dcnt`` forms, bounded by the per-chunk device counts
     # ``t["dcnt"]`` of the rows the call ordered first (:func:`zero_dlogp_partition`)
     dcnt: bool = False
+    # the cast at the last live chunk (:data:`DW_LIVE_CAST_BASES`, ``_lc``) of a counted plan of two chunks or more with
+    # the fused bf16 weight-gradient cast: every accumulate but the last chunk's runs its ``_lc`` form and the deferred
+    # cast its ``_lc`` form.  Set by the log-probability backward's eager skip path only (:func:`make_plan` resolves
+    # it, ``_skip_forms``); a runner of the public entry points never runs it, so its ``dw_acc`` keeps its meaning
+    live_cast: bool = False
     # the plan runs the temperature forms (:class:`_TemperaturePlan`, :func:`make_plan_temperature`).  A class
     # attribute, not a field: a plan without a temperature is built as before
     temperature: ClassVar[bool] = False
@@ -3977,6 +4015,7 @@ class Plan:
             "gemm_dw_acc",
             blocked=v.dw_group_n is not None,
             epi_store=v.dw_epi_store,
+            live_cast=self.live_cast,
             dcnt=self.dcnt,
         )
 
@@ -4080,6 +4119,7 @@ class Plan:
                 epi_store="tma"
                 if v.dw_cast_tma
                 else None,  # the TMA form of the bf16 cast (dw_cast_tma_rule)
+                live_cast=self.live_cast,
                 dcnt=self.dcnt,
             )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
@@ -4109,6 +4149,7 @@ class _TemperaturePlan(Plan):
         zero-gradient row skip are checked on the plan itself (:class:`_CountedTemperaturePlan` keeps it on)."""
         values = {f.name: getattr(self, f.name) for f in fields(self)}
         values["dcnt"] = False
+        values["live_cast"] = False
         return self.plain(**values)
 
     def hidden_logits_stage(self) -> str:
@@ -4238,6 +4279,7 @@ def make_plan(
     logprob_keep: bool = False,
     dcnt: bool = False,
     counted_tma_cast: bool = True,
+    live_cast: bool = False,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (the K-sliced reduction form registered) picks each chunk's slice count
     with :func:`dx_slices` under ``dx_slice_policy`` (``None`` = :func:`dx_slice_policy`; ``dx_resident`` = the device's
@@ -4259,7 +4301,9 @@ def make_plan(
     when the plan with those would have no counted forms), the
     last chunk's bf16 fused cast in the TMA epilogue's counted form where :func:`dw_cast_tma_rule` takes the TMA
     epilogue (``counted_tma_cast=False``, a record without that form: the shipped cast's counted form instead); off when
-    a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
+    a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile).
+    ``live_cast`` (the log-probability backward's eager skip path only): a counted plan of two chunks or more with the
+    fused bf16 weight-gradient cast runs the cast at the last live chunk (:attr:`Plan.live_cast`); ignored otherwise."""
     if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if logprob_keep:
@@ -4394,6 +4438,18 @@ def make_plan(
         logprob_dz=bool(logprob_dz),
         logprob_lbl=bool(logprob_lbl),
         dcnt=dcnt,
+        # the cast at the last live chunk: a counted plan of two chunks or more whose bf16 weight gradient comes out of
+        # the fused cast (the log-probability entry's dW is bf16)
+        live_cast=bool(
+            live_cast
+            and dcnt
+            and need_dw
+            and fuse_dw_cast
+            and len(chunks) >= 2
+            and not (
+                problem.entry == "loss" and problem.grad_weight_dtype == torch.float32
+            )
+        ),
     )
 
 
@@ -5651,12 +5707,15 @@ def stage_values(
                 f"chunk {index} plans the weight-gradient accumulate {want!r}; stage {stage!r} was requested"
             )
         v = plan.variants_of(index)
+        lc = parse_stage(stage)[1]["live_cast"]
+        if lc and last:
+            raise ValueError(
+                f"stage {stage!r} reads the next chunk's count; chunk {index} is the last of {plan.num_chunks}"
+            )
         values.update(
             A=dz_chunk,
             B=x_chunk,
-            C=t["dw_acc"],
-            STATS_OUT=t["stats"],
-            WS=t["f32_dummy"],
+            **_dw_acc_operands(t, p, lc),
             **gemm_scalars(
                 stage,
                 g,
@@ -5668,6 +5727,8 @@ def stage_values(
                 first_chunk=first,
             ),
         )
+        if lc:
+            values.update(CNT_NEXT=t["dcnt"][index + 1 : index + 2])
     elif base in DW_CAST_STAGES:
         # the deferred last chunk (backward): the same GEMM as ``gemm_dw_acc`` with the upstream scale and the output cast
         # fused into its epilogue -- ``C`` is the final ``dW``, ``WS`` the read-only FP32 sum of the chunks before it (a
@@ -5735,6 +5796,21 @@ def stage_values(
         raise ValueError(f"unknown stage {stage!r}")
     _dcnt_value(stage, t, plan, index, values)
     return values
+
+
+def _dw_acc_operands(t: dict[str, Any], p: Problem, live_cast: bool) -> dict[str, Any]:
+    """The tensor operands of a weight-gradient accumulate: the FP32 sum ``dw_acc`` as ``C`` (the statistics and a
+    dummy in the unused slots); its cast at the last live chunk (``_lc``) writes the bf16 ``dw_out`` (``C``), reads and
+    adds into the sum ``dw_acc`` (``WS``) and scales by the upstream cell (``STATS_OUT``), the deferred cast's operands
+    (the next chunk's count ``CNT_NEXT`` is bound beside them).  The gradient slots are allocated before the chunk
+    loop's first dX launch, ahead of any accumulate on the side stream."""
+    if live_cast:
+        return dict(
+            C=t["dw_out"],
+            STATS_OUT=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            WS=t["dw_acc"],
+        )
+    return dict(C=t["dw_acc"], STATS_OUT=t["stats"], WS=t["f32_dummy"])
 
 
 def _dcnt_value(
@@ -5836,13 +5912,10 @@ def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, 
     elif base in DX_BASES:
         _dx_slots(stage, t, plan, index, values)
     elif base == "gemm_dw_acc":
-        values.update(
-            A=logits[:rows_c],
-            B=x_chunk,
-            C=t["dw_acc"],
-            STATS_OUT=t["stats"],
-            WS=t["f32_dummy"],
-        )
+        lc = parse_stage(stage)[1]["live_cast"]
+        values.update(A=logits[:rows_c], B=x_chunk, **_dw_acc_operands(t, p, lc))
+        if lc:
+            values.update(CNT_NEXT=t["dcnt"][index + 1 : index + 2])
     elif base in DW_CAST_STAGES:
         values.update(
             A=logits[:rows_c],
@@ -6755,6 +6828,7 @@ def prepare_lm_head_loss(
     dx_rule: Optional[tuple] = None,
     logprob_keep: bool = False,
     dcnt: Optional[torch.Tensor] = None,
+    _skip_forms: bool = False,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -6939,10 +7013,16 @@ def prepare_lm_head_loss(
         dx_red_min_rows=red_min_rows,
         logprob_keep=keep,
     )
-    plan = plan_of(dcnt=dcnt is not None)
-    if plan.dcnt and any(s not in stages for s in plan.stages):
-        # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
-        plan = plan_of(dcnt=True, counted_tma_cast=False)
+    # the eager skip path (``_skip_forms``, :func:`backward_logprob`) tries the cast at the last live chunk first; a
+    # plan takes it whole or not at all (every accumulate but the last chunk's and the deferred cast)
+    for live_cast in (True, False) if _skip_forms else (False,):
+        plan = plan_of(dcnt=dcnt is not None, live_cast=live_cast)
+        if plan.dcnt and any(s not in stages for s in plan.stages):
+            # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
+            plan = plan_of(dcnt=True, counted_tma_cast=False, live_cast=live_cast)
+        if live_cast and not (plan.live_cast and all(s in stages for s in plan.stages)):
+            continue
+        break
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
         plan = plan_of(dcnt=False)
@@ -7159,6 +7239,7 @@ def prepare_lm_head_loss_temperature(
     dx_rule: Optional[tuple] = None,
     temperature: Optional[torch.Tensor] = None,
     dcnt: Optional[torch.Tensor] = None,
+    _skip_forms: bool = False,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -7377,12 +7458,23 @@ def prepare_lm_head_loss_temperature(
         )
     plan = plan_of(dcnt=dcnt is not None)
     if plan.dcnt:
-        for dz_form in dz_forms:
-            for cast_form in ({}, {"counted_tma_cast": False}):
-                plan = plan_of(dcnt=True, **dz_form, **cast_form)
-                if not plan.dcnt or all(s in stages for s in plan.stages):
+        # the eager skip path (``_skip_forms``, :func:`backward_logprob_temperature`) tries the cast at the last live
+        # chunk first (whole or not at all), each with the dz forms, each with the two cast forms
+        searched = False
+        for live_cast in (True, False) if _skip_forms else (False,):
+            for dz_form in dz_forms:
+                for cast_form in ({}, {"counted_tma_cast": False}):
+                    plan = plan_of(
+                        dcnt=True, live_cast=live_cast, **dz_form, **cast_form
+                    )
+                    if live_cast and not plan.live_cast:
+                        break
+                    if not plan.dcnt or all(s in stages for s in plan.stages):
+                        searched = True
+                        break
+                if searched or (live_cast and not plan.live_cast):
                     break
-            if not plan.dcnt or all(s in stages for s in plan.stages):
+            if searched:
                 break
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
@@ -10268,6 +10360,9 @@ def backward_logprob(
         )
         if skip
         else None,
+        # the skip's private forms (the cast at the last live chunk): the counts come from zero_dlogp_partition (zeros
+        # form a suffix) and the gradient buffers are this call's own
+        _skip_forms=skip,
     )
     order_rows(runner.plan.dcnt)
     if hc is not None or skip:
@@ -10779,6 +10874,9 @@ def backward_logprob_temperature(
         )
         if skip
         else None,
+        # the skip's private forms (the cast at the last live chunk): the counts come from zero_dlogp_partition (zeros
+        # form a suffix) and the gradient buffers are this call's own
+        _skip_forms=skip,
     )
     order_rows(runner.plan.dcnt)
     if hc is not None or skip:
