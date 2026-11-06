@@ -45,6 +45,8 @@ def _fused_qk_norm_rope(
     yarn_high: float,
     yarn_attention_factor: float,
     is_qk_norm: bool,
+    weight_offset: float,
+    cos_sin_cache: Optional[torch.Tensor],
 ) -> None:
     get_fused_qk_norm_rope_module().fused_qk_norm_rope(
         q,
@@ -61,6 +63,8 @@ def _fused_qk_norm_rope(
         yarn_high,
         yarn_attention_factor,
         is_qk_norm,
+        weight_offset,
+        cos_sin_cache,
     )
 
 
@@ -80,6 +84,8 @@ def _fake_fused_qk_norm_rope(
     yarn_high: float,
     yarn_attention_factor: float,
     is_qk_norm: bool,
+    weight_offset: float,
+    cos_sin_cache: Optional[torch.Tensor],
 ) -> None:
     pass
 
@@ -100,6 +106,8 @@ def fused_qk_norm_rope(
     yarn_low: float = 0.0,
     yarn_high: float = 0.0,
     yarn_attention_factor: float = 1.0,
+    weight_offset: float = 0.0,
+    cos_sin_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Fused per-head QK RMSNorm + Rotary Position Embedding, updated in place.
 
@@ -129,7 +137,7 @@ def fused_qk_norm_rope(
         Per-head RMSNorm weights for K, shape ``(head_dim,)``, same dtype as
         ``q``. Ignored when ``is_qk_norm=False``.
     pos_ids : torch.Tensor
-        Position indices, shape ``(nnz,)``, dtype ``torch.int32``.
+        Position indices, shape ``(nnz,)``, dtype ``torch.int32`` or ``torch.int64``.
     rotary_dim : Optional[int]
         Number of leading dimensions RoPE is applied to. Defaults to
         ``head_dim`` (full rope). Must be even and ``<= head_dim``.
@@ -155,6 +163,18 @@ def fused_qk_norm_rope(
     yarn_attention_factor : float
         YaRN post-processing scale applied to ``cos``/``sin``. Must be ``1.0``
         when ``yarn_factor == 1.0``.
+
+    weight_offset : float
+        Added in fp32 to the RMSNorm weight before scaling; ``1.0`` gives
+        ``gemma_rmsnorm`` semantics (``x * rsqrt(mean(x^2) + eps) * (1 + w)``).
+        Default ``0.0``.
+    cos_sin_cache : Optional[torch.Tensor]
+        fp32 ``(max_pos, rotary_dim)`` table laid out as ``[cos | sin]`` (each
+        ``rotary_dim // 2`` wide), as in :func:`apply_rope_with_cos_sin_cache`.
+        When given, ``rope_theta`` and the YaRN frequency arguments are
+        ignored. ``yarn_attention_factor`` still multiplies the result, so leave it
+        at ``1.0`` when the cache already includes the scale. ``pos_ids`` must
+        be in ``[0, max_pos)``; out-of-range values are not checked.
 
     Notes
     -----
@@ -198,4 +218,6 @@ def fused_qk_norm_rope(
         float(yarn_high),
         float(yarn_attention_factor),
         bool(is_qk_norm),
+        float(weight_offset),
+        cos_sin_cache,
     )

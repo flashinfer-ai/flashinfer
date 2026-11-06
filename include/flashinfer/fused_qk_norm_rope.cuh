@@ -126,22 +126,22 @@ __device__ __forceinline__ float ComputeFreqYarn(float base, int rotary_dim, int
  * Each warp processes one (token, qk_head) pair. The warp first loads the
  * entire head into registers (1 element per lane iteration, numElemsPerThread
  * iterations), performs an optional warp-level RMSNorm with the per-dim
- * weight, then applies RoPE with on-the-fly cos/sin derived from
- * ``position_ids`` and ``rope_theta``, and writes the result back in place.
+ * weight, then applies RoPE with cos/sin read from ``cos_sin_cache`` or derived
+ * on the fly from ``position_ids`` and ``rope_theta``, and writes the result back in place.
  */
-template <typename DType, int head_dim, bool interleave>
-__global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [nnz, H_q, D]
-                                      DType* __restrict__ k,               // [nnz, H_k, D]
-                                      DType const* __restrict__ q_weight,  // [D]
-                                      DType const* __restrict__ k_weight,  // [D]
-                                      int const* __restrict__ pos_ids,     // [nnz]
-                                      int const num_q_heads, int const num_kv_heads,
-                                      int const rotary_dim, float const eps, float const rope_theta,
-                                      float const yarn_factor, float const yarn_low,
-                                      float const yarn_high, float const yarn_attention_factor,
-                                      int const num_tokens, bool const is_qk_norm,
-                                      size_t const q_stride_n, size_t const q_stride_h,
-                                      size_t const k_stride_n, size_t const k_stride_h) {
+template <typename DType, typename PosT, int head_dim, bool interleave>
+__global__ void FusedQKNormRopeKernel(
+    DType* __restrict__ q,                    // [nnz, H_q, D]
+    DType* __restrict__ k,                    // [nnz, H_k, D]
+    DType const* __restrict__ q_weight,       // [D]
+    DType const* __restrict__ k_weight,       // [D]
+    PosT const* __restrict__ pos_ids,         // [nnz]
+    float const* __restrict__ cos_sin_cache,  // [P, rotary_dim] or null
+    float const weight_offset, int const num_q_heads, int const num_kv_heads, int const rotary_dim,
+    float const eps, float const rope_theta, float const yarn_factor, float const yarn_low,
+    float const yarn_high, float const yarn_attention_factor, int const num_tokens,
+    bool const is_qk_norm, size_t const q_stride_n, size_t const q_stride_h,
+    size_t const k_stride_n, size_t const k_stride_h) {
   using namespace fused_qk_norm_rope_impl;
   using Traits = DTypeTraits<DType>;
   using pack2_t = typename Traits::pack2_t;
@@ -215,7 +215,7 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
     for (int i = 0; i < numElemsPerThread; i++) {
       int dim = lane_id * numElemsPerThread + i;
       float weight = is_q ? Traits::to_float(q_weight[dim]) : Traits::to_float(k_weight[dim]);
-      elements[i] *= rms_rcp * weight;
+      elements[i] *= rms_rcp * (weight + weight_offset);
     }
   }
 
@@ -223,7 +223,11 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
   float elements2[numElemsPerThread];
   float cos_vals[numElemsPerThread];
   float sin_vals[numElemsPerThread];
-  float pos_id = static_cast<float>(pos_ids[token_idx]);
+  PosT const pos = pos_ids[token_idx];
+  float const pos_id = static_cast<float>(pos);
+  float const* cache_row =
+      cos_sin_cache == nullptr ? nullptr : cos_sin_cache + static_cast<size_t>(pos) * rotary_dim;
+  int const half_rot = rotary_dim / 2;
 
   if constexpr (interleave) {
     // GPT-J style: rotate even/odd pairs (elements[2i], elements[2i+1]).
@@ -232,10 +236,20 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
       elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
       int dim_idx = lane_id * numElemsPerThread + i;
       int half_dim = dim_idx / 2;
-      float freq =
-          ComputeFreqYarn(rope_theta, rotary_dim, half_dim, yarn_factor, yarn_low, yarn_high);
-      float theta = pos_id * freq;
-      __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+      if (cache_row != nullptr) {
+        if (dim_idx < rotary_dim) {
+          cos_vals[i] = cache_row[half_dim];
+          sin_vals[i] = cache_row[half_rot + half_dim];
+        } else {
+          cos_vals[i] = 1.0f;
+          sin_vals[i] = 0.0f;
+        }
+      } else {
+        float freq =
+            ComputeFreqYarn(rope_theta, rotary_dim, half_dim, yarn_factor, yarn_low, yarn_high);
+        float theta = pos_id * freq;
+        __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+      }
     }
   } else {
     // Neox / Llama style: rotate (x[i], x[i + rotary_dim/2]).
@@ -259,10 +273,15 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
       int dim_idx = lane_id * numElemsPerThread + i;
       dim_idx = (dim_idx * 2) % rotary_dim;
       int half_dim = dim_idx / 2;
-      float freq =
-          ComputeFreqYarn(rope_theta, rotary_dim, half_dim, yarn_factor, yarn_low, yarn_high);
-      float theta = pos_id * freq;
-      __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+      if (cache_row != nullptr) {
+        cos_vals[i] = cache_row[half_dim];
+        sin_vals[i] = cache_row[half_rot + half_dim];
+      } else {
+        float freq =
+            ComputeFreqYarn(rope_theta, rotary_dim, half_dim, yarn_factor, yarn_low, yarn_high);
+        float theta = pos_id * freq;
+        __sincosf(theta, &sin_vals[i], &cos_vals[i]);
+      }
     }
   }
 
@@ -305,9 +324,10 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
  * ``cudaErrorInvalidValue`` for unsupported ``head_dim`` so the C++ binding
  * can surface a clean TVM-FFI error.
  */
-template <typename DType>
+template <typename DType, typename PosT>
 cudaError_t FusedQKNormRopeLauncher(DType* q, DType* k, DType const* q_weight,
-                                    DType const* k_weight, int const* pos_ids, int num_tokens,
+                                    DType const* k_weight, PosT const* pos_ids,
+                                    float const* cos_sin_cache, float weight_offset, int num_tokens,
                                     int num_q_heads, int num_kv_heads, int head_dim, int rotary_dim,
                                     float eps, float rope_theta, bool interleave, float yarn_factor,
                                     float yarn_low, float yarn_high, float yarn_attention_factor,
@@ -336,10 +356,12 @@ cudaError_t FusedQKNormRopeLauncher(DType* q, DType* k, DType const* q_weight,
 
 #define LAUNCH_IMPL(HEAD_DIM_VAL)                                                                  \
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                                                    \
-    FusedQKNormRopeKernel<DType, HEAD_DIM_VAL, INTERLEAVE><<<grid_dim, block_dim, 0, stream>>>(    \
-        q, k, q_weight, k_weight, pos_ids, num_q_heads, num_kv_heads, rotary_dim, eps, rope_theta, \
-        yarn_factor, yarn_low, yarn_high, yarn_attention_factor, num_tokens, is_qk_norm,           \
-        q_stride_n, q_stride_h, k_stride_n, k_stride_h);                                           \
+    FusedQKNormRopeKernel<DType, PosT, HEAD_DIM_VAL, INTERLEAVE>                                   \
+        <<<grid_dim, block_dim, 0, stream>>>(q, k, q_weight, k_weight, pos_ids, cos_sin_cache,     \
+                                             weight_offset, num_q_heads, num_kv_heads, rotary_dim, \
+                                             eps, rope_theta, yarn_factor, yarn_low, yarn_high,    \
+                                             yarn_attention_factor, num_tokens, is_qk_norm,        \
+                                             q_stride_n, q_stride_h, k_stride_n, k_stride_h);      \
   })
 
   switch (head_dim) {

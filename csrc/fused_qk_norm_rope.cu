@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 #include <climits>
+#include <cmath>
 #include <flashinfer/fused_qk_norm_rope.cuh>
 
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
+using tvm::ffi::Optional;
 
 /*!
  * \brief TVM-FFI entry point for the fused QK RMSNorm + RoPE op.
@@ -44,7 +46,8 @@ using namespace flashinfer;
 void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorView k_weight,
                         TensorView pos_ids, int64_t rotary_dim, double eps, double rope_theta,
                         bool interleave, double yarn_factor, double yarn_low, double yarn_high,
-                        double yarn_attention_factor, bool is_qk_norm) {
+                        double yarn_attention_factor, bool is_qk_norm, double weight_offset,
+                        Optional<TensorView> maybe_cos_sin_cache) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_weight);
@@ -65,7 +68,8 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
   TVM_FFI_ICHECK_EQ(q.dtype(), k.dtype()) << "q and k must share the same dtype";
   TVM_FFI_ICHECK_EQ(q.dtype(), q_weight.dtype()) << "q and q_weight must share the same dtype";
   TVM_FFI_ICHECK_EQ(q.dtype(), k_weight.dtype()) << "q and k_weight must share the same dtype";
-  CHECK_INPUT_TYPE(pos_ids, dl_int32);
+  TVM_FFI_ICHECK(pos_ids.dtype() == dl_int32 || pos_ids.dtype() == dl_int64)
+      << "pos_ids must be int32 or int64";
 
   int64_t const nnz = q.size(0);
   int64_t const num_q_heads = q.size(1);
@@ -123,6 +127,18 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
     TVM_FFI_ICHECK_EQ(yarn_attention_factor, 1.0)
         << "yarn_attention_factor must be 1.0 when yarn_factor == 1.0 (YaRN disabled)";
   }
+
+  float const* cache_ptr = nullptr;
+  if (maybe_cos_sin_cache.has_value()) {
+    TensorView cache = maybe_cos_sin_cache.value();
+    CHECK_INPUT(cache);
+    CHECK_DEVICE(q, cache);
+    CHECK_DIM(2, cache);
+    CHECK_INPUT_TYPE(cache, dl_float32);
+    TVM_FFI_ICHECK_EQ(cache.size(1), rotary_dim) << "cos_sin_cache must have shape [P, rotary_dim]";
+    cache_ptr = static_cast<float const*>(cache.data_ptr());
+  }
+  TVM_FFI_ICHECK(std::isfinite(weight_offset)) << "weight_offset must be finite";
 
   if (nnz == 0) {
     return;
@@ -185,17 +201,22 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   cudaStream_t const stream = get_stream(q.device());
+  bool const pos_is_i64 = pos_ids.dtype() == dl_int64;
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
-    cudaError_t status = FusedQKNormRopeLauncher<c_type>(
-        static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-        static_cast<c_type*>(q_weight.data_ptr()), static_cast<c_type*>(k_weight.data_ptr()),
-        static_cast<int32_t*>(pos_ids.data_ptr()), static_cast<int>(nnz),
-        static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads), static_cast<int>(head_dim),
-        static_cast<int>(rotary_dim), static_cast<float>(eps), static_cast<float>(rope_theta),
-        interleave, static_cast<float>(yarn_factor), static_cast<float>(yarn_low),
-        static_cast<float>(yarn_high), static_cast<float>(yarn_attention_factor), is_qk_norm,
-        q_stride_n, q_stride_h, k_stride_n, k_stride_h, stream);
+    auto launch = [&](auto const* pos_ptr) {
+      return FusedQKNormRopeLauncher<c_type>(
+          static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
+          static_cast<c_type*>(q_weight.data_ptr()), static_cast<c_type*>(k_weight.data_ptr()),
+          pos_ptr, cache_ptr, static_cast<float>(weight_offset), static_cast<int>(nnz),
+          static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads), static_cast<int>(head_dim),
+          static_cast<int>(rotary_dim), static_cast<float>(eps), static_cast<float>(rope_theta),
+          interleave, static_cast<float>(yarn_factor), static_cast<float>(yarn_low),
+          static_cast<float>(yarn_high), static_cast<float>(yarn_attention_factor), is_qk_norm,
+          q_stride_n, q_stride_h, k_stride_n, k_stride_h, stream);
+    };
+    cudaError_t status = pos_is_i64 ? launch(static_cast<int64_t const*>(pos_ids.data_ptr()))
+                                    : launch(static_cast<int32_t const*>(pos_ids.data_ptr()));
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "FusedQKNormRopeLauncher failed: " << cudaGetErrorString(status);
     return true;

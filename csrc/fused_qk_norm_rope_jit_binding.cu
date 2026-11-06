@@ -15,11 +15,13 @@
  */
 #include "tvm_ffi_utils.h"
 
+using tvm::ffi::Optional;
 using tvm::ffi::Tensor;
 
 void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorView k_weight,
                         TensorView pos_ids, int64_t rotary_dim, double eps, double rope_theta,
                         bool interleave, double yarn_factor, double yarn_low, double yarn_high,
-                        double yarn_attention_factor, bool is_qk_norm);
+                        double yarn_attention_factor, bool is_qk_norm, double weight_offset,
+                        Optional<TensorView> maybe_cos_sin_cache);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_qk_norm_rope, fused_qk_norm_rope);

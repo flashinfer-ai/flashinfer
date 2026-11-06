@@ -384,7 +384,7 @@ def test_fused_qk_norm_rope_invalid_head_dim():
 def test_fused_qk_norm_rope_pos_ids_wrong_dtype():
     _skip_if_unsupported()
     q, k, q_weight, k_weight, pos_ids = _make_inputs()
-    pos_ids = pos_ids.to(torch.int64)
+    pos_ids = pos_ids.to(torch.float32)
     with pytest.raises(_KERNEL_VALIDATION_EXC):
         flashinfer.fused_qk_norm_rope(q, k, q_weight, k_weight, pos_ids)
 
@@ -460,3 +460,163 @@ def test_fused_qk_norm_rope_misaligned_stride():
 
     with pytest.raises(_KERNEL_VALIDATION_EXC):
         flashinfer.fused_qk_norm_rope(q, k, q_weight, k_weight, pos_ids)
+
+
+def _cos_sin_cache(rotary_dim, max_pos, rope_theta, device):
+    inv = 1.0 / (
+        rope_theta
+        ** (
+            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
+            / rotary_dim
+        )
+    )
+    freqs = (
+        torch.arange(max_pos, device=device, dtype=torch.float32)[:, None] * inv[None]
+    )
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1).contiguous()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("interleave", [True, False])
+@pytest.mark.parametrize("weight_offset", [0.0, 1.0])
+@pytest.mark.parametrize("use_cache", [True, False])
+@pytest.mark.parametrize("head_dim, rotary_dim", [(128, 64), (128, 128), (64, 32)])
+def test_fused_qk_norm_rope_gemma_cache_int64(
+    dtype, pos_dtype, interleave, weight_offset, use_cache, head_dim, rotary_dim
+):
+    _skip_if_unsupported()
+    torch.manual_seed(1)
+    device = "cuda:0"
+    nnz, hq, hk, theta, eps = 33, 12, 2, 1e4, 1e-6
+    qkv = torch.randn(nnz, hq + hk, head_dim, dtype=dtype, device=device)
+    q, k = qkv[:, :hq], qkv[:, hq:]
+    weight = torch.randn(head_dim, dtype=dtype, device=device) * 0.1
+    pos = torch.randint(0, 4096, (nnz,), dtype=pos_dtype, device=device)
+    cache = _cos_sin_cache(rotary_dim, 4096, theta, device)
+
+    eff_w = weight.float() + weight_offset
+    q_ref, k_ref = ref_fused_qk_norm_rope(
+        q.clone(),
+        k.clone(),
+        eff_w,
+        eff_w,
+        pos,
+        rotary_dim,
+        eps,
+        theta,
+        interleave,
+        True,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+    flashinfer.fused_qk_norm_rope(
+        q,
+        k,
+        weight,
+        weight,
+        pos,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        rope_theta=theta,
+        interleave=interleave,
+        weight_offset=weight_offset,
+        cos_sin_cache=cache if use_cache else None,
+    )
+    rtol, atol = _tolerances(dtype)
+    torch.testing.assert_close(q, q_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(k, k_ref, rtol=rtol, atol=atol)
+
+
+def test_fused_qk_norm_rope_cache_wrong_shape():
+    _skip_if_unsupported()
+    q, k, q_weight, k_weight, pos_ids = _make_inputs()
+    bad_cache = torch.zeros(16, 7, dtype=torch.float32, device=q.device)
+    with pytest.raises(_KERNEL_VALIDATION_EXC):
+        flashinfer.fused_qk_norm_rope(
+            q, k, q_weight, k_weight, pos_ids, cos_sin_cache=bad_cache
+        )
+
+
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_fused_qk_norm_rope_cuda_graph_replay(pos_dtype):
+    _skip_if_unsupported()
+    torch.manual_seed(2)
+    device, dtype = "cuda:0", torch.bfloat16
+    nnz, hq, hk, head_dim, rotary_dim = 8, 16, 2, 128, 64
+    weight = torch.randn(head_dim, dtype=dtype, device=device) * 0.1
+    cache = _cos_sin_cache(rotary_dim, 4096, 1e4, device)
+    pos = torch.randint(0, 4096, (nnz,), dtype=pos_dtype, device=device)
+    src = torch.randn(nnz, hq + hk, head_dim, dtype=dtype, device=device)
+    buf = src.clone()
+
+    def run(x):
+        flashinfer.fused_qk_norm_rope(
+            x[:, :hq],
+            x[:, hq:],
+            weight,
+            weight,
+            pos,
+            rotary_dim=rotary_dim,
+            weight_offset=1.0,
+            cos_sin_cache=cache,
+        )
+
+    run(src.clone())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(buf)
+    for _ in range(2):
+        pos.copy_(torch.randint(0, 4096, (nnz,), dtype=pos_dtype, device=device))
+        buf.copy_(src)
+        graph.replay()
+        expected = src.clone()
+        run(expected)
+        torch.cuda.synchronize()
+        assert torch.equal(buf, expected)
+
+
+def test_fused_qk_norm_rope_cache_wrong_dtype():
+    _skip_if_unsupported()
+    q, k, q_weight, k_weight, pos_ids = _make_inputs()
+    bad_cache = torch.zeros(16, 64, dtype=torch.float16, device=q.device)
+    with pytest.raises(_KERNEL_VALIDATION_EXC):
+        flashinfer.fused_qk_norm_rope(
+            q, k, q_weight, k_weight, pos_ids, rotary_dim=64, cos_sin_cache=bad_cache
+        )
+
+
+@pytest.mark.parametrize("interleave", [True, False])
+def test_fused_qk_norm_rope_cache_matches_apply_rope_with_cos_sin_cache(interleave):
+    _skip_if_unsupported()
+    torch.manual_seed(3)
+    device, dtype = "cuda:0", torch.bfloat16
+    nnz, hq, hk, head_dim, rotary_dim = 17, 8, 2, 128, 64
+    qk = torch.randn(nnz, hq + hk, head_dim, dtype=dtype, device=device)
+    weight = torch.randn(head_dim, dtype=dtype, device=device) * 0.1
+    pos = torch.randint(0, 2048, (nnz,), dtype=torch.int64, device=device)
+    cache = _cos_sin_cache(rotary_dim, 2048, 1e4, device)
+
+    x = qk.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (1.0 + weight.float())
+    ref_q = x[:, :hq].to(dtype).reshape(nnz, hq * head_dim).contiguous()
+    ref_k = x[:, hq:].to(dtype).reshape(nnz, hk * head_dim).contiguous()
+    flashinfer.apply_rope_with_cos_sin_cache_inplace(
+        pos, ref_q, ref_k, head_dim, cache, not interleave
+    )
+    ref = torch.cat([ref_q.view(nnz, hq, head_dim), ref_k.view(nnz, hk, head_dim)], 1)
+    flashinfer.fused_qk_norm_rope(
+        qk[:, :hq],
+        qk[:, hq:],
+        weight,
+        weight,
+        pos,
+        rotary_dim=rotary_dim,
+        interleave=interleave,
+        weight_offset=1.0,
+        cos_sin_cache=cache,
+    )
+    torch.testing.assert_close(qk, ref, rtol=3e-2, atol=3e-2)
