@@ -660,8 +660,8 @@ def test_tp_n_tp_k_without_finalize_reduces_partials():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enable_pdl", (False, True))
-def test_partitioned_finalize_forwards_enable_pdl(enable_pdl):
+@pytest.mark.parametrize(("enable_pdl", "zero_rows"), ((False, True), (True, False)))
+def test_partitioned_finalize_forwards_enable_pdl_and_zero_rows(enable_pdl, zero_rows):
     class Module:
         def trtllm_moe_run_finalize(self, *args):
             self.args = args
@@ -689,43 +689,11 @@ def test_partitioned_finalize_forwards_enable_pdl(enable_pdl):
             num_experts=8,
             do_finalize=True,
             enable_pdl=enable_pdl,
+            zero_rows_without_local_expert=zero_rows,
         )
         == []
     )
     assert module.args[9] is enable_pdl
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("zero_rows", (False, True))
-def test_partitioned_finalize_forwards_zero_rows_option(zero_rows):
-    class Module:
-        def trtllm_moe_run_finalize(self, *args):
-            self.args = args
-
-    module = Module()
-    runner = PrimsTsBf16MoERunner(
-        module,
-        top_k=2,
-        num_local_experts=8,
-        hidden_size=8,
-        intermediate_size=8,
-        num_experts=8,
-    )
-    tensor = torch.empty(0)
-
-    runner._finish_partitioned(
-        gemm2_output=tensor,
-        second_gemm2_output=None,
-        output=tensor,
-        expert_weights=tensor,
-        expanded_idx_to_permuted_idx=torch.empty(0, dtype=torch.int32),
-        total_num_padded_tokens=torch.empty(0, dtype=torch.int32),
-        num_tokens=4,
-        num_experts=8,
-        do_finalize=True,
-        enable_pdl=False,
-        zero_rows_without_local_expert=zero_rows,
-    )
     assert module.args[12] is zero_rows
 
 
