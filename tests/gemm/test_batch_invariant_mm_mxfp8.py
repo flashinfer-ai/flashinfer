@@ -43,7 +43,7 @@ from flashinfer.gemm.batch_invariant.schedule import (
     mx_class_for,
     rank_topk,
 )
-from flashinfer.gemm.batch_invariant.spec import MX_FMTS, chunk_unit
+from flashinfer.gemm.batch_invariant.spec import MXFP8_FMTS, chunk_unit
 
 E4 = torch.float8_e4m3fn
 _supported = torch.cuda.is_available() and bi.is_supported_device(
@@ -216,7 +216,7 @@ def test_chunk_rule_takes_no_m_and_counts_128_element_granules():
 
     params = list(inspect.signature(chunks_for).parameters)
     assert params == ["N", "K", "in_fmt"] and "M" not in params
-    for fmt in MX_FMTS:
+    for fmt in MXFP8_FMTS:
         assert (
             chunk_unit(fmt) == 128
         )  # four 32-element block scales: one scale-factor atom column, a whole number of steps
@@ -251,7 +251,7 @@ def test_block_scaled_spaces():
     )
     assert len(knob_product(in_fmt="mxfp8", cta_chunks=True)) == 640
     assert len(knob_product(in_fmt="mxfp8_k64", cta_chunks=True)) == 808
-    for fmt in MX_FMTS:
+    for fmt in MXFP8_FMTS:
         for k in knob_product(in_fmt=fmt, cta_chunks=True):
             assert k.well_formed(fmt)
             assert not (k.swap_ab or k.cluster_k > 1 or k.b_reuse) or not k.well_formed(
@@ -307,7 +307,7 @@ def test_in_cluster_split_is_not_a_placement_beyond_the_grid_z_limit():
     from flashinfer.gemm.batch_invariant.blocks.operands import MAX_GRID_Z
 
     N, K = 512, 16384
-    for fmt in MX_FMTS:
+    for fmt in MXFP8_FMTS:
         C = chunks_for(N, K, fmt)
         assert C == 2
         ck = next(

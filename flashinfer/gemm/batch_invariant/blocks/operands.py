@@ -24,9 +24,16 @@ from flashinfer.cute_dsl.attention.fmha.helpers import (
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
-from ..spec import BLOCK_SCALED
+from ..spec import BLOCK_SCALED, ELEM_BITS_OF, SF_VEC
 
-SF_BLOCK = 32  # elements per UE8M0 block scale of the MX classes: K is a whole number of blocks
+
+def k_granule(in_fmt: str) -> int:
+    """K of a block-scaled operand is a whole number of block scales and of 16-byte rows: 32 elements for every format."""
+    import math
+
+    row = 128 // ELEM_BITS_OF[in_fmt]  # elements per 16-byte row
+    return SF_VEC[in_fmt] * row // math.gcd(SF_VEC[in_fmt], row)
+
 
 ACC_DTYPE = cutlass.Float32
 IN_DT = {
@@ -35,6 +42,10 @@ IN_DT = {
     "e5m2": cutlass.Float8E5M2,
     "mxfp8": cutlass.Float8E4M3FN,  # the block-scaled classes: e4m3 elements, UE8M0 scales per 32 (blocks/blockscaled.py)
     "mxfp8_k64": cutlass.Float8E4M3FN,
+    "nvfp4": cutlass.Float4E2M1FN,  # e2m1 elements packed two per byte: the kernel views the byte operands as fp4
+    "nvfp4_k128": cutlass.Float4E2M1FN,
+    "mxfp4": cutlass.Float4E2M1FN,
+    "mxfp4_k128": cutlass.Float4E2M1FN,
 }
 OUT_DT = {
     "bf16": cutlass.BFloat16,
@@ -48,6 +59,10 @@ ALIGN = {
     "e5m2": 16,
     "mxfp8": 16,
     "mxfp8_k64": 16,
+    "nvfp4": 32,
+    "nvfp4_k128": 32,
+    "mxfp4": 32,
+    "mxfp4_k128": 32,
     "f32": 4,
 }  # elements per 16-byte TMA alignment
 
@@ -309,7 +324,11 @@ def can_implement(
         # number of steps AND of scale-factor atom columns (`spec.chunk_unit`: 128 elements for the MX classes)
         from ..spec import chunk_unit
 
-        if b_major != "k" or K % SF_BLOCK or (chunks > 1 and Kc % chunk_unit(in_fmt)):
+        if (
+            b_major != "k"
+            or K % k_granule(in_fmt)
+            or (chunks > 1 and Kc % chunk_unit(in_fmt))
+        ):
             return False
         if knobs.swap_ab:
             # the decode specialisation: the kernel's M is N (the weights), its N is M (the tokens), all tokens in one

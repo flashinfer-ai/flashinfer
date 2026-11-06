@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Block-scaled blocks: the dense blocks with scale-factor operands, for the MXFP8 classes.
+"""Block-scaled blocks: the dense blocks with scale-factor operands, for the MXFP8, NVFP4 and MXFP4 classes.
 
 The classes ``gemm.mxfp8.kfold`` / ``gemm.mxfp8.kchunk[C]`` (the sm_100 / sm_103 instruction) and ``gemm.mxfp8.kfold64`` /
 ``gemm.mxfp8.kchunk64[C]`` (the sm_107 instruction) are the dense K fold with a different opaque step: one
@@ -23,6 +23,8 @@ it, never in software (``spec.kslice_leaf``). What this file adds to the dense b
   instruction;
 * :class:`BlockScaledGemm`: the kernel composing them with the dense epilogue block (the unscaled chain of
   ``mm_mxfp8``: one ``cvt.rn``; the in-CTA chunk fold of the split classes exactly as in the dense body);
+  :class:`ScaledBlockScaledGemm` the same body with the alpha chain of the 4-bit classes (``mm_fp4``'s scalar: one
+  ``mul.rn``, then the conversion), on byte-packed e2m1 operands viewed as fp4 (:func:`fp4_view`);
 * the **in-cluster split** (``Knobs.cluster_k = C > 1``): the ``C`` CTAs of a ``(C, 1, 1)`` cluster each fold one K chunk
   (``k_tile0 = rank * k_tiles / C``: the class ``kchunk[C]``, exactly what the workspace split computes), and
   :func:`blockscaled_cluster_epilogue_loop` folds the fp32 partials **in chunk order from +0 with add.rn** through a
@@ -84,6 +86,10 @@ from .operands import (
 )
 
 E8M0_DTYPE = cutlass.Float8E8M0FNU  # the MX block scale
+E4M3_DTYPE = cutlass.Float8E4M3FN  # the NVFP4 block scale (and the MXFP8 element)
+FP4_DTYPE = (
+    cutlass.Float4E2M1FN
+)  # the 4-bit element, two per byte in the operands the API hands over
 SF_ATOM_BYTES = (
     SF_ATOM_ROWS * SF_ATOM_KBLOCKS
 )  # one scale-factor atom: 128 rows x 4 K-blocks
@@ -350,16 +356,17 @@ class BlockScaledPlan:
         return num_ab, num_c
 
 
-class BlockScaledPlanK64(BlockScaledPlan):
-    """The plan on the sm_107 MXFP8 instruction (``SM107BlockScaledMmaMXF8F6F4Op``: ``kind::mxf8f6f4.block_scale`` with
-    K = 64 e4m3 elements per step, two UE8M0 scales per row and step; the class ``gemm.mxfp8.kfold64``). A wider step folds
-    more products before the accumulator is updated, so it is a different per-element fold from the sm_100 step: a new
-    consistency class, not a placement. What differs from the base plan, all host-side and all placements but the
-    instruction itself: the tiled MMAs from ``rubin_helpers`` at the instruction shape ``(inst_m, tn, 64)`` with the
-    collector ops of the B-reuse record; two instructions per 128-byte stage (the lowering's inner radix 2); the sm_107
-    TMEM (576 columns: two accumulator stages fit next to the scale factors at every tile N) and the allocation of the
-    whole 576 when the need exceeds 512; the epilogue tile of the Rubin block-scaled example; the smem -> TMEM
-    scale-factor copy partitioned on the MN-broadcast view (``S2T_BROADCAST``)."""
+class BlockScaledPlanSM107(BlockScaledPlan):
+    """The plan on the sm_107 block-scaled instructions (``kind::mxf8f6f4.block_scale`` with K = 64 e4m3 elements per step,
+    two UE8M0 scales per row and step, for ``gemm.mxfp8.kfold64``; ``kind::mxf4nvf4.block_scale`` with K = 128 e2m1
+    elements per step for ``gemm.nvfp4.kfold128`` and ``gemm.mxfp4.kfold128``). A wider step folds more products before
+    the accumulator is updated, so it is a different per-element fold from the sm_100 step: a new consistency class, not
+    a placement. What differs from the base plan, all host-side and all placements but the instruction itself: the tiled
+    MMAs from ``rubin_helpers`` at the instruction shape ``(inst_m, tn, INST_K)`` with the collector ops of the B-reuse
+    record; two instructions per 128-byte stage (the lowering's inner radix 2); the sm_107 TMEM (576 columns: two
+    accumulator stages fit next to the scale factors at every tile N) and the allocation of the whole 576 when the need
+    exceeds 512; the epilogue tile of the Rubin block-scaled example; the smem -> TMEM scale-factor copy partitioned on
+    the MN-broadcast view (``S2T_BROADCAST``). The format hooks name the class."""
 
     IN_FMT = "mxfp8_k64"
     INST_K = 64
@@ -418,7 +425,65 @@ class BlockScaledPlanK64(BlockScaledPlan):
         return cols if cols <= 512 else TMEM_COLS_SM107
 
 
-PLANS = {"mxfp8": BlockScaledPlan, "mxfp8_k64": BlockScaledPlanK64}
+BlockScaledPlanK64 = (
+    BlockScaledPlanSM107  # the sm_107 MXFP8 plan: its format hooks are the base's
+)
+
+
+class BlockScaledPlanNVFP4(BlockScaledPlan):
+    """e2m1 x e2m1 with e4m3 block scales per 16 elements: the sm_100 / sm_103 ``kind::mxf4nvf4`` instruction, K = 64."""
+
+    IN_FMT = "nvfp4"
+    A_DT = FP4_DTYPE
+    B_DT = FP4_DTYPE
+    SF_DT = E4M3_DTYPE
+    SF_VEC = SF_VEC["nvfp4"]
+    INST_K = 64
+
+
+class BlockScaledPlanNVFP4K128(BlockScaledPlanSM107):
+    """e2m1 x e2m1 with e4m3 block scales per 16: the sm_107 ``kind::mxf4nvf4`` instruction, K = 128 (eight scales per
+    row and step)."""
+
+    IN_FMT = "nvfp4_k128"
+    A_DT = FP4_DTYPE
+    B_DT = FP4_DTYPE
+    SF_DT = E4M3_DTYPE
+    SF_VEC = SF_VEC["nvfp4_k128"]
+    INST_K = 128
+
+
+class BlockScaledPlanMXFP4(BlockScaledPlan):
+    """e2m1 x e2m1 with UE8M0 block scales per 32 elements: the sm_100 / sm_103 ``kind::mxf4`` instruction, K = 64."""
+
+    IN_FMT = "mxfp4"
+    A_DT = FP4_DTYPE
+    B_DT = FP4_DTYPE
+    SF_DT = E8M0_DTYPE
+    SF_VEC = SF_VEC["mxfp4"]
+    INST_K = 64
+
+
+class BlockScaledPlanMXFP4K128(BlockScaledPlanSM107):
+    """e2m1 x e2m1 with UE8M0 block scales per 32: the sm_107 ``kind::mxf4nvf4`` instruction at that scale, K = 128 (four
+    scales per row and step)."""
+
+    IN_FMT = "mxfp4_k128"
+    A_DT = FP4_DTYPE
+    B_DT = FP4_DTYPE
+    SF_DT = E8M0_DTYPE
+    SF_VEC = SF_VEC["mxfp4_k128"]
+    INST_K = 128
+
+
+PLANS = {
+    "mxfp8": BlockScaledPlan,
+    "mxfp8_k64": BlockScaledPlanK64,
+    "nvfp4": BlockScaledPlanNVFP4,
+    "nvfp4_k128": BlockScaledPlanNVFP4K128,
+    "mxfp4": BlockScaledPlanMXFP4,
+    "mxfp4_k128": BlockScaledPlanMXFP4K128,
+}
 
 
 class BlockScaledTmaSetup:
@@ -504,6 +569,19 @@ class BlockScaledTmaSetup:
         self.atom_c, self.tensor_c = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(), c, epi_smem, st.epi_tile
         )
+
+
+def fp4_view(t: cute.Tensor) -> cute.Tensor:
+    """The byte-packed ``(rows, K / 2, L)`` uint8 operand (two e2m1 values per byte, K contiguous) as the ``(rows, K, L)`` fp4
+    tensor the block-scaled TMA reads: the same bytes, the row and batch strides counted in elements (a view, no data moves)."""
+    s0, _, s2 = t.layout.stride
+    ptr = cute.recast_ptr(t.iterator, dtype=FP4_DTYPE)
+    return cute.make_tensor(
+        ptr,
+        cute.make_layout(
+            (t.shape[0], t.shape[1] * 2, t.shape[2]), stride=(s0 * 2, 1, s2 * 2)
+        ),
+    )
 
 
 def sf_view(sf: cute.Tensor, rows, k, l, vec: int, sf_dtype=E8M0_DTYPE):
@@ -1141,14 +1219,15 @@ def blockscaled_cluster_epilogue_loop(
 
 
 class BlockScaledGemm:
-    """``C[m, n, l] = cvt(sum_k MMA(A, SFA, B, SFB))``: the MXFP8 kernel for the knobs; M, N, K dynamic, L static (1, or the
-    chunk count of the split class). Operands: A ``(M, K, L)`` and B ``(N, K, L)`` e4m3 (K contiguous), their scale factors
-    as flat uint8 buffers in the 128x4 swizzled layout, C ``(M, N, L)`` row-major. ``in_fmt`` selects the plan, hence the
-    instruction (``mxfp8``: sm_100 / sm_103; ``mxfp8_k64``: sm_107). With ``knobs.cta_chunks`` (the in-CTA chunk fold of
-    the split class) A, B and their scales are the split class's ``(rows, Kc, C)`` views, C has ``L = 1``, and the CTA
-    folds the C chunk partials in order through a TMEM running sum (``blocks/epilogue.py``) before the chain. The chain is
-    the specification's object for the output format: unscaled (``mm_mxfp8`` takes no per-tensor scale); ``alpha`` is the
-    hook of a scaled subclass (``scaled``), None here."""
+    """``C[m, n, l] = cvt(sum_k MMA(A, SFA, B, SFB))``: the block-scaled kernel for the knobs; M, N, K dynamic, L static (1, or
+    the chunk count of the split class). Operands: A ``(M, K, L)`` and B ``(N, K, L)`` e4m3 (K contiguous), or for the 4-bit
+    formats the byte-packed ``(M, K / 2, L)`` / ``(N, K / 2, L)`` uint8 tensors (viewed as fp4 by :func:`fp4_view`), their
+    scale factors as flat uint8 buffers in the 128x4 swizzled layout, C ``(M, N, L)`` row-major. ``in_fmt`` selects the plan,
+    hence the instruction. With ``knobs.cta_chunks`` (the in-CTA chunk fold of the split class) A, B and their scales are the
+    split class's ``(rows, Kc, C)`` views, C has ``L = 1``, and the CTA folds the C chunk partials in order through a TMEM
+    running sum (``blocks/epilogue.py``) before the chain. The chain is the specification's object for the output format:
+    unscaled here (``mm_mxfp8`` takes no per-tensor scale); :class:`ScaledBlockScaledGemm` sets ``scaled`` and takes the
+    4-bit classes' ``alpha``."""
 
     scaled = False
 
@@ -1181,6 +1260,11 @@ class BlockScaledGemm:
     # host side (trace time)
     def _launch(self, a, b, sfa, sfb, c, max_active_clusters, stream, alpha):
         plan_cls = self.plan_cls
+        if cutlass.const_expr(plan_cls.A_DT.width == 4):
+            a, b = (
+                fp4_view(a),
+                fp4_view(b),
+            )  # the API's byte-packed operands as fp4 tensors of the logical K
         sfa_t = sf_view(
             sfa, a.shape[0], a.shape[1], a.shape[2], plan_cls.SF_VEC, plan_cls.SF_DT
         )
@@ -1635,3 +1719,25 @@ class BlockScaledGemm:
         if cutlass.const_expr(C > 1):
             cute.arch.cluster_arrive()  # no CTA leaves while a peer may still address its smem
             cute.arch.cluster_wait()
+
+
+class ScaledBlockScaledGemm(BlockScaledGemm):
+    """``C = cvt(mul.rn(sum_k MMA(A, SFA, B, SFB), alpha))``: the 4-bit classes' body (``mm_fp4``); ``alpha`` is the caller's
+    1-element fp32 tensor, read once per CTA and applied once per element after the whole fold (the epilogue of the direct
+    stores; the workspace split's fixup applies it instead)."""
+
+    scaled = True
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        c: cute.Tensor,
+        alpha: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, alpha)
