@@ -437,9 +437,9 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
     table except ``DX_LONG_CHUNK_STAGES``: its chunks of ``>= DW_LONG_CHUNK_MIN_ROWS`` rows keep the 512-wide dX tile's
     table ring.  At the same SM count (B300 148, R200 212 and 216) its plans are the ``sm_103a`` plans but for that
     ring depth (the C 4096 plans are the same), and its record registers every form they launch.  The zero-gradient
-    row skip is not a GEMM tile rule: ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` has no ``sm_107a`` entry, so ``sm_107a`` keeps
-    the generic 4097-row floor, and ``DX_COUNTED_MIN_SLICES_BY_ARCH`` has none, so its counted plans keep the slice
-    rule's dX counts."""
+    row skip is not a GEMM tile rule: ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` gives ``sm_107a`` its own floor (1946 valid
+    rows; ``sm_103a``: 3891), and ``DX_COUNTED_MIN_SLICES_BY_ARCH`` the ``sm_103a`` two-slice counted dX, so its
+    counted plans take the ``sm_103a`` dX slices and its record registers every counted form they launch."""
     b = cake_backend
     for table in (
         b.RASTER_WIDE_GROUPS,
@@ -459,8 +459,12 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
     for table in (b.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES, b.DX_WIDE_MIN_EFF):
         assert "sm_103a" not in table and "sm_107a" not in table, table
     assert b.DX_LONG_CHUNK_STAGES == {"sm_100a": 3, "sm_103a": 3}
-    assert "sm_107a" not in b.ZERO_DLOGP_MIN_ROWS_BY_ARCH
-    assert "sm_107a" not in b.DX_COUNTED_MIN_SLICES_BY_ARCH
+    assert b.ZERO_DLOGP_MIN_ROWS_BY_ARCH["sm_107a"] == 1946
+    assert (
+        b.DX_COUNTED_MIN_SLICES_BY_ARCH["sm_107a"]
+        == b.DX_COUNTED_MIN_SLICES_BY_ARCH["sm_103a"]
+        == 2
+    )
     assert b.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
     sm107 = next(n for n, r in cake_jit.MODULES.items() if r["arch"] == "sm_107a")
     registered = set(cake_jit.registered_stages(sm107))
@@ -510,6 +514,15 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
                 case,
                 sorted(set(p107.stages) - registered),
             )
+            if entry == "logprob":
+                c103 = b.make_plan(problem, arch="sm_103a", dcnt=True, **kw)
+                c107 = b.make_plan(problem, arch="sm_107a", dcnt=True, **kw)
+                assert c107.dcnt == c103.dcnt, case
+                assert c107.dx_slices == c103.dx_slices, case
+                assert set(c107.stages) <= registered, (
+                    case,
+                    sorted(set(c107.stages) - registered),
+                )
     assert long_ring, "no C 8192 chunk took the sm_103a long-chunk ring"
 
 
@@ -7066,15 +7079,16 @@ def test_zero_dlogp_floor_switch():
 def test_zero_dlogp_floor_per_architecture(monkeypatch):
     """The skip's default floor is per architecture: ``zero_dlogp_min_rows(index)`` reads the device's architecture
     once per device index and returns its floor in ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` (sm_100a: 1946 valid rows,
-    sm_103a: 3891), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and without a
-    device.  An override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device; the setter
-    returns ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every returned value
-    passed back restores the previous state exactly."""
+    sm_103a: 3891, sm_107a: 1946), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and
+    without a device.  An override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device;
+    the setter returns ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every
+    returned value passed back restores the previous state exactly."""
     sentinel = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
     assert cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
     assert cake_backend.ZERO_DLOGP_MIN_ROWS_BY_ARCH == {
         "sm_100a": 1946,
         "sm_103a": 3891,
+        "sm_107a": 1946,
     }
     assert repr(sentinel) == "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
     archs = {0: "sm_100a", 1: "sm_103a", 2: "sm_107a", 3: None}
@@ -7087,7 +7101,7 @@ def test_zero_dlogp_floor_per_architecture(monkeypatch):
     monkeypatch.setattr(cake_backend, "arch_for", arch_for)
     monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_ARCH", {})
     monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_MIN_ROWS", {"rows": sentinel})
-    defaults = {0: 1946, 1: 3891, 2: 4097, 3: 4097}
+    defaults = {0: 1946, 1: 3891, 2: 1946, 3: 4097}
 
     def floors():
         return {index: cake_backend.zero_dlogp_min_rows(index) for index in archs}
@@ -7241,15 +7255,15 @@ def _assert_counted_twin(plan, plain, arch, case=None):
 
 def test_counted_plan_runs_no_one_slice_dx_chunk():
     """Under the zero-gradient row skip (``make_plan(dcnt=True)``) a plan on an architecture of
-    ``DX_COUNTED_MIN_SLICES_BY_ARCH`` (sm_100a and sm_103a: two slices) runs no one-slice dX chunk: each chunk the slice
-    rule gives one slice (naturally, or below ``dx_red_min_rows``) runs the counted two-slice K-sliced reduction, every
-    other chunk, slice count and knob as the slice rule plans it, and the architecture's record registers every form
-    of the plan.  sm_107a keeps the slice rule's counts.  The plan without the skip keeps the slice rule's counts
+    ``DX_COUNTED_MIN_SLICES_BY_ARCH`` (sm_100a, sm_103a and sm_107a: two slices) runs no one-slice dX chunk: each chunk
+    the slice rule gives one slice (naturally, or below ``dx_red_min_rows``) runs the counted two-slice K-sliced
+    reduction, every other chunk, slice count and knob as the slice rule plans it, and the architecture's record
+    registers every form of the plan.  The plan without the skip keeps the slice rule's counts
     (:func:`plan_dx_slices`) on every architecture.  The counts stay the slice rule's under an explicit dX ``k_slices``
     (a count, or ``None`` = one slice), on a record that serves one slice and at a vocabulary of one K step; the
     backward binding key tells the skip and a dX slice pin apart."""
     b = cake_backend
-    assert b.DX_COUNTED_MIN_SLICES_BY_ARCH == {"sm_100a": 2, "sm_103a": 2}
+    assert b.DX_COUNTED_MIN_SLICES_BY_ARCH == {"sm_100a": 2, "sm_103a": 2, "sm_107a": 2}
     g = b.Geometry.from_record({"geometry": {"hidden": GLM_H, "vocab": GLM_V}})
     common = dict(
         need_dx=True,
@@ -7307,7 +7321,7 @@ def test_counted_plan_runs_no_one_slice_dx_chunk():
             raised[arch] += sum(
                 x != y for x, y in zip(plan.dx_slices, plain.dx_slices, strict=True)
             )
-    assert raised["sm_100a"] and raised["sm_103a"] and not raised["sm_107a"], raised
+    assert raised["sm_100a"] and raised["sm_103a"] and raised["sm_107a"], raised
     problem = _keep_problem(8117, GLM_H, GLM_V, 4096, entry="logprob")
     tiny_g = b.Geometry.from_record({"geometry": {"hidden": GLM_H, "vocab": g.k_block}})
     tiny = _keep_problem(8117, GLM_H, g.k_block, 4096, entry="logprob")
@@ -7812,8 +7826,8 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
     the loss entry's forward all four.  Every launch and host step of a binding's forward / backward sequence finds
     every value it binds when only that sequence's scratch slots are present, and the remembered calls give the first
     call's bits.  The log-probability cases set the zero-gradient row skip's floor: ``logprob_skip`` runs it (``0``),
-    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a the
-    default floor (1946 valid rows) would put both sizes on the skip."""
+    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a and
+    sm_107a the default floor (1946 valid rows) would put both sizes on the skip."""
     _require_program(entry="loss" if case.startswith("loss") else "logprob")
     objective = "policy" if case == "loss_policy" else "ce"
     inp = _device_inputs(T, objective, W=glm_weight)
@@ -7876,8 +7890,8 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
 
 def test_device_zero_dlogp_default_floor_per_architecture(glm_weight, monkeypatch):
     """Without an override a one-chunk log-probability backward runs the skip from this device's default floor on
-    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a, 3891 on sm_103a, else 4097): a backward of one row
-    fewer runs without it (the zero rows' ``dX`` zeros either way)."""
+    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a and sm_107a, 3891 on sm_103a, else 4097): a backward
+    of one row fewer runs without it (the zero rows' ``dX`` zeros either way)."""
     _require_zero_dlogp_skip()
     index = torch.cuda.current_device()
     _module_name, record = cake_backend.record_for(CUDA)
@@ -8185,8 +8199,8 @@ ZERO_DLOGP_RAISED_CASES = [
 @pytest.mark.parametrize("mode, T, kind", ZERO_DLOGP_RAISED_CASES, ids=str)
 def test_device_zero_dlogp_raised_dx_slices(glm_weight, mode, T, kind):
     """Under the skip the backward's plan runs each dX chunk at the architecture's counted slice count at least
-    (``DX_COUNTED_MIN_SLICES_BY_ARCH``: two on sm_100a and sm_103a; sm_107a keeps the slice rule's counts) and the
-    backward without the skip the slice rule's counts; every chunk of more than one slice launches its counted form.
+    (``DX_COUNTED_MIN_SLICES_BY_ARCH``: two on sm_100a, sm_103a and sm_107a) and the backward without the skip the
+    slice rule's counts; every chunk of more than one slice launches its counted form.
     The results pass the skip suite's checks on the binding and the remembered binding: ``logp`` the bits of the
     backward without the skip; the zero and ignored rows' ``dX`` exact ``+0``; the live rows' ``dX`` within one BF16
     rounding of the backward without the skip; ``dW`` bitwise without zero rows (the forward's row order); the
