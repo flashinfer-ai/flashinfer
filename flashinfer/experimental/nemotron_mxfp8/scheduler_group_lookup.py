@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Opt-in NT4 static scheduler with the original grouped FC1/FC2 work order.
+"""Opt-in Nemotron static scheduler with the original grouped FC1/FC2 work order.
 
 A scheduler warp builds four 128-entry prefix/count arrays after routing counts
 are ready. Direct searches replace per-work traversal through expert groups.

@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# Owned NT4 adaptation of the matching kernel-team drop file.
+# Owned Nemotron adaptation of the matching kernel-team drop file.
 # Upstream snapshot: 50d583aa0. See README.md for provenance.
 # Extracted from research commit 52e7da3f4; GPU parity must be requalified.
 """
-Fused FC1/clamped squared ReLU/FC2 MXFP8 kernel for NT4 on SM103.
+Fused FC1/clamped squared ReLU/FC2 MXFP8 kernel for Nemotron on SM103.
 """
 
 from typing import Optional, Tuple, Type, Union
@@ -64,7 +64,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
     GateUpInterleave: int = 32
 
     def __init__(self, group_hint: int) -> None:
-        # Fixed NT4 geometry; the public plan validates the device and tensors.
+        # Fixed Nemotron geometry; the public plan validates the device and tensors.
         self.ab_dtype = cutlass.Float8E4M3FN
         self.c_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -386,7 +386,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
     #
     # No-op base implementations for the lean fc1+fc2 path.  Mirroring the
     # identically-named stubs in the NVFP4 base (``kernel_fc12.py``).
-    # ``Sm100Nt4MegaMoEMxfp8Kernel`` (megamoe_kernel_mxfp8.py) overrides all of
+    # ``Sm100NemotronMegaMoEMxfp8Kernel`` (megamoe_kernel_mxfp8.py) overrides all of
     # them to delegate to ``src/token_comm.py``.
 
     def token_comm_extra_smem_storage_class(self) -> type:
@@ -480,7 +480,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         token_comm_args=None,
         fc1_c: Optional[cute.Tensor] = None,
     ) -> None:
-        """Launch the fused NT4 MXFP8 expert kernel."""
+        """Launch the fused Nemotron MXFP8 expert kernel."""
 
         # Bind data-tensor shapes to codegen-time expert dims when requested.
         # Strides, token rows, and SF tensors stay runtime-dynamic because they
@@ -1020,7 +1020,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         tma_tensor_c: Optional[cute.Tensor] = None,
         token_comm_args=None,
     ):
-        """Persistent NT4 compute with four epilogue and four dispatch warps.
+        """Persistent Nemotron compute with four epilogue and four dispatch warps.
 
         The epilogue owns accumulator consumption, TMA drains and FC1 readiness
         publication; the detached tail resets dispatch state after all CTAs exit.

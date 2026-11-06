@@ -1,9 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# Owned NT4 adaptation of the matching kernel-team drop file.
+# Owned Nemotron adaptation of the matching kernel-team drop file.
 # Upstream snapshot: 50d583aa0. See README.md for provenance.
 # Extracted from research commit 52e7da3f4; GPU parity must be requalified.
-"""Fused NT4 clamped-ReLU2, MXFP8 quantization and FC2 epilogue."""
+"""Fused Nemotron clamped-ReLU2, MXFP8 quantization and FC2 epilogue."""
 
 from typing import Optional, Tuple, Type
 

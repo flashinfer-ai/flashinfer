@@ -10,9 +10,10 @@ from unittest.mock import patch
 import torch
 
 _PATH = (
-    Path(__file__).resolve().parents[3] / "flashinfer/experimental/nt4_mxfp8/plan.py"
+    Path(__file__).resolve().parents[3]
+    / "flashinfer/experimental/nemotron_mxfp8/plan.py"
 )
-_SPEC = importlib.util.spec_from_file_location("nt4_plan_test.plan", _PATH)
+_SPEC = importlib.util.spec_from_file_location("nemotron_plan_test.plan", _PATH)
 plan_module = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = plan_module
 _SPEC.loader.exec_module(plan_module)
@@ -96,14 +97,14 @@ class ContractTest(unittest.TestCase):
             "cuda": cuda,
             "cuda.bindings": bindings,
             "cuda.bindings.driver": driver,
-            "nt4_plan_test.megamoe_kernel_mxfp8": glue,
+            "nemotron_plan_test.megamoe_kernel_mxfp8": glue,
         }
         x = torch.zeros(2, 768, dtype=torch.bfloat16)
         ids = torch.zeros(2, 10, dtype=torch.int64)
         probs, out = torch.zeros(2, 10), torch.empty(2, 768)
         with (
             patch.dict(sys.modules, modules),
-            patch.object(plan_module, "__package__", "nt4_plan_test"),
+            patch.object(plan_module, "__package__", "nemotron_plan_test"),
             patch.object(plan_module, "_cute", side_effect=lambda x: x),
             patch.object(torch.cuda, "current_device", return_value=None),
             patch.object(

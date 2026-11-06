@@ -1,4 +1,4 @@
-# NT4 MXFP8 local experts
+# Nemotron MXFP8 local experts
 
 Experimental GB300/SM103 operator for hidden size 768, intermediate size 4096,
 128 local experts, 512 global experts and top-k 10. Owner: helenn.
@@ -6,14 +6,14 @@ It owns local kernels and workspace; the caller owns NVLS gather/reduce-scatter.
 There is no distributed initialization, MCore dependency or automatic dispatch.
 
 ```python
-from flashinfer.fused_moe.nt4_mxfp8 import (
-    pack_nt4_mxfp8_weights,
-    prepare_nt4_mxfp8_local_experts,
+from flashinfer.fused_moe.nemotron_mxfp8 import (
+    pack_nemotron_mxfp8_weights,
+    prepare_nemotron_mxfp8_local_experts,
 )
 
 # Select the CUDA device first. Pack once per layer, before graph capture.
-weights = pack_nt4_mxfp8_weights(w1, s1, w2, s2)
-plan = prepare_nt4_mxfp8_local_experts(
+weights = pack_nemotron_mxfp8_weights(w1, s1, w2, s2)
+plan = prepare_nemotron_mxfp8_local_experts(
     weights,
     max_tokens=4 * local_capacity,
     local_expert_offset=128 * ep_rank,
@@ -56,15 +56,15 @@ data padding 64 and scale padding 128. Pipeline stage calculation is unchanged.
 
 ## Validation and provenance
 
-Run `python tests/experimental/nt4_mxfp8/test_plan_contract.py` for CPU contracts,
-`python tests/experimental/nt4_mxfp8/test_gpu.py` for SM103 reference/replay tests,
-and `python examples/experimental/nt4_local_experts.py` for a synthetic example.
+Run `python tests/experimental/nemotron_mxfp8/test_plan_contract.py` for CPU contracts,
+`python tests/experimental/nemotron_mxfp8/test_gpu.py` for SM103 reference/replay tests,
+and `python examples/experimental/nemotron_local_experts.py` for a synthetic example.
 The example is not a representative performance benchmark.
 
 Adapted from research commit `52e7da3f4791f059b5840d4ec210c7556b70c421`, using
 kernel-team snapshot `50d583aa0` and FlashInfer's existing shared primitives.
 Unchanged MXFP8 kernel/epilogue methods and the FC2 destination descriptor are
-reused directly; this package contains the NT4-specific overrides.
+reused directly; this package contains the Nemotron-specific overrides.
 The vendor `src/` drop is unchanged. Research timing/debug paths are excluded. Private kernels are specialized to the
 fixed local-expert configuration: no standalone FC1/FC2 diagnostics, alternate
 geometry, quantized combine output or in-kernel top-k reduction. The fused

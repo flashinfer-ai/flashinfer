@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Own compilation, scratch storage and launches for NT4 local experts."""
+"""Own compilation, scratch storage and launches for Nemotron local experts."""
 
 from dataclasses import dataclass
 
@@ -109,7 +109,7 @@ class LocalExpertPlan:
             256,
             384,
         ):
-            raise ValueError("NT4 EP4 requires expert offset 0, 128, 256, or 384")
+            raise ValueError("Nemotron EP4 requires expert offset 0, 128, 256, or 384")
         if (
             type(workers) is not int
             or workers <= 0
@@ -120,11 +120,11 @@ class LocalExpertPlan:
         if type(hardware_tanh) is not bool:
             raise ValueError("hardware_tanh must be a bool")
         if not isinstance(weights, PackedWeights):
-            raise TypeError("weights must come from pack_nt4_mxfp8_weights")
+            raise TypeError("weights must come from pack_nemotron_mxfp8_weights")
         device = weights.fc1.device
         _check_device(device)
         if torch.cuda.get_device_capability(device) != (10, 3):
-            raise ValueError("this NT4 candidate targets GB300 / SM103")
+            raise ValueError("this Nemotron candidate targets GB300 / SM103")
         if workers > torch.cuda.get_device_properties(device).multi_processor_count:
             raise ValueError("worker count exceeds the device SM count")
         for tensor, shape, dtype, name in (
@@ -161,7 +161,7 @@ class LocalExpertPlan:
         import cutlass.cute as cute
         from src.inputs_process import DataPreprocess
         from src.sym_buffer import SymBufferHost
-        from .megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
+        from .megamoe_kernel_mxfp8 import Sm100NemotronMegaMoEMxfp8Kernel
 
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
@@ -172,7 +172,7 @@ class LocalExpertPlan:
         self._sf = empty((max_tokens, 24), torch.float8_e8m0fnu)
         self._ids = empty((max_tokens, 10), torch.int64)
         self._probs = empty((max_tokens, 10), torch.float32)
-        self._kernel = Sm100Nt4MegaMoEMxfp8Kernel(
+        self._kernel = Sm100NemotronMegaMoEMxfp8Kernel(
             group_hint=group_hint,
             max_tokens_per_rank=max_tokens,
             hardware_tanh=hardware_tanh,
@@ -257,7 +257,7 @@ class LocalExpertPlan:
         Values are not scanned on the host. Input/output storage must not overlap.
         """
         if self._closed:
-            raise RuntimeError("NT4 plan is closed")
+            raise RuntimeError("Nemotron plan is closed")
         if torch.cuda.current_device() != self.device.index:
             raise ValueError("select the plan's CUDA device before running")
         for tensor, shape, dtype, name in (
@@ -297,7 +297,7 @@ class LocalExpertPlan:
         synchronization. Consumers must mask loads using the current route IDs.
         """
         if self._closed:
-            raise RuntimeError("NT4 plan is closed")
+            raise RuntimeError("Nemotron plan is closed")
         return self._terms
 
     def close(self):

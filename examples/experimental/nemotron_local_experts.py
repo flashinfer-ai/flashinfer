@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Synthetic SM103 example of native NT4 plan lifetime and graph capture.
+"""Synthetic SM103 example of native Nemotron plan lifetime and graph capture.
 
 This is local computation only, with two live experts; it is not a representative
 MoE performance benchmark. No checkpoint, process group or NVLS is required.
@@ -8,9 +8,9 @@ MoE performance benchmark. No checkpoint, process group or NVLS is required.
 
 import torch
 
-from flashinfer.fused_moe.nt4_mxfp8 import (
-    pack_nt4_mxfp8_weights,
-    prepare_nt4_mxfp8_local_experts,
+from flashinfer.fused_moe.nemotron_mxfp8 import (
+    pack_nemotron_mxfp8_weights,
+    prepare_nemotron_mxfp8_local_experts,
 )
 
 
@@ -23,8 +23,8 @@ def main():
     w2[:2].copy_((torch.randn((2, 768, 4096), device="cuda") / 64).to(w2.dtype))
     s1 = torch.full((128, 4096, 24), 127, dtype=torch.uint8, device="cuda")
     s2 = torch.full((128, 768, 128), 127, dtype=torch.uint8, device="cuda")
-    weights = pack_nt4_mxfp8_weights(w1, s1, w2, s2)
-    plan = prepare_nt4_mxfp8_local_experts(
+    weights = pack_nemotron_mxfp8_weights(w1, s1, w2, s2)
+    plan = prepare_nemotron_mxfp8_local_experts(
         weights, max_tokens=128, local_expert_offset=0
     )
     x = torch.randn((128, 768), dtype=torch.bfloat16, device="cuda")

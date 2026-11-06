@@ -15,7 +15,7 @@ def quantized_values(x):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires GB300 / SM103")
-class NativeNt4Test(unittest.TestCase):
+class NativeNemotronTest(unittest.TestCase):
     def setUp(self):
         self.original_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -26,9 +26,9 @@ class NativeNt4Test(unittest.TestCase):
     def test_reference_poison_and_changed_route_graph(self):
         if torch.cuda.get_device_capability() != (10, 3):
             self.skipTest("requires GB300 / SM103")
-        from flashinfer.fused_moe.nt4_mxfp8 import (
-            pack_nt4_mxfp8_weights,
-            prepare_nt4_mxfp8_local_experts,
+        from flashinfer.fused_moe.nemotron_mxfp8 import (
+            pack_nemotron_mxfp8_weights,
+            prepare_nemotron_mxfp8_local_experts,
         )
 
         torch.manual_seed(17)
@@ -46,13 +46,13 @@ class NativeNt4Test(unittest.TestCase):
         w2[1].zero_()
         s1.copy_((126 + torch.arange(24, device="cuda") % 3).to(torch.uint8))
         s2.copy_((126 + torch.arange(128, device="cuda") % 3).to(torch.uint8))
-        weights = pack_nt4_mxfp8_weights(w1, s1, w2, s2)
+        weights = pack_nemotron_mxfp8_weights(w1, s1, w2, s2)
         x = torch.randn((9, 768), device="cuda", dtype=torch.bfloat16)
         ids = torch.full((9, 10), -1, device="cuda", dtype=torch.int64)
         ids[:, 0], ids[:, 1] = 256, 383
         probs = torch.rand((9, 10), device="cuda")
         out = torch.empty((9, 768), device="cuda")
-        plan = prepare_nt4_mxfp8_local_experts(
+        plan = prepare_nemotron_mxfp8_local_experts(
             weights, max_tokens=9, local_expert_offset=256
         )
         expected = torch.zeros_like(out)
@@ -91,7 +91,7 @@ class NativeNt4Test(unittest.TestCase):
             plan.run(x, ids, probs, out=out)
         graph.replay()
         torch.testing.assert_close(out, eager, rtol=0, atol=0)
-        other = prepare_nt4_mxfp8_local_experts(
+        other = prepare_nemotron_mxfp8_local_experts(
             weights, max_tokens=1, local_expert_offset=256
         )
         other.run(x[:1], ids[:1], probs[:1], out=torch.empty((1, 768), device="cuda"))
@@ -112,7 +112,7 @@ class NativeNt4Test(unittest.TestCase):
             torch.testing.assert_close(out, changed, rtol=0, atol=0)
         # Multiple lookup groups, >128 tokens in one expert, all local experts,
         # and remote routes. Poisoning catches missing contribution writes.
-        dense = prepare_nt4_mxfp8_local_experts(
+        dense = prepare_nemotron_mxfp8_local_experts(
             weights, max_tokens=129, local_expert_offset=256
         )
         dx = torch.randn((129, 768), device="cuda", dtype=torch.bfloat16)

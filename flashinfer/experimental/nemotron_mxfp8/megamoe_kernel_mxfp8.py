@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# Owned NT4 adaptation of the matching kernel-team drop file.
+# Owned Nemotron adaptation of the matching kernel-team drop file.
 # Upstream snapshot: 50d583aa0. See README.md for provenance.
 # Extracted from research commit 52e7da3f4; GPU parity must be requalified.
 """Local MXFP8 dispatch, fused FC1/activation/FC2, and detached cleanup.
@@ -45,11 +45,11 @@ from moe_nvfp4_swapab.megamoe_kernel import (
 )
 
 # =============================================================================
-# Sm100Nt4MegaMoEMxfp8Kernel
+# Sm100NemotronMegaMoEMxfp8Kernel
 # =============================================================================
 
 
-class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
+class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
     """MegaMoE-complete fused dispatch + fc1 + fc2 + combine kernel (MXFP8)."""
 
     def __init__(
