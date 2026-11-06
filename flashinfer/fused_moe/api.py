@@ -2763,9 +2763,15 @@ class SM12xNvfp4Config:
     scales are taken from the optional view keys ``"w1_input_global_scale"``
     and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
     ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
-    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
-    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
-    supported.
+    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default alpha
+    and beta and a finite positive limit, ``SiTU`` with a finite linear
+    scale and no clamp limit, and ``ReLU2``. On 188-SM devices, compatible
+    calls select between the monolithic kernel and native modular operators
+    by shape. Non-default SwiGLU limits, SiTU and explicit PDL requests use
+    the modular operators; gated calls to those operators require
+    ``intermediate_size % 128 == 0``. Default SwiGLU retains the monolithic
+    path when only 64-column alignment is available. Expert parallelism and
+    fused shared experts are not supported.
     """
 
     @classmethod
