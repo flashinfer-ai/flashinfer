@@ -17,6 +17,7 @@ limitations under the License.
 import ast
 import contextlib
 import dataclasses
+import gc
 import re
 import threading
 from collections import OrderedDict
@@ -5565,6 +5566,14 @@ def test_router_split_rules_are_measured_windows_and_resolve_by_device():
     SMs) and a ``kk`` / ``nn_t`` row in the T 16129-16384 window; ``router_splits`` returns it inside the window
     and the layout's default outside it, for another SM count or N, and without a device."""
     assert ROUTER_SPLIT_RULES
+    # the measured rows and their counts, pinned here rather than read from the table under test
+    assert {key: windows[0][2] for key, windows in ROUTER_SPLIT_RULES.items()} == {
+        ("sm_100a", 148, "nn_t", 5120): 9,
+        ("sm_100a", 152, "nn_t", 5120): 9,
+        ("sm_103a", 148, "nn_t", 5120): 9,
+        ("sm_103a", 152, "nn_t", 5120): 9,
+    }
+    assert all(len(windows) == 1 for windows in ROUTER_SPLIT_RULES.values())
     for (arch, sm_count, layout, H), windows in ROUTER_SPLIT_RULES.items():
         assert arch in ("sm_100a", "sm_103a") and sm_count in (148, 152), arch
         assert layout in ("kk", "nn_t") and H in (4096, 5120, 6144), layout
@@ -6156,7 +6165,7 @@ def test_convenience_plan_entry_rolls_back_a_failed_plan_and_rechecks_the_cache(
 
 def test_convenience_router_launch_holds_the_arena_lock(monkeypatch):
     """The K2 hit path holds its arena's lock from the carve of the workspace views through the launch and the
-    split-K reduction (CPU stand-ins for the device, the stream and the FFI entry)."""
+    split-K reduction (CPU stand-ins for the device and its facts, the stream and the FFI entry)."""
     monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
     monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
     monkeypatch.setattr(cake_backend, "_ARENAS", {})
@@ -6172,6 +6181,10 @@ def test_convenience_router_launch_holds_the_arena_lock(monkeypatch):
     cached.entry = entry_call
     key = convenience_key(0, 7, (4,), v["A"], v["B"], v["out"])
     cake_backend._K2_CACHE[key] = cached
+    facts = cake_backend.DeviceFacts(
+        index=0, arch="sm_100a", sm_count=148, l2_bytes=L2_BYTES
+    )
+    monkeypatch.setattr(cake_backend, "device_facts", lambda device=None: facts)
     monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
     monkeypatch.setattr(cake_backend, "_cuda_index", lambda d: 0)
     monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: 7)
@@ -6218,9 +6231,10 @@ _FAKE_SPLIT_RECORD = {
 
 
 def _cpu_router_registry(monkeypatch, *, fused):
-    """CPU stand-ins for a K2 plan on ``sm_100a``: the device check and the architecture, the stream and FFI
-    context, and a module loader whose entries record ``(module, arguments, an arena lock was held)``; with
-    ``fused`` the registry holds a stand-in fused split program, without it none.  Returns the recorded calls."""
+    """CPU stand-ins for a K2 plan on ``sm_100a``: the device check, the architecture and the device facts, the
+    stream and FFI context, and a module loader whose entries record ``(module, arguments, an arena lock was
+    held)``; with ``fused`` the registry holds a stand-in fused split program, without it none.  Returns the
+    recorded calls."""
     calls = []
     kernels = dict(cake_jit.KERNELS["sm_100a"])
     kernels.pop(cake_backend.SPLIT_TEMPLATE, None)
@@ -6228,6 +6242,10 @@ def _cpu_router_registry(monkeypatch, *, fused):
         kernels[cake_backend.SPLIT_TEMPLATE] = _FAKE_SPLIT_MODULE
         monkeypatch.setitem(cake_jit.MODULES, _FAKE_SPLIT_MODULE, _FAKE_SPLIT_RECORD)
     monkeypatch.setitem(cake_jit.KERNELS, "sm_100a", kernels)
+    facts = cake_backend.DeviceFacts(
+        index=0, arch="sm_100a", sm_count=148, l2_bytes=L2_BYTES
+    )
+    monkeypatch.setattr(cake_backend, "device_facts", lambda device=None: facts)
     monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
     monkeypatch.setattr(cake_backend, "require_arch", lambda device: "sm_100a")
     monkeypatch.setattr(cake_backend, "_cuda_index", lambda d: 0)
@@ -9366,6 +9384,12 @@ def _plan_template(v, **knobs):
     return plan.template
 
 
+def _device_template(v, **knobs):
+    """The template a K1 binding of the views ``v`` runs on their device: the plan for the device's own architecture
+    (``_plan_template`` plans for the planner's default architecture), SM count and L2 size."""
+    return _plan_template(v, arch=arch_for(v["out"].device), **knobs)
+
+
 @pytest.mark.parametrize("row, op, out_dtype, T", GPU_ROWS)
 def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     if not _device_supported():
@@ -9587,7 +9611,7 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
     X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
     W = (torch.randn(N, K, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
     out = torch.empty(T, N, device=device, dtype=torch.bfloat16)
-    _require_program(_plan_template(dict(A=X, B=W.t(), out=out)))
+    _require_program(_device_template(dict(A=X, B=W.t(), out=out)))
     facts = cake_backend.device_facts(device)
     assert facts is cake_backend.device_facts(torch.device("cuda", facts.index))
     assert (facts.sm_count, facts.l2_bytes) == (_sm_count(), _l2_bytes())
@@ -9684,6 +9708,263 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     )
 
 
+class _RecordingModule:
+    """A loaded module stand-in: its entry records ``(module name, arguments)`` (CPU binding tests)."""
+
+    def __init__(self, name: str, calls: list):
+        self.name, self.calls = name, calls
+
+    def __getattr__(self, entry):
+        return lambda *args: self.calls.append((self.name, args))
+
+
+def _cpu_k1_entry_points(monkeypatch, arch="sm_103a"):
+    """CPU stand-ins for the K1 entry points (nothing is loaded or launched): the device facts of a 152-SM part, the
+    device and the raw stream 7 of every call, the dummies on the CPU, stand-in modules whose entries record their
+    arguments, the FFI conversion as the identity and fresh caches.  Returns ``(calls, made)``: the recorded launches
+    and the stream contexts made."""
+    calls, made = [], []
+    facts = cake_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=152, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(cake_backend.tvm_ffi, "from_dlpack", lambda t, **_: t)
+    monkeypatch.setattr(cake_backend, "device_facts", lambda device=None: facts)
+    monkeypatch.setattr(cake_backend, "arch_for", lambda device=None: arch)
+    monkeypatch.setattr(cake_backend, "require_arch", lambda device: arch)
+    monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
+    monkeypatch.setattr(cake_backend, "_cuda_index", lambda device=None: 0)
+    monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: 7)
+    monkeypatch.setattr(
+        cake_backend, "_dummy_key", lambda device, dtype, tag=None: ("cpu", dtype, tag)
+    )
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+
+    def stream_context(index, raw=None):
+        made.append((threading.get_ident(), index, raw))
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", stream_context)
+    monkeypatch.setattr(
+        cake_backend,
+        "load_cake_dense_projection_det_gemm_module",
+        lambda name, a: _RecordingModule(name, calls),
+    )
+    for name in ("_K1_CACHE", "_K2_CACHE", "_SWAP_CACHE", "_K1_BOUND_CACHE"):
+        monkeypatch.setattr(cake_backend, name, OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    monkeypatch.setattr(cake_backend, "_STREAM_CONTEXTS", {})
+    return calls, made
+
+
+def _same_launch_arguments(got: tuple, want: tuple, module_name: str) -> None:
+    """A bound launch's arguments are the convenience path's: the same view geometry for a TMA operand, the same data
+    pointer and dtype (and a contiguous tensor) for a pointer argument, the same values otherwise."""
+    kinds = [
+        kind for kind, _ in cake_jit.arg_plan_of(cake_backend.MODULES[module_name])
+    ]
+    assert len(got) == len(want) == len(kinds)
+    for i, (g, w, kind) in enumerate(zip(got, want, kinds, strict=True)):
+        if isinstance(w, torch.Tensor):
+            assert isinstance(g, torch.Tensor), i
+            if kind == "buffer":
+                assert (g.data_ptr(), g.dtype) == (w.data_ptr(), w.dtype), i
+                assert g.is_contiguous(), i
+            else:
+                assert (tuple(g.shape), g.stride(), g.data_ptr(), g.dtype) == (
+                    tuple(w.shape),
+                    w.stride(),
+                    w.data_ptr(),
+                    w.dtype,
+                ), i
+        else:
+            assert type(g) is type(w) and g == w, (i, g, w)
+
+
+def test_k1_entry_points_launch_the_bound_launch_of_their_key(monkeypatch):
+    """Once a key is bound, the K1 entry points launch it straight from the key: no planning and no convenience call,
+    the arguments of the convenience path's launch of the same call (fresh tensors of the key's geometry rebound), the
+    stream context of a (thread, device, stream) made once.  The arena's workspace is converted again after a growth;
+    tensors that alias keep their key unbound (the convenience path); ``clear_convenience_caches`` drops the bindings,
+    their arena references and the stream contexts."""
+    calls, made = _cpu_k1_entry_points(monkeypatch)
+    bf16, T = torch.bfloat16, 1000
+    X, W, G = (
+        torch.randn(T, 4096).to(bf16),
+        torch.randn(128, 4096).to(bf16),
+        torch.randn(T, 128).to(bf16),
+    )
+    out_f, out_d, out_w = (
+        torch.empty(T, 128, dtype=bf16),
+        torch.empty(T, 4096, dtype=bf16),
+        torch.empty(128, 4096),
+    )
+
+    def run():
+        assert cake_backend.projection_det_forward(X, W, out_f) is out_f
+        assert cake_backend.projection_det_dgrad(G, W, out_d) is out_d
+        assert cake_backend.projection_det_wgrad(G, X, out_w) is out_w
+        assert cake_backend.dense_projection_det_gemm(X, W.t(), out_f) is out_f
+
+    def same_calls(got, want):
+        assert len(got) == len(want)
+        for (name, args), (want_name, want_args) in zip(got, want, strict=True):
+            assert name == want_name
+            _same_launch_arguments(args, want_args, name)
+
+    # the convenience path (no device index for the entry points' binding) plans every call; the second run's
+    # launches (the arena at its grown size) are the reference
+    monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: -1)
+    run()
+    calls.clear()
+    run()
+    want = list(calls)
+    assert len(want) == 4 and len(cake_backend._K1_CACHE) == 3
+    assert not cake_backend._K1_BOUND_CACHE
+    # the first call of each key binds the cached planned launch, then launches it
+    monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: 0)
+    calls.clear()
+    made.clear()
+    run()
+    same_calls(calls, want)
+    assert len(cake_backend._K1_CACHE) == 3
+    bound = list(cake_backend._K1_BOUND_CACHE.values())
+    assert len(bound) == 4 and all(type(b) is cake_backend._BoundGemm for b in bound)
+    (arena,) = cake_backend._ARENAS.values()
+    assert arena.refs == 3 + 4  # the cached entries and the bindings
+    assert all(b.state[0] == arena.version for b in bound)
+
+    # a bound key goes from the key to the launch: no planning, no convenience call
+    def planning(*args, **kwargs):
+        raise AssertionError("planning path")
+
+    monkeypatch.setattr(cake_backend, "_cached_gemm", planning)
+    monkeypatch.setattr(cake_backend, "_launch_cached_gemm", planning)
+    calls.clear()
+    run()
+    same_calls(calls, want)
+    assert len(made) == 1
+    # fresh tensors of the key's geometry are rebound
+    other = torch.empty_like(out_f)
+    assert cake_backend.projection_det_forward(X, W, other) is other
+    pointers = {a.data_ptr() for a in calls[-1][1] if isinstance(a, torch.Tensor)}
+    assert other.data_ptr() in pointers and out_f.data_ptr() not in pointers
+    # a growth of the arena: the bound launches convert its workspace again
+    kinds = {kind for b in bound for _, kind in b.workspace}
+    assert kinds
+    with cake_backend._PLAN_LOCK:
+        for kind in kinds:
+            arena.require(kind, arena.buffers[kind].numel() + 4096)
+    assert all(b.state == (-1, None) for b in bound)
+    calls.clear()
+    run()
+    for b, (_, args) in zip(bound, calls, strict=True):
+        assert b.state[0] == arena.version
+        assert all(args[i] is arena.buffers[kind] for i, kind in b.workspace)
+    # another thread makes its own stream context of the same (device, stream)
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    assert len(made) == 2 and made[0][0] != made[1][0] and made[0][1:] == made[1][1:]
+    cake_backend.clear_convenience_caches()
+    assert not cake_backend._K1_BOUND_CACHE and not cake_backend._STREAM_CONTEXTS
+    assert cake_backend._ARENAS == {} and not cake_backend._K1_CACHE
+    # tensors that alias (``W`` starts at ``X``): the key stays unbound and the convenience path launches
+    monkeypatch.undo()
+    calls, made = _cpu_k1_entry_points(monkeypatch)
+    monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: 0)
+    assert cake_backend.projection_det_forward(X, X[:128], out_f) is out_f
+    assert list(cake_backend._K1_BOUND_CACHE.values()) == [False, False]
+    assert len(calls) == 1
+    # the key does not record aliasing: a call of that geometry takes the convenience path as well
+    assert cake_backend.projection_det_forward(X, W, out_f) is out_f
+    assert len(cake_backend._K1_BOUND_CACHE) == 2 and len(calls) == 2
+    (arena,) = cake_backend._ARENAS.values()
+    assert arena.refs == 1  # the cached entry; an unbound key holds no reference
+
+
+# GPU_ROWS cases the bound-launch test runs: a forward, an input gradient, an fp32 weight gradient and a swapped
+# stream-K weight gradient.
+_BOUND_ROWS = (
+    ("kv_a", "fwd", "bf16", 257),
+    ("kv_a", "dgrad", "bf16", 1001),
+    ("kv_a", "wgrad", "f32", 257),
+    ("indexer_hw", "wgrad", "bf16", 1001),
+)
+
+
+def test_k1_entry_points_bound_launch_is_bit_exact():
+    """On the device the K1 entry points' bound launches give the bits of the convenience path's launch of the same
+    call: on the first call of a key, on fresh outputs of a bound key (no allocation) and after a growth of the arena
+    (the workspace converted again); the slice counters are zero after the launches."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    device = torch.device("cuda")
+    arch = arch_for(device)
+    cases = []
+    for i, (row, op, out_dtype, T) in enumerate(_BOUND_ROWS):
+        v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED + 61 + i)
+        _require_program(_device_template(v))
+        cases.append((op, v))
+
+    def convenience(op, v):
+        out = torch.empty_like(v["out"])
+        if op != "wgrad":
+            return cake_backend._launch_cached_gemm(v["A"], v["B"], out)
+        A, B, t = cake_backend.wgrad_views(
+            v["G"], v["X"], arch=arch, out_f32=out.dtype == torch.float32
+        )
+        return cake_backend._launch_cached_gemm(
+            A, B, out, transposed_out=t, sk="auto", cta_rows=None
+        )
+
+    def entry(op, v, out):
+        if op == "fwd":
+            return cake_backend.projection_det_forward(v["X"], v["W"], out)
+        if op == "dgrad":
+            return cake_backend.projection_det_dgrad(v["G"], v["W"], out)
+        return cake_backend.projection_det_wgrad(v["G"], v["X"], out)
+
+    cake_backend.clear_convenience_caches()
+    want = [convenience(op, v) for op, v in cases]
+    got = [entry(op, v, torch.empty_like(v["out"])) for op, v in cases]
+    torch.cuda.synchronize()
+    for (_op, v), w in zip(cases, want, strict=True):
+        _check(w.t() if v.get("transposed") else w, v["A"].double() @ v["B"].double())
+    assert all(torch.equal(a, b) for a, b in zip(got, want, strict=True))
+    entries = list(cake_backend._K1_BOUND_CACHE.values())
+    assert len(entries) == 4 and all(
+        type(b) is cake_backend._BoundGemm for b in entries
+    )
+    # fresh outputs of the bound keys: no allocation, the same bits
+    fresh = [torch.empty_like(w) for w in want]
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()
+    for (op, v), out in zip(cases, fresh, strict=True):
+        entry(op, v, out)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    assert all(torch.equal(a, b) for a, b in zip(fresh, want, strict=True))
+    # a growth of the arena: the bound launches convert its workspace again and keep the bits
+    (arena,) = cake_backend._ARENAS.values()
+    with cake_backend._PLAN_LOCK:
+        for kind in ("k1_ws", "k1_counters"):
+            arena.require(kind, arena.buffers[kind].numel() + 4096)
+    for (op, v), out in zip(cases, fresh, strict=True):
+        out.fill_(float("nan"))
+        entry(op, v, out)
+    torch.cuda.synchronize()
+    assert all(b.state[0] == arena.version for b in entries)
+    assert all(torch.equal(a, b) for a, b in zip(fresh, want, strict=True))
+    counters = arena.buffers["k1_counters"].view(torch.int32)
+    assert int(torch.count_nonzero(counters)) == 0
+    cake_backend.clear_convenience_caches()
+    assert not cake_backend._K1_BOUND_CACHE and cake_backend._ARENAS == {}
+
+
 def test_convenience_path_memory_is_bounded_across_token_counts():
     """A ragged token count (a new T every step) must not grow the memory the convenience path holds: the
     router entries of 23 distinct T share one arena per (device, stream), so the memory held after the loop is
@@ -9708,6 +9989,7 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
 
     def held_after(T_values):
         cake_backend.clear_convenience_caches()
+        gc.collect()  # device tensors that only cyclic garbage of earlier tests still holds are not held here
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         base = torch.cuda.memory_allocated()

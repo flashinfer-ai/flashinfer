@@ -72,7 +72,12 @@ by planning with `initialize_workspace=False`.
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
 capture. Zero caller-owned FMHA scratch before its first trusted standalone
 launch and re-zero it when workspace-layout inputs change; wrappers
-initialize control storage by default. Scratch and output must not
+initialize control storage by default. Alternatively, FMHA plans for one
+device may share one buffer of at least the largest size returned for them:
+zero the whole buffer once, bind the same full tensor to every plan (not
+slices), and plan and launch them on one stream. FMHA may use any byte of the
+passed buffer; its control state sits at the buffer end and launches leave it
+zero. Scratch and output must not
 overlap any live input or each other; each concurrent launch/graph needs its
 own scratch. Warm up the exact topology before capture, retain stable storage,
 and update metadata only between completed replays. Validation is enabled by
@@ -788,9 +793,10 @@ No count, ceiling, or count tensor is exposed to users. Reduction selection chec
 cluster residency with the rounded capacity and falls back to the standalone
 reducer when that physical cluster grid no longer fits one resident wave.
 
-Producers and reducers receive typed runtime counts. Scratch strides and
-cluster/barrier participation retain prepared capacity; inactive slots/ranks
-contribute neutral state and preserve teardown. Count changes within a capacity
+Producers and reducers receive typed runtime counts. FMHA compact GMEM
+partials are packed by the runtime fanout; capacity only bounds it. Other
+scratch strides and cluster/barrier participation retain prepared capacity;
+inactive slots/ranks contribute neutral state and preserve teardown. Count changes within a capacity
 reuse the compiled callables, including reduction. Static internal kernel
 recipes remain available for comparison.
 

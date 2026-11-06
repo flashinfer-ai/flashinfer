@@ -135,6 +135,9 @@ exclude = [
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]
+# Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a MLA value
+# projection + sigmoid output gate backend, compiled on demand; README.md carries its attribution.
+"flashinfer.experimental.cake_mla_value_gate" = ["csrc/**", "build.json", "README.md"]
 # Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 FP8 projection backend, compiled on demand.
 "flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
 # JIT sources for the Kimi-K3 latent MoE front/tail and fused router.

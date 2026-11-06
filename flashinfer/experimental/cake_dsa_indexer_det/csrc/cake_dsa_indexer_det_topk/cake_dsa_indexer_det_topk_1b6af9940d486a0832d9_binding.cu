@@ -296,6 +296,8 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens
   check_same_device(a_K_scale, a_Q, "K_scale", "Q");
   check_contiguous(a_TicketWord, "TicketWord");
   check_same_device(a_TicketWord, a_Q, "TicketWord", "Q");
+  TVM_FFI_CHECK((a_grid_ctas >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (grid_ctas >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

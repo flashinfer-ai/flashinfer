@@ -33,7 +33,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import fcntl
+
+# Windows has no fcntl; the knob cache then updates without the advisory lock.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import tempfile
@@ -414,7 +419,8 @@ def record_knobs(
         os.makedirs(directory, exist_ok=True)
         lock_path = path + ".lock"
         with open(lock_path, "a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 entries = _load_entries(path)
                 entries = [
@@ -449,7 +455,8 @@ def record_knobs(
                         os.unlink(tmp)
                     raise
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     except (OSError, TypeError, ValueError) as exc:
         warnings.warn(
             f"[moe_ep-knob-cache] could not write {path!r}: {exc}",

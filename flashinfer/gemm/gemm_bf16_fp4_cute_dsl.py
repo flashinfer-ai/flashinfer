@@ -1012,6 +1012,35 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             # index must not replay on a different SM count.
             return (out_dtype, n, k, get_device_sm_count(a.device))
 
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            """Reject a cached GEMV tactic outside its single-row domain."""
+            return self._validate_tactic_for_m(inputs, tactic, int(inputs[0].shape[0]))
+
+        def validate_tactic_for_profile(
+            self, inputs: List[torch.Tensor], tactic: int, profile: OptimizationProfile
+        ) -> bool:
+            """Validate a warm bucket against its profiled row count."""
+            return self._validate_tactic_for_m(
+                inputs, tactic, int(profile.get_opt_shapes()[0][0])
+            )
+
+        def _validate_tactic_for_m(
+            self, inputs: List[torch.Tensor], tactic: int, m: int
+        ) -> bool:
+            if tactic == -1:
+                return True
+            a, b, _, _, _, _, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            configs = _bf16_fp4_cute_dsl_tactic_configs(
+                n, k, get_device_sm_count(a.device)
+            )
+            if not 0 <= tactic < len(configs):
+                return False
+            return configs[tactic][7] != "gemv" or (
+                m == 1 and get_compute_capability(a.device)[0] == 12
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],

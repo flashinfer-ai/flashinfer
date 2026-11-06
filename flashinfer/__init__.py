@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import contextlib
+import importlib
 import importlib.util
 
 from .version import __version__ as __version__
@@ -169,28 +170,30 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
     }
 )
 
-
-# Compatibility module paths of the causal conv1d facade and its backend package; each
-# resolves on first attribute access and loads no KCP host module.
-_COMPAT_SUBMODULES = frozenset(
-    {"cake_causal_conv1d_train", "cake_causal_conv1d_train_backend"}
-)
+# Top-level names bound on first access instead of by ``import flashinfer``:
+# ``name -> (module, attribute)``.  ``module`` is resolved relative to this
+# package when it starts with ``.``; an ``attribute`` of ``None`` binds the
+# module itself.  Packages whose backend sits under ``flashinfer.experimental``
+# add their top-level names here, so that importing ``flashinfer`` does not
+# import the experimental tree.
+_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+    **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+}
 
 
 def __getattr__(name: str):
-    if name in _COMPAT_SUBMODULES:
-        return importlib.import_module(f"{__name__}.{name}")
-    if name not in _PRIMS_TS_LAZY_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from . import fused_moe as _fused_moe
-
-    value = getattr(_fused_moe, name)
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    module = importlib.import_module(module_name, __name__)
+    value = module if attribute is None else getattr(module, attribute)
     globals()[name] = value
     return value
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
@@ -363,24 +366,6 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
 )
 
-# Use import aliases so strict JIT keys treat these as re-exports, not setup code.
-from .cake_causal_conv1d_det_train import (
-    CakeCausalConv1dDetFunction as CakeCausalConv1dFunction,
-)
-from .cake_causal_conv1d_det_train import cake_causal_conv1d_det as cake_causal_conv1d
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_train_backward,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_train_forward,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
-)
-
 from .cake_mhc_det_train import (
     CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
 )
@@ -420,39 +405,6 @@ from .cake_mhc_det_train import (
     cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
 )
 from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
-from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
-from .cake_mhc_train import CakeMHCTrainHeadFunction as CakeMHCTrainHeadFunction
-from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
-from .cake_mhc_train import (
-    cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_backward_prepare as cake_mhc_train_backward_prepare,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_backward_workspace_bytes as cake_mhc_train_backward_workspace_bytes,
-)
-from .cake_mhc_train import cake_mhc_train_finish as cake_mhc_train_finish
-from .cake_mhc_train import (
-    cake_mhc_train_forward_finish as cake_mhc_train_forward_finish,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_forward_prepare as cake_mhc_train_forward_prepare,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_forward_stats as cake_mhc_train_forward_stats,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
-)
-from .cake_mhc_train import cake_mhc_train_head as cake_mhc_train_head
-from .cake_mhc_train import (
-    cake_mhc_train_head_backward as cake_mhc_train_head_backward,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_head_forward as cake_mhc_train_head_forward,
-)
-from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
 from .cake_gdp import (
     cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
 )

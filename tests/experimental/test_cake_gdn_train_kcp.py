@@ -15,8 +15,8 @@ limitations under the License.
 
 CPU tests of the GDN KCP metadata layer of the NON-DETERMINISTIC package ``flashinfer.experimental.cake_gdn_train_kcp``
 (the twin of ``cake_gdn_det_train_kcp`` with the same contract and accuracy budgets, not its bitwise reproducibility):
-the package-local plan module against ``cake_kda_train.cake_kcp_plan`` (field-identical partitions and contexts on the
-step-0 rows with ``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing
+the package-local plan module against ``cake_kda_det_train_kcp.cake_kcp_plan`` (field-identical partitions and contexts on
+the step-0 rows with ``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing
 counts and exchange bytes against the rows of record, the table builders (pool addressing, segment lists, chains),
 head ownership incl. the padded ``(HV, W) = (3, 2)`` case, the byte queries, the registry seed, an emulated multi-rank
 row (W ranks on threads), and the package's host orchestration on the fake backend
@@ -381,14 +381,14 @@ def _sha(obj) -> str:
 @ROWS
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
-    """Result 1: ``cake_gdn_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
-    step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
+    """Result 1: ``cake_gdn_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_det_train_kcp.cake_kcp_plan`` on
+    every step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
     fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the exchange bytes of
     ``gdn_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they share,
     ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected explicitly
     here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     kp = importlib.import_module(
-        "flashinfer.experimental.cake_kda_train.cake_kcp_plan"
+        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
     )  # the test only
     # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
@@ -398,7 +398,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     W = int(row["cp"])
     args = _partition_inputs(row)
     part = gp.partition_kcp(**args)
-    kpart = kp.kcp_partition(**args)
+    kpart = kp.partition_det_kcp(**args)
     assert part.to_dict() == kpart.to_dict(), "partition differs from the KDA module"
     assert _plain(part.to_dict()["fragments"]) == row["fragments"], (
         "partition differs from the row of record"
@@ -419,7 +419,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
         ctx = gp.build_context_kcp(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )  # the per-rank rule both modules share; the GDN default "row_cost" is tested on the rows below
-        kctx = kp.build_kcp_context(
+        kctx = kp.build_context_det_kcp(
             kpart,
             None,
             r,
@@ -2037,8 +2037,8 @@ def test_registry_seed() -> None:
 
 
 def test_package_imports_no_kda_and_no_environ() -> None:
-    """The package never imports ``cake_kda_train`` and reads no environment variable; the plan
-    module imports torch, torch.distributed and dataclasses only."""
+    """The package never imports a KDA package (no module path or name containing ``cake_kda``) and reads no
+    environment variable; the plan module imports torch, torch.distributed and dataclasses only."""
     for path in sorted(PACKAGE_DIR.glob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
@@ -2048,8 +2048,8 @@ def test_package_imports_no_kda_and_no_environ() -> None:
                     if isinstance(node, ast.ImportFrom) and node.module
                     else []
                 )
-                assert not any("cake_kda_train" in n for n in names), (
-                    f"{path.name} imports cake_kda_train"
+                assert not any("cake_kda" in n for n in names), (
+                    f"{path.name} imports a KDA package"
                 )
                 assert "os" not in [
                     a.name for a in node.names if isinstance(node, ast.Import)

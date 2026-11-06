@@ -28,7 +28,8 @@ and output (``fwd_ho``; a split plan first runs the pre-scan and the stitch
 for the segment start states; on the architectures of ``FWD_HO_VH2_ARCHS`` a
 scan of one launch whose CTAs fill at most half of the SMs runs as
 ``fwd_ho_vh2``, two CTAs per segment and value head, one value half each,
-:func:`fwd_ho_vh2_engaged`; the same bits).  The backward runs ``dv_local`` and
+:func:`fwd_ho_vh2_engaged`, where the record is the split program,
+:func:`fwd_ho_vh2_splits`; the same bits).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -123,6 +124,7 @@ __all__ = [
     "dhu_tc_pricing",
     "finalize_stage",
     "fwd_ho_vh2_engaged",
+    "fwd_ho_vh2_splits",
     "gdn_chunk_backward",
     "gdn_chunk_det_backward",
     "gdn_chunk_det_forward",
@@ -1815,6 +1817,15 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
 FWD_HO_VH2_ARCHS = ("sm_107a",)
 
 
+@cache
+def fwd_ho_vh2_splits(arch: str) -> bool:
+    """Whether the ``fwd_ho_vh2`` record of ``arch`` is the split program (two CTAs per segment and value head).  On
+    ``sm_100a`` and ``sm_103a`` the record is the ``fwd_ho`` program itself, which runs on ``fwd_ho``'s grid."""
+    split = cake_backend.record(cake_backend.stage_record("fwd_ho_vh2", arch))
+    plain = cake_backend.record(cake_backend.stage_record("fwd_ho", arch))
+    return split["library"] != plain["library"]
+
+
 def fwd_ho_vh2_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> bool:
     """Whether a one-launch forward scan of ``num_segments`` segments runs as ``fwd_ho_vh2``: its ``2 x num_segments
     x num_v_heads`` CTAs fit one round of ``sm_count`` SMs (one CTA per SM)."""
@@ -1913,7 +1924,9 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         if arch in FWD_HO_VH2_ARCHS and fwd_ho_vh2_engaged(
             segs.num_segments, num_v_heads, _device_props(_tensor_index(kn))[0]
         ):
-            stage, ctas = "fwd_ho_vh2", 2 * ctas
+            stage = "fwd_ho_vh2"
+            if fwd_ho_vh2_splits(arch):
+                ctas = 2 * ctas
         _launch(stage, ctas, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o, final_state,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, walk,
                 num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip

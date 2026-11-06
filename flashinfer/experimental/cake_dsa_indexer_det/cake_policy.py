@@ -50,12 +50,12 @@ wrong choice costs time, not correctness.
 
 The opt-in FP8 input form (float8_e4m3fn ``q`` / ``k``) has its own scan
 programs, keyed ``scan:<kind>:u<unroll>:s0:f1:fp8[:lsf]``, for the narrow, l6
-and split kinds only.  An FP8 call runs the same decision procedure under the
-architecture's FP8 record (``fp8_policy_record``: the ``POLICY`` record with
-the fields of the registry's ``POLICY_FP8`` record replaced) and then the
-registered FP8 program of the decided kind, or of its ``FP8_KIND_FALLBACK``
-kind (``select_fp8_program``).  Every FP8 program of one architecture
-computes the same ids and score bits.
+and split kinds, and on sm_100a / sm_103a the wide kind.  An FP8 call runs the same
+decision procedure under the architecture's FP8 record (``fp8_policy_record``:
+the ``POLICY`` record with the fields of the registry's ``POLICY_FP8`` record
+replaced) and then the registered FP8 program of the decided kind, or of its
+``FP8_KIND_FALLBACK`` kind (``select_fp8_program``).  Every FP8 program of one
+architecture computes the same ids and score bits.
 """
 
 from __future__ import annotations
@@ -158,12 +158,14 @@ MERGE_KEY = "merge"
 BF16 = "bf16"
 FP8 = "fp8"
 FORMS = (BF16, FP8)
-# The FP8 scan programs exist for the narrow, l6 and split kinds only, with no snake order and in the sampled-fit form.
-# An FP8 call runs the decision procedure of ``select_program`` under the FP8 record (``fp8_policy_record``); a decided
-# kind without an FP8 program runs the FP8 program of the kind below (same unit geometry where it has one, unpaired).
-# An unsplit wide unit (8 queries, unpaired or a CTA pair) runs the l6 unit (6 queries), the largest FP8 unit: per key
-# tile it reads K once for 6 queries rather than for the narrow unit's 4.  A split wide unit (sm_107a only) runs
-# split_narrow: no architecture that splits wide units registers an FP8 split_l6 program.
+# The FP8 scan programs exist for the narrow, l6 and split kinds, and on sm_100a / sm_103a the wide kind, with no snake
+# order and in the sampled-fit form.  An FP8 call runs the decision procedure of ``select_program`` under the FP8 record
+# (``fp8_policy_record``); a decided kind without an FP8 program runs the FP8 program of its fallback kind below
+# (unpaired; the same unit geometry where it has one, except that a CTA-pair wide unit runs l6).  An unpaired, unsplit
+# wide unit (8 queries) runs the FP8 wide program where the architecture registers one; else it, and a CTA-pair wide
+# unit always, runs the l6 unit (6 queries), the largest FP8 unit below the wide one: per key tile it reads K once for 6
+# queries rather than for the narrow unit's 4.  A split wide unit (sm_107a only) runs split_narrow: no architecture that
+# splits wide units registers an FP8 split_l6 program.
 FP8_KIND_FALLBACK = {
     "wide": "l6",
     "pair_l6": "l6",
