@@ -289,7 +289,9 @@ Variable                                      Meaning
 ``FLASHINFER_KERNEL_PACKAGE_ROOT``            Root directory holding the digest-named package
                                               directories (default
                                               ``/opt/flashinfer/kernel_packages``).
-``FLASHINFER_KERNEL_PLUGINS_DISABLE``         Kill switch: refuse sealed loading with a warning.
+``FLASHINFER_KERNEL_PLUGINS_DISABLE``         Kill switch for the import-time loading above:
+                                              refuse it with a warning. A program calling
+                                              ``load_packages()`` itself is not affected.
 ============================================= =========================================================
 
 Loading is best-effort and never breaks ``import flashinfer``: a refused
