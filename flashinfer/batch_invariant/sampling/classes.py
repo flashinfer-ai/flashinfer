@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The sampling class's entries of the mode's registry (:data:`flashinfer.batch_invariant.CLASSES`): the class name and
 the fingerprint behind ``fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])``, ``fingerprint("log_softmax",
-...)`` and ``fingerprint("log_probs", ...)``.
+...)``, ``fingerprint("log_probs", ...)`` and ``fingerprint("entropy", ...)``.
 
-The three APIs run one class, ``lse.row``, whose specification is a function of the vocabulary ``N`` (the two row
-trees), the input dtype (the output conversion of the probabilities; the leaves of a 16-bit input are its exact
-widenings, so ``softmax`` with ``out_dtype=torch.float32`` is the fp32 input's specification) and whether a temperature
-enters the scale (``c = LOG2E`` or ``div(LOG2E, T)``)."""
+The four APIs run one class, ``lse.row``, whose specification is a function of the vocabulary ``N`` (the row trees),
+the input dtype (the output conversion of the probabilities; the leaves of a 16-bit input are its exact widenings, so
+``softmax`` with ``out_dtype=torch.float32`` is the fp32 input's specification) and whether a temperature enters the
+scale (``c = LOG2E`` or ``div(LOG2E, T)``). The entropy member (``entropy``, and ``log_probs(return_entropy=True)``)
+carries its own fingerprint: its third tree and chain; the input dtype does not enter it."""
 
 from __future__ import annotations
 
@@ -51,13 +52,24 @@ def _lse_row_fingerprint(N: int, dtype, temperature, out_dtype=None) -> str:
     return spec_fingerprint(int(N), in_fmt, bool(temperature))
 
 
+def _entropy_fingerprint(N: int, dtype, temperature) -> str:
+    """The entropy member's fingerprint: the same dimensions as the class's (the dtype is validated and does not enter:
+    the leaves of every input dtype are exact widenings)."""
+    from .spec import entropy_fingerprint
+
+    _in_fmt(dtype)
+    return entropy_fingerprint(int(N), bool(temperature))
+
+
 def register(classes: Dict[str, Any], class_info: Any) -> None:
     """Add the sampling class to the mode's registry (called by ``flashinfer.batch_invariant`` at import): ``softmax``,
-    ``log_softmax`` and ``log_probs`` take the vocabulary ``N``, the input ``dtype`` and whether a ``temperature`` is
-    given; ``softmax`` optionally ``out_dtype`` (f32: the probabilities before the output conversion)."""
+    ``log_softmax``, ``log_probs`` and ``entropy`` take the vocabulary ``N``, the input ``dtype`` and whether a
+    ``temperature`` is given; ``softmax`` optionally ``out_dtype`` (f32: the probabilities before the output
+    conversion); ``entropy`` names the member's own fingerprint."""
     dims = ("N", "dtype", "temperature")
     classes["softmax"] = class_info(
         "lse.row", dims, _lse_row_fingerprint, ("out_dtype",)
     )
     classes["log_softmax"] = class_info("lse.row", dims, _lse_row_fingerprint)
     classes["log_probs"] = class_info("lse.row", dims, _lse_row_fingerprint)
+    classes["entropy"] = class_info("lse.row", dims, _entropy_fingerprint)

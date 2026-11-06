@@ -23,6 +23,7 @@ def Term.sexpr : Term → String
   | .neg a => s!"(neg {a.sexpr})"
   | .ex2 a => s!"(ex2 {a.sexpr})"
   | .opq name a => s!"(op:{name} {a.sexpr})"
+  | .opq2 name a b => s!"(op:{name} {a.sexpr} {b.sexpr})"   -- `rlk.term.sexpr`'s generic `(op:name a b)` form (not sorted: a select)
 
 def osexpr : Option Term → String
   | none => "absent"

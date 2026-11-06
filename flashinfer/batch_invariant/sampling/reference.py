@@ -14,7 +14,7 @@ Outside every kernel cache closure (no kernel module imports it).
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -25,6 +25,19 @@ from .schedule import BLOCK, LANES, V, padded_blocks
 from .spec import LN2_F32, LOG2E_F32, LSESpec, scale_value
 
 _FMT = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
+_ZERO32 = torch.zeros((), dtype=torch.float32)
+
+
+def zsel_exact(e: float, p: float) -> float:
+    """``ZSEL(e, p) = +0 if e == 0 else p`` on binary32 values (``-0 == 0`` is true, NaN compares false): the exact
+    model of the entropy member's select, bound as ``syms["op:zsel"]`` for the symbolic evaluator."""
+    return 0.0 if e == 0 else p
+
+
+def row_w(e: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """The entropy member's leaves ``w_j = ZSEL(e_j, mul(e_j, z_j))`` over f32 rows (one torch rounding for the product;
+    the select is exact: ``+0`` where ``e_j`` is a zero, NaN where ``e_j`` is NaN)."""
+    return torch.where(e == 0, _ZERO32, torch.mul(e, z))
 
 
 # ---------------------------------------------------------------------------------------------------------- the trees
@@ -78,9 +91,9 @@ def lse_reference(
     token_ids: Optional[torch.Tensor] = None,
     rows: Optional[Sequence[int]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """The exact CPU model for ``rows`` of ``x`` (default: all). Returns ``{"m", "s", "lse", "logp"}`` as f32 ``(n,)``
-    tensors (``logp`` NaN where no token id is given or it is out of range), ``"probs"`` ``(n, N)`` in the input dtype
-    and ``"logprobs"`` ``(n, N)`` f32."""
+    """The exact CPU model for ``rows`` of ``x`` (default: all). Returns ``{"m", "s", "lse", "logp", "W", "entropy"}`` as
+    f32 ``(n,)`` tensors (``logp`` NaN where no token id is given or it is out of range), ``"probs"`` ``(n, N)`` in the input
+    dtype and ``"logprobs"`` ``(n, N)`` f32."""
     x = x.detach().cpu()
     M, N = x.shape
     rows = list(range(M)) if rows is None else list(rows)
@@ -90,7 +103,7 @@ def lse_reference(
         token_ids.detach().cpu().reshape(-1).tolist() if token_ids is not None else None
     )
     out: Dict[str, list] = {
-        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs")
+        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs", "W", "entropy")
     }
     for r in rows:
         xr = xf[r]
@@ -102,10 +115,14 @@ def lse_reference(
         )
         e = ex2_device(z)
         s = row_sum(e, N)
+        W = row_sum(
+            row_w(e, z), N
+        )  # the entropy member's tree: the same digits over w_j
         inv_s = fp32.div(1.0, s)
         p = torch.mul(e, torch.tensor(inv_s, dtype=torch.float32)).to(x.dtype)
         lg2s = float(lg2_device(torch.tensor([s], dtype=torch.float32))[0])
         lse = fp32.mul(fp32.add(fp32.mul(m, c), lg2s), LN2_F32)
+        ent = fp32.mul(fp32.add(lg2s, fp32.neg(fp32.div(W, s))), LN2_F32)
         nlg = fp32.neg(lg2s)
         lp = torch.mul(
             torch.add(z, torch.tensor(nlg, dtype=torch.float32)),
@@ -119,11 +136,13 @@ def lse_reference(
         out["s"].append(s)
         out["lse"].append(lse)
         out["logp"].append(logp_t)
+        out["W"].append(W)
+        out["entropy"].append(ent)
         out["probs"].append(p)
         out["logprobs"].append(lp)
     res = {
         k: torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
-        for k in ("m", "s", "lse", "logp")
+        for k in ("m", "s", "lse", "logp", "W", "entropy")
     }
     res["probs"] = torch.stack(out["probs"])
     res["logprobs"] = torch.stack(out["logprobs"])
@@ -166,7 +185,7 @@ def exact_rows(
             else [fp32.to_f32(float(temperature))] * M
         )
     out: Dict[str, list] = {
-        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs")
+        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs", "W", "entropy")
     }
     for r in rows:
         xr = xf[r].tolist()
@@ -174,7 +193,7 @@ def exact_rows(
         want = (
             list(terms["probs"])
             + list(terms["logprobs"])
-            + [terms["m"], terms["s"], terms["lse"]]
+            + [terms["m"], terms["s"], terms["lse"], terms["W"], terms["entropy"]]
         )
         if ids is not None and 0 <= ids[r] < N:
             want.append(spec.logp(r, ids[r]))
@@ -183,9 +202,10 @@ def exact_rows(
 
         def run(ex2_missing, lg2_missing, xr=xr, want=want, r=r):
             memo: Dict[int, float] = {}
-            syms = {
+            syms: Dict[str, Any] = {
                 "ex2": _table_fn(ex2_tab, ex2_missing, 1.0),
                 "op:lg2": _table_fn(lg2_tab, lg2_missing, 0.0),
+                "op:zsel": zsel_exact,
             }
             if ts is not None:
                 syms["T"] = ts[r]
@@ -225,10 +245,12 @@ def exact_rows(
         out["m"].append(vals[2 * N])
         out["s"].append(vals[2 * N + 1])
         out["lse"].append(vals[2 * N + 2])
-        out["logp"].append(vals[2 * N + 3] if len(vals) > 2 * N + 3 else float("nan"))
+        out["W"].append(vals[2 * N + 3])
+        out["entropy"].append(vals[2 * N + 4])
+        out["logp"].append(vals[2 * N + 5] if len(vals) > 2 * N + 5 else float("nan"))
     res = {
         k: torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
-        for k in ("m", "s", "lse", "logp")
+        for k in ("m", "s", "lse", "logp", "W", "entropy")
     }
     res["probs"] = torch.stack(out["probs"])
     res["logprobs"] = torch.stack(out["logprobs"])

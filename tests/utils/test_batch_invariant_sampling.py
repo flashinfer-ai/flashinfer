@@ -1,8 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""``flashinfer.sampling.softmax(logits, temperature, batch_invariant=True)`` and ``flashinfer.sampling.log_probs``: the
-class ``lse.row`` (the row maximum and the sum of ``ex2.approx`` weights as fixed trees over the vocabulary, the
-probabilities / token log-probabilities / log-sum-exp as fixed chains over them).
+"""``flashinfer.sampling.softmax(logits, temperature, batch_invariant=True)``, ``flashinfer.sampling.log_probs`` and
+``flashinfer.sampling.entropy``: the class ``lse.row`` (the row maximum and the sum of ``ex2.approx`` weights as fixed
+trees over the vocabulary, the probabilities / token log-probabilities / log-sum-exp as fixed chains over them) and its
+entropy member (a third tree with the sum's shape, accumulated in the same pass, and the entropy chain).
 
 Device-free: the pinned fingerprints, every placement of the configuration space traces to the canonical trees, the
 dispatcher's membership in the enumerated space and the device check. On an SM100 / SM103 / SM107 device with the CuTe
@@ -27,6 +28,7 @@ from flashinfer.batch_invariant.sampling import schedule as C
 from flashinfer.batch_invariant.sampling import spec as S
 from flashinfer.batch_invariant.sampling.api import (
     LSE_ROW_ARCHS,
+    entropy_batch_invariant,
     log_probs_batch_invariant,
     lse_row,
     softmax_batch_invariant,
@@ -89,21 +91,30 @@ def ids_for(x, seed=1):
 
 
 def run_all(x, temp=None, ids=None, config=None, enable_pdl=None, full=False):
-    """The public entries (``probs``, ``logp``, ``lse2``) and, with ``full``, the generic entry's row log-softmax
-    (``logprobs``) and log-sum-exp (``lse``)."""
+    """The public entries (``probs``, ``logp``, ``lse2``, ``entropy``, and ``entropy2`` from the fused
+    ``log_probs(return_lse, return_entropy)``) and, with ``full``, the generic entry's row log-softmax (``logprobs``)
+    and log-sum-exp (``lse``)."""
     if ids is None:
         ids = ids_for(x)
     out = {
         "probs": flashinfer.sampling.softmax(x, temp, enable_pdl, batch_invariant=True)
     }
-    out["logp"], out["lse2"] = flashinfer.sampling.log_probs(
-        x, ids, temp, return_lse=True, enable_pdl=enable_pdl
+    out["logp"], out["lse2"], out["entropy2"] = flashinfer.sampling.log_probs(
+        x, ids, temp, return_lse=True, return_entropy=True, enable_pdl=enable_pdl
     )
+    out["entropy"] = flashinfer.sampling.entropy(x, temp, enable_pdl=enable_pdl)
     if config is not None:
         out["probs"] = softmax_batch_invariant(x, temp, enable_pdl, config=config)
-        out["logp"], out["lse2"] = log_probs_batch_invariant(
-            x, ids, temp, enable_pdl, return_lse=True, config=config
+        out["logp"], out["lse2"], out["entropy2"] = log_probs_batch_invariant(
+            x,
+            ids,
+            temp,
+            enable_pdl,
+            return_lse=True,
+            return_entropy=True,
+            config=config,
         )
+        out["entropy"] = entropy_batch_invariant(x, temp, enable_pdl, config=config)
     if full:
         pdl = bool(enable_pdl)
         out["logprobs"] = lse_row(
@@ -125,6 +136,8 @@ def check_ref(got, x, temp=None, ids=None, rows=None):
         ("lse2", "lse"),
         ("logprobs", "logprobs"),
         ("lse", "lse"),
+        ("entropy", "entropy"),
+        ("entropy2", "entropy"),
     ):
         if k in got:
             assert same(sel(got[k]), ref[rk]), f"{k} is not the canonical dataflow"
@@ -156,6 +169,23 @@ def test_fingerprints_are_pinned():
         bi.fingerprint("softmax", N=300, dtype="bf16", temperature=False)
     )
     assert S.spec_fingerprint(301, "bf16") != S.spec_fingerprint(300, "bf16")
+    # the entropy member: its own fingerprint (the W tree and the entropy chain embed the class's trees), the class's
+    # fingerprints above unchanged by it; the input dtype does not enter (the leaves are exact widenings)
+    assert bi.class_name("entropy") == "lse.row"
+    assert (
+        bi.fingerprint("entropy", N=300, dtype="bf16", temperature=False)
+        == "lse-row-entropy-ddd184ec201e4d14"
+    )
+    assert (
+        bi.fingerprint("entropy", N=300, dtype=torch.float32, temperature=True)
+        == "lse-row-entropy-37c03b3db57c2f46"
+    )
+    assert bi.fingerprint("entropy", N=300, dtype="f16", temperature=False) == (
+        S.entropy_fingerprint(300)
+    )
+    assert S.entropy_fingerprint(301) != S.entropy_fingerprint(300)
+    assert S.ENTROPY.name == "h" and S.LOGP_LSE_ENTROPY.name == "sth"
+    assert not S.ENTROPY.row_output and S.ENTROPY.needs_log
     # the hash is linear in the term DAG: a production vocabulary is a receipt, not a cost
     assert (
         bi.fingerprint("log_probs", N=32000, dtype="bf16", temperature=False)
@@ -172,10 +202,40 @@ def test_every_placement_traces_to_the_canonical_trees(N):
     sp = S.LSESpec(N)
     cfgs = C.all_valid_configs(N, 2)
     assert cfgs
+    rs, rw = sp.sum_reduction(0), sp.w_reduction(0)
+    refs, refw = rs.canonical(sp.alg), rw.canonical(sp.alg)
+    nm, c = sp.alg.neg(sp.m(0)), sp.c()
+
+    class PairAlg:
+        """The kernel's lockstep backend over the term algebra: every value is the pair (s, W) and the sum digits'
+        const / add act componentwise (the digits call nothing else)."""
+
+        def const(self, v):
+            return (sp.alg.const(v), sp.alg.const(v))
+
+        def add(self, a, b):
+            return (sp.alg.add(a[0], b[0]), sp.alg.add(a[1], b[1]))
+
+    def pair_leaf(fp, idx):
+        i = S.flat_index(idx)
+        if i >= N:
+            return None
+        z = S.shifted(sp.alg, sp.leaf(0, i), nm, c)
+        e = S.weight(sp.alg, z)
+        return (e, S.wprod(sp.alg, e, z))
+
     for cfg in cfgs:
         pl = cfg.placement(N)
         canon.verify(canon.plan(sp.max_reduction(0), pl), sp.alg)
-        canon.verify(canon.plan(sp.sum_reduction(0), pl), sp.alg)
+        ps = canon.plan(rs, pl)
+        canon.verify(ps, sp.alg)
+        pw = canon.plan(rw, pl)
+        assert canon.verify(pw, sp.alg) is refw
+        # the entropy member's tree has exactly the sum's step list under every placement, so the kernel runs the sum
+        # plan once over (s, W) pairs: traced on the term algebra, both components are the canonical terms (every unit)
+        assert pw.steps == ps.steps
+        got = canon.trace(ps, PairAlg(), pair_leaf)
+        assert all(v[0] is refs and v[1] is refw for v in got.values()), cfg.describe()
 
 
 def test_dispatcher_picks_are_members_of_the_space():
@@ -197,10 +257,68 @@ def test_unsupported_inputs_raise_before_any_kernel():
         softmax_batch_invariant(x)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse.row"):
         log_probs_batch_invariant(x, torch.zeros(4, dtype=torch.int64))
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse.row"):
+        entropy_batch_invariant(x)
     with pytest.raises(ValueError, match="batch_invariant"):
         flashinfer.sampling.log_probs(
             x, torch.zeros(4, dtype=torch.int64), batch_invariant=False
         )
+    with pytest.raises(ValueError, match="batch_invariant"):
+        flashinfer.sampling.entropy(x, batch_invariant=False)
+    with pytest.raises(ValueError, match="CUDA"):
+        flashinfer.sampling.entropy(x)
+
+
+def test_entropy_select_in_the_exact_model():
+    """``ZSEL(e, p) = +0 if e == 0 else p``: the -inf logit's NaN product becomes +0, both zero signs select, a NaN weight
+    passes (the leaf's product is NaN then, so NaN rows stay NaN); the entropy chain evaluated with correctly rounded
+    stand-ins for the two MUFU primitives is -(p ln p) to fp32 accuracy, exactly 0 on a one-hot row, NaN on an all-masked
+    row (device-free)."""
+    import math
+
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+    from flashinfer.batch_invariant.sampling import sterm
+
+    nan, inf = float("nan"), float("inf")
+    assert (
+        R.zsel_exact(0.0, nan) == 0.0 and math.copysign(1.0, R.zsel_exact(0.0, nan)) > 0
+    )
+    assert math.copysign(1.0, R.zsel_exact(-0.0, -0.0)) > 0
+    assert R.zsel_exact(1.0, -2.5) == -2.5 and R.zsel_exact(nan, 1.0) == 1.0
+    assert math.isnan(R.zsel_exact(0.5, nan))
+    e = torch.tensor([0.0, -0.0, 1.0, 0.25, nan, 0.0], dtype=torch.float32)
+    z = torch.tensor([-inf, -140.0, 0.0, -2.0, -1.0, -3.0], dtype=torch.float32)
+    w = R.row_w(e, z)
+    assert (
+        w[0] == 0 and w[1] == 0 and not torch.signbit(w[0]) and not torch.signbit(w[1])
+    )
+    assert w[2] == 0 and w[3] == -0.5 and torch.isnan(w[4]) and w[5] == 0
+
+    def ex2(v):
+        return nan if v != v else (fp32.to_f32(2.0**v) if v > -1000 else 0.0)
+
+    def lg2(v):
+        return (
+            nan
+            if (v != v or v < 0)
+            else (-inf if v == 0 else fp32.to_f32(math.log2(v)))
+        )
+
+    syms = {"ex2": ex2, "op:lg2": lg2, "op:zsel": R.zsel_exact}
+    x = (torch.randn(1, 40, generator=torch.Generator().manual_seed(0)) * 3).float()
+    H = sterm.evaluate(S.LSESpec(40).entropy(0), lambda r, i: float(x[r, i]), {}, syms)
+    p = torch.softmax(x.double(), -1)
+    assert abs(H - float(-(p * p.log()).sum())) < 2e-6 * max(1.0, abs(H))
+    x1 = torch.full((1, 40), -inf)
+    x1[0, 7] = 2.0
+    assert (
+        sterm.evaluate(S.LSESpec(40).entropy(0), lambda r, i: float(x1[r, i]), {}, syms)
+        == 0.0
+    )
+    x1[0, 7] = -inf
+    assert math.isnan(
+        sterm.evaluate(S.LSESpec(40).entropy(0), lambda r, i: float(x1[r, i]), {}, syms)
+    )
 
 
 # ----------------------------------------------------------------------------------------------- on the device
@@ -232,10 +350,13 @@ def test_symbolic_oracle(dtype, N):
         ex = R.exact_rows(x, temp, rows=range(3), token_ids=ids)
         ref = R.lse_reference(x, temp, ids)
         got = run_all(x, temp, ids)
-        for k in ("probs", "logprobs", "lse", "logp", "m", "s"):
+        for k in ("probs", "logprobs", "lse", "logp", "m", "s", "W", "entropy"):
             assert same(ref[k], ex[k]), f"vectorised model {k} != symbolic spec"
         assert same(got["probs"], ex["probs"]) and same(got["logp"], ex["logp"])
         assert same(got["lse2"], ex["lse"])
+        assert same(got["entropy"], ex["entropy"]) and same(
+            got["entropy2"], ex["entropy"]
+        )
 
 
 def _config_sample(N, dtype):
@@ -417,6 +538,19 @@ def test_shared_dataflow_of_the_entries():
     assert lp40.shape == (16, 40) and same(lp40, lp_row[ar[:, None], ids40])
     assert same(flashinfer.sampling.log_probs(x, ids40.to(torch.int32), temps), lp40)
     assert same(flashinfer.sampling.log_probs(x, ids[:, None], temps), lp[:, None])
+    # the entropy member: alone, with the token log-probability, with both, with K ids per row -- the same bits
+    h = flashinfer.sampling.entropy(x, temps)
+    assert h.shape == (16,) and h.dtype == torch.float32
+    lp_h, h2 = flashinfer.sampling.log_probs(x, ids, temps, return_entropy=True)
+    lp_h3, lse_h3, h3 = flashinfer.sampling.log_probs(
+        x, ids, temps, return_lse=True, return_entropy=True
+    )
+    lp40h, h40 = flashinfer.sampling.log_probs(x, ids40, temps, return_entropy=True)
+    assert (
+        same(lp_h, lp) and same(lp_h3, lp) and same(lse_h3, lse) and same(lp40h, lp40)
+    )
+    assert same(h2, h) and same(h3, h) and same(h40, h)
+    assert same(entropy_batch_invariant(x, temps), h)
     # softmax in fp32 is the fp32 input's class: the probabilities before the output conversion
     p32 = flashinfer.sampling.softmax(
         x, temps, batch_invariant=True, out_dtype=torch.float32
@@ -460,6 +594,57 @@ def test_masked_nan_and_infinite_rows():
         assert bool(torch.isnan(got["lse"][r])) and bool(
             torch.isnan(got["logprobs"][r]).all()
         )
+        assert bool(torch.isnan(got["entropy"][r]))
+    assert same(got["entropy"][0], ref["entropy"][0]) and float(got["entropy"][0]) > 0
+
+
+@needs_device
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
+def test_entropy_select_rows(dtype):
+    """The rows that exercise the member's select: a one-hot row (every other logit -inf) is exactly 0; a finite logit
+    so far below the maximum that its weight flushes to +0, a masked half and two equal tokens (ln 2) equal the exact
+    model; every member of a configuration sample agrees."""
+    N = 4097
+    x = torch.full((5, N), float("-inf"), device="cuda")
+    x[0, 100] = 3.0
+    x[1] = logits(1, N, torch.float32)[0]
+    x[1, 7] = float(x[1].max()) - 200.0
+    x[2] = logits(1, N, torch.float32, seed=3)[0]
+    x[2, 2000:] = float("-inf")
+    x[3, 5] = 1.0
+    x[3, N - 1] = 1.0
+    x[4] = logits(1, N, torch.float32, seed=4)[0]
+    xd = x.to(dtype)
+    got = flashinfer.sampling.entropy(xd)
+    assert same(got, R.lse_reference(xd)["entropy"])
+    assert float(got[0]) == 0.0 and not torch.signbit(got[0])
+    assert abs(float(got[3]) - 0.6931471805599453) < 2e-7
+    assert torch.isfinite(got).all()
+    for cfg in _config_sample(N, dtype):
+        assert same(entropy_batch_invariant(xd, config=cfg), got), cfg.describe()
+
+
+@needs_device
+@pytest.mark.parametrize("dtype", DT, ids=["bf16", "f16", "f32"])
+def test_entropy_sanity_against_fp64(dtype):
+    """A tolerance check only: the member against -(p ln p) in fp64 and against verl's ``entropy_from_logits``
+    formula ``logsumexp(x) - (softmax(x) * x).sum`` in fp32, with and without a temperature."""
+    N = 32000
+    x = (torch.randn(8, N, device="cuda") * 4).to(dtype)
+    for temp in (None, 0.7, torch.rand(8, device="cuda") + 0.5):
+        ours = flashinfer.sampling.entropy(x, temp)
+        xs = x.double()
+        if temp is not None:
+            xs = xs / (
+                temp.double()[:, None] if isinstance(temp, torch.Tensor) else temp
+            )
+        p = torch.softmax(xs, -1)
+        assert torch.allclose(
+            ours.double(), -(p * torch.log(p)).sum(-1), rtol=2e-5, atol=2e-5
+        )
+        xf = xs.float()
+        verl = torch.logsumexp(xf, -1) - (torch.softmax(xf, -1) * xf).sum(-1)
+        assert torch.allclose(ours, verl, rtol=1e-4, atol=1e-4)
 
 
 @needs_device
@@ -477,19 +662,25 @@ def test_determinism_graph_replay_and_pdl():
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         p = softmax_batch_invariant(x, temps)
-        lp, lse = log_probs_batch_invariant(x, ids, temps, return_lse=True)
+        lp, lse, h = log_probs_batch_invariant(
+            x, ids, temps, return_lse=True, return_entropy=True
+        )
         torch.cuda.current_stream().synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, stream=s):
             p = softmax_batch_invariant(x, temps)
-            lp, lse = log_probs_batch_invariant(x, ids, temps, return_lse=True)
+            lp, lse, h = log_probs_batch_invariant(
+                x, ids, temps, return_lse=True, return_entropy=True
+            )
     torch.cuda.synchronize()
     p.zero_()
     lp.zero_()
     lse.zero_()
+    h.zero_()
     g.replay()
     torch.cuda.synchronize()
     assert same(p, ref["probs"]) and same(lp, ref["logp"]) and same(lse, ref["lse2"])
+    assert same(h, ref["entropy"])
 
 
 @needs_device
@@ -529,12 +720,21 @@ def test_shapes_views_and_empty_batches():
         log_probs_batch_invariant(
             x3, torch.zeros(2, 3, 0, dtype=torch.long, device="cuda")
         )
+    assert flashinfer.sampling.entropy(x3).shape == (2, 3)
+    assert same(
+        flashinfer.sampling.entropy(x3).view(6),
+        flashinfer.sampling.entropy(x3.view(6, N)),
+    )
     x0 = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
     assert softmax_batch_invariant(x0).shape == (0, N)
-    lp0, lse0 = log_probs_batch_invariant(
-        x0, torch.empty(0, dtype=torch.long, device="cuda"), return_lse=True
+    lp0, lse0, h0 = log_probs_batch_invariant(
+        x0,
+        torch.empty(0, dtype=torch.long, device="cuda"),
+        return_lse=True,
+        return_entropy=True,
     )
-    assert lp0.shape == (0,) and lse0.shape == (0,)
+    assert lp0.shape == (0,) and lse0.shape == (0,) and h0.shape == (0,)
+    assert flashinfer.sampling.entropy(x0).shape == (0,)
     for dt in (torch.float64, torch.int32):
         with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse.row"):
             softmax_batch_invariant(torch.zeros(2, N, device="cuda", dtype=dt))

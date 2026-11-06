@@ -1062,6 +1062,7 @@ def log_probs(
     temperature: Optional[Union[torch.Tensor, float]] = None,
     *,
     return_lse: bool = False,
+    return_entropy: bool = False,
     enable_pdl: Optional[bool] = None,
     batch_invariant: bool = True,
 ):
@@ -1090,6 +1091,9 @@ def log_probs(
         bfloat16, float32 or float64; a float64 temperature is rounded to float32).
     return_lse : bool
         Also return the natural log-sum-exp of each scaled row (the normaliser), from the same launch.
+    return_entropy : bool
+        Also return the entropy of each scaled row (:func:`entropy`), from the same launch: the trainers' entropy
+        bonus next to the token log-probability, on the same trees.
     enable_pdl : Optional[bool]
         Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
     batch_invariant : bool
@@ -1102,6 +1106,9 @@ def log_probs(
     lse : torch.Tensor
         Only with ``return_lse=True``: float32 tensor of shape ``logits.shape[:-1]`` with the natural
         log-sum-exp of each scaled row.
+    entropy : torch.Tensor
+        Only with ``return_entropy=True`` (after ``lse`` when both are asked): float32 tensor of shape
+        ``logits.shape[:-1]`` with the natural entropy of each scaled row.
 
     Notes
     -----
@@ -1134,7 +1141,12 @@ def log_probs(
     from .batch_invariant.sampling.api import log_probs_batch_invariant
 
     return log_probs_batch_invariant(
-        logits, token_ids, temperature, enable_pdl, return_lse=return_lse
+        logits,
+        token_ids,
+        temperature,
+        enable_pdl,
+        return_lse=return_lse,
+        return_entropy=return_entropy,
     )
 
 
@@ -1189,6 +1201,71 @@ def log_softmax(
     from .batch_invariant.sampling.api import log_softmax_batch_invariant
 
     return log_softmax_batch_invariant(logits, temperature, enable_pdl)
+
+
+@flashinfer_api
+def entropy(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+) -> torch.Tensor:
+    r"""The entropy of ``softmax(logits / temperature)`` per row in fp32, with a batch-invariant dataflow: the
+    entropy bonus the RL trainers compute next to the token log-probability (verl's ``entropy_from_logits``, Miles'
+    ``_VocabParallelEntropy``, NeMo RL's ``ChunkedDistributedEntropy`` all form ``-sum_j p_j ln p_j`` of the scaled
+    row), the same bits whatever the batch, its padding, the row's position or the SM count, and run-to-run
+    deterministic.
+
+    The dataflow is the entropy member of the class ``lse.row`` (``flashinfer/batch_invariant/README.md``): the row
+    maximum ``m`` and the sum ``s`` of the ``ex2.approx`` weights ``e_j = ex2((x_j - m) * c)`` as fixed trees over the
+    vocabulary, a third tree ``W = sum_j w_j`` with the same shape over ``w_j = e_j * ((x_j - m) * c)`` -- ``+0`` where
+    the weight is zero, so a ``-inf`` logit contributes nothing -- and ``H = (lg2(s) - W / s) * ln2`` with
+    ``c = log2(e) / temperature``. :func:`log_probs` with ``return_entropy=True`` returns the same bits from the same
+    launch. The fingerprint is ``flashinfer.batch_invariant.fingerprint("entropy", N=, dtype=, temperature=)``.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        CUDA tensor of logits of shape ``(..., vocab_size)``, dtype bfloat16, float16 or float32 (the 16-bit
+        inputs are widened exactly).
+    temperature : Optional[Union[torch.Tensor, float]]
+        ``None`` (no scaling), a positive scalar, or a tensor with one positive value per row (float16,
+        bfloat16, float32 or float64; a float64 temperature is rounded to float32).
+    enable_pdl : Optional[bool]
+        Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
+    batch_invariant : bool
+        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+
+    Returns
+    -------
+    entropy : torch.Tensor
+        float32 tensor of shape ``logits.shape[:-1]`` with the natural entropy of each scaled row (``0`` for a
+        one-hot row, NaN for a row of ``-inf`` or NaN logits).
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class (dtype, device, architecture); the entry never falls back.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> logits = torch.randn(4, 32000, device="cuda", dtype=torch.bfloat16)
+    >>> h = flashinfer.sampling.entropy(logits, temperature=0.7)
+    >>> h.shape, h.dtype
+    (torch.Size([4]), torch.float32)
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "entropy has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    from .batch_invariant.sampling.api import entropy_batch_invariant
+
+    return entropy_batch_invariant(logits, temperature, enable_pdl)
 
 
 @flashinfer_api(trace=sampling_from_logits_trace)

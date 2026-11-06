@@ -33,6 +33,7 @@ structure Prims (α : Type) where
   neg : α → α
   ex2 : α → α
   opq : String → α → α
+  opq2 : String → α → α → α
   add_comm : ∀ a b, add a b = add b a
   mul_comm : ∀ a b, mul a b = mul b a
   fmaxc_comm : ∀ a b, fmaxc a b = fmaxc b a
@@ -63,6 +64,7 @@ def eval (P : Prims α) : Term → α
   | .neg a => P.neg (eval P a)
   | .ex2 a => P.ex2 (eval P a)
   | .opq name a => P.opq name (eval P a)
+  | .opq2 name a b => P.opq2 name (eval P a) (eval P b)
 
 theorem eval_comb (P : Prims α) (c : Comb) (a b : Term) : eval P (c.app a b) = P.comb c (eval P a) (eval P b) := by
   cases c <;> rfl
@@ -89,6 +91,7 @@ theorem eval_equiv (P : Prims α) {a b : Term} (h : Equiv a b) : eval P a = eval
   | neg_congr _ ih => simp only [eval, ih]
   | ex2_congr _ ih => simp only [eval, ih]
   | opq_congr name _ ih => simp only [eval, ih]
+  | opq2_congr name _ _ ih₁ ih₂ => simp only [eval, ih₁, ih₂]
 
 /-- Evaluate an optional term, reading an absent value as `z`. -/
 def evalO (P : Prims α) (z : α) : Option Term → α

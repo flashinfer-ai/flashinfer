@@ -3,7 +3,8 @@
 """The sampling class's symbolic terms: the engine's hash-consed terms
 (:mod:`flashinfer.batch_invariant.fp_interface.term`) with the primitives the ``lse.row`` chains use (the rounded ``mul`` /
 ``div``, the commutative ``fmaxc`` join of the maximum tree, the exact ``neg``, the opaque ``ex2`` and the named opaque
-``op("lg2")``, the input leaf ``x`` and the runtime scalar ``sym``), their canonical S-expression (what the Lean model
+``op("lg2")`` and ``op("zsel", e, p)`` (the entropy member's exact select, binary), the input leaf ``x`` and the runtime
+scalar ``sym``), their canonical S-expression (what the Lean model
 prints and the fingerprints hash) and their bit-exact evaluation through :mod:`flashinfer.batch_invariant.fp_interface.exact`
 (the two opaque primitives are supplied by the caller: the device tabulates them).
 
@@ -78,7 +79,7 @@ def evaluate(
 ) -> float:
     """Bit-exact evaluation of a term: ``x_val(row, i)`` gives the binary32 value of a logit, ``syms`` binds the symbolic
     scalars (:meth:`TermAlgebra.sym`) and the opaque primitives (``syms["ex2"]`` and ``syms["op:lg2"]``: functions of one
-    binary32 value, tabulated on the device)."""
+    binary32 value, tabulated on the device; ``syms["op:zsel"]``: the entropy member's exact select of two)."""
     if memo is None:
         memo = {}
     syms = syms or {}
@@ -117,7 +118,7 @@ def evaluate(
                 raise NotImplementedError(
                     f"no CPU model for the opaque primitive {op!r}; bind syms[{op!r}] to a device-produced function"
                 )
-            v = fn(memo[A[0].uid])
+            v = fn(*[memo[a.uid] if isinstance(a, Term) else a for a in A])
         elif op == "cvt_out":
             fmt = {"f32": fp32.F32, "bf16": fp32.BF16, "f16": fp32.F16}[A[1]]
             v = fp32.to_format(memo[A[0].uid], fmt)
@@ -212,7 +213,7 @@ def sexpr(t: Term) -> str:
             out = f"({op} {A[0]})"
         elif op == "cvt_out":
             out = f"(cvt {A[1]} {A[0]})"
-        else:  # the named opaque primitives: ``(op:lg2 a)``
+        else:  # the named opaque primitives: ``(op:lg2 a)``, ``(op:zsel e p)``
             out = "(" + op + " " + " ".join(map(str, A)) + ")"
         memo[cur.uid] = out
     return memo[t.uid]

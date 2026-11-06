@@ -6,8 +6,16 @@ then the requested outputs.
 The reductions are not written here: the kernel builds the two :class:`canon.Plan` objects from the config's placement,
 loads leaves through ``canon.init_state`` and runs ``canon.run`` with a hardware :class:`canon.Peers` (shuffles, smem
 exchange, distributed-shared-memory exchange for the cluster members). The chains around them (``spec.shifted / weight
-/ prob / lse_nat / logp``) are the spec's own functions on the ``CuteF32`` backend. Kernel-specific is the plumbing
-only: tiled copies, predicates, the ``-inf`` fill of absent elements, the staging of the fragments between the passes.
+/ prob / lse_nat / logp / entropy_nat``) are the spec's own functions on the ``CuteF32`` backend. Kernel-specific is the
+plumbing only: tiled copies, predicates, the ``-inf`` fill of absent elements, the staging of the fragments between the
+passes.
+
+The entropy member (``Mode.entropy``) adds no pass: its tree ``W`` has the sum's digits and placement, so the sum pass runs
+the sum plan ONCE over pairs ``(e_j, w_j)`` with a componentwise backend (:class:`_PairFP`) -- two accumulators carried
+through one step sequence (the shuffles, the smem exchange and the DSMEM exchange move both components) -- and each
+component is exactly its own plan's tree (the W plan's step list is asserted equal to the sum plan's; the tests trace
+the pair form on the term algebra). The chain ``H = mul(add(lg2(s), neg(div(W, s))), LN2)`` is formed with the other
+per-row scalars.
 
 The vocabulary ``N`` is a *runtime* argument: a kernel is compiled per ``Kp`` bucket (``padded_blocks(N)``) and serves
 every ``N`` of the bucket. Elements beyond ``N`` read as ``-inf`` (the fragments are filled before the predicated
@@ -31,6 +39,7 @@ from .cute_ext import CuteF32
 from .schedule import BLOCK, LANES, V, LSEConfig
 from .spec import (
     Mode,
+    entropy_nat,
     inv_sum,
     lg2,
     logp,
@@ -40,6 +49,8 @@ from .spec import (
     scale,
     shifted,
     sum_reduction,
+    w_reduction,
+    wprod,
 )
 
 NEG_INF = float("-inf")
@@ -75,6 +86,43 @@ def _select(cond, a, b):
     """``cond ? a : b`` on two values of one numeric type (``selp``; no arithmetic)."""
     ty = type(a)
     return ty(arith.select(cond.ir_value(), ty(a).ir_value(), ty(b).ir_value()))
+
+
+class _KernelFP(CuteF32):
+    """The kernel's fp backend: ``CuteF32`` plus the entropy member's exact select ``ZSEL(e, p) = +0 if e == 0 else p``
+    (``setp.eq.f32`` + ``selp.f32``: a comparison and a move of bits, no arithmetic, like the ``-inf`` fill's select, so
+    it is kernel plumbing here and not a primitive of ``cute_ext.py``; the spec names it ``spec.zsel``)."""
+
+    @staticmethod
+    def zsel(e, p):
+        e, p = Float32(e), Float32(p)
+        return _select(e == Float32(0.0), Float32(0.0), p)
+
+
+class _PairFP:
+    """The sum pass's backend when the entropy member is on. Every value is the pair ``(s_partial, W_partial)``; the two
+    engine ops the sum digits use (``const`` for the fold's init, ``add`` for every step and combine) act componentwise,
+    so one run of the sum plan carries two accumulators through the SAME step sequence and each component is exactly its
+    own plan's tree (``LSERowKernel`` asserts the W plan's steps equal the sum plan's; the device-free tests trace this
+    pair form on the term algebra and check both components against the canonical terms). Two scalar ``add.rn.f32``:
+    the packed ``add.rn.f32x2`` form measured slower at 4096 rows (its register-pair constraint) and is not used."""
+
+    @staticmethod
+    def const(value: float):
+        return (CuteF32.const(value), CuteF32.const(value))
+
+    @staticmethod
+    def add(a, b):
+        return (CuteF32.add(a[0], b[0]), CuteF32.add(a[1], b[1]))
+
+
+def _parts(v):
+    """The scalar components of a state value: one for a float, two for the pair backend's tuple."""
+    return list(v) if isinstance(v, tuple) else [v]
+
+
+def _join(parts, like):
+    return tuple(parts) if isinstance(like, tuple) else parts[0]
 
 
 @dsl_user_op
@@ -254,6 +302,14 @@ class _RowLoader:
         x = self.max_leaf(key)
         return fp.ex2(shifted(fp, x, self.nm, self.c))
 
+    def sum_w_leaf(self, key):
+        """``(e, w)`` of one element for the pair backend: the sum's leaf and the entropy member's ``w = ZSEL(e, mul(e, z))``
+        from the same shifted logit."""
+        fp = _KernelFP
+        z = shifted(fp, self.max_leaf(key), self.nm, self.c)
+        e = fp.ex2(z)
+        return (e, wprod(fp, e, z))
+
 
 class _CutePeers(canon.Peers):
     """The hardware peers of one thread: lane shuffles, the cross-warp exchange through this CTA's shared memory and,
@@ -275,16 +331,31 @@ class _CutePeers(canon.Peers):
     def shuffle_xor(self, key, value, mask):
         if value is None:
             return None
+        if isinstance(
+            value, tuple
+        ):  # the pair backend: both components move (two shuffles, one step)
+            return tuple(cute.arch.shuffle_sync_bfly(v, offset=mask) for v in value)
         return cute.arch.shuffle_sync_bfly(value, offset=mask)
+
+    @staticmethod
+    def _slots(state):
+        """The smem entries of one exchange: ``(key, component)`` pairs in key order (one per key for scalar values, two
+        for the pair backend's tuples)."""
+        return [
+            (k, ci)
+            for k, v in state.items()
+            if v is not None
+            for ci in range(len(_parts(v)))
+        ]
 
     def exchange(self, step, state):
         if step.level == "cta":
             return self._exchange_cluster(step, state)
-        keys = [k for k, v in state.items() if v is not None]
+        slots = self._slots(state)
         if self.n_exchanges:
             cute.arch.barrier()  # previous readers must finish before we overwrite
-        for e, k in enumerate(keys):
-            self.xbuf[self.group, e, self.warp_id, self.lane_id] = state[k]
+        for e, (k, ci) in enumerate(slots):
+            self.xbuf[self.group, e, self.warp_id, self.lane_id] = _parts(state[k])[ci]
         cute.arch.barrier()
         self.n_exchanges += 1
         if step.warp_stride == 1 and step.radix == step.warp_total:
@@ -295,17 +366,23 @@ class _CutePeers(canon.Peers):
                 self.warp_id + (s - my) * step.warp_stride for s in range(step.radix)
             ]
         out = {k: [None] * step.radix for k in state}
-        for e, k in enumerate(keys):
-            out[k] = [self.xbuf[self.group, e, sid, self.lane_id] for sid in sib_ids]
+        for k, v in state.items():
+            if v is None:
+                continue
+            es = [e for e, (kk, _) in enumerate(slots) if kk == k]
+            out[k] = [
+                _join([self.xbuf[self.group, e, sid, self.lane_id] for e in es], v)
+                for sid in sib_ids
+            ]
         return out
 
     def _exchange_cluster(self, step, state):
-        keys = [k for k, v in state.items() if v is not None]
+        slots = self._slots(state)
         if self.n_cluster_exchanges:
             cute.arch.cluster_arrive()  # the peers' readers of the previous exchange must finish before we overwrite
             cute.arch.cluster_wait()
-        for e, k in enumerate(keys):
-            self.cbuf[self.group, e, self.lane_id] = state[k]
+        for e, (k, ci) in enumerate(slots):
+            self.cbuf[self.group, e, self.lane_id] = _parts(state[k])[ci]
         cute.arch.cluster_arrive()  # release: our partials are visible to the cluster ...
         cute.arch.cluster_wait()  # ... acquire: and the peers' partials to us
         self.n_cluster_exchanges += 1
@@ -318,9 +395,18 @@ class _CutePeers(canon.Peers):
             ]
         bases = [_map_shared_rank(self.cbuf.iterator, Int32(sid)) for sid in sib_ids]
         out = {k: [None] * step.radix for k in state}
-        for e, k in enumerate(keys):
-            off = cute.crd2idx((self.group, e, self.lane_id), self.cbuf.layout) * 4
-            out[k] = [_ld_shared_cluster_f32(b + off) for b in bases]
+        for k, v in state.items():
+            if v is None:
+                continue
+            offs = [
+                cute.crd2idx((self.group, e, self.lane_id), self.cbuf.layout) * 4
+                for e, (kk, _) in enumerate(slots)
+                if kk == k
+            ]
+            out[k] = [
+                _join([_ld_shared_cluster_f32(b + off) for off in offs], v)
+                for b in bases
+            ]
         return out
 
     def finish(self):
@@ -362,6 +448,13 @@ class LSERowKernel:
         pl = cfg.placement(N)
         self.plan_max = canon.plan(max_reduction(N, None), pl)
         self.plan_sum = canon.plan(sum_reduction(N, None), pl)
+        self.plan_w = canon.plan(w_reduction(N, None), pl)
+        # the entropy member's tree has the sum's digits and placement: the same step list, so the sum pass carries both
+        # accumulators through one run of `plan_sum` (the pair backend); this is what makes that run the W plan too
+        assert (
+            self.plan_w.steps == self.plan_sum.steps
+            and self.plan_w.n_reg == self.plan_sum.n_reg
+        )
         assert self.plan_max.units["grid"] == 1
         self.W = self.plan_max.units["warp"]
         self.C = self.plan_max.units["cta"]
@@ -370,13 +463,16 @@ class LSERowKernel:
         self.kpw = cfg.blocks_per_warp(N)
         self.vec = cfg.vec_elems
         self.num_threads = cfg.num_threads
+        width = (
+            2 if mode.entropy else 1
+        )  # exchange entries per key in the sum pass: the pair (s, W) or s alone
         warp_steps = [i for i, s in enumerate(self.plan_max.steps) if s.level == "warp"]
-        self.n_entries = max(
-            (len(self.plan_max.keys_at(i)) for i in warp_steps), default=0
+        self.n_entries = (
+            max((len(self.plan_max.keys_at(i)) for i in warp_steps), default=0) * width
         )
         cta_steps = [i for i, s in enumerate(self.plan_max.steps) if s.level == "cta"]
-        self.n_entries_cta = max(
-            (len(self.plan_max.keys_at(i)) for i in cta_steps), default=0
+        self.n_entries_cta = (
+            max((len(self.plan_max.keys_at(i)) for i in cta_steps), default=0) * width
         )
         self.elem_bytes = dtype.width // 8
         if cfg.stage == "smem":
@@ -408,6 +504,7 @@ class LSERowKernel:
         mLse: cute.Tensor,
         mTok: cute.Tensor,
         mLogp: cute.Tensor,
+        mEnt: cute.Tensor,
         mTemp: cute.Tensor,
         c_const: Float32,
         M: Int64,
@@ -422,6 +519,7 @@ class LSERowKernel:
             mLse,
             mTok,
             mLogp,
+            mEnt,
             mTemp,
             c_const,
             M,
@@ -458,6 +556,7 @@ class LSERowKernel:
         mLse: cute.Tensor,
         mTok: cute.Tensor,
         mLogp: cute.Tensor,
+        mEnt: cute.Tensor,
         mTemp: cute.Tensor,
         c_const: Float32,
         M: Int64,
@@ -468,7 +567,7 @@ class LSERowKernel:
         tv_layout_out: cute.Layout,
         tiler_mn: cute.Shape,
     ):
-        fp = CuteF32
+        fp = _KernelFP
         bidx, _, _ = cute.arch.block_idx()
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
@@ -562,15 +661,27 @@ class LSERowKernel:
         m = canon.run(self.plan_max, state, start, peers, fp)
         nm = fp.neg(m)
 
-        # ===== pass 2: the sum of exponentials (the same plan shape) ======================================================
+        # ===== pass 2: the sum of exponentials (the same plan shape); with the entropy member also W, in lockstep ==========
         loader.nm, loader.c = nm, c
-        state, start = canon.init_state(self.plan_sum, fp, loader.sum_leaf)
-        s = canon.run(self.plan_sum, state, start, peers, fp)
+        Wv = None
+        if cutlass.const_expr(self.mode.entropy):
+            state, start = canon.init_state(self.plan_sum, _PairFP, loader.sum_w_leaf)
+            s, Wv = canon.run(self.plan_sum, state, start, peers, _PairFP)
+        else:
+            state, start = canon.init_state(self.plan_sum, fp, loader.sum_leaf)
+            s = canon.run(self.plan_sum, state, start, peers, fp)
 
         # ===== the per-row scalars ===========================================================================================
         lg2s = None
-        if cutlass.const_expr(self.mode.lse or self.mode.logp or self.mode.logprobs):
+        if cutlass.const_expr(self.mode.needs_log):
             lg2s = lg2(fp, s)
+        if cutlass.const_expr(self.mode.entropy):
+            ent_v = entropy_nat(fp, lg2s, Wv, s)
+            if t == 0:
+                if w == 0:
+                    if c_rank == 0:
+                        if row_ok:
+                            mEnt[row] = ent_v
         if cutlass.const_expr(self.mode.lse):
             lse_v = lse_nat(fp, m, c, lg2s)
             if t == 0:
@@ -738,6 +849,7 @@ def _compile_bucket(
             vector(Float32, 4),
             ids(Int64, 8),
             ids(Float32, 4),
+            vector(Float32, 4),
             vector(Float32, 4),
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

@@ -47,6 +47,9 @@ inductive Term where
   | neg (a : Term)
   | ex2 (a : Term)
   | opq (name : String) (a : Term)
+  -- the entropy member of the sampling class (2026-11-06): a named opaque BINARY primitive `opq2` (the exact select
+  -- `ZSEL(e, p) = +0 if e == 0 else p` is `opq2 "zsel"`, printed `(op:zsel e p)` as `rlk.term.TermAlgebra.op` prints it)
+  | opq2 (name : String) (a b : Term)
   deriving Repr, DecidableEq, Inhabited
 
 /-- Term equality up to commutativity of the commutative primitives. -/
@@ -71,6 +74,7 @@ inductive Equiv : Term → Term → Prop where
   | neg_congr {a a' : Term} : Equiv a a' → Equiv (.neg a) (.neg a')
   | ex2_congr {a a' : Term} : Equiv a a' → Equiv (.ex2 a) (.ex2 a')
   | opq_congr {a a' : Term} (name : String) : Equiv a a' → Equiv (.opq name a) (.opq name a')
+  | opq2_congr {a a' b b' : Term} (name : String) : Equiv a a' → Equiv b b' → Equiv (.opq2 name a b) (.opq2 name a' b')
 
 /-- `none` is an absent leaf (dropped from the tree), as in `canon._pairwise`. -/
 def oadd : Option Term → Option Term → Option Term
