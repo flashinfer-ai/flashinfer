@@ -43,13 +43,9 @@ rounds.  ``speedup`` is ``det / nondet`` of the medians (above 1: the non-determ
 ``--dx-slice-policy`` selects the non-deterministic package's dX slice rule (``cake_backend.set_dx_slice_policy``):
 ``det`` (the package default, the deterministic package's slice counts) or ``measured`` (the form-aware B200 rule).
 
-``--facade`` adds the host cost of the two facades on tiny log-probability rows (``T`` = 1, 128): the median enqueue
-time of ``cake_lm_head_nondet_train_logprob`` against ``cake_lm_head_det_train_logprob``, interleaved over rounds.
-
 Example::
 
     python benchmarks/bench_cake_lm_head_nondet_train.py --rows t16231_c4096_ce t16231_c4096_logprob --json out.json
-    python benchmarks/bench_cake_lm_head_nondet_train.py --facade --rounds 9
 """
 
 from __future__ import annotations
@@ -59,7 +55,6 @@ import gc
 import json
 import statistics
 import sys
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -102,8 +97,6 @@ PHASES = ("fwd", "bwd", "step", "ckpt")
 SEED_BASE = 761
 ROUNDS = 5
 STEPS = 10
-FACADE_ROWS = (1, 128)
-FACADE_SAMPLES = 200
 
 
 def _gpu_us(fn: Callable[[], object], steps: int) -> float:
@@ -306,47 +299,6 @@ def bench_row(name: str, W: torch.Tensor, args) -> dict:
     return result
 
 
-def bench_facade(W: torch.Tensor, args) -> list[dict]:
-    """Median host enqueue time of the non-deterministic facade against the deterministic one on tiny rows."""
-    rows = []
-    for T in FACADE_ROWS:
-        inp = make_inputs(T, seed=SEED_BASE + T, device="cuda", W=W, ignore_frac=0.0)
-        X = inp.X.detach().requires_grad_(True)
-        calls = {
-            "det": lambda: det_public.cake_lm_head_det_train_logprob(X, W, inp.labels),
-            "nondet": lambda: public.cake_lm_head_nondet_train_logprob(
-                X, W, inp.labels
-            ),
-        }
-        per_round = {name: [] for name in calls}
-        for fn in calls.values():
-            for _ in range(10):
-                fn()
-        torch.cuda.synchronize()
-        for r in range(args.rounds):
-            order = list(calls) if r % 2 == 0 else list(calls)[::-1]
-            for name in order:
-                times = []
-                for _ in range(FACADE_SAMPLES):
-                    torch.cuda.synchronize()
-                    t0 = time.perf_counter()
-                    calls[name]()
-                    times.append(1e6 * (time.perf_counter() - t0))
-                per_round[name].append(statistics.median(times))
-        det, disp = per_round["det"], per_round["nondet"]
-        deltas = [b - a for a, b in zip(det, disp, strict=True)]
-        rows.append(
-            dict(
-                T=T,
-                det_host_us=statistics.median(det),
-                nondet_host_us=statistics.median(disp),
-                delta_us=statistics.median(deltas),
-                delta_us_range=[min(deltas), max(deltas)],
-            )
-        )
-    return rows
-
-
 def _format(result: dict) -> str:
     cells = [f"{result['row']:24s}"]
     for phase in PHASES:
@@ -370,9 +322,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--rows", nargs="*", default=list(ROWS), choices=list(ROWS))
     parser.add_argument("--rounds", type=int, default=ROUNDS)
     parser.add_argument("--steps", type=int, default=STEPS)
-    parser.add_argument(
-        "--facade", action="store_true", help="also time the two facades' host path"
-    )
     parser.add_argument(
         "--dx-slice-policy",
         choices=("det", "measured"),
@@ -408,14 +357,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = bench_row(name, W, args)
         report["rows"].append(result)
         print(_format(result), flush=True)
-    if args.facade:
-        report["facade"] = bench_facade(W, args)
-        for row in report["facade"]:
-            print(
-                f"facade t{row['T']} logprob: det {row['det_host_us']:.2f} us, nondet "
-                f"{row['nondet_host_us']:.2f} us, delta {row['delta_us']:+.2f} us "
-                f"[{row['delta_us_range'][0]:+.2f}, {row['delta_us_range'][1]:+.2f}]"
-            )
     if args.json is not None:
         args.json.write_text(json.dumps(report, indent=1))
     return 0
