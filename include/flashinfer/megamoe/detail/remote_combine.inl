@@ -1,92 +1,15 @@
 // Inter-node part of the combine (MXFP4 fused kernel), included inside ROLE 3
-// after the node-local combine barrier. Two steps, in this order on every rank
-// so that no two ranks wait on each other:
+// after the node-local combine barrier. The mirror duty (reduce the outbox rows
+// of the mirrored source and put them back) ran on the dispatch warps during
+// the GEMM (`remote_early_return` in detail/remote_dispatch.inl); here:
 //
-//   remote_return      mirror duty: for every packed token of the remote source
-//                      this rank mirrors, reduce the FC2 rows that this node's
-//                      owners stored in the outbox over the top-k slots whose
-//                      experts live on this node, and put the BF16 rows into the
-//                      source's return inbox with a signal.
 //   remote_wait_return source duty: wait for the return rows of every remote
-//                      node (after the node-local reduction, which hides the
-//                      return latency).
+//                      node (after the node-local reduction, which hides what
+//                      is left of the return latency).
 //   remote_add_returns  source duty: add the returned rows into the output.
 //
 // The node-local reduction (detail/combine.inl) masks out the slots whose
 // experts are on other nodes. With one node the helpers compile to nothing.
-
-const auto remote_return = [&]() {
-  if constexpr (kNumRemoteNodes > 0) {
-    constexpr uint32_t kRowBytes = kHidden * sizeof(nv_bfloat16);
-    constexpr uint32_t kUint4PerRow = kRowBytes / sizeof(uint4);
-#pragma unroll 1
-    for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
-      auto* header = remote.inbox_header(j);
-      const uint32_t num_packed = remote.header_control(header)[0];
-      const auto* inbox_idx = reinterpret_cast<const int64_t*>(
-          static_cast<uint8_t*>(remote.inbox_input_block(j)) + idx_block_offset);
-      auto* outbox = static_cast<const uint8_t*>(remote.outbox(j));
-      auto* out_rows = static_cast<uint8_t*>(remote.return_outbound(j));
-      // One warp per packed token; lanes over 16-byte columns of the row.
-      for (uint32_t p = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; p < num_packed;
-           p += kNumSMs * kNumEpilogueWarps) {
-        uint32_t mask = 0;
-        if (lane_idx < kNumTopk) {
-          const int64_t expert_idx = inbox_idx[p * kNumTopk + lane_idx];
-          mask = (expert_idx >= 0 and node_of_expert(static_cast<uint32_t>(expert_idx)) == my_node)
-                     ? 1u
-                     : 0u;
-        }
-        mask = __ballot_sync(0xffffffff, mask);
-        for (uint32_t c = lane_idx; c < kUint4PerRow; c += 32) {
-          // All slot rows of this column are loaded before any is summed, so the
-          // k loads overlap instead of paying one memory latency each.
-          uint4 v[kNumTopk];
-#pragma unroll
-          for (uint32_t k = 0; k < kNumTopk; ++k) {
-            if (mask & (1u << k))
-              // Combine layout: [top-k slot][packed token][row].
-              v[k] = reinterpret_cast<const uint4*>(
-                  outbox + (static_cast<uint64_t>(k) * remote.capacity + p) * kRowBytes)[c];
-          }
-          float2 acc[4] = {};
-#pragma unroll
-          for (uint32_t k = 0; k < kNumTopk; ++k) {
-            if (mask & (1u << k)) {
-              const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&v[k]);
-#pragma unroll
-              for (uint32_t q = 0; q < 4; ++q) ptx::accumulate(acc[q], pairs[q]);
-            }
-          }
-          uint4 packed;
-          auto* out_pairs = reinterpret_cast<nv_bfloat162*>(&packed);
-#pragma unroll
-          for (uint32_t q = 0; q < 4; ++q) out_pairs[q] = __float22bfloat162_rn(acc[q]);
-          reinterpret_cast<uint4*>(out_rows + static_cast<uint64_t>(p) * kRowBytes)[c] = packed;
-        }
-        __syncwarp();
-      }
-    }
-    if (epilogue_thread_idx == 0) stamp_max(16);
-    // Every return row of this rank is written before SM 0 ships them.
-    comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() {
-      ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-    });
-    if (sm_idx == 0 and epilogue_thread_idx == 0) stamp_max(17);
-    if (sm_idx == 0 and epilogue_warp_idx == 0) {
-      comm::RemoteIO<kNumRemoteNodes> io(remote_links);
-#pragma unroll 1
-      for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
-        const uint32_t num_packed = remote.header_control(remote.inbox_header(j))[0];
-        const uint32_t at = remote_links.peers[j].node_at_mirror;
-        io.put_warp(j, remote.return_inbox(at), remote.return_outbound(j),
-                    static_cast<uint64_t>(cute::max(num_packed, 1u)) * kRowBytes, lane_idx, true,
-                    remote.return_flag(at), comm::remote_return_signal(at));
-      }
-      if (lane_idx == 0) stamp_max(13);
-    }
-  }
-};
 
 const auto remote_wait_return = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
@@ -122,7 +45,8 @@ const auto remote_add_returns = [&]() {
         if (slots[j] >= 0) mask |= 1u << j;
       }
       if (mask == 0) continue;
-      auto* row = reinterpret_cast<uint4*>(math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kRowBytes));
+      auto* row = reinterpret_cast<uint4*>(
+          math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kRowBytes));
       for (uint32_t c = lane_idx; c < kUint4PerRow; c += 32) {
         uint4 v = row[c];
         auto* pairs = reinterpret_cast<nv_bfloat162*>(&v);
@@ -133,9 +57,9 @@ const auto remote_add_returns = [&]() {
         while (m) {
           const uint32_t j = __ffs(m) - 1;
           m ^= 1u << j;
-          const auto r = reinterpret_cast<const uint4*>(
-              static_cast<const uint8_t*>(remote.return_inbox(j)) +
-              static_cast<uint64_t>(slots[j]) * kRowBytes)[c];
+          const auto r =
+              reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(remote.return_inbox(j)) +
+                                             static_cast<uint64_t>(slots[j]) * kRowBytes)[c];
           const auto* rp = reinterpret_cast<const nv_bfloat162*>(&r);
 #pragma unroll
           for (uint32_t q = 0; q < 4; ++q) ptx::accumulate(acc[q], rp[q]);

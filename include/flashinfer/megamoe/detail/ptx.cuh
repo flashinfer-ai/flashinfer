@@ -299,6 +299,10 @@ CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
   asm volatile("red.release.sys.global.add.s32 [%0], %1;" ::"l"(ptr), "r"(value));
 }
 
+CUTLASS_DEVICE void red_add_rel_sys(const uint64_t* ptr, const uint64_t& value) {
+  asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(ptr), "l"(value));
+}
+
 CUTLASS_DEVICE int ld_acq_sys(const int* ptr) {
   int ret;
   asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));

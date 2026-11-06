@@ -21,6 +21,10 @@ FI_MEGAMOE_STATIC_ASSERT((BLOCK_M == 128) == (BLOCK_N == 128),
 // FP8MMASelector takes N=32, and the N_SWAP ladder below has a BM32 arm.
 FI_MEGAMOE_STATIC_ASSERT(!kSwapABRequested || BLOCK_M <= 32,
                          "swap-AB packs tokens into the WGMMA N dimension");
+// The early inter-node return relies on the interleaved scheduler's block
+// order (blocks with rows from other nodes first) and its task flag.
+FI_MEGAMOE_STATIC_ASSERT(kNumRemoteNodes == 0 || kUseInterleavedScheduler,
+                         "Inter-node layers need the interleaved scheduler");
 
 // =====================================================================
 // Thread / warp identification
@@ -34,7 +38,8 @@ const uint32_t lane_idx = ptx::get_lane_idx();
 // Compiled out entirely otherwise -- see the note on the template parameter.
 //
 //   0  min  kernel entry              1  max  dispatch barrier #1 done
-//   2  max  pool ready                3  min  first math task
+//   2  max  own remote-dependent FC2 tasks done (SM 0)
+//                                    3  min  first math task
 //   4  max  last L1 task end          5  max  last L2 task end
 //   6  max  combine barrier #2 done   7  max  combine end (returned rows added)
 //   8  max  cleanup barrier #3 done   9  max  index pass grid sync done
@@ -42,7 +47,9 @@ const uint32_t lane_idx = ptx::get_lane_idx();
 //  Inter-node steps: 10 remote puts issued (SM 0), 11 inbox wait done,
 //  12 proxy publication done, 13 return put issued (SM 0), 14 return wait done
 //  (SM 0), 16 mirror reduction done, 17 its grid sync done (SM 0),
-//  18 packing pass done, 19 count pass and send-offset stake-out done.
+//  18 packing pass done, 19 count pass and send-offset stake-out done,
+//  28 node's remote-dependent FC2 tasks seen done (the early return starts).
+//  2, 13, 16, 17 and 28 are written by the dispatch warps during the GEMM.
 //
 // Accumulators, summed over every CTA (value, then count):
 //  20/21 L1 task ns     22/23 L2 task ns
@@ -108,6 +115,7 @@ using interleaved_scheduler_t =
                                        L2_SHAPE_N, L2_SHAPE_K, kNumExpertsPerRank, kNumSMs,
                                        kNumRanks>;
 constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / BLOCK_N;
+constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / BLOCK_N;
 constexpr bool kSplitMDecodedWeightReuse =
     BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
 constexpr uint32_t WG_BLOCK_M = kSplitMDecodedWeightReuse ? BLOCK_M / 2 : BLOCK_M;
@@ -438,12 +446,12 @@ const auto for_each_static_selected_block = [&](auto&& func) {
       func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
            local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
            scheduler.get_current_pool_block_offset() + m_block_idx,
-           scheduler.template get_valid_m<false>());
+           scheduler.template get_valid_m<false>(), false);
     } else {
       func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
            local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
            scheduler.get_current_pool_block_offset() + m_block_idx,
-           scheduler.template get_valid_m<false>());
+           scheduler.template get_valid_m<false>(), false);
     }
   }
 };
@@ -452,11 +460,13 @@ const auto invoke_interleaved_task = [&](const task_info_t& task_info, auto&& fu
   if (task_info.block_phase == sched::BlockPhase::Linear1) {
     func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
          task_info.local_expert_idx, L1_SHAPE_K / BLOCK_K, task_info.m_block_idx,
-         task_info.n_block_idx, task_info.pool_block_idx, task_info.valid_m);
+         task_info.n_block_idx, task_info.pool_block_idx, task_info.valid_m,
+         task_info.remote_dependent != 0u);
   } else {
     func(std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
          task_info.local_expert_idx, L2_SHAPE_K / BLOCK_K, task_info.m_block_idx,
-         task_info.n_block_idx, task_info.pool_block_idx, task_info.valid_m);
+         task_info.n_block_idx, task_info.pool_block_idx, task_info.valid_m,
+         task_info.remote_dependent != 0u);
   }
 };
 
@@ -468,6 +478,8 @@ const auto for_each_published_block = [&](auto&& func) {
 
 const auto produce_interleaved_blocks = [&](auto&& func) {
   interleaved_scheduler.fetch_expert_recv_count();
+  if constexpr (kNumRemoteNodes > 0)
+    interleaved_scheduler.fetch_remote_rows(my_node * kNumLocalRanks, kNumLocalRanks);
   while (true) {
     interleaved_scheduler.wait_task_slot_empty();
     const auto task_info = interleaved_scheduler.claim_next_task();
@@ -485,6 +497,10 @@ const auto cleanup_workspace = [&]() {
       *workspace.get_expert_send_count_ptr(i) = 0;
     if constexpr (kNumRemoteNodes > 0) {
       if (thread_idx < kNumRemoteNodes) *remote.packed_token_count(thread_idx) = 0;
+      if (thread_idx == 0) {
+        *workspace.get_remote_l2_done_ptr() = 0;
+        *workspace.get_remote_rows_ready_ptr() = 0;
+      }
     }
     if constexpr (kUseInterleavedScheduler) {
       if (thread_idx == 0) {
@@ -614,7 +630,9 @@ if (warp_idx < kNumDispatchWarps) {
       *sym_buffer.map(
           workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
           dst_rank_idx) = expert_status & 0xffffffff;
-      ptx::atomic_add_sys(
+      // Release: the task producer reads the per-source counts after one
+      // acquire of the complete sum (`fetch_remote_rows`).
+      ptx::red_add_rel_sys(
           sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
                          dst_rank_idx),
           expert_status);
@@ -636,8 +654,8 @@ if (warp_idx < kNumDispatchWarps) {
   comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
                        kBeforeDispatchPullBarrierTag, kNumLocalRanks>(
       workspace, sym_buffer, sm_idx, thread_idx,
-      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-      kNumRemoteNodes > 0, true);
+      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, kNumRemoteNodes > 0,
+      true);
   if (thread_idx == 0) stamp_max(1);
 
   // Sync with epilogue warps before pulling tokens
@@ -656,6 +674,12 @@ if (warp_idx < kNumDispatchWarps) {
     uint32_t stored_rank_count[kNumRanksPerLane] = {};
     uint32_t expert_start_idx = 0, expert_end_idx = 0;
     uint32_t expert_pool_block_offset = 0;
+    // Rows of the current expert pulled from other nodes; they come first in
+    // the expert (see detail/dispatch_rank_selection.inl).
+    uint32_t remote_rows = 0;
+    const auto rank_is_remote = [&](const uint32_t& rank_idx) {
+      return kNumRemoteNodes > 0 and rank_idx / kNumLocalRanks != my_node;
+    };
 
     constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumActiveDispatchWarps;
     for (uint32_t token_idx = sm_idx * kNumActiveDispatchWarps + warp_idx;;
@@ -679,6 +703,11 @@ if (warp_idx < kNumDispatchWarps) {
                                            j, current_expert_idx))
                                      : 0;
         }
+        uint32_t remote_in_lane = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
+          if (rank_is_remote(i * 32 + lane_idx)) remote_in_lane += stored_rank_count[i];
+        remote_rows = __reduce_add_sync(0xffffffff, remote_in_lane);
       }
 
       // Round-robin rank selection (identical to SM100)
@@ -693,9 +722,8 @@ if (warp_idx < kNumDispatchWarps) {
       if (cute::elect_one_sync()) {
         ptx::tma_load_1d(
             pull_buffer.get_base_ptr(),
-            sym_regions.map_input(
-                input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                current_rank_in_expert_idx),
+            sym_regions.map_input(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                                  current_rank_in_expert_idx),
             pull_mbarrier, kHidden);
       }
       __syncwarp();
@@ -703,10 +731,9 @@ if (warp_idx < kNumDispatchWarps) {
       // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
       constexpr uint32_t kNumSFFloats = kHidden / 128;
       FI_MEGAMOE_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
-      const auto remote_sf_ptr =
-          sym_regions.map_input(
-              input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
-              current_rank_in_expert_idx);
+      const auto remote_sf_ptr = sym_regions.map_input(
+          input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
+          current_rank_in_expert_idx);
       const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<float>();
       const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
 #pragma unroll
@@ -718,10 +745,9 @@ if (warp_idx < kNumDispatchWarps) {
       __syncwarp();
 
       if (cute::elect_one_sync()) {
-        const auto weight =
-            *sym_regions.map_input(
-                input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
+        const auto weight = *sym_regions.map_input(
+            input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+            current_rank_in_expert_idx);
         *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
         ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
@@ -758,6 +784,10 @@ if (warp_idx < kNumDispatchWarps) {
         [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
   }
 
+  // Inter-node: the mirror duty of the combine, while the GEMM still runs the
+  // blocks that need no return (after the weight copy: the loader waits on it).
+  remote_early_return();
+
   // Cleanup workspace, overlapping with combine
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -793,7 +823,7 @@ if (warp_idx < kNumDispatchWarps) {
   const auto load_a_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
                                const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
-                               const uint32_t& valid_m) {
+                               const uint32_t& valid_m, const bool& remote_dependent) {
     using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
     constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
     const auto tensor_map_a_ptr = kBlockIsL2 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
@@ -873,7 +903,7 @@ if (warp_idx < kNumDispatchWarps) {
   const auto load_b_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
                                const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
-                               const uint32_t& valid_m) {
+                               const uint32_t& valid_m, const bool& remote_dependent) {
     using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
     constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
     const uint8_t* b_base = kBlockIsL2 ? l2_weights : l1_weights;
@@ -934,7 +964,7 @@ if (warp_idx < kNumDispatchWarps) {
   const auto run_decode_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
                                    const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                    const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
-                                   const uint32_t& valid_m) {
+                                   const uint32_t& valid_m, const bool& remote_dependent) {
     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
       {
         const unsigned long long w0 = stamp_now();
@@ -1009,7 +1039,7 @@ if (warp_idx < kNumDispatchWarps) {
   const auto run_math_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
                                  const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                  const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
-                                 const uint32_t& valid_m) {
+                                 const uint32_t& valid_m, const bool& remote_dependent) {
     const unsigned long long task_t0 = stamp_now();
     if (epilogue_thread_idx == 0) stamp_min(3);
     const uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -1522,6 +1552,13 @@ if (warp_idx < kNumDispatchWarps) {
 
 #include <flashinfer/megamoe/detail/fused_epilogue.inl>
 
+    // Early inter-node return: an FC2 task of a block with rows from other
+    // nodes reports its completion once its rows are stored (the epilogue ends
+    // with a CTA barrier, so the release covers every thread's stores).
+    if constexpr (kBlockIsL2 and kNumRemoteNodes > 0) {
+      if (remote_dependent and epilogue_thread_idx == 0)
+        ptx::red_add_rel(workspace.get_remote_l2_done_ptr(), 1u);
+    }
     if (epilogue_thread_idx == 0) {
       stamp_add(kBlockIsL2 ? 22u : 20u, stamp_now() - task_t0);
       stamp_max(kBlockIsL2 ? 5u : 4u);
@@ -1546,9 +1583,8 @@ if (warp_idx < kNumDispatchWarps) {
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
 #include <flashinfer/megamoe/detail/remote_combine.inl>
-  // Mirror duty first (the other node waits on it), then this node's slots,
-  // then the rows that came back.
-  remote_return();
+  // This node's slots first, then the rows that came back (the mirror duty ran
+  // on the dispatch warps during the GEMM).
 
 // These are function fragments: sizing declarations must precede the combine body.
 // clang-format off
@@ -1556,7 +1592,7 @@ if (warp_idx < kNumDispatchWarps) {
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
 #undef FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES
-// clang-format on
+  // clang-format on
   if (epilogue_thread_idx == 0) stamp_max(15);
   remote_wait_return();
   remote_add_returns();

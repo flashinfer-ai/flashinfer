@@ -742,8 +742,10 @@ if (warp_idx < kNumDispatchWarps) {
           }
         }
 
-        // Round-robin rank selection (identical to SM100)
-
+        // Round-robin rank selection (identical to SM100); one node, so every
+        // source rank is local.
+        constexpr uint32_t remote_rows = 0;
+        const auto rank_is_remote = [](const uint32_t&) { return false; };
 #include <flashinfer/megamoe/detail/dispatch_rank_selection.inl>
         const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
             current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);

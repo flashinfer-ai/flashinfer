@@ -181,6 +181,12 @@ struct Workspace {
   CUTLASS_DEVICE
   uint32_t* get_l2_task_count_ptr() const { return math::advance_ptr<uint32_t>(base, 32u); }
 
+  // Inter-node early return of the MXFP4 fused kernel:
+  // [36..39] FC2 tasks of the blocks that hold rows pulled from other nodes
+  //          completed on this rank (gpu-scope release per task; reset in the cleanup)
+  CUTLASS_DEVICE
+  uint32_t* get_remote_l2_done_ptr() const { return math::advance_ptr<uint32_t>(base, 36u); }
+
   // Counter-based words (second 64 B sector of the signal line, away from the
   // dev-m task counters that gpu-scope atomics hammer all kernel long):
   // [64..67] int push DONE count (monotonic; remote red.release.sys, +1 per rank per launch)
@@ -203,6 +209,11 @@ struct Workspace {
   // here, so the host can tell a protocol stall from any other launch failure.
   CUTLASS_DEVICE
   uint32_t* get_spin_debug_ptr() const { return math::advance_ptr<uint32_t>(base, 76u); }
+
+  // [92..95] ranks of this node whose remote-dependent FC2 tasks are all done (one
+  //          sys-scope release per rank per launch; reset in the cleanup)
+  CUTLASS_DEVICE
+  int* get_remote_rows_ready_ptr() const { return math::advance_ptr<int>(base, 92u); }
 
   CUTLASS_DEVICE
   uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
@@ -384,9 +395,8 @@ struct RemoteRegions {
   // Fixed-stride lists the index pass writes before the per-expert totals are
   // known; compacted into the outbound header after the grid sync.
   CUTLASS_HOST_DEVICE uint64_t list_scratch_bytes() const {
-    return math::align<uint64_t>(static_cast<uint64_t>(num_experts_per_node) * capacity *
-                                     sizeof(uint32_t),
-                                 128);
+    return math::align<uint64_t>(
+        static_cast<uint64_t>(num_experts_per_node) * capacity * sizeof(uint32_t), 128);
   }
   // Per remote node: inbox, outbound, outbox, return inbox, return outbound,
   // slot map with control words, list scratch.
@@ -444,9 +454,7 @@ struct RemoteRegions {
   CUTLASS_HOST_DEVICE uint64_t* return_flag(const uint32_t& node) const {
     return reinterpret_cast<uint64_t*>(packed_slot_map(node) + capacity + 4);
   }
-  CUTLASS_HOST_DEVICE uint32_t* launch_epoch() const {
-    return packed_token_count(0) + 6;
-  }
+  CUTLASS_HOST_DEVICE uint32_t* launch_epoch() const { return packed_token_count(0) + 6; }
   CUTLASS_HOST_DEVICE uint32_t* list_scratch(const uint32_t& node, const uint32_t& expert) const {
     return static_cast<uint32_t*>(math::advance_ptr(packed_slot_map(node), slot_map_bytes())) +
            static_cast<uint64_t>(expert) * capacity;
