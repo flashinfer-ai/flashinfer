@@ -16,21 +16,23 @@ limitations under the License.
 Names of the Cake packed KDA chunked training package (deterministic, single rank).
 
 The single-rank entry points live in ``flashinfer.cake_kda_det_train`` and the package in
-``flashinfer.experimental.cake.cake_kda_det_train``.  Every public training name states its mode (``det``) and
-follows one scheme: the autograd entry ``cake_kda_det``, the class ``CakeKDADetFunction``, the types
-``CakeKDADet*`` and the other functions ``cake_kda_det_train_<verb>``; no entry takes ``deterministic=``.  The
-names before this scheme are gone with no alias: the package path ``flashinfer.experimental.cake_kda_det_train``,
-the ``chunk_kda_det*`` / ``ChunkKDADetFunction`` / ``KdaDet*`` / ``kda_det_train_*`` names, and the older
-names before the det rename (the module ``flashinfer.kda_train``, the package
-``flashinfer.experimental.cake_kda_train``, the helper ``tests.test_helpers.cake_kda_train_reference``).  The
-manifests name the package; the single-rank programs are ``cake_kda_det_train_<digest>`` libraries.  Importing
-the facade or the package loads no KCP host module (checked in a fresh interpreter by module file).
+``flashinfer.experimental.cake.cake_kda_det_train``.  The shared check of #8928
+(``tests.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: every public name states
+the mode (``det``) right after the op, no entry takes ``deterministic=``, the facade, the ``flashinfer`` top
+level and the package bind each object under one name only, and the names before this scheme fail at import
+with no alias: the package path ``flashinfer.experimental.cake_kda_det_train``, the ``chunk_kda_det*`` /
+``ChunkKDADetFunction`` / ``KdaDet*`` / ``kda_det_train_*`` names, and the older names before the det rename
+(the module ``flashinfer.kda_train``, the package ``flashinfer.experimental.cake_kda_train``, the helper
+``tests.test_helpers.cake_kda_train_reference``).  The same mode-word and keyword checks run on the package.
+This file adds what the shared check does not cover: the facade entries are stable (not experimental), the
+backend objects are defined under their names in ``cake_backend``, the host-plan helpers stay internal, the
+manifests name the package and the single-rank programs are ``cake_kda_det_train_<digest>`` libraries, and
+importing the facade or the package loads no KCP host module (checked in a fresh interpreter by module file).
 """
 
 from __future__ import annotations
 
 import importlib
-import inspect
 import json
 import re
 import subprocess
@@ -38,21 +40,28 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
+import flashinfer
 import flashinfer.cake_kda_det_train as det_api
 from flashinfer.experimental.cake import cake_kda_det_train as package
 from flashinfer.experimental.cake.cake_kda_det_train import (
     cake_backend,
     cake_jit,
 )
+from tests.test_helpers.cake_mode_names import (
+    assert_cake_mode_module,
+    assert_mode_names,
+    assert_no_deterministic_keyword,
+)
 from tests.test_helpers.cake_package import cake_package
 
 pytestmark = pytest.mark.cpu_only
 
+FACADE = "flashinfer.cake_kda_det_train"
 NEW_PACKAGE = "flashinfer.experimental.cake.cake_kda_det_train"
 PREVIOUS_PACKAGE = "flashinfer.experimental.cake_kda_det_train"
 OLD_PACKAGE = "flashinfer.experimental.cake_kda_train"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 # the det package's modules, read from its directory
 SUBMODULES = tuple(
@@ -83,7 +92,7 @@ FACADE_NAMES = (
         "is_cake_kda_det_train_supported",
     ),
 )
-# (removed names, name) of the backend
+# (removed names, name) of the backend; the package exports the same names
 BACKEND_NAMES = (
     (("ChunkKDADetFunction", "ChunkKDAFunction"), "CakeKDADetFunction"),
     (("KdaDetArena", "KdaArena"), "CakeKDADetArena"),
@@ -93,8 +102,6 @@ BACKEND_NAMES = (
     (("chunk_kda_det_bwd", "chunk_kda_bwd"), "cake_kda_det_train_backward"),
     (("chunk_kda_det", "chunk_kda"), "cake_kda_det"),
 )
-# the backend names the package __init__ exports
-PACKAGE_NAMES = BACKEND_NAMES
 # backend host-plan helpers: internal to ``cake_backend``, not exported by the package (the facade exposes the
 # mode-named entries for them)
 BACKEND_HELPERS = (
@@ -107,32 +114,18 @@ BACKEND_HELPERS = (
     "seg_states_saved",
     "workspace_bytes",
 )
-# module constants are exempt from the mode word
-_CONSTANT = re.compile(r"^[A-Z][A-Z0-9_]*$")
-
-
-def _tokens(name: str) -> list[str]:
-    """The lower-case words of ``name``: split on ``_`` and on CamelCase (``CakeKDADetFunction`` -> cake, kda,
-    det, function), so ``nondet`` is one word and does not count as ``det``."""
-    words = []
-    for part in name.split("_"):
-        words += re.findall(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+", part)
-    return [w.lower() for w in words]
-
-
-def _signatures(obj) -> list[inspect.Signature]:
-    """The call signatures a caller reaches: a function's, a class's constructor and, for an autograd
-    ``Function``, its ``forward`` (callers reach it through ``apply``; the constructor and ``apply`` are
-    torch's generic ``(*args, **kwargs)``)."""
-    if isinstance(obj, type):
-        if issubclass(obj, torch.autograd.Function):
-            return [inspect.signature(obj.forward)]
-        return [inspect.signature(obj)]
-    return [inspect.signature(obj)] if callable(obj) else []
-
-
+# the facade functions that call a backend object (a link no attribute shows); the facade's arena / workspace
+# entries build the backend types and are not the types themselves
+FORWARDS = (
+    ("cake_kda_det_train_forward", cake_backend.cake_kda_det_train_forward),
+    ("cake_kda_det_train_backward", cake_backend.cake_kda_det_train_backward),
+    ("cake_kda_det", cake_backend.cake_kda_det),
+    ("cake_kda_det_train_workspace_bytes", cake_backend.workspace_bytes),
+    ("cake_kda_det_train_saved_bytes", cake_backend.saved_bytes),
+    ("is_cake_kda_det_train_supported", cake_backend.is_supported),
+)
 # the modules removed with the previous names
-REMOVED_MODULES = (
+OLD_MODULES = (
     PREVIOUS_PACKAGE,
     *(f"{PREVIOUS_PACKAGE}.{m}" for m in ("cake_backend", "cake_build", "cake_jit")),
     "flashinfer.kda_train",
@@ -150,18 +143,40 @@ REMOVED_MODULES = (
     ),
     "tests.test_helpers.cake_kda_train_reference",
 )
+OLD_NAMES = (
+    *((FACADE, old) for olds, _ in FACADE_NAMES for old in olds),
+    *(
+        (module, old)
+        for olds, _ in BACKEND_NAMES
+        for old in olds
+        for module in (NEW_PACKAGE, f"{NEW_PACKAGE}.cake_backend")
+    ),
+)
 
 
-@pytest.mark.parametrize("old,new", FACADE_NAMES)
-def test_facade_has_only_the_new_names(old: tuple[str, ...], new: str) -> None:
-    fn = getattr(det_api, new)
-    assert fn.__name__ == new
-    assert new in det_api.__all__
-    for name in old:
-        assert name not in det_api.__all__
-        assert not hasattr(det_api, name)
-        with pytest.raises(ImportError):
-            exec(f"from flashinfer.cake_kda_det_train import {name}", {})
+def test_facade_follows_the_cake_mode_names() -> None:
+    assert_cake_mode_module(
+        det_api,
+        "det",
+        namespaces=[flashinfer, package],
+        forwards=FORWARDS,
+        old_modules=OLD_MODULES,
+        old_names=OLD_NAMES,
+        cwd=REPO_ROOT,
+    )
+
+
+def test_package_states_the_mode_and_takes_no_deterministic_keyword() -> None:
+    assert_mode_names(package, "det")
+    assert_no_deterministic_keyword(package)
+
+
+def test_facade_exports_the_entry_points_under_their_names() -> None:
+    assert sorted(det_api.__all__) == sorted(
+        ["DEFAULT_SCALE", *(new for _, new in FACADE_NAMES)]
+    )
+    for _, new in FACADE_NAMES:
+        assert getattr(det_api, new).__name__ == new
 
 
 def test_facade_shares_the_scale_and_is_not_experimental() -> None:
@@ -171,65 +186,19 @@ def test_facade_shares_the_scale_and_is_not_experimental() -> None:
         assert not getattr(getattr(det_api, new), "is_experimental", False), new
 
 
-@pytest.mark.parametrize("old,new", BACKEND_NAMES)
-def test_backend_has_only_the_new_names(old: tuple[str, ...], new: str) -> None:
+@pytest.mark.parametrize("new", [new for _, new in BACKEND_NAMES])
+def test_backend_defines_the_package_names(new: str) -> None:
     obj = getattr(cake_backend, new)
     assert obj.__name__ == new and obj.__qualname__ == new
     assert obj.__module__ == f"{NEW_PACKAGE}.cake_backend"
-    assert new in cake_backend.__all__
-    for name in old:
-        assert name not in cake_backend.__all__
-        assert not hasattr(cake_backend, name)
-
-
-@pytest.mark.parametrize("old,new", PACKAGE_NAMES)
-def test_package_has_only_the_new_names(old: tuple[str, ...], new: str) -> None:
-    assert getattr(package, new) is getattr(cake_backend, new)
-    assert new in package.__all__
-    for name in old:
-        assert name not in package.__all__
-        assert not hasattr(package, name)
-
-
-@pytest.mark.parametrize("module", [det_api, package], ids=["facade", "package"])
-def test_public_training_names_state_the_mode(module) -> None:
-    """Every public name of the facade and of the package is a constant or states the mode in the family's prefix;
-    no callable takes ``deterministic``."""
-    for name in module.__all__:
-        obj = getattr(module, name)
-        if not _CONSTANT.match(name):
-            assert "det" in _tokens(name), name
-            assert name.startswith(
-                ("cake_kda_det", "CakeKDADet", "is_cake_kda_det_train_")
-            ), name
-        for sig in _signatures(obj):
-            with pytest.raises(TypeError):
-                sig.bind_partial(deterministic=False)
+    assert new in cake_backend.__all__ and new in package.__all__
+    assert getattr(package, new) is obj
 
 
 @pytest.mark.parametrize("name", BACKEND_HELPERS)
 def test_package_does_not_export_the_backend_helpers(name: str) -> None:
     assert hasattr(cake_backend, name)
     assert name not in package.__all__ and not hasattr(package, name)
-
-
-@pytest.mark.parametrize("module", REMOVED_MODULES)
-def test_previous_modules_are_removed(module: str) -> None:
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(module)
-
-
-@pytest.mark.parametrize(
-    "name,words",
-    [
-        ("CakeKDADetFunction", ["cake", "kda", "det", "function"]),
-        ("cake_kda_det_train_forward", ["cake", "kda", "det", "train", "forward"]),
-        ("CakeKDANondetFunction", ["cake", "kda", "nondet", "function"]),
-        ("cake_kda_nondet", ["cake", "kda", "nondet"]),
-    ],
-)
-def test_mode_word_is_a_token(name: str, words: list[str]) -> None:
-    assert _tokens(name) == words
 
 
 @pytest.mark.parametrize("submodule", SUBMODULES)
