@@ -86,7 +86,7 @@ def _run_rank(
     from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
         kcp as conv_kcp,
     )
-    from flashinfer.experimental.cake_kda_train import cake_kcp_plan as plan
+    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
 
     lengths, _w, layout, C = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -97,7 +97,7 @@ def _run_rank(
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD
     part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_kcp_context(part, group, rank, device, conv_kernel_size=WIDTH)
+    ctx = plan.build_context_det_kcp(part, group, rank, device, conv_kernel_size=WIDTH)
     T = cu[-1]
     g = torch.Generator(device="cpu").manual_seed(7815)
     x_all = torch.randn(T, C, generator=g).to(torch.bfloat16)
