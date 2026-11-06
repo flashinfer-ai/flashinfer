@@ -113,7 +113,7 @@ import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Optional, Protocol, Tuple, Union, cast
 
 import torch
 import tvm_ffi
@@ -1478,6 +1478,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 48, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, False, False, 5120, 16384, 512): {"block_n": 224, "cta_rows": 128, "f32_v8": True, "store_ef": True, "pro": 15},
+    # ragged sm_107a weight-gradient keys (every token count without an exact key): the 4096 -> 512 / 4096 -> 1024 fp32
+    # rows carry the rule of their T 16231 keys, the 5120 -> 1024 bf16 row the 224-column tile with the evict-first
+    # B hint and the column-grouped raster
+    ('sm_107a', True, True, True, False, False, 4096, None, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, False, False, 4096, None, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
+    ('sm_107a', True, True, False, False, False, 5120, None, 1024): {"block_n": 224, "cta_rows": 128, "hints": ('none', 'evict_first'), "cgrp": True, "pro": 15},
     # ---- sm_100a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB200 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -2379,6 +2385,238 @@ class CakeDenseGemmDetProjectionPlan:
         return self.epi == "tma" or self.stt
 
 
+# ---------------------------------------------------------------------------
+# K1 weight-gradient chain plans: one split, several accumulation chains
+# ---------------------------------------------------------------------------
+#
+# The one-split K1 program of several accumulation chains (``chain_det_gemm_nn_n<block_n>_f32_t_c<chains>``): the
+# transposed-store GEMM ``out[l, n, m] = sum_k A[l, k, m] B[l, k, n]`` over the launch's ``[L, K, M]`` /
+# ``[L, K, N]`` MN-major operand views, ``256 x block_n`` tiles walked persistently by at most one CTA pair per two
+# SMs.  Each tile's K blocks are cut into ``chains`` contiguous ranges (the ``j``-th of ``c`` takes blocks
+# ``[j kb / c, (j + 1) kb / c)``), each summed in a TMEM accumulator of its own from an ``init`` MMA; the epilogue
+# adds them once, in chain order, and stores the FP32 result.  No workspace, no atomics and no order that depends
+# on scheduling: a fixed input, plan and device give the same bits on every run.  The bits differ from the
+# deterministic programs' (another summation order), so a row moved onto a chain plan changes its bits across
+# versions and plans; its FP64 error is below the deterministic program's.
+
+#: Token ranges at which an FP32 weight-gradient row runs the chain program on the parts of exactly one SM count,
+#: ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, chains), over_exact), ...)}``, keyed by the row's
+#: ``ROW_RULES`` identity without the reduction length (``(arch, a_mn, b_mn, out_f32, out_t, batched, N, M)``, the
+#: direct orientation of :func:`wgrad_views`).  A token count of a range runs that range's program in place of the
+#: planner's, except a token count with an exact ``ROW_RULES`` key of the row (``(..., N, K, M)``), which keeps its
+#: key unless the range says ``over_exact``.  Every other SM count (the 208-SM parts) keeps the planner's routing.
+# fmt: off
+CHAIN_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, bool, bool, bool, bool, bool, int, int], tuple[tuple[int, int, tuple[int, int], bool], ...]],
+] = {
+    ("sm_107a", 212): {
+        ("sm_107a", True, True, True, False, False, 5120, 1024): ((960, 40961, (256, 3), False),),
+        ("sm_107a", True, True, True, False, False, 5120, 512): ((960, 40961, (128, 3), True),),
+    },
+    ("sm_107a", 216): {
+        ("sm_107a", True, True, True, False, False, 5120, 1024): ((960, 40961, (256, 3), False),),
+        ("sm_107a", True, True, True, False, False, 5120, 512): ((960, 40961, (128, 3), True),),
+    },
+}
+# fmt: on
+CHAIN_TEMPLATE_PREFIX = (
+    "chain_det_gemm_"  # the registry templates of the chain programs
+)
+CHAIN_PAIR_ROWS = 256  # rows of a chain program's tile (a CTA pair, 2 x 128)
+CHAIN_BLOCK_K = 64  # K elements per K block
+_CHAIN_INT_MAX = 1 << 30
+
+
+def chain_template(block_n: int, chains: int) -> str:
+    """The registry template of the chain program of ``block_n`` columns and ``chains`` accumulation chains."""
+    return f"{CHAIN_TEMPLATE_PREFIX}nn_n{int(block_n)}_f32_t_c{int(chains)}"
+
+
+def chains_fit(chains: int, K: int) -> bool:
+    """Whether ``chains`` accumulation chains each get at least one 64-element K block of ``K``."""
+    return (
+        int(chains) >= 1 and int(chains) * CHAIN_BLOCK_K <= int(K) + CHAIN_BLOCK_K - 1
+    )
+
+
+@dataclass(frozen=True)
+class ChainGemmPlan:
+    """The host plan of one chain-program launch.  ``M`` / ``N`` / ``K`` / ``transposed_out`` are the caller's (as in
+    :class:`CakeDenseGemmDetProjectionPlan`); the launch runs the transposed-store program over ``launch_m`` (the inner extent of the
+    stored output) and ``launch_n`` (its rows), with the caller's operands exchanged (``swapped``) when the caller's
+    output is not transposed."""
+
+    L: int
+    M: int
+    N: int
+    K: int
+    transposed_out: bool
+    launch_m: int
+    launch_n: int
+    block_n: int
+    chains: int
+    m_tiles: int
+    n_tiles: int
+    sm_pairs: int
+    template: str
+    swapped: bool
+    a_mn: bool = True
+    b_mn: bool = True
+    out_f32: bool = True
+    sk_units: int = 0
+    tail_tiles: int = 0
+    htail_plan: bool = False
+    swap_fallback: bool = False
+    rule_fallback: bool = False
+    knob_fallback: bool = False
+    wave_fallback: bool = False
+
+    @property
+    def k_blocks(self) -> int:
+        return _ceil_div(self.K, CHAIN_BLOCK_K)
+
+    @property
+    def tiles(self) -> int:
+        return self.L * self.m_tiles * self.n_tiles
+
+    @property
+    def num_full(self) -> int:
+        return self.tiles
+
+    @property
+    def chain_bounds(self) -> tuple[int, ...]:
+        """The K-block boundaries of the chains: ``(0, kb / c, 2 kb / c, ..., kb)`` (integer division)."""
+        kb, c = self.k_blocks, self.chains
+        return tuple(j * kb // c for j in range(c + 1))
+
+    @property
+    def grid(self) -> tuple[int, int, int]:
+        return (2 * min(self.tiles, self.sm_pairs), 1, 1)
+
+    @property
+    def ws_f32_elems(self) -> int:
+        return 0
+
+    @property
+    def counters_alloc_u32(self) -> int:
+        """The program binds a counter buffer it does not touch at one split: a small zeroed one."""
+        return 16
+
+
+def chain_plan_of(
+    arch: str, sm_count: int, N: int, K: int, M: int, *, transposed_out: bool
+) -> Optional[tuple[int, int]]:
+    """``(block_n, chains)`` of the FP32 nn weight-gradient row ``(N, K, M)`` (:data:`CHAIN_RANGES_BY_SM`) on a part of
+    exactly ``sm_count`` SMs, or ``None``: outside the ranges, at an exact ``ROW_RULES`` key the range does not
+    override, or at a ``K`` too short for the chains."""
+    part = CHAIN_RANGES_BY_SM.get((arch, int(sm_count)))
+    if not part:
+        return None
+    ident = (arch, True, True, True, bool(transposed_out), False)
+    for lo, hi, (block_n, chains), over_exact in part.get(ident + (int(N), int(M)), ()):
+        if lo <= int(K) <= hi:
+            if not over_exact and ident + (int(N), int(K), int(M)) in ROW_RULES:
+                return None
+            return (int(block_n), int(chains)) if chains_fit(chains, K) else None
+    return None
+
+
+def _chain_route(
+    A3: torch.Tensor,
+    B3: torch.Tensor,
+    O3: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool,
+    arch: str,
+    sm_count: int,
+) -> Optional[tuple[ChainGemmPlan, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """The chain plan of a validated binding (:func:`cake_dense_gemm_det_train_projection_plan` with no caller knob), or ``None``
+    (the planner's routing): an FP32 output of a single nn matrix whose row has a range in :data:`CHAIN_RANGES_BY_SM`
+    for this part, a registered program and views the program takes."""
+    if out.dtype != torch.float32 or int(A3.shape[0]) != 1:
+        return None
+    L, M, K = (int(s) for s in A3.shape)
+    N = int(B3.shape[2])
+    try:
+        a_mn, a_desc = operand_view(A3, "A", k_axis=2)
+        b_mn, b_desc = operand_view(B3, "B", k_axis=1)
+    except ValueError:
+        return None
+    if not (a_mn and b_mn):
+        return None
+    choice = chain_plan_of(arch, sm_count, N, K, M, transposed_out=transposed_out)
+    if choice is None:
+        return None
+    block_n, chains = choice
+    template = chain_template(block_n, chains)
+    if template not in KERNELS.get(arch, {}):
+        return None
+    swapped = not transposed_out
+    launch_m, launch_n = (N, M) if swapped else (M, N)
+    ldo, out_l = _out_strides(O3)
+    if (
+        launch_m % 8
+        or launch_n % 8
+        or max(launch_m, launch_n, K) > _CHAIN_INT_MAX
+        or O3.stride(2) != 1
+        or ldo % 8
+        or out_l % 8
+        or ldo < launch_m
+        or out.data_ptr() % 16
+    ):
+        return None
+    plan = ChainGemmPlan(
+        L=L,
+        M=M,
+        N=N,
+        K=K,
+        transposed_out=bool(transposed_out),
+        launch_m=launch_m,
+        launch_n=launch_n,
+        block_n=block_n,
+        chains=chains,
+        m_tiles=_ceil_div(launch_m, CHAIN_PAIR_ROWS),
+        n_tiles=_ceil_div(launch_n, block_n),
+        sm_pairs=max(1, int(sm_count) // 2),
+        template=template,
+        swapped=swapped,
+    )
+    a_launch, b_launch = (b_desc, a_desc) if swapped else (a_desc, b_desc)
+    return plan, a_launch, b_launch, O3
+
+
+def _chain_values(
+    plan: ChainGemmPlan,
+    *,
+    A: Any,
+    B: Any,
+    o_alias: Any,
+    ws: Any,
+    counters: Any,
+    ldo: int,
+    out_l: int,
+    enable_pdl: Any,
+) -> dict[str, Any]:
+    """The keyword arguments of a chain-program launch (:func:`bind_launch` orders them by the program's plan)."""
+    return dict(
+        A=A,
+        B=B,
+        out=o_alias,
+        ws=ws,
+        counters=counters,
+        M=plan.launch_m,
+        N=plan.launch_n,
+        K=plan.K,
+        num_l=plan.L,
+        num_splits=1,
+        ldo=ldo,
+        out_l=out_l,
+        enable_pdl=enable_pdl,
+    )
+
+
 def cake_dense_gemm_det_train_projection_plan(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2589,6 +2827,27 @@ def cake_dense_gemm_det_train_projection_plan(
             "cake_dense_gemm_det_train_projection: out needs unit inner stride, 16-byte aligned rows / batches "
             f"and base; strides {tuple(O3.stride())}"
         )
+    if (
+        _use_rules
+        and _fallback
+        and _allow_swap
+        and sk == "auto"
+        and all(
+            v is None
+            for k, v in _caller_knobs.items()
+            if k not in ("transposed_out", "sk", "arch")
+        )
+    ):
+        # the FP32 weight-gradient rows of ``CHAIN_RANGES_BY_SM`` on this part: the chain program
+        chained = _chain_route(
+            A3, B3, O3, out, transposed_out=transposed_out, arch=arch, sm_count=sm_count
+        )
+        if chained is not None:
+            # a ChainGemmPlan carries every CakeDenseGemmDetProjectionPlan field the launch path reads (template, grid, workspace sizes)
+            return cast(
+                "tuple[CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor]",
+                chained,
+            )
     swap_eligible = swap_small_m(L, M, N, transposed_out)
     swapped = _allow_swap and swap_eligible
     if swapped:
@@ -4208,6 +4467,18 @@ def _k1_values(
     :class:`_Slot` markers for a cached launch that rebinds the views on every call and resolves the workspace
     out of its arena; the plan decides which of the operands the instance dereferences.  ``enable_pdl`` is the
     launch's PDL flag (0 or 1), or a :class:`_Slot` a cached launch fills per call."""
+    if isinstance(plan, ChainGemmPlan):
+        return _chain_values(
+            plan,
+            A=A,
+            B=B,
+            o_alias=o_alias,
+            ws=ws,
+            counters=counters,
+            ldo=ldo,
+            out_l=out_l,
+            enable_pdl=enable_pdl,
+        )
     dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
     tma_out, out_f32 = plan.tma_out, plan.out_f32
     return dict(
@@ -4375,6 +4646,8 @@ def _k1_swapped(
     """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  The
     launcher's small-M swap rule on the caller's dimensions, unless the registry fallback undid the swap
     (``plan.swap_fallback``)."""
+    if isinstance(plan, ChainGemmPlan):
+        return plan.swapped
     A3, B3 = as_batched(A, "A"), as_batched(B, "B")
     L, M, N = int(A3.shape[0]), int(A3.shape[1]), int(B3.shape[2])
     return swap_small_m(L, M, N, transposed_out) and not plan.swap_fallback
