@@ -202,10 +202,12 @@ point takes a ``deterministic`` keyword, and nothing falls back to the
 deterministic package.
 
 Numerical contract of the non-deterministic module: only the summation order
-of ``dfn`` varies from run to run. Each element lies within ``P`` FP32
-roundings of the fixed-order sum of its starting value and its per-chunk
-partials (``P <= 32`` token chunks). The starting value is zero, or the
-caller's ``dfn`` with ``accumulate=True``. The FP32 reduction flushes subnormal
+of ``dfn`` varies from run to run. Each element adds its per-chunk partials
+(``P <= 32`` token chunks) onto its starting value with at most ``P`` FP32
+additions, so two runs differ by at most about
+``2 P u (|start| + sum |partial|)`` per element (``u = 2^-24``). Under
+cancellation this can be many ulps of the result. The starting value is zero,
+or the caller's ``dfn`` with ``accumulate=True``. The FP32 reduction flushes subnormal
 addends and results to zero; the chunk sizes follow the host rule, so the
 low-order bits of ``dfn`` can also differ from the deterministic ``dfn``. ``dX``, the forward, the statistics
 replay and ``backward_prepare`` are bitwise the deterministic values.

@@ -32,10 +32,13 @@ pass, as its programmatic dependent) and the atomic column slab (see
 the host rule picks, the two-size tail schedule over other chunk sizes): the
 column slab adds the ``dfn`` sum of every (column slab, token chunk) unit into
 ``dfn`` with FP32 reductions, so only the summation order of ``dfn`` varies
-from run to run (each element within ``P <= 32`` FP32 roundings of the
-fixed-order sum of its starting value -- zero, or the caller's ``dfn`` under
-``accumulate=True`` -- and its per-chunk partials; the FP32 reduction flushes
-subnormal addends and results to zero).  ``dX`` is the deterministic package's
+from run to run: each element adds its ``P <= 32`` per-chunk partials onto its
+starting value -- zero, or the caller's ``dfn`` under ``accumulate=True`` --
+with at most ``P`` FP32 additions, so it differs from the exact sum of those
+terms by at most about ``P u (|start| + sum |partial|)`` (``u = 2^-24``) and
+two runs by at most twice that (under cancellation, many ulps of the result);
+the FP32 reduction flushes subnormal addends and results to zero.  ``dX`` is
+the deterministic package's
 bits; ``dscale`` and ``dbase`` are the bits of its per-CTA reduction (see
 :mod:`.cake_jit` for the group-row band where they can differ).  There is no
 final reduction kernel, and the backward workspace has no per-chunk ``dfn``
@@ -1723,9 +1726,10 @@ def cake_mhc_nondet_train_backward_finish(
     sums of at most ``P <= 32`` token chunks (the host rule's chunk sizes per
     token count and device) per element onto its starting value (zero, or the
     caller's ``dfn`` under ``accumulate=True``) in an order that varies from run
-    to run (each element within ``P`` FP32 roundings of the fixed-order sum of
-    that value and the same chunk partials; the FP32 reduction flushes
-    subnormal addends and results to zero).  With ``T == 0`` nothing is launched: ``dX`` is empty and the
+    to run (at most ``P`` FP32 additions per element, so two runs differ by at
+    most about ``2 P u (|start| + sum |partial|)``, ``u = 2^-24``; the FP32
+    reduction flushes subnormal addends and results to zero).  With ``T == 0``
+    nothing is launched: ``dX`` is empty and the
     parameter gradients are zeroed (``accumulate=False``) or left untouched
     (``accumulate=True``).
 

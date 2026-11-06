@@ -32,12 +32,14 @@ Numerical contract: ``backward_finish`` has no final reduction kernel: the
 column-slab pass adds the ``dfn`` sum of every (column slab, token chunk) unit
 into ``dfn`` with FP32 reductions and folds ``dscale`` / ``dbase`` in the same
 grid.  Only the summation order of ``dfn`` varies from run to run: each element
-lies within ``P`` FP32 roundings of the fixed-order sum of its starting value
-(zero, or the caller's ``dfn`` under ``accumulate=True``) and its per-chunk
-partials (``P <= 32`` token chunks; the chunk sizes are the host rule's per
-token count and device, so the low-order bits can also differ from the
-deterministic ``dfn``), and the FP32 reduction flushes subnormal addends and
-results to zero.  ``dX`` is bitwise the deterministic value, and so are the
+adds its per-chunk partials (``P <= 32`` token chunks; the chunk sizes are the
+host rule's per token count and device, so the low-order bits can also differ
+from the deterministic ``dfn``) onto its starting value (zero, or the caller's
+``dfn`` under ``accumulate=True``) with at most ``P`` FP32 additions, so two
+runs differ by at most about ``2 P u (|start| + sum |partial|)`` per element
+(``u = 2^-24``; under cancellation, many ulps of the result), and the FP32
+reduction flushes subnormal addends and results to zero.  ``dX`` is bitwise the
+deterministic value, and so are the
 forward, the statistics replay and ``backward_prepare`` (copies of the
 deterministic programs).  ``dscale`` and ``dbase`` are bitwise the
 deterministic package's per-CTA reduction; in the token-count bands where the
@@ -503,11 +505,13 @@ def cake_mhc_nondet_train_backward_finish(
     The arguments and outputs are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_finish`;
     the call runs the non-deterministic backward.  ``dfn`` is summed with FP32
-    reductions in a run-to-run varying order, each element within ``P <= 32``
-    FP32 roundings of the fixed-order sum of its starting value (zero, or the
-    caller's ``dfn`` under ``accumulate=True``) and its per-chunk partials (the
-    chunk sizes are the host rule's per token count and device, so the
-    low-order bits can also differ from the deterministic ``dfn``); ``dX`` is
+    reductions in a run-to-run varying order: each element adds its
+    ``P <= 32`` per-chunk partials onto its starting value (zero, or the
+    caller's ``dfn`` under ``accumulate=True``) with at most ``P`` FP32
+    additions, so two runs differ by at most about
+    ``2 P u (|start| + sum |partial|)`` (``u = 2^-24``; the chunk sizes are the
+    host rule's per token count and device, so the low-order bits can also
+    differ from the deterministic ``dfn``); ``dX`` is
     bitwise the deterministic value; ``dscale`` and ``dbase`` are bitwise the
     deterministic package's per-CTA reduction (in its group-row bands their
     low-order bits can differ from the deterministic result; see the module

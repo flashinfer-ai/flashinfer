@@ -95,9 +95,10 @@ column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
 varies from run to run: each element sums at most ``P`` per-chunk partials
 (``P <= 32``: the chunk count of :func:`k7_chunks`, or of the two-size geometry
 under ``lpt``, whose chunks can cover other token ranges, so its total can also
-differ from the deterministic ``dfn`` in the low-order bits), so it lies within
-``P`` FP32 roundings of the fixed-order sum of those partials, and the FP32
-reduction flushes subnormal addends and results to zero.  ``dX`` and every other
+differ from the deterministic ``dfn`` in the low-order bits) with at most ``P``
+FP32 additions, so two runs differ by at most about
+``2 P u (|start| + sum |partial|)`` (``u = 2^-24``), and the FP32 reduction
+flushes subnormal addends and results to zero.  ``dX`` and every other
 route's outputs are the deterministic package's bits; ``dscale`` and ``dbase``
 are its per-CTA reduction's bits, which are its values except where it runs the
 group-row forms (hidden 4096 above 14927 tokens on sm_100a and sm_103a).
