@@ -42,8 +42,8 @@ In-tree checks (``--in-tree``, the default):
 * the ``cake_build.py`` files of all checked packages are byte-identical;
 * ``common.requires.tvm_ffi.python`` equals line 1 of ``requirements.txt``;
 * every package a package requires (``Package.requires``: a package it imports
-  as its sibling, as the numerical-mode ``dense_projection_gemm`` imports the
-  deterministic ``dense_projection_det_gemm``) is a row of this table with the
+  as its sibling, as the non-deterministic ``cake_dense_gemm_nondet_train`` imports
+  the deterministic ``cake_dense_gemm_det_train``) is a row of this table with the
   same parent package.
 
 Vendored gate (``--vendored-gate``; combinable with ``--package``): the form
@@ -455,8 +455,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_train",
-        "flashinfer/experimental/cake_dsa_train",
+        "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
+        "flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -539,18 +539,18 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_det_gemm",
-        "flashinfer/experimental/dense_projection_det_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_det_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_gemm",
-        "flashinfer/experimental/dense_projection_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_nondet_train",
         "cake_jit.py",
         refs_generic,
-        # its deterministic path calls the deterministic package's programs
-        requires=("flashinfer.experimental.dense_projection_det_gemm",),
+        # its fixed-order rows run the deterministic package's programs
+        requires=("flashinfer.experimental.cake.cake_dense_gemm_det_train",),
     ),
     Package(
         "flashinfer.experimental.cake_stepfun_moe",

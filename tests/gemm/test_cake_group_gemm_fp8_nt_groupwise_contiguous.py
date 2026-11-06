@@ -98,6 +98,7 @@ BLOCK_SCALED_ONLY_TESTS = frozenset(
         "test_block_scaled_route_rule_sm107a",
         "test_block_scaled_lead_prefetch_rule",
         "test_block_scaled_block_n_routes_write_the_same_bits",
+        "test_block_scaled_block_n_128_routes_cover_partial_scale_words",
         "test_block_scaled_lead_prefetch_writes_the_same_bits",
         "test_block_scaled_only_arch_routes_name_registered_programs",
         "test_block_scaled_only_arch_rejects_float32_scales",
@@ -2473,6 +2474,68 @@ def test_block_scaled_block_n_routes_write_the_same_bits(
     assert torch.equal(
         outs[128][routed].view(torch.int16), outs[256][routed].view(torch.int16)
     )
+
+
+# (group_counts, N, K, alignment): K of 1 to 9 K blocks (each packed UE8M0
+# scale word holds the scales of 4 K blocks), single-run and 32-row aligned.
+BLOCK_SCALED_PARTIAL_WORD_CASES = [
+    pytest.param([128, 0, 256, 1, 130], 512, k, 128, id=f"single_k{k}")
+    for k in (128, 256, 384, 640, 896, 1152)
+] + [
+    pytest.param([100, 0, 3, 69, 64, 129, 1, 97], 1024, k, 32, id=f"run32_k{k}")
+    for k in (128, 256, 384, 640, 896, 1152)
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment", BLOCK_SCALED_PARTIAL_WORD_CASES)
+def test_block_scaled_block_n_128_routes_cover_partial_scale_words(
+    group_counts, n, k, alignment, monkeypatch
+):
+    """On SM107a the BLOCK_N 128 routes are exact when K is not a multiple of 4 K blocks.
+
+    Their programs read each packed scale word once for 4 K blocks, so the last
+    word of a row can cover fewer.  The single-run route also writes the same
+    bits as the BLOCK_N 256 single-run route.
+    """
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) != "sm_107a":
+        pytest.skip("checks the SM107a programs")
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        group_counts,
+        n,
+        k,
+        alignment=alignment,
+        seed=4830 + k + alignment,
+        device=device,
+    )
+    m = int(m_indices.numel())
+    single_run = alignment % 128 == 0
+    routes = (
+        {128: BS_N128_ROUTE, 256: BS_N256_ROUTE}
+        if single_run
+        else {128: BS_N128_RUN32_ROUTE}
+    )
+    outs = {}
+    for block_n, route in routes.items():
+        monkeypatch.setattr(host, "bs_block_n", lambda *args, _n=block_n, **kw: _n)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, out=out, alignment=alignment
+        )
+        assert prepared.route == route
+        prepared.launch()
+        outs[block_n] = out
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[128], expected, m_indices)
+    if single_run:
+        routed = m_indices >= 0
+        assert torch.equal(
+            outs[128][routed].view(torch.int16), outs[256][routed].view(torch.int16)
+        )
 
 
 def test_block_scaled_only_arch_routes_name_registered_programs():
