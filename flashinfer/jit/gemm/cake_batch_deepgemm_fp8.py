@@ -333,6 +333,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_107a"],
     },
+    "cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_107a"],
+    },
     "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_41af09e0c42e80bf1963",
         "sources": [
@@ -753,6 +765,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan7",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_c6484b37ae389e3495bf": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_c6484b37ae389e3495bf",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c6484b37ae389e3495bf_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c6484b37ae389e3495bf_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_107a"],
+    },
     "cake_batch_deepgemm_fp8_c65607eda6318e4ba622": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_c65607eda6318e4ba622",
         "sources": [
@@ -1064,6 +1088,10 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_3ba1a9c5986b73bd44c2",
     },
+    "cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451",
+    },
     "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963",
@@ -1283,6 +1311,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_c580972984193a63c3c2_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_c580972984193a63c3c2",
+    },
+    "cake_batch_deepgemm_fp8_c6484b37ae389e3495bf_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_c6484b37ae389e3495bf",
     },
     "cake_batch_deepgemm_fp8_c65607eda6318e4ba622_sm_100a": {
         "arch": "sm_100a",
@@ -1670,10 +1702,11 @@ def _bcta(
     cta: tuple[int | None, int | None],
     stage: tuple[Any, ...],
     m: tuple[int | None, int | None] = (None, None),
+    arches: tuple[str, ...] = _BOTH,
 ) -> _Route:
-    """(N, K) by B, by CTA = B * ceil(expected_m / 128) and by M, on both architectures."""
+    """(N, K) by B, by CTA = B * ceil(expected_m / 128) and by M, on ``arches`` (both by default)."""
     where = {"nk": nk, "b": b, "cta": cta, "m": m}
-    return _Route(_BOTH, route, route.split("__")[0], "bcta", where, (stage,), None)
+    return _Route(arches, route, route.split("__")[0], "bcta", where, (stage,), None)
 
 
 def _nk(route: str, nk: tuple[int, int], stage: tuple[Any, ...]) -> _Route:
@@ -2157,6 +2190,44 @@ _ROUTES: tuple[_Route, ...] = (
     # K=7168 and N=7168 K=2048 keys without a cell by the (N, K) bands of
     # CTA = B * ceil(expected_m / 128) (measured on the 216-SM board).
     *(_cell(nk, tag) for nk, cells in _SM107A_CELLS.items() for tag in cells),
+    # One wave at the worst case (sm_107a, 216 SMs): a key the N=4096 K=7168 BLOCK_N 144 band or the N=7168 K=2048
+    # BLOCK_N 112 band takes moves to the early-setup form (masked_m read once and prefetched, split setup, early
+    # tensor-memory free) of the narrowest of BLOCK_N 96 (seven stages) and 128 (five stages, N=4096 only) whose tiles,
+    # B * min(ceil(M / 128), ceil(expected_m / 128) + 1) * ceil(N / BLOCK_N), fit 216 (every group at its masked_m
+    # bound: M, or the one M tile past expected_m the persistent grid already allows). Cells keep their programs.
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (1, 1), (4, 4),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, None), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (2, 2), (4, 4),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, 256), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (4, 4), (4, 4),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, 128), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn128", (4096, 7168), (2, 2), (4, 4),
+          ("cake_batch_deepgemm_fp8_c6484b37ae389e3495bf", "masked_bn", 128, 128),
+          m=(257, None), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn128", (4096, 7168), (1, 1), (6, 6),
+          ("cake_batch_deepgemm_fp8_c6484b37ae389e3495bf", "masked_bn", 128, 128),
+          m=(None, 768), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn128", (4096, 7168), (2, 2), (6, 6),
+          ("cake_batch_deepgemm_fp8_c6484b37ae389e3495bf", "masked_bn", 128, 128),
+          m=(None, 384), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn128", (4096, 7168), (3, 3), (6, 6),
+          ("cake_batch_deepgemm_fp8_c6484b37ae389e3495bf", "masked_bn", 128, 128),
+          m=(None, 256), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn128", (4096, 7168), (6, 6), (6, 6),
+          ("cake_batch_deepgemm_fp8_c6484b37ae389e3495bf", "masked_bn", 128, 128),
+          m=(None, 128), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn96", (7168, 2048), (1, 1), (1, 1),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, None), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn96", (7168, 2048), (1, 1), (2, 2),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, 256), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn96", (7168, 2048), (2, 2), (2, 2),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, 128), arches=("sm_107a",)),
     # N=4096, K=7168.
     _band("seed_masked_bn__n4096_k7168_bn32", (4096, 7168),
           ("cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b", "masked_bn", 32, 256),

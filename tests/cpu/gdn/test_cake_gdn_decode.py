@@ -1835,12 +1835,13 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
     """Cake rule mirror (``gate_stream_flat_default``, exporter ``_prefill_plan``): the full-DV stateful bodies take
     their ``_gatestream_full`` twin on every architecture when a CTA owns at least two work tiles under the grid rule
     and the mean sequence length is at most 512 tokens; every other key stays on its base.  On sm_107a the seq twin
-    rule applies on top: the gate-stream twin's own ``_sm107a_i64meta`` twin (no sm_107a record is a base body)."""
+    rule applies on top: the gate-stream twin's own ``_sm107a_i64meta`` twin (no sm_107a record is a base body),
+    its prefetch twin ``_gatestream_full_pf`` where the launch grid gives some CTA a second tile."""
     base = "flashinfer_blackwell_gdn_prefill_initial"
     key = _HQ16_HV32_BF16_STATEFUL_32X256
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         twin, specs, route = _requested_prefill_source(monkeypatch, arch=arch, **key)
-        seq_twin = "_sm107a_i64meta" if arch == "sm_107a" else ""
+        seq_twin = "_pf_sm107a_i64meta" if arch == "sm_107a" else ""
         assert twin == f"{base}_gatestream_full{seq_twin}", arch
         assert route == "flashinfer.gdn_prefill.noncp.full_dv"
         assert (
@@ -1965,8 +1966,8 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
             "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full"
         ), twin
     # CC 10.7 ships the gate-stream twin for the TP4 key: its `i64meta` record (the sm_107a
-    # default body: the same schedule reading int32 or int64 metadata directly); the base
-    # record lists the other architectures only.
+    # default body: the same schedule reading int32 or int64 metadata directly), here its
+    # prefetch twin (1024 tiles on 212 CTAs); the base record lists the other architectures only.
     seven = _prefill(
         arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape
     )
@@ -1975,7 +1976,7 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
     assert seven.metadata_i64 is True and base.metadata_i64 is False
     seven_record = cake_gdn._kernel_record(seven.variant_name)
     assert seven_record["source_schedule"].endswith(
-        ":flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta"
+        ":flashinfer_blackwell_gdn_prefill_initial_gatestream_full_pf_sm107a_i64meta"
     )
     assert seven_record["architectures"] == ["sm_107a"]
     assert seven_record["specializations"] == record["specializations"]

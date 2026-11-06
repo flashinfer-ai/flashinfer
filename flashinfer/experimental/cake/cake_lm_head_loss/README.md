@@ -5,7 +5,7 @@ fused log-sum-exp / cross-entropy / policy-gradient loss and a memory-bounded
 backward, in the form whose dX reduction is unordered.  It is the
 `deterministic=False` implementation of the entries of
 `flashinfer/chunked_lm_head.py`; the deterministic implementation is
-`flashinfer.experimental.cake_lm_head_det_loss` (its README describes the
+`flashinfer.experimental.cake.cake_lm_head_det_train` (its README describes the
 shared contract, the kernels and the toolchain rules in full).  Tracking issue
 of the family: https://github.com/flashinfer-ai/flashinfer/issues/5680.
 
@@ -23,8 +23,8 @@ from `build.json` otherwise (see "Layout of this package").
 
 | | deterministic | non-deterministic (this package) |
 | --- | --- | --- |
-| package | `flashinfer.experimental.cake_lm_head_det_loss` | `flashinfer.experimental.cake.cake_lm_head_loss` |
-| public call | `chunked_lm_head_det_*(...)`, or `chunked_lm_head_*(...)` with the default `deterministic=True` | `chunked_lm_head_*(..., deterministic=False)` |
+| package | `flashinfer.experimental.cake.cake_lm_head_det_train` | `flashinfer.experimental.cake.cake_lm_head_loss` |
+| public call | `cake_lm_head_det_train_*(...)`, or `chunked_lm_head_*(...)` with the default `deterministic=True` | `chunked_lm_head_*(..., deterministic=False)` |
 | `loss`, `logp`, `lse` | fixed order, bitwise run to run | fixed order, bitwise run to run (the same programs) |
 | zero-weight policy rows (`loss_weights == 0`) | in the chunk loop | left out of the gradient path (see "Zero-weight policy rows") |
 | log-probability rows with `dlogp == 0` | in the chunk loop | ordered last; the backward's GEMMs skip their work (see "Zero-gradient rows of the log-probability backward") |
@@ -50,7 +50,7 @@ The det-free entries `chunked_lm_head_loss`, `chunked_lm_head_logprob`,
 `chunked_lm_head_preload`, `chunked_lm_head_support_logprob` and
 `chunked_lm_head_support_kl` take a keyword-only `deterministic: bool = True`:
 
-* `True` (the default): the deterministic entry (`chunked_lm_head_det_*`) with
+* `True` (the default): the deterministic entry (`cake_lm_head_det_train_*`) with
   the same arguments -- the same bits, no added allocation or synchronization;
   the entry adds one identity test of host work and its own frame.
 * `False`: this package, after the same argument checks and with the same
@@ -66,8 +66,8 @@ The arguments, outputs, memory rule, switches, ignored-row semantics,
 compaction, the policy objective and its clip, the opt-in forms
 (`memory_mode`, `num_valid_rows`, `check_num_valid_rows`), the log-probability
 entry's `temperature` / `check_temperature` and the returned dtypes are those
-of the deterministic entries (`chunked_lm_head_det_loss` /
-`chunked_lm_head_det_logprob`).  Statements there that two forms of a call
+of the deterministic entries (`cake_lm_head_det_train_loss` /
+`cake_lm_head_det_train_logprob`).  Statements there that two forms of a call
 give "bitwise the same" output compare the same operations in one run; in
 this package the K-sliced dX reduction may round differently from one run to
 the next.
@@ -99,7 +99,7 @@ GEMM and do not alert.  The autograd contexts record the mode
 ## Kept log-probability logits (`memory_mode="keep_logits"`)
 
 The log-probability entry's opt-in `memory_mode="keep_logits"` is the
-deterministic package's kept logits (`chunked_lm_head_det_logprob_keep`) under
+deterministic package's kept logits (`cake_lm_head_det_train_logprob_keep`) under
 this package's names: `cake_backend.chunked_lm_head_logprob_keep`, the
 explicit pair `forward_logprob_keep` / `backward_logprob_keep`
 (`KeptForwardResult.logits`, one BF16 `[rows_c, V]` view per chunk),
@@ -135,7 +135,7 @@ explicit pair `forward_logprob_keep` / `backward_logprob_keep`
 ## Temperature of the log-probability entry (`temperature=`)
 
 `chunked_lm_head_logprob(..., temperature=..., check_temperature=...)` is the
-deterministic entry's temperature (`chunked_lm_head_det_logprob`) under this
+deterministic entry's temperature (`cake_lm_head_det_train_logprob`) under this
 package's names: the same contract (`None`, `1.0` or any scalar whose FP32
 value is 1.0 runs the path without a temperature; a positive Python number or a
 float32 `[T]` tensor on `X`'s device, not differentiable; `logp_t = q_y -
@@ -179,7 +179,7 @@ without a temperature parameter).
 ## Candidate-support entry points (`cake_support.py`)
 
 `chunked_lm_head_support_logprob` / `chunked_lm_head_support_kl` have the
-deterministic entries' contract (`chunked_lm_head_det_support_logprob` /
+deterministic entries' contract (`cake_lm_head_det_train_support_logprob` /
 `_kl`) plus the `deterministic` keyword (the deterministic entries have none).
 As part of this package they make no run-to-run promise for the gradients, and
 their backward raises the alert above.  Their programs are the deterministic
@@ -499,12 +499,12 @@ shared by `cake_backend_opt_in.py`.
 
 | Name | What it is now |
 | --- | --- |
-| `flashinfer.chunked_lm_head.chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}` | dispatchers: `deterministic=True` -> `chunked_lm_head_det_*`, `False` -> this package |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_*` | the deterministic entries, unchanged (`deterministic=False` raises) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}` | dispatchers: `deterministic=True` -> `cake_lm_head_det_train_*`, `False` -> this package |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_*` | the deterministic entries, unchanged (`deterministic=False` raises) |
 | `flashinfer.experimental.cake.cake_lm_head_loss` | this package |
 | `cake_backend.{prepare_lm_head_loss, validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction, chunked_lm_head_loss, chunked_lm_head_logprob}` | this package's objects |
-| `cake_backend.{chunked_lm_head_logprob_keep, ChunkedLmHeadLogprobKeepFunction, forward_logprob_keep, backward_logprob_keep, KeptForwardResult, kept_memory_report}` | this package's kept-logits objects (the deterministic package's `chunked_lm_head_det_logprob_keep`, `ChunkedLmHeadDetLogprobKeepFunction` and the same eager names) |
-| `cake_backend.{chunked_lm_head_logprob_temperature, ChunkedLmHeadLogprobTemperatureFunction, forward_logprob_temperature, backward_logprob_temperature, prepare_lm_head_loss_temperature, memory_report_temperature}` | this package's temperature objects (the deterministic package's `chunked_lm_head_det_logprob_temperature`, `ChunkedLmHeadDetLogprobTemperatureFunction`, `prepare_lm_head_det_loss_temperature` and the same eager names) |
+| `cake_backend.{chunked_lm_head_logprob_keep, ChunkedLmHeadLogprobKeepFunction, forward_logprob_keep, backward_logprob_keep, KeptForwardResult, kept_memory_report}` | this package's kept-logits objects (the deterministic package's `cake_lm_head_det_train_logprob_keep`, `CakeLMHeadDetLogprobKeepFunction` and the same eager names) |
+| `cake_backend.{chunked_lm_head_logprob_temperature, ChunkedLmHeadLogprobTemperatureFunction, forward_logprob_temperature, backward_logprob_temperature, prepare_lm_head_loss_temperature, memory_report_temperature}` | this package's temperature objects (the deterministic package's `cake_lm_head_det_train_logprob_temperature`, `CakeLMHeadDetLogprobTemperatureFunction`, `prepare_lm_head_det_loss_temperature` and the same eager names) |
 | `cake_support.{SupportLogprobFunction, chunked_lm_head_support_logprob, chunked_lm_head_support_kl}` | this package's objects |
 | `cake_jit.load_cake_lm_head_loss_module` | this package's loader |
 | libraries `cake_lm_head_loss_<20 hex>_<arch>`, symbols `kernel_cake_lm_head_loss_<20 hex>` | this package's programs (named from their current kernel modules; no name of the libraries the deterministic package shipped under this prefix before its `det` naming is reused) |

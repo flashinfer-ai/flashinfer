@@ -1,0 +1,14 @@
+{
+  "fi_api": "flashinfer.norm.rmsnorm",
+  "flashinfer_version": "0.7.0.post1",
+  "inputs": {
+    "hidden_states": "float32",
+    "output": "float32",
+    "weight": "float32"
+  },
+  "operation": "rmsnorm_h16",
+  "receipt_sha256": "20b2178bf32a1d60718b1ba3f3089738c0452ba9ef0d273c194eca4c76fd87a4",
+  "target_hardware": [
+    "sm100"
+  ]
+}
