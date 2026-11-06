@@ -50,7 +50,7 @@ from tests.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_kcp_jit.__file__).resolve().parent
