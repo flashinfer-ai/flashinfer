@@ -607,7 +607,8 @@ __device__ __forceinline__ void update_md_(typename KTraits::SharedStorage* smem
   for (uint32_t j = 0; j < 2; ++j) {
     // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh).
     const float m_scaled = max(m[j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-    o_scale[j] = math::ptx_exp2(m_prev[j] * sm_scale - m_scaled);
+    // Subtract before scaling so equal maxima preserve history exactly.
+    o_scale[j] = m_prev[j] == -math::inf ? 0.f : math::ptx_exp2((m_prev[j] - m[j]) * sm_scale);
     float d_local = 0.f;
 #pragma unroll
     for (uint32_t k = 0; k < KTraits::NUM_REGS_S_FRAG / 4; ++k) {
