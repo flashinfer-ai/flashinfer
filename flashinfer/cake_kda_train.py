@@ -64,7 +64,11 @@ other's set of that mode.
 
 The mode of :func:`chunk_kda` is fixed at its forward call: the autograd node's
 backward is the forward's package.  Both packages write the saved set in the
-same format, so either backward reads it.  A workspace serves its own package:
+same format, so either backward reads it.  The deterministic package's entries
+take their own saved-set type only: a backward routed to that package (by
+``deterministic=True`` or by torch's deterministic algorithms) hands them a
+non-deterministic set as a ``KdaDetChunkSaved`` with the same fields and
+tensors.  A workspace serves its own package:
 allocate it with the ``deterministic`` value of the calls that use it (the
 non-deterministic package refuses another package's workspace, and a
 ``deterministic=True`` call refuses a ``deterministic=False`` workspace).  When
@@ -138,8 +142,8 @@ _FEATURE = "Cake packed KDA chunked training, selectable mode (SM100/SM103/SM107
 # The default scale of the GLM contract: ``head_dim ** -0.5`` with head dimension 128.
 DEFAULT_SCALE = 128**-0.5
 
-# The module of the non-deterministic package's workspace type (a workspace of it is recognized without importing
-# the package: none exists before the package is imported).
+# The module of the non-deterministic package's workspace and saved-set types (an object of either is recognized
+# without importing the package: none exists before the package is imported).
 _ND_BACKEND = f"{__package__}.experimental.cake.cake_kda_train.cake_backend"
 
 # The flashinfer package directory: frames below it are this module, its decorators and the packages.
@@ -231,6 +235,18 @@ def _arena_for(det: bool, arena: Any) -> Any:
     if isinstance(arena, own) or not dataclasses.is_dataclass(arena):
         return arena
     return own(**{f.name: getattr(arena, f.name) for f in dataclasses.fields(arena)})
+
+
+def _det_saved(saved: Any) -> Any:
+    """``saved`` of a backward routed to the deterministic package: a saved set of the non-deterministic package
+    becomes the deterministic package's ``KdaDetChunkSaved`` with the same fields and tensors (the two packages write
+    the same format; the deterministic entries take their own type only), leaving out the non-deterministic set's
+    ``deterministic`` field; ``None`` and any other object pass through."""
+    nd = sys.modules.get(_ND_BACKEND)
+    if saved is None or nd is None or not isinstance(saved, nd.KdaChunkSaved):
+        return saved
+    own = _det().KdaDetChunkSaved
+    return own(**{f.name: getattr(saved, f.name) for f in dataclasses.fields(own)})
 
 
 def _det_call(
@@ -401,7 +417,8 @@ def chunk_kda_bwd(
     dout : torch.Tensor
         BF16 gradient of ``out``, laid out like ``v``.
     saved : optional
-        The forward's saved set (version 4 or 2, of either package: the format is the same); ``None`` recomputes it
+        The forward's saved set (version 4 or 2, of either package: the format is the same; the deterministic route
+        hands a non-deterministic set over as a ``KdaDetChunkSaved`` with the same fields); ``None`` recomputes it
         from the inputs (checkpoint replay).
     scale : float, optional
         The forward's scale; ``128 ** -0.5`` when ``None``.
@@ -445,7 +462,7 @@ def chunk_kda_bwd(
             beta,
             cu_seqlens,
             dout,
-            saved=saved,
+            saved=_det_saved(saved),
             scale=scale,
             workspace=workspace,
             arena=arena,

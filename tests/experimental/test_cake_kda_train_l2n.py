@@ -1090,6 +1090,15 @@ def _bwd(inputs, saved, gate="g", *, det=False, q=None, k=None, **kwargs):
     )
 
 
+def _det_set(saved):
+    """This package's saved set as the deterministic package's ``KdaDetChunkSaved`` with the same fields and tensors,
+    as the facade's deterministic route hands it over (the deterministic entries take their own type only)."""
+    det_type = det_backend.KdaDetChunkSaved
+    return det_type(
+        **{f.name: getattr(saved, f.name) for f in dataclasses.fields(det_type)}
+    )
+
+
 def _run(inputs, gate="g", *, det=False, **kwargs):
     """The forward with its saved set and the backward from it: ``out``, the results by name and the set."""
     bwd_kwargs = {
@@ -1273,7 +1282,7 @@ def test_l2n_paths_are_bitwise_the_deterministic_l2n(shape, gate: str) -> None:
             _bwd(inputs, det_set, gate), ref, gate, (tag, "det set, nd backward")
         )
         count.grads(
-            _bwd(inputs, nd_set, gate, det=True),
+            _bwd(inputs, _det_set(nd_set), gate, det=True),
             ref,
             gate,
             (tag, "nd set, det backward"),
@@ -1630,7 +1639,10 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
                 _bwd(inputs, saved_b, gate), ref, gate, (*tag, "default backward")
             )
             count.grads(
-                _bwd(inputs, saved_b, gate, det=True), ref, gate, (*tag, "det backward")
+                _bwd(inputs, _det_set(saved_b), gate, det=True),
+                ref,
+                gate,
+                (*tag, "det backward"),
             )
             if not lean:
                 got = _bwd(inputs, None, gate, workspace=ws, doc_lengths=lengths)

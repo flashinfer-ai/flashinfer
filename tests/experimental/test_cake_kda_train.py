@@ -9427,6 +9427,15 @@ def _rg_bwd(inputs, saved, *, det=False, g=None, **kwargs):
     )
 
 
+def _det_set(saved):
+    """This package's saved set as the deterministic package's ``KdaDetChunkSaved`` with the same fields and tensors,
+    as the facade's deterministic route hands it over (the deterministic entries take their own type only)."""
+    det_type = det_backend.KdaDetChunkSaved
+    return det_type(
+        **{f.name: getattr(saved, f.name) for f in dataclasses.fields(det_type)}
+    )
+
+
 def _rg_run(inputs, *, det=False, g=None, save=True, **kwargs):
     """The raw-mode forward with its saved set and the backward from it: ``out``, the seven results by name
     (:data:`RAW_RETURN_NAMES`) and the saved set."""
@@ -9642,7 +9651,9 @@ def test_raw_gate_paths_match_the_deterministic_raw_mode(
     ):
         _rg_check(_rg_bwd(inputs, det_set), ref, tag=(tag, "det set, nd backward"))
         _rg_check(
-            _rg_bwd(inputs, nd_set, det=True), ref, tag=(tag, "nd set, det backward")
+            _rg_bwd(inputs, _det_set(nd_set), det=True),
+            ref,
+            tag=(tag, "nd set, det backward"),
         )
 
 
@@ -10154,7 +10165,9 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
                 _check_group_launches(launched, p, arena, lengths, path, passes=passes)
             _rg_check(_rg_bwd(inputs, saved_b), ref, tag=(*tag, "default backward"))
             _rg_check(
-                _rg_bwd(inputs, saved_b, det=True), ref, tag=(*tag, "det backward")
+                _rg_bwd(inputs, _det_set(saved_b), det=True),
+                ref,
+                tag=(*tag, "det backward"),
             )
             got = _rg_bwd(inputs, saved, arena=arena, doc_lengths=lengths)
             _rg_check(got, ref, tag=(*tag, "per-call"))

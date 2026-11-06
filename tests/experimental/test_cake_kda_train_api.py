@@ -361,6 +361,50 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
         assert (got is source) is isinstance(source, own)
 
 
+def test_facade_routes_the_saved_set_to_the_package(monkeypatch) -> None:
+    """A saved set of either package serves both backwards: a backward routed to the deterministic package
+    (``deterministic=True``, or ``False`` under torch's deterministic mode) hands it a ``KdaDetChunkSaved`` with the
+    same fields and tensors (the deterministic entries take their own type only), this package's backward the set as
+    it is; the deterministic package's own set and ``None`` pass through."""
+    log = _recorders(monkeypatch)
+    tensors = ("Aqk", "Akk", "h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u")
+    fields = {name: torch.empty(0) for name in (*tensors, "qk_rstd")}
+    fields.update(
+        version=cake_backend.SAVED_VERSION_TAPE,
+        tables=(torch.empty(0),),
+        S=1,
+        H=1,
+        num_docs=1,
+        scale=facade.DEFAULT_SCALE,
+        gate="raw",
+        lower_bound=LOWER_BOUND,
+        qk_l2norm=True,
+    )
+    det_saved = det_backend.KdaDetChunkSaved(**fields)
+    nd_saved = cake_backend.KdaChunkSaved(**fields)
+    assert nd_saved.deterministic is False
+    operands = tuple(object() for _ in range(7))
+    sources = (det_saved, nd_saved, None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for saved in sources:
+            facade.chunk_kda_bwd(*operands, saved=saved)
+            facade.chunk_kda_bwd(*operands, saved=saved, deterministic=False)
+            with _TorchDeterministic():
+                facade.chunk_kda_bwd(*operands, saved=saved, deterministic=False)
+    assert [side for _entry, side, _kw in log] == ["det", "nd", "det"] * len(sources)
+    for (_entry, side, kwargs), source in zip(
+        log, (s for s in sources for _ in range(3)), strict=True
+    ):
+        got = kwargs["saved"]
+        if side == "nd" or source is not nd_saved:
+            assert got is source, (side, source)
+            continue
+        assert type(got) is det_backend.KdaDetChunkSaved
+        for f in dataclasses.fields(got):
+            assert getattr(got, f.name) is getattr(nd_saved, f.name), f.name
+
+
 def test_byte_queries_are_the_packages_and_agree() -> None:
     # An explicit SM count keeps the queries device-free.  The two packages' workspaces and saved sets have the same
     # size (the layouts are the same; the S1 programs bind the deterministic forms' buffers).
@@ -1631,7 +1675,9 @@ def test_autograd_records_the_forward_mode() -> None:
 
 def test_the_backward_reads_a_saved_set_of_either_package() -> None:
     """This package's forward writes a saved set recording ``deterministic=False`` in the deterministic package's
-    format: each package's backward reads the other's set and gives the gradients of its own."""
+    format: each package's backward reads the other's set and gives the gradients of its own (this package's backward
+    the deterministic set as it is, the deterministic backward this package's set through the facade, which hands it
+    over as a ``KdaDetChunkSaved``)."""
     device = _device_or_skip()
     lengths, heads = (63, 1, 65), 2
     q, k, v, g, beta, cu, dout = _operands(make_inputs(lengths, heads, device))
@@ -1669,9 +1715,11 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
         det_own = det_backend.chunk_kda_det_bwd(
             q, k, v, g, beta, cu, dout, saved=det_saved, scale=scale
         )
-        det_other = det_backend.chunk_kda_det_bwd(
-            q, k, v, g, beta, cu, dout, saved=nd_saved, scale=scale
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            det_other = facade.chunk_kda_bwd(
+                q, k, v, g, beta, cu, dout, saved=nd_saved, scale=scale
+            )
         assert _same(det_other, det_own), save_mode
 
 
