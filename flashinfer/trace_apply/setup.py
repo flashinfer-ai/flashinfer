@@ -88,16 +88,23 @@ class SetupStateError(RuntimeError):
 
 
 def _is_capturing(device: Any) -> bool:
-    """Whether the current stream of ``device`` is inside CUDA-graph capture.
+    """Whether a CUDA-graph capture is open on the call's device or on the current one.
 
-    Asked on the call's device, not on whatever device happens to be current:
-    a capture on another GPU than the current one must still be seen."""
+    Asked on the call's device, so a capture on another GPU than the current
+    one is seen, and on the current device too when it differs: a setup
+    allocates and synchronizes, which a capture open anywhere in the process
+    may not tolerate."""
     if device.type != "cuda":
         return False
     import torch
 
     with torch.cuda.device(device):
-        return torch.cuda.is_current_stream_capturing()
+        if torch.cuda.is_current_stream_capturing():
+            return True
+        index = torch.cuda.current_device()
+    return index != torch.cuda.current_device() and (
+        torch.cuda.is_current_stream_capturing()
+    )
 
 
 def _call_device(tensors: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
@@ -231,6 +238,7 @@ class SetupBoundCallable:
         self._preparing = False
         self._states: dict[_StateKey, tuple[Any, tuple[Any, ...]]] = {}
         self._frozen = False
+        self._released = False
         self._stats: dict[str, Any] = {
             "runs": 0,
             "weight_sets": 0,
@@ -254,6 +262,14 @@ class SetupBoundCallable:
             raise SetupStateError(
                 f"{self.name}: the call already passes {self.state_param!r}, "
                 "the parameter reserved for the setup state"
+            )
+        if self._released:
+            # A route resolved before the release (a wrapper a caller kept, a
+            # teardown re-entering its own Definition) must not prepare a state
+            # nothing tracks; the live binding is the one a later import makes.
+            raise SetupStateError(
+                f"{self.name}: this binding was released; its states are torn down "
+                "and a later import binds afresh"
             )
         tensors = self._setup_tensors(kwargs)
         key: _StateKey = tuple(
@@ -459,7 +475,9 @@ class SetupBoundCallable:
         graphs replay against the state addresses, so freeing them would serve
         recycled memory as weights. A shutdown-time operation: the caller
         quiesces calls first, since a call in flight already holds the state
-        it was handed and a teardown may empty it. Every teardown is
+        it was handed and a teardown may empty it. The binding refuses every
+        call from here on, before the first teardown runs, so a teardown that
+        re-enters its Definition prepares nothing. Every teardown is
         attempted; the first failure is raised afterwards, naming how many of
         them failed."""
         with self._lock:
@@ -469,6 +487,7 @@ class SetupBoundCallable:
                     "captured graphs replay against its addresses, so it is kept for "
                     "the life of the process"
                 )
+            self._released = True
             states, self._states = self._states, {}
             self._stats["weight_sets"] = 0
             self._stats["retained_bytes"] = 0

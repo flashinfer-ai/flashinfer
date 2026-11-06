@@ -740,9 +740,13 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
         raise SealedPackageError(f"no sealed module {fullname!r}")
 
 
-#: Definitions ``load_packages`` enabled from sealed packages in this process;
-#: ``release_packages`` takes exactly these out of Trace Apply's mapping.
-_preloaded_definitions: set[str] = set()
+#: The sealed Solutions ``load_packages`` enabled in this process, by Definition:
+#: ``{definition: (solution name, Solution hash)}``. ``release_packages`` takes
+#: exactly these out of Trace Apply's mapping, by identity (a curated Solution
+#: enabled for the same Definition after a ``disable_apply`` is not the sealed
+#: one and stays), and drops their preloaded entries; a Definition a captured
+#: binding serves is kept.
+_preloaded_solutions: dict[str, tuple[str, str]] = {}
 _bound_lock = threading.Lock()
 #: {(digest, pid): SetupBoundCallable} — one binding per package and process,
 #: so a repeat ``import_entry`` returns the identical object and the states it
@@ -890,22 +894,34 @@ def import_entry(package: SealedPackage) -> Callable[..., Any]:
     return function
 
 
-def release_packages() -> None:
-    """Release this process's setup-bearing bindings, then drop every preloaded entry.
+def _solution_hash(value: Any) -> str | None:
+    """``Solution.hash()`` of an enabled value; None for a curated plain callable."""
+    hash_of = getattr(value, "hash", None)
+    return hash_of() if callable(hash_of) else None
 
-    Each bound callable tears down the states it retains (``teardown(state)``
-    when declared) and leaves the registry, so a later ``import_entry`` binds
-    afresh; ``clear_preloaded`` then drops every preloaded entry, and the
-    released Definitions leave Trace Apply's mapping (a route a released
-    binding served would otherwise fall through to the on-disk build path on
-    its next call, the one place sealed sources must never reach); curated
-    Solutions enabled beside them stay enabled. Every binding is released
-    before a failed teardown is raised. A binding a CUDA-graph capture has
-    observed is kept, states and all, and stays in ``setup_stats()``: captured
-    graphs replay against the state addresses, so the state lives for the
-    rest of the process (the reason nothing runs at process exit either, where
-    CUDA frees during interpreter teardown). Callers quiesce their calls
-    first: a call in flight keeps no reference to the state it was handed.
+
+def release_packages() -> None:
+    """Release this process's sealed packages: their routes first, then their bindings.
+
+    The routes are disarmed before any teardown runs: every sealed Definition
+    ``load_packages`` enabled that no captured binding serves leaves Trace
+    Apply's mapping, by identity (a curated Solution enabled for the same
+    Definition since is not the sealed one and stays), and loses its preloaded
+    entry, so neither a teardown re-entering its Definition nor a route a
+    released binding served can reach the on-disk build path, the one place
+    sealed sources must never reach; curated Solutions enabled beside them stay
+    enabled. Then each bound callable tears down the states it retains
+    (``teardown(state)`` when declared), refuses every later call (a wrapper a
+    caller kept across the release included) and leaves the registry, so a
+    later ``import_entry`` binds afresh. Every binding is released before a
+    failed teardown is raised. A binding a CUDA-graph capture has observed is
+    kept, states, route and preloaded entry included, and stays in
+    ``setup_stats()``: captured graphs replay against the state addresses, so
+    the state lives for the rest of the process (the reason nothing runs at
+    process exit either, where CUDA frees during interpreter teardown).
+    Callers quiesce their calls first: a call in flight holds the state object
+    it was handed, and a teardown that empties it in place is the Solution's
+    own choice.
     """
     from . import apply
     from .setup import SetupStateError
@@ -913,27 +929,34 @@ def release_packages() -> None:
     _own_bound()
     with _bound_lock:
         released = [bound for bound in _bound.values() if not bound.frozen]
+        kept = {bound.name for bound in _bound.values() if bound.frozen}
         for key in [key for key, bound in _bound.items() if not bound.frozen]:
             del _bound[key]
-    failures: list[SetupStateError] = []
-    try:
-        for bound in released:
-            try:
-                bound.release()
-            except SetupStateError as error:
-                failures.append(error)
-    finally:
-        apply.clear_preloaded()
-        if apply.is_enabled():
-            remaining = {
-                definition: solution
-                for definition, solution in apply._solutions.items()
-                if definition not in _preloaded_definitions
-            }
-            _preloaded_definitions.clear()
+    releasing = {
+        definition: identity
+        for definition, identity in _preloaded_solutions.items()
+        if definition not in kept
+    }
+    for definition, (name, _) in releasing.items():
+        apply.unregister_preloaded(definition, name)
+        del _preloaded_solutions[definition]
+    if releasing and apply._solutions:
+        remaining = {
+            definition: solution
+            for definition, solution in apply._solutions.items()
+            if definition not in releasing
+            or _solution_hash(solution) != releasing[definition][1]
+        }
+        if len(remaining) != len(apply._solutions):
             apply.disable_apply()
             if remaining:
                 apply.enable_apply(remaining)
+    failures: list[SetupStateError] = []
+    for bound in released:
+        try:
+            bound.release()
+        except SetupStateError as error:
+            failures.append(error)
     if failures:
         raise SetupStateError(
             f"{len(failures)} of {len(released)} setup-bearing bindings failed to "
@@ -1062,7 +1085,7 @@ def load_packages(
             apply.register_preloaded(
                 definition, name, fn, solution_hash=solutions[definition].hash()
             )
-        _preloaded_definitions.update(solutions)
+            _preloaded_solutions[definition] = (name, solutions[definition].hash())
         if solutions:
             result.applied = apply.enable_apply({**current, **solutions})
     return result

@@ -198,7 +198,20 @@ def register_preloaded(
     callable of the first.
     """
     with _loaded_lock:
-        _preloaded[(str(definition), str(name))] = (fn, solution_hash)
+        key = (str(definition), str(name))
+        _preloaded[key] = (fn, solution_hash)
+        # A callable the build path cached for this key before the
+        # registration is never served again.
+        _loaded.pop(key, None)
+
+
+def unregister_preloaded(definition: str, name: str) -> None:
+    """Drop the preloaded entry of one (definition, solution-name) pair, if any.
+
+    The release path of a sealed-package loader: the entries other loaders
+    registered stay."""
+    with _loaded_lock:
+        _preloaded.pop((str(definition), str(name)), None)
 
 
 def clear_preloaded() -> None:
@@ -245,6 +258,12 @@ def _get_loaded_solution(solution: Solution) -> Callable:
     # different solutions still build in parallel.
     with lock:
         with _loaded_lock:
+            # Asked again under the per-solution lock: a registration that
+            # landed while this caller waited for another caller's build wins
+            # over the callable that build cached.
+            preloaded = _preloaded.get(key)
+            if preloaded is not None:
+                return _preloaded_for(preloaded, solution)
             cached = _loaded.get(key)
             if cached is not None:
                 return cached

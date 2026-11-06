@@ -681,6 +681,62 @@ def test_preloaded_callable_is_bound_to_its_solution(tmp_path, monkeypatch):
     assert _get_loaded_solution(solution) is sentinel
 
 
+def test_a_registration_during_another_callers_build_is_seen_under_the_build_lock(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    import flashinfer.trace_apply.apply as apply_module
+    from flashinfer.trace.solution import Solution
+
+    def sentinel(x):
+        return x
+
+    def built(x):
+        return x - 1
+
+    apply_module.reset_loaded()
+    clear_preloaded()
+    sealed = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
+    solution = Solution.from_dict(sealed.solution)
+    key = (solution.definition, solution.name)
+
+    class Gate:  # the per-solution build lock, held by a caller whose build is in flight
+        def __init__(self):
+            self.lock, self.waited = threading.Lock(), threading.Event()
+
+        def __enter__(self):
+            self.waited.set()
+            self.lock.acquire()
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    gate = Gate()
+    monkeypatch.setitem(apply_module._loading_locks, key, gate)
+    rebuilt = []
+    monkeypatch.setattr(
+        apply_module, "load_solution", lambda sol: rebuilt.append(sol) or built
+    )
+    gate.lock.acquire()  # caller A is building
+    served = []
+    caller_b = threading.Thread(
+        target=lambda: served.append(_get_loaded_solution(solution))
+    )
+    caller_b.start()
+    assert gate.waited.wait(5)  # B missed the registry and waits for A's lock
+    with apply_module._loaded_lock:
+        apply_module._loaded[key] = built  # A's build completes and is cached
+    register_preloaded(
+        *key, sentinel, solution_hash=solution.hash()
+    )  # then a loader registers
+    gate.lock.release()  # A lets go; B takes the lock
+    caller_b.join(5)
+    assert (
+        served == [sentinel] and rebuilt == []
+    )  # B serves the registration, builds nothing
+
+
 def test_target_hardware_gate(tmp_path, monkeypatch):
     import flashinfer.trace_apply.apply as apply_mod
 

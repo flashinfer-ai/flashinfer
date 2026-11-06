@@ -384,7 +384,9 @@ def test_golden_setup_package_verifies_binds_and_serves(sm_gate_off):
     assert pk.import_entry(sealed) is not bound  # a later import binds afresh
 
 
-def test_release_packages_leaves_curated_solutions_enabled(tmp_path, sm_gate_off):
+def test_release_packages_leaves_curated_and_captured_solutions_enabled(
+    tmp_path, sm_gate_off, monkeypatch
+):
     import flashinfer.trace_apply.apply as apply_module
 
     def curated(hidden_states, weight):
@@ -392,10 +394,12 @@ def test_release_packages_leaves_curated_solutions_enabled(tmp_path, sm_gate_off
 
     assert ta.enable_apply({"rmsnorm_h16": curated}) >= 1
     sealed = setup_package(tmp_path)
-    pk.load_packages(tmp_path, [sealed.digest])
+    result = pk.load_packages(tmp_path, [sealed.digest])
+    [(definition, name)] = result.callables
     assert set(apply_module._solutions) == {"rmsnorm_h16", OPERATION}
     pk.release_packages()
     assert apply_module._solutions == {"rmsnorm_h16": curated} and ta.is_enabled()
+    assert preloaded_entry(definition, name) is None
 
     # One Definition has one Solution: a sealed package for an enabled one is
     # refused (strict) or recorded and left out (best effort), never substituted.
@@ -404,6 +408,35 @@ def test_release_packages_leaves_curated_solutions_enabled(tmp_path, sm_gate_off
     result = pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST], strict=False)
     assert result.applied == 0 and GOLDEN_SETUP_DIGEST in result.errors
     assert apply_module._solutions == {"rmsnorm_h16": curated}
+
+    # Release goes by identity: a curated Solution enabled for the sealed
+    # Definition after Apply was disabled is not the sealed one and stays.
+    ta.disable_apply()
+    pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    ta.disable_apply()
+    assert ta.enable_apply({"rmsnorm_h16": curated}) >= 1
+    pk.release_packages()
+    assert apply_module._solutions == {"rmsnorm_h16": curated} and ta.is_enabled()
+    assert preloaded_entry(*GOLDEN_SETUP_KEY) is None
+    ta.disable_apply()
+
+    # A binding a capture observed keeps its states, its route and its
+    # preloaded entry: captured graphs replay against them.
+    monkeypatch.setattr(
+        pk, "_bound", {}
+    )  # the frozen binding must not outlive the test
+    result = pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    bound = result.callables[GOLDEN_SETUP_KEY]
+    hidden, weight, out = torch.randn(2, 16), torch.randn(16), torch.empty(2, 16)
+    bound(hidden_states=hidden, weight=weight, output=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    bound(hidden_states=hidden, weight=weight, output=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+    assert bound.frozen
+    pk.release_packages()
+    assert set(apply_module._solutions) == {"rmsnorm_h16"} and ta.is_enabled()
+    assert preloaded_entry(*GOLDEN_SETUP_KEY) is bound
+    assert pk.setup_stats() == {"rmsnorm_h16": bound.stats()}
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +550,66 @@ def test_capture_refuses_first_use_freezes_and_never_releases(tmp_path, monkeypa
     assert sys.modules[bound.__module__].CALLS["teardown"] == 0
     assert pk.setup_stats() == {OPERATION: bound.stats()}
     assert bound.stats()["weight_sets"] == 1
+
+
+def test_capture_is_seen_on_the_calls_device_and_on_the_current_one(monkeypatch):
+    capturing = {0: False, 1: False}
+    current = [0]
+
+    class Device:  # torch.cuda.device: the current device, for the block
+        def __init__(self, device):
+            self.index = current[0] if device.index is None else device.index
+
+        def __enter__(self):
+            self.previous, current[0] = current[0], self.index
+
+        def __exit__(self, *exc):
+            current[0] = self.previous
+
+    monkeypatch.setattr(torch.cuda, "device", Device)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing[current[0]]
+    )
+    call = torch.device("cuda", 1)
+    assert not su._is_capturing(call)
+    capturing[1] = True
+    assert su._is_capturing(call)  # the call's device captures, the current does not
+    capturing[1], capturing[0] = False, True
+    assert su._is_capturing(call)  # the current device captures, the call's does not
+    assert current[0] == 0  # the current device is left as it was
+    assert not su._is_capturing(torch.device("cpu"))
+
+
+def test_a_released_binding_refuses_calls_even_from_its_own_teardown():
+    life = _Lifecycle()
+    reentered = []
+
+    def teardown(state):
+        life.teardowns.append(state)
+        try:
+            wrapper(x=a, out=out)  # a teardown re-entering its own Definition
+        except SetupStateError as error:
+            reentered.append(str(error))
+
+    wrapper = SetupBoundCallable(
+        life.run,
+        life.setup,
+        teardown,
+        name=OPERATION,
+        setup_inputs=("x",),
+        state_param="state",
+    )
+    a, out = torch.ones(2), torch.empty(2)
+    wrapper(x=a, out=out)
+    wrapper.release()
+    assert life.teardowns == [{"serial": 1}]
+    assert len(reentered) == 1 and "was released" in reentered[0]
+    assert (
+        life.setups == 1 and wrapper.stats()["weight_sets"] == 0
+    )  # nothing prepared behind the release
+    with pytest.raises(SetupStateError, match="was released"):
+        wrapper(x=a, out=out)  # a wrapper a caller kept across the release
 
 
 def test_a_state_does_not_survive_fork(monkeypatch):

@@ -32,6 +32,7 @@ from flashinfer.trace_apply.apply import (
     is_enabled,
     preloaded_entry,
     register_preloaded,
+    unregister_preloaded,
     stats_snapshot,
 )
 
@@ -81,6 +82,7 @@ __all__ = [
     "preloaded_entry",
     "register_preloaded",
     "release_packages",
+    "unregister_preloaded",
     "setup_stats",
     "stats",
     "verify_package",
