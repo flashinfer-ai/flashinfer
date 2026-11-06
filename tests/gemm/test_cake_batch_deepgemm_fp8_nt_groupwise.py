@@ -21,6 +21,7 @@ from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
     _TABLE,
     _cell_tag,
     _em4,
+    _matches,
     PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
@@ -593,7 +594,8 @@ def _band_points(row):
 )
 def test_sm107a_band_boundaries_match_reference(row):
     """Every end of every SM107a BLOCK_N band selects that band's program, or the
-    (B, em4) cell that takes the problem first, and matches the reference."""
+    (B, em4) cell or the one-wave (B, CTA, M) row that takes the problem first, and
+    matches the reference."""
     if _arch() != "sm_107a":
         pytest.skip("the SM107a bands run on SM107a")
     device = torch.device("cuda")
@@ -609,9 +611,21 @@ def test_sm107a_band_boundaries_match_reference(row):
             a, b, a_scale, b_scale, masked_m, rows
         )
         tag = _cell_tag(n, k, 1, rows)
-        if tag is None:
+        earlier = _TABLE["sm_107a"][: _TABLE["sm_107a"].index(row)]
+        wave = next(
+            (
+                other
+                for other in earlier
+                if other.form == "bcta" and _matches(other, "sm_107a", 1, m, n, k, rows)
+            ),
+            None,
+        )
+        if tag is None and wave is None:
             assert prepared.route == row.route, (cta, prepared.route)
             assert prepared.programs == (row.stages[0][0],)
+        elif tag is None:
+            assert prepared.route == wave.route, (cta, prepared.route)
+            assert prepared.programs == (wave.stages[0][0],)
         else:
             assert prepared.route == f"seed_masked_bn__n{n}_k{k}_cell_{tag}", (
                 cta,
