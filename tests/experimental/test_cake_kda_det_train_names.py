@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 import flashinfer.cake_kda_det_train as det_api
 from flashinfer.experimental.cake import cake_kda_det_train as package
@@ -108,6 +109,28 @@ BACKEND_HELPERS = (
 )
 # module constants are exempt from the mode word
 _CONSTANT = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _tokens(name: str) -> list[str]:
+    """The lower-case words of ``name``: split on ``_`` and on CamelCase (``CakeKDADetFunction`` -> cake, kda,
+    det, function), so ``nondet`` is one word and does not count as ``det``."""
+    words = []
+    for part in name.split("_"):
+        words += re.findall(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+", part)
+    return [w.lower() for w in words]
+
+
+def _signatures(obj) -> list[inspect.Signature]:
+    """The call signatures a caller reaches: a function's, a class's constructor and, for an autograd
+    ``Function``, its ``forward`` (callers reach it through ``apply``; the constructor and ``apply`` are
+    torch's generic ``(*args, **kwargs)``)."""
+    if isinstance(obj, type):
+        if issubclass(obj, torch.autograd.Function):
+            return [inspect.signature(obj.forward)]
+        return [inspect.signature(obj)]
+    return [inspect.signature(obj)] if callable(obj) else []
+
+
 # the modules removed with the previous names
 REMOVED_MODULES = (
     PREVIOUS_PACKAGE,
@@ -141,10 +164,11 @@ def test_facade_has_only_the_new_names(old: tuple[str, ...], new: str) -> None:
             exec(f"from flashinfer.cake_kda_det_train import {name}", {})
 
 
-def test_facade_shares_the_scale_and_the_feature() -> None:
+def test_facade_shares_the_scale_and_is_not_experimental() -> None:
     assert det_api.DEFAULT_SCALE == 128**-0.5 == cake_backend.SCALE
-    for _, new in FACADE_NAMES[:3]:
-        assert getattr(det_api, new).experimental_feature == det_api._FEATURE
+    assert not hasattr(det_api, "_FEATURE")
+    for _, new in FACADE_NAMES:
+        assert not getattr(getattr(det_api, new), "is_experimental", False), new
 
 
 @pytest.mark.parametrize("old,new", BACKEND_NAMES)
@@ -174,15 +198,13 @@ def test_public_training_names_state_the_mode(module) -> None:
     for name in module.__all__:
         obj = getattr(module, name)
         if not _CONSTANT.match(name):
+            assert "det" in _tokens(name), name
             assert name.startswith(
                 ("cake_kda_det", "CakeKDADet", "is_cake_kda_det_train_")
             ), name
-        if callable(obj) and not isinstance(obj, type):
-            assert "deterministic" not in inspect.signature(obj).parameters, name
-        if isinstance(obj, type):
-            init = obj.__dict__.get("__init__")
-            if init is not None:
-                assert "deterministic" not in inspect.signature(init).parameters, name
+        for sig in _signatures(obj):
+            with pytest.raises(TypeError):
+                sig.bind_partial(deterministic=False)
 
 
 @pytest.mark.parametrize("name", BACKEND_HELPERS)
@@ -195,6 +217,19 @@ def test_package_does_not_export_the_backend_helpers(name: str) -> None:
 def test_previous_modules_are_removed(module: str) -> None:
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module(module)
+
+
+@pytest.mark.parametrize(
+    "name,words",
+    [
+        ("CakeKDADetFunction", ["cake", "kda", "det", "function"]),
+        ("cake_kda_det_train_forward", ["cake", "kda", "det", "train", "forward"]),
+        ("CakeKDANondetFunction", ["cake", "kda", "nondet", "function"]),
+        ("cake_kda_nondet", ["cake", "kda", "nondet"]),
+    ],
+)
+def test_mode_word_is_a_token(name: str, words: list[str]) -> None:
+    assert _tokens(name) == words
 
 
 @pytest.mark.parametrize("submodule", SUBMODULES)

@@ -17,7 +17,7 @@ Packed KDA (Kimi Delta Attention) chunked training forward and backward
 (SM100 / SM103 / SM107), the Cake backend.  Deterministic: the same inputs, hardware and
 plan give bitwise the same outputs and gradients.
 
-Thin experimental entry points.  The contract, the host plan, the workspace,
+Thin entry points.  The contract, the host plan, the workspace,
 the launch sequences, the autograd Function and the generated kernels live in
 ``flashinfer.experimental.cake.cake_kda_det_train``; this module validates nothing
 itself and forwards every keyword.  Every switch is a keyword argument; no
@@ -60,15 +60,14 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
-_FEATURE = "Cake packed KDA chunked training (SM100/SM103/SM107)"
 
 # The default scale of the GLM contract: ``head_dim ** -0.5`` with head dimension 128.
 DEFAULT_SCALE = 128**-0.5
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -169,7 +168,7 @@ def cake_kda_det_train_forward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -249,7 +248,7 @@ def cake_kda_det_train_backward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det(
     q: torch.Tensor,
     k: torch.Tensor,

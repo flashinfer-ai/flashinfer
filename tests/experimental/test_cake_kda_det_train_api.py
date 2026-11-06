@@ -17,21 +17,18 @@ flashinfer public-API tests of the Cake packed KDA chunked training package
 (``flashinfer.experimental.cake.cake_kda_det_train``).
 
 The backend suite ``test_cake_kda_det_train.py`` imports only the package.  This file covers what needs flashinfer
-itself: the experimental public entry points ``flashinfer.cake_kda_det_train.cake_kda_det_train_forward`` /
-``cake_kda_det_train_backward`` / ``cake_kda_det`` (their experimental marking, the keywords they forward and the default
-scale) and the workspace / byte helpers next to them.  The KCP entry points are covered by
+itself: the public entry points ``flashinfer.cake_kda_det_train.cake_kda_det_train_forward`` /
+``cake_kda_det_train_backward`` / ``cake_kda_det`` (the keywords they forward and the default scale) and the workspace / byte helpers next to them.  The KCP entry points are covered by
 ``test_cake_kda_det_train_kcp_api.py``.
 """
 
 import inspect
-import warnings
 from pathlib import Path
 
 import pytest
 import torch
 
 import flashinfer.cake_kda_det_train as det_api
-from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake.cake_kda_det_train import cake_backend, cake_jit
 from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 
@@ -56,13 +53,6 @@ def _device_or_skip() -> torch.device:
     return torch.device("cuda", index)
 
 
-def test_entry_points_are_marked_experimental() -> None:
-    for fn in ENTRY_POINTS:
-        assert getattr(fn, "is_experimental", False) is True, fn.__name__
-        assert fn.experimental_feature == det_api._FEATURE
-        assert ".. warning::" in fn.__doc__
-
-
 def test_default_scale_is_the_contracts() -> None:
     assert det_api.DEFAULT_SCALE == 128**-0.5 == cake_backend.SCALE
 
@@ -82,22 +72,20 @@ def test_entry_points_forward_every_keyword(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(cake_backend, "cake_kda_det", recorder("autograd"))
     operands = tuple(object() for _ in range(6))
     dout, saved, workspace = object(), object(), object()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        assert (
-            det_api.cake_kda_det_train_forward(
-                *operands,
-                save_for_backward=False,
-                workspace=workspace,
-                save_mode="tape",
-            )
-            == "fwd"
+    assert (
+        det_api.cake_kda_det_train_forward(
+            *operands,
+            save_for_backward=False,
+            workspace=workspace,
+            save_mode="tape",
         )
-        assert (
-            det_api.cake_kda_det_train_backward(*operands, dout, saved=saved, scale=0.5)
-            == "bwd"
-        )
-        assert det_api.cake_kda_det(*operands, workspace=workspace) == "autograd"
+        == "fwd"
+    )
+    assert (
+        det_api.cake_kda_det_train_backward(*operands, dout, saved=saved, scale=0.5)
+        == "bwd"
+    )
+    assert det_api.cake_kda_det(*operands, workspace=workspace) == "autograd"
     assert calls == [
         (
             "fwd",
@@ -184,22 +172,18 @@ def test_arena_option_is_forwarded_and_the_factory_is_the_backends(
     monkeypatch.setattr(cake_backend, "workspace_bytes", recorder("bytes"))
     operands = tuple(object() for _ in range(6))
     lengths = (300, 700)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        det_api.cake_kda_det_train_forward(*operands, arena=arena)
-        det_api.cake_kda_det_train_backward(*operands, object(), arena=arena)
-        det_api.cake_kda_det(*operands, arena=arena)
-        det_api.cake_kda_det_train_workspace_bytes(1, 1, 1, sm_count=148, arena=arena)
-        det_api.cake_kda_det_train_forward(
-            *operands, arena=batched, doc_lengths=lengths
-        )
-        det_api.cake_kda_det_train_backward(
-            *operands, object(), arena=batched, doc_lengths=lengths
-        )
-        det_api.cake_kda_det(*operands, arena=batched, doc_lengths=lengths)
-        det_api.cake_kda_det_train_workspace_bytes(
-            1000, 2, 1, sm_count=148, arena=batched, doc_lengths=lengths
-        )
+    det_api.cake_kda_det_train_forward(*operands, arena=arena)
+    det_api.cake_kda_det_train_backward(*operands, object(), arena=arena)
+    det_api.cake_kda_det(*operands, arena=arena)
+    det_api.cake_kda_det_train_workspace_bytes(1, 1, 1, sm_count=148, arena=arena)
+    det_api.cake_kda_det_train_forward(*operands, arena=batched, doc_lengths=lengths)
+    det_api.cake_kda_det_train_backward(
+        *operands, object(), arena=batched, doc_lengths=lengths
+    )
+    det_api.cake_kda_det(*operands, arena=batched, doc_lengths=lengths)
+    det_api.cake_kda_det_train_workspace_bytes(
+        1000, 2, 1, sm_count=148, arena=batched, doc_lengths=lengths
+    )
     assert calls == [
         ("fwd", arena, None),
         ("bwd", arena, None),
@@ -210,23 +194,6 @@ def test_arena_option_is_forwarded_and_the_factory_is_the_backends(
         ("autograd", batched, lengths),
         ("bytes", batched, lengths),
     ]
-
-
-def test_entry_points_warn_once_as_experimental(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        cake_backend, "cake_kda_det_train_forward", lambda *a, **k: None
-    )
-    # A fresh wrapper so the once-per-function warning is observable regardless of test order.
-    fresh = det_api.flashinfer_experimental_api(feature=det_api._FEATURE)(
-        lambda *a, **k: cake_backend.cake_kda_det_train_forward(*a, **k)
-    )
-    with pytest.warns(ExperimentalWarning):
-        fresh(None, None, None, None, None, None)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", ExperimentalWarning)
-        fresh(None, None, None, None, None, None)
 
 
 def test_byte_queries_are_the_backends() -> None:
@@ -463,42 +430,34 @@ def test_public_entries_run_the_backend() -> None:
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        ws = det_api.cake_kda_det_train_workspace(
-            sum(lengths), len(lengths), heads, device
-        )
-        assert isinstance(
-            ws, cake_backend.CakeKDADetWorkspace
-        ) and ws.bytes == det_api.cake_kda_det_train_workspace_bytes(
-            sum(lengths), len(lengths), heads
-        )
-        out, saved = det_api.cake_kda_det_train_forward(
-            q, k, v, g, beta, cu, workspace=ws
-        )
-        assert out.shape == v.shape and isinstance(
-            saved, cake_backend.CakeKDADetChunkSaved
-        )
-        grads = det_api.cake_kda_det_train_backward(
-            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
-        )
-        grads = [t.clone() for t in grads]
-        ref_out, ref_saved = cake_backend.cake_kda_det_train_forward(
-            q, k, v, g, beta, cu, scale=cake_backend.SCALE
-        )
-        ref_grads = cake_backend.cake_kda_det_train_backward(
-            q, k, v, g, beta, cu, dout, saved=ref_saved, scale=cake_backend.SCALE
-        )
-        assert torch.equal(out, ref_out)
-        for mine, theirs in zip(grads, ref_grads, strict=True):
-            assert torch.equal(mine, theirs)
-        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
-        o = det_api.cake_kda_det(*leaves, cu)
-        o.backward(dout)
-        for leaf, expected in zip(
-            leaves, (grads[0], grads[1], grads[2], grads[4], grads[3]), strict=True
-        ):
-            assert torch.equal(leaf.grad, expected)
+    ws = det_api.cake_kda_det_train_workspace(sum(lengths), len(lengths), heads, device)
+    assert isinstance(
+        ws, cake_backend.CakeKDADetWorkspace
+    ) and ws.bytes == det_api.cake_kda_det_train_workspace_bytes(
+        sum(lengths), len(lengths), heads
+    )
+    out, saved = det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu, workspace=ws)
+    assert out.shape == v.shape and isinstance(saved, cake_backend.CakeKDADetChunkSaved)
+    grads = det_api.cake_kda_det_train_backward(
+        q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
+    )
+    grads = [t.clone() for t in grads]
+    ref_out, ref_saved = cake_backend.cake_kda_det_train_forward(
+        q, k, v, g, beta, cu, scale=cake_backend.SCALE
+    )
+    ref_grads = cake_backend.cake_kda_det_train_backward(
+        q, k, v, g, beta, cu, dout, saved=ref_saved, scale=cake_backend.SCALE
+    )
+    assert torch.equal(out, ref_out)
+    for mine, theirs in zip(grads, ref_grads, strict=True):
+        assert torch.equal(mine, theirs)
+    leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+    o = det_api.cake_kda_det(*leaves, cu)
+    o.backward(dout)
+    for leaf, expected in zip(
+        leaves, (grads[0], grads[1], grads[2], grads[4], grads[3]), strict=True
+    ):
+        assert torch.equal(leaf.grad, expected)
 
 
 def test_public_arena_option_runs_the_backend() -> None:
@@ -515,81 +474,75 @@ def test_public_arena_option_runs_the_backend() -> None:
     ref_grads = cake_backend.cake_kda_det_train_backward(
         q, k, v, g, beta, cu, dout, saved=ref_saved, scale=cake_backend.SCALE
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        arena = det_api.cake_kda_det_train_arena(tail_passes=2)
-        ws = det_api.cake_kda_det_train_workspace(S, N, heads, device, arena=arena)
-        assert ws.arena_option == arena
-        assert ws.bytes == det_api.cake_kda_det_train_workspace_bytes(
-            S, N, heads, arena=arena
+    arena = det_api.cake_kda_det_train_arena(tail_passes=2)
+    ws = det_api.cake_kda_det_train_workspace(S, N, heads, device, arena=arena)
+    assert ws.arena_option == arena
+    assert ws.bytes == det_api.cake_kda_det_train_workspace_bytes(
+        S, N, heads, arena=arena
+    )
+    assert ws.bytes < det_api.cake_kda_det_train_workspace_bytes(S, N, heads)
+    out, saved = det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu, workspace=ws)
+    assert torch.equal(out, ref_out)
+    grads = det_api.cake_kda_det_train_backward(
+        q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
+    )
+    for mine, theirs in zip(grads, ref_grads, strict=True):
+        assert torch.equal(mine, theirs)
+    grads = det_api.cake_kda_det_train_backward(
+        q, k, v, g, beta, cu, dout, saved=saved, arena=arena
+    )
+    for mine, theirs in zip(grads, ref_grads, strict=True):
+        assert torch.equal(mine, theirs)
+    with pytest.raises(ValueError, match="lean=False"):
+        det_api.cake_kda_det_train_backward(q, k, v, g, beta, cu, dout, workspace=ws)
+    leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+    o = det_api.cake_kda_det(*leaves, cu, arena=arena)
+    o.backward(dout)
+    for leaf, expected in zip(
+        leaves,
+        (ref_grads[0], ref_grads[1], ref_grads[2], ref_grads[4], ref_grads[3]),
+        strict=True,
+    ):
+        assert torch.equal(leaf.grad, expected)
+    # the batched option through the public entries: two document groups, the results bit for bit
+    batched = det_api.cake_kda_det_train_arena(
+        lean=True, tail_passes=2, batch_tokens=65
+    )
+    ws_b = det_api.cake_kda_det_train_workspace(
+        S, N, heads, device, arena=batched, doc_lengths=lengths
+    )
+    assert ws_b.bytes == det_api.cake_kda_det_train_workspace_bytes(
+        S, N, heads, arena=batched, doc_lengths=lengths
+    )
+    out_b, saved_b = det_api.cake_kda_det_train_forward(
+        q, k, v, g, beta, cu, workspace=ws_b, doc_lengths=lengths
+    )
+    assert torch.equal(out_b.view(torch.int16), ref_out.view(torch.int16))
+    grads_b = det_api.cake_kda_det_train_backward(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu,
+        dout,
+        saved=saved_b,
+        workspace=ws_b,
+        doc_lengths=lengths,
+    )
+    for mine, theirs in zip(grads_b, ref_grads, strict=True):
+        assert torch.equal(
+            mine.view(torch.int16 if mine.element_size() == 2 else torch.int32),
+            theirs.view(torch.int16 if theirs.element_size() == 2 else torch.int32),
         )
-        assert ws.bytes < det_api.cake_kda_det_train_workspace_bytes(S, N, heads)
-        out, saved = det_api.cake_kda_det_train_forward(
-            q, k, v, g, beta, cu, workspace=ws
-        )
-        assert torch.equal(out, ref_out)
-        grads = det_api.cake_kda_det_train_backward(
-            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
-        )
-        for mine, theirs in zip(grads, ref_grads, strict=True):
-            assert torch.equal(mine, theirs)
-        grads = det_api.cake_kda_det_train_backward(
-            q, k, v, g, beta, cu, dout, saved=saved, arena=arena
-        )
-        for mine, theirs in zip(grads, ref_grads, strict=True):
-            assert torch.equal(mine, theirs)
-        with pytest.raises(ValueError, match="lean=False"):
-            det_api.cake_kda_det_train_backward(
-                q, k, v, g, beta, cu, dout, workspace=ws
-            )
-        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
-        o = det_api.cake_kda_det(*leaves, cu, arena=arena)
-        o.backward(dout)
-        for leaf, expected in zip(
-            leaves,
-            (ref_grads[0], ref_grads[1], ref_grads[2], ref_grads[4], ref_grads[3]),
-            strict=True,
-        ):
-            assert torch.equal(leaf.grad, expected)
-        # the batched option through the public entries: two document groups, the results bit for bit
-        batched = det_api.cake_kda_det_train_arena(
-            lean=True, tail_passes=2, batch_tokens=65
-        )
-        ws_b = det_api.cake_kda_det_train_workspace(
-            S, N, heads, device, arena=batched, doc_lengths=lengths
-        )
-        assert ws_b.bytes == det_api.cake_kda_det_train_workspace_bytes(
-            S, N, heads, arena=batched, doc_lengths=lengths
-        )
-        out_b, saved_b = det_api.cake_kda_det_train_forward(
-            q, k, v, g, beta, cu, workspace=ws_b, doc_lengths=lengths
-        )
-        assert torch.equal(out_b.view(torch.int16), ref_out.view(torch.int16))
-        grads_b = det_api.cake_kda_det_train_backward(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            cu,
-            dout,
-            saved=saved_b,
-            workspace=ws_b,
-            doc_lengths=lengths,
-        )
-        for mine, theirs in zip(grads_b, ref_grads, strict=True):
-            assert torch.equal(
-                mine.view(torch.int16 if mine.element_size() == 2 else torch.int32),
-                theirs.view(torch.int16 if theirs.element_size() == 2 else torch.int32),
-            )
-        with pytest.raises(ValueError, match="doc_lengths"):
-            det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu, workspace=ws_b)
-        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
-        o = det_api.cake_kda_det(*leaves, cu, arena=batched, doc_lengths=lengths)
-        o.backward(dout)
-        for leaf, expected in zip(
-            leaves,
-            (ref_grads[0], ref_grads[1], ref_grads[2], ref_grads[4], ref_grads[3]),
-            strict=True,
-        ):
-            assert torch.equal(leaf.grad, expected)
+    with pytest.raises(ValueError, match="doc_lengths"):
+        det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu, workspace=ws_b)
+    leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+    o = det_api.cake_kda_det(*leaves, cu, arena=batched, doc_lengths=lengths)
+    o.backward(dout)
+    for leaf, expected in zip(
+        leaves,
+        (ref_grads[0], ref_grads[1], ref_grads[2], ref_grads[4], ref_grads[3]),
+        strict=True,
+    ):
+        assert torch.equal(leaf.grad, expected)
