@@ -17,7 +17,7 @@ Backend suite of the Cake deterministic GDN chunked-training package
 (``flashinfer.experimental.cake.cake_gdn_det_train``).
 
 Without a device: the package's names (the det names only, the former names removed) and its mode contract (no
-``deterministic`` keyword; the low-level backward refuses a non-deterministic tape), the registry (one record per stage and architecture, the argument plans of the call sites, the
+``deterministic`` keyword; the low-level backward refuses a tape without the det tag), the registry (one record per stage and architecture, the argument plans of the call sites, the
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
 library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
 entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule, the split pass-2 rule on the campaign rows and
@@ -75,7 +75,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_package import PACKAGES, cake_package
 
 cake_backend = cake_package("cake_gdn_det_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_det_train", "cake_chain")
@@ -402,9 +402,19 @@ def test_former_names_are_removed() -> None:
         assert getattr(cake_chain, name).__name__ == name
 
 
+_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _words(name: str) -> list[str]:
+    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (``nondet`` is not ``det``)."""
+    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
+
+
 def test_the_package_exports_the_det_names_only() -> None:
     assert sorted(cake_gdn_det_train.__all__) == sorted(DET_NAMES)
-    assert all("det" in name.lower() for name in cake_gdn_det_train.__all__)
+    assert all("det" in _words(name) for name in cake_gdn_det_train.__all__)
+    assert "det" not in _words("cake_gdn_nondet")
+    assert "det" in _words("CakeGDNDetFunction")
     for name in CHAIN_ONLY_NAMES:
         assert name in cake_chain.__all__ and hasattr(cake_chain, name), name
         assert not hasattr(cake_gdn_det_train, name), name
@@ -429,16 +439,19 @@ def test_the_det_entries_take_no_deterministic_keyword(value) -> None:
         cake_chain.CakeGDNDetFunction.apply(*(None,) * 12, deterministic=value)
 
 
-@pytest.mark.parametrize("mode", [False, None])
-def test_det_backward_refuses_a_non_deterministic_tape(mode) -> None:
-    # the tape of the non-deterministic package's low-level forward records deterministic=False; the check runs
-    # before the tape is read
-    with pytest.raises(ValueError, match=r"records the non-deterministic mode"):
-        cake_chain.cake_gdn_det_train_backward({"deterministic": mode}, None)
-    # a det tape (the key True, or absent: the autograd chain's own tape) passes the check and is read
-    for tape in ({"deterministic": True}, {}):
-        with pytest.raises(KeyError, match="arch"):
-            cake_chain.cake_gdn_det_train_backward(tape, None)
+@pytest.mark.parametrize(
+    "tape",
+    [{"mode": "nondet"}, {}, {"mode": None}, {"deterministic": True}],
+    ids=["nondet-tape", "untagged", "none", "former-key"],
+)
+def test_det_backward_refuses_a_tape_without_the_det_tag(tape) -> None:
+    # the det tape carries "mode": "det" (the low-level forward's tape and the autograd chain's own tape); the
+    # non-deterministic package's tape carries "mode": "nondet"; the check runs before the tape is read
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_det_train_backward({"arch": None, **tape}, None)
+    # a tape with the det tag passes the check and is read
+    with pytest.raises(KeyError, match="meta"):
+        cake_chain.cake_gdn_det_train_backward({"arch": None, "mode": "det"}, None)
 
 
 def test_registry_records_are_well_formed() -> None:
@@ -1489,11 +1502,46 @@ def test_low_level_entries_record_and_check_the_mode(device) -> None:
     tape = cake_chain.cake_gdn_det_train_forward(
         q, k, v, g, beta, meta=meta, arch=cake_backend.device_arch(index)
     )
-    assert tape["deterministic"] is True
+    assert tape["mode"] == "det" and "deterministic" not in tape
     grads = cake_chain.cake_gdn_det_train_backward(tape, do)
     assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
-    with pytest.raises(ValueError, match="records the non-deterministic mode"):
-        cake_chain.cake_gdn_det_train_backward({**tape, "deterministic": False}, do)
+    untagged = {key: value for key, value in tape.items() if key != "mode"}
+    for other in ({**tape, "mode": "nondet"}, untagged):
+        with pytest.raises(ValueError, match="this tape does not carry that tag"):
+            cake_chain.cake_gdn_det_train_backward(other, do)
+
+
+@pytest.mark.skipif(
+    "cake_gdn_nondet_train" not in PACKAGES,
+    reason="pending integration: the non-deterministic package is not in this tree's PACKAGES table",
+)
+def test_det_backward_refuses_a_real_nondet_tape(device) -> None:
+    # the tape of the non-deterministic package's low-level forward (the same keys as the det tape but its own tag):
+    # the det backward refuses it; a non-deterministic package that does not import fails here, it is not skipped
+    seq_lens, heads = (300, 77, 640), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=263)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    nd_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
+    q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
+
+    def meta_of(chain):
+        plans = chain.scan_plans(
+            sum(seq_lens), len(seq_lens), heads[1], index, seq_lens
+        )
+        return chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
+
+    nd_tape = nd_chain.cake_gdn_nondet_train_forward(
+        q, k, v, g, beta, meta=meta_of(nd_chain), arch=arch
+    )
+    assert nd_tape["mode"] == "nondet"
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_det_train_backward(nd_tape, do)
+    tape = cake_chain.cake_gdn_det_train_forward(
+        q, k, v, g, beta, meta=meta_of(cake_chain), arch=arch
+    )
+    grads = cake_chain.cake_gdn_det_train_backward(tape, do)
+    assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
 
 
 @pytest.mark.parametrize(

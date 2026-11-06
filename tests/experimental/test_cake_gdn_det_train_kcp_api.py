@@ -21,8 +21,10 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
+import importlib.util
 import inspect
 import pathlib
+import re
 import types
 
 import pytest
@@ -594,6 +596,16 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     ):
         for p in _after(inspect.signature(fn), "ctx"):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
+    # every public function of the facade module is a real def decorated with ``@flashinfer_api`` (the support query
+    # too); the decorator returns the function unchanged while logging is off, so the check reads the source
+    tree = ast.parse(pathlib.Path(facade.__file__).read_text())
+    decorators = {
+        node.name: [ast.unparse(d) for d in node.decorator_list]
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+    }
+    assert sorted(decorators) == sorted(names)
+    assert all(d == ["flashinfer_api"] for d in decorators.values()), decorators
     # a stable API: no entry is marked experimental
     for n in names:
         assert getattr(getattr(facade, n), "is_experimental", False) is False, n
@@ -716,10 +728,36 @@ DET_FREE_NAMES = (
 )
 
 
+_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _words(name: str) -> list[str]:
+    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (``nondet`` is not ``det``)."""
+    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
+
+
 def test_legacy_names_are_removed() -> None:
     """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` (and its modules) do not import, and no
-    module of the deterministic route binds a pre-rename name."""
+    module of the deterministic route binds a pre-rename name.  A checkout may keep an untracked leftover of a former
+    package directory (``aot/``, ``__pycache__``), which Python imports as an empty namespace package: such a leftover
+    holds no module and none of the former names."""
     for name in LEGACY_MODULES:
+        try:
+            spec = importlib.util.find_spec(name)
+        except ModuleNotFoundError:  # a parent path does not import
+            spec = None
+        if (
+            spec is not None
+            and spec.origin in (None, "namespace")
+            and spec.submodule_search_locations
+        ):
+            leftover = importlib.import_module(name)
+            for old in LEGACY_NAMES:
+                assert not hasattr(leftover, old), (name, old)
+            for sub in LEGACY_SUBMODULES:
+                with pytest.raises(ModuleNotFoundError):
+                    importlib.import_module(f"{name}.{sub}")
+            continue
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(name)
     facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
@@ -733,7 +771,7 @@ def test_package_exports_the_det_names_only() -> None:
     """The package's ``__all__`` holds the names that carry ``det`` only, each bound; the constants and backend
     controls without ``det`` are neither exported nor bound by the package, and are read from their modules."""
     pkg = _mod()
-    assert pkg.__all__ and [n for n in pkg.__all__ if "det" not in n.lower()] == []
+    assert pkg.__all__ and [n for n in pkg.__all__ if "det" not in _words(n)] == []
     assert all(hasattr(pkg, n) for n in pkg.__all__)
     holders = (_mod("cake_kcp"), _mod("cake_options"))
     for n in DET_FREE_NAMES:
@@ -815,7 +853,8 @@ def _facade_source() -> pathlib.Path:
 
 def test_package_never_imports_a_kda_package() -> None:
     sources = _package_sources() + [_facade_source()]
-    assert len(sources) > 10, sources  # the package modules and the facade (not vacuous)
+    # the package modules and the facade (not vacuous)
+    assert len(sources) > 10, sources
     seen = 0
     for path in sources:
         tree = ast.parse(path.read_text())

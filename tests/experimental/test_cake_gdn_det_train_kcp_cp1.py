@@ -51,6 +51,7 @@ from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
     make_inputs,
     reference_pack,
 )
+from tests.test_helpers.cake_package import PACKAGES, cake_package
 
 gdn_api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
 
@@ -407,6 +408,10 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         )
 
 
+@pytest.mark.skipif(
+    "cake_gdn_nondet_train_kcp" not in PACKAGES,
+    reason="pending integration: the non-deterministic package is not in this tree's PACKAGES table",
+)
 def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace(
     device,
 ) -> None:
@@ -416,11 +421,9 @@ def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace
     kcp = importlib.import_module(
         "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
     )
-    # the non-deterministic package under its FlashInfer #8928 path and names (absent from a tree without it)
-    nd = pytest.importorskip(
-        "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
-        reason="the non-deterministic package is not part of this tree",
-    )
+    # the non-deterministic package under its FlashInfer #8928 path and names; it ships with this package, so a
+    # package that does not import fails here, it is not skipped
+    nd = cake_package("cake_gdn_nondet_train_kcp")
     cu = _cu((100, 640, 77))
     inputs = make_inputs(cu, 2, 6)
     ops = [inputs[n].to(device) for n in OPERANDS]

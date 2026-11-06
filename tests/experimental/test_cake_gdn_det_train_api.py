@@ -24,9 +24,12 @@ SM107 the facade's results against the package's (bitwise) and under ``torch.use
 (no alert, bitwise the same).
 """
 
+import ast
 import inspect
 import math
+import re
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -55,6 +58,14 @@ FORMER_NAMES = (
 )
 
 
+_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _words(name: str) -> list[str]:
+    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (``nondet`` is not ``det``)."""
+    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
+
+
 def _call(fn, *args, **kwargs):
     # a stable API: an ExperimentalWarning would raise
     with warnings.catch_warnings():
@@ -64,7 +75,7 @@ def _call(fn, *args, **kwargs):
 
 def test_the_facade_exports_the_mode_word_names_only() -> None:
     assert sorted(facade.__all__) == sorted(FACADE_NAMES)
-    assert all("det" in name.lower() for name in facade.__all__)
+    assert all("det" in _words(name) for name in facade.__all__)
     assert facade.CakeGDNDetFunction is pkg.CakeGDNDetFunction
     assert facade.CakeGDNDetFunction.__name__ == "CakeGDNDetFunction"
     assert facade.cake_gdn_det.__name__ == "cake_gdn_det"
@@ -81,6 +92,19 @@ def test_the_entry_point_is_a_stable_api(monkeypatch: pytest.MonkeyPatch) -> Non
     assert not hasattr(facade, "_FEATURE")
     monkeypatch.setattr(pkg, "cake_gdn_det", lambda *args, **kwargs: "cake_gdn_det")
     assert _call(fn, *(None,) * 5) == "cake_gdn_det"
+
+
+def test_every_facade_function_is_a_flashinfer_api_def() -> None:
+    # the public functions of the facade module are real defs decorated with ``@flashinfer_api`` (the support query
+    # too); the decorator returns the function unchanged while logging is off, so the check reads the source
+    tree = ast.parse(Path(facade.__file__).read_text())
+    decorators = {
+        node.name: [ast.unparse(d) for d in node.decorator_list]
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+    }
+    assert sorted(decorators) == sorted(n for n in FACADE_NAMES if n[0].islower())
+    assert all(d == ["flashinfer_api"] for d in decorators.values()), decorators
 
 
 def test_the_entry_point_takes_the_package_signature() -> None:

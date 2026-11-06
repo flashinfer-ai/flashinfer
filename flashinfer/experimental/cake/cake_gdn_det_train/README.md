@@ -19,8 +19,9 @@
 - The non-deterministic route is a separate package.  Its results match this
   package within this package's accuracy budgets, not bitwise.  Nothing here
   routes to it.
-- `cake_gdn_det_train_backward` refuses a tape of the non-deterministic
-  package (it records `deterministic=False`) with `ValueError`.
+- The forward tape carries this package's tag, `"mode": "det"`.
+  `cake_gdn_det_train_backward` refuses any other tape with `ValueError`; a
+  tape of the non-deterministic package carries `"mode": "nondet"`.
 
 Experimental backend for the forward and backward of packed GDN (scalar-gated
 DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
@@ -32,7 +33,9 @@ run to run for one layout and one plan.  Some stages run as two groups of sequen
 side stream; the groups write disjoint outputs, so this holds with one or two
 streams.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The facade `flashinfer.cake_gdn_det_train` is a stable FlashInfer API: its
+entry points are `@flashinfer_api` functions.  This package, under
+`flashinfer.experimental.cake`, is its backend.
 SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
 architectures; another device raises `RuntimeError`.  The SM107 libraries need
 CUDA 13.4 or newer.  The feature does not
@@ -43,7 +46,7 @@ otherwise.  The package reads no environment variable.
 
 ## Opt-in
 
-Import the entry point explicitly from the experimental facade
+Import the entry point explicitly from the facade
 `flashinfer.cake_gdn_det_train` (it exports `cake_gdn_det`,
 `CakeGDNDetFunction` and `is_cake_gdn_det_train_supported`, and forwards every
 argument to this package); nothing in `flashinfer` imports this package

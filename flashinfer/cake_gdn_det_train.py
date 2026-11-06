@@ -129,6 +129,7 @@ def cake_gdn_det(
     )
 
 
+@flashinfer_api
 def is_cake_gdn_det_train_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:

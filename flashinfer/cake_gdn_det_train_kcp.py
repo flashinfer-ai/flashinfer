@@ -27,10 +27,7 @@ and the results are bitwise reproducible run to run at the same topology.
 non-deterministic mode with ``ValueError``.  The non-deterministic mode is a
 separate package with its own partition, context and plan rules (the ``b1``
 layout differs; the head plan and the ``P`` rule are each package's own);
-nothing here routes to it.  The former names
-(``chunk_gdn_det_kcp``, ``partition_det_kcp``, ``ContextDetKcp``, ...) and the
-former backend path ``flashinfer.experimental.cake_gdn_det_train_kcp`` were
-removed with no alias.
+nothing here routes to it.
 
 Thin entry points (a stable API: no ``ExperimentalWarning``).  The partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
@@ -447,6 +444,7 @@ def cake_gdn_det_train_kcp_comm_bytes(
     return _pkg().cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
 
 
+@flashinfer_api
 def is_cake_gdn_det_train_kcp_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:

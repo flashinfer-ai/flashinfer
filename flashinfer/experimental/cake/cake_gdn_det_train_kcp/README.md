@@ -8,7 +8,9 @@ passing of the per-document recurrent state.  Tokens never move between ranks;
 only affine summaries of the state do.  Tracking issue:
 flashinfer-ai/flashinfer#7082.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The facade `flashinfer.cake_gdn_det_train_kcp` is a stable FlashInfer API:
+its entry points are `@flashinfer_api` functions.  This package, under
+`flashinfer.experimental.cake`, is its backend.
 SM100 (B200 / GB200) and SM103 (B300 / GB300) are the acceptance architectures
 of the kernels; SM107 (R200) is compiled from the same sources with an nvcc
 that emits `compute_107a`.  The feature does not participate in automatic

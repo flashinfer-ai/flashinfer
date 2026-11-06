@@ -238,17 +238,54 @@ def _namespaces() -> dict[str, object]:
     return out
 
 
+# Untracked build leftovers a former package directory may keep after the move (ignored by git, never code).
+LEFTOVER_ENTRIES = ("__pycache__", "aot")
+
+
+def _namespace_leftover(name: str):
+    """The module at ``name`` when it imports as an empty namespace package (a leftover untracked directory at a
+    former package path), else ``None``."""
+    try:
+        spec = importlib.util.find_spec(name)
+    except ModuleNotFoundError:  # a parent path does not import
+        return None
+    if (
+        spec is not None
+        and spec.origin in (None, "namespace")
+        and spec.submodule_search_locations
+    ):
+        return importlib.import_module(name)
+    return None
+
+
 @pytest.mark.parametrize("name", REMOVED_MODULES)
 def test_former_module_paths_do_not_import(name: str) -> None:
+    # A clean tree has no module at a former path.  A leftover untracked directory at a former package path (``aot/``
+    # or ``__pycache__`` from an earlier build) makes the path import as an empty namespace package: then it binds no
+    # former name and every former submodule path still raises ``ModuleNotFoundError``.
     sys.modules.pop(name, None)
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(name)
+    leftover = _namespace_leftover(name)
+    if leftover is None:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
+        return
+    for former in FORMER_NAMES:
+        assert not hasattr(leftover, former), (name, former)
+    for sub in sorted({*SUBMODULES, *KCP_SUBMODULES}):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(f"{name}.{sub}")
 
 
 def test_former_package_directories_are_gone() -> None:
+    # gone, or holding only untracked build leftovers: no module, manifest or source
     experimental = Path(flashinfer.__file__).parent / "experimental"
     for name in ("cake_gdn_det_train", "cake_gdn_det_train_kcp", "cake_gdn_train"):
-        assert not (experimental / name).exists(), name
+        directory = experimental / name
+        if directory.exists():
+            kept = sorted(
+                p.name for p in directory.iterdir() if p.name not in LEFTOVER_ENTRIES
+            )
+            assert kept == [], (name, kept)
     assert (experimental / "cake" / "cake_gdn_det_train" / "build.json").is_file()
     assert (experimental / "cake" / "cake_gdn_det_train_kcp" / "build.json").is_file()
 
@@ -411,7 +448,9 @@ backend = [m for m in sys.modules if m.startswith(("flashinfer.experimental.cake
                                                    "flashinfer.experimental.cake_gdn_det_train"))]
 assert not backend, backend
 for old in ("flashinfer.experimental.cake_gdn_det_train", "flashinfer.experimental.cake_gdn_det_train_kcp"):
-    assert importlib.util.find_spec(old) is None, old
+    # absent, or an empty namespace package (a leftover untracked directory of an earlier build)
+    spec = importlib.util.find_spec(old)
+    assert spec is None or (spec.origin in (None, "namespace") and spec.submodule_search_locations), old
 import flashinfer
 for old in {former!r}:
     if old in {stable!r}:

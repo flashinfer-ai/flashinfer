@@ -151,6 +151,10 @@ PRESCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (64, 1))
 SCAN_KINDS = ("fwd_h", "dhu")
 STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
 
+# The tag of this package's forward tape: the backward reads only a tape that carries it (the non-deterministic
+# package's tape carries ``"mode": "nondet"``, so it is refused).
+_TAPE_MODE = "det"
+
 # Kernel parameter names of every stage in call-site order; a delivered record whose parameters are these names in
 # another order is launched with the values reordered.
 _PREP_ARGS = ("q", "k", "g", "beta", "beta32_out", "qn", "kn", "rstd_q", "rstd_k", "g_cs", "chunk_start", "chunk_len",
@@ -2036,7 +2040,7 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
         "w": w, "u": u, "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
         "final_state": final_state if output_final_state else None, "initial_state": initial_state, "h": h,
-        "v_new": v_new, "options": options, "deterministic": True,
+        "v_new": v_new, "options": options, "mode": _TAPE_MODE,
     }  # fmt: skip
 
 
@@ -2047,13 +2051,12 @@ def cake_gdn_det_train_backward(
     forward, do, dht=None, *, initial_state=None, dbeta_dtype=None
 ) -> dict[str, Any]:
     """The backward chain over one forward tape of :func:`cake_gdn_det_train_forward`; returns ``dq``, ``dk``, ``dv``,
-    ``dg``, ``dbeta`` and ``dinitial_state``.  A tape of the non-deterministic package (it records
-    ``deterministic=False``) raises ``ValueError``."""
-    mode = forward.get("deterministic", True)
-    if mode is not True:
+    ``dg``, ``dbeta`` and ``dinitial_state``.  The tape must carry this package's tag (``"mode": "det"``): any other
+    tape, such as one of the non-deterministic package (``"mode": "nondet"``), is refused (``ValueError``)."""
+    if forward.get("mode") != _TAPE_MODE:
         raise ValueError("cake_gdn_det_train_backward reads the tape of a deterministic forward "
-                         "(cake_gdn_det_train_forward); this tape records the non-deterministic mode "
-                         f"(deterministic={mode!r}) of the non-deterministic GDN package, whose backward reads it")  # fmt: skip
+                         "(cake_gdn_det_train_forward, tag 'mode': 'det'); this tape does not carry that tag "
+                         "(a tape of the non-deterministic package, for example)")  # fmt: skip
     arch = forward["arch"]
     meta = forward["meta"]
     options = forward.get("options") or ChainOptions()
@@ -2534,6 +2537,8 @@ class CakeGDNDetFunction(torch.autograd.Function):
         ctx.has_initial_state_input = initial_state is not None
         ctx.dtypes = (g.dtype, beta.dtype)
         ctx.options = options
+        # the forward tape's tag; the backward reads only a tape of its own
+        ctx.mode = fwd["mode"]
         output = fwd["output"]
         if output.dtype != q.dtype:
             output = output.to(q.dtype)
@@ -2548,7 +2553,7 @@ class CakeGDNDetFunction(torch.autograd.Function):
         g_dtype, beta_dtype = ctx.dtypes
         tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
                 "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
-                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options}  # fmt: skip
+                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
         if ctx.saved_state_tensors:
             tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
         grads = cake_gdn_det_train_backward(
