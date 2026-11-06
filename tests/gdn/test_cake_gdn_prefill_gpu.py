@@ -259,6 +259,8 @@ def _public_route_kwargs(case):
 
     major, minor = torch.cuda.get_device_capability(case["q"].device)
     return dict(
+        # the device's SM count, as the public launch passes it
+        sm_count=prefill_mod._cake_gdn_sm_count(case["q"].device.index),
         arch=cake_gdn.arch_for_compute_capability(major, minor),
         io_dtype={torch.bfloat16: "bfloat16", torch.float16: "float16"}[
             case["q"].dtype
@@ -684,8 +686,10 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
 ):
     # The vLLM FP32-state contract with several short full-DV tiles per CTA: on
     # sm_107a these keys run the gate-stream twin (the epilogue warp streams the
-    # successor tile's gate/beta prologue); elsewhere the base body or its twin
-    # where shipped.  Output and final state match the reference recurrence.
+    # successor tile's gate/beta prologue), as its initial-state prefetch twin
+    # (the launch grid gives some CTA a second tile); elsewhere the base body or
+    # its twin where shipped.  Output and final state match the reference
+    # recurrence.
     num_q_heads, num_v_heads = heads
     case = _make_case(
         seq_lens=(128,) * num_seqs,
@@ -699,11 +703,124 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
     assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv", route.route_id
     major, minor = torch.cuda.get_device_capability()
     if cake_gdn.arch_for_compute_capability(major, minor) == "sm_107a":
-        assert "_initial_gatestream_full_sm107a_i64meta_" in route.variant_name, (
+        assert "_initial_gatestream_full_pf_sm107a_i64meta_" in route.variant_name, (
             route.variant_name
         )
     out, state = _launch(case)
     torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
+)
+def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_aligned(
+    state_dtype,
+):
+    # On sm_107a these keys run the gate-stream prefetch twin, which asks L2 for
+    # the initial state of each tile that follows another tile on its CTA with
+    # 16-byte aligned bulk prefetches.  An initial state 8 (FP32) or 4 (BF16)
+    # bytes past a 16-byte boundary prefetches the aligned bytes inside it:
+    # output and final state equal the aligned call's bit for bit.
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        state_dtype=state_dtype,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) == "sm_107a":
+        route = _public_route(case)
+        assert "_gatestream_full_pf_sm107a_i64meta_" in route.variant_name, (
+            route.variant_name
+        )
+    initial_state = case["initial_state"]
+    aligned_out, aligned_state = _launch(case)
+    aligned_out, aligned_state = aligned_out.clone(), aligned_state.clone()
+    backing = torch.empty(
+        initial_state.numel() + 16, dtype=state_dtype, device=initial_state.device
+    )
+    shifted = backing[2 : 2 + initial_state.numel()].view(initial_state.shape)
+    shifted.copy_(initial_state)
+    assert shifted.is_contiguous() and shifted.data_ptr() % 16 != 0
+    shifted_case = dict(
+        case,
+        initial_state=shifted,
+        output=torch.full_like(case["output"], float("nan")),
+        output_state=torch.full_like(case["output_state"], float("nan")),
+    )
+    out, state = _launch(shifted_case)
+    torch.cuda.synchronize()
+    assert torch.equal(out, aligned_out)
+    assert torch.equal(state, aligned_state)
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
+)
+def test_public_cake_gdn_prefill_sm107a_gatestream_one_cta_per_tile_runs_the_twin_without_prefetch(
+    monkeypatch, state_dtype
+):
+    # The sm_107a gate-stream prefetch twin asks L2 for the initial state of each
+    # tile that follows another tile on its CTA, so the resolver takes it only
+    # when the launch grid gives some CTA a second tile.  The persistent grid
+    # loads the prefetch twin; a launch with one CTA per tile (an SM count of
+    # one SM a tile, seen by both the resolver and the launch) loads the
+    # gate-stream twin without the prefetch.  Both outputs and final states are
+    # equal bit for bit and match the reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the gate-stream prefetch twin is sm_107a only")
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        state_dtype=state_dtype,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    total_tiles = len(case["seq_lens"]) * case["num_v_heads"]
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    # The loaded record and the launched grid (observed where the launch sizes its
+    # per-CTA workspace).
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    persistent_out, persistent_state = _launch(case)
+    torch.cuda.synchronize()
+    persistent_out = persistent_out.clone()
+    persistent_state = persistent_state.clone()
+    assert len(grids) == 1 and grids[0] < total_tiles, grids
+    (prefetch,) = loaded
+    assert "_gatestream_full_pf_sm107a_i64meta_" in prefetch, prefetch
+    monkeypatch.setattr(
+        prefill_mod, "_cake_gdn_sm_count", lambda _device_index: total_tiles
+    )
+    case["output"].fill_(float("nan"))
+    case["output_state"].fill_(float("nan"))
+    out, state = _launch(case)
+    torch.cuda.synchronize()
+    assert grids[1:] == [total_tiles], grids
+    assert loaded[1:] == [prefetch.replace("_gatestream_full_pf_", "_gatestream_full_")]
+    assert torch.equal(out, persistent_out)
+    assert torch.equal(state, persistent_state)
     torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
