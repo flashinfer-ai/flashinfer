@@ -175,48 +175,34 @@ Removed names
 -------------
 
 The former names of this family were removed with no alias: importing one raises
-``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.  Every call in the table
-ran the deterministic package, including the names without ``det`` (aliases of the
-deterministic objects) and the selectable entries of
-``flashinfer.experimental.cake.grouped_mm`` called without ``deterministic=False``.
-Move each one to this module.  The calls that passed ``deterministic=False`` move to
-:mod:`flashinfer.cake_moe_grouped_gemm_nondet_train` instead.
+``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.  Every name in the table
+ran the deterministic package; move each one to this module.  The former
+non-deterministic entries, which required ``deterministic=False``, move to
+:mod:`flashinfer.cake_moe_grouped_gemm_nondet_train`.
 
 .. list-table::
     :header-rows: 1
 
     * - Removed
       - Use instead
-    * - the packages ``flashinfer.experimental.cake_moe_grouped_det_gemm`` and
-        ``flashinfer.experimental.cake_moe_grouped_gemm`` (its alias), with their
-        submodules, and the module ``flashinfer.grouped_mm.cake``
+    * - the package ``flashinfer.experimental.cake_moe_grouped_det_gemm`` with its
+        submodules, and the module ``flashinfer.grouped_mm.cake_det``
       - ``flashinfer.cake_moe_grouped_gemm_det_train`` (backend
         ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``, same submodule
         names)
-    * - ``grouped_det_gemm_fwd`` / ``_dgrad`` / ``_wgrad`` and their aliases
-        ``grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from ``flashinfer.grouped_mm``,
-        ``flashinfer.grouped_mm.cake`` or the two packages above
+    * - ``grouped_det_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from ``flashinfer.grouped_mm``,
+        ``flashinfer.grouped_mm.cake_det`` or the package above
       - ``cake_moe_grouped_gemm_det_train_forward`` / ``_dgrad`` / ``_wgrad``
-    * - ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_fwd`` / ``_dgrad`` /
-        ``_wgrad`` without ``deterministic=False``
-      - ``cake_moe_grouped_gemm_det_train_forward`` / ``_dgrad`` / ``_wgrad``
-    * - ``prepare_grouped_det_gemm_fwd`` / ``_dgrad`` / ``_wgrad`` and their aliases
-        ``prepare_grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from the two packages above
+    * - ``prepare_grouped_det_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from the package above
       - ``cake_moe_grouped_gemm_det_train_prepare_forward`` / ``_prepare_dgrad`` /
         ``_prepare_wgrad``
-    * - ``GroupedDetGemmLaunch`` and its alias ``GroupedGemmLaunch``, from the two
-        packages above
+    * - ``GroupedDetGemmLaunch``, from the package above
       - ``CakeMoEGroupedGemmDetLaunch``
-    * - ``cake_grouped_det_mm`` and its alias ``cake_grouped_mm``, from
-        ``flashinfer.grouped_mm``, ``flashinfer.grouped_mm.cake`` or the two packages
-        above
+    * - ``cake_grouped_det_mm``, from ``flashinfer.grouped_mm``,
+        ``flashinfer.grouped_mm.cake_det`` or the package above
       - ``cake_moe_grouped_gemm_det``
-    * - ``flashinfer.experimental.cake.grouped_mm.cake_grouped_mm`` without
-        ``deterministic=False``
-      - ``cake_moe_grouped_gemm_det``
-    * - ``CakeGroupedDetMm`` and its alias ``CakeGroupedMm``, from the two packages above
+    * - ``CakeGroupedDetMm``, from the package above
       - ``CakeMoEGroupedGemmDetFunction``
-    * - ``cake_backend.grouped_mm_bf16_cake`` of the two packages above
-      - :func:`flashinfer.grouped_mm.grouped_mm_bf16` with ``backend="cake"`` (unchanged)
-    * - the ``deterministic`` argument
-      - the module of the mode; passing the argument raises ``TypeError``
+
+:func:`flashinfer.grouped_mm.grouped_mm_bf16` with ``backend="cake"`` is unchanged: it
+runs the forward of this module.

@@ -209,15 +209,10 @@ Both modes have the same entries; the module and every name carry the mode:
       - ``is_cake_moe_grouped_gemm_nondet_train_supported``
 
 The former names of this module were removed with no alias: importing one raises
-``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.  Only the calls that
-passed ``deterministic=False`` move here.  The calls of
-``flashinfer.experimental.cake.grouped_mm`` without ``deterministic=False`` (the default
-``deterministic=True``) ran the deterministic package: they move to
-:mod:`flashinfer.cake_moe_grouped_gemm_det_train` (see its table), as do the names
-without ``det`` of ``flashinfer.grouped_mm``, ``flashinfer.grouped_mm.cake``,
-``flashinfer.experimental.cake_moe_grouped_det_gemm`` and
-``flashinfer.experimental.cake_moe_grouped_gemm``, which were aliases of the
-deterministic objects.
+``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.  Every entry in the table
+ran only with ``deterministic=False``; any other value raised ``ValueError``.  The former
+deterministic names move to :mod:`flashinfer.cake_moe_grouped_gemm_det_train` (see its
+table).
 
 .. list-table::
     :header-rows: 1
@@ -225,21 +220,20 @@ deterministic objects.
     * - Removed
       - Use instead
     * - the package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` with its
-        submodules (every entry required ``deterministic=False``)
+        submodules, and the module ``flashinfer.experimental.cake.grouped_mm``
       - ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (backend
         ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``, same submodule
         names)
-    * - ``grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad`` with ``deterministic=False``, from
+    * - ``grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from
         ``flashinfer.experimental.cake.grouped_mm`` or the package above
       - ``cake_moe_grouped_gemm_nondet_train_forward`` / ``_dgrad`` / ``_wgrad``
-    * - ``prepare_grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad`` with
-        ``deterministic=False``, from the package above
+    * - ``prepare_grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from the package above
       - ``cake_moe_grouped_gemm_nondet_train_prepare_forward`` / ``_prepare_dgrad`` /
         ``_prepare_wgrad``
     * - ``GroupedGemmLaunch``, from the package above
       - ``CakeMoEGroupedGemmNondetLaunch``
-    * - ``cake_grouped_mm`` with ``deterministic=False``, from
-        ``flashinfer.experimental.cake.grouped_mm`` or the package above
+    * - ``cake_grouped_mm``, from ``flashinfer.experimental.cake.grouped_mm`` or the
+        package above
       - ``cake_moe_grouped_gemm_nondet``
     * - ``CakeGroupedMm``, from the package above
       - ``CakeMoEGroupedGemmNondetFunction``
@@ -247,13 +241,12 @@ deterministic objects.
       - the module of the mode: ``cake_moe_grouped_gemm_det_train`` or
         ``cake_moe_grouped_gemm_nondet_train``; passing the argument raises ``TypeError``
 
-One behavior changes.  Under ``torch.use_deterministic_algorithms(True)``, a call of
-``flashinfer.experimental.cake.grouped_mm`` with ``deterministic=False`` ran the
-deterministic package and warned once.  This module never falls back: it raises
-PyTorch's non-determinism alert (``RuntimeError``) right before an order-varying weight
-gradient launch, and with ``warn_only=True`` it warns (``UserWarning``) and runs the
-non-deterministic launch.  Use :mod:`flashinfer.cake_moe_grouped_gemm_det_train` where
-the deterministic mode must hold.
+Under ``torch.use_deterministic_algorithms(True)`` the behavior is unchanged.  This
+module raises PyTorch's non-determinism alert (``RuntimeError``) right before an
+order-varying weight gradient launch.  With ``warn_only=True`` it warns
+(``UserWarning``) and runs the non-deterministic launch.  It never falls back to the
+deterministic module: use :mod:`flashinfer.cake_moe_grouped_gemm_det_train` where the
+deterministic mode must hold.
 
 Features by architecture
 ------------------------
