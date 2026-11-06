@@ -1323,6 +1323,7 @@ class BlockSparseAttentionWrapper:
             if self._backend == "fa2":
                 args.append(-1)  # fixed_split_size
                 args.append(False)  # disable_split_kv
+                args.append(-1)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
                 args.append(False)  # fixed_uniform_q_len
@@ -2097,6 +2098,7 @@ class VariableBlockSparseAttentionWrapper:
         if self._backend == "fa2":
             args.append(-1)  # fixed_split_size
             args.append(False)  # disable_split_kv
+            args.append(-1)  # fixed_cta_tile_q
             args.append(0)  # num_colocated_ctas
             args.append(0)  # uniform_q_len
             args.append(False)  # fixed_uniform_q_len
