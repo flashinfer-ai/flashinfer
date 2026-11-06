@@ -66,7 +66,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | | nondet | single rank | `cake_moe_grouped_gemm_nondet_train` | `cake_moe_grouped_gemm_nondet` | `CakeMoEGroupedGemmNondetFunction` | `cake_grouped_mm` |
 | dense GEMM | det | single rank | `cake_dense_gemm_det_train` | `cake_dense_gemm_det_train_projection`, `cake_dense_gemm_det_train_router` | per entry, by rule 3 | `dense_projection_det_gemm`, `router_fp32_det_gemm` |
 | | nondet | single rank | `cake_dense_gemm_nondet_train` | `cake_dense_gemm_nondet_train_projection`, `cake_dense_gemm_nondet_train_router` | per entry, by rule 3 | `experimental.dense_projection_gemm` `cake_backend` |
-| DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | entries renamed by the rules | | `experimental.cake_dsa_indexer_det` |
+| DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | `cake_dsa_indexer_det_train_topk`, `cake_dsa_indexer_det_train_topk_workspace_size` | none (no autograd: top-k selection) | `experimental.cake_dsa_indexer_det` (+ alias `experimental.cake_dsa_indexer`) / `dsa_indexer.dsa_indexer_det_topk(backend="cake")`, `dsa_indexer_det_topk_workspace_size`, aliases `dsa_indexer_topk*` |
 | | nondet | single rank | `cake_dsa_indexer_nondet_train` | | | planned |
 | DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | | | planned |
 | | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | entries renamed by the rules | | `experimental.cake_dsa_train` |
