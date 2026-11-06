@@ -300,6 +300,16 @@ def _select_expert_weights(
     return routed_expert_weights
 
 
+def _gemm_config_hash(io: dict) -> str:
+    """Compile-cache key of a GEMM launch: its config and, for an FC2 with a
+    fused finalize, the element type of the expert weights, which the config
+    leaves to the call and the compiled GEMM is specialized on."""
+    expert_weights = io.get("expert_weights_dp")
+    if expert_weights is None:
+        return stable_config_hash(io["cfg"])
+    return stable_config_hash(io["cfg"], expert_weights_dtype=expert_weights.dtype)
+
+
 def _torch_views_of_ffi_tensors(tensors: Any) -> list[Any]:
     """Return zero-copy Torch views for tensors nested in a TVM-FFI container.
 
@@ -2276,7 +2286,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     fc=fc, cfg=gemm_cfg, **common_io_kwargs
                 )
                 get_compiled_gemm(
-                    stable_config_hash(gemm_io["cfg"]),
+                    _gemm_config_hash(gemm_io),
                     f"mxfp4_mxfp8_{fc}",
                     gemm_io,
                     stream,
@@ -2441,7 +2451,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 expert_weights=expert_weights,
             )
         fc2_io = build_mxfp4_mxfp8_launch_io(fc="fc2", cfg=fc2_cfg, **common_io_kwargs)
-        fc2_hash = stable_config_hash(fc2_io["cfg"])
+        fc2_hash = _gemm_config_hash(fc2_io)
         fc2_fn = get_compiled_gemm(fc2_hash, "mxfp4_mxfp8_fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))
 
