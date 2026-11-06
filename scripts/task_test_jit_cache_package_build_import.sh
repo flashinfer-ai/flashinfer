@@ -280,12 +280,26 @@ for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do
 done
 
 PROVIDER_BUILD_STARTED_AT=${SECONDS}
+# Trial only: host-wide CPU seconds (user+system, all cores) over the build.
+trial_cpu_seconds() { awk '/^cpu /{print ($2+$3+$4+$7+$8)/100}' /proc/stat; }
+[ -n "${FLASHINFER_SCCACHE_FLAVOR:-}" ] && TRIAL_CPU_START=$(trial_cpu_seconds)
 run_bounded_parallel "${AOT_PROVIDER_CONCURRENCY}" build_provider_wheel \
     "${PROVIDER_ARCHITECTURE_LIST[@]}" || {
     echo "ERROR: A provider wheel build failed"
     exit 1
 }
 echo "Provider wheels built in $(( SECONDS - PROVIDER_BUILD_STARTED_AT )) s"
+if [ -n "${FLASHINFER_SCCACHE_FLAVOR:-}" ]; then
+    echo "TRIAL host CPU seconds during provider build: $(awk -v a="$(trial_cpu_seconds)" -v b="${TRIAL_CPU_START}" 'BEGIN{print a-b}')"
+    # Per-object and per-module checksums, paths relative to the build tree, for
+    # cross-flavor output equality.
+    ( cd build/aot-providers && find . -name '*.o' -o -name '*.so' | LC_ALL=C sort | xargs sha256sum ) \
+        > trial-object-sha256.txt || true
+    echo "TRIAL objects hashed: $(wc -l < trial-object-sha256.txt), digest of list: $(sha256sum < trial-object-sha256.txt | cut -c1-16)"
+    { set +x; } 2>/dev/null
+    sed 's/^/TRIALSUM /' trial-object-sha256.txt
+    set -x
+fi
 
 rm -rf flashinfer-jit-cache/dist flashinfer-jit-cache/build \
     flashinfer-jit-cache/*.egg-info
