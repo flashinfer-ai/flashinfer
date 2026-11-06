@@ -120,6 +120,7 @@ _COMMON = dict(
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
     snake_default=False,
+    snake_cap_rule=None,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
@@ -770,6 +771,15 @@ def test_policy_record_round_trip_and_validation():
         dict(l6_solo_unsampled_max_queries=16384.0),
         dict(l6_solo_unsampled_max_queries=True),
         dict(l6_solo_unsampled_max_queries=[16384]),
+        # the FP8 snake cap: [max segments >= 1, max waves >= 1] or None
+        dict(snake_cap_rule=40),
+        dict(snake_cap_rule=[]),
+        dict(snake_cap_rule=[1]),
+        dict(snake_cap_rule=[1, 40, 1]),
+        dict(snake_cap_rule=[0, 40]),
+        dict(snake_cap_rule=[1, 0]),
+        dict(snake_cap_rule=[1.0, 40]),
+        dict(snake_cap_rule=[True, 40]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -844,6 +854,14 @@ def test_policy_record_round_trip_and_validation():
     assert waved.wide_wave_rule == [1.6, 1.3, 80.0]
     assert waved.record()["wide_wave_rule"] == [1.6, 1.3, 80.0]
     assert DispatchPolicy.from_record(waved.record()) == waved
+    capped = DispatchPolicy.from_record(dict(record, snake_cap_rule=(1, 40)))
+    assert capped.record()["snake_cap_rule"] == [1, 40]
+    assert DispatchPolicy.from_record(capped.record()) == capped
+    # waves of 6-query units on 212 CTAs: 32768 queries take 26, 65536 take 52
+    assert capped.snake_copy_fits(32768, 1, 6, 212)
+    assert not capped.snake_copy_fits(65536, 1, 6, 212)
+    assert not capped.snake_copy_fits(32768, 2, 6, 212)
+    assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )

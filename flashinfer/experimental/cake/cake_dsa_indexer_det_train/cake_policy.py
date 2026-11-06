@@ -52,8 +52,9 @@ changes a result -- every form computes the same ids and score bits -- so a
 wrong choice costs time, not correctness.
 
 The opt-in FP8 input form (float8_e4m3fn ``q`` / ``k``) has its own scan
-programs, keyed ``scan:<kind>:u<unroll>:s0:f1:fp8[:lsf]``, for the narrow, l6,
-split and wide kinds.  An FP8 call runs the same decision procedure under the
+programs, keyed ``scan:<kind>:u<unroll>:s<snake>:f1:fp8[:lsf]``, for the narrow,
+l6, split and wide kinds, in the plain unit order (``s0``) but for the snake copy
+(``s1``) of the sm_107a l6 program.  An FP8 call runs the same decision procedure under the
 architecture's FP8 record (``fp8_policy_record``: the ``POLICY`` record with
 the fields of the registry's ``POLICY_FP8`` record replaced) and then the
 registered FP8 program of the decided kind, or of its ``FP8_KIND_FALLBACK``
@@ -101,6 +102,7 @@ POLICY_FIELDS = (
     "wide_pair_snake_only",  # a sampled call pairs the wide unit only when it walks the snake order (else the unpaired wide program)
     "snake_default",  # snake unit order when no rule applies
     "snake_rule",  # [program kinds, min mean tiles, min mean tiles (ratio > 1), min unit-cost spread], or None
+    "snake_cap_rule",  # [max segments, max waves of the persistent grid] within which an FP8 call the decision marks snake runs the snake copy of its program, or None (no cap); read only by select_fp8_program
     "tile_unroll_default",  # tile-loop unroll when no rule applies
     "tile_unroll_factor",  # tile-loop unroll when the rule applies
     "tile_unroll_rule",  # [program kinds, min top_k, yields to the snake order], or None
@@ -162,7 +164,9 @@ MERGE_KEY = "merge"
 BF16 = "bf16"
 FP8 = "fp8"
 FORMS = (BF16, FP8)
-# The FP8 scan programs exist for the narrow, l6, split and wide kinds, with no snake order and in the sampled-fit form.
+# The FP8 scan programs exist for the narrow, l6, split and wide kinds, in the plain unit order (sm_107a also registers the
+# snake copy of its l6 program, which ``select_fp8_program`` runs for a snake-marked call within ``snake_cap_rule``) and in
+# the sampled-fit form.
 # An FP8 call runs the decision procedure of ``select_program`` under the FP8 record (``fp8_policy_record``); a decided
 # kind without an FP8 program runs the FP8 program of its fallback kind below (unpaired; the same unit geometry where it
 # has one, except that a CTA-pair wide unit runs l6).  An unpaired, unsplit wide unit (8 queries) runs the FP8 wide
@@ -315,6 +319,7 @@ _OPTIONAL_RULE = (
     "pair_rule",
     "l6_solo_rule",
     "snake_rule",
+    "snake_cap_rule",
     "tile_unroll_rule",
     "sample_shift_rule",
     "sample_class_rule",
@@ -373,6 +378,7 @@ class DispatchPolicy:
     wide_pair_snake_only: bool
     snake_default: bool
     snake_rule: Optional[list]
+    snake_cap_rule: Optional[list]
     tile_unroll_default: int
     tile_unroll_factor: int
     tile_unroll_rule: Optional[list]
@@ -528,6 +534,13 @@ class DispatchPolicy:
         if solo_queries is not None and solo_queries < 1:
             raise ValueError(
                 f"policy['l6_solo_unsampled_max_queries'] must be an integer >= 1 or None, got {solo_queries!r}"
+            )
+        snake_cap = raw["snake_cap_rule"]
+        if snake_cap is not None and (
+            len(snake_cap) != 2 or not all(_is_int(v) and v >= 1 for v in snake_cap)
+        ):
+            raise ValueError(
+                f"policy['snake_cap_rule'] must be [max segments >= 1, max waves >= 1] or None, got {snake_cap!r}"
             )
         shift_lo, shift_hi = SAMPLE_SHIFT_PERMILLE_BOUNDS
         shift_rule = raw["sample_shift_rule"]
@@ -1082,6 +1095,21 @@ class DispatchPolicy:
         spread = min(1.0, int(num_queries) / max(1.0, r * float(num_keys)))
         return mean_tiles >= (rule[1] if r == 1 else rule[2]) and spread >= rule[3]
 
+    def snake_copy_fits(
+        self, num_queries: int, num_segments: int, block_q: int, grid: int
+    ) -> bool:
+        """Whether a call of ``num_segments`` segments whose ``num_queries`` queries in units of ``block_q`` take a
+        persistent grid of ``grid`` CTAs stays within ``snake_cap_rule`` (at most its segments and waves; always where
+        the record leaves the rule None).  The snake unit order balances the last waves of one causal document; over
+        packed documents, or over many waves, the plain order is faster (the FP8 sm_107a l6 program), so
+        ``select_fp8_program`` runs a snake copy only within the rule."""
+        rule = self.snake_cap_rule
+        if rule is None:
+            return True
+        units = -(-int(num_queries) // max(1, int(block_q)))
+        waves = -(-units // max(1, int(grid)))
+        return int(num_segments) <= int(rule[0]) and waves <= int(rule[1])
+
     def tile_unroll_for(self, kind: str, top_k: int, snake: bool, block_q: int) -> int:
         rule = self.tile_unroll_rule
         if rule is None or (bool(rule[2]) and snake):
@@ -1385,8 +1413,9 @@ def fp8_policy_record(record: dict, fp8_record: dict) -> dict:
 
 
 def fp8_scan_programs(scan_keys: Collection[str]) -> dict:
-    """The dispatchable FP8 scan programs of a registry's keys: ``{(physical kind, lsf): {tile unroll: key}}`` over the
-    FP8 keys of the form the FP8 programs are built in (no snake order, the sampled-fit form: ``s0`` / ``f1``)."""
+    """The plain FP8 scan programs of a registry's keys: ``{(physical kind, lsf): {tile unroll: key}}`` over the FP8
+    keys in the plain unit order and the sampled-fit form (``s0`` / ``f1``).  A snake copy (``s1``) is not indexed
+    here: ``select_fp8_program`` swaps it in for its plain program where the decision marks the call snake."""
     programs: dict = {}
     for key in scan_keys:
         fields = scan_key_fields(key)
@@ -1896,7 +1925,8 @@ def select_fp8_program(
     kind's sampled first threshold and check period (``fallback_knobs``), where no FP8 program of the decided kind is
     registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered), with the decided tile
     unroll where an FP8 program of it is registered, else the smallest registered one, and in the snake unit order
-    where the decision marks it and the registry has the snake copy (``s1``) of that program.  ``fp8_programs``:
+    where the decision marks it, the registry has the snake copy (``s1``) of that program and the call stays within
+    the record's ``snake_cap_rule`` (``DispatchPolicy.snake_copy_fits``).  ``fp8_programs``:
     ``fp8_scan_programs(scan_keys)``, made once by the caller.  Raises ``NotImplementedError`` when no FP8 program
     serves the kind."""
     choice = select_program(policy, scan_keys=scan_keys, **call)
@@ -1911,11 +1941,19 @@ def select_fp8_program(
             f"(registered FP8 kinds: {sorted({kind for kind, _lsf in programs})})"
         )
     key = unrolls.get(choice.tile_unroll, unrolls[min(unrolls)])
-    if choice.snake and key.replace(":s0:", ":s1:", 1) in scan_keys:
-        key = key.replace(":s0:", ":s1:", 1)
     if physical != choice.physical_kind:
         choice = fallback_knobs(policy, choice, physical, call)
-    return fp8_program_choice(policy, choice, key)
+    plain = fp8_program_choice(policy, choice, key)
+    twin = key.replace(":s0:", ":s1:", 1)
+    if (
+        choice.snake
+        and twin in scan_keys
+        and policy.snake_copy_fits(
+            plain.num_queries, plain.num_segments, plain.block_q, plain.grid_ctas
+        )
+    ):
+        return fp8_program_choice(policy, choice, twin)
+    return plain
 
 
 __all__ = [
