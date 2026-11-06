@@ -231,6 +231,7 @@ class MlaConfig(Nvfp4KVConfig):
     coalesce_keeps_output: bool = False
     # Programmatic dependent launch for the attention kernel itself: it waits
     # for the preceding grid before any input read and releases dependents.
+    # The kernel sets it from its ``enable_pdl``.
     use_pdl: bool = False
     # Grids of at most this many CTAs release PDL dependents right after the
     # entry wait instead of at exit (0: never). Dependents always wait for the
