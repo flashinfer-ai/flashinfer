@@ -119,21 +119,6 @@ ALLOWLIST = (
         "('from ..cake_kda_det_train import'), undeclared",
     ),
     (
-        "flashinfer.experimental.cake_kda_train",
-        (
-            "__init__",
-            "cake_backend",
-            "cake_build",
-            "cake_jit",
-            "cake_kcp",
-            "cake_kcp_jit",
-            "cake_kcp_plan",
-        ),
-        "compatibility alias: __init__.py star-imports "
-        "flashinfer.experimental.cake_kda_det_train, and each module replaces "
-        "itself with a det package's module, imported by its flashinfer path",
-    ),
-    (
         "flashinfer.experimental.cake_kda_train_kcp",
         ("cake_kcp", "cake_kcp_jit"),
         "they import the single-rank package across directories "

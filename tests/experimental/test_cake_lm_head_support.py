@@ -43,7 +43,7 @@ from tests.test_helpers.cake_package import cake_package
 
 cake_support = cake_package("cake.cake_lm_head_loss", "cake_support")
 cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
-det_support = cake_package("cake_lm_head_det_loss", "cake_support")
+det_support = cake_package("cake.cake_lm_head_det_train", "cake_support")
 support_logprob = cake_support.chunked_lm_head_support_logprob
 support_kl = cake_support.chunked_lm_head_support_kl
 
@@ -69,8 +69,8 @@ def run_support(
         logprob_fn, kl_fn = support_logprob, support_kl
         kwargs.update(ND)
     else:
-        logprob_fn = det_support.chunked_lm_head_det_support_logprob
-        kl_fn = det_support.chunked_lm_head_det_support_kl
+        logprob_fn = det_support.cake_lm_head_det_train_support_logprob
+        kl_fn = det_support.cake_lm_head_det_train_support_kl
     res = dict(packed=None, selected=None, kl=None)
     if "kl" in outputs:
         out = kl_fn(
@@ -205,7 +205,7 @@ def test_entries_refuse_any_mode_but_false(value):
             backend=REF,
             deterministic=value,
         )
-    with pytest.raises(ValueError, match="cake_lm_head_det_loss"):
+    with pytest.raises(ValueError, match="cake_lm_head_det_train"):
         support_kl(
             inp.X,
             inp.W,
@@ -231,9 +231,10 @@ def test_entries_refuse_any_mode_but_false(value):
 
 def test_names_are_the_deterministic_names_without_det():
     assert (
-        cake_support.SupportLogprobFunction is not det_support.SupportDetLogprobFunction
+        cake_support.SupportLogprobFunction
+        is not det_support.CakeLMHeadDetSupportFunction
     )
-    assert support_logprob is not det_support.chunked_lm_head_det_support_logprob
+    assert support_logprob is not det_support.cake_lm_head_det_train_support_logprob
     assert set(cake_support.__all__) >= {
         "SupportLogprobFunction",
         "chunked_lm_head_support_logprob",

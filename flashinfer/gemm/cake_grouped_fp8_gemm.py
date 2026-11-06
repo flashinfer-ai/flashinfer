@@ -119,9 +119,15 @@ BS_N256_RUN32_ROUTE = "bs_ue8m0_n256_run32"
 BS_N128_S16_ROUTE = "bs_ue8m0_n128_s16"
 BS_N256_S16_ROUTE = "bs_ue8m0_n256_s16"
 # The SM107a lead-prefetch program of the BLOCK_N 256 single-run route
-# (:func:`bs_lead_prefetch`; its short-K layouts never take BLOCK_N 128 there).
+# (:func:`bs_lead_prefetch`; only layouts the host routes to BLOCK_N 256 take it).
 BS_N256_LPF_ROUTE = "bs_ue8m0_n256_lpf"
 BS_LPF_ROUTES = {BS_N256_ROUTE: BS_N256_LPF_ROUTE}
+# The lead-prefetch rule's bounds (:func:`bs_lead_prefetch`): K of at most two K
+# blocks, the routed rows per group at or below which such a layout always takes
+# it, and the routed rows per group from which a longer-K layout takes it.
+BS_LPF_SHORT_K = 2 * K_BLOCK
+BS_LPF_SHORT_K_MAX_ROWS = 10
+BS_LPF_LONG_K_MIN_ROWS = 160
 BS_ROUTES = frozenset(
     {
         BS_N128_ROUTE,
@@ -792,22 +798,30 @@ def bs_lead_prefetch(
     Each CTA writes the leading ``m_indices`` entry of each of its first 224
     tiles to a shared table before its prologue barrier, and each role reads
     its tile's entry from there (a later tile reads ``m_indices``), so a
-    padding tile costs no dependent global load; on a layout of mostly routed
-    blocks, or past two K blocks where the K loop outweighs the walk, the
-    table costs as much as it saves.  The rule reads host-known values only: at
-    most two K blocks, the valid blocks bounded as in :func:`bs_block_n`
-    (``min(routed, num_groups + routed // 128)`` with
-    ``routed = m - num_groups * (alignment - 1)``) at most four fifths of the
-    M blocks.  The program computes every output as the single-run program
-    does, so the routed rows keep their bits.
+    padding tile costs no dependent global load.  The rule reads host-known
+    values only, with ``routed = m - num_groups * (alignment - 1)`` routed rows
+    and ``routed / num_groups`` routed rows per group:
+
+    * at most two K blocks (K <= 256) with the valid blocks bounded as in
+      :func:`bs_block_n` (``min(routed, num_groups + routed // 128)``) at most
+      four fifths of the M blocks, or at most 10 routed rows per group;
+    * more than two K blocks (K > 256) with at least 160 routed rows per group.
+
+    Between those bounds (and at K <= 256 above 10 rows per group on a layout
+    of mostly routed blocks) the table costs as much as it saves.  The program
+    computes every output as the single-run program does, so the routed rows
+    keep their bits.
     """
     if arch != BS_SM107A_ARCH or not num_groups or alignment % BS_BLOCK_M:
-        return False
-    if k // K_BLOCK > 2:
         return False
     routed = m - num_groups * (alignment - 1)
     if routed <= 0:
         return False
+    if k > BS_LPF_SHORT_K:
+        # rows = routed / num_groups >= 160; compared without division.
+        return routed >= BS_LPF_LONG_K_MIN_ROWS * num_groups
+    if routed <= BS_LPF_SHORT_K_MAX_ROWS * num_groups:
+        return True
     valid_blocks = min(routed, num_groups + routed // BS_BLOCK_M)
     m_blocks = (m + BS_BLOCK_M - 1) // BS_BLOCK_M
     return 5 * valid_blocks <= 4 * m_blocks
