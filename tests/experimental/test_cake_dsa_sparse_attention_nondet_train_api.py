@@ -364,15 +364,17 @@ def _non_causal_local_indices(inp, gen, *, masked_docs=()):
 
 
 def test_public_api_is_a_stable_api():
-    """The entry points are stable APIs (issue #8928): not marked experimental, and their docstrings state the
-    behaviour under ``torch.use_deterministic_algorithms``."""
+    """The entry points are stable APIs (issue #8928): not marked experimental, and the docstring of every entry
+    point states its behaviour under ``torch.use_deterministic_algorithms``."""
     for fn in (
         cake_dsa_sparse_attention_nondet,
         cake_dsa_sparse_attention_nondet_varlen,
+        cake_dsa_sparse_attention_nondet_nope,
+        cake_dsa_sparse_attention_nondet_nope_varlen,
     ):
         assert not getattr(fn, "is_experimental", False), fn.__name__
+        assert "use_deterministic_algorithms" in fn.__doc__, fn.__name__
     assert "SM100" in cake_dsa_sparse_attention_nondet.__doc__
-    assert "use_deterministic_algorithms" in cake_dsa_sparse_attention_nondet.__doc__
 
 
 def test_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
@@ -1302,9 +1304,6 @@ def test_public_nope_api_is_a_stable_api():
         cake_dsa_sparse_attention_nondet_nope_varlen,
     ):
         assert not getattr(fn, "is_experimental", False), fn.__name__
-    assert (
-        "use_deterministic_algorithms" in cake_dsa_sparse_attention_nondet_nope.__doc__
-    )
     doc = cake_dsa_sparse_attention_nondet_nope.__doc__
     assert "SM100" in doc and "1 / 16" in doc
     assert "dK + dV" in doc and "[S, 1, 512]" in doc and "K_slots >= 1" in doc
@@ -1965,8 +1964,8 @@ def _alert_case(entry: str):
 @pytest.mark.parametrize("entry", ALERT_ENTRIES)
 def test_torch_deterministic_mode_raises_at_the_backward_only(entry):
     """Under ``torch.use_deterministic_algorithms(True)`` the forward of every entry point runs (fixed-order, the
-    output of the forward outside the mode) and its autograd backward raises PyTorch's ``RuntimeError`` before it
-    launches; no gradient reaches the leaves."""
+    output of the forward outside the mode) and its autograd backward raises PyTorch's ``RuntimeError``; no gradient
+    reaches the leaves (the prepared-runner test checks that no backward buffer is written)."""
     sources, call, dout, _ = _alert_case(entry)
     leaves = [t.detach().clone().requires_grad_() for t in sources]
     expected = call(*leaves).detach()
@@ -1997,15 +1996,49 @@ def test_torch_deterministic_warn_only_warns_and_runs_this_package(entry):
         assert g.dtype == e.dtype and rel_l2(g, e) < 1e-2
 
 
+# The backward buffers of a prepared runner: the outputs and, where the binding has them, the FP32 accumulators the
+# backward zero-fills first.
+RUNNER_BACKWARD_BUFFERS = (
+    "dq_latent",
+    "dq_rope",
+    "dkv_latent",
+    "dk_rope",
+    "dkv",
+    "dkv_latent_acc",
+    "dk_rope_acc",
+)
+
+
+def _fill_backward_buffers(runner) -> dict[str, torch.Tensor]:
+    """Fill the backward buffers of ``runner`` with a sentinel; returns them by name."""
+    buffers = {
+        name: runner.tensors[name]
+        for name in RUNNER_BACKWARD_BUFFERS
+        if name in runner.tensors
+    }
+    assert "dq_latent" in buffers, sorted(runner.tensors)
+    for buffer in buffers.values():
+        buffer.fill_(3.0)
+    return buffers
+
+
 def test_torch_deterministic_mode_explicit_and_prepared_backwards_alert():
-    """The eager ``backward`` / ``backward_nope`` and the prepared runners' ``backward`` alert too (strict: before
-    they launch; ``warn_only``: a warning, then the backward runs); their forwards never alert."""
+    """The eager ``backward`` / ``backward_nope`` and the prepared runners' ``backward`` alert too: in strict mode a
+    runner's backward raises before it writes a backward buffer (the sentinel in every output and accumulator stays);
+    with ``warn_only`` each warns and runs its backward (query gradients bitwise the ones outside the mode, key
+    gradients within the FP32 reduction spread).  Their forwards never alert."""
     _require_program(backward=True)
     _require_nope_program(backward=True)
     inp = make_inputs([256], [512], seed=SEED + 41, topk=128)
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
     nope = _nope_inputs(256, 512, seed=NOPE_SEED + 41, topk=128)
     nope_args = (nope.q, nope.kv, nope.idx_global)
+    o, lse, o_lo = cake_backend.forward(*args)
+    eager_expected = cake_backend.backward(*args, o, o_lo, lse, inp.dout)
+    no, nlse, no_lo = cake_backend.forward_nope(*nope_args)
+    nope_eager_expected = cake_backend.backward_nope(
+        *nope_args, no, no_lo, nlse, nope.dout
+    )
     runner = prepare_dsa_train(*args, dout=inp.dout, backward=True)
     nope_runner = cake_backend.prepare_dsa_nope_train(
         *nope_args, dout=nope.dout, backward=True
@@ -2022,19 +2055,33 @@ def test_torch_deterministic_mode_explicit_and_prepared_backwards_alert():
         with pytest.raises(RuntimeError, match=ALERT):
             cake_backend.backward_nope(*nope_args, no, no_lo, nlse, nope.dout)
         runner.forward()
+        buffers = _fill_backward_buffers(runner)
         with pytest.raises(RuntimeError, match="DSATrainRunner.backward " + ALERT):
             runner.backward()
         nope_runner.forward()
+        nope_buffers = _fill_backward_buffers(nope_runner)
         with pytest.raises(RuntimeError, match="DSANopeTrainRunner.backward " + ALERT):
             nope_runner.backward()
+        torch.cuda.synchronize()
+        for name, buffer in {**buffers, **nope_buffers}.items():
+            assert torch.all(buffer == 3.0), name
     with _torch_deterministic(warn_only=True):
+        with pytest.warns(UserWarning, match=ALERT):
+            eager_got = cake_backend.backward(*args, o, o_lo, lse, inp.dout)
+        with pytest.warns(UserWarning, match=ALERT):
+            nope_eager_got = cake_backend.backward_nope(
+                *nope_args, no, no_lo, nlse, nope.dout
+            )
         with pytest.warns(UserWarning, match=ALERT):
             got = runner.backward()
         with pytest.warns(UserWarning, match=ALERT):
             nope_got = nope_runner.backward()[0]
     torch.cuda.synchronize()
-    assert torch.equal(got[0], expected[0]) and torch.equal(got[1], expected[1])
-    assert rel_l2(got[2], expected[2]) < 1e-2 and rel_l2(got[3], expected[3]) < 1e-2
+    for g, e in ((eager_got, eager_expected), (got, expected)):
+        assert torch.equal(g[0], e[0]) and torch.equal(g[1], e[1])
+        assert rel_l2(g[2], e[2]) < 1e-2 and rel_l2(g[3], e[3]) < 1e-2
+    assert torch.equal(nope_eager_got[0], nope_eager_expected[0])
+    assert rel_l2(nope_eager_got[1], nope_eager_expected[1]) < 1e-2
     assert torch.equal(nope_got, nope_expected)
 
 

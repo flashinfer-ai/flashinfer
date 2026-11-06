@@ -18,7 +18,7 @@ limitations under the License.
 # DeepSeek Sparse Attention (top-k sparse MLA, absorbed queries) training forward and backward on SM100 / SM103 /
 # SM107 (flashinfer-ai/flashinfer#5657, tracker #4254), the non-deterministic package: the backward adds the dK / dV
 # gradients with unordered FP32 atomics and raises PyTorch's alert under
-# ``torch.use_deterministic_algorithms(True)`` (a ``UserWarning`` with ``warn_only=True``) before it launches.  The
+# ``torch.use_deterministic_algorithms(True)`` (a ``UserWarning`` with ``warn_only=True``) before its first backward kernel launch.  The
 # stable entry points are ``cake_dsa_sparse_attention_nondet``, ``cake_dsa_sparse_attention_nondet_varlen``,
 # ``cake_dsa_sparse_attention_nondet_nope`` and ``cake_dsa_sparse_attention_nondet_nope_varlen`` of
 # ``flashinfer.cake_dsa_sparse_attention_nondet_train``; the autograd Functions, host planning, JIT registration and

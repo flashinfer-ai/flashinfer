@@ -25,9 +25,12 @@ the dK / dV contributions of every query row into FP32 accumulators with
 unordered atomics, so ``dkv`` (the ``kv_latent`` / ``k_rope`` or ``kv``
 gradients, or the rows added into ``dkv_acc``) may differ run to run within
 the FP32 reduction spread.  Under ``torch.use_deterministic_algorithms(True)``
-the forward runs and the backward raises PyTorch's ``RuntimeError`` before it
-launches; with ``warn_only=True`` it warns (``UserWarning``) and runs this
-package's backward.  It never falls back to another package.  The
+the forward runs and the backward raises PyTorch's ``RuntimeError`` before its
+first backward kernel launch; with ``warn_only=True`` it warns
+(``UserWarning``) and runs this package's backward.  Deterministic host
+preparation may run before the alert (a copy of a ``dout`` the TMA descriptor
+cannot address, the plan of a new binding, the validation of ``dkv_acc`` /
+``dkv_dst_map``).  It never falls back to another package.  The
 deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a
 reserved name (planned); it does not exist yet.
 
@@ -293,9 +296,10 @@ def cake_dsa_sparse_attention_nondet(
     apply no positional mask: the index rows define the key set.
 
     Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
-    backward raises PyTorch's ``RuntimeError`` before it launches (its dK / dV
-    atomics are not run-to-run reproducible); with ``warn_only=True`` it issues a
-    ``UserWarning`` and runs.  No deterministic package is chosen instead.
+    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
+    (its dK / dV atomics are not run-to-run reproducible); with
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     Host side: the inputs are validated and bound on the first call for an
     input binding (``data_ptr``, shape, stride and dtype of every input plus
@@ -373,6 +377,12 @@ def cake_dsa_sparse_attention_nondet_varlen(
     other varlen attention entry points and are not read on the host.  Other
     arguments and returns as in :func:`cake_dsa_sparse_attention_nondet`; the strided
     query slices and packed key rows described there are accepted here too.
+
+    Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
+    (its dK / dV atomics are not run-to-run reproducible); with
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     Parameters
     ----------
@@ -555,9 +565,10 @@ def cake_dsa_sparse_attention_nondet_nope(
     key set.
 
     Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
-    backward raises PyTorch's ``RuntimeError`` before it launches (its dK / dV
-    atomics are not run-to-run reproducible); with ``warn_only=True`` it issues a
-    ``UserWarning`` and runs.  No deterministic package is chosen instead.
+    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
+    (its dK / dV atomics are not run-to-run reproducible); with
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     The incoming ``dout`` may be a head-major view (strides ``[512, T * 512,
     1]``, the layout an output projection hands back) or any strided
@@ -640,6 +651,12 @@ def cake_dsa_sparse_attention_nondet_nope_varlen(
     other varlen attention entry points and are not read on the host.  Other
     arguments, the ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and
     the returns as in :func:`cake_dsa_sparse_attention_nondet_nope`.
+
+    Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
+    (its dK / dV atomics are not run-to-run reproducible); with
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     ``cu_seqlens_q`` and ``cu_seqlens_k`` are caller-owned prefix sums with
     these invariants: int32 ``[num_docs + 1]`` tensors of one length on the
