@@ -26,8 +26,9 @@ limitations under the License.
 # ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer,
 # so a build that vendors the package under another import path runs it
 # unchanged after pointing that table entry at its package.  The flashinfer
-# public entry point (``flashinfer.dsa_indexer``) and its experimental-API
-# warning contract are covered by ``test_cake_dsa_indexer_api.py``.
+# public entry points (``flashinfer.cake_dsa_indexer_det_train``) are covered by
+# ``test_cake_dsa_indexer_det_train_api.py`` and their #8928 naming rules by
+# ``test_cake_dsa_indexer_det_train_names.py``.
 
 import itertools
 import json
@@ -42,10 +43,10 @@ import torch
 from tests.test_helpers import cake_dsa_indexer_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake_dsa_indexer_det", "cake_backend")
-cake_build = cake_package("cake_dsa_indexer_det", "cake_build")
-cake_jit = cake_package("cake_dsa_indexer_det", "cake_jit")
-cake_policy = cake_package("cake_dsa_indexer_det", "cake_policy")
+cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
+cake_build = cake_package("cake.cake_dsa_indexer_det_train", "cake_build")
+cake_jit = cake_package("cake.cake_dsa_indexer_det_train", "cake_jit")
+cake_policy = cake_package("cake.cake_dsa_indexer_det_train", "cake_policy")
 ABI_CONTRACT = cake_backend.ABI_CONTRACT
 CONTRACT_SCALARS = cake_backend.CONTRACT_SCALARS
 CONTRACT_TENSORS = cake_backend.CONTRACT_TENSORS
@@ -56,7 +57,9 @@ SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
 ZERO_SIGN_POLICIES = cake_backend.ZERO_SIGN_POLICIES
 arch_for = cake_backend.arch_for
 bind_program = cake_backend.bind_program
-dsa_indexer_det_workspace_size = cake_backend.dsa_indexer_det_workspace_size
+cake_dsa_indexer_det_train_topk_workspace_size = (
+    cake_backend.cake_dsa_indexer_det_train_topk_workspace_size
+)
 generated_program_available = cake_backend.generated_program_available
 plan_dsa_indexer_det_topk = cake_backend.plan_dsa_indexer_det_topk
 policy_for = cake_backend.policy_for
@@ -222,7 +225,7 @@ def _require_program():
 
 
 def _run(inputs: ref.IndexerInputs, **extra):
-    out = cake_backend.dsa_indexer_det_topk(
+    out = cake_backend.cake_dsa_indexer_det_train_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -1766,7 +1769,7 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
     assert solo(unsampled) and unsampled.scan_key == "scan:l6:u1:s0:f0"
     assert unsampled.workspace_bytes > sampled.workspace_bytes
     assert (
-        dsa_indexer_det_workspace_size(
+        cake_dsa_indexer_det_train_topk_workspace_size(
             *geometry, top_k=2048, arch="sm_107a", num_sms=212
         )
         == unsampled.workspace_bytes
@@ -2145,7 +2148,7 @@ def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
     layout) of a packed batch, here the CP16 zigzag rank-0 geometry of the Z3cp row with its keys pooled 4:1, takes
     8192-slot candidate buffers (57 MiB on 152 SMs with six queries per unit, the pre-16384-floor plan: check period 16),
     where the 16384-slot floor on every top_k needed 114 MiB and check period 32; ``candidate_multiplier=32`` restores
-    that plan; a top_k 2048 call of the same geometry keeps the previous record's 16384 slots; ``dsa_indexer_det_workspace_size``
+    that plan; a top_k 2048 call of the same geometry keeps the previous record's 16384 slots; ``cake_dsa_indexer_det_train_topk_workspace_size``
     agrees.  sm_103a sets no rule: the same call keeps its 16384-slot buffers (114 MiB, check period 32), the plan of the
     previous package there."""
     pooled = dict(
@@ -2177,13 +2180,13 @@ def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
         == 16384
     )
     assert (
-        dsa_indexer_det_workspace_size(
+        cake_dsa_indexer_det_train_topk_workspace_size(
             10624, 43824, 16, top_k=512, ratio=4, arch="sm_100a", num_sms=152
         )
         == new.workspace_bytes
     )
     assert (
-        dsa_indexer_det_workspace_size(
+        cake_dsa_indexer_det_train_topk_workspace_size(
             10624,
             43824,
             16,
@@ -2202,7 +2205,7 @@ def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
     assert (kept.cand_cap, kept.check_period) == (16384, 32)
     assert kept.workspace_bytes == 152 * 6 * 16384 * 8 + tail == 119537664 + tail
     assert (
-        dsa_indexer_det_workspace_size(
+        cake_dsa_indexer_det_train_topk_workspace_size(
             10624, 43824, 16, top_k=512, ratio=4, arch="sm_103a", num_sms=152
         )
         == kept.workspace_bytes
@@ -3447,7 +3450,7 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
 
 
 def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
-    return dsa_indexer_det_workspace_size(
+    return cake_dsa_indexer_det_train_topk_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -3586,7 +3589,7 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         workspace.fill_(
             fill
         )  # what another kernel could leave in the buffer, the tail included
-        out = cake_backend.dsa_indexer_det_topk(
+        out = cake_backend.cake_dsa_indexer_det_train_topk(
             inputs.q,
             inputs.k,
             inputs.w,
@@ -3764,7 +3767,7 @@ def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
         assert ref.same_bits(out, expected_s), fill
         assert (word == fill).all(), fill  # untouched by the scan
     assert not memsets
-    out = cake_backend.dsa_indexer_det_topk(
+    out = cake_backend.cake_dsa_indexer_det_train_topk(
         inputs_s.q,
         inputs_s.k,
         inputs_s.w,
@@ -4116,7 +4119,7 @@ def test_workspace_bound_is_respected():
         [900, 300], [900, 7000], top_k=2048, seed=60, device="cuda"
     )
     device = torch.device("cuda", torch.cuda.current_device())
-    nbytes = dsa_indexer_det_workspace_size(
+    nbytes = cake_dsa_indexer_det_train_topk_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -4184,7 +4187,7 @@ def test_empty_rows_and_no_keys_are_all_padding():
     k = torch.zeros((5, HEAD_DIM), dtype=torch.bfloat16, device=device)
     w = torch.zeros((0, NUM_HEADS), dtype=torch.float32, device=device)
     cu = torch.tensor([0, 0], dtype=torch.int32, device=device)
-    indices, scores = cake_backend.dsa_indexer_det_topk(
+    indices, scores = cake_backend.cake_dsa_indexer_det_train_topk(
         q, k, w, cu, torch.tensor([0, 5], dtype=torch.int32, device=device), top_k=8
     )
     assert tuple(indices.shape) == (0, 8) and tuple(scores.shape) == (0, 8)
@@ -4300,7 +4303,9 @@ def test_device_facts_are_queried_once_per_device(monkeypatch):
             plan = plan_dsa_indexer_det_topk(1024, 4096, 1, top_k=256, device=dev)
             assert plan.grid == sms
             assert (
-                dsa_indexer_det_workspace_size(1024, 4096, 1, top_k=256, device=dev)
+                cake_dsa_indexer_det_train_topk_workspace_size(
+                    1024, 4096, 1, top_k=256, device=dev
+                )
                 == plan.workspace_bytes
             )
     assert properties.call_count == 1 and capabilities.call_count == 0
@@ -4549,7 +4554,7 @@ class _EagerCall:
 
     def __call__(self):
         i = self.inputs
-        return cake_backend.dsa_indexer_det_topk(
+        return cake_backend.cake_dsa_indexer_det_train_topk(
             i.q,
             i.k,
             i.w,

@@ -13,10 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Experimental Cake packages without a run-to-run bitwise contract: the
-non-deterministic counterparts of the deterministic (``*_det_*``) Cake training
-packages.  Each one has a facade whose ``deterministic: bool = True`` keyword
-routes to the deterministic package and whose ``deterministic=False`` runs the
-package's own non-deterministic programs.  Each subpackage is standalone
-(import it by its full name); this module imports nothing.
+Backend packages of the Cake training kernels (issue #8928).  A subpackage
+named ``cake_<op>_<det|nondet>_train[_kcp]`` is the backend of the top-level
+module of the same name, ``flashinfer.cake_<op>_<det|nondet>_train[_kcp]``;
+both modes live here.  For these packages the mode is part of the module name
+and no entry point takes a ``deterministic=`` keyword.  A ``det`` package
+returns run-to-run bitwise-identical results.  A ``nondet`` package makes no
+run-to-run bitwise promise; under ``torch.use_deterministic_algorithms(True)``
+it raises PyTorch's alert at its non-deterministic step (with
+``warn_only=True`` it warns and runs ``nondet``) and never falls back to
+``det``.  A subpackage whose family is not renamed yet keeps its current entry
+points until that rename.  Each subpackage is standalone (import it by its
+full name); this module imports nothing.
 """
