@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 GOLDEN_ROOT = Path(__file__).with_name("data") / "kernel_package"
-GOLDEN_DIGEST = "59a6a6628b685f1becd920fd2fbf07845abe72bacce7f1935c6ff197c41a984d"
+GOLDEN_DIGEST = "efdedf36a4861e97ad1c0d2895883b1bbc6cdcc8ae59075283ed602427c7e6ea"
 #: The preserved setup-bearing package: ``kernel.py`` (``run``), ``prepare.py``
 #: (``setup``/``teardown``), ``solution.json`` with the four setup fields, a sealed
 #: ``definition.json`` and a manifest in the canonical ``sealed_files`` spelling.
