@@ -20,7 +20,7 @@ form.
 
 This package is the ``deterministic=False`` implementation of the chunked
 LM-head + loss entries.  Its contract is the deterministic package's
-(``flashinfer.experimental.cake_lm_head_det_loss``) with one relaxation:
+(``flashinfer.experimental.cake.cake_lm_head_det_train``) with one relaxation:
 outputs whose reduction this package performs in an unordered way are not
 bitwise reproducible from run to run.  Every precision boundary below holds
 (BF16 logits and ``dlogits``, FP32 probability / loss arithmetic, FP32
@@ -182,7 +182,7 @@ Contract
   unordered FP32 reduction (:func:`_dx_keys`, :data:`DX_RED_STAGE`).  With
   ``torch.use_deterministic_algorithms(True)`` every entry that launches the
   gradient GEMMs raises PyTorch's alert (:func:`_alert_nondeterministic`).
-  The deterministic programs are ``flashinfer.experimental.cake_lm_head_det_loss``.
+  The deterministic programs are ``flashinfer.experimental.cake.cake_lm_head_det_train``.
 * Temperature (log-probability entry, ``temperature`` / ``check_temperature``;
   :func:`_resolve_temperature`): a positive scalar or a per-token FP32 ``[T]``
   ``tau``, not differentiable.  ``logp_t = z_y / tau_t - logsumexp_v(z_v /
@@ -3715,7 +3715,7 @@ def _require_nondeterministic(deterministic: object, entry: str) -> None:
         raise ValueError(
             f"{entry} of flashinfer.experimental.cake.cake_lm_head_loss is the non-deterministic implementation "
             f"(unordered dX reduction) and needs deterministic=False, got deterministic={deterministic!r}; the "
-            "deterministic programs are flashinfer.experimental.cake_lm_head_det_loss (or "
+            "deterministic programs are flashinfer.experimental.cake.cake_lm_head_det_train (or "
             "flashinfer.chunked_lm_head.chunked_lm_head_loss with deterministic=True)"
         )
 
@@ -3734,13 +3734,13 @@ def _alert_nondeterministic(entry: str) -> None:
         warnings.warn(
             f"{entry} does not have a deterministic implementation, but you set "
             "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
-            "flashinfer.experimental.cake_lm_head_det_loss is the deterministic package",
+            "flashinfer.experimental.cake.cake_lm_head_det_train is the deterministic package",
             stacklevel=3,
         )
         return
     raise RuntimeError(
         f"{entry} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True)'; flashinfer.experimental.cake_lm_head_det_loss is "
+        "'torch.use_deterministic_algorithms(True)'; flashinfer.experimental.cake.cake_lm_head_det_train is "
         "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
         "application"
     )

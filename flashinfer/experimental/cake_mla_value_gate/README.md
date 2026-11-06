@@ -37,7 +37,8 @@ runner.launch(latent, gate, valid_lengths, out)  # returns out; graph-capturable
 
 `1 <= B <= max_rows <= 64`, `B % q == 0` (`q = rows_per_request`), all tensors on
 the device of `w_uv`.  The tests cover `H` in {1, 6, 12, 16} (12 is the
-Kimi-K3 TP8 rank) and `B` in {1..9, 16, 17, 32, 33, 48, 64}.
+Kimi-K3 TP8 rank) and `B` in {1..9, 16, 17, 24, 25, 32, 33, 48, 64}, on both
+programs (see below).
 
 ## Numerics
 
@@ -72,15 +73,41 @@ padding), are never read or written.  A caller whose attention shards the KV
 cache passes the global lengths: a request with an empty local shard is still
 a valid row.
 
+## Programs: 16-row and 8-row tiles
+
+Each architecture has two programs.  They differ only in the token rows one
+CTA owns; both give the same bits for every input, so the choice affects time
+only.
+
+| program | grid | CTA owns | dynamic shared memory |
+| --- | --- | --- | --- |
+| 16-row | `(4, H, ceil(B / 16))` | 32 value columns x 16 rows | 17408 B |
+| 8-row | `(4, H, ceil(B / 8))` | 32 value columns x 8 rows | 8704 B |
+
+For every `B` in `[1, max_rows]`, `prepare_mla_value_gate` decides once
+(outside capture) which program a launch of `B` rows runs:
+
+```text
+8-row program   if enable_pdl  or  4 * H * ceil(B / 8) <= SM count of the device
+16-row program  otherwise
+```
+
+At `H = 12` the 8-row grid fits one wave for `B <= 24` on B200, B300 (148 SMs)
+and GB300 (152 SMs).  `runner.program_for(B)` and `runner.tile_rows_for(B)`
+report the choice, `runner.programs` lists the loaded programs and
+`runner.sm_count` the SM count used.  Only the programs some `B` uses are
+loaded.
+
 ## Prepare, launch and CUDA graphs
 
 - `prepare_mla_value_gate` checks the device (exact SM100a / SM103a), the
-  weight's dtype, shape, strides and alignment, selects the program, loads or
-  JIT-builds it and caches the device facts.  It raises `RuntimeError` during
+  weight's dtype, shape, strides and alignment, decides the program of every
+  `B`, loads or JIT-builds those programs and caches the device facts.  It raises `RuntimeError` during
   CUDA graph capture: prepare before capturing.
 - `runner.launch` checks host metadata only (shapes, strides, dtypes, devices,
-  alignment, overlap), computes the grid on the host and submits one kernel on
-  the current torch stream without allocating or synchronizing.  It may be
+  alignment, overlap), looks up the program decided for `B`, computes its grid
+  on the host and submits one kernel on the current torch stream without
+  allocating or synchronizing.  It may be
   captured in a CUDA graph.
 - A replay re-reads the contents of the captured `latent`, `gate`,
   `valid_lengths` and `w_uv` and rewrites `out`; keep their storage alive and
@@ -118,7 +145,7 @@ With `enable_pdl=False` the launch is an ordinary stream-ordered launch.
 | file | content |
 | --- | --- |
 | `cake_backend.py` | weight and launch checks, the runner, the logical argument values (hand-written) |
-| `cake_jit.py` | the host vocabulary, registry and loader glue (hand-written); the `MODULES` records are written by the exporter |
+| `cake_jit.py` | the host vocabulary, registry and loader glue (hand-written); the `MODULES` records (one per program; `grid_rule["rows"]` is the row tile the host selects on) are written by the exporter |
 | `build.json`, `cake_build.py` | the build manifest and the pinned loader (generated) |
 | `csrc/` | the generated kernels (`<program>_kernel.cu`), their TVM-FFI bindings (`<program>_binding.cu`) and `cake_ffi_checks.h` (generated; digest-bound by `build.json`) |
 
