@@ -16,7 +16,7 @@ limitations under the License.
 Registry and loader glue of the Cake packed KDA chunked training kernels on
 the context-parallel (KCP) route (SM100 / SM103 / SM107): the state walks,
 the transfer walk and the affine merge that :mod:`.cake_kcp` composes with the
-chunk stages of :mod:`..cake_kda_det_train.cake_jit`, whose records this
+chunk stages of :mod:`..cake.cake_kda_det_train.cake_jit`, whose records this
 module never edits.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
@@ -130,7 +130,7 @@ from typing import Any
 
 import tvm_ffi
 
-from ..cake_kda_det_train import cake_jit
+from ..cake.cake_kda_det_train import cake_jit
 from . import cake_build, cake_kcp_plan
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300

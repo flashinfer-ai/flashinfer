@@ -281,7 +281,7 @@ def test_saved_set_fields_and_their_checks_read_either_package() -> None:
         assert cake_backend._EXTRA_FIELDS[version][-1] == "qk_rstd"
     rstd = torch.zeros(2, S, H, dtype=torch.float32)
     checked = 0
-    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.CakeKDADetChunkSaved):
         on = _saved(saved_type, S, H, qk_rstd=rstd, qk_l2norm=True)
         off = _saved(saved_type, S, H)
         for check in (cake_backend._check_saved_l2n, det_backend._check_saved_l2n):
@@ -355,7 +355,7 @@ def test_check_saved_l2n_agrees_in_both_directions() -> None:
         return None
 
     compared = accepted = 0
-    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.CakeKDADetChunkSaved):
         for state, fields in states.items():
             saved = _saved(saved_type, S, H, **fields)
             for mode in ("off", *L2N_ON):
@@ -1055,7 +1055,7 @@ def _names(gate: str) -> tuple[str, ...]:
 def _fwd(inputs, gate="g", *, det=False, q=None, k=None, **kwargs):
     """The l2n forward of this package (``det``: of the deterministic package); ``q`` / ``k``: other views of the
     same raw rows."""
-    fn = det_backend.chunk_kda_det_fwd if det else chunk_kda_fwd
+    fn = det_backend.cake_kda_det_train_forward if det else chunk_kda_fwd
     return fn(
         inputs["q"] if q is None else q,
         inputs["k"] if k is None else k,
@@ -1073,7 +1073,7 @@ def _fwd(inputs, gate="g", *, det=False, q=None, k=None, **kwargs):
 def _bwd(inputs, saved, gate="g", *, det=False, q=None, k=None, **kwargs):
     """The l2n backward of this package (``det``: of the deterministic package) from ``saved`` (``None``: the
     replay)."""
-    fn = det_backend.chunk_kda_det_bwd if det else chunk_kda_bwd
+    fn = det_backend.cake_kda_det_train_backward if det else chunk_kda_bwd
     return fn(
         inputs["q"] if q is None else q,
         inputs["k"] if k is None else k,
@@ -1384,7 +1384,7 @@ def test_l2n_launch_sequences_are_the_deterministic_l2n(
                     launcher=_recorder(nd_log, cake_jit),
                     deterministic=False,
                 ),
-                det_backend.KdaDetWorkspace.for_problem(
+                det_backend.CakeKDADetWorkspace.for_problem(
                     S,
                     N,
                     heads,
@@ -1750,7 +1750,7 @@ def _leaves(inputs, gate: str) -> list[torch.Tensor]:
 
 
 def _autograd(leaves, cu, gate: str, *, det=False, **kwargs) -> torch.Tensor:
-    fn = det_backend.chunk_kda_det if det else chunk_kda
+    fn = det_backend.cake_kda_det if det else chunk_kda
     q, k, v, g, beta, *params = leaves
     gate_kw = (
         {
@@ -1904,7 +1904,7 @@ def test_l2n_fused_equals_the_fallback_route(shape, gate: str) -> None:
         S, N, H, device, gate=gate, l2n="fallback", deterministic=False
     )
     assert ws.l2n == "fallback" and ws.plan.dispatched("qk_pullback", "light")
-    det_ws = det_backend.KdaDetWorkspace.for_problem(
+    det_ws = det_backend.CakeKDADetWorkspace.for_problem(
         S, N, H, device, gate=gate, l2n="fallback"
     )
     count = _Count()
