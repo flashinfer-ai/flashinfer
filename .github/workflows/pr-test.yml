@@ -253,6 +253,38 @@ jobs:
             echo "::notice::Skipping build - only docs/config files changed"
           fi
 
+      # The AOT lanes (45-70 minutes each) only matter when a PR can change what
+      # the provider wheels compile or import. scripts/pr_checks/aot_scope.py
+      # holds the rules; it skips only for paths it can classify as unreachable
+      # from flashinfer/aot.py, and prints run=true when it cannot decide. It
+      # reads the workflow-level SKIP_CI_PATTERNS from the environment, so any
+      # PR that skips the whole run (skip_build) is also one that skips AOT.
+      # Scheduled and manual runs always keep the lanes (skip_aot is the manual
+      # opt-out). The AOT lanes are simply absent from the matrix, like a
+      # skip_aot run, and the summary job already passes on a missing lane.
+      - name: Detect AOT-affecting changes
+        id: aot-scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          RUN=true
+          REASON="not a pull request; AOT always runs"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            OUT=$(python3 scripts/pr_checks/aot_scope.py --base "$BASE_SHA" --head "$HEAD_SHA") \
+              || OUT=$'run=true\nreason=aot_scope.py failed'
+            RUN=$(sed -n 's/^run=//p' <<< "$OUT" | head -n1)
+            REASON=$(sed -n 's/^reason=//p' <<< "$OUT" | head -n1)
+            [ "$RUN" = "false" ] || RUN=true
+          fi
+          echo "run_aot=$RUN" >> "$GITHUB_OUTPUT"
+          if [ "$RUN" = "true" ]; then
+            echo "AOT lanes will run: $REASON"
+          else
+            echo "::notice title=AOT lanes skipped::$REASON"
+          fi
+
       # skip_aot / skip_gpu dispatch inputs have to drop entries before the
       # matrix expands - a job-level `if` cannot see the matrix context, and
       # skipping inside the job would still claim a runner first.
@@ -260,6 +292,7 @@ jobs:
         id: matrix
         env:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
+          RUN_AOT_SCOPE: ${{ steps.aot-scope.outputs.run_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
           RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
           # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
@@ -294,7 +327,7 @@ jobs:
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
           fi
           {
-            if [ "$SKIP_AOT" != "true" ]; then
+            if [ "$SKIP_AOT" != "true" ] && [ "$RUN_AOT_SCOPE" != "false" ]; then
               for arch in x64 arm64; do
                 for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
                   # Runtime entries land before their multi-arch image is
