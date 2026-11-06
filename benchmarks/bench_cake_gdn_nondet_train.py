@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake GDN (Gated DeltaNet) training step on one GPU: the deterministic package
-(``flashinfer.experimental.cake_gdn_det_train.chunk_gated_delta_rule_det``, bitwise run to run) against the
-non-deterministic one (``flashinfer.experimental.cake.cake_gdn_train.chunk_gated_delta_rule`` with
-``deterministic=False``).  Both take FLA's ``chunk_gated_delta_rule`` signature; every call is a packed
+(``flashinfer.cake_gdn_det_train.cake_gdn_det``, bitwise run to run) against the non-deterministic one
+(``flashinfer.cake_gdn_nondet_train.cake_gdn_nondet``).  Both take FLA's ``chunk_gated_delta_rule`` signature; every
+call is a packed
 variable-length batch (``B = 1``, ``cu_seqlens`` on the device and ``cu_seqlens_cpu`` on the host: the host-table
 route), head dimension 128, ``use_qk_l2norm_in_kernel=True``.
 
@@ -75,8 +75,8 @@ packs of up to 262k tokens and one H = 16 pack, ``pairs`` the five head pairs ``
 
 Example::
 
-    python benchmarks/bench_cake_gdn_train.py --shapes rows,p7074_issue_261987x3_h2 \\
-        --boundaries fwd,bwd,fwdbwd,ckpt --groups 5 --samples 10 --warmup 3 --json cake_gdn_train.json
+    python benchmarks/bench_cake_gdn_nondet_train.py --shapes rows,p7074_issue_261987x3_h2 \\
+        --boundaries fwd,bwd,fwdbwd,ckpt --groups 5 --samples 10 --warmup 3 --json cake_gdn_nondet_train.json
 """
 
 from __future__ import annotations
@@ -247,19 +247,17 @@ def _load_package_dir(path: str) -> Any:
 def _entry(arm: str) -> Callable[..., Any]:
     """The GDN entry point of an arm, the package imported on first use (``--list`` needs no GPU and no package)."""
     if arm == "det":
-        from flashinfer.experimental.cake_gdn_det_train import (
-            chunk_gated_delta_rule_det,
-        )
+        from flashinfer.cake_gdn_det_train import cake_gdn_det
 
-        return chunk_gated_delta_rule_det
+        return cake_gdn_det
     if arm == "det_dir":
         if DET_DIR is None:
             raise SystemExit("the det_dir arm needs --det-dir")
-        return _load_package_dir(DET_DIR).chunk_gated_delta_rule_det
-    from flashinfer.experimental.cake.cake_gdn_train import chunk_gated_delta_rule
+        return _load_package_dir(DET_DIR).cake_gdn_det
+    from flashinfer.cake_gdn_nondet_train import cake_gdn_nondet
 
     pins = PIN_ARMS.get(arm, {})
-    return functools.partial(chunk_gated_delta_rule, deterministic=False, **pins)
+    return functools.partial(cake_gdn_nondet, **pins)
 
 
 class Problem(NamedTuple):
@@ -368,7 +366,7 @@ def record_stages(
     """One untimed forward + backward of ``forward`` (the non-deterministic arm) with the package's launches recorded:
     the stages, in launch order, of its forward and its backward on this shape (the launch recorder that shows which
     tail and which adjoint table the measured rows run)."""
-    from flashinfer.experimental.cake.cake_gdn_train import cake_backend
+    from flashinfer.experimental.cake.cake_gdn_nondet_train import cake_backend
 
     launches: list[str] = []
     launch = cake_backend.launch_stage

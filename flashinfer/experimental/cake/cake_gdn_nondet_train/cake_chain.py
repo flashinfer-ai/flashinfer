@@ -17,7 +17,8 @@ Host plan and autograd chain of the non-deterministic GDN chunked training
 (head dimension 128, chunk 64): the chunk and segment tables, the scan
 configuration and segment planner, the workspace pool, the forward and backward
 launch order, the adjoint-scan and finalize selection and the autograd wrapper
-with FLA's ``chunk_gated_delta_rule`` signature (no context parallelism).
+:func:`cake_gdn_nondet` with FLA's ``chunk_gated_delta_rule`` signature (no
+context parallelism).
 
 The forward runs the prep (``prep_tma``, the q / k tiles staged by TMA and one
 CTA per (chunk, key head), unless its dispatch rule :func:`use_prep_tma` keeps
@@ -69,14 +70,15 @@ the chunks one pre-scan CTA covers) are the records' ``scan`` constants; the
 ``prep_tma`` dispatch window are those
 records' ``select`` tables.
 
-Every launch is fixed-order: two runs of one call on one device give the same
-bits.  The results agree with the deterministic package
-(``flashinfer.experimental.cake_gdn_det_train``) to its accuracy budgets, not
+Every launch is fixed-order today, so two runs of one call on one device give
+the same bits; the non-deterministic contract does not promise run-to-run bits.
+The results agree with the deterministic package
+(``flashinfer.experimental.cake.cake_gdn_det_train``) to its accuracy budgets, not
 bitwise: the package tail of a value-head group of two or more sums the group's
 FP32 ``dq`` / ``dk`` partials before one BF16 rounding, and the adjoint table
 priced for ``dhu_tc2`` splits the sequences at other segment boundaries.
 The plan pins that tests and tuning use are explicit keyword arguments of
-:func:`chunk_gated_delta_rule` (``scan_config``, ``segment_chunks``,
+:func:`cake_gdn_nondet` (``scan_config``, ``segment_chunks``,
 ``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``, ``streams``,
 ``tail``);
 nothing here reads an environment variable.
@@ -116,8 +118,8 @@ __all__ = [
     "TC_PLAN_MIN_SAVING",
     "TC_PLAN_SELECT",
     "TC_PLAN_STEP",
+    "CakeGDNNondetFunction",
     "ChainOptions",
-    "ChunkGatedDeltaRuleFunction",
     "ChunkMeta",
     "ScanPlan",
     "SegmentTable",
@@ -126,13 +128,13 @@ __all__ = [
     "adjoint_r_form",
     "build_chunk_meta",
     "build_chunk_meta_from_cu_seqlens",
+    "cake_gdn_nondet",
+    "cake_gdn_nondet_train_backward",
+    "cake_gdn_nondet_train_forward",
     "choose_scan_plan",
     "chain_plan_pricing",
-    "chunk_gated_delta_rule",
     "dhu_tc_pricing",
     "finalize_stage",
-    "gdn_chunk_backward",
-    "gdn_chunk_forward",
     "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
@@ -162,30 +164,9 @@ PRESCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (64, 1))
 SCAN_KINDS = ("fwd_h", "dhu")
 STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
 
-# What ``chunk_gated_delta_rule`` passes to ``ChunkGatedDeltaRuleFunction.apply`` as ``deterministic``: the mode was
-# checked and reported by the entry, so the Function does not report it a second time.
-_MODE_CHECKED = object()
-
-
-# Each entry's deterministic counterpart in ``flashinfer.experimental.cake_gdn_det_train`` (named in the refusal).
-_DET_ENTRIES = {
-    "chunk_gated_delta_rule": "chunk_gated_delta_rule_det",
-    "ChunkGatedDeltaRuleFunction": "ChunkGatedDeltaRuleDetFunction",
-    "gdn_chunk_forward": "gdn_chunk_det_forward",
-    "gdn_chunk_backward": "gdn_chunk_det_backward",
-}
-
-
-def _require_nondeterministic(deterministic: Any, entry: str) -> None:
-    """The mode contract of every entry: the package is the non-deterministic route (its results match the
-    deterministic package within that package's accuracy budgets, not bitwise), so an entry takes
-    ``deterministic=False`` and raises ``ValueError`` for any other value, naming the entry's deterministic
-    counterpart in ``flashinfer.experimental.cake_gdn_det_train``."""
-    if deterministic is not False:
-        raise ValueError(f"{entry} is the non-deterministic route and takes deterministic=False (got "
-                         f"{deterministic!r}): pass deterministic=False for the non-deterministic path; the "
-                         f"deterministic entry is flashinfer.experimental.cake_gdn_det_train.{_DET_ENTRIES[entry]}")  # fmt: skip
-
+# The tag of this package's forward tape: the backward reads only a tape that carries it (the deterministic package's
+# tape has no ``"mode"`` key, so it is refused).
+_TAPE_MODE = "nondet"
 
 # Kernel parameter names of every stage in call-site order; a delivered record whose parameters are these names in
 # another order is launched with the values reordered.
@@ -825,7 +806,7 @@ def tail_form(
     """The backward tail of one call on ``arch`` over ``num_chunks`` chunks (``None``: a large call): ``forced`` when
     given (``"tail_g2"`` / ``"tail_g3"`` serve a value-head group of two / three), else the fastest tail measured for
     the call's architecture, value-head group ``G = num_v_heads / num_heads`` and size
-    (``benchmarks/bench_cake_gdn_train.py`` on B200 and GB300): the fixed-order cluster tail of
+    (``benchmarks/bench_cake_gdn_nondet_train.py`` on B200 and GB300): the fixed-order cluster tail of
     ``CLUSTER_TAILS[arch]`` for its group; otherwise the package tail ``TAIL_DEFAULT`` from
     :func:`tail_min_ctas` (chunk, value head) CTAs on, and below them the fixed-order ``"tail_g3"`` for a group of
     three, ``"unfused"`` for the others."""
@@ -2219,26 +2200,17 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     return h, v_new, final_state, o
 
 
-def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, output_final_state=False,
-                      normalize_qk=True, options: ChainOptions | None = None,
-                      deterministic: bool = True) -> dict[str, Any]:  # fmt: skip
+def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None,
+                                  output_final_state=False, normalize_qk=True,
+                                  options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
     """The forward chain over flattened ``[T, H, 128]`` / ``[T, HV, 128]`` inputs and one chunk table; returns the
-    output and the tape the backward reads (the tape records ``deterministic=False``).  ``deterministic`` must be
-    ``False`` (``ValueError`` otherwise).  The forward runs fixed-order programs only: it raises no determinism alert
-    under PyTorch's deterministic algorithms."""
-    _require_nondeterministic(deterministic, "gdn_chunk_forward")
-    return _forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
-                    output_final_state=output_final_state, normalize_qk=normalize_qk, options=options)  # fmt: skip
-
-
-def _forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, output_final_state=False,
-             normalize_qk=True, options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
-    """:func:`gdn_chunk_forward` after its mode check."""
+    output and the tape the backward reads (the tape carries this package's tag, ``"mode": "nondet"``).  The forward
+    runs fixed-order programs only today: it raises no determinism alert under PyTorch's deterministic algorithms."""
     options = options or ChainOptions()
     num_heads, key_dim = q.shape[-2], q.shape[-1]
     num_v_heads, value_dim = v.shape[-2], v.shape[-1]
     if key_dim != HEAD_DIM or value_dim != HEAD_DIM:
-        raise ValueError("gdn_chunk_forward requires K = V = 128")
+        raise ValueError("cake_gdn_nondet_train_forward requires K = V = 128")
     if num_v_heads % num_heads != 0:
         raise ValueError("num_v_heads must be a multiple of num_heads")
     total_tokens = q.numel() // (num_heads * key_dim)
@@ -2298,39 +2270,24 @@ def _forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, ou
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
         "w": w, "u": u, "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
         "final_state": final_state if output_final_state else None, "initial_state": initial_state, "h": h,
-        "v_new": v_new, "options": options, "deterministic": False,
+        "v_new": v_new, "options": options, "mode": _TAPE_MODE,
     }  # fmt: skip
 
 
 # --------------------------------------------------------------------------- #
 # backward
 # --------------------------------------------------------------------------- #
-def gdn_chunk_backward(
-    forward,
-    do,
-    dht=None,
-    *,
-    initial_state=None,
-    dbeta_dtype=None,
-    deterministic: bool = True,
-) -> dict[str, Any]:
-    """The backward chain over one forward tape of :func:`gdn_chunk_forward`; returns ``dq``, ``dk``, ``dv``, ``dg``,
-    ``dbeta`` and ``dinitial_state``.  ``deterministic`` must be ``False``, and so must the mode the tape records
-    (``ValueError`` otherwise: a tape of the deterministic package is refused).  With PyTorch's deterministic
-    algorithms enabled it runs as usual: every launch is fixed-order."""
-    _require_nondeterministic(deterministic, "gdn_chunk_backward")
-    return _backward(
-        forward, do, dht, initial_state=initial_state, dbeta_dtype=dbeta_dtype
-    )
-
-
-def _backward(
+def cake_gdn_nondet_train_backward(
     forward, do, dht=None, *, initial_state=None, dbeta_dtype=None
 ) -> dict[str, Any]:
-    """:func:`gdn_chunk_backward` after its mode check: the tape must be of this package's mode."""
-    if forward.get("deterministic", True) is not False:
-        raise ValueError("gdn_chunk_backward reads the tape of a non-deterministic forward (deterministic=False); "
-                         "this tape records the deterministic mode")  # fmt: skip
+    """The backward chain over one forward tape of :func:`cake_gdn_nondet_train_forward`; returns ``dq``, ``dk``,
+    ``dv``, ``dg``, ``dbeta`` and ``dinitial_state``.  The tape must carry this package's tag (``"mode": "nondet"``):
+    any other tape, such as one of the deterministic package, is refused (``ValueError``).  With PyTorch's
+    deterministic algorithms enabled it runs as usual: every launch is fixed-order today."""
+    if forward.get("mode") != _TAPE_MODE:
+        raise ValueError("cake_gdn_nondet_train_backward reads the tape of a non-deterministic forward "
+                         "(cake_gdn_nondet_train_forward, tag 'mode': 'nondet'); this tape does not carry that tag "
+                         "(a tape of the deterministic package, for example)")  # fmt: skip
     arch = forward["arch"]
     meta = forward["meta"]
     options = forward.get("options") or ChainOptions()
@@ -2605,7 +2562,7 @@ _OPTIONAL_INPUT = 5
 
 
 def _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu) -> None:
-    """The API-boundary checks of :func:`chunk_gated_delta_rule`: devices, shapes and the offsets' form, from tensor
+    """The API-boundary checks of :func:`cake_gdn_nondet`: devices, shapes and the offsets' form, from tensor
     metadata only (no device synchronization; the values of ``cu_seqlens_cpu`` are checked when its layout is first
     planned, those of the device ``cu_seqlens`` not at all).  FLA's ``chunk_gated_delta_rule`` checks the head
     counts, the batch of a packed call and the rows of ``initial_state``; the rest is this backend's contract.
@@ -2870,21 +2827,19 @@ def _chunk_meta(
     return meta
 
 
-class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+class CakeGDNNondetFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
-                use_qk_l2norm_in_kernel, options, deterministic=True):  # fmt: skip
-        if deterministic is not _MODE_CHECKED:
-            _require_nondeterministic(deterministic, "ChunkGatedDeltaRuleFunction")
+                use_qk_l2norm_in_kernel, options):  # fmt: skip
         batch, seq_len, num_heads, key_dim = q.shape
         num_v_heads = v.shape[2]
         index = _tensor_index(q)
         arch = cake_backend.device_arch(index)
         meta = _chunk_meta(cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options,
                            num_v_heads // num_heads)  # fmt: skip
-        fwd = _forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
-                       output_final_state=output_final_state, normalize_qk=use_qk_l2norm_in_kernel,
-                       options=options)  # fmt: skip
+        fwd = cake_gdn_nondet_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
+                                            initial_state=initial_state, output_final_state=output_final_state,
+                                            normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
         state_tensors = (
             (fwd["w"], fwd["u"], fwd["h"], fwd["v_new"]) if options.save_state else ()
         )
@@ -2897,8 +2852,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.has_initial_state_input = initial_state is not None
         ctx.dtypes = (g.dtype, beta.dtype)
         ctx.options = options
-        # the forward's mode; the backward reads only a tape of its own
-        ctx.deterministic = fwd["deterministic"]
+        # the forward tape's tag; the backward reads only a tape of its own
+        ctx.mode = fwd["mode"]
         output = fwd["output"]
         if output.dtype != q.dtype:
             output = output.to(q.dtype)
@@ -2913,11 +2868,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         g_dtype, beta_dtype = ctx.dtypes
         tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
                 "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
-                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options,
-                "deterministic": ctx.deterministic}  # fmt: skip
+                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
         if ctx.saved_state_tensors:
             tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
-        grads = _backward(
+        grads = cake_gdn_nondet_train_backward(
             tape,
             do.contiguous(),
             dht,
@@ -2944,11 +2898,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             None,
             None,
             None,
-            None,
         )
 
 
-def chunk_gated_delta_rule(
+def cake_gdn_nondet(
     q,
     k,
     v,
@@ -2972,7 +2925,6 @@ def chunk_gated_delta_rule(
     lpt: bool = True,
     streams: int = 2,
     tail: str | None = None,
-    deterministic: bool = True,
 ):
     """Non-deterministic chunked gated delta rule with FLA's signature (head dimension 128, ``HV`` a multiple of ``H``).
 
@@ -2989,13 +2941,12 @@ def chunk_gated_delta_rule(
     decreasing, to the tokens of ``q``.  The device route trusts the values of ``cu_seqlens`` (reading them would
     synchronize): the same contract, unchecked.
 
-    ``deterministic`` must be ``False``: the package is the non-deterministic route (the outputs and gradients match
-    the deterministic package within its accuracy budgets, not bitwise), and any other value raises ``ValueError``.
-    Every launch is fixed-order, so PyTorch's deterministic algorithms (``torch.use_deterministic_algorithms(True)``)
-    change nothing.  ``tail`` pins the backward tail (:class:`ChainOptions`).
+    The package is the non-deterministic route: the outputs and gradients match the deterministic package within its
+    accuracy budgets, not bitwise.  The mode is in the name; there is no ``deterministic`` keyword.  Every launch is
+    fixed-order today, so PyTorch's deterministic algorithms (``torch.use_deterministic_algorithms(True)``, with or
+    without ``warn_only``) change nothing: no alert, no warning, no fallback.  The contract does not promise run-to-run
+    bits.  ``tail`` pins the backward tail (:class:`ChainOptions`).
     """
-    if deterministic is not False:
-        _require_nondeterministic(deterministic, "chunk_gated_delta_rule")
     if (
         q.dtype != torch.bfloat16
         or k.dtype != torch.bfloat16
@@ -3017,6 +2968,5 @@ def chunk_gated_delta_rule(
         g = g.float()
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    return ChunkGatedDeltaRuleFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
-                                             cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options,
-                                             _MODE_CHECKED)  # fmt: skip
+    return CakeGDNNondetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state, cu_seqlens,
+                                       cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip

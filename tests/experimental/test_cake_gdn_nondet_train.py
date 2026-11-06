@@ -14,23 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the Cake non-deterministic GDN chunked-training package
-(``flashinfer.experimental.cake.cake_gdn_train``).
+(``flashinfer.experimental.cake.cake_gdn_nondet_train``) and of its facade ``flashinfer.cake_gdn_nondet_train``.
 
 The suite mirrors the deterministic package's suite (``test_cake_gdn_det_train.py``) with every bitwise contract
 replaced by the accuracy budgets of that suite (the same constants, declared before the first run, never derived from a
 non-deterministic output): two runs, the two table routes, the longest-first order, two streams, the two preps, the
 CUDA graph replay and the equal-length batch agree within the budgets.  It adds the non-deterministic contract: the
-explicit ``deterministic=False`` on every entry and the backward's refusal of a tape of the other mode, the interaction
-with PyTorch's deterministic algorithms, the det package's names left out, the launches served by this package's
-records, the five source head pairs, strided packed QKV views, non-reentrant checkpointing and its zero retained bytes,
-gradient accumulation into a nonzero ``.grad``, changed shapes over poisoned reused workspaces, the worst case over
-repeated runs, two concurrent caller streams, a resident side-stream kernel and the same-input comparison with the
-deterministic package.  The tail's own contract: it serves every value-head group, leaves its counters zero after
-every launch, launches in segments that give the bits of one launch, keeps the deterministic bits of ``o``, ``dv``,
-``dg`` and ``dbeta`` and its own bits run to run, and protocol controls (stale counters must break ``dq`` / ``dk``,
-stale workspace slots must not).
+mode in the names only (the exact public names, each with ``nondet``; no ``deterministic`` parameter; the old names
+and the old module gone; the facade imports the package on first use) and the backward's refusal of a tape without
+this package's tag, the interaction with PyTorch's deterministic algorithms (no alert, no warning, no fallback), the
+launches served by this package's records, the five source head pairs, strided packed QKV views, non-reentrant
+checkpointing and its zero retained bytes, gradient accumulation into a nonzero ``.grad``, changed shapes over
+poisoned reused workspaces, the worst case over repeated runs, two concurrent caller streams, a resident side-stream
+kernel and the same-input comparison with the deterministic package.  The tail's own contract: it serves every
+value-head group, leaves its counters zero after every launch, launches in segments that give the bits of one launch,
+keeps the deterministic bits of ``o``, ``dv``, ``dg`` and ``dbeta`` and its own bits run to run, and protocol controls
+(stale counters must break ``dq`` / ``dk``, stale workspace slots must not).
 
-The suite names its packages through the shared alias helper and imports nothing else from flashinfer.
+The suite names its packages through the shared alias helper; the facade tests import the facade
+``flashinfer.cake_gdn_nondet_train`` by name.  It imports nothing else from flashinfer.
 """
 
 from __future__ import annotations
@@ -39,9 +41,14 @@ import contextlib
 import dataclasses
 import gc
 import hashlib
+import importlib
+import importlib.util
+import inspect
 import json
 import math
 import re
+import subprocess
+import sys
 import types
 import warnings
 from pathlib import Path
@@ -52,18 +59,23 @@ from torch.utils.checkpoint import checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake.cake_gdn_train", "cake_backend")
-cake_chain = cake_package("cake.cake_gdn_train", "cake_chain")
-cake_jit = cake_package("cake.cake_gdn_train", "cake_jit")
-cake_gdn_train = cake_package("cake.cake_gdn_train")
+cake_backend = cake_package("cake_gdn_nondet_train", "cake_backend")
+cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
+cake_jit = cake_package("cake_gdn_nondet_train", "cake_jit")
+cake_gdn_nondet_train = cake_package("cake_gdn_nondet_train")
+cake_gdn_nondet = cake_gdn_nondet_train.cake_gdn_nondet
 # The deterministic package: the same-input comparison point (never a source of budgets).
 cake_gdn_det_train = cake_package("cake_gdn_det_train")
 det_backend = cake_package("cake_gdn_det_train", "cake_backend")
 
+# The public facade of this package (a flashinfer module, imported by name in its tests) and the backend package it
+# imports on first use.
+FACADE = "flashinfer.cake_gdn_nondet_train"
+BACKEND = "flashinfer.experimental.cake.cake_gdn_nondet_train"
 
-def chunk_gated_delta_rule_nd(*args, **kwargs):
-    """The package's entry point with the mode it requires."""
-    return cake_gdn_train.chunk_gated_delta_rule(*args, deterministic=False, **kwargs)
+
+def _facade() -> types.ModuleType:
+    return importlib.import_module(FACADE)
 
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
@@ -145,10 +157,11 @@ def _inputs(
 
 
 def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_state=False, dht=None,
-         use_qk_l2norm_in_kernel=True, leaves=None, det=False, sync=True, **pins):  # fmt: skip
-    """Forward and backward through the package (``det``: through the deterministic package); returns the outputs and
-    gradients (and the final state / its initial-state gradient when asked).  ``leaves`` replaces the fresh leaf
-    copies of the inputs it names; ``sync=False`` returns without synchronizing the device."""
+         use_qk_l2norm_in_kernel=True, leaves=None, det=False, sync=True, entry=None, **pins):  # fmt: skip
+    """Forward and backward through the package (``det``: through the deterministic package; ``entry``: through that
+    entry point, the facade's for example); returns the outputs and gradients (and the final state / its
+    initial-state gradient when asked).  ``leaves`` replaces the fresh leaf copies of the inputs it names;
+    ``sync=False`` returns without synchronizing the device."""
     leaves = {
         **{
             name: inputs[name].detach().clone().requires_grad_(True)
@@ -168,11 +181,8 @@ def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_sta
         kwargs["cu_seqlens_cpu"] = (
             torch.tensor(cu, dtype=torch.int64) if route == "host" else None
         )
-    entry = (
-        cake_gdn_det_train.chunk_gated_delta_rule_det
-        if det
-        else chunk_gated_delta_rule_nd
-    )
+    if entry is None:
+        entry = cake_gdn_det_train.cake_gdn_det if det else cake_gdn_nondet
     o, final = entry(
         leaves["q"],
         leaves["k"],
@@ -1396,7 +1406,7 @@ def test_two_streams_under_cuda_graph_capture(device, monkeypatch) -> None:
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_nd(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                       cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, streams=2,
                                       **STREAM_PINS)  # fmt: skip
@@ -1487,7 +1497,7 @@ def test_launches_run_on_the_callers_stream(streams, device, monkeypatch) -> Non
         torch.cuda._sleep(200_000_000)
         with torch.no_grad():
             leaves["q"].copy_(new["q"])
-        o, _ = chunk_gated_delta_rule_nd(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM),
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                       cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
@@ -1614,17 +1624,17 @@ def test_equal_length_batch_matches_the_packed_layout(preps, device) -> None:
 def test_rejects_unsupported_inputs(device) -> None:
     inputs = _inputs((64,), (1, 2), torch.float32, device)
     with pytest.raises(NotImplementedError):
-        chunk_gated_delta_rule_nd(
+        cake_gdn_nondet(
             inputs["q"].half(), inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         )
     cu = torch.tensor([0, 64], dtype=torch.int64, device=device)
     two = {name: torch.cat([t, t], 0) for name, t in inputs.items()}
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule_nd(
+        cake_gdn_nondet(
             two["q"], two["k"], two["v"], two["g"], two["beta"], cu_seqlens=cu
         )
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule_nd(
+        cake_gdn_nondet(
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"],
             segment_chunks=-1,
         )  # fmt: skip
@@ -1729,7 +1739,7 @@ _INVALID_MESSAGES = {
 
 def _call_rejected(call) -> ValueError:
     with pytest.raises(ValueError) as error:
-        chunk_gated_delta_rule_nd(
+        cake_gdn_nondet(
             call["q"], call["k"], call["v"], call["g"], call["beta"], initial_state=call["initial_state"],
             output_final_state=True, cu_seqlens=call["cu_seqlens"], cu_seqlens_cpu=call["cu_seqlens_cpu"],
             use_qk_l2norm_in_kernel=True,
@@ -1746,7 +1756,7 @@ def test_rejects_invalid_inputs_before_any_launch(case, device, monkeypatch) -> 
     assert str(_call_rejected(call)) == _INVALID_MESSAGES[case]
     assert stages == [], stages
     # the unmodified call is accepted
-    o, final = chunk_gated_delta_rule_nd(
+    o, final = cake_gdn_nondet(
         base["q"], base["k"], base["v"], base["g"], base["beta"], initial_state=base["initial_state"],
         output_final_state=True, cu_seqlens=base["cu_seqlens"], cu_seqlens_cpu=base["cu_seqlens_cpu"],
         use_qk_l2norm_in_kernel=True,
@@ -1781,7 +1791,7 @@ def test_device_route_does_not_synchronize(device) -> None:
             n: inputs[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         }
-        o, final = chunk_gated_delta_rule_nd(
+        o, final = cake_gdn_nondet(
             leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], initial_state=h0,
             output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
         )  # fmt: skip
@@ -1798,70 +1808,189 @@ def test_device_route_does_not_synchronize(device) -> None:
     torch.cuda.synchronize()
 
 
-# --------------------------------------------------------------------------- the mode contract (no device)
+# --------------------------------------------------------------------------- the names and the mode (no device)
 
-ENTRY_NAMES = (
+# The public names: the facade's ``__all__`` and the package root's ``__all__``.  Every one carries the mode word
+# ``nondet`` (the check looks for ``nondet``: ``det`` alone is a substring of it).
+FACADE_NAMES = (
+    "CakeGDNNondetFunction",
+    "cake_gdn_nondet",
+    "is_cake_gdn_nondet_train_supported",
+)
+PACKAGE_NAMES = ("CakeGDNNondetFunction", "cake_gdn_nondet", "cake_gdn_nondet_train_backward",
+                 "cake_gdn_nondet_train_forward")  # fmt: skip
+# The package's entries and, in the same order, the deterministic package's entries (its det names).
+ENTRY_NAMES = ("cake_gdn_nondet", "CakeGDNNondetFunction", "cake_gdn_nondet_train_forward",
+               "cake_gdn_nondet_train_backward")  # fmt: skip
+DET_NAMES = (
+    "cake_gdn_det",
+    "CakeGDNDetFunction",
+    "cake_gdn_det_train_forward",
+    "cake_gdn_det_train_backward",
+)
+# The names and the module path before the rename (FlashInfer #8928): none of them resolves any more.
+OLD_NAMES = (
     "chunk_gated_delta_rule",
     "ChunkGatedDeltaRuleFunction",
     "gdn_chunk_forward",
     "gdn_chunk_backward",
 )
-DET_NAMES = ("chunk_gated_delta_rule_det", "ChunkGatedDeltaRuleDetFunction", "gdn_chunk_det_forward",
-             "gdn_chunk_det_backward")  # fmt: skip
+OLD_MODULE = "flashinfer.experimental.cake.cake_gdn_train"
 _ALERT = "does not have a deterministic implementation"
 
 
-def test_the_package_exports_the_det_free_names_only() -> None:
-    for name in ENTRY_NAMES:
-        for module in (cake_gdn_train, cake_chain):
-            assert name in module.__all__ and getattr(module, name) is getattr(
-                cake_chain, name
-            ), name
-    for name in DET_NAMES:
-        for module in (cake_gdn_train, cake_chain):
-            assert not hasattr(module, name) and name not in module.__all__, name
-    # the deterministic package's entries (its det names) are distinct objects from this package's entries
-    for name, det_name in zip(ENTRY_NAMES, DET_NAMES, strict=True):
-        assert getattr(cake_gdn_train, name) is not getattr(
-            cake_gdn_det_train, det_name
-        ), name
-    assert cake_jit.PACKAGE == "flashinfer.experimental.cake.cake_gdn_train"
+def test_importing_the_facade_does_not_import_the_package() -> None:
+    # a fresh interpreter: this module already imported the package
+    code = (
+        "import sys\n"
+        f"import {FACADE} as facade\n"
+        f"assert {BACKEND!r} not in sys.modules, 'the facade import imported the package'\n"
+        "assert 'CakeGDNNondetFunction' in dir(facade)\n"
+        f"assert {BACKEND!r} not in sys.modules, 'dir() imported the package'\n"
+        "cls = facade.CakeGDNNondetFunction\n"
+        f"assert {BACKEND!r} in sys.modules\n"
+        "print('ok', cls.__qualname__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "ok CakeGDNNondetFunction"
+
+
+def test_the_public_names_are_the_nondet_names() -> None:
+    facade = _facade()
+    assert sorted(facade.__all__) == sorted(FACADE_NAMES)
+    assert sorted(cake_gdn_nondet_train.__all__) == sorted(PACKAGE_NAMES)
+    for module in (facade, cake_gdn_nondet_train):
+        for name in module.__all__:
+            assert "nondet" in name.lower(), (module.__name__, name)
+            assert getattr(module, name) is not None, (module.__name__, name)
+    # one object per entry: the package root re-exports cake_chain's, the facade resolves the package's Function
+    for name in PACKAGE_NAMES:
+        assert name in cake_chain.__all__, name
+        assert getattr(cake_gdn_nondet_train, name) is getattr(cake_chain, name), name
+    assert facade.CakeGDNNondetFunction is cake_chain.CakeGDNNondetFunction
+    assert facade.cake_gdn_nondet.__name__ == "cake_gdn_nondet"
+    cls = cake_chain.CakeGDNNondetFunction
+    assert cls.__name__ == cls.__qualname__ == "CakeGDNNondetFunction"
+    assert cls.__module__ == cake_chain.__name__
+    # the package path is the module name; the library identity is unchanged
+    assert cake_jit.PACKAGE == BACKEND
     assert cake_jit.LIBRARY_PREFIX == "cake_gdn_train"
 
 
-def _entry_calls(**mode) -> dict:
-    """One call per entry with ``mode`` (``{}``: the default); with an accepted mode each fails after its mode check."""
+def test_the_old_names_are_gone_and_the_det_names_are_the_det_package() -> None:
+    facade = _facade()
+    for module in (facade, cake_gdn_nondet_train, cake_chain):
+        exported = set(getattr(module, "__all__", ()))
+        for name in OLD_NAMES + DET_NAMES:
+            assert not hasattr(module, name), (module.__name__, name)
+            assert name not in exported, (module.__name__, name)
+    # the deterministic package's entries (its det names) are distinct objects from this package's entries
+    for name, det_name in zip(ENTRY_NAMES, DET_NAMES, strict=True):
+        assert getattr(cake_gdn_nondet_train, name) is not getattr(
+            cake_gdn_det_train, det_name
+        ), name
+
+
+def test_the_old_module_path_does_not_import() -> None:
+    # A clean tree has no module at the old path.  A leftover untracked directory there (``aot/`` or ``__pycache__``
+    # from an earlier build) makes the path import as an empty namespace package: then it must hold no code, no
+    # module of the package and none of the old names.
+    spec = importlib.util.find_spec(OLD_MODULE)
+    if spec is None:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(OLD_MODULE)
+        return
+    assert spec.origin is None, spec  # a namespace package, not a package with code
+    old = importlib.import_module(OLD_MODULE)
+    for name in OLD_NAMES:
+        assert not hasattr(old, name), name
+    for sub in ("cake_chain", "cake_jit", "cake_backend", "cake_build"):
+        assert importlib.util.find_spec(f"{OLD_MODULE}.{sub}") is None, sub
+
+
+def _callables(module) -> dict:
+    """The callables of ``module.__all__``, an autograd Function by its ``forward`` and ``backward``."""
+    found = {}
+    for name in module.__all__:
+        obj = getattr(module, name)
+        if isinstance(obj, type):
+            found[f"{name}.forward"] = obj.forward
+            found[f"{name}.backward"] = obj.backward
+        else:
+            found[name] = obj
+    return found
+
+
+def test_no_entry_takes_a_deterministic_parameter() -> None:
+    facade = _facade()
+    for module in (facade, cake_gdn_nondet_train):
+        for name, fn in _callables(module).items():
+            params = inspect.signature(fn).parameters
+            bad = [p for p in params if "deterministic" in p.lower()]
+            assert not bad, (module.__name__, name, bad)
+    # the facade entry copies the package entry's signature and forwards every argument
+    ours = inspect.signature(facade.cake_gdn_nondet).parameters
+    theirs = inspect.signature(cake_chain.cake_gdn_nondet).parameters
+    assert [(p.name, p.kind, p.default) for p in ours.values()] == [
+        (p.name, p.kind, p.default) for p in theirs.values()
+    ]
+
+
+def test_a_deterministic_keyword_is_a_type_error() -> None:
+    # host operands: the call fails at its signature, before any check or launch
+    q = torch.zeros(1, 64, 1, HEAD_DIM, dtype=torch.bfloat16)
+    v = torch.zeros(1, 64, 2, HEAD_DIM, dtype=torch.bfloat16)
+    g, beta = torch.zeros(1, 64, 2), torch.zeros(1, 64, 2)
+    entries = (
+        _facade().cake_gdn_nondet,
+        cake_gdn_nondet_train.cake_gdn_nondet,
+        cake_chain.cake_gdn_nondet,
+    )
+    for entry in entries:
+        for value in (True, False):
+            with pytest.raises(TypeError, match="deterministic"):
+                entry(q, q, v, g, beta, deterministic=value)
+    with pytest.raises(TypeError, match="deterministic"):
+        cake_chain.cake_gdn_nondet_train_forward(
+            q, q, v, g, beta, meta=None, arch=None, deterministic=False
+        )
+    with pytest.raises(TypeError, match="deterministic"):
+        cake_chain.cake_gdn_nondet_train_backward({}, None, deterministic=False)
+    # the Function takes its twelve inputs only: a thirteenth (the former mode argument) is refused
+    options = cake_chain.make_options()
+    apply_args = (q, q, v, g, beta, 1.0, None, False, None, None, True, options)
+    with pytest.raises(TypeError):
+        cake_chain.CakeGDNNondetFunction.apply(*apply_args, False)
+
+
+def test_the_support_query_returns_a_bool() -> None:
+    facade = _facade()
+    got = facade.is_cake_gdn_nondet_train_supported()
+    assert isinstance(got, bool)
+    assert facade.is_cake_gdn_nondet_train_supported("cpu") is False
+    if not torch.cuda.is_available():
+        assert got is False
+    else:
+        capability = tuple(torch.cuda.get_device_capability())
+        assert got is (cake_backend.arch_for_capability(capability) is not None)
+
+
+def _entry_calls() -> dict:
+    """One call per forward entry on host operands: each fails at its operand checks."""
     q = torch.zeros(1, 64, 1, HEAD_DIM, dtype=torch.bfloat16)
     v = torch.zeros(1, 64, 2, HEAD_DIM, dtype=torch.bfloat16)
     g, beta = torch.zeros(1, 64, 2), torch.zeros(1, 64, 2)
     options = cake_chain.make_options()
-    apply_args = (
-        q,
-        q,
-        v,
-        g,
-        beta,
-        1.0,
-        None,
-        False,
-        None,
-        None,
-        True,
-        options,
-        *mode.values(),
-    )
+    apply_args = (q, q, v, g, beta, 1.0, None, False, None, None, True, options)
+    pkg, forward = cake_gdn_nondet_train, cake_chain.cake_gdn_nondet_train_forward
     return {
-        "chunk_gated_delta_rule": lambda: cake_gdn_train.chunk_gated_delta_rule(
-            q, q, v, g, beta, **mode
-        ),
-        "ChunkGatedDeltaRuleFunction": lambda: cake_gdn_train.ChunkGatedDeltaRuleFunction.apply(
-            *apply_args
-        ),
-        "gdn_chunk_forward": lambda: cake_chain.gdn_chunk_forward(
-            q, q, v, g, beta, meta=None, arch=None, **mode
-        ),
-        "gdn_chunk_backward": lambda: cake_chain.gdn_chunk_backward(
-            {"deterministic": False}, None, **mode
+        "cake_gdn_nondet": lambda: pkg.cake_gdn_nondet(q, q, v, g, beta),
+        "CakeGDNNondetFunction": lambda: pkg.CakeGDNNondetFunction.apply(*apply_args),
+        "cake_gdn_nondet_train_forward": lambda: forward(
+            q, q, v, g, beta, meta=None, arch=None
         ),
     }
 
@@ -1879,34 +2008,6 @@ def _deterministic_algorithms(mode: bool, *, warn_only: bool = False):
         torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
 
 
-@pytest.mark.parametrize("mode", [{}, {"deterministic": True}, {"deterministic": None}, {"deterministic": 0}],
-                         ids=["default", "true", "none", "zero"])  # fmt: skip
-def test_every_entry_requires_deterministic_false(mode) -> None:
-    for name, call in _entry_calls(**mode).items():
-        with pytest.raises(
-            ValueError,
-            match=f"^{name} is the non-deterministic route and takes deterministic=False",
-        ):
-            call()
-    # the refusal names the entry's deterministic counterpart
-    for (name, call), det_name in zip(
-        _entry_calls(**mode).items(), DET_NAMES, strict=True
-    ):
-        with pytest.raises(ValueError) as info:
-            call()
-        assert str(info.value).endswith(
-            "pass deterministic=False for the non-deterministic path; the deterministic entry is "
-            f"flashinfer.experimental.cake_gdn_det_train.{det_name}"
-        ), (name, str(info.value))
-    # the refusal comes first, also with PyTorch's deterministic algorithms on
-    with _deterministic_algorithms(True):
-        for name, call in _entry_calls(**mode).items():
-            with pytest.raises(
-                ValueError, match=f"^{name} is the non-deterministic route"
-            ):
-                call()
-
-
 def test_torch_deterministic_algorithms_do_not_alert_the_forward_entries() -> None:
     # the forward entries run fixed-order programs: under PyTorch's deterministic algorithms (an alert as an error,
     # a warning as an error) each proceeds to its operand checks, which refuse the host operands here
@@ -1916,24 +2017,18 @@ def test_torch_deterministic_algorithms_do_not_alert_the_forward_entries() -> No
             warnings.catch_warnings(),
         ):
             warnings.simplefilter("error")
-            for name, call in _entry_calls(deterministic=False).items():
-                if name == "gdn_chunk_backward":
-                    continue
+            for name, call in _entry_calls().items():
                 with pytest.raises(Exception) as info:  # noqa: PT011 - any operand refusal, never the alert
                     call()
                 assert _ALERT not in str(info.value), (name, warn_only, info.value)
 
 
 @pytest.mark.parametrize(
-    "tape",
-    [{}, {"deterministic": True}, {"deterministic": None}],
-    ids=["det-tape", "true", "none"],
+    "tape", [{}, {"mode": "det"}, {"mode": None}], ids=["det-tape", "other", "none"]
 )
-def test_backward_refuses_a_tape_of_the_other_mode(tape) -> None:
-    with pytest.raises(ValueError, match="this tape records the deterministic mode"):
-        cake_chain.gdn_chunk_backward(
-            {"arch": ARCHES[0], **tape}, None, deterministic=False
-        )
+def test_backward_refuses_a_tape_without_the_nondet_tag(tape) -> None:
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_nondet_train_backward({"arch": ARCHES[0], **tape}, None)
 
 
 # --------------------------------------------------------------------------- the non-deterministic contract (device)
@@ -1953,17 +2048,44 @@ def test_low_level_entries_round_trip_and_refuse_a_det_tape(device) -> None:
         )
         return chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
 
-    tape = cake_chain.gdn_chunk_forward(
-        q, k, v, g, beta, meta=meta_of(cake_chain), arch=arch, deterministic=False
+    tape = cake_chain.cake_gdn_nondet_train_forward(
+        q, k, v, g, beta, meta=meta_of(cake_chain), arch=arch
     )
-    assert tape["deterministic"] is False
-    grads = cake_chain.gdn_chunk_backward(tape, do, deterministic=False)
+    assert tape["mode"] == "nondet"
+    grads = cake_chain.cake_gdn_nondet_train_backward(tape, do)
     assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
-    det_tape = det_chain.gdn_chunk_det_forward(
+    det_tape = det_chain.cake_gdn_det_train_forward(
         q, k, v, g, beta, meta=meta_of(det_chain), arch=arch
     )
-    with pytest.raises(ValueError, match="this tape records the deterministic mode"):
-        cake_chain.gdn_chunk_backward(det_tape, do, deterministic=False)
+    assert "mode" not in det_tape
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_nondet_train_backward(det_tape, do)
+
+
+def test_the_facade_runs_unchanged_under_torch_deterministic_algorithms(
+    device, monkeypatch
+) -> None:
+    # a fixed-order non-deterministic entry under PyTorch's deterministic algorithms, strict and warn_only: the
+    # facade's forward and backward run with no alert, no warning and no fallback, to the bits of the default mode
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the deterministic package launched a kernel")
+
+    monkeypatch.setattr(det_backend, "launch_stage", refuse)
+    facade = _facade()
+    seq_lens, heads = (300, 77, 640), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=269)
+    # the default mode first: it also takes the facade's one-time ExperimentalWarning
+    want = _run(inputs, seq_lens, entry=facade.cake_gdn_nondet)
+    for warn_only in (False, True):
+        with (
+            _deterministic_algorithms(True, warn_only=warn_only),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            got = _run(inputs, seq_lens, entry=facade.cake_gdn_nondet)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert not user_warnings, (warn_only, [str(w.message) for w in user_warnings])
+        _assert_same_bits(got, want, OUTPUT_NAMES)
 
 
 # (H, HV) and tail pins: every tail the rule dispatches or a pin forces
@@ -2015,9 +2137,9 @@ def test_torch_deterministic_algorithms_change_nothing(
     meta = cake_chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
     q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
     with _deterministic_algorithms(True):
-        tape = cake_chain.gdn_chunk_forward(q, k, v, g, beta, meta=meta, arch=arch, options=options,
-                                            deterministic=False)  # fmt: skip
-        cake_chain.gdn_chunk_backward(tape, do, deterministic=False)
+        tape = cake_chain.cake_gdn_nondet_train_forward(q, k, v, g, beta, meta=meta, arch=arch,
+                                                        options=options)  # fmt: skip
+        cake_chain.cake_gdn_nondet_train_backward(tape, do)
 
 
 def test_launches_are_this_packages_records(device, monkeypatch) -> None:
@@ -2565,7 +2687,7 @@ def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> N
 
 # --------------------------------------------------------------------------- deeper split tables (CHAIN_PLAN)
 
-# The layouts of the bench's rows, packs, head pairs and group shapes (benchmarks/bench_cake_gdn_train.py): (sequence
+# The layouts of the bench's rows, packs, head pairs and group shapes (benchmarks/bench_cake_gdn_nondet_train.py): (sequence
 # lengths, HV); the tables of host_plans do not depend on H, so the group shapes that repeat a row's layout and HV are
 # left out (the value-head group enters only through the split R form, SPLIT_R_FORM, tested with its group below).
 _PAIR_LAYOUT = (11000, 12000, 9768)
@@ -2876,7 +2998,7 @@ def test_forward_backward_beside_a_resident_side_stream_kernel(heads, device) ->
     def step() -> None:
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_nd(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                          scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
         torch.autograd.backward(o, inputs["do"])
@@ -3003,7 +3125,7 @@ def test_strided_packed_qkv_views(device) -> None:
     assert not q.is_contiguous() and q.stride(1) == (2 * h + hv) * HEAD_DIM
     g, beta = (inputs[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
     cu = _cu(seq_lens)
-    o, _ = chunk_gated_delta_rule_nd(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM),
+    o, _ = cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM),
                                      cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                      cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64),
                                      use_qk_l2norm_in_kernel=True)  # fmt: skip
@@ -3052,7 +3174,7 @@ def test_checkpoint_matches_and_retains_no_bytes(device) -> None:
     }
 
     def layer(q, k, v, g, beta):
-        o, _ = chunk_gated_delta_rule_nd(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+        o, _ = cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
         return o
 
@@ -3098,7 +3220,7 @@ def test_gradients_accumulate_into_nonzero_grad(device) -> None:
         for n in ("q", "k", "v", "g", "beta")
     }
     for _ in range(2):
-        o, _ = chunk_gated_delta_rule_nd(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                          scale=1.0 / math.sqrt(HEAD_DIM),
                                          cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                          cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64),
@@ -3185,7 +3307,7 @@ def test_cuda_graph_replay_matches_eager(heads, device) -> None:
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_nd(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                          scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True,
                                          streams=1)  # fmt: skip
