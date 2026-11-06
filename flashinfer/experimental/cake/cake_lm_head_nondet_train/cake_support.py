@@ -80,9 +80,8 @@ deterministic, no synchronization.  The programs of these entries are the determ
 (every sum has one owner and one order; the bits depend on the pass form, ``chunk_size``, the dense
 vocabulary block and the sparse split) except the dense dX: its blocks add into the chunk sum through
 the reduction form of the dX GEMM, bitwise the deterministic dX at one K slice and an unordered FP32
-sum of the slices above one.  As part of the non-deterministic package the entries take
-``deterministic=False`` only (any other value is a ``ValueError``) and make no run-to-run bitwise promise for the
-gradients.  Under torch's deterministic algorithms the
+sum of the slices above one.  As part of the non-deterministic package the entries take no
+``deterministic`` keyword and make no run-to-run bitwise promise for the gradients.  Under torch's deterministic algorithms the
 backward raises PyTorch's alert (:func:`cake_backend._alert_nondeterministic`) when its dense dX runs a block of more
 than one K slice (:func:`_dense_dx_unordered`; only inside a cell of :data:`SUPPORT_DX_SLICE_CELLS`), before its first
 launch; every other backward has one fixed order and does not alert.  The device bytes of a step by bucket: :func:`support_memory_report`.  A token
@@ -118,7 +117,6 @@ from .cake_backend import (
     _ffi_stream_context,
     _mm_fp32,
     _modes_off,
-    _require_nondeterministic,
     _resolve_temperature,
     _selective_checkpoint_modes,
     _temperature_rows,
@@ -1987,7 +1985,6 @@ class SupportLogprobFunction(torch.autograd.Function):
         check_inputs: bool,
         backend: str,
         cake,
-        deterministic: bool,
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             # under selective activation checkpointing: every dispatch mode popped (as in :mod:`.cake_backend`)
@@ -2006,7 +2003,6 @@ class SupportLogprobFunction(torch.autograd.Function):
                     check_inputs,
                     backend,
                     cake,
-                    deterministic,
                 )
         ctx.set_materialize_grads(False)
         ctx.problem, ctx.outputs, ctx.backend, ctx.cake = (
@@ -2015,8 +2011,6 @@ class SupportLogprobFunction(torch.autograd.Function):
             backend,
             cake,
         )
-        # the call's numerical mode (False: validated by the entry)
-        ctx.deterministic = deterministic
         T, M = problem.num_rows, problem.num_pairs
         device = X.device
         if T == 0:
@@ -2084,7 +2078,7 @@ class SupportLogprobFunction(torch.autograd.Function):
         problem, outputs = ctx.problem, ctx.outputs
         up = dict(zip(outputs.names(), grads, strict=True))
         g, d, e = up.get("packed"), up.get("selected"), up.get("kl")
-        rest = (None,) * 11
+        rest = (None,) * 10
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         if (g is None and d is None and e is None) or not (need_dx or need_dw):
             return (None, None) + rest
@@ -2151,8 +2145,6 @@ def _support_call(
     check_inputs,
     backend,
     outputs: SupportOutputs,
-    deterministic,
-    entry: str,
     path="auto",
     dw_mode="auto",
     vocab_block=None,
@@ -2160,7 +2152,6 @@ def _support_call(
 ) -> dict[str, torch.Tensor]:
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
-    _require_nondeterministic(deterministic, entry)
     if not isinstance(check_inputs, bool):
         raise ValueError("check_inputs must be a bool")
     problem = validate_support_inputs(
@@ -2198,7 +2189,6 @@ def _support_call(
         check_inputs,
         backend,
         cake,
-        deterministic,
     )
     return dict(zip(outputs.names(), result, strict=True))
 
@@ -2227,7 +2217,6 @@ def chunked_lm_head_support_logprob(
     temperature: Union[None, float, torch.Tensor] = 1.0,
     chunk_size: Optional[int] = None,
     check_inputs: bool = False,
-    deterministic: bool = True,
     backend: str = "cake",
     path: Union[str, dict] = "auto",
     dw_mode: str = "auto",
@@ -2243,8 +2232,7 @@ def chunked_lm_head_support_logprob(
     ``[T]`` tensor (default 1).  ``chunk_size``: the token chunk (default 4096); the weight gradient's
     rounding depends on it.  ``check_inputs``: read the validation word back and raise ``ValueError``
     (default: an asynchronous device assertion, no synchronization).  Under ``torch.no_grad()`` the call
-    only runs the forward (teacher-target preparation).  ``deterministic`` must be ``False`` (this package's only
-    mode; any other value is a ``ValueError``).  See the module docstring for the contract.
+    only runs the forward (teacher-target preparation).  See the module docstring for the contract.
 
     Backend-level knobs of ``backend="cake"`` (not part of the public API; tests and measurements force them):
     ``path`` (``"auto"`` / ``"sparse"`` / ``"dense"``, or a dict over the passes ``"F"`` / ``"X"`` / ``"W"``),
@@ -2269,8 +2257,6 @@ def chunked_lm_head_support_logprob(
         check_inputs=check_inputs,
         backend=backend,
         outputs=outputs,
-        deterministic=deterministic,
-        entry="chunked_lm_head_support_logprob",
         path=path,
         dw_mode=dw_mode,
         vocab_block=vocab_block,
@@ -2291,7 +2277,6 @@ def chunked_lm_head_support_kl(
     return_logprobs: bool = False,
     chunk_size: Optional[int] = None,
     check_inputs: bool = False,
-    deterministic: bool = True,
     backend: str = "cake",
     path: Union[str, dict] = "auto",
     dw_mode: str = "auto",
@@ -2319,8 +2304,6 @@ def chunked_lm_head_support_kl(
         check_inputs=check_inputs,
         backend=backend,
         outputs=outputs,
-        deterministic=deterministic,
-        entry="chunked_lm_head_support_kl",
         path=path,
         dw_mode=dw_mode,
         vocab_block=vocab_block,
