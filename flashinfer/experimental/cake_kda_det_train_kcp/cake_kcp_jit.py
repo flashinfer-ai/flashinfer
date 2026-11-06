@@ -31,7 +31,7 @@ recorded once in ``build.json`` next to this file; :mod:`.cake_build` serves
 the library from a prebuilt ``aot/`` file when a builder compiled it and
 otherwise through FlashInfer's JIT from the same sources and flags.
 
-The programs are the eight launches of the KCP composition
+The programs are the nine launches of the KCP composition
 (:data:`PROGRAMS`, the names :mod:`.cake_kcp` passes to :func:`run_program`):
 
 * ``kcp_fwdh_offset`` / ``kcp_fwdh_tape`` -- the forward state recurrence
@@ -72,7 +72,17 @@ The programs are the eight launches of the KCP composition
 * ``kcp_dav`` -- the output backward at the rank's shape: ``dAqk`` and the
   first value gradient ``dv1`` (read by the adjoint walk) from ``do_int``, the
   ``v_new`` tape and the ``Aqk`` rows, one CTA per chunk pair and head
-  (``grid_rule`` ``kcp_pairs``: ``(num_chunks_pad / 2, num_heads, 1)``).
+  (``grid_rule`` ``kcp_pairs``: ``(num_chunks_pad / 2, num_heads, 1)``);
+* ``kcp_fwdh_o`` -- the forward state walk of ``kcp_fwdh_tape`` with the
+  chunk output of ``kcp_fwd_o`` computed inside it: the same segments, the same
+  indexed initial states, ``out`` written for the walked segments' token rows
+  from the ``qg`` / ``Aqk`` rows and no ``h`` / ``v_new`` tape (``out`` is
+  bitwise the tape walk followed by ``kcp_fwd_o``: the same two MMAs on the same
+  BF16 tiles in the same order, one rounding).  The forward that keeps no tape
+  launches it in place of those two programs; the forward a replay-mode backward
+  runs keeps the tape walk, whose tapes the backward reads.  It ships in two
+  records (``select_rule`` ``walk_form``): the full-width form and its ``_vh64``
+  form (two CTAs per segment and head), bitwise equal.
 
 Compact state pools (the walks' ``h0`` / ``dht`` inputs and ``out`` outputs)
 are flat FP32 tensors of ``128 x 128`` tiles addressed by an int32 slot table
@@ -129,8 +139,9 @@ ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 
 # The launches of the KCP composition, by the names :mod:`.cake_kcp` uses
 # (``cake_kcp.KCP_PROGRAMS``).  The first five are walks over a segment list;
-# the sixth composes chains; the last two are the chunk stages of the forward
-# output and the output backward at the rank's shape.
+# the sixth composes chains; the seventh and eighth are the chunk stages of the
+# forward output and the output backward at the rank's shape; the ninth is the
+# forward state walk with the forward output fused in (a walk too).
 PROGRAMS = (
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
@@ -140,8 +151,9 @@ PROGRAMS = (
     "kcp_affine_merge",
     "kcp_fwd_o",
     "kcp_dav",
+    "kcp_fwdh_o",
 )
-WALK_PROGRAMS = PROGRAMS[:5]
+WALK_PROGRAMS = (*PROGRAMS[:5], "kcp_fwdh_o")
 # Elements of one FP32 state tile [128, 128].
 TILE = 128 * 128
 # The static ``precision_mode`` knob of the TF32 hi/lo transfer walk: 0 the
@@ -152,21 +164,64 @@ PRECISION_MODES = (0, 1, 2)
 # CTAs per segment and head), ``tf32_hilo`` / ``bf16x3`` the test-only programs
 # of ``build.test.json`` (the TF32 hi/lo walk and the full-width BF16x3 form).
 TRANSFER_WALKS = ("bf16x3_hw64", "tf32_hilo", "bf16x3")
-# The ``walk_form`` test knob of the K1 / K2 state walks: ``auto`` the shipped
-# rule (:func:`walk_form`), ``full`` / ``split`` force the full-width or the
-# two-CTA record of every walk launch (the A/B record).
+# The ``walk_form`` test knob of the K1 / K2 state walks and the fused forward
+# walk: ``auto`` the shipped rule (:func:`walk_form`), ``full`` / ``split``
+# force the full-width or the two-CTA record of every walk launch (the A/B
+# record).
 WALK_FORMS = ("auto", "full", "split")
 # The shipped form rule per walk program: ``fit`` = the two-CTA record when the
 # launch list-schedules within its longest chain (:func:`walk_form`), else the
 # full-width one (the offset programs: two shipped records); ``split`` = the
 # two-CTA record on every launch (the tape programs, whose per-step tape stores
 # halve with the CTA's columns: their full-width records are test-only, under
-# ``walk_form="full"``).
-WALK_FORM_RULES = {
+# ``walk_form="full"``); a mapping = one of those rules (or head-count bands of
+# them) per architecture, both records shipped (the fused forward walk:
+# :data:`FWDH_O_FORM_RULE`).
+# The fused forward walk's rule per architecture: a rule, or head-count bands
+# ``((bound, rule), ..., (None, rule))`` whose first ``bound >= num_heads``
+# names the rule.  From kernel medians of its two records on the same inputs
+# (us, full-width / two-CTA; walk lists: w4 = the eight fragments of a W4
+# zigzag rank, 48 to 20 chunks | z2 = two of 222 | c14 = fourteen of 39 to 24 |
+# d4 = four of 60 to 48 | w2d = four of 192 to 80 | w1 = three of 79, 47 and
+# 13):
+#   sm_103a (GB300, 152 SMs; cold L2), H = 64: w4 252.0 / 258.8 | z2 407.3 /
+#     429.9 | c14 400.6 / 410.8 | d4 216.7 / 223.8 | w2d 519.9 / 513.0; H =
+#     48: w4 198.4 / 199.8 | z2 382.3 / 418.6 | c14 316.2 / 325.9 | d4 195.2
+#     / 180.8 | w2d 370.4 / 384.2; H = 40: w4 171.3 / 172.6 | z2 379.7 / 424.0
+#     | c14 266.8 / 276.0 | d4 189.4 / 177.4 | w2d 361.5 / 354.0; H = 32: w4
+#     142.7 / 139.4 | z2 371.1 / 263.5 | w2d 337.4 / 294.7; H = 16: w4 93.9 /
+#     83.6 | z2 366.3 / 236.3 | w1 134.6 / 90.1; H = 8: w4 86.3 / 63.0; H = 4:
+#     w4 84.5 / 55.9 | z2 362.7 / 230.2 | w1 132.2 / 85.0 | w2d 314.8 / 200.5
+#     -> the two-CTA record up to 32 heads, the full-width one above: the
+#     faster record on 22 of these 26 rows (on the other four, w2d at H = 64
+#     and 40 and d4 at H = 48 and 40, the other record takes at most 7.4 %
+#     less time);
+#   sm_100a (GB200, 152 SMs; cold L2), H = 64: w4 253.6 / 267.7 | z2 412.6 /
+#     462.2 | c14 409.1 / 447.9 | d4 219.7 / 233.3 | w2d 517.9 / 538.0; H =
+#     48: w4 197.9 / 203.2 | z2 386.4 / 421.0 | c14 314.7 / 327.4 | d4 194.6
+#     / 183.8 | w2d 366.8 / 383.9; H = 40: w4 171.9 / 175.9 | z2 384.8 / 425.3
+#     | c14 263.9 / 277.7 | d4 189.6 / 179.6 | w2d 359.0 / 354.5; H = 32: w4
+#     145.6 / 147.3 | z2 374.1 / 266.9 | w2d 342.9 / 307.3; H = 16: w4 97.1 /
+#     87.0 | z2 369.0 / 239.0 | w1 136.1 / 91.6; H = 8: w4 87.4 / 63.9; H = 4:
+#     w4 84.7 / 57.1 | z2 363.6 / 231.3 | w1 133.0 / 85.2 | w2d 315.7 / 200.9
+#     -> the same bands: the faster record on 22 of these 26 rows (on the
+#     other four, w4 at H = 32, d4 at H = 48 and 40 and w2d at H = 40, the
+#     other record takes at most 5.5 % less time);
+#   sm_107a (an R200 board, 212 SMs; cold L2), the same lists at H = 64, 48,
+#     40, 32, 16, 8 and 4 -> the fit rule (:func:`walk_form`) up to 48 heads
+#     and the full-width record above: the faster record on 22 of these 26
+#     rows (on the other four the chosen record takes at most 8.8 % longer).
+FWDH_O_FORM_RULE: dict[str, Any] = {
+    "sm_100a": ((32, "split"), (None, "full")),
+    "sm_103a": ((32, "split"), (None, "full")),
+    "sm_107a": ((48, "fit"), (None, "full")),
+}
+WALK_FORM_RULES: dict[str, Any] = {
     "kcp_fwdh_offset": "fit",
     "kcp_fwdh_tape": "split",
     "kcp_dhu_offset": "fit",
     "kcp_dhu_tape": "split",
+    "kcp_fwdh_o": FWDH_O_FORM_RULE,
 }
 # The fit rule's step ratio: a two-CTA step beside a co-resident CTA, relative
 # to the full-width step of a CTA alone on its SM (measured 0.74-0.84 on the
@@ -196,7 +251,8 @@ TEST_MANIFEST = "build.test.json"
 # ``kcp_fwd_o``) the call's BF16 output ``[T, H, 128]``, and the int32 chunk
 # tables ``chunk_bos`` / ``chunk_len`` (``[NC_pad]``) / ``seq_chunk_start``
 # (``[num_seqs + 1]``, the chunk table of the rank's sequences, not the KCP
-# segment table ``seg_chunk_start``).
+# segment table ``seg_chunk_start``).  ``kcp_fwdh_o`` binds ``out`` (the call's
+# BF16 output) too: it writes no state pool, so ``out`` names no pool there.
 LOGICAL_TENSORS = (
     "w",
     "kg",
@@ -257,10 +313,15 @@ LOGICAL_SCALARS = (
 # The ``kcp_affine_merge`` record of a launch (:func:`merge_record`), by architecture: ``T = n_chains * ncols / 128``
 # (the launch's 128-column chain blocks; one rule for both operator layouts) -> the record of the first band whose
 # upper bound holds ``T`` (``None``: no bound).  Every record gives the same bits.  The bands are the fastest build per
-# ``T`` in an A/B on GB300 (sm_103a, 152 SMs: 17 launch rows x 11 builds, every row bitwise equal to the
-# previous build); sm_100a takes the GB300 bands (not measured on sm_100a).  sm_107a has no packed FMA pairs and ships
-# no 8 x 8 build: its bands are the GB300 bands with the scalar builds and the 4 x 8 build above ``T`` 56 (a proxy, not
-# measured on sm_107a).
+# ``T`` in kernel A/Bs over 17 launch rows, every row of every build bitwise equal to v1's 8-column build: on GB300
+# (sm_103a) and GB200 (sm_100a), 152 SMs, 14 builds each (238 of 238 rows equal on each part), and on an R200 board
+# (sm_107a, 208 SMs) 11 scalar builds (187 of 187).  Kernel time against the previous pick: on sm_100a / sm_103a the
+# 8 x 4 tile over 64 columns 0.93-0.99 on the T = 64 rows (the previous pick: the 8 x 8 tile) and over 32 columns
+# 0.93-0.97 on the T = 24 and 32 rows (the previous pick: the 4 x 8 tile); the T = 48 rows and those up to 16 keep
+# their builds, and the 16-warp 4 x 4 tile over 64 columns is the fastest on no row.  sm_107a has no packed FMA pairs
+# and ships no 64-column build; on its 208 SMs the build that keeps about one CTA per SM wins: the 4 x 4 tile over 16
+# columns 0.758-0.829 at T = 24 and 0.832-0.896 at T = 64, the 8 x 4 tile over 32 columns 0.936-0.947 at T = 32 and
+# 0.865-0.884 at T = 48.
 MERGE_RULE: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (12, "kcp_affine_merge_c8"),
@@ -278,10 +339,9 @@ MERGE_RULE: dict[str, tuple[tuple[int | None, str], ...]] = {
     ),
     "sm_107a": (
         (12, "kcp_affine_merge_c8"),
-        (20, "kcp_affine_merge_c16"),
-        (40, "kcp_affine_merge_c32"),
-        (56, "kcp_affine_merge_c16"),
-        (None, "kcp_affine_merge_c32"),
+        (24, "kcp_affine_merge_c16"),
+        (48, "kcp_affine_merge_c32"),
+        (None, "kcp_affine_merge_c16"),
     ),
 }
 # The full-width record of a K1 / K2 offset walk under the ``walk_heads`` rule: walk program -> bands ``(upper bound
@@ -893,7 +953,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         # The 4 x 4 thread tile over 16 columns (packed FMA pairs on sm_100a / sm_103a): T 13-20 and
-        # 41-56 (MERGE_RULE).
+        # 41-56; on sm_107a T 13-24 and above 48 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 16, "kind": "kcp_chains"},
         "kernel_symbol": "kernel_cake_kda_det_train_9ab870ac43ee331f2dd3_kcp",
         "launch": {
@@ -946,10 +1006,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # The 4 x 8 thread tile over 32 columns (packed FMA pairs on sm_100a / sm_103a): T 21-40, and
-        # above 56 on sm_107a (MERGE_RULE).
+        # The 8 x 4 thread tile over 32 columns (packed FMA pairs on sm_100a / sm_103a): T 21-40; on
+        # sm_107a T 25-48 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 32, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
+        "kernel_symbol": "kernel_cake_kda_det_train_7634c7541a6836a5146a_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -957,7 +1017,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 110592,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_c2ad3b63ad48e23ccbdb_kcp",
+        "library": "cake_kda_det_train_7634c7541a6836a5146a_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -1000,18 +1060,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # The 8 x 8 thread tile over 64 columns with packed FMA pairs (sm_100a / sm_103a only): T above
+        # The 8 x 4 thread tile over 64 columns with packed FMA pairs (sm_100a / sm_103a only): T above
         # 56 (MERGE_RULE).
         "grid_rule": {"cols_per_cta": 64, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "kernel_symbol": "kernel_cake_kda_det_train_8cda0d1f1291e740f798_kcp",
         "launch": {
-            "block": (128, 1, 1),
+            "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 143360,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_7ddde81b137fb82d27d5_kcp",
+        "library": "cake_kda_det_train_8cda0d1f1291e740f798_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -1115,6 +1175,130 @@ MODULES: dict[str, dict[str, Any]] = {
         "program": "kcp_dav",
         "select_rule": {"kind": "always"},
         "variant": None,
+    },
+    "kcp_fwdh_o": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "w_tma"],
+            ["buffer", "kg_tma"],
+            ["buffer", "u"],
+            ["buffer", "gk"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "walk_seg"],
+            ["buffer", "h0"],
+            ["buffer", "h0_index"],
+            ["parameter", "h0_hg"],
+            ["parameter", "h0_n"],
+            ["parameter", "tile_stride"],
+            ["buffer", "qg_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_det_train_051de8b4660b1587fc85_kcp",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 140288,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_051de8b4660b1587fc85_kcp",
+        "logical": {
+            "aqk_tma": "aqk_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "gk": "gk",
+            "h0": "h0",
+            "h0_hg": "h0_hg",
+            "h0_index": "h0_index",
+            "h0_n": "h0_n",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "o_out": "out",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "seq_chunk_start": "seg_chunk_start",
+            "tile_stride": "tile_stride",
+            "u": "u",
+            "w_tma": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_fwdh_o",
+        "select_rule": {"form": "full", "kind": "walk_form"},
+        "variant": None,
+    },
+    "kcp_fwdh_o_vh64": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "w_tma"],
+            ["buffer", "kg_tma"],
+            ["buffer", "u"],
+            ["buffer", "gk"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "walk_seg"],
+            ["buffer", "h0"],
+            ["buffer", "h0_index"],
+            ["parameter", "h0_hg"],
+            ["parameter", "h0_n"],
+            ["parameter", "tile_stride"],
+            ["buffer", "qg_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_det_train_5e6f3ba0b9b429241ab2_kcp",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_5e6f3ba0b9b429241ab2_kcp",
+        "logical": {
+            "aqk_tma": "aqk_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "gk": "gk",
+            "h0": "h0",
+            "h0_hg": "h0_hg",
+            "h0_index": "h0_index",
+            "h0_n": "h0_n",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "o_out": "out",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "seq_chunk_start": "seg_chunk_start",
+            "tile_stride": "tile_stride",
+            "u": "u",
+            "w_tma": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_fwdh_o",
+        "select_rule": {"form": "split", "kind": "walk_form"},
+        "variant": "vh64",
     },
 }
 
@@ -1639,12 +1823,14 @@ def walk_form(
     sm_count: int,
     *,
     knob: str = "auto",
+    arch: str | None = None,
 ) -> str:
     """The form of one launch of walk ``program``: ``"full"`` (one CTA per
     segment and head over the 128 value columns) or ``"split"`` (the two-CTA
     record: two CTAs per segment and head over 64 value columns each; bitwise
     equal).  ``chains`` are the chunk counts of the listed segments, ``knob``
-    the ``walk_form`` test knob (``"full"`` / ``"split"`` force a form).
+    the ``walk_form`` test knob (``"full"`` / ``"split"`` force a form),
+    ``arch`` the device's architecture (needed by a per-architecture rule).
 
     Under the rule ``fit`` (:data:`WALK_FORM_RULES`, the offset programs) a
     launch takes the split form when its ``2 * num_heads`` CTAs per chain, two
@@ -1656,13 +1842,24 @@ def walk_form(
     several waves, where the full-width CTA does more per issued instruction
     and keeps the SMs busier.  Under the rule ``split`` (the tape programs,
     whose per-step tape stores halve with the CTA's columns) every launch takes
-    the split form.  An empty list is ``"full"``.
+    the split form.  A per-architecture rule (a mapping: the fused forward walk)
+    applies its rule for ``arch``, either a rule or head-count bands
+    ``((bound, rule), ..., (None, rule))`` (the rule of the first ``bound >=
+    num_heads``).  An empty list is ``"full"``.
     """
     if knob not in WALK_FORMS:
         raise ValueError(f"walk_form must be one of {WALK_FORMS}, got {knob!r}")
     if knob != "auto":
         return knob
     rule = WALK_FORM_RULES[program]
+    if isinstance(rule, Mapping):
+        if arch not in rule:
+            raise ValueError(
+                f"{program}: the walk form rule is per architecture ({sorted(rule)}), got arch={arch!r}"
+            )
+        rule = rule[arch]
+    if not isinstance(rule, str):  # head-count bands: the first bound >= num_heads
+        rule = next(r for bound, r in rule if bound is None or int(num_heads) <= bound)
     if rule != "fit":
         return rule
     steps = [int(c) for c in chains if int(c) > 0]
@@ -2029,21 +2226,24 @@ def test_specs_for_arch(arch: str) -> list[Any]:
 
 # Per walk program: the compact pool its initial state / final adjoint comes from (``None``: none) and the pool it
 # writes, by the argument names of ``cake_kcp.CallDetKcp.walk`` (= the records' logical names).
-_WALK_POOLS: dict[str, tuple[str | None, str]] = {
+_WALK_POOLS: dict[str, tuple[str | None, str | None]] = {
     "kcp_fwdh_offset": ("h0", "out"),
     "kcp_fwdh_tape": ("h0", "out"),
     "kcp_dhu_offset": ("dht", "out"),
     "kcp_dhu_tape": ("dht", "out"),
     "kcp_transfer_walk": (None, "out"),
+    "kcp_fwdh_o": ("h0", None),  # writes no pool: its ``out`` is the call's BF16 output
 }
 # Per walk program: the local stage values it reads (the logical names of ``cake_backend``'s value dict, which the
-# composition holds under ``CallDetKcp.local_values``): the prep stages' operands and the tapes.
+# composition holds under ``CallDetKcp.local_values``): the prep stages' operands and the tapes; the fused forward walk
+# reads the intra stage's ``qg`` / ``Aqk`` rows and the chunk tables in place of the tapes.
 _WALK_OPERANDS: dict[str, tuple[str, ...]] = {
     "kcp_fwdh_offset": ("w", "kg", "u", "gk", "h", "v_new"),
     "kcp_fwdh_tape": ("w", "kg", "u", "gk", "h", "v_new"),
     "kcp_dhu_offset": ("w", "kg", "qg", "do_int", "dv1", "gk", "dh", "dv2"),
     "kcp_dhu_tape": ("w", "kg", "qg", "do_int", "dv1", "gk", "dh", "dv2"),
     "kcp_transfer_walk": ("w", "kg", "u", "gk"),
+    "kcp_fwdh_o": ("w", "kg", "u", "gk", "qg", "aqk_int", "chunk_bos", "chunk_len"),
 }
 
 
@@ -2207,6 +2407,15 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
     values["tile_stride"] = 1 if stride is None else stride
     if name in ("kcp_dhu_offset", "kcp_dhu_tape"):
         values["scale"] = float(call.scale)
+    if (
+        name == "kcp_fwdh_o"
+    ):  # the chunk output: the call's BF16 output and the output scale
+        out = getattr(call, "out", None)
+        if out is None:
+            raise RuntimeError(
+                "kcp_fwdh_o writes the call's output: the call has no output tensor (a replay forward walks the tape)"
+            )
+        values.update(out=out, scale=float(call.scale))
     if name == "kcp_transfer_walk":
         values.update(
             init_mode=int(args["init_mode"]),
@@ -2224,9 +2433,10 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
                 H,
                 sm_count(device_index),
                 knob=str(_call_knob(call, "walk_form", "auto")),
+                arch=_arch_of(device_index),
             )
         rule = WALK_FORM_RULES[name]
-        if rule in ("full", "split") and form != rule:
+        if isinstance(rule, str) and rule in ("full", "split") and form != rule:
             # the other form of a fixed-rule walk: its test-only record (the knob alone selects it)
             record = test_walk_record(name, form)[0]
             module = load_test(record, device_arch(device_index))
@@ -2343,8 +2553,9 @@ def run_program(name: str, args: Mapping[str, Any], *, device_index: int) -> Non
     them through :func:`run_module` with their logical values on the grid of :func:`launch_grid`.
 
     ``args`` is the vocabulary of ``cake_kcp.Backend.run``: for a walk the segment list ``walk`` (a launch over no
-    segment is skipped), the compact pools ``h0`` / ``dht`` / ``out`` as ``Indexed`` (or ``None``), the transfer
-    walk's ``init_mode`` / ``use_u`` / ``write_transposed``; for the merge the tile pools ``m`` / ``c`` / ``x0`` /
+    segment is skipped), the compact pools ``h0`` / ``dht`` / ``out`` as ``Indexed`` (or ``None``; ``kcp_fwdh_o``
+    reads ``h0`` and writes the call's output, no pool), the transfer walk's ``init_mode`` / ``use_u`` /
+    ``write_transposed``; for the merge the tile pools ``m`` / ``c`` / ``x0`` /
     ``y`` (``c`` / ``x0`` may be ``None``), the ``chains`` tables and ``transpose_m`` / ``write_states``; and
     ``_call``, the ``CallDetKcp`` of the launch, which supplies the head count, the segment table, the operand and
     tape tensors (``local_values``), ``scale`` and ``precision_mode``.  The record is selected from the launch's
@@ -2370,6 +2581,7 @@ def run_program(name: str, args: Mapping[str, Any], *, device_index: int) -> Non
 
 __all__ = [
     "ARCHES",
+    "FWDH_O_FORM_RULE",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MERGE_RULE",

@@ -211,20 +211,25 @@ def _program_table(binding: str, name: str) -> list[str | None]:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("table", "suffix", "world_sizes"),
+    ("table", "suffix", "world_sizes", "empty"),
     [
-        ("kSmallKernels", "_small", (2, 4, 8)),
-        ("kKernels", "", (2, 4)),
-        ("kLargeTokenKernels", "_lt", (2,)),
-        ("kTwoShotKernels", "_ts", (4, 8)),
-        ("kTwoShotDeferKernels", "_tsd", (4, 8)),
-        ("kTwoShotDeferSharedKernels", "_tsds", (4,)),
-        ("kTwoShotEarlyKernels", "_tse", (4, 8)),
-        ("kW2QuadKernels", "_quad", (2,)),
+        ("kSmallKernels", "_small", (2, 4, 8), ()),
+        ("kKernels", "", (2, 4), ()),
+        ("kLargeTokenKernels", "_lt", (2,), ()),
+        ("kLargeTokenSharedKernels", "_lts", (2,), ()),
+        ("kTwoShotKernels", "_ts", (4, 8), ()),
+        ("kTwoShotDeferKernels", "_tsd", (4, 8), ()),
+        # The float16 o110 deferred shared program of world size 8 is not built.
+        ("kTwoShotDeferSharedKernels", "_tsds", (4, 8), (("float16", 8, "110"),)),
+        ("kTwoShotEarlyKernels", "_tse", (4, 8), ()),
+        ("kW2QuadKernels", "_quad", (2,), ()),
     ],
 )
 def test_program_tables_list_one_program_kind(
-    table: str, suffix: str, world_sizes: tuple[int, ...]
+    table: str,
+    suffix: str,
+    world_sizes: tuple[int, ...],
+    empty: tuple[tuple[str, int, str], ...],
 ) -> None:
     source_dir = cake_moe_finalize_comm._source_dir()
     binding = (
@@ -238,6 +243,7 @@ def test_program_tables_list_one_program_kind(
                     f"kernel_cake_trtllm_moe_finalize_{dtype}_ws{world_size}"
                     f"_o{output_profile}{suffix}"
                     if world_size in world_sizes
+                    and (dtype, world_size, output_profile) not in empty
                     else None
                 )
                 assert next(entries) == expected
@@ -255,6 +261,7 @@ def test_program_tables_cover_the_module_records() -> None:
             "kSmallKernels",
             "kKernels",
             "kLargeTokenKernels",
+            "kLargeTokenSharedKernels",
             "kTwoShotKernels",
             "kTwoShotDeferKernels",
             "kTwoShotDeferSharedKernels",
@@ -558,17 +565,36 @@ def _two_shot_select(binding: str) -> str:
     )
 
 
+def _program_suffix(kernel: str | None) -> str | None:
+    """The program suffix of a table entry (None for an empty slot)."""
+    if kernel is None:
+        return None
+    match = re.fullmatch(r"kernel_cake_trtllm_moe_finalize_\w+?_o11[01](\w*)", kernel)
+    assert match is not None, kernel
+    return match.group(1)
+
+
+def _table_slot(dtype: str, world_size: int, quantize: bool) -> int:
+    """The index of a (dtype, world size, epilogue) slot in _program_table's order."""
+    return (
+        ("float16", "bfloat16").index(dtype) * 3 + (2, 4, 8).index(world_size)
+    ) * 2 + int(quantize)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("small_token_max", [16, 64])
-def test_world_size_4_shared_expert_runs_the_deferred_shared_program(
+def test_shared_expert_runs_the_deferred_shared_program(
     small_token_max: int,
 ) -> None:
-    """At world size 4, from kTwoShotDeferMinTokensWorldSize4 (1536) tokens, a rank with
-    a shared expert runs the deferred program that also prefetches the shared-expert row
-    (_tsds) and a rank without one the deferred program (_tsd); below 1536 tokens the
-    shared expert changes nothing. Whether a call runs a deferred form reads the token
-    count and the world size alone at world size 4, so ranks with and without a shared
-    expert run forms of the same exchange. World sizes 2 and 8 choose as before."""
+    """From the deferred two-shot threshold (kTwoShotDeferMinTokensWorldSize4 = 1536
+    tokens at world size 4, kTwoShotDeferMinTokensWorldSize8 = 768 at world size 8), a
+    rank with a shared expert runs the deferred program that also prefetches the
+    shared-expert row (_tsds): at world size 4 for every top_k, at world size 8 for
+    top_k 8 in every cell but float16 o110, whose slot is empty. Every other deferred call
+    runs the deferred program (_tsd); below the threshold the shared expert changes
+    nothing. Whether a call runs a deferred form reads the token count, the world size and
+    the C11 defer_excluded class alone, so ranks with and without a shared expert, or with
+    different top_k, run forms of the same exchange. World size 2 runs no two-shot form."""
     source_dir = cake_moe_finalize_comm._source_dir()
     binding = (
         source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
@@ -603,11 +629,18 @@ def test_world_size_4_shared_expert_runs_the_deferred_shared_program(
         for name, source in sources.items()
     }
     select = compile(_two_shot_select(binding), "two_shot_select", "eval")
+    shared_table = _program_table(binding, "kTwoShotDeferSharedKernels")
 
     def program(
-        world_size: int, tokens: int, top_k: int, use_shared: bool, quantize: bool
+        world_size: int,
+        tokens: int,
+        top_k: int,
+        use_shared: bool,
+        quantize: bool,
+        dtype: str,
     ) -> str:
         two_shot_world = world_size in (4, 8)
+        shared_kernel = shared_table[_table_slot(dtype, world_size, quantize)]
         scope: dict[str, object] = {
             **constants,
             "world_size": world_size,
@@ -621,7 +654,7 @@ def test_world_size_4_shared_expert_runs_the_deferred_shared_program(
             "capacity": 71,
             "two_shot": "_ts" if two_shot_world else None,
             "two_shot_defer": "_tsd" if two_shot_world else None,
-            "defer_shared": "_tsds" if world_size == 4 else None,
+            "defer_shared": _program_suffix(shared_kernel),
             "two_shot_early": "_tse" if two_shot_world else None,
         }
         for name in ("defer_excluded", "two_shot_deferred", "two_shot_now"):
@@ -634,39 +667,182 @@ def test_world_size_4_shared_expert_runs_the_deferred_shared_program(
             return eval(select, {"__builtins__": {}}, scope)
         return "one_shot"
 
-    for top_k in (4, 8):
+    def world_size_8(
+        tokens: int, top_k: int, use_shared: bool, quantize: bool, dtype: str
+    ) -> str:
+        if tokens < 768 or (top_k == 4 and not use_shared and not quantize):
+            return "_ts"
+        built = dtype == "bfloat16" or quantize
+        return "_tsds" if use_shared and top_k == 8 and built else "_tsd"
+
+    for dtype in ("float16", "bfloat16"):
+        for quantize in (False, True):
+            for top_k in (4, 8):
+                for use_shared in (False, True):
+                    case = (top_k, use_shared, quantize, dtype)
+                    for tokens in (1535, 1536, 1537, 2048, 4096):
+                        deferred = "_tsds" if use_shared else "_tsd"
+                        assert program(
+                            4, tokens, top_k, use_shared, quantize, dtype
+                        ) == (deferred if tokens >= 1536 else "_ts"), (tokens, *case)
+                    for tokens in (72, 128):
+                        assert (
+                            program(4, tokens, top_k, use_shared, quantize, dtype)
+                            == "_tse"
+                        )
+                    for tokens in (767, 768, 769, 1536, 2048, 4096):
+                        assert program(
+                            8, tokens, top_k, use_shared, quantize, dtype
+                        ) == world_size_8(tokens, *case), (tokens, *case)
+                    for tokens in (1535, 1536, 2048):
+                        assert program(
+                            2, tokens, top_k, use_shared, quantize, dtype
+                        ) not in ("_ts", "_tsd", "_tsds", "_tse")
+                # Mixed shared-expert presence among the four ranks of one call.
+                for present in ({0}, {0, 1}, {2, 3}, {1, 2, 3}, {0, 2}):
+                    for tokens in (1535, 1536, 2048):
+                        programs = [
+                            program(4, tokens, top_k, rank in present, quantize, dtype)
+                            for rank in range(4)
+                        ]
+                        expected = [
+                            ("_tsds" if rank in present else "_tsd")
+                            if tokens >= 1536
+                            else "_ts"
+                            for rank in range(4)
+                        ]
+                        assert programs == expected, (present, tokens, top_k, quantize)
+            # Mixed shared-expert presence and top_k among the eight ranks of one call.
+            for present in (
+                {0},
+                {0, 1, 2, 3},
+                {4, 5, 6, 7},
+                set(range(1, 8)),
+                {0, 2, 4, 6},
+            ):
+                for top_ks in ((8,) * 8, (4,) * 4 + (8,) * 4, (4, 8) * 4):
+                    for tokens in (767, 768, 2048):
+                        programs = [
+                            program(
+                                8,
+                                tokens,
+                                top_ks[rank],
+                                rank in present,
+                                quantize,
+                                dtype,
+                            )
+                            for rank in range(8)
+                        ]
+                        expected = [
+                            world_size_8(
+                                tokens, top_ks[rank], rank in present, quantize, dtype
+                            )
+                            for rank in range(8)
+                        ]
+                        assert programs == expected, (present, top_ks, tokens, quantize)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
+    small_token_max: int,
+) -> None:
+    """At world size 2, a top_k 4 batch the large-token program takes (above
+    kLargeTokenMinTokens = 512 tokens, kLargeTokenMinTokensSharedExpert = 1280 with a
+    shared expert) runs the large-token program that also prefetches the shared-expert row
+    (_lts) on a rank with a shared expert and the large-token program (_lt) on a rank
+    without one; the shared form runs the same exchange, so the ranks of one call may mix
+    them. The large-token class itself is unchanged; world sizes 4 and 8 run neither."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (k\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kLargeTokenMinTokens"] == 512
+    assert constants["kLargeTokenMinTokensSharedExpert"] == 1280
+    large = re.search(
+        r"\} else if \((large_token != nullptr &&.*?)\) \{\s*kernel = (.*?);",
+        binding,
+        re.S,
+    )
+    assert large is not None
+    shared_choice = re.compile(r"\(v_has_shared_expert != 0 \? (\w+) : (\w+)\)")
+    condition = compile(
+        _as_python(
+            shared_choice.sub(
+                r"(\1 if v_has_shared_expert != 0 else \2)",
+                " ".join(large.group(1).split()),
+            )
+        ),
+        "large_token",
+        "eval",
+    )
+    choice = compile(_as_python(large.group(2)), "large_token_choice", "eval")
+    lt_table = _program_table(binding, "kLargeTokenKernels")
+    lts_table = _program_table(binding, "kLargeTokenSharedKernels")
+    _, branch_expression = _small_token_test(binding)
+    small_token = compile(branch_expression, "small_token", "eval")
+
+    def program(
+        world_size: int,
+        tokens: int,
+        top_k: int,
+        use_shared: bool,
+        quantize: bool,
+        dtype: str,
+    ) -> str | None:
+        slot = _table_slot(dtype, world_size, quantize)
+        scope: dict[str, object] = {
+            **constants,
+            "world_size": world_size,
+            "top_k": top_k,
+            "v_has_shared_expert": int(use_shared),
+            "tokens": tokens,
+            "small_token_max": small_token_max,
+            "small_token_extended": world_size == 4
+            or (world_size == 2 and (top_k != 4 or use_shared)),
+            "capacity": 71,
+            "large_token": _program_suffix(lt_table[slot]),
+            "large_token_shared": _program_suffix(lts_table[slot]),
+        }
+        if eval(small_token, {"__builtins__": {}}, scope):
+            return "_small"
+        if eval(condition, {"__builtins__": {}}, scope):
+            return eval(choice, {"__builtins__": {}}, scope)
+        return None
+
+    for dtype in ("float16", "bfloat16"):
         for quantize in (False, True):
             for use_shared in (False, True):
-                for tokens in (1535, 1536, 1537, 2048, 4096):
-                    deferred = "_tsds" if use_shared else "_tsd"
-                    assert program(4, tokens, top_k, use_shared, quantize) == (
-                        deferred if tokens >= 1536 else "_ts"
-                    ), (tokens, top_k, use_shared, quantize)
-                for tokens in (72, 128):
-                    assert program(4, tokens, top_k, use_shared, quantize) == "_tse"
-                for tokens in (767, 768, 1536, 2048):
-                    excluded = top_k == 4 and not use_shared and not quantize
-                    assert program(8, tokens, top_k, use_shared, quantize) == (
-                        "_tsd" if tokens >= 768 and not excluded else "_ts"
-                    ), (tokens, top_k, use_shared, quantize)
-                for tokens in (1535, 1536, 2048):
-                    assert program(2, tokens, top_k, use_shared, quantize) not in (
-                        "_ts",
-                        "_tsd",
-                        "_tsds",
-                        "_tse",
+                case = (use_shared, quantize, dtype)
+                large_min = 1280 if use_shared else 512
+                for tokens in (512, 513, 1280, 1281, 2048, 4096):
+                    expected = (
+                        ("_lts" if use_shared else "_lt")
+                        if tokens > large_min
+                        else None
                     )
-            # Mixed shared-expert presence among the four ranks of one call.
-            for present in ({0}, {0, 1}, {2, 3}, {1, 2, 3}, {0, 2}):
-                for tokens in (1535, 1536, 2048):
+                    assert program(2, tokens, 4, use_shared, quantize, dtype) == (
+                        expected
+                    ), (tokens, *case)
+                    assert program(2, tokens, 8, use_shared, quantize, dtype) is None
+                    for world_size in (4, 8):
+                        assert (
+                            program(world_size, tokens, 4, use_shared, quantize, dtype)
+                            is None
+                        ), (world_size, tokens, *case)
+            # Mixed shared-expert presence among the two ranks of one call.
+            for present in ({0}, {1}):
+                for tokens in (1281, 2048):
                     programs = [
-                        program(4, tokens, top_k, rank in present, quantize)
-                        for rank in range(4)
+                        program(2, tokens, 4, rank in present, quantize, dtype)
+                        for rank in range(2)
                     ]
-                    expected = [
-                        ("_tsds" if rank in present else "_tsd")
-                        if tokens >= 1536
-                        else "_ts"
-                        for rank in range(4)
-                    ]
-                    assert programs == expected, (present, tokens, top_k, quantize)
+                    assert programs == [
+                        "_lts" if rank in present else "_lt" for rank in range(2)
+                    ], (present, tokens, quantize, dtype)

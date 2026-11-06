@@ -1820,15 +1820,11 @@ def test_the_package_exports_the_det_free_names_only() -> None:
     for name in DET_NAMES:
         for module in (cake_gdn_train, cake_chain):
             assert not hasattr(module, name) and name not in module.__all__, name
-    # the deterministic package keeps its names and its aliases, distinct objects from this package's entries
-    assert (
-        cake_gdn_det_train.chunk_gated_delta_rule
-        is cake_gdn_det_train.chunk_gated_delta_rule_det
-    )
-    assert (
-        cake_gdn_train.chunk_gated_delta_rule
-        is not cake_gdn_det_train.chunk_gated_delta_rule
-    )
+    # the deterministic package's entries (its det names) are distinct objects from this package's entries
+    for name, det_name in zip(ENTRY_NAMES, DET_NAMES, strict=True):
+        assert getattr(cake_gdn_train, name) is not getattr(
+            cake_gdn_det_train, det_name
+        ), name
     assert cake_jit.PACKAGE == "flashinfer.experimental.cake.cake_gdn_train"
     assert cake_jit.LIBRARY_PREFIX == "cake_gdn_train"
 
@@ -1892,6 +1888,16 @@ def test_every_entry_requires_deterministic_false(mode) -> None:
             match=f"^{name} is the non-deterministic route and takes deterministic=False",
         ):
             call()
+    # the refusal names the entry's deterministic counterpart
+    for (name, call), det_name in zip(
+        _entry_calls(**mode).items(), DET_NAMES, strict=True
+    ):
+        with pytest.raises(ValueError) as info:
+            call()
+        assert str(info.value).endswith(
+            "pass deterministic=False for the non-deterministic path; the deterministic entry is "
+            f"flashinfer.experimental.cake_gdn_det_train.{det_name}"
+        ), (name, str(info.value))
     # the refusal comes first, also with PyTorch's deterministic algorithms on
     with _deterministic_algorithms(True):
         for name, call in _entry_calls(**mode).items():

@@ -5555,6 +5555,23 @@ def _saved_fresh_pools(saved: SavedDetKcp | None) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _check_mode_objects(saved: Any, workspace: Any) -> None:
+    """The deterministic backward reads the deterministic forward's :class:`SavedDetKcp` and a caller-held
+    :class:`WorkspaceDetKcp` only.  A saved set or workspace of the non-deterministic package (or any other object) is
+    refused with ``ValueError`` before any launch.  The check is by type: the saved sets of both modes have the same
+    fields and version, so their fields cannot tell them apart."""
+    for name, obj, cls in (
+        ("saved", saved, SavedDetKcp),
+        ("workspace", workspace, WorkspaceDetKcp),
+    ):
+        if obj is not None and not isinstance(obj, cls):
+            raise ValueError(
+                f"chunk_gdn_det_bwd_kcp: {name} must be a {cls.__name__} of the deterministic mode (got "
+                f"{type(obj).__module__}.{type(obj).__qualname__}); the deterministic backward reads the "
+                f"deterministic forward's {name} only"
+            )
+
+
 def chunk_gdn_det_bwd_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -5572,7 +5589,10 @@ def chunk_gdn_det_bwd_kcp(
     **knobs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The KCP backward: ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward.
-    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused)."""
+    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused).  ``saved`` and
+    ``workspace`` must be this package's :class:`SavedDetKcp` / :class:`WorkspaceDetKcp`: a saved set or workspace of
+    the non-deterministic mode is refused with ``ValueError`` (:func:`_check_mode_objects`)."""
+    _check_mode_objects(saved, workspace)
     over = _literal_overrides(
         options,
         (
@@ -6086,17 +6106,3 @@ __all__ = [
     "torch_release",
     "torch_release_verified",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-ChunkGDNKcpFunction = ChunkGDNDetFunctionKcp
-KcpCall = CallDetKcp
-KcpOptions = OptionsDetKcp
-KcpRecomputeHandle = RecomputeHandleDetKcp
-KcpSaved = SavedDetKcp
-KcpWorkspace = WorkspaceDetKcp
-chunk_gdn_kcp = chunk_gdn_det_kcp
-chunk_gdn_kcp_bwd = chunk_gdn_det_bwd_kcp
-chunk_gdn_kcp_fwd = chunk_gdn_det_fwd_kcp
-gdn_kcp_comm_bytes = gdn_det_comm_bytes_kcp
-gdn_kcp_saved_bytes = gdn_det_saved_bytes_kcp
-gdn_kcp_workspace_bytes = gdn_det_workspace_bytes_kcp

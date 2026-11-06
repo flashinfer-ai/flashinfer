@@ -8,16 +8,14 @@ The public API is backend-agnostic and lives in :mod:`.core`.  Each
 backend has its own subpackage (e.g. :mod:`.cudnn`); future backends
 should follow the same convention.  The experimental Cake entry points
 (``grouped_det_gemm_fwd``, ``grouped_det_gemm_dgrad``, ``grouped_det_gemm_wgrad``,
-``cake_grouped_det_mm``) live in :mod:`.cake` and hand off to
+``cake_grouped_det_mm``) live in :mod:`.cake_det` and hand off to
 :mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`.
 """
 
-from typing import Any as _Any
-
-from .cake import cake_grouped_det_mm as cake_grouped_det_mm
-from .cake import grouped_det_gemm_dgrad as grouped_det_gemm_dgrad
-from .cake import grouped_det_gemm_fwd as grouped_det_gemm_fwd
-from .cake import grouped_det_gemm_wgrad as grouped_det_gemm_wgrad
+from .cake_det import cake_grouped_det_mm as cake_grouped_det_mm
+from .cake_det import grouped_det_gemm_dgrad as grouped_det_gemm_dgrad
+from .cake_det import grouped_det_gemm_fwd as grouped_det_gemm_fwd
+from .cake_det import grouped_det_gemm_wgrad as grouped_det_gemm_wgrad
 from .core import grouped_mm_bf16 as grouped_mm_bf16
 from .core import grouped_mm_fp4 as grouped_mm_fp4
 from .core import grouped_mm_fp8 as grouped_mm_fp8
@@ -41,15 +39,3 @@ __all__ = [
     "moe_gemm_fp8_nt_groupwise",
     "moe_gemm_mxfp8_nt_groupwise",
 ]
-
-
-def __getattr__(name: str) -> _Any:
-    # The Cake entry-point names before the deterministic-family rename
-    # (``grouped_gemm_fwd``, ``grouped_gemm_dgrad``, ``grouped_gemm_wgrad``,
-    # ``cake_grouped_mm``): deprecated compatibility aliases of the ``*_det_*``
-    # functions, resolved by :mod:`.cake`.
-    from . import cake
-
-    if name in cake._RENAMED:
-        return getattr(cake, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
