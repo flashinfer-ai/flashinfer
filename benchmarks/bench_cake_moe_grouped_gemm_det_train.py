@@ -46,8 +46,8 @@ CUDA kernel count of one call per arm (``torch.profiler``).
 
 Usage::
 
-    python benchmarks/bench_cake_moe_grouped_det_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--cupti] [--json out.json]
-    python benchmarks/bench_cake_moe_grouped_det_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake_det_inforward,torch_grouped_mm [--census]
+    python benchmarks/bench_cake_moe_grouped_gemm_det_train.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--cupti] [--json out.json]
+    python benchmarks/bench_cake_moe_grouped_gemm_det_train.py --ops step,step_es,block,block_es --arms cake_det,cake_det_inforward,torch_grouped_mm [--census]
 """
 
 import argparse
@@ -58,12 +58,14 @@ import torch
 import torch.profiler
 import torch.utils.checkpoint
 
-from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd import (
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+    cake_backend as cb,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
     CakeGroupedDetMm,
     cake_grouped_det_mm,
 )
-from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend import (
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
     prepare_grouped_det_gemm_dgrad,
     prepare_grouped_det_gemm_fwd,
     prepare_grouped_det_gemm_wgrad,

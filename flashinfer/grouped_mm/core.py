@@ -119,8 +119,9 @@ def grouped_mm_bf16(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  ``"cudnn"`` (default), or the experimental
-        ``"cake"`` backend (:mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`,
-        SM100 / SM103 / SM107): generated ragged BF16 programs that read
+        ``"cake"`` backend (the deterministic forward programs of
+        :mod:`flashinfer.cake_moe_grouped_gemm_det_train`, SM100 / SM103 /
+        SM107): generated ragged BF16 programs that read
         ``m_indptr`` on the device, need no padding, produce bfloat16 outputs
         only and require ``n % 256 == 0`` and ``k % 64 == 0``.  Naming it is the
         opt-in and emits an ``ExperimentalWarning`` once.
@@ -146,7 +147,7 @@ def grouped_mm_bf16(
     """
     if backend == "cake":
         warn_experimental_backend_once("grouped_mm_bf16", "cake")
-        from ..experimental.cake_moe_grouped_det_gemm.cake_backend import (
+        from ..experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
             grouped_det_mm_bf16_cake,
         )
 

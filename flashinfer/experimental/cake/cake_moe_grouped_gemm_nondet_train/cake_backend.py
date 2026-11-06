@@ -16,7 +16,7 @@ limitations under the License.
 Cake backend: non-deterministic ragged BF16 MoE grouped GEMM (SM100 / SM103 / SM107).
 
 The three operations of the deterministic package
-``flashinfer.experimental.cake_moe_grouped_det_gemm``, over ``E`` groups of rows
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``, over ``E`` groups of rows
 described by an int32 **device** tensor ``offs[E]`` of cumulative end offsets
 (never read on the host):
 
@@ -27,10 +27,10 @@ described by an int32 **device** tensor ``offs[E]`` of cumulative end offsets
 Numerical mode.  This package is the ``deterministic=False`` implementation
 and runs nothing else: every entry point (``prepare_grouped_gemm_*`` here,
 ``grouped_gemm_*`` and ``cake_grouped_mm`` of the package, and the facade
-``flashinfer.experimental.cake.grouped_mm``) takes the keyword-only
+``flashinfer.cake_moe_grouped_gemm_nondet_train``) takes the keyword-only
 ``deterministic: bool = True`` and raises ``ValueError`` for every value but
 the bool ``False`` (the default included), naming the deterministic entry of
-the deterministic package ``flashinfer.experimental.cake_moe_grouped_det_gemm``
+the deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``
 (``grouped_det_gemm_*``, ``prepare_grouped_det_gemm_*``,
 ``cake_grouped_det_mm``).  Nothing here routes to that package.
 ``fwd``, ``dgrad`` and the weight gradient with the 256-wide k tile run this
@@ -305,7 +305,7 @@ def sm_count(device: torch.device) -> int:
     return _device_facts(_device_index(device))[1]
 
 
-# The deterministic entry of the package ``flashinfer.experimental.cake_moe_grouped_det_gemm`` that
+# The deterministic entry of the package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`` that
 # corresponds to each entry point of this package (and of the facade): named by the mode refusal.
 _DET_ENTRIES: dict[str, str] = {
     "CakeGroupedMm": "CakeGroupedDetMm",
@@ -329,7 +329,7 @@ def _require_deterministic_false(deterministic: object, entry: str) -> None:
             f"{entry} is the non-deterministic ragged grouped GEMM (the 512-wide k tile's weight gradient adds "
             "its split tail with unordered fp32 reductions) and runs only with deterministic=False, got "
             f"deterministic={deterministic!r}; the deterministic entry is "
-            f"flashinfer.experimental.cake_moe_grouped_det_gemm.{det} (it takes no deterministic argument); "
+            f"flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.{det} (it takes no deterministic argument); "
             "pass deterministic=False for the non-deterministic path"
         )
 
@@ -380,7 +380,7 @@ def _alert_not_deterministic(entry: str) -> None:
     exposes no public Python entry for it."""
     if not torch.are_deterministic_algorithms_enabled():
         return
-    det = "flashinfer.experimental.cake_moe_grouped_det_gemm"
+    det = "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train"
     if entry in _ALERT_DET_ENTRIES:
         det = f"{det}.{_ALERT_DET_ENTRIES[entry]}"
     if torch.is_deterministic_algorithms_warn_only_enabled():

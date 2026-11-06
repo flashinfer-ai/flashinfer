@@ -1381,6 +1381,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake.cake_moe_grouped_gemm",
+  "package": "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train",
   "schema": "cake-build/1"
 }

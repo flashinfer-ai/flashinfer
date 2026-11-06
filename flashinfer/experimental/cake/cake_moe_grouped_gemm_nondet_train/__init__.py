@@ -16,7 +16,7 @@ limitations under the License.
 
 # Experimental Cake backend: the non-deterministic ragged BF16 MoE grouped GEMM
 # for SM100 / SM103 / SM107, the ``deterministic=False`` counterpart of
-# ``flashinfer.experimental.cake_moe_grouped_det_gemm``.  The same three
+# ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``.  The same three
 # operations over groups of rows described by an int32 device tensor of
 # cumulative end offsets (never read on the host): the row projection
 # ``Y = X @ W[e].T`` (``grouped_gemm_fwd``), the activation gradient
@@ -26,7 +26,7 @@ limitations under the License.
 # Every entry point takes the keyword-only ``deterministic: bool = True`` and
 # raises ``ValueError`` for every value but the bool ``False`` (the default
 # included), naming the deterministic entry of
-# ``flashinfer.experimental.cake_moe_grouped_det_gemm``; nothing here routes to
+# ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``; nothing here routes to
 # that package.  The forward pass, the activation
 # gradient and the 256-wide k tile's weight gradient run copies of the
 # deterministic programs, but for the sm_100a activation gradient's L2
@@ -41,7 +41,7 @@ limitations under the License.
 # 256-wide k tile and an unsplit tail) never alert.
 #
 # The public (experimental) entry points are the facade functions
-# ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_fwd`` /
+# ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_fwd`` /
 # ``grouped_gemm_dgrad`` / ``grouped_gemm_wgrad`` / ``cake_grouped_mm``, which
 # take the same arguments, accept only ``deterministic=False``, carry the
 # experimental-API marking and the once-only warnings and hand off to the

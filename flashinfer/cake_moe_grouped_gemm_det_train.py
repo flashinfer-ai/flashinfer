@@ -4,7 +4,7 @@
 
 Thin core entry points, per ``flashinfer/experimental/README.md``: each
 function below carries the public signature and the documentation of its
-namesake in :mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`, adds the
+namesake in :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`, adds the
 experimental-API marking, and hands off to it.
 The kernels, the host planning, the autograd wrapper and the JIT
 registration live in that package, which every function imports inside its
@@ -18,7 +18,7 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_experimental_api
 
 __all__ = [
     "grouped_det_gemm_fwd",
@@ -61,7 +61,9 @@ def grouped_det_gemm_fwd(
     tensors (or CUDA Graph capture) use ``prepare_grouped_det_gemm_fwd`` once and
     call ``launch()`` on the returned object.
     """
-    from ..experimental.cake_moe_grouped_det_gemm import grouped_det_gemm_fwd as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_det_train import (
+        grouped_det_gemm_fwd as _impl,
+    )
 
     return _impl(x, w, offs, out=out)
 
@@ -80,7 +82,9 @@ def grouped_det_gemm_dgrad(
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  See ``grouped_det_gemm_fwd`` for the prepared form.
     """
-    from ..experimental.cake_moe_grouped_det_gemm import grouped_det_gemm_dgrad as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_det_train import (
+        grouped_det_gemm_dgrad as _impl,
+    )
 
     return _impl(g, w, offs, out=out)
 
@@ -120,7 +124,9 @@ def grouped_det_gemm_wgrad(
     keeps it with a prepared launch (CUDA-graph capturable; every launch and
     replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
     """
-    from ..experimental.cake_moe_grouped_det_gemm import grouped_det_gemm_wgrad as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_det_train import (
+        grouped_det_gemm_wgrad as _impl,
+    )
 
     return _impl(
         g,
@@ -208,10 +214,10 @@ def cake_grouped_det_mm(
     (passing one raises ``TypeError``) and
     ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
     warning).  The non-deterministic wrapper is
-    ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm(...,
+    ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm(...,
     deterministic=False)``.
     """
-    from ..experimental.cake_moe_grouped_det_gemm.cake_autograd import (
+    from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
         cake_grouped_det_mm as _impl,
     )
 

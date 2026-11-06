@@ -32,8 +32,8 @@ useful work only (forward, data and weight gradient of each GEMM); the ``step``
 rows keep their earlier count, which includes the recomputed forward.
 
 Arms: ``cake_det`` (the deterministic package,
-``flashinfer.experimental.cake_moe_grouped_det_gemm``), ``cake``
-(``flashinfer.experimental.cake.cake_moe_grouped_gemm`` with
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``), ``cake``
+(``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` with
 ``deterministic=False``), ``torch._grouped_mm``, a per-group cuBLAS loop with
 host-known bounds and ``flashinfer.grouped_mm.grouped_mm_bf16`` (cuDNN; fwd /
 dgrad only); opt-in ``cake_inforward``, ``cake`` through a direct
@@ -93,9 +93,9 @@ cuBLAS) are not arms of this benchmark.
 
 Usage::
 
-    python benchmarks/bench_cake_moe_grouped_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake] [--cupti] [--json out.json]
-    python benchmarks/bench_cake_moe_grouped_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake,cake_inforward,torch_grouped_mm [--census]
-    python benchmarks/bench_cake_moe_grouped_gemm.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB,det_mgX
+    python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake] [--cupti] [--json out.json]
+    python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --ops step,step_es,block,block_es --arms cake_det,cake,cake_inforward,torch_grouped_mm [--census]
+    python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB,det_mgX
 """
 
 import argparse
@@ -107,10 +107,14 @@ import torch.profiler
 import torch.utils.checkpoint
 
 from flashinfer.experimental.cake import cake_moe_grouped_gemm as pkg
-from flashinfer.experimental.cake.cake_moe_grouped_gemm import cake_backend as cb
-import flashinfer.experimental.cake_moe_grouped_det_gemm as det_pkg
-from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as det_cb
-from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd import (
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+    cake_backend as cb,
+)
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as det_pkg
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+    cake_backend as det_cb,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
     cake_grouped_det_mm,
 )
 from flashinfer.testing import bench_gpu_time

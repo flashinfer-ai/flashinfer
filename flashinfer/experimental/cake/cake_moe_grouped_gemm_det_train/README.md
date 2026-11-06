@@ -2,7 +2,7 @@
 
 Both this API and its Cake backend are experimental and may change or be
 removed without compatibility guarantees. The entry points are the core
-functions `flashinfer.grouped_mm.grouped_det_gemm_fwd`, `grouped_det_gemm_dgrad`,
+functions `flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd`, `grouped_det_gemm_dgrad`,
 `grouped_det_gemm_wgrad` and `cake_grouped_det_mm`, and the stable API
 `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`; calling one of
 them is the explicit opt-in and emits FlashInfer's `ExperimentalWarning` once.
@@ -47,8 +47,8 @@ This package is deterministic only; every public name carries `det`.
 | `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | the deterministic forward (the forward programs of both Cake packages give the same bits) |
 
 The non-deterministic counterpart is the separate package
-`flashinfer.experimental.cake.cake_moe_grouped_gemm` and its facade
-`flashinfer.experimental.cake.grouped_mm`, which take only `deterministic=False`
+`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` and its facade
+`flashinfer.cake_moe_grouped_gemm_nondet_train`, which take only `deterministic=False`
 (`ValueError` otherwise, naming the deterministic entry of this package) and never
 route here. The names of this package before the deterministic-family rename
 (`flashinfer.experimental.cake_moe_grouped_gemm` with its submodules,
@@ -70,7 +70,7 @@ from flashinfer.grouped_mm import (
     grouped_det_gemm_fwd,
     grouped_det_gemm_wgrad,
 )
-from flashinfer.experimental.cake_moe_grouped_det_gemm import prepare_grouped_det_gemm_wgrad
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import prepare_grouped_det_gemm_wgrad
 
 E, N, K = 4, 4096, 6144
 sizes = [28128, 28128, 28128, 28192]
@@ -141,7 +141,7 @@ and `torch.compile`.
 
 `grouped_det_gemm_wgrad(..., out=out, accumulate=True)` (also
 `prepare_grouped_det_gemm_wgrad(..., accumulate=True)` and
-`flashinfer.grouped_mm.grouped_det_gemm_wgrad`) adds the deterministic weight
+`flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_wgrad`) adds the deterministic weight
 gradient into the caller's `out` instead of overwriting it:
 `out[e] += G[e].T @ X[e]`, Megatron's `gradient_accumulation_fusion` into an
 fp32 or bf16 `main_grad` (FlashInfer issue #5678).
@@ -241,8 +241,8 @@ Cost (`S = E * N * K` elements):
   allocates them, one more write of each.
 
 ```python
-from flashinfer.experimental.cake_moe_grouped_det_gemm import prepare_grouped_det_gemm_wgrad
-from flashinfer.grouped_mm import cake_grouped_det_mm, grouped_det_gemm_wgrad
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import prepare_grouped_det_gemm_wgrad
+from flashinfer.cake_moe_grouped_gemm_det_train import cake_grouped_det_mm, grouped_det_gemm_wgrad
 
 # Megatron-style accumulation into an fp32 main_grad, deterministic
 w = torch.nn.Parameter(torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda"))
@@ -500,38 +500,38 @@ call of the package's functions emits none of them.
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_det_gemm.py tests/experimental/test_cake_moe_grouped_det_gemm_api.py tests/experimental/test_cake_moe_grouped_det_gemm_standalone.py tests/experimental/test_cake_moe_grouped_det_gemm_determinism.py tests/experimental/test_cake_moe_grouped_det_gemm_acc.py
-python benchmarks/bench_cake_moe_grouped_det_gemm.py --help
+pytest tests/experimental/test_cake_moe_grouped_gemm_det_train.py tests/experimental/test_cake_moe_grouped_gemm_det_train_api.py tests/experimental/test_cake_moe_grouped_gemm_det_train_standalone.py tests/experimental/test_cake_moe_grouped_gemm_det_train_determinism.py tests/experimental/test_cake_moe_grouped_gemm_det_train_acc.py
+python benchmarks/bench_cake_moe_grouped_gemm_det_train.py --help
 ```
 
-`test_cake_moe_grouped_det_gemm.py` (the backend suite, which imports the package
+`test_cake_moe_grouped_gemm_det_train.py` (the backend suite, which imports the package
 through `tests.test_helpers.cake_package`) compares against a per-group fp64
 reference (including an empty group, a one-row group, padded outputs,
 determinism and the fp32 output) and skips when no supported device or no
-registered program is present. `test_cake_moe_grouped_det_gemm_api.py` covers the
+registered program is present. `test_cake_moe_grouped_gemm_det_train_api.py` covers the
 core entry points of `flashinfer.grouped_mm` (the experimental marking, the
 once-only warnings and the `backend="cake"` route of `grouped_mm_bf16`) and the
 mode rules above (the removed det-free names and paths, the `TypeError` of a
 `deterministic` argument, no change under torch's deterministic mode).
-`test_cake_moe_grouped_det_gemm_standalone.py` copies the package under another
+`test_cake_moe_grouped_gemm_det_train_standalone.py` copies the package under another
 name into a CPU subprocess with `flashinfer` blocked and checks that it
 imports, raises its host-side errors without any warning and has its only
 `flashinfer` import in the JIT fallback.
-`test_cake_moe_grouped_det_gemm_determinism.py` repeats every route (forward,
+`test_cake_moe_grouped_gemm_det_train_determinism.py` repeats every route (forward,
 data gradient, weight gradient in bf16 and fp32 at both k tiles with the tail
 reduce, the probed split of the data gradient) on fixed inputs and zeroed
 accumulators and requires bitwise-identical outputs, also across fresh
 processes.
-`test_cake_moe_grouped_det_gemm_acc.py` covers the weight-gradient accumulation:
+`test_cake_moe_grouped_gemm_det_train_acc.py` covers the weight-gradient accumulation:
 on the CPU the plans (equal to the overwrite's, bound to the scratch), the
 checks, the launch's add and the autograd flag's Megatron contract with CPU
 stand-ins for the preparations; on a GPU every weight-gradient form with and
 without a split tail, fp32 and bf16, bitwise against `out0.add_(dW)` and run to
 run, CUDA graph replays, streams, layouts, and the autograd flag with the
 generated programs. The accumulation is timed by the accumulation rows of
-`benchmarks/bench_cake_moe_grouped_gemm.py` (arm `det_mgX`, beside the
+`benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py` (arm `det_mgX`, beside the
 deterministic baselines `det_acc` and `det_mgB` and the non-deterministic arms).
-The benchmark `benchmarks/bench_cake_moe_grouped_det_gemm.py` times the prepared
+The benchmark `benchmarks/bench_cake_moe_grouped_gemm_det_train.py` times the prepared
 launches against `torch._grouped_mm`, a per-group cuBLAS loop and
 `flashinfer.grouped_mm.grouped_mm_bf16` on the MoE projection rows of the
 design (E = 4 ragged distributions, E = 8 / 16 / 32 balanced, fp32 weight

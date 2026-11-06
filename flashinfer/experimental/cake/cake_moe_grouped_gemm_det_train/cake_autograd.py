@@ -36,7 +36,7 @@ limitations under the License.
 # argument (passing one raises ``TypeError``), and
 # ``torch.use_deterministic_algorithms(True)`` changes nothing here (every launch
 # reduces in a fixed order).  The non-deterministic counterpart is
-# ``flashinfer.experimental.cake.cake_moe_grouped_gemm``.
+# ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``.
 
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ class CakeGroupedDetMm(torch.autograd.Function):
                 "or pass None before fuse_wgrad_accumulation), got "
                 f"{_launch!r}: the deterministic package has no deterministic argument "
                 "(the non-deterministic autograd function is "
-                "flashinfer.experimental.cake.cake_moe_grouped_gemm.CakeGroupedMm)"
+                "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.CakeGroupedMm)"
             )
         _require_flag(
             fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedDetMm"
@@ -338,7 +338,7 @@ def cake_grouped_det_mm(
     (passing one raises ``TypeError``) and
     ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
     warning).  The non-deterministic wrapper is
-    ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm(...,
+    ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm(...,
     deterministic=False)``.
     """
     _require_flag(

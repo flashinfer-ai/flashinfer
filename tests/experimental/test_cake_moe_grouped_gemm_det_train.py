@@ -28,11 +28,11 @@ from tests.test_helpers.cake_package import cake_package
 # Backend suite: the package is named once, through ``cake_package``; nothing else
 # of flashinfer is imported here.  The tests of the stable flashinfer entry point
 # ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` live in
-# ``test_cake_moe_grouped_det_gemm_api.py``.
-pkg = cake_package("cake_moe_grouped_det_gemm")
-cb = cake_package("cake_moe_grouped_det_gemm", "cake_backend")
-cake_jit = cake_package("cake_moe_grouped_det_gemm", "cake_jit")
-cake_autograd = cake_package("cake_moe_grouped_det_gemm", "cake_autograd")
+# ``test_cake_moe_grouped_gemm_det_train_api.py``.
+pkg = cake_package("cake_moe_grouped_gemm_det_train")
+cb = cake_package("cake_moe_grouped_gemm_det_train", "cake_backend")
+cake_jit = cake_package("cake_moe_grouped_gemm_det_train", "cake_jit")
+cake_autograd = cake_package("cake_moe_grouped_gemm_det_train", "cake_autograd")
 grouped_det_gemm_dgrad = pkg.grouped_det_gemm_dgrad
 grouped_det_gemm_fwd = pkg.grouped_det_gemm_fwd
 grouped_det_gemm_wgrad = pkg.grouped_det_gemm_wgrad

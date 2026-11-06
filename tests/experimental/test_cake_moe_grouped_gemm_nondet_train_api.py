@@ -15,12 +15,12 @@ limitations under the License.
 
 flashinfer public-API tests of the non-deterministic Cake MoE grouped GEMM.
 
-The facade ``flashinfer.experimental.cake.grouped_mm`` (``grouped_gemm_fwd``,
+The facade ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (``grouped_gemm_fwd``,
 ``grouped_gemm_dgrad``, ``grouped_gemm_wgrad``, ``cake_grouped_mm``) and the package
-``flashinfer.experimental.cake.cake_moe_grouped_gemm`` it hands off to are
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` it hands off to are
 non-deterministic only: the keyword-only ``deterministic`` must be the bool ``False``
 (every other value, the default ``True`` included, raises ``ValueError`` naming the
-deterministic entry of ``flashinfer.experimental.cake_moe_grouped_det_gemm``), nothing
+deterministic entry of ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``), nothing
 routes to the deterministic package, and under ``torch.use_deterministic_algorithms(True)``
 PyTorch's non-determinism alert is raised immediately before an order-varying launch
 only (the weight gradient whose 512-wide k tile splits its tail).  This suite covers on
@@ -51,13 +51,17 @@ import torch.utils.checkpoint
 
 pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
-import flashinfer.experimental.cake.cake_moe_grouped_gemm as pkg
-import flashinfer.experimental.cake.grouped_mm as facade
-import flashinfer.experimental.cake_moe_grouped_det_gemm as det_pkg
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
+import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as det_pkg
 import flashinfer.grouped_mm as grouped_mm
-from flashinfer.experimental.cake.cake_moe_grouped_gemm import cake_autograd
-from flashinfer.experimental.cake.cake_moe_grouped_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_det_gemm import (
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+    cake_autograd,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+    cake_backend as cb,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
     cake_autograd as det_autograd,
 )
 
@@ -244,7 +248,7 @@ def test_facade_rejects_every_mode_but_false(name, value, monkeypatch):
         message = str(info.value)
         assert DET_ENTRY[name] in message, message
         assert MODE_HINT in message, message
-        assert "cake_moe_grouped_det_gemm" in message, message
+        assert "cake_moe_grouped_gemm_det_train" in message, message
 
 
 def test_facade_has_no_deterministic_route():
@@ -253,7 +257,7 @@ def test_facade_has_no_deterministic_route():
     for name in ("_FALLBACK_WARNED", "_deterministic", "_caller_stacklevel"):
         assert not hasattr(facade, name), name
     source = Path(facade.__file__).read_text()
-    assert "from ..cake_moe_grouped_det_gemm" not in source
+    assert "experimental.cake.cake_moe_grouped_gemm_det_train import" not in source
     assert "NotImplementedError" not in source
 
 
@@ -273,7 +277,7 @@ import warnings
 import torch
 
 import flashinfer.api_logging as api_logging
-import flashinfer.experimental.cake.grouped_mm as facade
+import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
 
 assert not torch.cuda.is_available()
 
@@ -328,11 +332,11 @@ def test_importing_the_facade_imports_neither_package():
     """The facade reaches the package through deferred imports only."""
     code = (
         "import json, sys\n"
-        "import flashinfer.experimental.cake.grouped_mm\n"
+        "import flashinfer.cake_moe_grouped_gemm_nondet_train\n"
         "import flashinfer.grouped_mm\n"
         "print(json.dumps(sorted(m for m in sys.modules"
-        " if m.startswith('flashinfer.experimental.cake_moe_grouped_det_gemm')"
-        " or m.startswith('flashinfer.experimental.cake.cake_moe_grouped_gemm'))))\n"
+        " if m.startswith('flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train')"
+        " or m.startswith('flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train'))))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == []
 
@@ -388,7 +392,7 @@ def test_package_refuses_every_mode_but_false(name):
         with pytest.raises(ValueError) as info:
             call(**kwargs)
         message = str(info.value)
-        assert f"cake_moe_grouped_det_gemm.{cb._DET_ENTRIES[name]}" in message, (
+        assert f"cake_moe_grouped_gemm_det_train.{cb._DET_ENTRIES[name]}" in message, (
             name,
             value,
             message,
@@ -396,7 +400,7 @@ def test_package_refuses_every_mode_but_false(name):
         assert MODE_HINT in message, (name, value)
     with pytest.raises(ValueError) as info:
         call(deterministic=False)
-    assert "cake_moe_grouped_det_gemm" not in str(info.value), name
+    assert "cake_moe_grouped_gemm_det_train" not in str(info.value), name
 
 
 def test_package_mode_keyword_only():
@@ -432,7 +436,7 @@ def test_alert_names_the_deterministic_entry(entry, det):
     """The alert of every entry that can launch an order-varying weight gradient names the
     entry and its deterministic counterpart: the ``RuntimeError`` (strict) and the
     ``UserWarning`` (``warn_only``); nothing with the mode off."""
-    want = f"flashinfer.experimental.cake_moe_grouped_det_gemm.{det}"
+    want = f"flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.{det}"
     with (
         _TorchDeterministic(warn_only=False),
         pytest.raises(RuntimeError) as info,
@@ -562,7 +566,9 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
         pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch") as info,
     ):
         launch.launch()
-    assert "cake_moe_grouped_det_gemm.GroupedDetGemmLaunch.launch" in str(info.value)
+    assert "cake_moe_grouped_gemm_det_train.GroupedDetGemmLaunch.launch" in str(
+        info.value
+    )
     assert log == []
     with (
         _TorchDeterministic(warn_only=True),
@@ -573,7 +579,7 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     alerts = _user_warnings(rec)
     assert len(alerts) == 1, [str(w.message) for w in rec]
     assert "GroupedGemmLaunch.launch" in str(alerts[0].message)
-    assert "cake_moe_grouped_det_gemm.GroupedDetGemmLaunch.launch" in str(
+    assert "cake_moe_grouped_gemm_det_train.GroupedDetGemmLaunch.launch" in str(
         alerts[0].message
     )
     assert os.path.samefile(alerts[0].filename, __file__), alerts[0].filename
@@ -653,8 +659,11 @@ def test_package_has_no_stable_api_handoff():
     for name in ("grouped_mm_bf16_cake", "grouped_det_mm_bf16_cake"):
         assert not hasattr(cb, name), name
     source = Path(grouped_mm.core.__file__).read_text()
-    assert "experimental.cake_moe_grouped_det_gemm.cake_backend import" in source
-    assert "experimental.cake.cake_moe_grouped_gemm" not in source
+    assert (
+        "experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import"
+        in source
+    )
+    assert "experimental.cake.cake_moe_grouped_gemm_nondet_train" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +698,11 @@ def test_det_free_names_are_only_the_non_deterministic_objects():
     from tests.test_helpers.cake_package import PACKAGES, cake_package
 
     assert "cake_moe_grouped_gemm" not in PACKAGES
-    assert cake_package("cake.cake_moe_grouped_gemm") is pkg
-    assert pkg.__name__ == "flashinfer.experimental.cake.cake_moe_grouped_gemm"
+    assert cake_package("cake_moe_grouped_gemm_nondet_train") is pkg
+    assert (
+        pkg.__name__
+        == "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +712,7 @@ def test_det_free_names_are_only_the_non_deterministic_objects():
 
 def _base():
     """The package's backend suite (its shapes and helpers), imported on first use."""
-    from tests.experimental import test_cake_moe_grouped_gemm as base
+    from tests.experimental import test_cake_moe_grouped_gemm_nondet_train as base
 
     return base
 

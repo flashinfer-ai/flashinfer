@@ -1,18 +1,18 @@
-.. _apicake_moe_grouped_gemm:
+.. _apicake_moe_grouped_gemm_nondet_train:
 
 Cake ragged BF16 grouped GEMM, non-deterministic weight gradient (experimental)
 ================================================================================
 
-The functions of ``flashinfer.experimental.cake.grouped_mm`` compute the ragged BF16
-grouped GEMM of :ref:`apicake_moe_grouped_det_gemm` -- the forward projection, the data
+The functions of ``flashinfer.cake_moe_grouped_gemm_nondet_train`` compute the ragged BF16
+grouped GEMM of :ref:`apicake_moe_grouped_gemm_det_train` -- the forward projection, the data
 gradient and the weight gradient of the expert projections of Mixture-of-Experts layers
 on SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) -- with the
-non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm``, whose
+non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``, whose
 512-wide k tile adds the split tail of the weight gradient with unordered fp32
 reductions.  Both the API and the backends are experimental (see :ref:`experimental`);
 calling one of the functions is the explicit opt-in and emits an ``ExperimentalWarning``
 once.  The deterministic implementation is a separate package with ``det`` in every
-name (:ref:`apicake_moe_grouped_det_gemm`).
+name (:ref:`apicake_moe_grouped_gemm_det_train`).
 
 Mode and dispatch rules
 -----------------------
@@ -121,7 +121,7 @@ and a ``create_graph`` backward.
 The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package with the
 same mode rules; it has no deterministic route.  The deterministic package takes the same two
 switches and always composes (its deterministic overwrite into a scratch, then
-``out.add_``), bitwise reproducible run to run: see :ref:`apicake_moe_grouped_det_gemm`.
+``out.add_``), bitwise reproducible run to run: see :ref:`apicake_moe_grouped_gemm_det_train`.
 
 Functions
 ---------
@@ -143,15 +143,15 @@ autodoc before graduation):
 Each takes ``deterministic=False`` only (the default ``True`` raises ``ValueError``,
 above)::
 
-    from flashinfer.experimental.cake.grouped_mm import cake_grouped_mm, grouped_gemm_wgrad
+    from flashinfer.cake_moe_grouped_gemm_nondet_train import cake_grouped_mm, grouped_gemm_wgrad
 
     y = cake_grouped_mm(x, w, offs, deterministic=False)
     dw = grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
 
 The shapes, the group offsets (``offs[E]`` end offsets or ``m_indptr[E + 1]``) and the
-alignment rules are those of :ref:`apicake_moe_grouped_det_gemm`.  The prepare-once /
+alignment rules are those of :ref:`apicake_moe_grouped_gemm_det_train`.  The prepare-once /
 launch-many surface is in the packages:
-``flashinfer.experimental.cake.cake_moe_grouped_gemm.prepare_grouped_gemm_fwd``,
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.prepare_grouped_gemm_fwd``,
 ``prepare_grouped_gemm_dgrad`` and ``prepare_grouped_gemm_wgrad`` (with
 ``deterministic=False``) return a ``GroupedGemmLaunch`` whose ``plan`` records, for the
 weight gradient, ``unordered_tail``, ``tail_splits`` and the sizes of the tail sums and
@@ -166,10 +166,10 @@ The deterministic names carry ``det``; the non-deterministic names omit it:
 ======================================================== ==============================================================
 deterministic (no ``deterministic`` argument)            non-deterministic (``deterministic=False`` only)
 ======================================================== ==============================================================
-``flashinfer.grouped_mm.grouped_det_gemm_fwd``           ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_fwd``
-``flashinfer.grouped_mm.grouped_det_gemm_dgrad``         ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_dgrad``
-``flashinfer.grouped_mm.grouped_det_gemm_wgrad``         ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_wgrad``
-``flashinfer.grouped_mm.cake_grouped_det_mm``            ``flashinfer.experimental.cake.grouped_mm.cake_grouped_mm``
+``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd``           ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_fwd``
+``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_dgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_dgrad``
+``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_wgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_wgrad``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_grouped_det_mm``            ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm``
 ``cake_moe_grouped_det_gemm.prepare_grouped_det_gemm_*`` ``cake.cake_moe_grouped_gemm.prepare_grouped_gemm_*``
 ``cake_moe_grouped_det_gemm.GroupedDetGemmLaunch``       ``cake.cake_moe_grouped_gemm.GroupedGemmLaunch``
 ``cake_moe_grouped_det_gemm.CakeGroupedDetMm``           ``cake.cake_moe_grouped_gemm.CakeGroupedMm``

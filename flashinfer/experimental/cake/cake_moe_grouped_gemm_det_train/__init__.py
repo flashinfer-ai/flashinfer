@@ -24,7 +24,7 @@ limitations under the License.
 # wrapper's ``fuse_wgrad_accumulation`` adds into ``w.main_grad``).
 #
 # The public (experimental) entry points are the core functions
-# ``flashinfer.grouped_mm.grouped_det_gemm_fwd`` / ``grouped_det_gemm_dgrad`` /
+# ``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd`` / ``grouped_det_gemm_dgrad`` /
 # ``grouped_det_gemm_wgrad`` / ``cake_grouped_det_mm`` and the stable API
 # ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``: they carry
 # the experimental-API marking and the once-only warnings and hand off to the

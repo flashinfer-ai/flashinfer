@@ -17,9 +17,9 @@ flashinfer public-API tests of the Cake MoE grouped GEMM package.
 
 The experimental entry points ``grouped_det_gemm_fwd``, ``grouped_det_gemm_dgrad``,
 ``grouped_det_gemm_wgrad`` and ``cake_grouped_det_mm`` of ``flashinfer.grouped_mm`` (the
-thin core module ``flashinfer.grouped_mm.cake_det``) and the stable entry point
+thin core module ``flashinfer.cake_moe_grouped_gemm_det_train``) and the stable entry point
 ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` hand off to
-``flashinfer.experimental.cake_moe_grouped_det_gemm``.  This suite covers the core
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``.  This suite covers the core
 entry points on CPU -- the experimental-API marking, the signatures and docstrings
 they share with the package functions, the once-only ``ExperimentalWarning`` that
 the package functions never emit, and the deferred import that keeps the package
@@ -33,7 +33,7 @@ rename are gone (``ModuleNotFoundError`` / ``AttributeError`` / ``KeyError``, no
 no deterministic entry takes a ``deterministic`` argument (``TypeError``, also a stale
 positional mode of ``CakeGroupedDetMm.apply``), and torch's deterministic mode changes
 nothing for them (no alert, no warning).
-The backend tests of the package live in ``test_cake_moe_grouped_det_gemm.py``, which
+The backend tests of the package live in ``test_cake_moe_grouped_gemm_det_train.py``, which
 imports the package only through ``tests.test_helpers.cake_package``.
 """
 
@@ -52,10 +52,12 @@ import torch
 import torch.utils.checkpoint
 
 import flashinfer.api_logging as api_logging
-import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
-import flashinfer.grouped_mm as grouped_mm
-from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend import (
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as pkg
+import flashinfer.cake_moe_grouped_gemm_det_train as facade
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+    cake_backend as cb,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
 )
 
@@ -67,7 +69,7 @@ ATOL = RTOL = 1e-2  # bf16 outputs
 RAGGED_E4 = [300, 0, 1, 700]
 RAGGED_E6 = [1, 257, 511, 4099, 0, 33]
 
-# The experimental entry points of flashinfer.grouped_mm.cake_det; the package
+# The experimental entry points of flashinfer.cake_moe_grouped_gemm_det_train; the package
 # functions they hand off to carry the same names.
 ENTRY_POINTS = (
     "grouped_det_gemm_fwd",
@@ -108,8 +110,8 @@ def test_core_entry_points_are_the_experimental_api():
     and its docstring behind the experimental banner, and exported by
     ``flashinfer.grouped_mm``; the package function itself is unmarked."""
     for name in ENTRY_POINTS:
-        entry, impl = getattr(grouped_mm, name), getattr(pkg, name)
-        assert name in grouped_mm.__all__, name
+        entry, impl = getattr(facade, name), getattr(pkg, name)
+        assert name in facade.__all__, name
         assert entry.is_experimental is True, name
         assert entry.experimental_feature == f"cake_moe_grouped_det_gemm.{name}", name
         assert inspect.signature(entry) == inspect.signature(impl), name
@@ -124,8 +126,8 @@ import warnings
 import torch
 
 import flashinfer.api_logging as api_logging
-import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
-import flashinfer.grouped_mm as grouped_mm
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as pkg
+import flashinfer.cake_moe_grouped_gemm_det_train as facade
 
 assert not torch.cuda.is_available()
 
@@ -161,7 +163,7 @@ for name in pkg.__all__:  # load the submodules outside the recorded calls
     getattr(pkg, name)
 
 for name, args in operands.items():
-    entry, impl = getattr(grouped_mm, name), getattr(pkg, name)
+    entry, impl = getattr(facade, name), getattr(pkg, name)
     [w] = warnings_of(entry, args)  # first call: exactly one warning
     assert w.category is api_logging.ExperimentalWarning, (name, w.category)
     message = str(w.message)
@@ -180,19 +182,21 @@ def test_core_entry_points_warn_once_and_the_package_functions_do_not():
     assert _run_cpu_subprocess(_WARN_ONCE) == "OK"
 
 
-def test_importing_grouped_mm_does_not_import_the_package():
-    """``flashinfer.grouped_mm`` reaches the package through deferred imports only
-    (experimental containment): a fresh interpreter that imports it has the thin
-    module ``flashinfer.grouped_mm.cake_det`` loaded and no module of
-    ``flashinfer.experimental.cake_moe_grouped_det_gemm``."""
+def test_importing_the_facade_does_not_import_the_package():
+    """``flashinfer.cake_moe_grouped_gemm_det_train`` reaches the package through
+    deferred imports only (experimental containment): a fresh interpreter that
+    imports it (and ``flashinfer.grouped_mm``) has the facade loaded and no module of
+    ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``."""
     code = (
         "import json, sys\n"
         "import flashinfer.grouped_mm\n"
+        "import flashinfer.cake_moe_grouped_gemm_det_train\n"
         "print(json.dumps(sorted(m for m in sys.modules"
-        " if m == 'flashinfer.grouped_mm.cake_det'"
-        " or m.startswith('flashinfer.experimental.cake_moe_grouped_det_gemm'))))\n"
+        " if 'cake_moe_grouped' in m)))\n"
     )
-    assert json.loads(_run_cpu_subprocess(code)) == ["flashinfer.grouped_mm.cake_det"]
+    assert json.loads(_run_cpu_subprocess(code)) == [
+        "flashinfer.cake_moe_grouped_gemm_det_train"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +212,15 @@ REMOVED_MODULES = (
     "flashinfer.experimental.cake_moe_grouped_gemm.cake_build",
     "flashinfer.experimental.cake_moe_grouped_gemm.cake_jit",
     "flashinfer.grouped_mm.cake",
+    # the paths before the #8928 move
+    "flashinfer.experimental.cake_moe_grouped_det_gemm",
+    "flashinfer.experimental.cake.cake_moe_grouped_gemm",
+    "flashinfer.experimental.cake.grouped_mm",
+    "flashinfer.grouped_mm.cake_det",
 )
 # module -> the det-free names it no longer has (formerly aliases of the det objects).
 REMOVED_NAMES = {
-    "flashinfer.experimental.cake_moe_grouped_det_gemm": (
+    "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train": (
         "CakeGroupedMm",
         "GroupedGemmLaunch",
         "cake_grouped_mm",
@@ -222,18 +231,18 @@ REMOVED_NAMES = {
         "prepare_grouped_gemm_fwd",
         "prepare_grouped_gemm_wgrad",
     ),
-    "flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd": (
+    "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd": (
         "CakeGroupedMm",
         "cake_grouped_mm",
     ),
-    "flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend": (
+    "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend": (
         "GroupedGemmLaunch",
         "grouped_mm_bf16_cake",
         "prepare_grouped_gemm_dgrad",
         "prepare_grouped_gemm_fwd",
         "prepare_grouped_gemm_wgrad",
     ),
-    "flashinfer.grouped_mm.cake_det": (
+    "flashinfer.cake_moe_grouped_gemm_det_train": (
         "cake_grouped_mm",
         "grouped_gemm_dgrad",
         "grouped_gemm_fwd",
@@ -280,20 +289,22 @@ def test_removed_test_helper_key():
     assert "cake_moe_grouped_gemm" not in PACKAGES
     with pytest.raises(KeyError):
         cake_package("cake_moe_grouped_gemm")
-    assert cake_package("cake_moe_grouped_det_gemm") is pkg
+    assert cake_package("cake_moe_grouped_gemm_det_train") is pkg
     assert (
-        PACKAGES["cake.cake_moe_grouped_gemm"]
-        == "flashinfer.experimental.cake.cake_moe_grouped_gemm"
+        PACKAGES["cake_moe_grouped_gemm_nondet_train"]
+        == "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train"
     )
 
 
 def _det_callables():
     """name -> callable of every deterministic entry point: the package functions,
     the prepared-launch builders, the autograd wrapper and the core entry points."""
-    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+        cake_autograd,
+    )
 
     found = {f"pkg.{name}": getattr(pkg, name) for name in pkg.__all__}
-    found.update({f"core.{name}": getattr(grouped_mm, name) for name in ENTRY_POINTS})
+    found.update({f"core.{name}": getattr(facade, name) for name in ENTRY_POINTS})
     found["CakeGroupedDetMm.forward"] = cake_autograd.CakeGroupedDetMm.forward
     found["cb.grouped_det_mm_bf16_cake"] = cb.grouped_det_mm_bf16_cake
     return found
@@ -307,7 +318,9 @@ def test_det_entries_have_no_mode_parameter():
         if inspect.isclass(fn):
             continue
         assert "deterministic" not in inspect.signature(fn).parameters, name
-    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+        cake_autograd,
+    )
 
     forward = inspect.signature(cake_autograd.CakeGroupedDetMm.forward)
     assert list(forward.parameters) == [
@@ -333,11 +346,7 @@ def test_det_wrapper_refuses_a_mode_argument(entry, value):
     """``cake_grouped_det_mm(..., deterministic=...)`` raises ``TypeError`` for either
     value (no silent acceptance of ``False``), as does a fourth positional argument, in
     the package and in ``flashinfer.grouped_mm``."""
-    fn = (
-        pkg.cake_grouped_det_mm
-        if entry == "package"
-        else grouped_mm.cake_grouped_det_mm
-    )
+    fn = pkg.cake_grouped_det_mm if entry == "package" else facade.cake_grouped_det_mm
     x, w, offs = _cpu_operands()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # the core entry's ExperimentalWarning
@@ -367,7 +376,9 @@ def test_direct_apply_refuses_a_stale_mode_argument(stale):
     numerical-mode argument) raises ``TypeError`` in ``forward`` before anything runs,
     instead of binding the value to the internal deferred-launch slot; five arguments
     exceed the arity."""
-    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+        cake_autograd,
+    )
 
     x, w, offs = _cpu_operands()
     x.requires_grad_(True)
@@ -545,7 +556,7 @@ def test_grouped_mm_bf16_cake_backend_rejects_unsupported_options():
 def test_core_autograd_checkpoint_early_stop_skips_the_forward_launch(
     early_stop, monkeypatch
 ):
-    """``flashinfer.grouped_mm.cake_grouped_det_mm`` hands off to the package's wrapper,
+    """``flashinfer.cake_moe_grouped_gemm_det_train.cake_grouped_det_mm`` hands off to the package's wrapper,
     which launches its forward after autograd saved the inputs: a non-reentrant
     checkpoint of one GEMM launches the forward once with early stop on (the
     recomputation stops before it) and twice with it off, with the bits of the plain
@@ -553,7 +564,9 @@ def test_core_autograd_checkpoint_early_stop_skips_the_forward_launch(
     device = _require_program("fwd")
     _require_program("dgrad")
     _require_program("wgrad", torch.bfloat16)
-    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+        cake_autograd,
+    )
 
     x0, w0, g, offs = _inputs(RAGGED_E4, 512, 256, device, seed=55)
     launches = []
@@ -566,7 +579,7 @@ def test_core_autograd_checkpoint_early_stop_skips_the_forward_launch(
     monkeypatch.setattr(cake_autograd, "_fwd_op", counted)
 
     def gemm(x, w):
-        return grouped_mm.cake_grouped_det_mm(x, w, offs)
+        return facade.cake_grouped_det_mm(x, w, offs)
 
     def run(checkpointed):
         launches.clear()

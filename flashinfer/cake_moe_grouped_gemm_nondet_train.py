@@ -17,12 +17,12 @@ Cake ragged BF16 MoE grouped GEMM (SM100 / SM103 / SM107), the
 non-deterministic package's experimental-API namespace.
 
 The functions of this module carry the experimental-API marking and hand off
-to the package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` with the
+to the package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` with the
 same arguments: the weight gradient with the 512-wide k tile adds its split
 tail (the tiles of its last partial wave, cut into k-step units over the
 clusters) in place with unordered fp32 reductions, in one launch.  The
 deterministic counterpart is a separate package with ``det`` in every name,
-``flashinfer.experimental.cake_moe_grouped_det_gemm`` (also
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`` (also
 ``flashinfer.grouped_mm.grouped_det_gemm_*`` / ``cake_grouped_det_mm``), to
 which nothing here routes.
 
@@ -39,7 +39,7 @@ Mode and dispatch rules (one row per call)::
                                                             runs); never a deterministic fallback
 
     entry                 deterministic entry (no deterministic argument)
-    grouped_gemm_fwd      flashinfer.experimental.cake_moe_grouped_det_gemm.grouped_det_gemm_fwd
+    grouped_gemm_fwd      flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd
     grouped_gemm_dgrad    ...grouped_det_gemm_dgrad
     grouped_gemm_wgrad    ...grouped_det_gemm_wgrad
     cake_grouped_mm       ...cake_grouped_det_mm
@@ -80,7 +80,7 @@ across ranks stays with the caller.
 
 Usage::
 
-    from flashinfer.experimental.cake.grouped_mm import (
+    from flashinfer.cake_moe_grouped_gemm_nondet_train import (
         cake_grouped_mm,
         grouped_gemm_wgrad,
     )
@@ -89,7 +89,7 @@ Usage::
     dw = grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
 
     # The deterministic entries take no deterministic argument:
-    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_grouped_det_mm
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_grouped_det_mm
 
     y = cake_grouped_det_mm(x, w, offs)
 
@@ -104,7 +104,7 @@ from typing import Optional
 
 import torch
 
-from ...api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_experimental_api
 
 __all__ = [
     "cake_grouped_mm",
@@ -149,7 +149,9 @@ def grouped_gemm_fwd(
     torch.Tensor
         ``out``.  ``N % 256 == 0`` and ``K % 64 == 0`` are required.
     """
-    from .cake_moe_grouped_gemm import grouped_gemm_fwd as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+        grouped_gemm_fwd as _impl,
+    )
 
     return _impl(x, w, offs, out=out, deterministic=deterministic)
 
@@ -176,7 +178,9 @@ def grouped_gemm_dgrad(
     with L2 evict-first loads and stores; bitwise the same ``dX``).  Never
     alerts under torch's deterministic mode (fixed order).
     """
-    from .cake_moe_grouped_gemm import grouped_gemm_dgrad as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+        grouped_gemm_dgrad as _impl,
+    )
 
     return _impl(g, w, offs, out=out, deterministic=deterministic)
 
@@ -221,7 +225,9 @@ def grouped_gemm_wgrad(
     the checks of ``out`` (no overlap with itself, ``g``, ``x`` or ``offs``).
     Every call adds again.
     """
-    from .cake_moe_grouped_gemm import grouped_gemm_wgrad as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+        grouped_gemm_wgrad as _impl,
+    )
 
     return _impl(
         g,
@@ -270,7 +276,7 @@ def cake_grouped_mm(
         (Megatron's ``gradient_accumulation_fusion``): the backward adds ``dW``
         into ``w.main_grad`` (fp32 or bf16) and returns a placeholder or no
         gradient for ``w``, as
-        ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm``
+        ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm``
         documents.
 
     Returns
@@ -281,7 +287,9 @@ def cake_grouped_mm(
         ``[E, N, K]`` in ``w``'s dtype; use :func:`grouped_gemm_wgrad` for an
         fp32 weight gradient.
     """
-    from .cake_moe_grouped_gemm.cake_autograd import cake_grouped_mm as _impl
+    from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_autograd import (
+        cake_grouped_mm as _impl,
+    )
 
     return _impl(
         x,

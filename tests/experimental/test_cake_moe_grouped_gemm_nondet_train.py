@@ -49,10 +49,10 @@ from tests.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named through ``cake_package`` only; nothing
 # else of flashinfer is imported here.  The facade and the numerical-mode
-# checks live in ``test_cake_moe_grouped_gemm_api.py``, the comparisons with
+# checks live in ``test_cake_moe_grouped_gemm_nondet_train_api.py``, the comparisons with
 # the deterministic package (its routes and bits) in
-# ``test_cake_moe_grouped_gemm_reproducibility.py``.
-PACKAGE = "cake.cake_moe_grouped_gemm"
+# ``test_cake_moe_grouped_gemm_nondet_train_reproducibility.py``.
+PACKAGE = "cake_moe_grouped_gemm_nondet_train"
 pkg = cake_package(PACKAGE)
 cb = cake_package(PACKAGE, "cake_backend")
 cake_jit = cake_package(PACKAGE, "cake_jit")

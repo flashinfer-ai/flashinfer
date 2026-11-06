@@ -36,7 +36,7 @@ call is fused; it skips (``"cannot load"`` in the reason) only where the build's
 cannot load in this environment (neither prebuilt nor a JIT toolkit at its ``min_cuda``),
 where the call composes instead.
 
-``python -m tests.experimental.test_cake_moe_grouped_gemm_acc sanitize`` (from the
+``python -m tests.experimental.test_cake_moe_grouped_gemm_nondet_train_acc sanitize`` (from the
 repository root) runs one small launch of every accumulate build the device serves, with
 an unsplit and a split tail, for ``compute-sanitizer --tool memcheck | racecheck |
 synccheck``.
@@ -56,7 +56,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.experimental import test_cake_moe_grouped_gemm as base
+from tests.experimental import test_cake_moe_grouped_gemm_nondet_train as base
 
 pkg = base.pkg
 cb = base.cb
@@ -273,7 +273,7 @@ def test_docs_list_the_shipped_acc_builds():
         "flashinfer",
         "experimental",
         "cake",
-        "cake_moe_grouped_gemm",
+        "cake_moe_grouped_gemm_nondet_train",
         "README.md",
     )
     row = _doc_matrix_row(readme, "`wgrad` accumulate, fused")
@@ -286,7 +286,7 @@ def test_docs_list_the_shipped_acc_builds():
             name + ACC for name in cell.replace("`", "").replace(" ", "").split(",")
         }
         assert forms == set(SHIPPED_ACC_STAGES[route][arch]), (arch, cell)
-    rst = os.path.join(_REPO, "docs", "api", "cake_moe_grouped_gemm.rst")
+    rst = os.path.join(_REPO, "docs", "api", "cake_moe_grouped_gemm_nondet_train.rst")
     line = _doc_matrix_row(rst, "``wgrad`` accumulate, fused")
     label, rest = line.split("``out``", 1)
     assert "fp32" in label and "bf16" not in line, line
@@ -838,7 +838,7 @@ def test_accumulate_keywords_and_signatures():
     assert forward["fuse_wgrad_accumulation"].default is False
     mode = inspect.signature(pkg.cake_grouped_mm).parameters["deterministic"]
     assert mode.kind is inspect.Parameter.KEYWORD_ONLY and mode.default is True
-    facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
+    facade = pytest.importorskip("flashinfer.cake_moe_grouped_gemm_nondet_train")
     for name in ("grouped_gemm_wgrad", "cake_grouped_mm"):
         impl = (
             pkg.grouped_gemm_wgrad
@@ -996,8 +996,8 @@ def test_fuse_flag_is_refused_under_trace_and_compile(mode, monkeypatch):
 def _det_tripwires(monkeypatch):
     """Replace the deterministic package's weight gradient and autograd wrapper by
     functions that fail the test when called: nothing may route there."""
-    import flashinfer.experimental.cake_moe_grouped_det_gemm as det_pkg
-    from flashinfer.experimental.cake_moe_grouped_det_gemm import (
+    import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as det_pkg
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
         cake_autograd as det_autograd,
     )
 
@@ -1031,7 +1031,7 @@ def test_facade_accumulate_rows(monkeypatch):
     """The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package with
     ``deterministic=False``, also under torch's deterministic mode: no reroute to the
     deterministic package, no warning, no ``NotImplementedError``."""
-    facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
+    facade = pytest.importorskip("flashinfer.cake_moe_grouped_gemm_nondet_train")
     log = _facade_recorders(monkeypatch)
     sizes, n, k = [2, 2], 256, 64
     g, x, offs, out = _cpu_operands(sizes, n, k, torch.float32)
@@ -1074,7 +1074,7 @@ def test_facade_accumulate_rows_refuse_the_default_mode(monkeypatch):
     raise ``ValueError`` naming the deterministic entry and saying to pass
     ``deterministic=False``, before the checks of ``out`` and before anything runs; the
     deterministic package is never called and ``out`` is untouched."""
-    facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
+    facade = pytest.importorskip("flashinfer.cake_moe_grouped_gemm_nondet_train")
     _det_tripwires(monkeypatch)
     g, x, offs, out = _cpu_operands([2, 2], 256, 64, torch.float32)
     weight = torch.zeros(2, 256, 64, dtype=torch.bfloat16)

@@ -51,7 +51,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.experimental import test_cake_moe_grouped_det_gemm as base
+from tests.experimental import test_cake_moe_grouped_gemm_det_train as base
 
 pkg = base.pkg
 cb = base.cb

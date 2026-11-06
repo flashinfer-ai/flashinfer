@@ -1,13 +1,13 @@
-.. _apicake_moe_grouped_det_gemm:
+.. _apicake_moe_grouped_gemm_det_train:
 
 Cake deterministic ragged BF16 grouped GEMM (experimental)
 ==========================================================
 
-.. currentmodule:: flashinfer.grouped_mm
+.. currentmodule:: flashinfer.cake_moe_grouped_gemm_det_train
 
-The experimental ragged BF16 grouped GEMM entry points live in
-:mod:`flashinfer.grouped_mm` and hand off to the backend package
-:mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`: generated ragged BF16 grouped
+The experimental ragged BF16 grouped GEMM entry points live in the module
+:mod:`flashinfer.cake_moe_grouped_gemm_det_train` and hand off to the backend package
+:mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`: generated ragged BF16 grouped
 GEMM programs for the expert projections of Mixture-of-Experts layers on SM100
 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200).  Both the API and the backend
 are experimental (see :ref:`experimental`); calling one of the functions below, or
@@ -52,8 +52,8 @@ This package and its entry points are deterministic only; every public name carr
   forward (the forward programs of both Cake packages give the same bits).
 
 The non-deterministic counterpart is a separate package,
-``flashinfer.experimental.cake.cake_moe_grouped_gemm``, and its facade
-``flashinfer.experimental.cake.grouped_mm`` (see :ref:`apicake_moe_grouped_gemm`),
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``, and its facade
+``flashinfer.cake_moe_grouped_gemm_nondet_train`` (see :ref:`apicake_moe_grouped_gemm_nondet_train`),
 which take only ``deterministic=False``.  The names of this package before the
 deterministic-family rename (``flashinfer.experimental.cake_moe_grouped_gemm``,
 ``flashinfer.grouped_mm.cake``, ``grouped_gemm_*``, ``cake_grouped_mm`` and the other
@@ -144,13 +144,13 @@ same stream, outside autograd.
   ``torch.use_deterministic_algorithms(True)`` with
   ``torch.utils.deterministic.fill_uninitialized_memory`` on, torch also fills the scratch
   and the placeholder with NaN when it allocates them.  The non-deterministic package adds
-  in the kernel epilogue instead (:ref:`apicake_moe_grouped_gemm`).
+  in the kernel epilogue instead (:ref:`apicake_moe_grouped_gemm_nondet_train`).
 
 Prepared launches
 -----------------
 
 The backend package also holds the prepare-once / launch-many surface:
-``flashinfer.experimental.cake_moe_grouped_det_gemm.prepare_grouped_det_gemm_fwd``,
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.prepare_grouped_det_gemm_fwd``,
 ``prepare_grouped_det_gemm_dgrad`` and ``prepare_grouped_det_gemm_wgrad`` validate the
 arguments, bind one generated program and return a ``GroupedDetGemmLaunch`` whose
 ``launch()`` performs no allocation and no host synchronisation and is CUDA-graph

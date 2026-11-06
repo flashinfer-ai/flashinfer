@@ -13,15 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Standalone-import tests of the Cake MoE grouped GEMM package.
+Standalone-import tests of the non-deterministic Cake MoE grouped GEMM package.
 
-A copy of ``flashinfer/experimental/cake_moe_grouped_det_gemm`` must import and
+A copy of ``flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train`` must import and
 reach its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
 gate).  The package imports only itself, ``torch`` and ``tvm_ffi``; the
-experimental-API marking and the once-only warnings belong to the core entry
-points of ``flashinfer.grouped_mm`` (covered by
-``test_cake_moe_grouped_det_gemm_api.py``), so a direct call of the package emits
+experimental-API marking and the once-only warnings belong to the facade
+``flashinfer.cake_moe_grouped_gemm_nondet_train`` (covered by
+``test_cake_moe_grouped_gemm_nondet_train_api.py``), so a direct call of the package emits
 no warning, and the only ``flashinfer`` import is the JIT fallback of
 ``cake_build.py``.  CPU-only: no GPU, no generated program and no JIT build is
 needed, so every test here runs on every lane.
@@ -40,10 +40,12 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
-import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
-VENDORED_NAME = "vendored_grouped_gemm"  # the copy's top-level name in the subprocess
+VENDORED_NAME = (
+    "vendored_cake_grouped_gemm"  # the copy's top-level name in the subprocess
+)
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +101,10 @@ for name in pkg.__all__:  # the lazy re-exports load cake_backend and cake_autog
     getattr(pkg, name)
 cb = importlib.import_module(PKG_NAME + ".cake_backend")
 for name in (
-    "grouped_det_gemm_fwd",
-    "grouped_det_gemm_dgrad",
-    "grouped_det_gemm_wgrad",
-    "cake_grouped_det_mm",
+    "grouped_gemm_fwd",
+    "grouped_gemm_dgrad",
+    "grouped_gemm_wgrad",
+    "cake_grouped_mm",
 ):
     # plain functions: the experimental marking belongs to the core entry points
     assert not hasattr(getattr(pkg, name), "is_experimental"), name
@@ -113,20 +115,21 @@ def f32(*shape):
 
 
 offs = torch.tensor([2, 4], dtype=torch.int32)
-m_indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
-# float32 operands fail the bfloat16 check of the four package functions; the
-# two grouped_det_mm_bf16_cake calls fail their out_dtype / tactic checks first.
-# Every call raises ValueError before any device access.
-calls = [
-    lambda: pkg.grouped_det_gemm_fwd(f32(4, 64), f32(2, 256, 64), offs),
-    lambda: pkg.grouped_det_gemm_dgrad(f32(4, 64), f32(2, 64, 256), offs),
-    lambda: pkg.grouped_det_gemm_wgrad(f32(4, 256), f32(4, 64), offs),
-    lambda: pkg.cake_grouped_det_mm(f32(4, 64), f32(2, 256, 64), offs),
-    lambda: cb.grouped_det_mm_bf16_cake(
-        f32(4, 64), f32(2, 256, 64), m_indptr, out_dtype=torch.float32
-    ),
-    lambda: cb.grouped_det_mm_bf16_cake(f32(4, 64), f32(2, 256, 64), m_indptr, tactic=0),
-]
+# float32 operands fail the bfloat16 check of the package functions with
+# deterministic=False; without it, every function refuses the mode first.  Every
+# call raises ValueError before any device access.
+calls = []
+for mode in ({"deterministic": False}, {}):
+    calls += [
+        lambda kw=mode: pkg.grouped_gemm_fwd(f32(4, 64), f32(2, 256, 64), offs, **kw),
+        lambda kw=mode: pkg.grouped_gemm_dgrad(f32(4, 64), f32(2, 64, 256), offs, **kw),
+        lambda kw=mode: pkg.grouped_gemm_wgrad(f32(4, 256), f32(4, 64), offs, **kw),
+        lambda kw=mode: pkg.cake_grouped_mm(f32(4, 64), f32(2, 256, 64), offs, **kw),
+        lambda kw=mode: cb.prepare_grouped_gemm_wgrad(
+            f32(4, 256), f32(4, 64), offs, **kw
+        ),
+    ]
+assert not hasattr(cb, "grouped_mm_bf16_cake")  # the stable API stays deterministic
 
 with warnings.catch_warnings(record=True) as rec:
     warnings.simplefilter("always")
