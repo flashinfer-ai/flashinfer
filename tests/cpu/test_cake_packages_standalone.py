@@ -119,12 +119,6 @@ ALLOWLIST = (
         "('from ..cake_kda_det_train import'), undeclared",
     ),
     (
-        "flashinfer.experimental.cake_kda_train_kcp",
-        ("cake_kcp", "cake_kcp_jit"),
-        "they import the single-rank package across directories "
-        "('from ..cake.cake_kda_train import'), undeclared",
-    ),
-    (
         "flashinfer.experimental.cake_stepfun_moe",
         ("__init__",),
         "__init__.py decorates its entry points with flashinfer's "

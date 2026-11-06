@@ -45,6 +45,9 @@
       "cuda_toolkit": {
         "min": "12.8"
       },
+      "packages": [
+        "cake_kda_nondet_train"
+      ],
       "tvm_ffi": {
         "include_dirs": [
           "tvm_ffi.libinfo.find_include_path()",

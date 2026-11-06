@@ -16,17 +16,17 @@ limitations under the License.
 Registry and loader glue of the Cake packed KDA chunked training kernels on
 the context-parallel (KCP) route (SM100 / SM103 / SM107): the state walks,
 the transfer walk and the affine merge that :mod:`.cake_kcp` composes with the
-chunk stages of :mod:`..cake.cake_kda_nondet_train.cake_jit`, whose records this
-module never edits.
+chunk stages of ``cake_jit`` of the single-rank sibling ``cake_kda_nondet_train``
+(resolved by name through :mod:`._single_rank`), whose records this module never
+edits.
 
-This is the registry of the non-deterministic KCP package
-(``deterministic=False``).  The KCP programs have no reduction whose order a
-non-deterministic form could relax (every output tile has one writer), so every
-record here is a copy of the deterministic package's record under this
-package's library prefix (``cake_kda_train_``, the same twenty hex digits);
-the package ships and loads its own copies and never the deterministic
-package's.  The non-deterministic programs of the KCP route are the
-single-rank package's local stages.
+This is the registry of the non-deterministic KCP package.  The KCP programs
+have no reduction whose order a non-deterministic form could relax (every
+output tile has one writer), so every record here is a copy of the
+deterministic package's record under this package's library prefix
+(``cake_kda_train_``, the same twenty hex digits); the package ships and loads
+its own copies and never the deterministic package's.  The non-deterministic
+programs of the KCP route are the single-rank package's local stages.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
@@ -139,8 +139,9 @@ from typing import Any
 
 import tvm_ffi
 
-from ..cake.cake_kda_nondet_train import cake_jit
-from . import cake_build, cake_kcp_plan
+from . import _single_rank, cake_build, cake_kcp_plan
+
+cake_jit = _single_rank.module("cake_jit")
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300
 # (``sm_103a``) and R200 (``sm_107a``); the chunk stages' architectures.

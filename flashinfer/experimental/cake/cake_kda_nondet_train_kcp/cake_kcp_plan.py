@@ -22,14 +22,14 @@ queries.  Pure host metadata: nothing here reads the contents of a tensor or
 launches a kernel; the module imports ``dataclasses``, ``os``, ``torch`` and
 ``torch.distributed`` only and is importable and testable on the CPU.
 
-Numerical mode.  This is the plan of the non-deterministic KCP package
-(``deterministic=False``), a copy of the deterministic package's plan
-(``flashinfer.experimental.cake.cake_kda_det_train_kcp``): the same partitions, the
-same tables, collectives, segment plan and byte counts.  A partition, a context
-and the byte queries hold no mode; the mode is a keyword of the entry points
-(:mod:`.cake_kcp`).  The local arena and table rules the byte queries read are
-those of the non-deterministic single-rank package
-``flashinfer.experimental.cake.cake_kda_nondet_train``, imported on first use.
+Numerical mode.  This is the plan of the non-deterministic KCP package, a copy
+of the deterministic package's plan
+(``flashinfer.experimental.cake.cake_kda_det_train_kcp``): the same partitions,
+the same tables, collectives, segment plan and byte counts.  A partition, a
+context and the byte queries hold no mode; the package is the mode.  The local
+arena and table rules the byte queries read are those of the single-rank sibling
+``cake_kda_nondet_train`` (resolved by name through :mod:`._single_rank`),
+imported on first use.
 
 Partition.  ``cake_kda_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout, fragments=None)``
 cuts the global token order (``cu_seqlens`` of the packed documents, CPU
@@ -2952,10 +2952,10 @@ def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
     """Whether the existing backend's intra record of ``path`` (a :class:`cake_backend.Plan`) computes the chunk
     layout from ``cu_seqlens`` and writes the tables itself (its logical vocabulary binds ``cu_seqlens``): the kernel
     backend then hands it a scratch table set so the KCP's CPU-built tables are never rewritten by a kernel."""
-    from ..cake.cake_kda_nondet_train import (
-        cake_jit,
-    )  # the registry literal; imported here so the metadata module stays torch-only
+    from . import _single_rank
 
+    # the registry literal; imported here so the metadata module stays torch-only
+    cake_jit = _single_rank.module("cake_jit")
     record = plan.record("fwd_intra", path)
     return "cu_seqlens" in cake_jit.MODULES[record]["logical"].values()
 
@@ -3037,8 +3037,9 @@ def _lean_slots(
     note above it).  ``NSEG`` is unused: the layout has no state blocks.  ``l2n``: the plan's in-kernel Q / K L2 norm
     mode (the slot functions' seventh argument): the KCP never runs this layout with the norm (a lean workspace
     refuses it), so the slots are the flag-off occupants' in every mode."""
-    from ..cake.cake_kda_nondet_train import cake_backend
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
     R_b = cake_backend.BT * -(-NC // passes)
     unit_w, unit_p = R * H, R_b * H
     capacity = {host: per * unit_w for host, per in _LEAN_HOSTS}
@@ -3067,8 +3068,9 @@ def _lean_slots(
 def register_lean_layout():
     """Register :data:`LOCAL_LAYOUT_BWD_LEAN` on the existing backend's arenas (``cake_backend._register_route_slots``;
     idempotent) and return that backend module."""
-    from ..cake.cake_kda_nondet_train import cake_backend
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
     cake_backend._register_route_slots(LOCAL_LAYOUT_BWD_LEAN, _lean_slots)
     return cake_backend
 
@@ -3301,8 +3303,9 @@ def _takes(fn: Any, name: str) -> bool:
 @functools.cache
 def _cuda_arch(index: int) -> str | None:
     """The exported architecture of CUDA device ``index``, ``None`` when no record targets it (fixed per process)."""
-    from ..cake.cake_kda_nondet_train import cake_jit
+    from . import _single_rank
 
+    cake_jit = _single_rank.module("cake_jit")
     return cake_jit.arch_for_capability(torch.cuda.get_device_capability(index))
 
 
@@ -3347,8 +3350,9 @@ def qk_l2norm_twin(record: str) -> bool:
     """Whether the existing backend's record ``record`` is the ``_l2n`` twin of its stage, the program that normalizes
     the raw q / k rows itself: the registry's ``l2n`` key of the record lists the fused mode only (absent:
     ``["off"]``).  The key decides, not the name: a twin may carry a version suffix (``fwd_intra_l2n_v37``)."""
-    from ..cake.cake_kda_nondet_train import cake_jit
+    from . import _single_rank
 
+    cake_jit = _single_rank.module("cake_jit")
     return list(cake_jit.MODULES[record].get("l2n", ("off",))) == ["fused"]
 
 
@@ -3371,8 +3375,10 @@ def saved_rstd_record(record: str, arch: str | None) -> str:
     twin = SAVED_RSTD_TWINS.get(record)
     if twin is None or arch is None:
         return record
-    from ..cake.cake_kda_nondet_train import cake_build, cake_jit
+    from . import _single_rank
 
+    cake_build = _single_rank.module("cake_build")
+    cake_jit = _single_rank.module("cake_jit")
     try:
         entry = cake_jit.MODULES[twin]
     except KeyError:
@@ -3401,8 +3407,9 @@ def _qk_l2norm_problem(
     :data:`QK_L2NORM_GATE_STAGES` (``modes``' ``gate``, ``"g"`` when absent) selects a record (no ``ValueError``, no
     ``None``) delivered for ``arch`` with a library in ``libraries`` (``build.json``), and the readers give the
     route's order (:func:`_qk_l2norm_readers`)."""
-    from ..cake.cake_kda_nondet_train import cake_jit
+    from . import _single_rank
 
+    cake_jit = _single_rank.module("cake_jit")
     nc, docs, heads = problem
     where = f"{arch}, {sm} SMs, {docs} documents, {heads} heads, {nc} chunks"
     picked: dict[tuple[str, str], str] = {}
@@ -3443,8 +3450,11 @@ _QK_L2NORM_SERVED: dict[tuple[str, str, str | None], tuple[Any, ...]] = {}
 def _qk_l2norm_inputs() -> tuple[Any, ...]:
     """The objects :func:`qk_l2norm_missing` reads: the existing backend's entry point, plan, layout table, registry
     and libraries query, and this module's stages, grid, SM counts, layouts, slots and helpers."""
-    from ..cake.cake_kda_nondet_train import cake_backend, cake_build, cake_jit
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
+    cake_build = _single_rank.module("cake_build")
+    cake_jit = _single_rank.module("cake_jit")
     return (
         cake_backend.cake_kda_nondet_train_forward,
         cake_backend.plan,
@@ -3497,8 +3507,11 @@ def _qk_l2norm_missing(mode: str, gate: str, arch: str | None) -> str | None:
     """The uncached check of :func:`qk_l2norm_missing`."""
     if mode == "off":
         return None
-    from ..cake.cake_kda_nondet_train import cake_backend, cake_build, cake_jit
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
+    cake_build = _single_rank.module("cake_build")
+    cake_jit = _single_rank.module("cake_jit")
     if not _takes(cake_backend.cake_kda_nondet_train_forward, "use_qk_l2norm_in_kernel"):
         return "the single-rank backend does not take use_qk_l2norm_in_kernel"
     if (
@@ -3633,10 +3646,10 @@ def cake_kda_nondet_train_kcp_workspace_bytes(
     for c in ctxs:
         if c.T_r <= 0:
             continue
-        from ..cake.cake_kda_nondet_train import (
-            cake_backend,
-        )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
+        from . import _single_rank
 
+        # the existing backend's arena rule; imported here so the metadata module stays torch-only
+        cake_backend = _single_rank.module("cake_backend")
         p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate, **l2n_kw)
         if lean and local_lean_serves(p):
             a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))

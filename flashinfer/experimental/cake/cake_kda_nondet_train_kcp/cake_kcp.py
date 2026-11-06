@@ -19,32 +19,30 @@ chunked training kernels (SM100 / SM103 / SM107): the transient
 collectives, the saved set :class:`CakeKDANondetKcpSaved`, the autograd Function and the
 entry points ``cake_kda_nondet_kcp`` / ``cake_kda_nondet_train_kcp_forward`` / ``cake_kda_nondet_train_kcp_backward``.
 
-Numerical mode.  This is the non-deterministic KCP package
-(``deterministic=False``), the counterpart of
-``flashinfer.experimental.cake.cake_kda_det_train_kcp``; it imports no module of the
-deterministic packages and ships its own copies of the KCP programs.  The entry
-points take ``deterministic: bool = True`` and raise ``ValueError`` unless it
-is ``False``, so a call that only swaps the import path of the deterministic
-package fails instead of changing mode.  The KCP programs (the walks, the
-transfer walk, the affine merge, ``kcp_fwd_o``, ``kcp_dav``) and the exchanges
-are the deterministic package's: no output tile has two writers and the
-cross-rank merge is the recurrence's own order, so none of them has an order
-to relax.  The local chunk stages run the records of the non-deterministic
-single-rank package ``flashinfer.experimental.cake.cake_kda_nondet_train`` on the
-paths :data:`LOCAL_PATH_FWD` / :data:`LOCAL_PATH_BWD`: the forward runs copies
-of the deterministic programs, and on the rows of that package's
+Numerical mode.  This is the non-deterministic KCP package, the counterpart of
+``flashinfer.experimental.cake.cake_kda_det_train_kcp``; it imports no module of
+the deterministic packages and ships its own copies of the KCP programs.  The
+package is the mode: no entry takes a mode keyword, and a workspace or a saved
+set of the deterministic package raises ``ValueError`` naming the mode.  The
+KCP programs (the walks, the transfer walk, the affine merge, ``kcp_fwd_o``,
+``kcp_dav``) and the exchanges are the deterministic package's: no output tile
+has two writers and the cross-rank merge is the recurrence's own order, so none
+of them has an order to relax.  The local chunk stages run the records of the
+non-deterministic single-rank package
+``flashinfer.experimental.cake.cake_kda_nondet_train`` on the paths
+:data:`LOCAL_PATH_FWD` / :data:`LOCAL_PATH_BWD`: the forward runs copies of the
+deterministic programs, and on the rows of that package's
 ``cake_jit.S1_RECORDS`` the backward's fused gradient leaves the ``q * dq`` term
 of ``dg`` to the GLM intra program that follows it (the pair is selected
 together per rank; its plan refuses a mixed pair).  The schedule has a fixed
-order and no atomic adds: at the same topology repeated calls are bitwise
-equal, saved-mode and checkpoint-replay backwards run the same programs and
-are bitwise equal, and ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta`` are
-bitwise those of the deterministic package; ``dg`` differs from it by FP32
-rounding on the ``S1`` rows.  No path launches an unordered reduction, so no
-entry raises torch's deterministic-algorithms alert (a launch whose result can
-vary from run to run must raise it immediately before that launch).  The
-context holds no mode; a saved set is read by the backward of this package
-only.
+order and no atomic adds: at the same topology repeated calls are bitwise equal,
+saved-mode and checkpoint-replay backwards run the same programs and are bitwise
+equal, and ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta`` are bitwise those of
+the deterministic package; ``dg`` differs from it by FP32 rounding on the ``S1``
+rows.  No launch is unordered, so no entry raises an alert or a warning under
+``torch.use_deterministic_algorithms(True)`` (also with ``warn_only=True``); the
+entries never read that setting and never run the deterministic package.  The
+context holds no mode; a saved set is read by the backward of this package only.
 
 Every rank holds its own token fragments (``[T_r, H, 128]`` operands, local
 ``cu_seqlens`` with one sequence per fragment) and only recurrent-state
@@ -235,7 +233,8 @@ from metadata only, allocates the outputs and the saved set fresh per call and
 keeps only transient buffers in the workspace.  The kernels are launched
 through a dispatch table (:class:`Backend`): the shipped backend runs the
 exported programs of :mod:`.cake_kcp_jit` and the local chunk stages through
-:mod:`..cake.cake_kda_nondet_train.cake_backend`; a test may install another backend (an FP64 emulation of
+``cake_backend`` of the single-rank sibling ``cake_kda_nondet_train``
+(:mod:`._single_rank`); a test may install another backend (an FP64 emulation of
 the same ABI) for the orchestration tests.
 
 Semantics and contracts follow the KCP design note (its sections 3.5, 3.6, 6.4,
@@ -343,7 +342,9 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import functools
+import inspect
 import operator
+import sys
 import types
 import warnings
 import weakref
@@ -353,8 +354,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ..cake.cake_kda_nondet_train import cake_backend, cake_jit
-from . import cake_kcp_plan
+from . import _single_rank, cake_kcp_plan
+
+cake_backend = _single_rank.module("cake_backend")
+cake_jit = _single_rank.module("cake_jit")
 
 D = cake_backend.D  # head dimension (128)
 BT = cake_backend.BT  # tokens per chunk (64)
@@ -761,7 +764,7 @@ class Backend:
     ``run(name, args)`` launches program ``name`` (one of :data:`KCP_PROGRAMS`) with the logical arguments ``args``
     (the ABI vocabulary of the design note §14: pools, index tables, ``hg`` / ``n`` addressing scalars, modes; plus
     ``_call``, the :class:`CakeKDANondetKcpCall` the launch belongs to).  ``stage(name, call, **extra)`` launches one local chunk
-    stage of :mod:`..cake.cake_kda_nondet_train.cake_backend` at the per-rank shape.  ``dtypes`` are the storage dtypes of the operands, outputs
+    stage of the single-rank sibling's ``cake_backend`` (:mod:`._single_rank`) at the per-rank shape.  ``dtypes`` are the storage dtypes of the operands, outputs
     and states; ``local_stages`` says whether the local stages exist (the FP64 emulation folds them into its tape
     programs).  The shipped backend is :class:`KernelBackend`; tests install another with :func:`set_backend`.
     """
@@ -4164,7 +4167,6 @@ class CakeKDANondetKcpWorkspace:
                 fwd_layout=cake_kcp_plan.local_fwd_layout(kind, self.save_mode),
                 gate=self.gate,
                 **cake_kcp_plan.qk_l2norm_plan_kwargs(self.l2n),
-                deterministic=False,
             )
             return self.local
         # the lean arena: exactly the KCP forward layout and the lean backward layout, plus its tail-count table
@@ -4179,7 +4181,6 @@ class CakeKDANondetKcpWorkspace:
                 (cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY, 1),
                 (LOCAL_LAYOUT_BWD_LEAN, passes),
             ),
-            deterministic=False,
         )
         words = cake_kcp_plan.local_tail_count_words(self.local.bytes, H)
         setattr(
@@ -4676,6 +4677,41 @@ def _validate_options(kwargs: dict[str, Any]) -> CakeKDANondetKcpOptions:
         p_rule=p_rule,
         **p2,
     ).check()
+
+
+def _with_option_signature(fn):
+    """Give entry point ``fn`` the signature of the keywords it accepts: its own parameters without ``**options``,
+    then one keyword-only parameter per :data:`_OPTION_KEYS` with the default of its :class:`CakeKDANondetKcpOptions`
+    field, then ``_kcp_test_knobs`` (``None``).  ``inspect.signature(fn).bind_partial`` of any other keyword then
+    raises ``TypeError``, as for every other entry point.  The implementation still takes ``**options`` and
+    validates them with :func:`_options` (an unknown keyword is a ``TypeError`` at the call; the validated options
+    the autograd node passes on as ``_kcp_options`` are internal).  Returns ``fn`` itself."""
+    fields = {f.name: f for f in dataclasses.fields(CakeKDANondetKcpOptions)}
+    sig = inspect.signature(fn)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind is not inspect.Parameter.VAR_KEYWORD
+    ]
+    params += [
+        inspect.Parameter(
+            key,
+            inspect.Parameter.KEYWORD_ONLY,
+            default=fields[key].default,
+            annotation=fields[key].type,
+        )
+        for key in _OPTION_KEYS
+    ]
+    params.append(
+        inspect.Parameter(
+            "_kcp_test_knobs",
+            inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation="dict[str, Any] | None",
+        )
+    )
+    fn.__signature__ = sig.replace(parameters=params)
+    return fn
 
 
 def _exchange_scheme(tb: _Tables, opts: CakeKDANondetKcpOptions) -> str:
@@ -6239,6 +6275,42 @@ def _l2n_key_saved(saved: CakeKDANondetKcpSaved | None) -> tuple[Any, ...]:
     return (saved.qk_rstd,) if saved is not None and saved.qk_l2norm else ()
 
 
+# The host module of the deterministic package cake_kda_det_train_kcp, this package's sibling: its workspace type is
+# recognized through sys.modules without importing that package (none of its objects exists before it is imported).
+_DET_PARENT = __package__.rpartition(".")[0]
+_DET_KCP = (
+    f"{_DET_PARENT}.cake_kda_det_train_kcp.cake_kcp"
+    if _DET_PARENT
+    else "cake_kda_det_train_kcp.cake_kcp"
+)
+
+
+def _refuse_det_workspace(workspace: Any) -> None:
+    """A workspace of the deterministic package raises ``ValueError`` naming the mode."""
+    det = sys.modules.get(_DET_KCP)
+    if det is not None and isinstance(
+        workspace, getattr(det, "CakeKDADetKcpWorkspace", ())
+    ):
+        raise ValueError(
+            f"workspace: a {CakeKDANondetKcpWorkspace.__module__}.CakeKDANondetKcpWorkspace is required, got "
+            f"{type(workspace).__module__}.{type(workspace).__qualname__}; a workspace of the deterministic "
+            "package cake_kda_det_train_kcp serves that package's calls only"
+        )
+
+
+def _refuse_other_mode(saved: Any, workspace: Any) -> None:
+    """The backward's mode check, before any graph key, operand or tensor read: a saved set that is not a
+    :class:`CakeKDANondetKcpSaved` (the deterministic package's ``CakeKDADetKcpSaved`` has the same version and
+    members) and a workspace of the deterministic package raise ``ValueError`` naming the mode."""
+    if saved is not None and not isinstance(saved, CakeKDANondetKcpSaved):
+        raise ValueError(
+            f"saved: a {CakeKDANondetKcpSaved.__module__}.CakeKDANondetKcpSaved (the non-deterministic KCP forward) is "
+            f"required, got {type(saved).__module__}.{type(saved).__qualname__}; a saved set of the deterministic "
+            "package cake_kda_det_train_kcp is read by that package's backward"
+        )
+    _refuse_det_workspace(workspace)
+
+
 def _call_workspace(
     workspace: Any,
     backend: Any,
@@ -6251,7 +6323,7 @@ def _call_workspace(
     dtype and local stages (with the flag on, its construction checks the mode on ``device``'s architecture; its
     "eye" pool is the device's shared identity tile, :func:`_identity_tile`); otherwise ``workspace``, which must be
     a :class:`CakeKDANondetKcpWorkspace` of the call's gate and in-kernel Q / K L2 norm modes and the backend's state dtype
-    (``TypeError`` / ``ValueError``)."""
+    (``TypeError`` / ``ValueError``; a workspace of the deterministic package: ``ValueError`` naming the mode)."""
     if workspace is None:
         workspace = CakeKDANondetKcpWorkspace(
             device=device,
@@ -6263,6 +6335,7 @@ def _call_workspace(
         )
         workspace._shared_eye = True  # this call's own: the shared identity tile
     elif not isinstance(workspace, CakeKDANondetKcpWorkspace):
+        _refuse_det_workspace(workspace)
         raise TypeError("workspace must be a CakeKDANondetKcpWorkspace")
     elif workspace.gate != gate:
         raise ValueError(
@@ -6385,20 +6458,7 @@ def _prepare(
     return call, batched
 
 
-def _require_deterministic_false(deterministic: object, entry: str) -> None:
-    """Refuse every numerical mode but ``deterministic=False``: the deterministic programs are another package's
-    (a call that swaps only the import path must fail, not change mode)."""
-    if deterministic is False:  # the one accepted value (bool has no subclass)
-        return
-    if not isinstance(deterministic, bool) or deterministic:
-        raise ValueError(
-            f"{entry} is the non-deterministic context-parallel packed KDA training (deterministic=False), got "
-            f"deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.experimental.cake.cake_kda_det_train_kcp (or flashinfer.cake_kda_nondet_train_kcp with "
-            "deterministic=True)"
-        )
-
-
+@_with_option_signature
 def cake_kda_nondet_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -6417,15 +6477,13 @@ def cake_kda_nondet_train_kcp_forward(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    deterministic: bool = True,
     **options: Any,
 ) -> tuple[torch.Tensor, CakeKDANondetKcpSaved | None]:
     """The KCP forward of this rank's fragments (the KCP contract §3.2): ``out`` like ``v`` (fresh) and the saved set
     (``None`` without ``save_for_backward`` or in ``boundary_mode="replay"``).  ``ctx`` is this rank's
     ``CakeKDANondetKcpContext``; the token operands are its ``T_r`` local tokens in fragment order; ``**options`` are the
     keywords of :class:`CakeKDANondetKcpOptions` (+ ``_kcp_test_knobs``), among them ``graph="replay"`` (keyed CUDA-graph
-    capture / replay of this call; module docstring and :func:`graph_cache_clear`).  ``deterministic`` must be
-    ``False`` (:func:`_require_deterministic_false`).
+    capture / replay of this call; module docstring and :func:`graph_cache_clear`).
 
     ``use_gate_in_kernel=True`` (raw gate mode, the single-rank keywords of ``cake_backend.cake_kda_nondet_train_forward``):
     ``g`` is this rank's raw gate BF16 ``[T_r, H, 128]`` (a strided view under the single-rank rule, never copied)
@@ -6440,7 +6498,6 @@ def cake_kda_nondet_train_kcp_forward(
     stages per token and 128-channel head with eps ``1e-6`` (``v`` is not); the saved set adds the FP32
     ``qk_rstd`` ``[2, T_r, H]``.  The workspace must be of the same mode (:attr:`CakeKDANondetKcpWorkspace.qk_l2norm`).  With
     ``False`` (the default) nothing changes."""
-    _require_deterministic_false(deterministic, "cake_kda_nondet_train_kcp_forward")
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
@@ -6674,6 +6731,7 @@ def _check_saved(saved: CakeKDANondetKcpSaved, call: CakeKDANondetKcpCall) -> No
             _check(getattr(saved, n), f"saved.{n}", shape, torch.bfloat16, call.device)
 
 
+@_with_option_signature
 def cake_kda_nondet_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -6692,12 +6750,9 @@ def cake_kda_nondet_train_kcp_backward(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    deterministic: bool = True,
     **options: Any,
 ) -> tuple[torch.Tensor, ...]:
     """The KCP backward (the KCP contract §3.2): ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward.
-    ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`); ``saved`` must come from this
-    package's forward (a saved set of the deterministic package raises ``ValueError``).
 
     Raw gate mode (``use_gate_in_kernel=True`` with the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``):
     ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous, ranked like
@@ -6716,16 +6771,11 @@ def cake_kda_nondet_train_kcp_backward(
     ``use_qk_l2norm_in_kernel=True`` (the forward's; issue #7817): the same seven / five tensors, ``dq`` / ``dk`` the
     gradients of the raw ``q`` / ``k`` (contiguous, ranked like ``q``), the FP32 pullback fused into their final BF16
     store.  A saved-mode backward reads the saved ``qk_rstd``; a replay-mode backward recomputes it.  A saved set or
-    a workspace of the other mode is refused with ``ValueError``."""
-    _require_deterministic_false(deterministic, "cake_kda_nondet_train_kcp_backward")
-    if saved is not None and not isinstance(saved, CakeKDANondetKcpSaved):
-        # the deterministic package's saved set (CakeKDADetKcpSaved) has the same members; its backward reads it, this one
-        # reads its own forward's sets only (checked before a graph key reads the set's tensors)
-        raise ValueError(
-            f"saved: a {CakeKDANondetKcpSaved.__module__}.CakeKDANondetKcpSaved (the forward of deterministic=False) is required, got "
-            f"{type(saved).__module__}.{type(saved).__qualname__}; a saved set of the deterministic package is read "
-            "by that package's backward"
-        )
+    a workspace of the other mode is refused with ``ValueError``.
+
+    ``saved`` must come from this package's forward and ``workspace`` must not be one of the deterministic package
+    ``cake_kda_det_train_kcp``: either raises ``ValueError`` naming the mode before anything is read."""
+    _refuse_other_mode(saved, workspace)
     opts = _options(options)
     gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
     l2n = cake_kcp_plan.check_qk_l2norm(use_qk_l2norm_in_kernel)
@@ -7129,7 +7179,7 @@ class CakeKDANondetKcpRecomputeHandle:
     of the checkpointed function, so the recompute sees the same object::
 
         def layer(q, k, v, g, beta, handle):
-            return cake_kda_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=handle, deterministic=False)
+            return cake_kda_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
 
         out = torch.utils.checkpoint.checkpoint(layer, q, k, v, g, beta, CakeKDANondetKcpRecomputeHandle(), use_reentrant=False)
 
@@ -7590,8 +7640,7 @@ def _handoff_toolkit(arch: str) -> str | None:
     ``cake_build.record_cuda_version``: the prebuilt sidecar, else FlashInfer's JIT toolkit), ``None`` when it cannot
     be read ("auto" then stays off)."""
     try:
-        from ..cake.cake_kda_nondet_train import cake_build
-
+        cake_build = _single_rank.module("cake_build")
         major, minor = cake_build.record_cuda_version(arch)
         return f"{int(major)}.{int(minor)}"
     except Exception:  # noqa: BLE001
@@ -7814,8 +7863,7 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
     saved set has the same members either way.  The tier follows the options' ``save_transfer`` (``False``:
     ``S_in``; ``True``: also the c1 receive tensor; :func:`cake_kda_nondet_kcp` sets it from ``checkpoint_keep``).  A
     handle is refused with graph replay, inside a CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and
-    ``boundary_mode="replay"``.  The node records the mode of its forward (``deterministic=False``, the only mode of
-    this package) and its backward runs that mode.  ``handoff``: :func:`cake_kda_nondet_kcp`'s checkpoint hand-off decision
+    ``boundary_mode="replay"``.  ``handoff``: :func:`cake_kda_nondet_kcp`'s checkpoint hand-off decision
     (:func:`_handoff_decide`); ``True``: the forward keeps its tape set and the backward reads it.  Raw gate mode
     (``use_gate_in_kernel``): the node saves the raw gate (the caller's view) and ``A_log`` / ``dt_bias`` beside the
     KCP saved set, which records the mode and ``lower_bound``, and returns the gradients of the raw gate, ``A_log``
@@ -7888,7 +7936,6 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
                 save_mode=save_mode,
                 boundary_mode=boundary_mode,
                 workspace=workspace,
-                deterministic=False,
                 **gate_args,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 **options,
@@ -7916,8 +7963,6 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
         params = (A_log, dt_bias) if raw else ()
         tensors = saved.tensors() if saved is not None else ()
         fctx.save_for_backward(q, k, v, g, beta, *params, *tensors)
-        # the forward's mode; the backward runs it (and reads the saved set it wrote)
-        fctx.deterministic = False
         fctx.kcp = (
             ctx,
             scale,
@@ -7958,7 +8003,6 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
             scale=scale,
             save_mode=save_mode,
             workspace=workspace,
-            deterministic=fctx.deterministic,
             **_gate_args(raw, A_log, dt_bias, lower_bound),
             use_qk_l2norm_in_kernel=l2n,
             **options,
@@ -7981,6 +8025,7 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
         )
 
 
+@_with_option_signature
 def cake_kda_nondet_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -8001,7 +8046,6 @@ def cake_kda_nondet_kcp(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    deterministic: bool = True,
     **options: Any,
 ) -> torch.Tensor:
     """The differentiable KCP forward (the KCP contract §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``.
@@ -8055,9 +8099,7 @@ def cake_kda_nondet_kcp(
     CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and ``boundary_mode="replay"``.  Retains
     ``recompute_handle.nbytes()`` (``cake_kda_nondet_train_kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)``) while
     the handle lives.  The exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or
-    none, at the same checkpoint nesting level; a mismatch hangs or corrupts data (no check across ranks).
-    ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`); the node's backward is this package's."""
-    _require_deterministic_false(deterministic, "cake_kda_nondet_kcp")
+    none, at the same checkpoint nesting level; a mismatch hangs or corrupts data (no check across ranks)."""
     opts = _options(options)  # validate on the caller's frame
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(

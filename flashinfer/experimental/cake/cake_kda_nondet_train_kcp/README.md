@@ -1,27 +1,23 @@
 # Cake non-deterministic context-parallel (KCP) packed KDA chunked training backend (SM100 / SM103 / SM107)
 
-Experimental backend of the context-parallel route of the packed Kimi Delta
-Attention (KDA) chunked training forward and backward, the
-`deterministic=False` counterpart of
-`flashinfer.experimental.cake.cake_kda_det_train_kcp`: the packed batch is split
-over the ranks of a `torch.distributed` process group and the per-document
-state recurrences cross the rank boundaries exactly.  The public entry points
-are in `flashinfer/cake_kda_nondet_train_kcp.py` (every entry takes
-`deterministic: bool = True`; `False` selects this package); each rank runs the
-chunk stages of `flashinfer.experimental.cake.cake_kda_nondet_train` (the
-non-deterministic single-rank package) at its own shape.  Both the API and the
-backend are experimental: no compatibility guarantee.
+Backend of the context-parallel route of the packed Kimi Delta Attention
+(KDA) chunked training forward and backward, the non-deterministic
+counterpart of `flashinfer.experimental.cake.cake_kda_det_train_kcp`: the
+packed batch is split over the ranks of a `torch.distributed` process group
+and the per-document state recurrences cross the rank boundaries exactly.
+The public entry points are in `flashinfer/cake_kda_nondet_train_kcp.py`; each
+rank runs the chunk stages of `flashinfer.experimental.cake.cake_kda_nondet_train`
+(the non-deterministic single-rank package) at its own shape.  The entry
+points of `flashinfer.cake_kda_nondet_train_kcp` are a stable top-level API;
+the modules of this package are their backend.
 
 ### Numerical mode
 
-* The entry points of this package (`cake_kcp.cake_kda_nondet_kcp`,
-  `cake_kda_nondet_train_kcp_forward`, `cake_kda_nondet_train_kcp_backward`) take `deterministic: bool = True`
-  and raise `ValueError` unless it is `False`: a call that only swaps the
-  import path of the deterministic package fails instead of changing mode.
-  The facade `flashinfer.cake_kda_nondet_train_kcp` routes `deterministic=True` (the
-  default) to the deterministic package and `False` here; under
-  `torch.use_deterministic_algorithms(True)` it runs the deterministic package
-  and warns once per process.
+* The package is the mode: no entry point of this package or of the facade
+  `flashinfer.cake_kda_nondet_train_kcp` takes a mode keyword, and none runs
+  the deterministic package.  A `CakeKDADetKcpWorkspace` or a saved set of the
+  deterministic package passed to an entry point here raises `ValueError`
+  naming the mode.
 * The KCP programs (the K1 / K2 state walks, the K3 transfer walk, the K4
   affine merge, `kcp_fwd_o`, `kcp_dav`) and the exchanges are copies of the
   deterministic package's, shipped under this package's library prefix.  Every
@@ -46,16 +42,17 @@ backend are experimental: no compatibility guarantee.
   checkpoint-replay backwards run the same programs (bitwise equal, as in the
   deterministic package).  `out`, `dq`, `dk`, `dv` and `dbeta` are bitwise the
   deterministic package's; `dg` differs from it by FP32 rounding on the `S1`
-  rows (the same FP64-referenced accuracy budget).  No path launches an
-  unordered reduction, so no entry raises torch's deterministic-algorithms
-  alert.
+  rows (the same FP64-referenced accuracy budget).  No launch is unordered,
+  so no entry raises an alert or a warning under
+  `torch.use_deterministic_algorithms(True)` (also with `warn_only=True`);
+  the entries never read that setting and never run the deterministic
+  package.
 * A partition, a context and the byte queries hold no mode: they describe the
   same plan in both packages, and a context of either package serves the calls
-  of both (each package keeps its own launch tables on it).  The autograd node
-  records its forward's mode and its backward runs it; a saved set is read by
-  the backward of the package that wrote it (`CakeKDANondetKcpSaved` here, the other
-  package's set raises `ValueError`), and a workspace (`CakeKDANondetKcpWorkspace`) serves
-  this package only.
+  of both (each package keeps its own launch tables on it).  A saved set is
+  read by the backward of the package that wrote it (`CakeKDANondetKcpSaved`
+  here), and a workspace (`CakeKDANondetKcpWorkspace`) serves this package
+  only.
 * The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and
   `lower_bound`, FlashInfer #7816) runs on this package too ("Raw gate mode"
   below): the rank's local stages take the single-rank package's raw records,
@@ -72,7 +69,7 @@ backend are experimental: no compatibility guarantee.
 
 ### Names
 
-| deterministic package (`flashinfer.cake_kda_det_train_kcp`) | this package (`flashinfer.cake_kda_nondet_train_kcp`, `deterministic=False`) |
+| deterministic package (`flashinfer.cake_kda_det_train_kcp`) | this package (`flashinfer.cake_kda_nondet_train_kcp`) |
 |---|---|
 | `cake_kda_det_train_kcp_forward` | `cake_kda_nondet_train_kcp_forward` |
 | `cake_kda_det_train_kcp_backward` | `cake_kda_nondet_train_kcp_backward` |
@@ -83,6 +80,8 @@ backend are experimental: no compatibility guarantee.
 | `cake_kda_det_train_kcp_saved_bytes` | `cake_kda_nondet_train_kcp_saved_bytes` |
 | `cake_kda_det_train_kcp_comm_bytes` | `cake_kda_nondet_train_kcp_comm_bytes` |
 | `cake_kda_det_train_kcp_reduce_gate_param_grads` | `cake_kda_nondet_train_kcp_reduce_gate_param_grads` |
+| (none: no checkpoint hand-off) | `cake_kda_nondet_train_kcp_handoff_bytes` |
+| (none: no checkpoint hand-off) | `cake_kda_nondet_train_kcp_handoff_stats` |
 | `CakeKDADetKcpRecomputeHandle` | `CakeKDANondetKcpRecomputeHandle` |
 | `CakeKDADetKcpWorkspace` | `CakeKDANondetKcpWorkspace` |
 | `CakeKDADetKcpSaved` | `CakeKDANondetKcpSaved` |
@@ -92,10 +91,6 @@ backend are experimental: no compatibility guarantee.
 | `CakeKDADetKcpPartition` | `CakeKDANondetKcpPartition` |
 | `CakeKDADetKcpFragment` | `CakeKDANondetKcpFragment` |
 | `CakeKDADetKcpFunction` | `CakeKDANondetKcpFunction` |
-
-`flashinfer.kda_train` keeps the names of the deterministic package from
-before its rename (`cake_kda_nondet_kcp` among them) bound to the deterministic
-objects; this package defines none of those aliases.
 
 ## Usage
 
@@ -116,15 +111,14 @@ from flashinfer.cake_kda_nondet_train_kcp import (cake_kda_nondet_train_kcp_part
                                            cake_kda_nondet_train_kcp_workspace_bytes, cake_kda_nondet_train_kcp_saved_bytes, cake_kda_nondet_train_kcp_comm_bytes)
 from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
-nd = dict(deterministic=False)                                     # the default True is the deterministic package
-part = cake_kda_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size, **nd)      # the same object on every rank
-ctx = cake_kda_nondet_train_kcp_build_context(part, group, rank, device, **nd)           # this rank's tables and collectives
+part = cake_kda_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size)      # the same object on every rank
+ctx = cake_kda_nondet_train_kcp_build_context(part, group, rank, device)           # this rank's tables and collectives
 y_local = cake_causal_conv1d_det_kcp(x_local, conv_weight, ctx)    # the convolution before the KDA step
-out_local = cake_kda_nondet_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, **nd)   # autograd
+out_local = cake_kda_nondet_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
 out_local, saved = cake_kda_nondet_train_kcp_forward(q_local, k_local, v_local, g_local, beta_local, ctx,
-                                     save_mode="light", boundary_mode="saved", **nd)
+                                     save_mode="light", boundary_mode="saved")
 dq, dk, dv, dbeta, dg = cake_kda_nondet_train_kcp_backward(q_local, k_local, v_local, g_local, beta_local, ctx,
-                                          dout_local, saved=saved, **nd)
+                                          dout_local, saved=saved)
 ```
 
 The context is a plain frozen object, not a dataclass: the pre-forward hooks
@@ -329,7 +323,7 @@ def layer(xq, xk, xv, g, beta, hq, hk, hv):
     k = cake_causal_conv1d_det_kcp(xk, wk, ctx, recompute_handle=hk)
     v = cake_causal_conv1d_det_kcp(xv, wv, ctx, recompute_handle=hv)
     ...                                                          # split heads, normalize q / k
-    return cake_kda_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=hq, deterministic=False)   # "kda" entry of hq
+    return cake_kda_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=hq)   # "kda" entry of hq
 
 handles = [CakeKDANondetKcpRecomputeHandle() for _ in range(3)]               # per layer and micro-step
 out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, *handles, use_reentrant=False)
@@ -431,11 +425,10 @@ to +10196 MiB at CP2 H64.
 engaged call (no carry plane; the flag is the decision, a `bool`, not the
 mode); the facade `flashinfer.cake_kda_nondet_train_kcp`
 exports `cake_kda_nondet_train_kcp_saved_bytes(..., checkpoint_handoff=...)`,
-`cake_kda_nondet_train_kcp_handoff_bytes` (`0` with `deterministic=True`) and
+`cake_kda_nondet_train_kcp_handoff_bytes` and
 `cake_kda_nondet_train_kcp_handoff_stats()` (the forwards that kept a set, the backwards that read
 one and the refused requests by reason).  To opt out, pass
-`checkpoint_handoff="off"`; the deterministic package has no hand-off and
-`deterministic=True` ignores the keyword.
+`checkpoint_handoff="off"`; the deterministic package has no hand-off.
 
 The call keeps the light set outside a checkpoint pass, with
 `graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
@@ -470,7 +463,7 @@ the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
 def layer(xq, xk, xv, g, beta, h):
     q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
     ...
-    return cake_kda_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=h, deterministic=False)
+    return cake_kda_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
 
 out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, CakeKDANondetKcpRecomputeHandle(),
                                         use_reentrant=False)
@@ -490,15 +483,14 @@ on every rank).
 ```python
 from flashinfer.cake_kda_nondet_train_kcp import CakeKDANondetKcpWorkspace, cake_kda_nondet_train_kcp_reduce_gate_param_grads
 
-nd = dict(deterministic=False)
 ws = CakeKDANondetKcpWorkspace(use_gate_in_kernel=True)                        # the workspace's mode, fixed
 gate = dict(use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
 out_local, saved = cake_kda_nondet_train_kcp_forward(q_local, k_local, v_local, raw_local, beta_local, ctx,
-                                     workspace=ws, **gate, **nd)
+                                     workspace=ws, **gate)
 dq, dk, dv, dbeta, draw, dA_log_r, ddt_bias_r = cake_kda_nondet_train_kcp_backward(
     q_local, k_local, v_local, raw_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
-    **gate, **nd)
-dA_log, ddt_bias = cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log_r, ddt_bias_r, **nd)   # optional, see below
+    **gate)
+dA_log, ddt_bias = cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log_r, ddt_bias_r)   # optional, see below
 ```
 
 * The local stages run the raw records of the rank's plan
@@ -548,13 +540,12 @@ the GLM intra programs fuse the FP32 pullback into the BF16 `dq` / `dk`, so
 `q_local` / `k_local` are the rank's raw rows and the gradients are theirs.
 
 ```python
-nd = dict(deterministic=False)
 ws = CakeKDANondetKcpWorkspace(use_qk_l2norm_in_kernel=True)                   # the workspace's mode, fixed
 out_local, saved = cake_kda_nondet_train_kcp_forward(q_raw, k_raw, v_local, g_local, beta_local, ctx,
-                                     workspace=ws, use_qk_l2norm_in_kernel=True, **nd)
+                                     workspace=ws, use_qk_l2norm_in_kernel=True)
 dq_raw, dk_raw, dv, dbeta, dg = cake_kda_nondet_train_kcp_backward(
     q_raw, k_raw, v_local, g_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
-    use_qk_l2norm_in_kernel=True, **nd)
+    use_qk_l2norm_in_kernel=True)
 ```
 
 * `q_raw` / `k_raw` may be strided views, such as columns of a packed
@@ -660,6 +651,8 @@ The files of this package:
   tables and collectives, with the byte queries.
 * `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
   of a rank, the autograd `Function` and the three entry points.
+* `_single_rank.py` -- the name of the single-rank package this package
+  requires (see "Vendoring") and the import of its modules.
 * `build.test.json` -- a `cake-build/1` manifest of the same form as
   `build.json` holding the test-only programs of `cake_kcp_jit.TEST_MODULES`
   (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
@@ -681,6 +674,18 @@ The files of this package:
   `build.test.json`); the units of the deterministic package's programs under
   this package's names.
 
+## Vendoring
+
+This package needs its single-rank sibling `cake_kda_nondet_train`: it runs
+that package's chunk stages and reads its registry.  `build.json` and
+`build.test.json` declare it as `common.requires.packages:
+["cake_kda_nondet_train"]` (directory names).  `_single_rank.py` finds the
+sibling by name from this package's parent, so vendor the two directories
+together, either as siblings under one parent package or both as top-level
+packages.  Without the sibling, importing `cake_kcp` or `cake_kcp_jit` raises
+`ModuleNotFoundError` naming `cake_kda_nondet_train`.  Importing them needs
+no `flashinfer`: `flashinfer` is imported only on the JIT path.
+
 ## Status
 
 The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
@@ -695,8 +700,10 @@ registries and manifests, no device needed),
 `tests/experimental/test_cake_kda_nondet_train_kcp.py` (the per-rank path),
 `tests/experimental/test_cake_kda_nondet_train_kcp_dist.py` (multi-GPU rows, with
 the comparison against the deterministic package),
+`tests/experimental/test_cake_kda_nondet_train_kcp_standalone.py` (the two
+vendored layouts without `flashinfer`),
 `tests/experimental/test_cake_kda_nondet_train_kcp_api.py` (the public entry
-points, the mode keyword, the names and the import isolation),
+points, the names and the import isolation),
 `tests/experimental/test_cake_kda_nondet_train_kcp_handoff.py` (the checkpoint
 hand-off: multi-GPU rows bitwise against `"off"`, the admission rule, the
 once-per-call decision, the byte queries),
@@ -709,6 +716,6 @@ route),
 norm: the keywords, the strided views, the workspace, the byte queries and
 the saved set; multi-GPU rows against the single-rank path, the FP64
 reference and, bitwise, the deterministic package's KCP route in the mode),
-`_fsdp_walk.py`, `_shared_ws.py` and `_upload.py`; benchmark
+`_fsdp_walk.py`, `_lean.py`, `_shared_ws.py` and `_upload.py`; benchmark
 `benchmarks/bench_cake_kda_nondet_train_kcp.py` (`torchrun`, one process per
 rank; the deterministic and the non-deterministic package interleaved).
