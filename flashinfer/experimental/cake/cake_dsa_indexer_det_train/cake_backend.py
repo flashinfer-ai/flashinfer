@@ -56,7 +56,7 @@ Contract (the issue text is authoritative)
   ``candidate_multiplier``, ``check_period``, the sampled-threshold knobs, the
   finalize program) never change a result.
 * Memory: no ``[T, Tkv]`` score matrix.  The workspace is
-  :func:`dsa_indexer_det_workspace_size` bytes for the call's geometry -- the
+  :func:`cake_dsa_indexer_det_train_topk_workspace_size` bytes for the call's geometry -- the
   persistent candidate buffers ``grid x queries_per_unit x
   candidate_capacity(top_k) x entry_bytes`` plus, when the dispatch splits the
   key ranges, the staging ``T x n_split x top_k x entry_bytes`` -- separate
@@ -730,7 +730,7 @@ def plan_dsa_indexer_det_topk(
     return select_program(policy, **call)
 
 
-def dsa_indexer_det_workspace_size(
+def cake_dsa_indexer_det_train_topk_workspace_size(
     num_queries: int,
     num_keys: int,
     num_segments: int,
@@ -1385,7 +1385,7 @@ def prepare_dsa_indexer_det_topk(
 
     Missing outputs and the workspace are allocated here (the only allocations
     of the backend).  Pass ``workspace_buffer`` of at least
-    :func:`dsa_indexer_det_workspace_size` bytes for the call's geometry (same
+    :func:`cake_dsa_indexer_det_train_topk_workspace_size` bytes for the call's geometry (same
     ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls.
     A caller-owned buffer may be written by other runners or kernels between
     two runs of the returned runner, so where the scan program draws from the
@@ -1447,7 +1447,7 @@ def prepare_dsa_indexer_det_topk(
     )
 
 
-def dsa_indexer_det_topk(
+def cake_dsa_indexer_det_train_topk(
     q: torch.Tensor,
     k: torch.Tensor,
     w: torch.Tensor,
@@ -1540,8 +1540,8 @@ __all__ = [
     "arch_for",
     "bind_program",
     "default_softmax_scale",
-    "dsa_indexer_det_topk",
-    "dsa_indexer_det_workspace_size",
+    "cake_dsa_indexer_det_train_topk",
+    "cake_dsa_indexer_det_train_topk_workspace_size",
     "effective_offsets",
     "form_for",
     "fp8_programs_for",
@@ -1556,22 +1556,4 @@ __all__ = [
     "validate_dsa_indexer_det_inputs",
     "visible_key_count",
     "visible_key_counts",
-]
-
-
-# Previous names of the callables above: aliases of the same objects.
-DSAIndexerRunner = DSAIndexerDetRunner
-dsa_indexer_topk = dsa_indexer_det_topk
-dsa_indexer_workspace_size = dsa_indexer_det_workspace_size
-plan_dsa_indexer_topk = plan_dsa_indexer_det_topk
-prepare_dsa_indexer_topk = prepare_dsa_indexer_det_topk
-validate_dsa_indexer_inputs = validate_dsa_indexer_det_inputs
-
-__all__ += [
-    "DSAIndexerRunner",
-    "dsa_indexer_topk",
-    "dsa_indexer_workspace_size",
-    "plan_dsa_indexer_topk",
-    "prepare_dsa_indexer_topk",
-    "validate_dsa_indexer_inputs",
 ]
