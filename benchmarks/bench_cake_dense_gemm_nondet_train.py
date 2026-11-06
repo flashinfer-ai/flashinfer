@@ -14,15 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Benchmark the numerical modes of the experimental Cake dense projection GEMMs (SM100 / SM103 / SM107).
+"""Benchmark the non-deterministic Cake dense GEMMs (``flashinfer.cake_dense_gemm_nondet_train``) against the
+deterministic ones (``flashinfer.cake_dense_gemm_det_train``) and the non-Cake SOTA (SM100 / SM103 / SM107).
 
 Rows: every row of the deterministic family's benchmark table (flashinfer-ai/flashinfer#5677 and #7043): the
 projection GEMMs, the batched MLA head projections and the FP32 router x {forward, input gradient, weight gradient}
 x their token counts and output dtypes (294 rows: 124 weight gradients, 12 router rows, 158 forward / input-gradient
 rows).  Arms per row:
 
-* ``det``: the deterministic package's prepared launch (``dense_projection_det_gemm``, its production plan).
-* ``atomic``: ``deterministic=False`` through ``flashinfer.experimental.dense_projection_gemm`` (prepared): this
+* ``det``: the deterministic package's prepared launch (``cake_dense_gemm_det_train_projection_prepare`` and the
+  router and weight-gradient prepare entries, its production plan).
+* ``atomic``: the non-deterministic package (``flashinfer.cake_dense_gemm_nondet_train``, prepared): this
   package's program where its planner takes the row, else the deterministic program (``atomic_program`` says
   which).  On a delegated row (every forward and input gradient, the rows the planners leave) the arm shows that
   the dispatch costs nothing.
@@ -71,7 +73,7 @@ this package) with absolute latencies per row and mode.
 
 Usage::
 
-    python benchmarks/bench_cake_dense_projection_gemm.py [--rows indexer_hw_wgrad_bf16_t16231 ...]
+    python benchmarks/bench_cake_dense_gemm_nondet_train.py [--rows indexer_hw_wgrad_bf16_t16231 ...]
         [--families proj,mla,router] [--ops fwd,dgrad,wgrad] [--T 16231] [--only-atomic] [--steps 20]
         [--groups 5] [--modes eager,graph] [--accuracy] [--memory] [--composite] [--resident] [--exclusive]
         [--json out.json] [--csv out.csv] [--markdown out.md]
@@ -95,10 +97,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.dense_projection_det_gemm import (  # noqa: E402
+from flashinfer.experimental.cake.cake_dense_gemm_det_train import (  # noqa: E402
     cake_backend as det_backend,
 )
-from flashinfer.experimental.dense_projection_gemm import cake_backend  # noqa: E402
+from flashinfer.experimental.cake.cake_dense_gemm_nondet_train import (  # noqa: E402
+    cake_backend,
+)
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -285,58 +289,69 @@ def fresh_out(out):
 def prepare_det(spec, inp, out):
     """The deterministic package's prepared launch of the row (its production plan)."""
     if spec["family"] == "router":
-        return det_backend.prepare_router_fp32_det_gemm(inp["A"], inp["B"], out)
+        return det_backend.cake_dense_gemm_det_train_router_prepare(
+            inp["A"], inp["B"], out
+        )
     if spec["family"] == "proj" and spec["op"] == "wgrad":
-        return det_backend.prepare_projection_det_wgrad(inp["G"], inp["X"], out)
-    return det_backend.prepare_dense_projection_det_gemm(inp["A"], inp["B"], out)
+        return det_backend.cake_dense_gemm_det_train_projection_wgrad_prepare(
+            inp["G"], inp["X"], out
+        )
+    return det_backend.cake_dense_gemm_det_train_projection_prepare(
+        inp["A"], inp["B"], out
+    )
 
 
 def prepare_atomic(spec, inp, out, **knobs):
-    """``deterministic=False`` through this package (``knobs``: ``splits`` / ``block_n``, the control arm)."""
+    """This package's prepared launch of the row (``knobs``: ``splits`` / ``block_n``, the control arm)."""
     if spec["family"] == "router":
-        return cake_backend.prepare_router_fp32_gemm(
-            inp["A"], inp["B"], out, deterministic=False, **knobs
+        return cake_backend.cake_dense_gemm_nondet_train_router_prepare(
+            inp["A"], inp["B"], out, **knobs
         )
     if spec["family"] == "proj" and spec["op"] == "wgrad":
         if not knobs:
-            return cake_backend.prepare_projection_wgrad(
-                inp["G"], inp["X"], out, deterministic=False
+            return cake_backend.cake_dense_gemm_nondet_train_projection_wgrad_prepare(
+                inp["G"], inp["X"], out
             )
-        return cake_backend.prepare_dense_projection_gemm(
+        return cake_backend.cake_dense_gemm_nondet_train_projection_prepare(
             inp["X"].t(),
             inp["G"],
             out,
             transposed_out=True,
-            deterministic=False,
             **knobs,
         )
-    return cake_backend.prepare_dense_projection_gemm(
-        inp["A"], inp["B"], out, deterministic=False, **knobs
+    return cake_backend.cake_dense_gemm_nondet_train_projection_prepare(
+        inp["A"], inp["B"], out, **knobs
     )
 
 
 def convenience_det(spec, inp, out):
     """The deterministic package's convenience entry point of the row (cached plan, arena workspace)."""
     if spec["family"] == "router":
-        return lambda: det_backend.router_fp32_det_gemm(inp["A"], inp["B"], out)
+        return lambda: det_backend.cake_dense_gemm_det_train_router(
+            inp["A"], inp["B"], out
+        )
     if spec["family"] == "proj" and spec["op"] == "wgrad":
-        return lambda: det_backend.projection_det_wgrad(inp["G"], inp["X"], out)
-    return lambda: det_backend.dense_projection_det_gemm(inp["A"], inp["B"], out)
+        return lambda: det_backend.cake_dense_gemm_det_train_projection_wgrad(
+            inp["G"], inp["X"], out
+        )
+    return lambda: det_backend.cake_dense_gemm_det_train_projection(
+        inp["A"], inp["B"], out
+    )
 
 
 def convenience_atomic(spec, inp, out):
-    """``deterministic=False`` through this package's convenience entry point of the row (cached plan, arena
+    """This package's convenience entry point of the row (cached plan, arena
     workspace)."""
     if spec["family"] == "router":
-        return lambda: cake_backend.router_fp32_gemm(
-            inp["A"], inp["B"], out, deterministic=False
+        return lambda: cake_backend.cake_dense_gemm_nondet_train_router(
+            inp["A"], inp["B"], out
         )
     if spec["family"] == "proj" and spec["op"] == "wgrad":
-        return lambda: cake_backend.projection_wgrad(
-            inp["G"], inp["X"], out, deterministic=False
+        return lambda: cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(
+            inp["G"], inp["X"], out
         )
-    return lambda: cake_backend.dense_projection_gemm(
-        inp["A"], inp["B"], out, deterministic=False
+    return lambda: cake_backend.cake_dense_gemm_nondet_train_projection(
+        inp["A"], inp["B"], out
     )
 
 
@@ -344,7 +359,10 @@ def is_atomic(prepared):
     """Whether a prepared launch runs this package's program (else the deterministic package's)."""
     return isinstance(
         prepared,
-        (cake_backend.PreparedAtomicGemm, cake_backend.PreparedAtomicRouterGemm),
+        (
+            cake_backend.CakeDenseGemmNondetProjectionLaunch,
+            cake_backend.CakeDenseGemmNondetRouterLaunch,
+        ),
     )
 
 
@@ -352,7 +370,7 @@ def plan_record(prepared):
     """The plan facts of a prepared launch (and the rule-table key and value of this package's program, so a
     per-row verdict can be written into ``K1_SPLIT_RULES`` / ``ROUTER_RULES``)."""
     record = dict(template=prepared.template, grid=list(prepared.grid))
-    if isinstance(prepared, cake_backend.PreparedAtomicGemm):
+    if isinstance(prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch):
         p = prepared.plan
         # the rule key is the transposed-store launch's (M = d_in, N = d_out); a row-major plan exchanges them
         key_m, key_n = (p.M, p.N) if p.out_t else (p.N, p.M)
@@ -373,7 +391,7 @@ def plan_record(prepared):
             ],
             rule_value=[p.block_n, p.splits],
         )
-    elif isinstance(prepared, cake_backend.PreparedAtomicRouterGemm):
+    elif isinstance(prepared, cake_backend.CakeDenseGemmNondetRouterLaunch):
         p = prepared.plan
         # the rule key's (hidden, experts) of the launched GEMM, as _router_rule_spec reads them
         if p.layout == "kk":
@@ -1138,10 +1156,10 @@ def build_arms(spec, inp, args, libs, entry):
     entry["atomic_program"] = is_atomic(p)
     entry["atomic_plan"] = plan_record(p)
     control = None
-    if isinstance(p, cake_backend.PreparedAtomicGemm) and p.splits > 1:
+    if isinstance(p, cake_backend.CakeDenseGemmNondetProjectionLaunch) and p.splits > 1:
         control = dict(splits=1, block_n=p.plan.block_n)
     elif (
-        isinstance(p, cake_backend.PreparedAtomicRouterGemm)
+        isinstance(p, cake_backend.CakeDenseGemmNondetRouterLaunch)
         and p.plan.units != p.plan.tiles
     ):
         control = dict(splits=1)
@@ -1278,7 +1296,7 @@ def measure_row(label, spec, args, libs, resident, uuid):
         entry["traceback"] = traceback.format_exc()
         print(f"{label:34s} failed: {entry['error']}", flush=True)
     finally:
-        cake_backend.clear_convenience_caches()
+        cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
         torch.cuda.empty_cache()
     return entry
 
@@ -1360,12 +1378,12 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
             ("det", convenience_det),
             ("atomic", convenience_atomic),
         ):
-            cake_backend.clear_convenience_caches()
+            cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
             fn = convenience(spec, inp, outs[mode])
             retained, peak = memory_of(lambda fn=fn: first_call(fn))
             mem[f"{mode}_convenience_retained"] = retained
             mem[f"{mode}_convenience_peak_temp"] = peak
-        cake_backend.clear_convenience_caches()
+        cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
         entry["memory_bytes"] = mem
     if args.host_overhead:
         entry["host_us_prepared"] = {
