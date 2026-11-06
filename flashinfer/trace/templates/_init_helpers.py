@@ -137,7 +137,7 @@ def make_probs(
     """Return a ``[batch_size, vocab_size]`` probability distribution.
 
     Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the
-    pattern used throughout ``tests/utils/test_sampling.py``.
+    pattern used throughout ``tests/sampling/test_sampling.py``.
     """
     return torch.softmax(
         torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),

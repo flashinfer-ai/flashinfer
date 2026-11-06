@@ -271,7 +271,7 @@ def _aggregate_from_junit_xml(
 
     Each entry in *junit_xml_dirs* is ``(lane_name, directory)`` where directory
     contains ``*.xml`` files written by ``pytest --junitxml``.  The XML file
-    names encode the source file path (e.g. ``tests/utils/test_sampling.py.xml``).
+    names encode the source file path (e.g. ``tests/sampling/test_sampling.py.xml``).
 
     For each testcase element we read the outcome (passed/failed/skipped) and
     accumulate into the existing *results* dict under the given lane.

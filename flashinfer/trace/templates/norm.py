@@ -32,7 +32,7 @@ def _norm_check(
 ):
     from flashinfer.trace import default_check
 
-    # Matches tests/utils/test_norm.py for rmsnorm/gemma_rmsnorm.
+    # Matches tests/norm/test_norm.py for rmsnorm/gemma_rmsnorm.
     rtol = 1e-3 if rtol is None else rtol
     atol = 1e-3 if atol is None else atol
     return default_check(
@@ -56,7 +56,7 @@ def _layernorm_check(
 ):
     from flashinfer.trace import default_check
 
-    # Matches tests/utils/test_norm.py::test_layernorm.
+    # Matches tests/norm/test_norm.py::test_layernorm.
     rtol = 1e-2 if rtol is None else rtol
     atol = 1e-2 if atol is None else atol
     return default_check(
@@ -80,7 +80,7 @@ def _rmsnorm_quant_check(
 ):
     from flashinfer.trace import default_check
 
-    # Matches tests/utils/test_norm.py FP8 norm quantization checks.
+    # Matches tests/norm/test_norm.py FP8 norm quantization checks.
     rtol = 1.0 if rtol is None else rtol
     atol = 1.0 if atol is None else atol
     return default_check(
@@ -115,7 +115,7 @@ def _fused_add_rmsnorm_quant_check(
         ref_quant, ref_residual = reference_outputs
         actual_quant, actual_residual = actual_outputs
 
-    # Matches tests/utils/test_norm.py::test_fused_add_rmsnorm_quant:
+    # Matches tests/norm/test_norm.py::test_fused_add_rmsnorm_quant:
     # FP8 output uses rtol/atol=1; residual update uses rtol/atol=1e-3.
     quant_rtol = 1.0 if quant_rtol is None else quant_rtol
     quant_atol = 1.0 if quant_atol is None else quant_atol
@@ -195,7 +195,7 @@ def _rmsnorm_init(
 ):
     """Build inputs for ``flashinfer.rmsnorm``.
 
-    Sourced from ``tests/utils/test_norm.py::test_norm`` (contiguous path):
+    Sourced from ``tests/norm/test_norm.py::test_norm`` (contiguous path):
     ``input ~ randn(batch_size, hidden_size)``, ``weight ~ randn(hidden_size)``.
     Default ``hidden_size=4096`` matches Llama-3.1-8B.
     """
@@ -251,7 +251,7 @@ def _fused_add_rmsnorm_init(
 ):
     """Build inputs for ``flashinfer.fused_add_rmsnorm``.
 
-    Sourced from ``tests/utils/test_norm.py::test_fused_add_rmsnorm``.
+    Sourced from ``tests/norm/test_norm.py::test_fused_add_rmsnorm``.
     Default ``hidden_size=5120`` matches Qwen3-14B (per the example call).
     """
     torch.manual_seed(seed)
@@ -572,7 +572,7 @@ def _rmsnorm_quant_init(
 ):
     """Build inputs for ``flashinfer.rmsnorm_quant``.
 
-    Sourced from ``tests/utils/test_norm.py::test_norm_quant``. Default
+    Sourced from ``tests/norm/test_norm.py::test_norm_quant``. Default
     ``hidden_size=7168`` matches DeepSeek-V3 down_proj.
     """
     torch.manual_seed(seed)
@@ -645,7 +645,7 @@ def _fused_add_rmsnorm_quant_init(
 ):
     """Build inputs for ``flashinfer.fused_add_rmsnorm_quant``.
 
-    Sourced from ``tests/utils/test_norm.py::test_fused_add_rmsnorm_quant``.
+    Sourced from ``tests/norm/test_norm.py::test_fused_add_rmsnorm_quant``.
     """
     torch.manual_seed(seed)
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
@@ -719,7 +719,7 @@ def _gemma_rmsnorm_init(
 ):
     """Build inputs for ``flashinfer.gemma_rmsnorm``.
 
-    Sourced from ``tests/utils/test_norm.py::test_gemma_norm``. Default
+    Sourced from ``tests/norm/test_norm.py::test_gemma_norm``. Default
     ``hidden_size=4608`` matches Gemma-2-27B.
     """
     torch.manual_seed(seed)
@@ -773,7 +773,7 @@ def _gemma_fused_add_rmsnorm_init(
 ):
     """Build inputs for ``flashinfer.gemma_fused_add_rmsnorm``.
 
-    Sourced from ``tests/utils/test_norm.py::test_gemma_fused_add_rmsnorm``.
+    Sourced from ``tests/norm/test_norm.py::test_gemma_fused_add_rmsnorm``.
     """
     torch.manual_seed(seed)
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
@@ -831,7 +831,7 @@ def _layernorm_init(
 ):
     """Build inputs for ``flashinfer.layernorm``.
 
-    Sourced from ``tests/utils/test_norm.py::test_layernorm``. Default
+    Sourced from ``tests/norm/test_norm.py::test_layernorm``. Default
     ``hidden_size=768`` matches GPT-2/BERT base. ``gemma`` (gamma) and
     ``beta`` are float32 as required by the API.
     """

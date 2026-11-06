@@ -62,7 +62,7 @@ def test_rope_quantize_fp8_reference_correctness(shape_kwargs):
     _assert_finite(
         q_r_api, k_r_api, q_n_api, k_n_api, q_r_ref, k_r_ref, q_n_ref, k_n_ref
     )
-    # Match tolerance used by tests/attention/test_rope.py's rope_quantize_fp8
+    # Match tolerance used by tests/rope/test_rope.py's rope_quantize_fp8
     # coverage: generous rtol (2e-1) absorbs single-ULP FP8 rounding between
     # the CUDA kernel and torch's FP8 cast while still catching real bugs.
     _check(

@@ -52,7 +52,7 @@ from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cake_fp4_allreduce import gen_cake_fp4_allreduce_aot_modules
 from .jit.cpp_ext import get_cuda_version
-from .jit.fp4_quantization import (
+from .jit.quantization.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
@@ -62,8 +62,8 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
 )
-from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
-from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.quantization.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
+from .jit.quantization.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.blackwell_msa import (
     BLACKWELL_MSA_VARIANTS_BY_TARGET,
     BlackwellMSATarget,
@@ -101,7 +101,7 @@ from .jit.cake_kda_packed_t1 import (
 )
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
-from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.quantization.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
@@ -208,7 +208,7 @@ from .jit.cake_vsa_sm120 import (
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
-from .jit.rmsnorm_silu import (
+from .jit.norm.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
     select_knobs,
     _estimate_ctas_per_row,

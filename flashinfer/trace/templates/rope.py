@@ -345,7 +345,7 @@ def _rope_ragged_init(
 
     ``nnz`` is the total token count; ``batch_size`` controls how many
     sequences they're split across. ``batch_size_plus_1`` is derived.
-    Sourced from ``tests/attention/test_rope.py`` and the example call
+    Sourced from ``tests/rope/test_rope.py`` and the example call
     in ``tests/trace/example.py``.
     """
     del batch_size_plus_1  # derived
@@ -827,7 +827,7 @@ def _rope_quantize_fp8_init(
 ):
     """Build inputs for ``rope_quantize_fp8``.
 
-    Mirrors ``tests/attention/test_rope.py``: GQA K tensors are 3D and the
+    Mirrors ``tests/rope/test_rope.py``: GQA K tensors are 3D and the
     unit-test path uses interleaved RoPE (``is_neox=False``).
     """
     torch.manual_seed(seed)
@@ -869,7 +869,7 @@ def _mla_rope_quantize_fp8_init(
 ):
     """Build inputs for ``mla_rope_quantize_fp8``.
 
-    This mirrors ``tests/attention/test_rope.py``: Q tensors are 3D, while
+    This mirrors ``tests/rope/test_rope.py``: Q tensors are 3D, while
     rank-compressed MLA K tensors are 2D ``[nnz, dim]``.
     """
     torch.manual_seed(seed)

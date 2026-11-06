@@ -51,7 +51,7 @@ def _top_k_sampling_init(
 ):
     """Build inputs for ``flashinfer.top_k_sampling_from_probs``.
 
-    Sourced from ``tests/utils/test_sampling.py``: probs is ``softmax(randn)``
+    Sourced from ``tests/sampling/test_sampling.py``: probs is ``softmax(randn)``
     so it sums to 1 along the vocab axis; ``top_k`` is a per-row int32
     tensor (here filled with 50, matching the example call).
     """

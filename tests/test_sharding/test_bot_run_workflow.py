@@ -48,9 +48,9 @@ class RunCommandTests(unittest.TestCase):
             ("full", []), scope.parse_run_command("@FlashInfer-bot RUN ALL")
         )
         self.assertEqual(
-            ("manual", ["tests/moe", "tests/attention/test_rope.py"]),
+            ("manual", ["tests/moe", "tests/rope/test_rope.py"]),
             scope.parse_run_command(
-                "@flashinfer-bot run tests/moe tests/attention/test_rope.py"
+                "@flashinfer-bot run tests/moe tests/rope/test_rope.py"
             ),
         )
         for command in (
@@ -274,7 +274,7 @@ if os.getenv('SELECT_FAIL'):
     sys.exit(1)
 mode = os.getenv('SCOPE_MODE', 'automatic')
 Path(arg('--output')).write_text(json.dumps({'head_sha':'head-A','mode':mode,
-    'chunks':['tests/attention/test_rope.py'] if mode in ('manual','advisory') or os.getenv('AUTOMATIC_PATHS') else [],
+    'chunks':['tests/rope/test_rope.py'] if mode in ('manual','advisory') or os.getenv('AUTOMATIC_PATHS') else [],
     'snapshot':None if mode != 'automatic' or os.getenv('BAD_SNAPSHOT') else {
         'head_sha':'head-A','base_sha':'b'*40,'merge_sha':'c'*40,'tree_sha':'d'*40}}))
 Path(arg('--note')).write_text('AI scope recommendation; review before running')

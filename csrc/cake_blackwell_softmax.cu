@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <flashinfer/cake_blackwell_softmax.cuh>
-#include <flashinfer/sampling.cuh>
+#include <flashinfer/sampling/sampling.cuh>
 #include <limits>
 #include <vector>
 

@@ -1811,7 +1811,7 @@ except ImportError:
 # Fused RMSNorm + SiLU kernel (SM100 optimized)
 # ============================================================
 
-from ..jit.rmsnorm_silu import (
+from ..jit.norm.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
     select_knobs,
     _estimate_ctas_per_row,

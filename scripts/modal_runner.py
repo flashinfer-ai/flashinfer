@@ -4,7 +4,7 @@ Modal runner script for FlashInfer testing and benchmarking.
 
 Usage:
     # Run tests (default B200)
-    modal run scripts/modal_runner.py --command "pytest tests/utils/test_norm.py -v"
+    modal run scripts/modal_runner.py --command "pytest tests/norm/test_norm.py -v"
 
     # Specify GPU type
     modal run scripts/modal_runner.py --gpu H100 --command "pytest tests/attention/test_hopper.py -v"
@@ -163,7 +163,7 @@ def run_gpu(command: str) -> str:
 
 @app.local_entrypoint()
 def main(
-    command: str = "pytest tests/utils/test_norm.py -v",
+    command: str = "pytest tests/norm/test_norm.py -v",
     gpu: str = "B200",
 ):
     """

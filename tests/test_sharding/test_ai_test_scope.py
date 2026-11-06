@@ -26,7 +26,7 @@ SOURCES = {
     "scripts/task_run_unit_tests.sh": 'python scripts/test_sharding/runner.py "$@"',
     "tests/conftest.py": "# CPU/GPU routing is inspected, not imported\n",
     "flashinfer/rope.py": "def apply_rope(x):\n    return x\n",
-    "tests/attention/test_rope.py": "from flashinfer.rope import apply_rope\ndef test_rope():\n    assert apply_rope(1) == 1\n",
+    "tests/rope/test_rope.py": "from flashinfer.rope import apply_rope\ndef test_rope():\n    assert apply_rope(1) == 1\n",
     "tests/sampling/test_sampling.py": "def test_sampling():\n    pass\n",
     "tests/test_sharding/test_manifest.py": "def test_manifest():\n    pass\n",
     "tests/ignored/test_old.py": "def test_old():\n    pass\n",
@@ -37,7 +37,7 @@ CI_FILES = {
 }
 
 
-def target(path="tests/attention/test_rope.py"):
+def target(path="tests/rope/test_rope.py"):
     return {
         "path": path,
         "reason": "Exercises changed rotary positions",
@@ -51,7 +51,7 @@ class FakeInference:
 
     def __init__(self, outputs=None):
         self.outputs = outputs or [
-            {"read_paths": ["flashinfer/rope.py", "tests/attention/test_rope.py"]},
+            {"read_paths": ["flashinfer/rope.py", "tests/rope/test_rope.py"]},
             {"outcome": "selected", "targets": [target()]},
         ]
         self.calls = []
@@ -65,7 +65,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
     def test_evidence_can_reference_ci_files_already_supplied_in_context(self):
         self.inference.outputs[0]["read_paths"].extend(CI_FILES)
         result = self.selector.select(PR)
-        self.assertEqual(["tests/attention/test_rope.py"], result.paths)
+        self.assertEqual(["tests/rope/test_rope.py"], result.paths)
         self.assertFalse(
             any(
                 call.args[1].removeprefix("blob:") in CI_FILES
@@ -114,7 +114,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
         self,
     ):
         result = self.selector.select(PR)
-        self.assertEqual(["tests/attention/test_rope.py"], result.paths)
+        self.assertEqual(["tests/rope/test_rope.py"], result.paths)
         self.github.get_repository_tree.assert_called_once_with(
             "upstream/flashinfer", "tree-42"
         )
@@ -126,7 +126,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
             "tests/ignored/test_old.py", first_context["candidate_test_files"]
         )
         self.assertIn(
-            "tests/attention/test_rope.py", self.inference.calls[1][0]["source_files"]
+            "tests/rope/test_rope.py", self.inference.calls[1][0]["source_files"]
         )
         self.assertIn("AI-suggested pytest targets", result.note("commit-42"))
         self.assertIn("CUDA GPU", result.note("commit-42"))
@@ -145,11 +145,11 @@ class PytestTargetSelectorTests(unittest.TestCase):
     def test_collapses_overlapping_targets(self):
         self.inference.outputs[1]["targets"] = [
             target(),
-            target("tests/attention/"),
+            target("tests/rope/"),
             target(),
         ]
         result = self.selector.select(PR)
-        self.assertEqual(["tests/attention"], result.paths)
+        self.assertEqual(["tests/rope"], result.paths)
 
     def test_target_explanations_are_sanitized_but_commands_remain_copyable(self):
         prose = "@FlashInfer-bot <!-- ci-bot-notification:copied -->\nsecret-value"
@@ -164,7 +164,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
                 value,
             )
         self.assertIn(
-            "@flashinfer-bot run tests/attention/test_rope.py", result.note("commit-42")
+            "@flashinfer-bot run tests/rope/test_rope.py", result.note("commit-42")
         )
 
     def test_public_timeout_leaves_room_for_workflow_feedback(self):
@@ -177,7 +177,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
             "tests/missing.py",
             "tests/sampling/test_sampling.py",
             "tests/",
-            "tests/attention/test_rope.py::test_rope",
+            "tests/rope/test_rope.py::test_rope",
             "--full",
             "../../etc/passwd",
             "tests/attention;echo",
@@ -187,7 +187,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.selector.inference = FakeInference(
                     [
-                        {"read_paths": ["tests/attention/test_rope.py"]},
+                        {"read_paths": ["tests/rope/test_rope.py"]},
                         {"outcome": "selected", "targets": [target(path)]},
                     ]
                 )
@@ -208,12 +208,12 @@ class PytestTargetSelectorTests(unittest.TestCase):
                 self.assertEqual([path], result.paths)
 
     def test_rejects_obvious_unconditional_module_skip(self):
-        original = SOURCES["tests/attention/test_rope.py"]
+        original = SOURCES["tests/rope/test_rope.py"]
         with (
             patch.dict(
                 SOURCES,
                 {
-                    "tests/attention/test_rope.py": 'import pytest\npytestmark = pytest.mark.skip(reason="disabled")\n'
+                    "tests/rope/test_rope.py": 'import pytest\npytestmark = pytest.mark.skip(reason="disabled")\n'
                     + original
                 },
             ),
@@ -270,7 +270,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
             {"outcome": "full", "targets": []},
         ):
             self.selector.inference = FakeInference(
-                [{"read_paths": ["tests/attention/test_rope.py"]}, result]
+                [{"read_paths": ["tests/rope/test_rope.py"]}, result]
             )
             with self.assertRaises(TargetSelectionError):
                 self.selector.select(PR)
@@ -281,7 +281,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
             output.pop(field)
             self.selector.inference = FakeInference(
                 [
-                    {"read_paths": ["tests/attention/test_rope.py"]},
+                    {"read_paths": ["tests/rope/test_rope.py"]},
                     {"outcome": "selected", "targets": [output]},
                 ]
             )
@@ -291,7 +291,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
     def test_evidence_requests_cannot_escape_inventory(self):
         for paths in (
             ["../../.env"],
-            ["tests/attention/test_rope.py"] * 21,
+            ["tests/rope/test_rope.py"] * 21,
             ["https://attacker.example"],
         ):
             self.selector.inference = FakeInference([{"read_paths": paths}])
@@ -335,21 +335,21 @@ class PytestTargetSelectorTests(unittest.TestCase):
     def test_changed_test_body_is_included_before_model_file_requests(self):
         self.github.get_pr_files.return_value = [
             {
-                "filename": "tests/attention/test_rope.py",
+                "filename": "tests/rope/test_rope.py",
                 "status": "added",
                 "patch": "@@ added",
             }
         ]
         self.inference.outputs[0] = {"read_paths": []}
         result = self.selector.select(PR)
-        self.assertEqual(["tests/attention/test_rope.py"], result.paths)
+        self.assertEqual(["tests/rope/test_rope.py"], result.paths)
         self.assertEqual(
-            SOURCES["tests/attention/test_rope.py"],
-            self.inference.calls[0][0]["source_files"]["tests/attention/test_rope.py"],
+            SOURCES["tests/rope/test_rope.py"],
+            self.inference.calls[0][0]["source_files"]["tests/rope/test_rope.py"],
         )
 
     def test_oversized_changed_test_is_reported_unavailable_in_both_requests(self):
-        name = "tests/attention/test_rope.py"
+        name = "tests/rope/test_rope.py"
         self.github.get_pr_files.return_value = [{"filename": name, "status": "added"}]
         for blob in self.github.get_repository_tree.return_value["tree"]:
             if blob["path"] == name:
@@ -376,15 +376,15 @@ class PytestTargetSelectorTests(unittest.TestCase):
             patch("ai_test_scope.MAX_CONTEXT_CHARS", 20_000),
         ):
             result = self.selector.select(PR)
-        self.assertEqual(["tests/attention/test_rope.py"], result.paths)
+        self.assertEqual(["tests/rope/test_rope.py"], result.paths)
         context = self.inference.calls[1][0]
         self.assertNotIn("flashinfer/rope.py", context["source_files"])
         self.assertEqual(
             "context budget", context["unavailable_evidence"]["flashinfer/rope.py"]
         )
         self.assertEqual(
-            SOURCES["tests/attention/test_rope.py"],
-            context["source_files"]["tests/attention/test_rope.py"],
+            SOURCES["tests/rope/test_rope.py"],
+            context["source_files"]["tests/rope/test_rope.py"],
         )
 
     def test_verbose_explanations_are_bounded_after_escaping(self):

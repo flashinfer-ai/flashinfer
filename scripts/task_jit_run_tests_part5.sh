@@ -17,7 +17,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Separate processes release CUDA memory between files.
 pytest -s tests/attention/test_batch_prefill_kernels.py -k 'nvfp4 and large_head_bf16'
-pytest -s tests/utils/test_logits_processor.py
+pytest -s tests/logits_processor/test_logits_processor.py
 pytest -s tests/attention/test_block_sparse.py
 pytest -s tests/attention/test_cake_vsa_planning.py
 pytest -s tests/cli/test_cli_cmds.py

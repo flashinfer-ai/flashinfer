@@ -41,7 +41,7 @@ def _gated_act_init(
 
     ``hidden_size`` is the full gated input width (``2 * H_out``). Default
     16384 mirrors LLaMA FFN (H_out=8192). Sourced from
-    ``tests/utils/test_activation.py`` and the example call in
+    ``tests/activation/test_activation.py`` and the example call in
     ``tests/trace/example.py``.
     """
     del hidden_div_2  # derived from hidden_size
@@ -212,7 +212,7 @@ def _silu_and_mul_scaled_nvfp4_experts_quantize_init(
     """Build inputs for ``silu_and_mul_scaled_nvfp4_experts_quantize``.
 
     Sourced from
-    ``tests/utils/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``.
+    ``tests/quantization/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``.
     The mask is per-expert token count (shape ``(B,)``) — *not* a 3-D
     boolean mask despite the trace template's ``dim_names``. The global
     scale is per-expert (shape ``(B,)``) computed from the absmax of the
@@ -227,7 +227,7 @@ def _silu_and_mul_scaled_nvfp4_experts_quantize_init(
     a = torch.randn((B, M, K_doubled), dtype=torch.bfloat16, device=device)
     mask = torch.randint(low=1, high=M + 1, size=(B,), dtype=torch.int32, device=device)
     # Per-expert global_sf computed from amax of silu_and_mul(a), matching
-    # ``tests/utils/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``:
+    # ``tests/quantization/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``:
     #   ref_y       = silu_and_mul(a)               # [B, M, K]
     #   tensor_amax = ref_y.abs().amax(dim=(1, 2))  # [B]
     #   global_sf   = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax

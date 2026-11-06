@@ -13,5 +13,5 @@ if [ "$SKIP_INSTALL" = "0" ]; then
 fi
 
 # Separate processes release CUDA memory between files.
-pytest -s tests/utils/test_sampling.py
-pytest -s tests/utils/test_topk.py
+pytest -s tests/sampling/test_sampling.py
+pytest -s tests/topk/test_topk.py

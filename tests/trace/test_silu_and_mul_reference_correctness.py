@@ -18,7 +18,7 @@ def test_silu_and_mul_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.activation import silu_and_mul_trace
 
-    # tests/utils/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
+    # tests/activation/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
     inputs = silu_and_mul_trace.init(**shape_kwargs)
     inputs["input"] = inputs["input"].to(torch.float16)
     _assert_finite(inputs["input"])

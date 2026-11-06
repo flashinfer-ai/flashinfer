@@ -2478,7 +2478,9 @@ def scaled_fp4_grouped_quantize(
 
 @functools.cache
 def get_fp4_kv_dequantization_module():
-    from ..jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
+    from ..jit.quantization.fp4_kv_dequantization import (
+        gen_fp4_kv_dequantization_module,
+    )
 
     module = gen_fp4_kv_dequantization_module().build_and_load()
 
@@ -2558,7 +2560,7 @@ def get_fp4_kv_dequantization_module():
 
 @functools.cache
 def get_fp4_kv_quantization_module():
-    from ..jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+    from ..jit.quantization.fp4_kv_quantization import gen_fp4_kv_quantization_module
 
     module = gen_fp4_kv_quantization_module().build_and_load()
 

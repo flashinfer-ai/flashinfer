@@ -31,7 +31,7 @@ from ..jit.cake_grouped_mxfp8_quantize import (
     TILED_WIDE_F16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
 )
 from ..jit.cake_program import CakeProgram
-from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from ..jit.quantization.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..jit.quantization import gen_quantization_module
 from ..utils import (
     device_support_pdl,

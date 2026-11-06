@@ -1902,7 +1902,7 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric(
     )
 
     # --- bf16 source K/V, quantized via the in-tree NVFP4 KV quantization
-    # kernel (the helper tests/utils/test_fp4_kv_quantization.py exercises).
+    # kernel (the helper tests/quantization/test_fp4_kv_quantization.py exercises).
     # It quantizes row-wise over the last dim, so asymmetric K/V widths
     # quantize naturally. ---
     k_bf16 = torch.randn(

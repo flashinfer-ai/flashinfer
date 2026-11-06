@@ -526,7 +526,7 @@ class TestCacheKey:
 def test_resolve_canonicalizes_subclass_to_base(recipe):
     """A subclass must not reach a ``@functools.cache`` key.
 
-    ``tests/utils/test_fp4_quantize.py`` subclasses ``NVFP44Over6Config`` purely
+    ``tests/quantization/test_fp4_quantize.py`` subclasses ``NVFP44Over6Config`` purely
     to attach a readable pytest id.  A dataclass ``__eq__`` requires
     ``other.__class__ is self.__class__``, and the extra field changes the
     hash, so an un-canonicalized subclass would compile (and cache to disk) a

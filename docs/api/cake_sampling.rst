@@ -133,7 +133,7 @@ the precision level and the selection exactness may not):
   key are broken by the lower index: the 64-bit ``(key, ~index)`` composite is a total order, so every exact
   selection yields the same set and the same slab order).
 * **Top-p cut**: equal to the float64 reference, except when the exact cumulative mass lies within ``eps = 1e-6``
-  of ``top_p`` times the top-k mass, where the cut may differ by one element (``tests/utils/test_cake_sampling.py``
+  of ``top_p`` times the top-k mass, where the cut may differ by one element (``tests/sampling/test_cake_sampling.py``
   places rows on that boundary and checks both sides).
 * **Sample**: always inside the exact support (the kept prefix); run-to-run deterministic for identical inputs,
   ``philox_seed`` and ``philox_offset`` (CUDA-graph replay, concurrent streams and repeated invocation included);

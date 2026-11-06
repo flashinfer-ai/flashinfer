@@ -53,20 +53,16 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
             "logits_cap",
             "mla_page",
             "mla_paged_attention_fuzz",
-            "rope",
             "sliding_window",
             "tensor_cores_decode",
         ],
-        "utils": [
-            "jit_example",
-            "jit_warmup",
-            "logits_processor",
-            "norm",
-            "quantization",
-            "sampling",
-            "sampling_fuzz",
-            "topk",
-        ],
+        "utils": ["jit_example", "jit_warmup"],
+        "logits_processor": ["logits_processor"],
+        "norm": ["norm"],
+        "quantization": ["quantization"],
+        "rope": ["rope"],
+        "sampling": ["sampling", "sampling_fuzz"],
+        "topk": ["topk"],
         "cli": ["cli_cmds", "cli_cmds_gpu"],
         "moe": ["bgmv_moe", "bgmv_moe_lora_delta"],
         "gemm": ["group_gemm"],
@@ -83,8 +79,8 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
     assert set(counts.values()) == {1}
     assert set(coverage(SCRIPTS)) == files
     assert coverage([ROOT / "scripts/task_jit_run_tests_t4.sh"]) == [
-        "tests/utils/test_sampling.py",
-        "tests/utils/test_topk.py",
+        "tests/sampling/test_sampling.py",
+        "tests/topk/test_topk.py",
     ]
     assert (
         sum(s.read_text().count("bash tests/moe_ep/run_tests.sh unit") for s in SCRIPTS)

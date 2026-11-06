@@ -17,5 +17,5 @@ fi
 pytest -s tests/attention/test_logits_cap.py
 pytest -s tests/attention/test_sliding_window.py
 pytest -s tests/attention/test_tensor_cores_decode.py
-pytest -s tests/utils/test_norm.py
+pytest -s tests/norm/test_norm.py
 pytest -s tests/utils/test_jit_warmup.py

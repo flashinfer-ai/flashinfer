@@ -16,7 +16,7 @@ flags, so they do not make their directory eligible.
 Usage::
 
     targeted_lane_scope.py --scripts scripts/task_jit_run_tests_part{1..5}.sh \\
-        --targets "tests/attention/ tests/utils/test_topk.py"
+        --targets "tests/attention/ tests/topk/test_topk.py"
 
 Prints the narrowed scope on one line; an empty line means nothing requested is
 covered and the lane should not be scheduled. Targets are files or directories

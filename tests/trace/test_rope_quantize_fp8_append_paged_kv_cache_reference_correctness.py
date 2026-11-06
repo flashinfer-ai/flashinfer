@@ -85,7 +85,7 @@ def test_rope_quantize_fp8_append_paged_kv_cache_reference_correctness(shape_kwa
         page_size=inputs["page_size"],
         kv_layout=inputs["kv_layout"],
     )
-    # Match tests/attention/test_rope.py FP8 rope quantize tolerance for Q.
+    # Match tests/rope/test_rope.py FP8 rope quantize tolerance for Q.
     # (The paged K/V append half uses an implementation-specific internal
     # layout — nope/rope interleave order varies between kernel versions —
     # so we only compare the Q outputs here, which are portable.)

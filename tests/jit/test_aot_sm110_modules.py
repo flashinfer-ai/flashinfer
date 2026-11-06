@@ -171,7 +171,10 @@ SHARED_GENERATORS = [
     ("flashinfer.jit.gemm.core", "gen_gemm_sm100_module_cutlass_fp4"),
     ("flashinfer.jit.gemm.core", "gen_gemm_sm100_module_cutlass_fp8"),
     ("flashinfer.jit.gemm.core", "gen_gemm_sm100_module_cutlass_mxfp8"),
-    ("flashinfer.jit.fp8_quantization", "gen_mxfp8_quantization_sm100_module"),
+    (
+        "flashinfer.jit.quantization.fp8_quantization",
+        "gen_mxfp8_quantization_sm100_module",
+    ),
     ("flashinfer.jit.comm", "gen_dcp_alltoall_module"),
 ]
 

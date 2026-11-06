@@ -23,7 +23,9 @@ from flashinfer.quantization.fp8_quantization import (
     cake_grouped_mxfp8_quantize_launch,
     is_cake_grouped_mxfp8_quantize_available,
 )
-from flashinfer.jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from flashinfer.jit.quantization.fp8_quantization import (
+    gen_mxfp8_quantization_sm100_module,
+)
 from flashinfer.quantization.kernels.cutile.mxfp8_grouped_quantize_cutile import (
     build_mxfp8_grouped_quant_prefix_schedule,
     mxfp8_grouped_quantize_cutile_with_prefix_schedule,

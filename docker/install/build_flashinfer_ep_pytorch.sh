@@ -180,7 +180,7 @@ echo "== pre-warm FlashInfer JIT cache (trtllm fused-MoE reference kernels) =="
 # Bake the compiled modules into the image instead: they land in
 # ~/.cache/flashinfer, which --container-save captures.
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-10.0a}" python - <<'PYEOF'
-from flashinfer.jit.fp4_quantization import gen_fp4_quantization_sm100_module
+from flashinfer.jit.quantization.fp4_quantization import gen_fp4_quantization_sm100_module
 from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 
 for gen in (gen_trtllm_gen_fused_moe_sm100_module, gen_fp4_quantization_sm100_module):
