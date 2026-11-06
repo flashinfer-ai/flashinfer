@@ -231,7 +231,7 @@ def test_no_name_shim(key) -> None:
     if kind == "backend":
         assert "__getattr__" not in vars(module), key
         return
-    assert module._BACKEND_OBJECTS == BACKEND_OBJECTS[mode], key
+    assert BACKEND_OBJECTS[mode] == module._BACKEND_OBJECTS, key
     backend = importlib.import_module(BACKEND[mode])
     for name in BACKEND_OBJECTS[mode]:
         assert module.__getattr__(name) is getattr(backend, name), (key, name)
