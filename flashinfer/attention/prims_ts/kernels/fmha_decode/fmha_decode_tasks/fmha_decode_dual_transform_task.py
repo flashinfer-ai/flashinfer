@@ -81,6 +81,12 @@ def create_dual_transform_kv_task(
         else cfg.transform_v_task_num_registers
     )
 
+    # At D512 the four unrolled per-stage bodies of each converter crowd the
+    # Q64 softmax out of the instruction cache. Run the steady state once per
+    # raw stage instead and select the stage at run time.
+    stages = cfg.num_head_dim_stages_kv
+    flatten_loop = stages == 4
+
     @schedule
     def conversion_schedule(smem_kv: MemoryResource, tmem_kv: MemoryResource):
         """Convert one operand's raw ring into its TMEM FIFO for each work tile."""
@@ -90,19 +96,31 @@ def create_dual_transform_kv_task(
             """Convert every tile of one work tile into the TMEM FIFO."""
             tmem_kv.init_load_state()
 
+            def convert_stage(work):
+                """Convert one raw stage into one TMEM FIFO slot."""
+                tmem_kv.acquire()
+                smem_kv.wait()
+                work()
+                tmem_kv.commit()
+                smem_kv.release()
+
             def convert_tile():
                 """Convert one KV tile, one head-dimension stage at a time."""
-                for head_stage in range(cfg.num_head_dim_stages_kv):
-                    tmem_kv.acquire()
-                    smem_kv.wait()
-                    getattr(tmem_kv, label)(head_dim_stage_idx=head_stage)
-                    tmem_kv.commit()
-                    smem_kv.release()
+                for head_stage in range(stages):
+                    convert_stage(
+                        lambda head_stage=head_stage: getattr(tmem_kv, label)(
+                            head_dim_stage_idx=head_stage
+                        )
+                    )
 
             if not is_v:
                 convert_tile()
-            with domain_loop(0, domain, 1, unroll=1):
-                convert_tile()
+            if flatten_loop:
+                with domain_loop(0, domain * stages, 1, unroll=1):
+                    convert_stage(getattr(tmem_kv, f"{label}_loop_stage"))
+            else:
+                with domain_loop(0, domain, 1, unroll=1):
+                    convert_tile()
             if is_v:
                 convert_tile()
 
@@ -117,6 +135,7 @@ def create_dual_transform_kv_task(
         schedule=conversion_schedule(smem_kv, tmem_kv),
         num_registers=v_num_registers if is_v else cfg.transform_kv_task_num_registers,
         name="TransformVTask" if is_v else "TransformKTask",
+        domain_scale=stages if flatten_loop else 1,
         **kw,
     )
 

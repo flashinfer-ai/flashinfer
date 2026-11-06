@@ -467,6 +467,32 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
 
     @producer_work
     @cute.jit
+    def transform_k0_loop_stage(self, stage_info: StageInfo) -> None:
+        """Transform head-dimension stage ``n % stages`` of a dual-ring K tile.
+
+        The dual K converter's steady state runs once per raw stage; loop
+        iteration ``n`` selects the stage at run time so one K body serves
+        every stage.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        self._store_k(stage_info, item & Int32(stages - 1))
+
+    @producer_work
+    @cute.jit
+    def transform_v0_loop_stage(self, stage_info: StageInfo) -> None:
+        """Transform head-dimension stage ``n % stages`` of a dual-ring V tile.
+
+        The V counterpart of :meth:`transform_k0_loop_stage`.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        self._store_v(stage_info, item & Int32(stages - 1))
+
+    @producer_work
+    @cute.jit
     def transform_k0(
         self, stage_info: StageInfo, *, head_dim_stage_idx: Constexpr[int]
     ) -> None:
