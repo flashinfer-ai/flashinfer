@@ -30,7 +30,9 @@ valid.  The bandwidth column counts the bytes the call must move (``w_uv``,
 ``latent``, the gate and ``out``).  ``--baseline unfused`` adds the unfused
 composition on the same tensors under the same protocol: ``torch.bmm`` into
 the ``[B, H * 128]`` output layout, then the FP32 sigmoid gate, the BF16
-rounding and the padded-row zeroing as elementwise torch operations.
+rounding and the padded-row zeroing as elementwise torch operations.  The
+``tile`` column is the row tile (16 or 8) of the program prepare chose for
+that ``B``.
 
 Usage::
 
@@ -123,7 +125,8 @@ def bench_row(rows, heads, pitch, enable_pdl, cold_l2, baseline):
         "heads": heads,
         "gate_pitch": pitch,
         "arch": runner.arch,
-        "program": runner.program,
+        "program": runner.program_for(rows),
+        "tile_rows": runner.tile_rows_for(rows),
         "enable_pdl": enable_pdl,
         "l2": "cold" if cold_l2 else "warm",
         "call_us_median": call_ms * 1e3,
@@ -177,12 +180,12 @@ def main():
         f"H={args.heads}  gate pitch {args.gate_pitch}  L2 {first['l2']}  "
         f"PDL {'on' if first['enable_pdl'] else 'off'}  timer {timer}"
     )
-    header = f"{'B':>4}{'call us':>10}{'GB/s':>8}"
+    header = f"{'B':>4}{'tile':>6}{'call us':>10}{'GB/s':>8}"
     if args.baseline == "unfused":
         header += f"{'unfused us':>12}{'speedup':>9}"
     print(header)
     for r in records:
-        line = f"{r['rows']:>4}{r['call_us_median']:>10.2f}{r['call_gbps']:>8.0f}"
+        line = f"{r['rows']:>4}{r['tile_rows']:>6}{r['call_us_median']:>10.2f}{r['call_gbps']:>8.0f}"
         if args.baseline == "unfused":
             line += f"{r['unfused_us_median']:>12.2f}{r['speedup_vs_unfused']:>9.2f}"
         print(line)

@@ -73,14 +73,14 @@ _GRIDS = {"sm_100a": (148,), "sm_103a": (148, 152, 160), "sm_107a": (212,)}
 # DeepGEMM's fp8_mqa_logits accumulates in four K = 32 steps, the order of the sm_100a / sm_103a FP8 programs.
 _K32_ARCHES = ("sm_100a", "sm_103a")
 # The architectures that register an FP8 wide program; elsewhere an FP8 wide decision runs l6 (``FP8_KIND_FALLBACK``).
-_FP8_WIDE_ARCHES = ("sm_100a", "sm_103a")
+_FP8_WIDE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def _spec_fp8_keys(arch: str) -> set[str]:
-    """The FP8 scan keys the export registers per architecture: narrow, l6, split_narrow and split_l6 with
-    their :lsf copies on sm_100a / sm_103a, and wide with its :lsf copy on sm_100a / sm_103a; narrow, l6 and split_narrow on
-    sm_107a.  A stand-in registry for the host tests while a checkout registers none; the dispatch reads the tile
-    unroll from the keys, so two unrolls appear."""
+    """The FP8 scan keys the export registers per architecture: narrow, l6, split_narrow, split_l6 and wide, each
+    with its :lsf copy, on sm_100a / sm_103a; narrow, l6, split_narrow and wide, without :lsf copies, on sm_107a.  A
+    stand-in registry for the host tests while a checkout registers none; the dispatch reads the tile unroll from the
+    keys, so two unrolls appear."""
     if arch == "sm_107a":
         kinds, lsf = (("narrow", 2), ("l6", 1), ("split_narrow", 1)), (False,)
     else:
@@ -226,7 +226,7 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
     } == {
         "sm_100a": [],
         "sm_103a": [],
-        "sm_107a": ["l6", "narrow", "split_narrow"],
+        "sm_107a": ["l6", "narrow", "split_narrow", "wide"],
     }
     # the FP8 records' own rules: sm_107a keeps no split-fit rule (no FP8 split program is measured under one)
     assert {
@@ -434,9 +434,10 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
     "arch, grid", [("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)]
 )
 def test_fp8_wide_call_runs_the_wide_or_l6_program(arch, grid):
-    """s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 record plans a wide unit, and the
-    FP8 form runs its wide program (8 queries per unit) where the architecture registers one (sm_100a / sm_103a), else its l6
-    program (``FP8_KIND_FALLBACK``), unpaired and unsplit, rather than the narrow one."""
+    """s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 record plans a wide unit (on
+    sm_107a the sampled call drops its CTA pair, ``wide_pair_snake_only``), and the FP8 form runs its wide program (8
+    queries per unit) where the architecture registers one (``_FP8_WIDE_ARCHES``: sm_100a, sm_103a and sm_107a), else
+    its l6 program (``FP8_KIND_FALLBACK``), unpaired and unsplit, rather than the narrow one."""
     keys = set((cake_jit.PROGRAM_KEYS or {}).get(arch) or ())
     if not any(scan_key_form(k) == FP8 for k in keys):
         pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
@@ -862,6 +863,39 @@ def test_fp8_empty_rows_and_no_keys_are_all_padding():
 # two segments of unequal key length, each with more units than CTAs: the longest-first order and the ticket draws
 # that continue into the shorter segment differ from the plain order's
 _UNEQUAL2 = dict(seg_q_len=[4096, 4096], seg_k_len=[200000, 20000], top_k=2048)
+# the rows of ``_UNEQUAL2`` judged against the reference, (segment, first row in the segment, rows): the first and the
+# last rows of each segment
+_UNEQUAL2_JUDGED = [(0, 0, 64), (0, 4032, 64), (1, 0, 64), (1, 4032, 64)]
+
+
+def _row_blocks_reference(inputs, blocks):
+    """The positions in ``inputs`` of the rows ``blocks`` (segment, first row in the segment, rows) and their
+    reference: every block is one segment of a smaller problem over its segment's keys, with the causal offset
+    moved by the block's first row, so each row sees the keys it sees in ``inputs``."""
+    q_starts, k_starts = inputs.query_starts(), inputs.key_starts()
+    offsets = inputs.offsets()
+    rows = torch.cat(
+        [
+            torch.arange(
+                q_starts[s] + first, q_starts[s] + first + n, device=inputs.device
+            )
+            for s, first, n in blocks
+        ]
+    )
+    keys = [(k_starts[s], k_starts[s + 1]) for s, _first, _n in blocks]
+    sub = ref.build_inputs(
+        inputs.q.index_select(0, rows),
+        torch.cat([inputs.k[a:b] for a, b in keys]),
+        inputs.w.index_select(0, rows),
+        [n for _s, _first, n in blocks],
+        [inputs.seg_k_len[s] for s, _first, _n in blocks],
+        top_k=inputs.top_k,
+        softmax_scale=inputs.softmax_scale,
+        q_causal_offsets=[offsets[s] + first for s, first, _n in blocks],
+        ratio=inputs.ratio,
+        k_scale=torch.cat([inputs.k_scale[a:b] for a, b in keys]),
+    )
+    return rows, ref.select_reference(sub)
 
 
 @pytest.mark.parametrize(
@@ -877,8 +911,9 @@ def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch, shap
     """Every FP8 program of the device's architecture, forced on the same call (the planned capacity, check period,
     sampling and finalize; the split and unit geometry of the forced key), returns the dispatched program's ids and
     score bits: within one architecture the dispatched FP8 program never changes a result.  The packed call is judged
-    against the reference; on ``_S1`` and ``_UNEQUAL2`` every unit kind outnumbers the CTAs, so a drawing program
-    draws tickets, and on ``_UNEQUAL2`` the draws cross from one segment into the other in both segment orders."""
+    against the reference, ``_UNEQUAL2`` on the rows of ``_UNEQUAL2_JUDGED``; on ``_S1`` and ``_UNEQUAL2`` every unit
+    kind outnumbers the CTAs, so a drawing program draws tickets, and on ``_UNEQUAL2`` the draws cross from one segment
+    into the other in both segment orders."""
     _require_fp8_program()
     arch = arch_for(torch.device("cuda"))
     policy = policy_for(arch, FP8)
@@ -888,15 +923,19 @@ def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch, shap
         for key in unrolls.values()
     )
     inputs = ref.make_fp8_inputs(seed=41, device="cuda", **shape)
-    reference = (
-        None if shape is _S1 or shape is _UNEQUAL2 else ref.select_reference(inputs)
-    )
+    rows, reference = None, None
+    if shape is _UNEQUAL2:
+        rows, reference = _row_blocks_reference(inputs, _UNEQUAL2_JUDGED)
+    elif shape is not _S1:
+        reference = ref.select_reference(inputs)
     original = cake_backend.plan_dsa_indexer_det_topk
     for sample in (None, 0):
         extra = {} if sample is None else {"sample_tiles_max": sample}
         expected = _cloned(_run(inputs, **extra))
         torch.cuda.synchronize()
-        if reference is not None:
+        if rows is not None:
+            _judge_ok(tuple(x.index_select(0, rows) for x in expected), reference)
+        elif reference is not None:
             _judge_ok(expected, reference)
         for key in keys:
 
@@ -948,7 +987,8 @@ def test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace():
     enumeration (no tail, no ticket block, the device's placeholder); elsewhere a drawing FP8 program gets the tail
     (zeroed by the scan binding on a caller-owned buffer).  Rows stay bit-exact on a caller-owned buffer poisoned
     everywhere.  The last shape (``_S1``) runs the FP8 wide program where the architecture registers one, and its
-    units outnumber the CTAs, so that program draws tickets."""
+    units outnumber the CTAs, so that program draws tickets on sm_100a / sm_103a (on sm_107a it keeps the static unit
+    enumeration like every FP8 program there)."""
     _require_fp8_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
