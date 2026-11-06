@@ -378,10 +378,10 @@ print(json.dumps([answers, loaded]))
 
 
 def test_support_query_is_false_off_cuda():
-    """``is_cake_moe_grouped_gemm_nondet_train_supported`` is a plain function (not marked
-    experimental) that is ``False`` without CUDA (the default device, an explicit CUDA
-    device, a CPU device) and then imports none of the package; a device that is not
-    CUDA is ``False`` on any host."""
+    """``is_cake_moe_grouped_gemm_nondet_train_supported`` is a stable FlashInfer API
+    (``@flashinfer_api``; not marked experimental) that is ``False`` without CUDA
+    (the default device, an explicit CUDA device, a CPU device) and then imports
+    none of the package; a device that is not CUDA is ``False`` on any host."""
     answers, loaded = json.loads(_run_cpu_subprocess(_SUPPORT_OFF_CUDA))
     assert answers == [False] * 5 and loaded == []
     query = facade.is_cake_moe_grouped_gemm_nondet_train_supported

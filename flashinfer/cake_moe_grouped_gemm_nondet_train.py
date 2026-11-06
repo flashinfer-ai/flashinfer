@@ -429,6 +429,7 @@ def cake_moe_grouped_gemm_nondet(
     return _impl(x, w, offs, fuse_wgrad_accumulation=fuse_wgrad_accumulation)
 
 
+@flashinfer_api
 def is_cake_moe_grouped_gemm_nondet_train_supported(
     device: Optional[torch.device] = None,
 ) -> bool:
