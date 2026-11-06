@@ -79,10 +79,11 @@ fusion and an autograd wrapper.
    * The ``flashinfer`` top level binds the ``det`` entry points
      (``cake_rmsnorm_det``, ``CakeRMSNormDetFunction``,
      ``cake_rmsnorm_det_train_forward``, ``cake_rmsnorm_det_train_backward``,
-     ``cake_rmsnorm_det_train_backward_workspace_bytes``) and the module
-     ``flashinfer.cake_rmsnorm_nondet_train``, through which the
-     non-deterministic package is reached; it binds none of that package's
-     names.
+     ``cake_rmsnorm_det_train_backward_workspace_bytes``) and the modules
+     ``flashinfer.cake_rmsnorm_det_train`` and
+     ``flashinfer.cake_rmsnorm_nondet_train``. It binds none of the
+     non-deterministic package's names: that package is reached through its
+     module only.
    * The names from before the rename are removed, with no aliases; code that
      uses them fails at import:
 

@@ -108,9 +108,10 @@ TOP_LEVEL_DET = (
     "cake_rmsnorm_det_train_forward",
 )
 # Their rows of ``flashinfer._LAZY_EXPORTS`` (``name -> (module, attribute)``),
-# with the module of the non-deterministic package.
+# with the modules of both facades.
 TOP_LEVEL_ROWS = {
     **{name: (".cake_rmsnorm_det_train", name) for name in TOP_LEVEL_DET},
+    "cake_rmsnorm_det_train": (".cake_rmsnorm_det_train", None),
     "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
 }
 # The keys of another family that share the ``cake_rmsnorm`` prefix.
@@ -503,9 +504,10 @@ def _rmsnorm_row(name: str, module_name: str) -> bool:
 
 
 def test_top_level_rows_are_the_lazy_exports() -> None:
-    """The RMSNorm names of the top level are exactly the six rows of
+    """The RMSNorm names of the top level are exactly the seven rows of
     ``flashinfer._LAZY_EXPORTS``; ``dir(flashinfer)`` lists them and each
-    resolves to its facade's object (the nondet row to the facade module)."""
+    resolves to its facade's object (the two module rows to the facade
+    modules)."""
     rows = flashinfer._LAZY_EXPORTS
     family = {n: row for n, row in rows.items() if _rmsnorm_row(n, row[0])}
     assert family == TOP_LEVEL_ROWS
@@ -520,6 +522,7 @@ def test_top_level_rows_are_the_lazy_exports() -> None:
         expected = module if attribute is None else getattr(module, attribute)
         assert getattr(flashinfer, name) is expected, name
     assert flashinfer.cake_rmsnorm_det is det_facade.cake_rmsnorm_det
+    assert flashinfer.cake_rmsnorm_det_train is sys.modules[DET_FACADE]
     assert flashinfer.cake_rmsnorm_nondet_train is sys.modules[FACADE]
 
 
@@ -670,8 +673,8 @@ def test_facade_loads_only_its_own_backend_on_first_use(mode: str, use: str) -> 
 
 
 def test_top_level_rows_load_their_facade_only() -> None:
-    """A top-level det entry point loads the det facade only, the nondet row the
-    nondet facade only, and a backend object of a row its own backend."""
+    """A top-level det entry point loads the det facade only, each module row
+    its facade only, and a backend object of a row its own backend."""
     on_import, det_entry, nondet_module, det_class = _loaded_after(
         "import flashinfer",
         "flashinfer.cake_rmsnorm_det",
@@ -683,6 +686,17 @@ def test_top_level_rows_load_their_facade_only() -> None:
     assert nondet_module == sorted([DET_FACADE, FACADE])
     assert DET_PACKAGE in det_class, det_class
     assert [name for name in det_class if not _owned(name, "det")] == [FACADE]
+
+
+def test_top_level_det_module_row_loads_the_det_facade_only() -> None:
+    """After a bare ``import flashinfer``, ``flashinfer.cake_rmsnorm_det_train``
+    is the det facade module: the row loads that facade and no backend."""
+    on_import, det_module = _loaded_after(
+        "import flashinfer",
+        f"assert flashinfer.cake_rmsnorm_det_train is sys.modules['{DET_FACADE}']",
+    )
+    assert on_import == []
+    assert det_module == [DET_FACADE]
 
 
 # --------------------------------------------------------------------------- the non-deterministic package is self-contained
@@ -769,6 +783,7 @@ FRESH = {
         "import sys\nimport flashinfer\n"
         f"assert flashinfer.{FACADE.rpartition('.')[2]} is sys.modules['{FACADE}']\n"
         f"assert not hasattr(flashinfer, '{PAIRS[0][0]}')\n"
+        f"assert flashinfer.{DET_FACADE.rpartition('.')[2]} is sys.modules['{DET_FACADE}']\n"
         f"assert flashinfer.{PAIRS[0][1]} is sys.modules['{DET_FACADE}'].{PAIRS[0][1]}\n"
         f"assert not hasattr(sys.modules['{DET_FACADE}'], '{PAIRS[0][0]}')\n"
     ),

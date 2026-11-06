@@ -178,7 +178,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
-    # RMSNorm training: det names from the det facade; the nondet package only as its module.
+    # RMSNorm training: det names from the det facade, and both facades as modules.
     "cake_rmsnorm_det": (".cake_rmsnorm_det_train", "cake_rmsnorm_det"),
     "CakeRMSNormDetFunction": (".cake_rmsnorm_det_train", "CakeRMSNormDetFunction"),
     "cake_rmsnorm_det_train_forward": (
@@ -193,6 +193,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_rmsnorm_det_train",
         "cake_rmsnorm_det_train_backward_workspace_bytes",
     ),
+    "cake_rmsnorm_det_train": (".cake_rmsnorm_det_train", None),
     "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
 }
 
