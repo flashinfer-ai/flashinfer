@@ -60,8 +60,8 @@ limitations under the License.
 #   chooses it and no entry point takes a mode keyword.  Under ``torch.use_deterministic_algorithms(True)`` every
 #   backward launch sequence raises PyTorch's alert before it allocates its backward buffers and launches its first
 #   backward kernel (``_alert_nondeterministic``; with ``warn_only=True`` a ``UserWarning``, then it runs); the
-#   deterministic host preparation before it (a ``dout`` copy, the plan of a new binding, the ``dkv_acc`` checks)
-#   may run first.  The forward never alerts and nothing falls back to another package.
+#   deterministic preparation before it (a ``dout`` copy, the plan of a new binding and its row-length vector, the
+#   ``dkv_acc`` checks) may run first.  The forward never alerts and nothing falls back to another package.
 
 from __future__ import annotations
 
@@ -573,8 +573,8 @@ def _alert_nondeterministic(entry: str) -> None:
     are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
     warn_only=True)`` after which the backward runs; nothing otherwise.  Called by every backward launch sequence
     (the bound backward of the rope and NoPE programs and the prepared runners' ``backward``) before it allocates its
-    backward buffers or launches a kernel; the deterministic host preparation of the outer entries (a ``dout`` copy,
-    the plan of a new binding, the ``dkv_acc`` checks) may run before it.  A backward without query rows launches
+    backward buffers or launches a backward kernel; the deterministic preparation of the outer entries (a ``dout``
+    copy, the plan of a new binding and its row-length vector, the ``dkv_acc`` checks) may run before it.  A backward without query rows launches
     nothing and does not alert.  There is no fallback: the
     deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a reserved name (planned).  The alert
     is raised here because PyTorch exposes no public Python entry for it."""

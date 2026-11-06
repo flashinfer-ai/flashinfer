@@ -27,10 +27,12 @@ gradients, or the rows added into ``dkv_acc``) may differ run to run within
 the FP32 reduction spread.  Under ``torch.use_deterministic_algorithms(True)``
 the forward runs and the backward raises PyTorch's ``RuntimeError`` before its
 first backward kernel launch; with ``warn_only=True`` it warns
-(``UserWarning``) and runs this package's backward.  Deterministic host
-preparation may run before the alert (a copy of a ``dout`` the TMA descriptor
-cannot address, the plan of a new binding, the validation of ``dkv_acc`` /
-``dkv_dst_map``).  It never falls back to another package.  The
+(``UserWarning``) and runs this package's backward.  Deterministic
+preparation may run before the alert: a copy of a ``dout`` the TMA descriptor
+cannot address; the plan of a new binding, which can JIT-load the backward
+stages and, without a caller ``topk_length``, allocates and fills the
+binding's row-length vector; the validation of ``dkv_acc`` /
+``dkv_dst_map``.  It never falls back to another package.  The
 deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a
 reserved name (planned); it does not exist yet.
 
@@ -296,8 +298,9 @@ def cake_dsa_sparse_attention_nondet(
     apply no positional mask: the index rows define the key set.
 
     Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
-    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
-    (its dK / dV atomics are not run-to-run reproducible); with
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
     ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
     package is chosen instead.
 
@@ -374,13 +377,15 @@ def cake_dsa_sparse_attention_nondet_varlen(
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
     positional mask of their own; the offset index rows define the key sets.
     ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
-    other varlen attention entry points and are not read on the host.  Other
-    arguments and returns as in :func:`cake_dsa_sparse_attention_nondet`; the strided
-    query slices and packed key rows described there are accepted here too.
+    other varlen attention entry points and are not read on the host.  See
+    :func:`cake_dsa_sparse_attention_nondet` for the other arguments and the
+    returns; the strided query slices and packed key rows described there are
+    accepted here too.
 
     Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
-    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
-    (its dK / dV atomics are not run-to-run reproducible); with
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
     ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
     package is chosen instead.
 
@@ -565,8 +570,9 @@ def cake_dsa_sparse_attention_nondet_nope(
     key set.
 
     Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
-    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
-    (its dK / dV atomics are not run-to-run reproducible); with
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
     ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
     package is chosen instead.
 
@@ -648,13 +654,14 @@ def cake_dsa_sparse_attention_nondet_nope_varlen(
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
     positional mask of their own; the offset index rows define the key sets.
     ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
-    other varlen attention entry points and are not read on the host.  Other
-    arguments, the ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and
-    the returns as in :func:`cake_dsa_sparse_attention_nondet_nope`.
+    other varlen attention entry points and are not read on the host.  See
+    :func:`cake_dsa_sparse_attention_nondet_nope` for the other arguments, the
+    ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and the returns.
 
     Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
-    backward raises PyTorch's ``RuntimeError`` before its first kernel launch
-    (its dK / dV atomics are not run-to-run reproducible); with
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
     ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
     package is chosen instead.
 

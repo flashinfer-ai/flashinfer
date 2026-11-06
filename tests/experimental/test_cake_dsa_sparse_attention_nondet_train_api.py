@@ -1906,6 +1906,27 @@ def test_rope_varlen_entry_captures_into_a_cuda_graph():
 
 ALERT = "does not have a deterministic implementation"
 ALERT_ENTRIES = ("rope", "rope_varlen", "nope", "nope_varlen")
+# The entry names this package's alerts carry: the bound rope / NoPE backward and the prepared runners' backward.
+ALERT_NAMES = (
+    cake_backend.ROPE_BACKWARD_ENTRY,
+    cake_backend.NOPE_BACKWARD_ENTRY,
+    "DSATrainRunner.backward",
+    "DSANopeTrainRunner.backward",
+)
+
+
+@contextlib.contextmanager
+def _alerts_once(name: str):
+    """Expect exactly one alert of this package inside the block (``warn_only=True``), the one of ``name``; warnings
+    of other operations are ignored."""
+    with pytest.warns(UserWarning, match=ALERT) as record:
+        yield
+    ours = [
+        str(w.message)
+        for w in record
+        if any(str(w.message).startswith(f"{n} {ALERT}") for n in ALERT_NAMES)
+    ]
+    assert len(ours) == 1 and ours[0].startswith(f"{name} {ALERT}"), ours
 
 
 @contextlib.contextmanager
@@ -1980,14 +2001,20 @@ def test_torch_deterministic_mode_raises_at_the_backward_only(entry):
 
 @pytest.mark.parametrize("entry", ALERT_ENTRIES)
 def test_torch_deterministic_warn_only_warns_and_runs_this_package(entry):
-    """With ``warn_only=True`` the backward warns and runs this package's backward: the query gradients are the
-    ones outside the mode bitwise (fixed-order), the key gradients within the FP32 reduction spread."""
+    """With ``warn_only=True`` the backward warns once (the alert of the bound rope or NoPE backward) and runs this
+    package's backward: the query gradients are the ones outside the mode bitwise (fixed-order), the key gradients
+    within the FP32 reduction spread."""
     sources, call, dout, num_q = _alert_case(entry)
+    name = (
+        cake_backend.ROPE_BACKWARD_ENTRY
+        if entry.startswith("rope")
+        else cake_backend.NOPE_BACKWARD_ENTRY
+    )
     leaves = [t.detach().clone().requires_grad_() for t in sources]
     expected = torch.autograd.grad(call(*leaves), leaves, dout)
     with _torch_deterministic(warn_only=True):
         out = call(*leaves)
-        with pytest.warns(UserWarning, match=ALERT):
+        with _alerts_once(name):
             got = torch.autograd.grad(out, leaves, dout)
     torch.cuda.synchronize()
     for g, e in zip(got[:num_q], expected[:num_q], strict=True):
@@ -2025,8 +2052,8 @@ def _fill_backward_buffers(runner) -> dict[str, torch.Tensor]:
 def test_torch_deterministic_mode_explicit_and_prepared_backwards_alert():
     """The eager ``backward`` / ``backward_nope`` and the prepared runners' ``backward`` alert too: in strict mode a
     runner's backward raises before it writes a backward buffer (the sentinel in every output and accumulator stays);
-    with ``warn_only`` each warns and runs its backward (query gradients bitwise the ones outside the mode, key
-    gradients within the FP32 reduction spread).  Their forwards never alert."""
+    with ``warn_only`` each warns once, under its own entry name, and runs its backward (query gradients bitwise the
+    ones outside the mode, key gradients within the FP32 reduction spread).  Their forwards never alert."""
     _require_program(backward=True)
     _require_nope_program(backward=True)
     inp = make_inputs([256], [512], seed=SEED + 41, topk=128)
@@ -2046,7 +2073,7 @@ def test_torch_deterministic_mode_explicit_and_prepared_backwards_alert():
     runner.forward()
     expected = [t.clone() for t in runner.backward()]
     nope_runner.forward()
-    nope_expected = nope_runner.backward()[0].clone()
+    nope_expected = [t.clone() for t in nope_runner.backward()]
     with _torch_deterministic(warn_only=False):
         o, lse, o_lo = cake_backend.forward(*args)
         with pytest.raises(RuntimeError, match=ALERT):
@@ -2066,23 +2093,25 @@ def test_torch_deterministic_mode_explicit_and_prepared_backwards_alert():
         for name, buffer in {**buffers, **nope_buffers}.items():
             assert torch.all(buffer == 3.0), name
     with _torch_deterministic(warn_only=True):
-        with pytest.warns(UserWarning, match=ALERT):
+        with _alerts_once(cake_backend.ROPE_BACKWARD_ENTRY):
             eager_got = cake_backend.backward(*args, o, o_lo, lse, inp.dout)
-        with pytest.warns(UserWarning, match=ALERT):
+        with _alerts_once(cake_backend.NOPE_BACKWARD_ENTRY):
             nope_eager_got = cake_backend.backward_nope(
                 *nope_args, no, no_lo, nlse, nope.dout
             )
-        with pytest.warns(UserWarning, match=ALERT):
+        with _alerts_once("DSATrainRunner.backward"):
             got = runner.backward()
-        with pytest.warns(UserWarning, match=ALERT):
-            nope_got = nope_runner.backward()[0]
+        with _alerts_once("DSANopeTrainRunner.backward"):
+            nope_got = nope_runner.backward()
     torch.cuda.synchronize()
     for g, e in ((eager_got, eager_expected), (got, expected)):
         assert torch.equal(g[0], e[0]) and torch.equal(g[1], e[1])
         assert rel_l2(g[2], e[2]) < 1e-2 and rel_l2(g[3], e[3]) < 1e-2
     assert torch.equal(nope_eager_got[0], nope_eager_expected[0])
     assert rel_l2(nope_eager_got[1], nope_eager_expected[1]) < 1e-2
-    assert torch.equal(nope_got, nope_expected)
+    assert nope_expected[1] is not None and nope_got[1] is not None
+    assert torch.equal(nope_got[0], nope_expected[0])
+    assert rel_l2(nope_got[1], nope_expected[1]) < 1e-2
 
 
 @pytest.mark.parametrize("warn_only", [None, False, True])

@@ -29,9 +29,10 @@ backward launch sequence (the autograd backward, `backward` / `backward_nope`
 and the prepared runners' `backward`) raises PyTorch's `RuntimeError` before it
 allocates its backward buffers and launches its first backward kernel; with
 `warn_only=True` it issues a `UserWarning` and runs this package's backward.
-Deterministic host preparation may run before the alert: a copy of a `dout`
-the TMA descriptor cannot address, the plan of a new binding (which can
-JIT-load the backward stages) and the validation of `dkv_acc` /
+Deterministic preparation may run before the alert: a copy of a `dout` the
+TMA descriptor cannot address, the plan of a new binding (which can JIT-load
+the backward stages and, without a caller `topk_length`, allocates and fills
+the binding's row-length vector) and the validation of `dkv_acc` /
 `dkv_dst_map`.  It never falls back to another package.  A
 backward without query rows launches nothing and does not alert.  The
 deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` is a
