@@ -161,7 +161,7 @@ class LocalExpertPlan:
         import cutlass.cute as cute
         from src.inputs_process import DataPreprocess
         from src.sym_buffer import SymBufferHost
-        from .kernels.megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
+        from .megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
 
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
@@ -231,7 +231,7 @@ class LocalExpertPlan:
         )
         self._input_view = None
         # Warm Triton specializations before capture; no expert work is needed.
-        from .glue import route_mask, weighted_partial
+        from .megamoe_kernel_mxfp8 import route_mask, weighted_partial
 
         self._ids.fill_(-1)
         self._probs.zero_()
@@ -268,7 +268,7 @@ class LocalExpertPlan:
         ):
             _tensor(tensor, shape, dtype, self.device, name)
         import cuda.bindings.driver as cuda
-        from .glue import route_mask, weighted_partial
+        from .megamoe_kernel_mxfp8 import route_mask, weighted_partial
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         key = hidden_states.data_ptr()

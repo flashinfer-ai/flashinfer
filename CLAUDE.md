@@ -58,12 +58,6 @@ derive their interpreter and site-packages paths from that file. When raising
 the minimum, also update `project.requires-python` and `tool.mypy.python_version`
 in `pyproject.toml`.
 
-## Experimental NT4 local experts
-
-`flashinfer.fused_moe.nt4_mxfp8` provides explicit weight packing and a fixed-capacity
-SM103 plan. See `flashinfer/experimental/nt4_mxfp8/README.md` for the supported
-contract and reference/replay tests. Communication stays with the caller.
-
 ## Quick Start for Development
 
 ### Installation

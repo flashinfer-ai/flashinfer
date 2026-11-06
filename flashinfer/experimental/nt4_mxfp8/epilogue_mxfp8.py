@@ -1,12 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # Owned NT4 adaptation of the matching kernel-team drop file.
-# Upstream snapshot: 50d583aa0. See ../README.md for provenance.
+# Upstream snapshot: 50d583aa0. See README.md for provenance.
 # Extracted from research commit 52e7da3f4; GPU parity must be requalified.
 """Fused NT4 clamped-ReLU2, MXFP8 quantization and FC2 epilogue."""
 
-from typing import Optional, Tuple, Type, Union, Any
-import dataclasses
+from typing import Optional, Tuple, Type
+
+from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue as _BaseGluMxfp8Epilogue
+from moe_mxfp8_glu.epilogue_mxfp8 import Fc2OutputDest
 
 import cutlass
 import cutlass.cute as cute
@@ -15,15 +17,13 @@ try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-import cutlass.utils.blackwell_helpers as sm100_utils
 
 from cutlass.cutlass_dsl import Int64
 
 from src.flag_batch import GpuReleaseFlagBatchTracker
-from src.token_comm import TokenSrcMetadata
 
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 
@@ -43,88 +43,11 @@ Fc1CTMAStages = 1
 
 
 # =============================================================================
-# Fc2OutputDest  (MegaMoE fc2 STG destination resolver, non-swap MXFP8 path)
-# =============================================================================
-
-
-@dataclasses.dataclass(frozen=True)
-class Fc2OutputDest:
-    """fc2 output destination in MoE-domain ``(token_max, topk, hidden)`` layout.
-
-    Mirrors the indirect-mode resolution used by the NVFP4 ``Fc2ReturnTile``
-    (``moe_nvfp4_swapab.epilogue``) but specialised for the non-swap-AB MXFP8
-    epilogue, whose fc2 STG is already a simple per-(token_row, hidden) store.
-
-    * ``metadata`` / ``peer_rank_ptr_mapper`` both ``None`` -- **direct mode**:
-      the row is ``tensor[pool_token, 0, :]`` on the local rank.
-    * Both non-``None`` -- **indirect mode** (MegaMoE form A): each lane LDGs
-      ``(src_rank, src_token, src_topk)`` from ``metadata[pool_token, :]`` and
-      writes to ``peer(src_rank).tensor[src_token, src_topk, :]`` via
-      ``peer_rank_ptr_mapper.ptr_map_to_rank(local_addr, src_rank)``.
-
-    ``metadata`` is the ``(pool_token_count, TokenSrcMetadata.nbytes)`` Uint8 view
-    (or any recast with the same base pointer) of the dispatch warps'
-    ``token_src_metadata`` record; each record is one packed Int64 decoded by
-    ``TokenSrcMetadata.load()``.  ``peer_rank_ptr_mapper``
-    is a ``SymBuffer{world_size}`` instance (returns a zero delta when
-    ``src_rank == local_rank``, so single-rank runs fold to a no-op).
-    """
-
-    tensor: cute.Tensor
-    metadata: Optional[cute.Tensor] = None
-    peer_rank_ptr_mapper: Any = None
-    reduce_topk_in_kernel: bool = False
-
-    def __post_init__(self) -> None:
-        if (self.metadata is None) != (self.peer_rank_ptr_mapper is None):
-            raise ValueError(
-                "Fc2OutputDest: ``metadata`` and ``peer_rank_ptr_mapper`` must be "
-                "both None (direct mode) or both non-None (MegaMoE / indirect "
-                "mode).  Got metadata="
-                f"{'set' if self.metadata is not None else 'None'}, "
-                f"peer_rank_ptr_mapper="
-                f"{'set' if self.peer_rank_ptr_mapper is not None else 'None'}."
-            )
-
-    @cute.jit
-    def resolve_token_row(self, pool_token_global) -> cute.Tensor:
-        """Return the ``(hidden,)`` BF16 GMEM row this pool token's STG lands on.
-
-        Direct mode: ``tensor[pool_token_global, 0, :]`` on the local rank.
-        Indirect mode: LDG packed i64 from ``metadata`` at byte offset
-        ``pool_token_global * TokenSrcMetadata.nbytes``, unpack via
-        ``TokenSrcMetadata.load()`` to get ``(src_rank, src_token, src_topk)``,
-        build the local-rank row view, then rebase the row's GMEM pointer
-        through ``peer_rank_ptr_mapper.ptr_map_to_rank`` so the iterator points
-        at the source rank's combine slot.
-        """
-        if cutlass.const_expr(self.metadata is None):
-            return cute.slice_(self.tensor, (pool_token_global, 0, None))
-
-        md = TokenSrcMetadata.load(
-            self.metadata.iterator.toint()
-            + Int64(pool_token_global) * Int64(TokenSrcMetadata.nbytes)
-        )
-        src_rank = md.src_rank
-        src_token = md.src_token
-        if cutlass.const_expr(self.reduce_topk_in_kernel):
-            src_topk = cutlass.Int32(0)
-        else:
-            src_topk = md.src_topk
-        local_row = cute.slice_(self.tensor, (src_token, src_topk, None))
-        peer_iter = self.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_row.iterator,
-            src_rank,
-        )
-        return cute.make_tensor(peer_iter, local_row.layout)
-
-
-# =============================================================================
 # GluMxfp8Epilogue
 # =============================================================================
 
 
-class GluMxfp8Epilogue:
+class GluMxfp8Epilogue(_BaseGluMxfp8Epilogue):
     _SubtileBarIdBase = 4
     _CStoreBarId = 10
 
@@ -203,116 +126,6 @@ class GluMxfp8Epilogue:
         self.glu_clamp = cutlass.Float32(glu_clamp) if glu_clamp is not None else None
 
     # -- Codegen-time queries  --
-
-    @property
-    def epi_tile(self) -> Tuple[int, int]:
-        return self._epi_tile
-
-    @property
-    def overlapping_accum(self) -> bool:
-        return self._overlapping_accum
-
-    @property
-    def num_acc_pipeline_stages(self) -> int:
-        return self._num_acc_pipeline_stages
-
-    @property
-    def num_acc_stage(self) -> int:
-        return self._num_acc_stage
-
-    @property
-    def iter_acc_early_release(self) -> int:
-        return self._iter_acc_early_release
-
-    @property
-    def subtile_cnt(self) -> int:
-        return self._subtile_cnt
-
-    @property
-    def cta_tile_n(self) -> int:
-        return self._cta_tile_n
-
-    @property
-    def num_sf_tmem_cols(self) -> int:
-        return self._num_sf_tmem_cols
-
-    @property
-    def num_sfa_tmem_cols(self) -> int:
-        return self._num_sfa_tmem_cols
-
-    @property
-    def num_sfb_tmem_cols(self) -> int:
-        return self._num_sfb_tmem_cols
-
-    @property
-    def num_accumulator_tmem_cols(self) -> int:
-        return self._num_accumulator_tmem_cols
-
-    def staged_smem_layout(
-        self,
-        n_stages: int,
-    ) -> Union[cute.Layout, cute.ComposedLayout]:
-        return sm100_utils.make_smem_layout_epi(
-            self.fc1_output_dtype,
-            self.fc1_output_layout,
-            self._epi_tile,
-            n_stages,
-        )
-
-    @property
-    def smem_layout_one_stage(self) -> Union[cute.Layout, cute.ComposedLayout]:
-        staged = self.staged_smem_layout(1)
-        return cute.select(staged, mode=[0, 1])
-
-    @property
-    def bytes_per_stage(self) -> int:
-        return cute.size_in_bytes(self.fc1_output_dtype, self.smem_layout_one_stage)
-
-    @staticmethod
-    @cute.jit
-    def tma_store_fc1_output(
-        warp_idx,
-        sC,
-        store_idx,
-        tma_atom_fc1_output: cute.CopyAtom,
-        g_fc1_output_subtile_view: cute.Tensor,
-        valid_tokens,
-    ) -> None:
-        """
-        Per-warp TMA store for non-swap-AB MXFP8 FC1 output.
-        Uses rotated-leader pattern (leader = warp store_idx).
-        SMEM stage store_idx has (EpilogueTileN tokens × Fc1EpilogueOutputTileN intermediates).
-        All 4 warps arrive at barrier store_idx+_SubtileBarIdBase, leader issues TMA.
-        """
-        cute.arch.fence_proxy("async.shared", space="cta")
-        sC_stage = cute.slice_(sC, (None, None, store_idx))
-        g_fc1_output_2d = cute.slice_(g_fc1_output_subtile_view, (None, None, 0))
-        bSG_sC, bSG_g = cpasync.tma_partition(
-            tma_atom_fc1_output,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sC_stage, 0, 2),
-            cute.group_modes(g_fc1_output_2d, 0, 2),
-        )
-
-        leader_warp = store_idx
-        tile_has_valid = store_idx * cutlass.Int32(EpilogueTileN) < valid_tokens
-
-        bar_id = store_idx + cutlass.Int32(GluMxfp8Epilogue._SubtileBarIdBase)
-        bar = pipeline.NamedBarrier(
-            barrier_id=bar_id,
-            num_threads=EpiWarpCount * WarpThreadCount,
-        )
-        if warp_idx == leader_warp:
-            bar.arrive_and_wait()
-            # TMA bulk-tensor stores are all-or-nothing per issue (no per-element
-            # `pred` mask, no scalar predicate arg), so guard the whole copy with
-            # a runtime `if`.  Skips fully-padding token-tiles that would alias
-            # the next expert's region.
-            if tile_has_valid:
-                cute.copy(tma_atom_fc1_output, bSG_sC, bSG_g)
-        else:
-            bar.arrive()
 
     def _subtile_local_tmem_tensor_pair(
         self,
@@ -599,51 +412,6 @@ class GluMxfp8Epilogue:
         cute.copy(r2s_copy_atom, cute.coalesce(c), cute.coalesce(sC_thread_row))
 
         iket.range_pop()
-
-    @cute.jit
-    def _subtile_fc2_tmem_tensor(
-        self,
-        tmem_acc_tensor: cute.Tensor,
-        subtile_idx,
-        warp_idx,
-    ) -> cute.Tensor:
-        """
-        Per-warp TMEM view for one fc2 subtile (EpilogueTileN=32 cols).
-        """
-        base = tmem_acc_tensor.iterator
-        warp_lane_off = warp_idx * WarpThreadCount
-        subtile_col_off = subtile_idx * EpilogueTileN
-        total = (warp_lane_off << 16) + subtile_col_off
-        subtile_ptr = base + cute.assume(total, divby=16)
-        return cute.make_tensor(
-            subtile_ptr,
-            _TmemTranspose16x32Core._tmem_layout(32, EpilogueTileN),
-        )
-
-    @cute.jit
-    def _advance_fc2_tmem_tensor(
-        self,
-        tmem_tensor: cute.Tensor,
-        col_offset: int,
-    ) -> cute.Tensor:
-        """Advance the fc2 TMEM tensor by col_offset cols (mirrors _subtile_forward_tmem_tensor)."""
-        new_ptr = tmem_tensor.iterator + cute.assume(col_offset, divby=16)
-        return cute.make_tensor(
-            new_ptr,
-            _TmemTranspose16x32Core._tmem_layout(32, EpilogueTileN),
-        )
-
-    @cute.jit
-    def _acc_pipeline_consumer_release(
-        self,
-        acc_pipeline,
-        acc_consumer_state,
-        is_release: bool,
-    ) -> None:
-        """Release the acc pipeline consumer."""
-        if is_release:
-            cute.arch.fence_view_async_tmem_load()
-            acc_pipeline.consumer_release(acc_consumer_state)
 
     @cute.jit
     def _run_fc2_subtile(

@@ -63,6 +63,8 @@ The example is not a representative performance benchmark.
 
 Adapted from research commit `52e7da3f4791f059b5840d4ec210c7556b70c421`, using
 kernel-team snapshot `50d583aa0` and FlashInfer's existing shared primitives.
+Unchanged MXFP8 kernel/epilogue methods and the FC2 destination descriptor are
+reused directly; this package contains the NT4-specific overrides.
 The vendor `src/` drop is unchanged. Research timing/debug paths are excluded. Private kernels are specialized to the
 fixed local-expert configuration: no standalone FC1/FC2 diagnostics, alternate
 geometry, quantized combine output or in-kernel top-k reduction. The fused

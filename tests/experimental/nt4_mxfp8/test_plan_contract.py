@@ -96,7 +96,7 @@ class ContractTest(unittest.TestCase):
             "cuda": cuda,
             "cuda.bindings": bindings,
             "cuda.bindings.driver": driver,
-            "nt4_plan_test.glue": glue,
+            "nt4_plan_test.megamoe_kernel_mxfp8": glue,
         }
         x = torch.zeros(2, 768, dtype=torch.bfloat16)
         ids = torch.zeros(2, 10, dtype=torch.int64)

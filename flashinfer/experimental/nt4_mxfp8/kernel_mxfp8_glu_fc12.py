@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # Owned NT4 adaptation of the matching kernel-team drop file.
-# Upstream snapshot: 50d583aa0. See ../README.md for provenance.
+# Upstream snapshot: 50d583aa0. See README.md for provenance.
 # Extracted from research commit 52e7da3f4; GPU parity must be requalified.
 """
 Fused FC1/clamped squared ReLU/FC2 MXFP8 kernel for NT4 on SM103.
@@ -10,6 +10,10 @@ Fused FC1/clamped squared ReLU/FC2 MXFP8 kernel for NT4 on SM103.
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
+
+from moe_mxfp8_glu.kernel_mxfp8_glu_fc12 import (
+    Sm100SwigluMxfp8Fc12Kernel as _BaseSm100SwigluMxfp8Fc12Kernel,
+)
 
 import cutlass
 import cutlass.cute as cute
@@ -41,7 +45,7 @@ from src.token_comm import TokenInPullTokenBackPush
 # =============================================================================
 
 
-class Sm100ClampedRelu2Mxfp8Fc12Kernel:
+class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
     token_comm: TokenInPullTokenBackPush
     # SMEM budget for all "non-problem-tensor" buffers (mbarriers, sched
     # work-tile buffer, TMEM allocator state).  Reserved at host side in
@@ -110,37 +114,6 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         self.epi_subtile_bar_ids = (4, 5, 6, 7)
         self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
-
-    def _create_tiled_mmas(self) -> Tuple[cute.TiledMma, cute.TiledMma]:
-        """Return ``(tiled_mma, tiled_mma_sfb)``.
-
-        Both phases share the same MMA configuration because ``mma_tiler_mnk``
-        is shared.  Phase selection is
-        purely a matter of which TMA load fills SMEM / which acc TMEM stage
-        the MMA writes -- the tiled MMA atoms themselves are phase-invariant.
-
-        SFB always uses ``CtaGroup.ONE``: SFB is not multicast across the
-        2-CTA pair under ``use_2cta_instrs``.
-        """
-        common = (
-            self.a_dtype,
-            self.b_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-        )
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            *common,
-            self.cta_group,
-            self.mma_inst_shape_mn,
-        )
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            *common,
-            tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mn_sfb,
-        )
-        return tiled_mma, tiled_mma_sfb
 
     def _create_fc2_mma(self):
         return sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -342,17 +315,6 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             )
         ) * atom_thr_size
 
-    def _smem_misc_budget_bytes(self) -> int:
-        """Per-CTA SMEM reserved outside the AB-stage pipeline.
-
-        Lean fc12 path: only the fixed ``_SmemMiscBudget``.  Subclasses (the
-        MegaMoE wrapper) extend this to also reserve SMEM for the dispatch
-        warps' pull_buffer / pull_mbar / smem_expert_count regions;
-        ``_compute_stages`` reads this hook so the AB-stage count comes out
-        small enough to leave room for those extra regions.
-        """
-        return self._SmemMiscBudget
-
     def _compute_stages(
         self,
         tiled_mma: cute.TiledMma,
@@ -420,55 +382,12 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
         return num_acc_stage, num_a_stage, num_b_stage, num_sched_stages
 
-    def mainloop_s2t_copy_and_partition(
-        self,
-        sSF: cute.Tensor,
-        tSF: cute.Tensor,
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """SMEM → TMEM tiled copy + partition for SFA / SFB."""
-        tCsSF_compact = cute.filter_zeros(sSF)
-        tCtSF_compact = cute.filter_zeros(tSF)
-
-        copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(self.cta_group),
-            self.sf_dtype,
-        )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
-            tiled_copy_s2t, tCsSF_compact_s2t_
-        )
-        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-
-        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
-
     # ── MegaMoE communication hook stubs ─────────────────────────────────────
     #
     # No-op base implementations for the lean fc1+fc2 path.  Mirroring the
     # identically-named stubs in the NVFP4 base (``kernel_fc12.py``).
     # ``Sm100Nt4MegaMoEMxfp8Kernel`` (megamoe_kernel_mxfp8.py) overrides all of
     # them to delegate to ``src/token_comm.py``.
-
-    def sched_ext_fc1_peek_threshold(self) -> int:
-        """Return the fc1 ready-counter peek threshold for GluMxFp8Fc12SchedExtension.
-
-        Must match the spin threshold in ``token_comm_hook_fc1_tma_b_predispatch_spin``
-        so that an early peek hit does not skip the spin and expose stale pool rows.
-        Default 0 → use ``valid_tokens_in_tile`` (no cluster, base class behaviour).
-        MegaMoE overrides to return ``cluster_tile_tokens`` to match the cluster spin.
-        """
-        return 0
-
-    def sched_ext_fc1_counter_cumul_scale(self) -> int:
-        """Return the scale factor for the fc1 ready-counter slot formula.
-
-        Slot = scale * (cumul + fc1_counter_index) + tile_m_idx % scale.
-        Default 1 = cluster-level granularity (slot = cumul + cluster_token_block_idx).
-        A MegaMoE subclass can override to cluster_m for per-CTA granularity.
-        """
-        return 1
 
     def token_comm_extra_smem_storage_class(self) -> type:
         return self.token_comm.extra_smem_storage_class()
