@@ -207,7 +207,25 @@ def test_package_wiring() -> None:
     assert former not in package_data
     assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
-    assert "experimental/cake/cake_mhc_head_det_train/csrc/" in pre_commit
+    # pre-commit skips every generated source of the package (a per-package entry or the generic #8928 rule), still
+    # checks its Python modules and names no former tree
+    exclude = re.compile(
+        next(ln for ln in pre_commit.splitlines() if ln.startswith("exclude:"))
+        .split(":", 1)[1]
+        .strip()
+    )
+    root, package_dir = REPO.resolve(), directory.resolve()
+    sources = [
+        p.relative_to(root).as_posix()
+        for p in sorted((package_dir / "csrc").rglob("*"))
+        if p.is_file()
+    ]
+    assert sources and all(exclude.search(p) for p in sources), [
+        p for p in sources if not exclude.search(p)
+    ]
+    assert not exclude.search(
+        (package_dir / "cake_jit.py").relative_to(root).as_posix()
+    )
     assert "cake_mhc_det_train_head_backend" not in pre_commit
     spec = importlib.util.spec_from_file_location(
         "check_cake_build_manifests", REPO / "scripts" / "check_cake_build_manifests.py"
