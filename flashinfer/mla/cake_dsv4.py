@@ -1834,9 +1834,9 @@ def cake_dsv4_workspace_requirement(
     ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
     ``single_launch_bytes`` covers the SM107 split-KV launch of the shape
     (:func:`_k64_split_plan`, with or without PDL) on every architecture.
-    Below 69 SMs some 64-head split shapes take an M64 route, which never
-    splits, so their ``single_launch_bytes`` can depend on ``sm_count``,
-    ``arch`` and ``kv4``.
+    The one exception to the independence above: below 69 SMs some 64-head
+    split shapes take an M64 route, which never splits, so their
+    ``single_launch_bytes`` can depend on ``sm_count``, ``arch`` and ``kv4``.
     """
     device_arch = arch is None
     if sm_count is None:
@@ -2414,16 +2414,17 @@ _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
 # width in tiles.  VR200 (sm_107a, 212 SMs), eight back-to-back calls per
 # CUDA graph with PDL over one input set and over eight, L2 flushed before
 # each replay, q_len 1 and 4, items n x 128 wide whose rows use every tile,
-# split launch vs the K=32 program, lowest of four rounds and both input
-# protocols, at 1-5, 8, 9, 12-14, 16-18, 20 and 24 rows (1, 4, 8 and 16 at
-# four tiles): four tiles (width 512) 1.05-1.18x at 1 and 4 rows, five (640)
-# 1.03-1.22x up to 9 rows, six (768) 1.02-1.34x up to 18, seven (896)
-# 1.02-1.41x up to 17, eight (1024) 1.04-1.51x up to 20 and nine (1152)
-# 1.10-1.63x up to 20; at the next measured row count a split gains under
-# 2 % or loses.  Three tiles have no rule: where the four-stage M64 body runs
-# them, a split lost against it from 4 rows.  A launch whose every row fits
-# in one piece measured 0.83-0.98x (1152 and 640 wide); as for 128 heads,
-# those launches split as well, and no launch without PDL splits.
+# split launch vs the K=32 program, the lowest at each row count over four
+# rounds, both input protocols and every measured shape, at 1-5, 8, 9,
+# 12-14, 16-18, 20 and 24 rows (1, 4, 8 and 16 at four tiles): four tiles
+# (width 512) 1.05-1.18x at 1 and 4 rows, five (640) 1.03-1.22x up to 9
+# rows, six (768) 1.02-1.34x up to 18, seven (896) 1.02-1.41x up to 17,
+# eight (1024) 1.04-1.51x up to 20 and nine (1152) 1.10-1.63x up to 20; at
+# the next measured row count a split gains under 2 % or loses.  Three tiles
+# have no rule: where the four-stage M64 body runs them, a split lost
+# against it from 4 rows.  A launch whose every row fits in one piece
+# measured 0.83-0.97x (1152 and 640 wide).  The rules follow the 128-head
+# policy: those launches split as well, and no launch without PDL splits.
 _K64_SPLIT_HEADS_H64 = 64
 _K64_SPLIT_RULES_H64: Mapping[str, tuple[_K64SplitRule, ...]] = {
     "sm_107a": (
@@ -2668,12 +2669,12 @@ def run_cake_dsv4(
     programs launch without the attribute.  Without ``enable_pdl`` the FP8
     H128 persistent route launches its PDL-free twin on SM103 from 384 query
     rows per launch and on SM100 when the longest request has at least 257
-    query tokens (``_pdl_variant``).  On SM107, PDL launches of FP8/H128 of few
-    metadata rows over items 1025-1152 wide (``_K64_SPLIT_RULES``) and of
-    FP8/H64 of few rows over items of four to nine tiles
-    (``_K64_SPLIT_RULES_H64``) run a split-KV producer and a merge when the
-    workspace holds their carve (:func:`_k64_split`;
-    :func:`cake_dsv4_workspace_requirement` includes it).
+    query tokens (``_pdl_variant``).  On SM107, PDL launches of few metadata
+    rows run a split-KV producer and a merge when the workspace holds their
+    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``) and
+    FP8/H64 over items of four to nine tiles (``_K64_SPLIT_RULES_H64``)
+    (:func:`_k64_split`; :func:`cake_dsv4_workspace_requirement` includes
+    it).
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;

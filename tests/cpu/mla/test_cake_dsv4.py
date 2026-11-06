@@ -5504,9 +5504,10 @@ def test_row_tiled_launches_never_split(monkeypatch):
 @pytest.mark.parametrize("sm_count", [148, 216])
 def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
     """At a split shape the requirement reports the split carve on every
-    architecture and SM count (the PDL setting is no input); elsewhere and in
-    the one-row minimum it reports the route's own numbers, and
-    get_cake_dsv4_workspace_bytes bounds every split carve."""
+    architecture at these SM counts (the PDL setting is no input; below 69
+    SMs some 64-head split shapes take an M64 route, which never splits);
+    elsewhere and in the one-row minimum it reports the route's own numbers,
+    and get_cake_dsv4_workspace_bytes bounds every split carve."""
     for tokens in (*range(1, 19), 24, 48):
         for sparse_topk in (1024, 1028, 1152):
             for num_heads in (64, 128):
@@ -5831,6 +5832,39 @@ def test_h64_workspace_requirement_covers_the_split_launch(arch):
         )
         == 4_737_024
     )
+
+
+@pytest.mark.cpu_only
+def test_h64_split_requirement_below_69_sms_follows_the_route():
+    """Below 69 SMs a 64-head split shape can take an M64 route, which never
+    splits: 18 rows over six tiles with the four-stage sibling take it at 68
+    SMs and report that route's own bytes; at 69 SMs, without the sibling or
+    off SM107 they take the uniform route and report the three-piece carve."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        num_query_tokens=18,
+        sparse_topk=768,
+        compressed_page_size=64,
+        max_q_len=1,
+        batch_size=18,
+        ragged=False,
+    )
+    carve = cake_dsv4_workspace_layout(18, 64, 3).total_bytes
+    m64 = cake.cake_dsv4_workspace_requirement(
+        **shape, sm_count=68, arch="sm_107a", kv4=True
+    )
+    assert m64.route == _M64_MULTI_TILE_ROUTE
+    own = cake._launch_workspace_bytes(m64.plan, 18, 64, 0)
+    assert m64.single_launch_bytes == own < carve
+    for change in (
+        dict(sm_count=69, arch="sm_107a", kv4=True),
+        dict(sm_count=68, arch="sm_107a", kv4=False),
+        dict(sm_count=68, arch="sm_100a", kv4=False),
+    ):
+        req = cake.cake_dsv4_workspace_requirement(**shape, **change)
+        assert req.route == _UNIFORM_ROUTE, change
+        assert req.single_launch_bytes == carve, change
 
 
 @pytest.mark.cpu_only
