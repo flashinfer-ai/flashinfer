@@ -120,11 +120,17 @@ def test_route_tables_cover_every_delivered_world_size_once():
 @pytest.mark.parametrize("program", PROGRAMS)
 def test_program_records_carry_the_fused_launcher_contract(program):
     record = loader.PROGRAMS[program]
-    # The device unit and its thin tvm-ffi launcher, both directly under the package.
+    # The device unit and its thin tvm-ffi launcher, both directly under the package
+    # or both in one family directory of it, next to the shared headers they include.
     assert len(record["sources"]) == 2
+    directories = set()
     for relative in record["sources"]:
         assert relative.startswith("csrc/cake_fp8_rowwise_gemm_allreduce/")
-        assert relative.count("/") == 2
+        directory = relative.split("/", 2)[2].rpartition("/")[0]
+        assert directory in ("", *loader.SOURCE_DIRECTORIES)
+        assert loader._source_path(relative).is_file()
+        directories.add(directory)
+    assert len(directories) == 1
     assert record["arches"] and set(record["arches"]) <= set(ARCHES)
     args = loader.launcher_args(program)
     assert args[-3:] == ("grid_x", "grid_y", "grid_z")
