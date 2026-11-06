@@ -77,9 +77,10 @@ This is the `nondet` package of the family; its names carry the mode word and
 no entry takes a `deterministic=` keyword.  The forward is fixed-order and
 never alerts.  Under `torch.use_deterministic_algorithms(True)` the backward
 (`cake_gqa_nondet_train_backward`, and the backward of `cake_gqa_nondet`)
-raises PyTorch's alert after its checks and before it launches: a
-`RuntimeError`, or with `warn_only=True` a `UserWarning`, after which the
-non-deterministic backward runs.  Nothing falls back to a deterministic
+raises PyTorch's alert after its checks and before it allocates or launches
+anything: a `RuntimeError`, or with `warn_only=True` a `UserWarning`, after
+which the non-deterministic backward runs.  A call without a (query, key) pair
+launches nothing and does not alert.  Nothing falls back to a deterministic
 implementation; the deterministic package `flashinfer.cake_gqa_det_train` is
 planned.
 

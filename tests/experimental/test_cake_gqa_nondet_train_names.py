@@ -205,13 +205,13 @@ def test_no_entry_takes_a_mode_keyword():
     keyword (``inspect.signature(fn).bind_partial(deterministic=False)`` is a ``TypeError``: no such parameter, no
     ``**kwargs``); passing it to a facade entry is a ``TypeError`` from argument binding, before any work."""
     backend = _backend("cake_backend")
-    fns = {name: getattr(public, name) for name in ENTRIES}
+    fns = {f"facade.{name}": getattr(public, name) for name in ENTRIES}
     for name in FORWARDED:
         obj = getattr(backend, name)
         if name == "CakeGQANondetFunction":
-            fns[name + ".forward"] = obj.forward
+            fns[f"backend.{name}.forward"] = obj.forward
         elif name == "CakeGQANondetWorkspace" or inspect.isfunction(obj):
-            fns[name] = obj
+            fns[f"backend.{name}"] = obj
     autograd = [
         cls
         for cls in vars(backend).values()

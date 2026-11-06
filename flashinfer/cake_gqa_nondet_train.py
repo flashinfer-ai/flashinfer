@@ -29,8 +29,9 @@ The mode is part of the name: no entry takes a ``deterministic`` keyword
 adds the dQ partials (and the row-map dK / dV adds) with atomic FP32
 reductions, so its gradients are not bitwise reproducible run to run.  Under
 ``torch.use_deterministic_algorithms(True)`` the backward raises PyTorch's
-alert before it launches (``warn_only=True``: it warns and runs this
-backward); it never falls back to a deterministic implementation.  The
+alert after its checks and before it allocates or launches anything
+(``warn_only=True``: it warns and runs this backward); it never falls back
+to a deterministic implementation.  The
 deterministic counterpart ``flashinfer.cake_gqa_det_train`` is planned.
 
 A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin

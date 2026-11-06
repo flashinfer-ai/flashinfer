@@ -410,8 +410,9 @@ def _scale(softmax_scale: Optional[float]) -> float:
 def _alert_nondeterministic(entry: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic algorithms
     are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
-    warn_only=True)``; nothing otherwise.  :func:`cake_gqa_nondet_train_backward` calls it once per call, after its
-    checks and before it allocates or launches anything (PyTorch exposes no public Python entry for the alert)."""
+    warn_only=True)``; nothing otherwise.  :func:`cake_gqa_nondet_train_backward` calls it once per call that has a
+    (query, key) pair, after its checks and before it allocates or launches anything (PyTorch exposes no public Python
+    entry for the alert)."""
     if not torch.are_deterministic_algorithms_enabled():
         return
     if torch.is_deterministic_algorithms_warn_only_enabled():
@@ -524,8 +525,9 @@ def cake_gqa_nondet_train_backward(
     with more CTAs that retire at once.  It is never read from the device.
 
     Not bitwise reproducible run to run: the dQ partials (and the row-map adds) are atomic FP32 reductions.  Under
-    ``torch.use_deterministic_algorithms(True)`` a call that launches raises PyTorch's alert (a ``RuntimeError``;
-    with ``warn_only=True`` a ``UserWarning``, and the backward runs) after the checks and before any launch.
+    ``torch.use_deterministic_algorithms(True)`` a call with a (query, key) pair raises PyTorch's alert (a
+    ``RuntimeError``; with ``warn_only=True`` a ``UserWarning``, and the backward runs) after the checks and before
+    anything is allocated or launched.
     """
     dims = _check_operands(q, k, v, cu_seqlens_q, cu_seqlens_k)
     if max_seqlen_k is not None and int(max_seqlen_k) < 0:
@@ -564,21 +566,27 @@ def cake_gqa_nondet_train_backward(
                 f"dkv_dtype must be torch.bfloat16 or torch.float32, got {dkv_dtype}"
             )
         mode = "bf16" if dkv_dtype == torch.bfloat16 else "fp32"
+        if dk is not None:
+            _check_out("dk", dk, kv_shape, dkv_dtype, device)
+        if dv is not None:
+            _check_out("dv", dv, kv_shape, dkv_dtype, device)
+    if dq is not None:
+        _check_out("dq", dq, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
+    if total_q and total_k:
+        # The kernels below add the dQ partials (and the row-map rows) with atomic FP32 reductions.
+        _alert_nondeterministic(
+            "cake_gqa_nondet_train_backward (the backward of cake_gqa_nondet)"
+        )
+    if mode != "rowmap":
         if dk is None:
             dk = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
-        else:
-            _check_out("dk", dk, kv_shape, dkv_dtype, device)
         if dv is None:
             dv = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
-        else:
-            _check_out("dv", dv, kv_shape, dkv_dtype, device)
         dk_out, dv_out = dk, dv
     if dq is None:
         dq = torch.empty(
             total_q, heads_q, HEAD_DIM, dtype=torch.bfloat16, device=device
         )
-    else:
-        _check_out("dq", dq, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
     if total_q == 0 or total_k == 0:
         # No (query, key) pair: every gradient is zero; a row-map destination keeps its contents.
         dq.zero_()
@@ -586,9 +594,6 @@ def cake_gqa_nondet_train_backward(
             dk_out.zero_()
             dv_out.zero_()
         return dq, dk_out, dv_out
-    _alert_nondeterministic(
-        "cake_gqa_nondet_train_backward (the backward of cake_gqa_nondet)"
-    )
     device_index = device.index
     ws = workspace if workspace is not None else default_workspace(device_index)
     dq_accum, lse_log2, dpsum = ws.scratch(total_q, heads_q, dims["num_segments"])

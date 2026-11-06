@@ -803,7 +803,7 @@ def test_deterministic_mode_alerts_at_the_backward_only(
     device, deterministic_algorithms
 ) -> None:
     """The fixed-order forward runs silently; the backward (atomic FP32 dQ reductions) raises PyTorch's alert after
-    its checks and before it launches anything, through the low-level entry and through autograd."""
+    its checks and before it allocates or launches anything, through the low-level entry and through autograd."""
     x = _inputs((130, 77), (200, 77), 24, 4, device)
     q, k, v, cq, ck = x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"]
     ref_out, ref_lse = cake_backend.cake_gqa_nondet_train_forward(
@@ -824,6 +824,28 @@ def test_deterministic_mode_alerts_at_the_backward_only(
         )
     torch.cuda.synchronize()
     assert bool((dq == 7.0).all()), "the alert must come before any launch"
+    dk = torch.full(k.shape, 5.0, dtype=torch.float32, device=device)
+    dv = torch.full(v.shape, 3.0, dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match=ALERT):
+        cake_backend.cake_gqa_nondet_train_backward(
+            q,
+            k,
+            v,
+            out,
+            lse,
+            x["dout"],
+            cq,
+            ck,
+            softmax_scale=SCALE,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            dkv_dtype=torch.float32,
+        )
+    torch.cuda.synchronize()
+    assert (
+        bool((dq == 7.0).all()) and bool((dk == 5.0).all()) and bool((dv == 3.0).all())
+    )
     # A bad argument is reported as such, not as the alert.
     with pytest.raises(ValueError, match="dkv_dtype"):
         cake_backend.cake_gqa_nondet_train_backward(
