@@ -81,9 +81,9 @@ _SM120_MAX_TOPK = 8
 _SM120_MAX_LOCAL_EXPERTS = 256
 _SM120_MAX_HIDDEN = 7936  # the dispatch stages one MXFP8 row (hidden + hidden / 32 bytes) in 8 KB of shared memory
 # The SM120 kernel multiplies 8 tokens per weight tile, a decode-size design. Up to 128 tokens per rank it
-# beats the moe_ep SM120 MXFP4 backends on RTX 6000D (DeepSeek-V4-Flash, EP4 and EP8), at 256 it is within
-# about 10% of them either way, and at 512 it is clearly slower, so larger batches (prefill) belong on moe_ep.
-_SM120_MAX_TOKENS_PER_RANK = 256
+# beats the moe_ep SM120 MXFP4 backends on RTX 6000D and RTX PRO 6000 (DeepSeek-V4-Flash, DeepSeek-V4.1-Flash
+# and GLM-5.3-Flash MoE shapes); at 256 it is mostly 0-14% slower, so larger batches belong on moe_ep.
+_SM120_MAX_TOKENS_PER_RANK = 128
 
 
 def _is_sm120() -> bool:
@@ -761,7 +761,7 @@ def mxfp4_mega_moe(
     On SM120 one host's ranks (1 to 8) take part over PCIe peer-to-peer; the
     weights come from :func:`transform_mxfp4_weights_for_mega_moe` on the same
     device. The kernel targets decode-size batches: ``num_max_tokens_per_rank``
-    is limited to 256 (beyond that the ``flashinfer.moe_ep`` SM120 backends are
+    is limited to 128 (beyond that the ``flashinfer.moe_ep`` SM120 backends are
     faster), and the expert pools hold that many rows per (local expert, source
     rank). Top-k ids outside ``[0, num_experts)`` and
     repeats of an earlier id of the same token are treated as masked (-1). A

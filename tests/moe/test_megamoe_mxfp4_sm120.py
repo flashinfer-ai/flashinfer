@@ -277,17 +277,17 @@ def test_megamoe_mxfp4_sm120_model_shapes(ep, hidden, intermediate, experts, top
             intermediate=intermediate,
             experts=experts,
             topk=topk,
-            capacity=256,
-            tokens=[1, 16, 64, 256],
+            capacity=128,
+            tokens=[1, 16, 64, 128],
         )
     )
 
 
 def test_megamoe_mxfp4_sm120_production_shape():
-    """DeepSeek-V4-Flash routed experts (H4096, I2048, 256 experts, top-6), EP4, up to the 256 tokens/rank cap."""
+    """DeepSeek-V4-Flash routed experts (H4096, I2048, 256 experts, top-6), EP4, up to the 128 tokens/rank cap."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
-    _run(_args(hidden=4096, intermediate=2048, capacity=256, tokens=[1, 16, 64, 256]))
+    _run(_args(hidden=4096, intermediate=2048, capacity=128, tokens=[1, 16, 64, 128]))
 
 
 if __name__ == "__main__":
