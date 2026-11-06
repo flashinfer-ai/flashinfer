@@ -1,12 +1,13 @@
 # Cake deterministic context-parallel (KCP) packed KDA chunked training backend (SM100 / SM103 / SM107)
 
-Experimental backend of the context-parallel route of the packed Kimi Delta
+Backend of the context-parallel route of the packed Kimi Delta
 Attention (KDA) chunked training forward and backward: the packed batch is
 split over the ranks of a `torch.distributed` process group and the
 per-document state recurrences cross the rank boundaries exactly.  The public
 entry points are in `flashinfer/cake_kda_det_train_kcp.py`; each rank runs the
 chunk stages of `flashinfer.experimental.cake_kda_det_train` at its own shape.
-Both the API and the backend are experimental: no compatibility guarantee.
+The entry points of `flashinfer.cake_kda_det_train_kcp` are a stable top-level
+API; the modules of this package are their backend.
 
 The path is deterministic: the same inputs, hardware, plan and process group
 give bitwise the same outputs and gradients.

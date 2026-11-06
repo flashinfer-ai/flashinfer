@@ -15,22 +15,35 @@ limitations under the License.
 
 flashinfer public-API tests of the Cake deterministic context-parallel (KCP) packed KDA training package
 (``flashinfer.experimental.cake.cake_kda_det_train_kcp``), device-free: the keywords the entry points of
-``flashinfer.cake_kda_det_train_kcp`` forward, the #8928 names of the facade, the package and its modules (the mode
-word, one prefix, no ``deterministic`` keyword), and the absence of the earlier names and package path.
+``flashinfer.cake_kda_det_train_kcp`` forward, and the #8928 names.  The shared check of #8928
+(``tests.test_helpers.cake_mode_names``) covers the names of the facade and the package: the mode word right after
+the op, no ``deterministic`` keyword, each object bound under one name only (the facade, the ``flashinfer`` top
+level, the package's modules) and the earlier names and package path failing at import.  The three entries that
+take ``**options`` bind any keyword by signature, so the keyword check runs on them by call (the options check
+refuses ``deterministic`` before any operand is read).  This file adds what the shared check does not cover: the
+facade entries are stable (not experimental) and defined in the facade, the types resolve lazily to the backend
+classes, the backend modules define the names, errors name the entry points, and importing the facade or the
+package loads no host module.
 """
 
 import importlib
 import inspect
-import re
 import subprocess
 import sys
 import warnings
+from pathlib import Path
 
 import pytest
 
-import flashinfer.cake_kda_det_train as det_api
+import flashinfer
 import flashinfer.cake_kda_det_train_kcp as kcp_api
-from flashinfer.api_logging import ExperimentalWarning
+from tests.test_helpers.cake_mode_names import (
+    assert_mode_names,
+    assert_no_deterministic_keyword,
+    assert_old_names_fail,
+    assert_same_object_same_name,
+)
+
 
 pytestmark = pytest.mark.cpu_only
 
@@ -121,21 +134,86 @@ DET_NAMES_BEFORE_8928 = (
     "partition_det_kcp",
     "reduce_gate_param_grads_det_kcp",
 )
-# #8928 rule 7: every public name carries the mode; ALL_CAPS module constants keep their names
-CONSTANT_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
-# rules 2-6 and 10: the entries and types of the package share one prefix
-MODE_NAME = re.compile(
-    r"^(?:cake_kda_det_kcp|cake_kda_det_train_kcp_[a-z0-9_]+|is_cake_kda_det_train_kcp_supported"
-    r"|CakeKDADetKcp[A-Za-z0-9]+)$"
+# the backend module each facade entry forwards to (the same name)
+ENTRY_BACKEND = {
+    "cake_kda_det_train_kcp_partition": "cake_kcp_plan",
+    "cake_kda_det_train_kcp_build_context": "cake_kcp_plan",
+    "cake_kda_det_kcp": "cake_kcp",
+    "cake_kda_det_train_kcp_forward": "cake_kcp",
+    "cake_kda_det_train_kcp_backward": "cake_kcp",
+    "cake_kda_det_train_kcp_workspace_bytes": "cake_kcp_plan",
+    "cake_kda_det_train_kcp_saved_bytes": "cake_kcp_plan",
+    "cake_kda_det_train_kcp_comm_bytes": "cake_kcp_plan",
+    "cake_kda_det_train_kcp_reduce_gate_param_grads": "cake_kcp",
+}
+FACADE = "flashinfer.cake_kda_det_train_kcp"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SUBMODULES = ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit", "cake_build")
+# the entries that take ``**options`` (forwarded to the backend's options check): checked by call
+OPTIONS_ENTRIES = (
+    "cake_kda_det_kcp",
+    "cake_kda_det_train_kcp_backward",
+    "cake_kda_det_train_kcp_forward",
 )
+# the package path before the move and the names before #8928 and before the det rename: no alias, no shim
+OLD_MODULES = (PREVIOUS_PACKAGE, *(f"{PREVIOUS_PACKAGE}.{m}" for m in SUBMODULES))
+OLD_NAMES = tuple(
+    (module, old)
+    for old in PREVIOUS_NAMES + DET_NAMES_BEFORE_8928
+    for module in (
+        FACADE,
+        PACKAGE,
+        *(f"{PACKAGE}.{m}" for m in ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit")),
+    )
+)
+
+
+def _backend(module: str):
+    return importlib.import_module(f"{PACKAGE}.{module}")
+
+
+def _required_arguments(fn) -> tuple[list[object], dict[str, object]]:
+    """Placeholder objects for the parameters of ``fn`` without a default (positional, then keyword-only)."""
+    args, kwargs = [], {}
+    for p in inspect.signature(fn).parameters.values():
+        if p.default is not inspect.Parameter.empty or p.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if p.kind is inspect.Parameter.KEYWORD_ONLY:
+            kwargs[p.name] = object()
+        else:
+            args.append(object())
+    return args, kwargs
 
 
 @pytest.mark.parametrize("new", FACADE_NAMES)
 def test_facade_entries_carry_the_det_names(new: str) -> None:
     fn = getattr(kcp_api, new)
     assert fn.__name__ == new and fn.__module__ == "flashinfer.cake_kda_det_train_kcp"
-    assert fn.experimental_feature == det_api._FEATURE
     assert new in kcp_api.__all__
+
+
+@pytest.mark.parametrize("new", FACADE_NAMES)
+def test_facade_entries_are_stable_api(
+    new: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #8928: the facade is a stable top-level API (flashinfer_api, not flashinfer_experimental_api): no
+    # experimental marker, and a call emits no ExperimentalWarning.  Device-free: the backend entry is a recorder.
+    fn = getattr(kcp_api, new)
+    assert not getattr(fn, "is_experimental", False), new
+    assert not hasattr(fn, "experimental_feature"), new
+    backend = importlib.import_module(f"{PACKAGE}.{ENTRY_BACKEND[new]}")
+    calls = []
+    monkeypatch.setattr(backend, new, lambda *a, **k: calls.append(new))
+    args, kwargs = _required_arguments(fn)
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        fn(*args, **kwargs)
+    assert calls == [new]
+    # by class name: the test imports nothing from the experimental-API machinery
+    assert not [w for w in seen if w.category.__name__ == "ExperimentalWarning"], new
 
 
 @pytest.mark.parametrize("new", TYPE_NAMES)
@@ -160,66 +238,52 @@ def test_backend_definitions_carry_the_det_names(module: str, new: str) -> None:
         assert getattr(package, new) is obj
 
 
-@pytest.mark.parametrize("old", PREVIOUS_NAMES + DET_NAMES_BEFORE_8928)
-def test_previous_names_are_gone(old: str) -> None:
-    package = importlib.import_module(PACKAGE)
-    modules = [kcp_api, package] + [
-        importlib.import_module(f"{PACKAGE}.{sub}")
-        for sub in ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit")
-    ]
-    for mod in modules:
-        assert not hasattr(mod, old), (mod.__name__, old)
-        assert old not in getattr(mod, "__all__", ()), (mod.__name__, old)
-    assert old not in dir(kcp_api) and old not in dir(package)
-    for name in ("flashinfer.cake_kda_det_train_kcp", PACKAGE):
-        with pytest.raises(ImportError):
-            exec(f"from {name} import {old}", {})
+def test_facade_follows_the_cake_mode_names() -> None:
+    # the shared check (assert_cake_mode_module without its keyword check, see test_no_entry_takes_deterministic):
+    # the facade, the flashinfer top level and the package's modules bind each object under its facade name only,
+    # including the backend object each entry calls
+    assert_mode_names(kcp_api, "det")
+    assert_same_object_same_name(
+        kcp_api,
+        [flashinfer, *(_backend(m) for m in ("cake_kcp", "cake_kcp_plan"))],
+        forwards=[
+            (name, getattr(_backend(module), name))
+            for name, module in ENTRY_BACKEND.items()
+        ],
+    )
+    assert_old_names_fail(OLD_MODULES, OLD_NAMES, cwd=REPO_ROOT)
 
 
-@pytest.mark.parametrize(
-    "module", ("", ".cake_kcp", ".cake_kcp_plan", ".cake_kcp_jit", ".cake_build")
-)
-def test_previous_package_path_is_gone(module: str) -> None:
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(f"{PREVIOUS_PACKAGE}{module}")
-
-
-@pytest.mark.parametrize("where", ("facade", "package"))
-def test_public_names_carry_the_mode(where: str) -> None:
-    # #8928 rules 2-7 and 10: every public name of the facade and of the backend package carries the mode and the
-    # package's prefix; ALL_CAPS constants keep their names
-    mod = kcp_api if where == "facade" else importlib.import_module(PACKAGE)
-    names = [name for name in mod.__all__ if not CONSTANT_NAME.match(name)]
-    assert names
-    for name in names:
-        assert re.search(r"(?:^|_)det(?:_|$)|Det", name), name
-        assert MODE_NAME.match(name), name
+def test_package_states_the_mode() -> None:
+    assert_mode_names(importlib.import_module(PACKAGE), "det")
 
 
 @pytest.mark.parametrize("where", ("facade", "package"))
 def test_no_entry_takes_deterministic(where: str) -> None:
-    # #8928 rule 7: the mode is part of the name only
-    import torch
-
+    # #8928 rule 7: the mode is part of the name only.  The shared keyword check runs on every public callable but
+    # the three entries with ``**options``, which bind ``deterministic=`` there and refuse it at the call (the
+    # options check runs before any operand is read).
     mod = kcp_api if where == "facade" else importlib.import_module(PACKAGE)
-    checked = 0
-    for name in mod.__all__:
+    names = [name for name in mod.__all__ if callable(getattr(mod, name))]
+    # functions only: a class is checked by its constructor (an autograd Function by its forward / backward)
+    var_keyword = [
+        name
+        for name in names
+        if not inspect.isclass(getattr(mod, name))
+        and any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in inspect.signature(getattr(mod, name)).parameters.values()
+        )
+    ]
+    assert sorted(var_keyword) == sorted(OPTIONS_ENTRIES)
+    assert_no_deterministic_keyword(
+        [getattr(mod, name) for name in names if name not in OPTIONS_ENTRIES]
+    )
+    for name in OPTIONS_ENTRIES:
         obj = getattr(mod, name)
-        if not callable(obj):
-            continue
-        if inspect.isclass(obj):
-            obj = (
-                obj.forward
-                if issubclass(obj, torch.autograd.Function)
-                else obj.__init__
-            )
-        assert "deterministic" not in inspect.signature(obj).parameters, name
-        checked += 1
-    assert checked
-    # the entry points' **options refuse the keyword like any unknown one
-    cake_kcp = importlib.import_module(f"{PACKAGE}.cake_kcp")
-    with pytest.raises(TypeError, match="deterministic"):
-        cake_kcp._options({"deterministic": True})
+        args, kwargs = _required_arguments(obj)
+        with pytest.raises(TypeError, match="deterministic"):
+            obj(*args, deterministic=False, **kwargs)
 
 
 def test_errors_name_the_det_entry_points() -> None:
@@ -260,13 +324,11 @@ def test_workspace_query_resolves_save_transfer_like_the_forward(
         lambda ctx, **kw: calls.append(kw) or 0,
     )
     ctx = object()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        kcp_api.cake_kda_det_train_kcp_workspace_bytes(ctx, backward=False)
-        kcp_api.cake_kda_det_train_kcp_workspace_bytes(
-            ctx, backward=False, save_transfer=False
-        )
-        kcp_api.cake_kda_det_train_kcp_workspace_bytes(ctx)
+    kcp_api.cake_kda_det_train_kcp_workspace_bytes(ctx, backward=False)
+    kcp_api.cake_kda_det_train_kcp_workspace_bytes(
+        ctx, backward=False, save_transfer=False
+    )
+    kcp_api.cake_kda_det_train_kcp_workspace_bytes(ctx)
     assert [kw["save_transfer"] for kw in calls] == [
         cake_kcp_plan.SAVE_TRANSFER_DEFAULT,
         False,
@@ -312,26 +374,22 @@ def test_recompute_handle_keywords_are_forwarded(
     )
     operands = tuple(object() for _ in range(6))
     handle, ctx = object(), object()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        assert (
-            kcp_api.cake_kda_det_kcp(
-                *operands, recompute_handle=handle, checkpoint_keep="transfer"
-            )
-            == "autograd"
+    assert (
+        kcp_api.cake_kda_det_kcp(
+            *operands, recompute_handle=handle, checkpoint_keep="transfer"
         )
-        assert kcp_api.cake_kda_det_kcp(*operands, exchange="ring") == "autograd"
-        assert (
-            kcp_api.cake_kda_det_train_kcp_saved_bytes(ctx, checkpoint_keep="states")
-            == "saved"
-        )
-        assert (
-            kcp_api.cake_kda_det_train_kcp_comm_bytes(
-                ctx, H=4, checkpoint_keep="states"
-            )
-            == "comm"
-        )
-        assert kcp_api.cake_kda_det_train_kcp_comm_bytes(ctx, H=4) == "comm"
+        == "autograd"
+    )
+    assert kcp_api.cake_kda_det_kcp(*operands, exchange="ring") == "autograd"
+    assert (
+        kcp_api.cake_kda_det_train_kcp_saved_bytes(ctx, checkpoint_keep="states")
+        == "saved"
+    )
+    assert (
+        kcp_api.cake_kda_det_train_kcp_comm_bytes(ctx, H=4, checkpoint_keep="states")
+        == "comm"
+    )
+    assert kcp_api.cake_kda_det_train_kcp_comm_bytes(ctx, H=4) == "comm"
     base = {
         "scale": None,
         "save_mode": "light",
@@ -462,31 +520,26 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
         "lower_bound": -5.0,
     }
     reduce_args = (object(), object(), object())
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        assert kcp_api.cake_kda_det_train_kcp_forward(*operands, **kw) == "fwd"
-        assert (
-            kcp_api.cake_kda_det_train_kcp_backward(*operands, object(), **kw) == "bwd"
+    assert kcp_api.cake_kda_det_train_kcp_forward(*operands, **kw) == "fwd"
+    assert kcp_api.cake_kda_det_train_kcp_backward(*operands, object(), **kw) == "bwd"
+    assert kcp_api.cake_kda_det_kcp(*operands, **kw) == "autograd"
+    assert (
+        kcp_api.cake_kda_det_train_kcp_workspace_bytes(
+            object(), use_gate_in_kernel=True
         )
-        assert kcp_api.cake_kda_det_kcp(*operands, **kw) == "autograd"
+        == "bytes"
+    )
+    assert (
+        kcp_api.cake_kda_det_train_kcp_reduce_gate_param_grads(*reduce_args) == "reduce"
+    )
+    for gate in (True, False):
         assert (
-            kcp_api.cake_kda_det_train_kcp_workspace_bytes(
-                object(), use_gate_in_kernel=True
+            kcp_api.cake_kda_det_train_kcp_saved_bytes(
+                object(), use_gate_in_kernel=gate
             )
-            == "bytes"
+            == "saved"
         )
-        assert (
-            kcp_api.cake_kda_det_train_kcp_reduce_gate_param_grads(*reduce_args)
-            == "reduce"
-        )
-        for gate in (True, False):
-            assert (
-                kcp_api.cake_kda_det_train_kcp_saved_bytes(
-                    object(), use_gate_in_kernel=gate
-                )
-                == "saved"
-            )
-        assert kcp_api.cake_kda_det_train_kcp_saved_bytes(object()) == "saved"
+    assert kcp_api.cake_kda_det_train_kcp_saved_bytes(object()) == "saved"
     for name, _, got in calls[:3]:
         assert all(got[k] is v for k, v in kw.items()), name
     assert calls[3][2]["use_gate_in_kernel"] is True
@@ -535,15 +588,11 @@ def test_public_module_forwards_the_qk_l2norm(monkeypatch: pytest.MonkeyPatch) -
     )
     operands = tuple(object() for _ in range(6))
     kw = {"use_qk_l2norm_in_kernel": True}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        assert kcp_api.cake_kda_det_train_kcp_forward(*operands, **kw) == "fwd"
-        assert (
-            kcp_api.cake_kda_det_train_kcp_backward(*operands, object(), **kw) == "bwd"
-        )
-        assert kcp_api.cake_kda_det_kcp(*operands, **kw) == "autograd"
-        assert kcp_api.cake_kda_det_train_kcp_workspace_bytes(object(), **kw) == "ws"
-        assert kcp_api.cake_kda_det_train_kcp_saved_bytes(object(), **kw) == "saved"
+    assert kcp_api.cake_kda_det_train_kcp_forward(*operands, **kw) == "fwd"
+    assert kcp_api.cake_kda_det_train_kcp_backward(*operands, object(), **kw) == "bwd"
+    assert kcp_api.cake_kda_det_kcp(*operands, **kw) == "autograd"
+    assert kcp_api.cake_kda_det_train_kcp_workspace_bytes(object(), **kw) == "ws"
+    assert kcp_api.cake_kda_det_train_kcp_saved_bytes(object(), **kw) == "saved"
     assert [c[0] for c in calls] == ["fwd", "bwd", "autograd", "ws", "saved"]
     for name, _, got in calls:
         assert got["use_qk_l2norm_in_kernel"] is True, name

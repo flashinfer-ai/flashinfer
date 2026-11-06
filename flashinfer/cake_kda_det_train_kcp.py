@@ -43,15 +43,15 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
-from .cake_kda_det_train import _FEATURE, DEFAULT_SCALE
+from .api_logging import flashinfer_api
+from .cake_kda_det_train import DEFAULT_SCALE
 
 # The KCP entry points forward to ``flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
 # launch sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the
 # context's tables and collectives, the byte queries).  Every keyword is forwarded; nothing is validated here.
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_partition(
     cu_seqlens_global_cpu: Any,
     world_size: int,
@@ -85,7 +85,7 @@ def cake_kda_det_train_kcp_partition(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_build_context(
     part: Any,
     group: Any,
@@ -140,7 +140,7 @@ def cake_kda_det_train_kcp_build_context(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -225,7 +225,7 @@ def cake_kda_det_train_kcp_forward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -289,7 +289,7 @@ def cake_kda_det_train_kcp_backward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -365,7 +365,7 @@ def cake_kda_det_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_workspace_bytes(
     ctx: Any,
     *,
@@ -418,7 +418,7 @@ def cake_kda_det_train_kcp_workspace_bytes(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_reduce_gate_param_grads(
     ctx: Any, dA_log: torch.Tensor, ddt_bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -434,7 +434,7 @@ def cake_kda_det_train_kcp_reduce_gate_param_grads(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_saved_bytes(
     ctx: Any,
     *,
@@ -473,7 +473,7 @@ def cake_kda_det_train_kcp_saved_bytes(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_kda_det_train_kcp_comm_bytes(
     ctx: Any,
     *,
