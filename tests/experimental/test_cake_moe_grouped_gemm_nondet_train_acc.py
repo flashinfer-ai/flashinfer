@@ -1948,7 +1948,7 @@ def _composed_main_grad(mg0, grads, x, offs):
     mg = mg0.clone()
     for g in grads:
         mg.add_(
-            base.cake_moe_grouped_gemm_nondet_train_wgrad(
+            pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
                 g, x, offs, out_dtype=mg0.dtype
             )
         )
@@ -2097,7 +2097,7 @@ def test_autograd_flag_errors_and_side_effects(monkeypatch):
     device, sizes, x0, w0, g1, _g2, offs = _autograd_case(torch.float32, monkeypatch)
     gemm = _fused_gemm(offs)
     mg0 = torch.zeros(w0.shape, device=device)
-    dw1 = base.cake_moe_grouped_gemm_nondet_train_wgrad(
+    dw1 = pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
         g1, x0, offs, out_dtype=torch.float32
     )
 
