@@ -138,7 +138,8 @@ def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
 
 # Passed by ``cake_grouped_mm`` as the fifth argument of ``CakeGroupedMm.apply``:
 # ``forward`` then allocates ``Y`` without launching, and the wrapper fills it
-# after ``apply`` returns (after autograd saved the inputs).
+# after ``apply`` returns (after autograd saved the inputs).  ``forward`` accepts
+# nothing else in that position but ``None``.
 _DEFER_FWD = object()
 
 
@@ -155,7 +156,8 @@ class CakeGroupedMm(torch.autograd.Function):
 
     ``x`` ``[sum_m, K]`` bf16, ``w`` ``[E, N, K]`` bf16, ``offs`` int32 device
     end offsets ``[E]`` (or ``m_indptr`` ``[E + 1]``); the fourth argument is
-    the numerical mode and must be ``False``.  ``forward`` saves ``x``, ``w``
+    the numerical mode and must be ``False`` (omitted, it is ``True`` and
+    refused with ``ValueError``, as every other value).  ``forward`` saves ``x``, ``w``
     and ``offs`` only.  ``backward`` returns ``dX`` ``[sum_m, K]`` bf16 (the
     deterministic bits) and ``dW`` ``[E, N, K]`` in the dtype of ``w``, whose
     split tail (512-wide k tile) is added in an order the launch does not fix;
@@ -170,9 +172,12 @@ class CakeGroupedMm(torch.autograd.Function):
     and a checkpoint always recomputes it, as does the wrapper under
     ``torch.jit.trace`` and ``torch.compile``.
 
-    The sixth argument, ``fuse_wgrad_accumulation`` (default ``False``), makes
-    the backward add the weight gradient into ``w.main_grad`` instead
-    (:func:`cake_grouped_mm`); ``forward`` then keeps the Python object ``w``
+    The fifth argument is an internal slot: anything there but ``None``
+    raises ``TypeError``.  The sixth argument, ``fuse_wgrad_accumulation``
+    (default ``False``; a bool, ``ValueError`` otherwise), makes the backward
+    add the weight gradient into ``w.main_grad`` instead
+    (:func:`cake_grouped_mm`; a direct call passes ``apply(x, w, offs, False,
+    None, True)``); ``forward`` then keeps the Python object ``w``
     on ``ctx`` (a saved tensor unpacked under a checkpoint has no attributes).
     ``forward`` runs with grad mode off and cannot tell whether autograd
     records the call, so it does not check ``main_grad``:
@@ -187,11 +192,17 @@ class CakeGroupedMm(torch.autograd.Function):
         x: torch.Tensor,
         w: torch.Tensor,
         offs: torch.Tensor,
-        deterministic: bool,
+        deterministic: bool = True,
         _launch=None,
         fuse_wgrad_accumulation: bool = False,
     ):
         _require_deterministic_false(deterministic, "CakeGroupedMm")
+        if _launch is not None and _launch is not _DEFER_FWD:
+            raise TypeError(
+                "CakeGroupedMm.apply(x, w, offs, False) takes no fifth argument (an internal slot: omit it, "
+                f"or pass None before fuse_wgrad_accumulation), got {_launch!r}; a direct call that fuses "
+                "the weight-gradient accumulation passes apply(x, w, offs, False, None, True)"
+            )
         _require_flag(
             fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedMm"
         )
@@ -220,8 +231,12 @@ class CakeGroupedMm(torch.autograd.Function):
         # The autograd engine runs backward on a worker thread that has not
         # touched the CUDA runtime yet; the programs encode their TMA
         # descriptors through the driver API, which needs the primary context
-        # current on the calling thread.  One runtime call binds it.
-        torch.cuda.current_stream(x.device).query()
+        # current on the calling thread.  One runtime call binds it: the
+        # capture-status query, which is legal while a CUDA graph captures the
+        # backward, then a stream query outside a capture (a stream that is
+        # being captured must not be queried: that would end the capture).
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream(x.device).query()
         g = _bf16_rows(grad_y)
         dx = dw = None
         if ctx.needs_input_grad[0]:

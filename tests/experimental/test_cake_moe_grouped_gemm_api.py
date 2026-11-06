@@ -232,9 +232,13 @@ def test_facade_rejects_every_mode_but_false(name, value, monkeypatch):
     """Every value of ``deterministic`` but the bool ``False`` (the default ``True``,
     ``None``, ``0``, ``1``, ``"False"``) raises ``ValueError`` naming the deterministic
     entry and saying to pass ``deterministic=False``, also under torch's deterministic
-    mode; nothing reaches the deterministic package."""
+    mode (strict and ``warn_only``); nothing reaches the deterministic package."""
     _tripwires(monkeypatch)
-    for mode in (contextlib.nullcontext(), _TorchDeterministic(warn_only=False)):
+    for mode in (
+        contextlib.nullcontext(),
+        _TorchDeterministic(warn_only=False),
+        _TorchDeterministic(warn_only=True),
+    ):
         with mode, pytest.raises(ValueError) as info:
             _call(name, value)
         message = str(info.value)
@@ -366,7 +370,7 @@ PACKAGE_CALLS = {
         _bf16(4, 64), _bf16(2, 256, 64), OFFS, **kw
     ),
     "CakeGroupedMm": lambda **kw: cake_autograd.CakeGroupedMm.apply(
-        _bf16(4, 64), _bf16(2, 256, 64), OFFS, kw.get("deterministic", True)
+        _bf16(4, 64), _bf16(2, 256, 64), OFFS, *kw.values()
     ),
 }
 
@@ -414,6 +418,85 @@ def test_package_mode_keyword_only():
     with pytest.raises(TypeError):
         pkg.cake_grouped_mm(_bf16(4, 64), _bf16(2, 256, 64), OFFS, False)
     assert set(cb._DET_ENTRIES) == set(PACKAGE_CALLS)
+
+
+@pytest.mark.parametrize(
+    "entry,det",
+    [
+        ("CakeGroupedMm.backward", "CakeGroupedDetMm"),
+        ("GroupedGemmLaunch.launch", "GroupedDetGemmLaunch.launch"),
+        ("grouped_gemm_wgrad", "grouped_det_gemm_wgrad"),
+    ],
+)
+def test_alert_names_the_deterministic_entry(entry, det):
+    """The alert of every entry that can launch an order-varying weight gradient names the
+    entry and its deterministic counterpart: the ``RuntimeError`` (strict) and the
+    ``UserWarning`` (``warn_only``); nothing with the mode off."""
+    want = f"flashinfer.experimental.cake_moe_grouped_det_gemm.{det}"
+    with (
+        _TorchDeterministic(warn_only=False),
+        pytest.raises(RuntimeError) as info,
+    ):
+        cb._alert_not_deterministic(entry)
+    assert str(info.value).startswith(entry) and want in str(info.value)
+    with (
+        _TorchDeterministic(warn_only=True),
+        warnings.catch_warnings(record=True) as rec,
+    ):
+        warnings.simplefilter("always")
+        cb._alert_not_deterministic(entry)
+    alerts = _user_warnings(rec)
+    assert len(alerts) == 1 and want in str(alerts[0].message), alerts
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        cb._alert_not_deterministic(entry)
+    assert rec == []
+
+
+@pytest.mark.parametrize("value", [True, False, 0, 1, "junk"], ids=str)
+def test_autograd_function_refuses_a_stray_internal_slot(value):
+    """``CakeGroupedMm.apply`` takes the mode fourth and nothing but ``None`` fifth (an
+    internal slot; the fuse flag is sixth): ``apply(x, w, offs, False, True)`` -- the
+    deterministic package's ``apply(x, w, offs, None, True)`` with the mode put first --
+    raises ``TypeError`` before anything runs; ``apply(x, w, offs, False, None, True)``
+    reaches the host checks (CPU operands: the device check)."""
+    x, w = _bf16(4, 64), _bf16(2, 256, 64)
+    with pytest.raises(TypeError, match="takes no fifth argument"):
+        cake_autograd.CakeGroupedMm.apply(x, w, OFFS, False, value)
+    with pytest.raises(ValueError, match="device"):
+        cake_autograd.CakeGroupedMm.apply(x, w, OFFS, False, None, True)
+
+
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
+def test_backward_never_queries_a_captured_stream(capturing, monkeypatch):
+    """The backward binds the CUDA context of its thread with one runtime call: the
+    capture-status query, then a stream query only outside a CUDA graph capture (querying
+    a stream that is being captured ends the capture with an error), with and without the
+    fuse flag (CPU stand-ins for the programs)."""
+    ran = []
+    for name in ("_fwd_op", "_dgrad_op", "_wgrad_op", "_wgrad_acc_op"):
+        monkeypatch.setattr(
+            cake_autograd, name, lambda *args, _name=name: ran.append(_name)
+        )
+    queries = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device=None: types.SimpleNamespace(
+            query=lambda: queries.append(device) or True
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    x = _bf16(4, 64).requires_grad_(True)
+    w = _bf16(2, 256, 64).requires_grad_(True)
+    w.main_grad = torch.zeros(2, 256, 64)
+    for fuse in (False, True):
+        y = cake_autograd.CakeGroupedMm.apply(x, w, OFFS, False, None, fuse)
+        y.backward(torch.ones_like(y))
+    assert len(queries) == (0 if capturing else 2), queries
+    want = ["_fwd_op", "_dgrad_op", "_wgrad_op"]
+    want += ["_fwd_op", "_dgrad_op", "_wgrad_acc_op"]
+    assert ran == want, ran
 
 
 @pytest.mark.parametrize("name", [n for n in PACKAGE_CALLS if n != "CakeGroupedMm"])
@@ -468,9 +551,10 @@ SPLIT_TAIL = {"unordered_tail": True, "tail_splits": 3}
 def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     """An order-varying launch (the weight gradient with an unordered split tail) checks
     torch's deterministic mode at every ``launch()``: strict, a ``RuntimeError`` naming
-    ``GroupedGemmLaunch.launch`` and the deterministic package, and nothing launches;
-    ``warn_only``, one ``UserWarning`` naming the caller's line, then it launches; mode
-    off, it launches silently."""
+    ``GroupedGemmLaunch.launch`` and the deterministic entry
+    (``GroupedDetGemmLaunch.launch``), and nothing launches; ``warn_only``, one
+    ``UserWarning`` naming both and the caller's line, then it launches; mode off, it
+    launches silently."""
     launch, log = _recorded_launch(monkeypatch, plan=SPLIT_TAIL)
     assert launch.order_varying
     with (
@@ -478,7 +562,7 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
         pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch") as info,
     ):
         launch.launch()
-    assert "cake_moe_grouped_det_gemm" in str(info.value)
+    assert "cake_moe_grouped_det_gemm.GroupedDetGemmLaunch.launch" in str(info.value)
     assert log == []
     with (
         _TorchDeterministic(warn_only=True),
@@ -489,6 +573,9 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     alerts = _user_warnings(rec)
     assert len(alerts) == 1, [str(w.message) for w in rec]
     assert "GroupedGemmLaunch.launch" in str(alerts[0].message)
+    assert "cake_moe_grouped_det_gemm.GroupedDetGemmLaunch.launch" in str(
+        alerts[0].message
+    )
     assert os.path.samefile(alerts[0].filename, __file__), alerts[0].filename
     assert log == ["launch"]
     with warnings.catch_warnings(record=True) as rec:

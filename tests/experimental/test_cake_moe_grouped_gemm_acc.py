@@ -2055,6 +2055,42 @@ def test_autograd_returns_megatron_placeholder(zero_out, monkeypatch):
     _assert_bitwise(w.main_grad, _composed_main_grad(mg0, (g1,), x0, offs), "main_grad")
 
 
+def test_graph_captures_the_fused_backward(monkeypatch):
+    """The forward and the fused backward of ``cake_grouped_mm(..., deterministic=False,
+    fuse_wgrad_accumulation=True)`` capture into one CUDA graph (the backward binds the
+    context without querying the captured stream): on an unsplit shape (one writer per
+    element) ``r`` replays from ``mg0`` give bitwise ``mg0`` plus ``r`` composed adds of
+    ``dW``, and ``x.grad`` holds the eager backward's bits."""
+    device, _sizes, x0, w0, g1, _g2, offs = _autograd_case(torch.float32, monkeypatch)
+    gen = torch.Generator(device=device).manual_seed(57)
+    mg0 = torch.randn(w0.shape, generator=gen, device=device)
+    w = w0.clone().requires_grad_(True)
+    w.main_grad = mg0.clone()
+    x = x0.clone().requires_grad_(True)
+    fn = _fused_gemm(offs)
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        fn(x, w).backward(g1)  # every program loaded outside the capture
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize()
+    eager_dx = x.grad.clone()
+    x.grad = None
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(x, w).backward(g1)
+    torch.cuda.synchronize()
+    assert w.grad is None
+    for replays in (1, 3):
+        w.main_grad.copy_(mg0)
+        for _ in range(replays):
+            graph.replay()
+        torch.cuda.synchronize()
+        want = _composed_main_grad(mg0, (g1,) * replays, x0, offs)
+        _assert_bitwise(w.main_grad, want, f"{replays} replays")
+        assert torch.equal(x.grad, eager_dx)
+
+
 def test_autograd_flag_errors_and_side_effects(monkeypatch):
     """Missing ``main_grad`` at the forward and a wrong one at the backward raise
     ``ValueError``; ``w`` as a reentrant checkpoint's input arrives without ``main_grad``

@@ -360,28 +360,42 @@ def _caller_stacklevel() -> int:
     return 2
 
 
+# The deterministic counterpart of each entry that can launch an order-varying weight gradient (the
+# ``entry`` of ``GroupedGemmLaunch._run``): named by the alert.
+_ALERT_DET_ENTRIES: dict[str, str] = {
+    "CakeGroupedMm.backward": "CakeGroupedDetMm",
+    "GroupedGemmLaunch.launch": "GroupedDetGemmLaunch.launch",
+    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
+}
+
+
 def _alert_not_deterministic(entry: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic
-    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` (naming the caller's frame) under
-    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by
-    :meth:`GroupedGemmLaunch._run` immediately before an order-varying launch (``order_varying``); there is no
-    fallback.  The alert is raised here because PyTorch exposes no public Python entry for it."""
+    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
+    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Both name the
+    deterministic entry (``_ALERT_DET_ENTRIES``).  The warning names the nearest frame outside flashinfer:
+    the caller's line for a direct call (``grouped_gemm_wgrad``, ``launch()``), a frame of PyTorch's autograd
+    for a backward (the engine calls it).  Called by :meth:`GroupedGemmLaunch._run` immediately before an
+    order-varying launch (``order_varying``); there is no fallback.  The alert is raised here because PyTorch
+    exposes no public Python entry for it."""
     if not torch.are_deterministic_algorithms_enabled():
         return
+    det = "flashinfer.experimental.cake_moe_grouped_det_gemm"
+    if entry in _ALERT_DET_ENTRIES:
+        det = f"{det}.{_ALERT_DET_ENTRIES[entry]}"
     if torch.is_deterministic_algorithms_warn_only_enabled():
         warnings.warn(
             f"{entry} does not have a deterministic implementation, but you set "
             "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
-            "flashinfer.experimental.cake_moe_grouped_det_gemm is the deterministic package",
+            f"the deterministic entry is {det}",
             UserWarning,
             stacklevel=_caller_stacklevel(),
         )
         return
     raise RuntimeError(
         f"{entry} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True)'; flashinfer.experimental.cake_moe_grouped_det_gemm is "
-        "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
-        "application"
+        f"'torch.use_deterministic_algorithms(True)'; the deterministic entry is {det}, or use the "
+        "'warn_only=True' option if that is acceptable for your application"
     )
 
 

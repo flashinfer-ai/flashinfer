@@ -100,7 +100,9 @@ def _wgrad_acc_op(
 
 def _main_grad(w: torch.Tensor, entry: str) -> torch.Tensor:
     """``w.main_grad``, checked: a tensor of ``w``'s shape, fp32 or bf16, on ``w``'s device, with unit stride
-    along the last dimension (``ValueError`` otherwise)."""
+    along the last dimension and rows and experts that do not overlap (the layout rule of the accumulate
+    mode; ``ValueError`` otherwise).  Memory shared with the operands is refused by the accumulate launch
+    of the backward."""
     main_grad = getattr(w, "main_grad", None)
     if not isinstance(main_grad, torch.Tensor):
         raise ValueError(
@@ -121,6 +123,14 @@ def _main_grad(w: torch.Tensor, entry: str) -> torch.Tensor:
             f"{list(w.shape)} on {w.device} with unit stride along the last dimension; got "
             f"{main_grad.dtype} {list(main_grad.shape)} on {main_grad.device}, strides "
             f"{list(main_grad.stride())}"
+        )
+    groups, n, k = (int(v) for v in main_grad.shape)
+    ldc, stride_e = int(main_grad.stride(1)), int(main_grad.stride(0))
+    if (n > 1 and ldc < k) or (groups > 1 and stride_e < n * ldc):
+        raise ValueError(
+            f"{entry}: fuse_wgrad_accumulation=True reads and writes every element of w.main_grad, so its "
+            "rows and experts must not overlap (row stride at least K, expert stride at least N row "
+            f"strides; an expanded main_grad has expert stride 0); got strides {list(main_grad.stride())}"
         )
     return main_grad
 
@@ -221,8 +231,12 @@ class CakeGroupedDetMm(torch.autograd.Function):
         # The autograd engine runs backward on a worker thread that has not
         # touched the CUDA runtime yet; the programs encode their TMA
         # descriptors through the driver API, which needs the primary context
-        # current on the calling thread.  One runtime call binds it.
-        torch.cuda.current_stream(x.device).query()
+        # current on the calling thread.  One runtime call binds it: the
+        # capture-status query, which is legal while a CUDA graph captures the
+        # backward, then a stream query outside a capture (a stream that is
+        # being captured must not be queried: that would end the capture).
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream(x.device).query()
         g = _bf16_rows(grad_y)
         dx = dw = None
         if ctx.needs_input_grad[0]:
@@ -273,10 +287,11 @@ def cake_grouped_det_mm(
         gradient as below.  ``True`` (Megatron's
         ``gradient_accumulation_fusion``): ``w.main_grad`` must be an fp32 or
         bf16 tensor of ``w``'s shape on its device with unit stride along the
-        last dimension (``ValueError``, checked at the forward call when
-        autograd records it: ``w`` requires grad, grad mode is on and the call
-        is not a checkpoint recompute inside a backward; and again at the
-        backward, which reads ``w.main_grad`` then).  Under
+        last dimension and rows and experts that do not overlap (``ValueError``,
+        checked at the forward call when autograd records it: ``w`` requires
+        grad, grad mode is on and the call is not a checkpoint recompute inside
+        a backward; and again at the backward, which reads ``w.main_grad`` then
+        and also refuses one that shares memory with the operands).  Under
         ``torch.no_grad()`` or inference mode the forward needs no
         ``main_grad``.  The backward adds the deterministic ``dW`` into it in
         place (``main_grad[e] += G[e].T @ X[e]``: ``dW`` in ``main_grad``'s

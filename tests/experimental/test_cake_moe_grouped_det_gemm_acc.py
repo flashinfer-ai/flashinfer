@@ -341,25 +341,29 @@ def test_row_padded_out_binds_a_contiguous_scratch(monkeypatch):
         assert (kwargs["ldc"], kwargs["stride_e"]) == (k + 32, (n + 2) * (k + 32))
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("arch,sm_count", ARCH_SM_COUNTS)
-def test_forced_form_cases_exist(arch, sm_count, monkeypatch):
-    """Every weight-gradient form the architecture serves has a shape of ``CASE_SIZES``
-    with a split tail (the ordered tail reduce runs: ``tail_splits > 1``) and one without,
-    at every SM count of its parts, so the GPU cases of each form run both (none passes
-    vacuously); on sm_107a the k256-tail twin's split tail is the 256-wide k tile's."""
+def test_forced_form_cases_exist(arch, sm_count, out_dtype, monkeypatch):
+    """Every weight-gradient form the architecture serves for ``out_dtype`` has a shape
+    of ``CASE_SIZES`` with a split tail (the ordered tail reduce runs: ``tail_splits >
+    1``) and one without, at every SM count of its parts, so the GPU cases of each form
+    and dtype run both (none passes vacuously); on sm_107a the k256-tail twin's split tail
+    is the 256-wide k tile's."""
     found = []
     for form, (tile, stage) in FORMS.items():
         with monkeypatch.context() as mp:
             if not _force_form(mp, form, arch):
                 continue
-            name = cake_jit.record_name("wgrad", out_dtype="float32", tile_k=tile)
+            name = cake_jit.record_name(
+                "wgrad", out_dtype=DTYPE_NAMES[out_dtype], tile_k=tile
+            )
             if not cake_jit.stage_served(name, stage, arch):
                 continue
             for split in (True, False):
-                case = _find_case(arch, sm_count, form, split)
+                case = _find_case(arch, sm_count, form, split, out_dtype)
                 assert case is not None, (form, split)
                 sizes, n, k = case
-                _stage, plan = _det_plan(sizes, n, k, arch, sm_count)
+                _stage, plan = _det_plan(sizes, n, k, arch, sm_count, out_dtype)
                 if split and stage == "main_halves_k256t":
                     assert plan["tail_tile_k"] == cb.K256_TAIL_TILE_K
             found.append(form)
@@ -679,7 +683,8 @@ class _HostPreparations:
     small-integer operands of these tests): the forward, the data gradient, and the
     weight gradient written over ``out`` or, with ``accumulate=True``, in ``out``'s dtype
     and added into it with ``out.add_`` (the package's composed accumulate).  Every call is
-    logged as ``(op, kwargs)``; ``torch.cuda.current_stream`` is a stub."""
+    logged as ``(op, kwargs)``; ``torch.cuda.current_stream`` and
+    ``torch.cuda.is_current_stream_capturing`` are stubs."""
 
     def __init__(self, monkeypatch):
         self.log = []
@@ -691,6 +696,7 @@ class _HostPreparations:
             "current_stream",
             lambda device=None: types.SimpleNamespace(query=lambda: True),
         )
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def ops(self, op):
         return [kwargs for name, kwargs in self.log if name == op]
@@ -929,6 +935,50 @@ def test_autograd_fuse_under_checkpoints_on_the_host(ckpt, early_stop, monkeypat
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
+def test_backward_never_queries_a_captured_stream(capturing, monkeypatch):
+    """The backward binds the CUDA context of its thread with one runtime call: the
+    capture-status query, then a stream query only outside a CUDA graph capture (querying
+    a stream that is being captured ends the capture with an error), with and without the
+    fuse flag."""
+    _HostPreparations(monkeypatch)
+    queries = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device=None: types.SimpleNamespace(
+            query=lambda: queries.append(device) or True
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    x0, w0, g, offs, mg0, _dw = _host_case(7)
+    for fuse in (False, True):
+        x, w = _host_leaves(x0, w0, mg0)
+        _host_gemm(offs, fuse)(x, w).backward(g)
+    assert len(queries) == (0 if capturing else 2), queries
+
+
+@pytest.mark.parametrize("layout", ["expanded", "row_overlap"])
+def test_overlapping_main_grad_is_refused_at_the_forward(layout, monkeypatch):
+    """A ``main_grad`` whose experts or rows overlap (an expanded one, or a row stride
+    below ``K``) is refused with ``ValueError`` at a forward call that autograd records,
+    before anything launches, as at the backward."""
+    host = _HostPreparations(monkeypatch)
+    x0, w0, g, offs, mg0, _dw = _host_case(8)
+    e, n, k = w0.shape
+    if layout == "expanded":
+        main_grad = torch.zeros(1, n, k).expand(e, n, k)
+    else:
+        main_grad = torch.zeros(e * n * k).as_strided(
+            (e, n, k), (n * (k - 1), k - 1, 1)
+        )
+    x, w = _host_leaves(x0, w0, mg0)
+    w.main_grad = main_grad
+    with pytest.raises(ValueError, match="must not overlap"):
+        _host_gemm(offs)(x, w)
+    assert host.log == []
+
+
 def _arch(device):
     return SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
 
@@ -1001,18 +1051,31 @@ def _overwrite(g, x, offs, out_dtype, num_groups=None):
     )
 
 
+def _steps_expected(out0, dws):
+    """``(ref, scale)`` of ``out0`` plus each fp64 weight gradient of ``dws`` added in
+    turn: the fp64 sum (as fp32), and the magnitude the bf16 budget scales with, one term
+    per rounding: ``sum_i (|dW_i| + |out0 + dW_1 + ... + dW_i|)`` (each step rounds its
+    ``dW`` and its partial sum once)."""
+    total = out0.double()
+    scale = torch.zeros_like(total)
+    for dw in dws:
+        total = total + dw
+        scale = scale + dw.abs() + total.abs()
+    return total.float(), scale.float()
+
+
 def _expected(out0, g, x, sizes, times=1):
-    """``(ref, scale)``: ``out0 + times * sum_e G[e].T X[e]`` in fp64 (as fp32), and the
-    operands' magnitude ``|out0| + times * |dW|`` the bf16 budget scales with."""
+    """``(ref, scale)`` of ``out0`` plus ``times`` adds of ``sum_e G[e].T X[e]``
+    (``_steps_expected``)."""
     dw64 = base._reference("wgrad", g, x, sizes).double()
-    start = out0.double()
-    return (start + times * dw64).float(), (start.abs() + times * dw64.abs()).float()
+    return _steps_expected(out0, [dw64] * times)
 
 
 def _assert_within_budget(out, expected, mask=None):
     """The budget of ``out``'s dtype against ``expected`` over ``mask`` (default all):
     fp32 rel-L2 against the fp64 reference (the deterministic ``dW``'s budget plus one fp32
-    rounding); bf16 every element within ``1e-2 + 1e-2 * (|out0| + n |dW|)``."""
+    rounding); bf16 every element within ``1e-2 + 1e-2 * scale`` (``_steps_expected``:
+    one term per bf16 rounding)."""
     ref, scale = expected
     if mask is not None:
         out, ref, scale = out[mask], ref[mask], scale[mask]
@@ -1078,8 +1141,9 @@ def test_accumulate_is_the_overwrite_plus_add(form, out_dtype, split, monkeypatc
     tail, into an fp32 and a bf16 ``out`` holding specials: the accumulate launch takes
     the overwrite's stages and plan and gives bitwise ``out0.add_(dW)`` (AccumulateGrad of
     the deterministic ``dW`` in ``out``'s dtype), the same bits at each of ``REPEATS``
-    launches from fresh copies of ``out0`` (run to run), within the budget of the fp64
-    ``out0 + dW``; empty groups keep their values."""
+    launches from fresh copies of ``out0`` (run to run; every other launch from a fresh
+    preparation, so a fresh scratch), within the budget of the fp64 ``out0 + dW``; empty
+    groups keep their values."""
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
     sizes, n, k = _device_case(device, form, split, monkeypatch, out_dtype)
@@ -1099,9 +1163,12 @@ def test_accumulate_is_the_overwrite_plus_add(form, out_dtype, split, monkeypatc
     )
     oracle = out0.clone().add_(dw)
     first = None
-    for _ in range(REPEATS):
+    for repeat in range(REPEATS):
         out.copy_(out0)
-        acc.launch()
+        if repeat % 2:
+            prepare_wgrad(g, x, offs, out=out, accumulate=True).launch()
+        else:
+            acc.launch()
         if first is None:
             torch.cuda.synchronize()
             _assert_bitwise(out, oracle, f"{form} {out_dtype}")
@@ -1323,14 +1390,19 @@ def test_accumulate_bumps_the_version_counter():
     assert out._version == version + 2
 
 
+@pytest.mark.parametrize("split", [False, True], ids=["unsplit", "split_tail"])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
-def test_torch_deterministic_mode_changes_nothing(out_dtype, monkeypatch):
-    """Under ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``) an
-    accumulate of a split-tail shape, prepared or one-shot, raises no alert, warns
-    nothing and gives the bits it gives with the mode off."""
+@pytest.mark.parametrize("form", list(FORMS))
+def test_torch_deterministic_mode_changes_nothing(form, out_dtype, split, monkeypatch):
+    """Under ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``; with
+    ``torch.utils.deterministic.fill_uninitialized_memory`` on, its default, so torch fills
+    each fresh scratch with NaN) an accumulate of every form, with and without the split
+    tail, prepared or one-shot, raises no alert, warns nothing and gives the bits it gives
+    with the mode off."""
+    assert torch.utils.deterministic.fill_uninitialized_memory
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
-    sizes, n, k = _device_case(device, "main_halves", True, monkeypatch, out_dtype)
+    sizes, n, k = _device_case(device, form, split, monkeypatch, out_dtype)
     x, _w, g, offs = base._inputs(sizes, n, k, device, seed=42)
     out0 = torch.randn(len(sizes), n, k, device=device).to(out_dtype)
     want = out0.clone()
@@ -1446,12 +1518,7 @@ def test_autograd_accumulates_into_main_grad(
     )
     assert torch.equal(_bits(again.main_grad), _bits(w.main_grad)), "run to run"
     dws = [base._reference("wgrad", g, x0, sizes).double() for g in (g1, g2)]
-    start = mg0.double()
-    expected = (
-        (start + dws[0] + dws[1]).float(),
-        (start.abs() + dws[0].abs() + dws[1].abs()).float(),
-    )
-    _assert_within_budget(w.main_grad, expected)
+    _assert_within_budget(w.main_grad, _steps_expected(mg0, dws))
     _, default_dxs = _run_micro_steps(
         lambda a, b: pkg.cake_grouped_det_mm(a, b, offs),
         x0,
@@ -1497,6 +1564,49 @@ def test_autograd_returns_megatron_placeholder(zero_out, monkeypatch):
     if zero_out:
         assert int(w.grad.count_nonzero()) == 0
     _assert_bitwise(w.main_grad, _composed_main_grad(mg0, (g1,), x0, offs), "main_grad")
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["unsplit", "split_tail"])
+def test_graph_captures_the_fused_backward(split, monkeypatch):
+    """The forward and the fused backward of ``cake_grouped_det_mm(...,
+    fuse_wgrad_accumulation=True)`` capture into one CUDA graph (the backward binds the
+    context without querying the captured stream, and prepares its accumulate launch
+    with the scratch from the graph's pool): ``r`` replays from ``mg0`` give bitwise ``mg0``
+    plus ``r`` adds of the deterministic fp32 ``dW`` (AccumulateGrad's bits), and
+    ``x.grad`` holds the eager backward's bits."""
+    device, _sizes, x0, w0, g1, _g2, offs = _autograd_case(
+        monkeypatch, torch.float32, split
+    )
+    gen = torch.Generator(device=device).manual_seed(57)
+    mg0 = torch.randn(w0.shape, generator=gen, device=device)
+    w = w0.clone().requires_grad_(True)
+    w.main_grad = mg0.clone()
+    x = x0.clone().requires_grad_(True)
+    fn = _fused_gemm(offs)
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        fn(x, w).backward(g1)  # every program loaded outside the capture
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize()
+    eager_dx = x.grad.clone()
+    x.grad = None
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(x, w).backward(g1)
+    torch.cuda.synchronize()
+    assert w.grad is None
+    dw = pkg.grouped_det_gemm_wgrad(g1, x0, offs, out_dtype=torch.float32)
+    for replays in (1, 3):
+        w.main_grad.copy_(mg0)
+        for _ in range(replays):
+            graph.replay()
+        torch.cuda.synchronize()
+        want = mg0.clone()
+        for _ in range(replays):
+            want.add_(dw)
+        _assert_bitwise(w.main_grad, want, f"{replays} replays")
+        assert torch.equal(x.grad, eager_dx)
 
 
 def test_autograd_flag_errors_and_side_effects(monkeypatch):

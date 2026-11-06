@@ -157,10 +157,11 @@ def cake_grouped_det_mm(
         gradient as below.  ``True`` (Megatron's
         ``gradient_accumulation_fusion``): ``w.main_grad`` must be an fp32 or
         bf16 tensor of ``w``'s shape on its device with unit stride along the
-        last dimension (``ValueError``, checked at the forward call when
-        autograd records it: ``w`` requires grad, grad mode is on and the call
-        is not a checkpoint recompute inside a backward; and again at the
-        backward, which reads ``w.main_grad`` then).  Under
+        last dimension and rows and experts that do not overlap (``ValueError``,
+        checked at the forward call when autograd records it: ``w`` requires
+        grad, grad mode is on and the call is not a checkpoint recompute inside
+        a backward; and again at the backward, which reads ``w.main_grad`` then
+        and also refuses one that shares memory with the operands).  Under
         ``torch.no_grad()`` or inference mode the forward needs no
         ``main_grad``.  The backward adds the deterministic ``dW`` into it in
         place (``main_grad[e] += G[e].T @ X[e]``: ``dW`` in ``main_grad``'s
