@@ -84,7 +84,7 @@ ordering, and the two groups of a two-stream stage write disjoint outputs, so
 the outputs and gradients are bitwise run to run for one layout and one plan,
 with one or two streams.
 The plan pins that tests and tuning use are explicit keyword arguments of
-:func:`chunk_gated_delta_rule_det` (``scan_config``, ``segment_chunks``,
+:func:`cake_gdn_det` (``scan_config``, ``segment_chunks``,
 ``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``, ``streams``);
 nothing here reads an environment variable.
 """
@@ -108,9 +108,8 @@ __all__ = [
     "HEAD_DIM",
     "PRESCAN_CONFIGS",
     "REG_SCAN_CONFIGS",
+    "CakeGDNDetFunction",
     "ChainOptions",
-    "ChunkGatedDeltaRuleDetFunction",
-    "ChunkGatedDeltaRuleFunction",
     "ChunkMeta",
     "ScanPlan",
     "SegmentTable",
@@ -118,17 +117,14 @@ __all__ = [
     "StreamGroups",
     "build_chunk_meta",
     "build_chunk_meta_from_cu_seqlens",
+    "cake_gdn_det",
+    "cake_gdn_det_train_backward",
+    "cake_gdn_det_train_forward",
     "choose_scan_plan",
-    "chunk_gated_delta_rule",
-    "chunk_gated_delta_rule_det",
     "dhu_tc_pricing",
     "finalize_stage",
     "fwd_ho_vh2_engaged",
     "fwd_ho_vh2_splits",
-    "gdn_chunk_backward",
-    "gdn_chunk_det_backward",
-    "gdn_chunk_det_forward",
-    "gdn_chunk_forward",
     "lpt_sequence_order",
     "lpt_walk",
     "make_options",
@@ -154,6 +150,10 @@ REG_SCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (32, 1), (64, 1))
 PRESCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (64, 1))
 SCAN_KINDS = ("fwd_h", "dhu")
 STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
+
+# The tag of this package's forward tape: the backward reads only a tape that carries it (the non-deterministic
+# package's tape carries ``"mode": "nondet"``, so it is refused).
+_TAPE_MODE = "det"
 
 # Kernel parameter names of every stage in call-site order; a delivered record whose parameters are these names in
 # another order is launched with the values reordered.
@@ -1972,15 +1972,15 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     return h, v_new, final_state, o
 
 
-def gdn_chunk_det_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, output_final_state=False,
-                      normalize_qk=True, options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
+def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None,
+                               output_final_state=False, normalize_qk=True, options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
     """The forward chain over flattened ``[T, H, 128]`` / ``[T, HV, 128]`` inputs and one chunk table; returns the
     output and the tape the backward reads."""
     options = options or ChainOptions()
     num_heads, key_dim = q.shape[-2], q.shape[-1]
     num_v_heads, value_dim = v.shape[-2], v.shape[-1]
     if key_dim != HEAD_DIM or value_dim != HEAD_DIM:
-        raise ValueError("gdn_chunk_det_forward requires K = V = 128")
+        raise ValueError("cake_gdn_det_train_forward requires K = V = 128")
     if num_v_heads % num_heads != 0:
         raise ValueError("num_v_heads must be a multiple of num_heads")
     total_tokens = q.numel() // (num_heads * key_dim)
@@ -2040,18 +2040,23 @@ def gdn_chunk_det_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_s
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
         "w": w, "u": u, "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
         "final_state": final_state if output_final_state else None, "initial_state": initial_state, "h": h,
-        "v_new": v_new, "options": options,
+        "v_new": v_new, "options": options, "mode": _TAPE_MODE,
     }  # fmt: skip
 
 
 # --------------------------------------------------------------------------- #
 # backward
 # --------------------------------------------------------------------------- #
-def gdn_chunk_det_backward(
+def cake_gdn_det_train_backward(
     forward, do, dht=None, *, initial_state=None, dbeta_dtype=None
 ) -> dict[str, Any]:
-    """The backward chain over one forward tape; returns ``dq``, ``dk``, ``dv``, ``dg``, ``dbeta`` and
-    ``dinitial_state``."""
+    """The backward chain over one forward tape of :func:`cake_gdn_det_train_forward`; returns ``dq``, ``dk``, ``dv``,
+    ``dg``, ``dbeta`` and ``dinitial_state``.  The tape must carry this package's tag (``"mode": "det"``): any other
+    tape, such as one of the non-deterministic package (``"mode": "nondet"``), is refused (``ValueError``)."""
+    if forward.get("mode") != _TAPE_MODE:
+        raise ValueError("cake_gdn_det_train_backward reads the tape of a deterministic forward "
+                         "(cake_gdn_det_train_forward, tag 'mode': 'det'); this tape does not carry that tag "
+                         "(a tape of the non-deterministic package, for example)")  # fmt: skip
     arch = forward["arch"]
     meta = forward["meta"]
     options = forward.get("options") or ChainOptions()
@@ -2328,7 +2333,7 @@ _OPTIONAL_INPUT = 5
 
 
 def _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu) -> None:
-    """The API-boundary checks of :func:`chunk_gated_delta_rule_det`: devices, shapes and the offsets' form, from tensor
+    """The API-boundary checks of :func:`cake_gdn_det`: devices, shapes and the offsets' form, from tensor
     metadata only (no device synchronization; the values of ``cu_seqlens_cpu`` are checked when its layout is first
     planned, those of the device ``cu_seqlens`` not at all).  FLA's ``chunk_gated_delta_rule`` checks the head
     counts, the batch of a packed call and the rows of ``initial_state``; the rest is this backend's contract.
@@ -2499,7 +2504,7 @@ def _chunk_meta(
     return meta
 
 
-class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
+class CakeGDNDetFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
                 use_qk_l2norm_in_kernel, options):  # fmt: skip
@@ -2517,9 +2522,9 @@ class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
             options,
             num_heads=num_heads,
         )
-        fwd = gdn_chunk_det_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
-                                output_final_state=output_final_state, normalize_qk=use_qk_l2norm_in_kernel,
-                                options=options)  # fmt: skip
+        fwd = cake_gdn_det_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
+                                         initial_state=initial_state, output_final_state=output_final_state,
+                                         normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
         state_tensors = (
             (fwd["w"], fwd["u"], fwd["h"], fwd["v_new"]) if options.save_state else ()
         )
@@ -2532,6 +2537,8 @@ class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
         ctx.has_initial_state_input = initial_state is not None
         ctx.dtypes = (g.dtype, beta.dtype)
         ctx.options = options
+        # the forward tape's tag; the backward reads only a tape of its own
+        ctx.mode = fwd["mode"]
         output = fwd["output"]
         if output.dtype != q.dtype:
             output = output.to(q.dtype)
@@ -2546,10 +2553,10 @@ class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
         g_dtype, beta_dtype = ctx.dtypes
         tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
                 "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
-                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options}  # fmt: skip
+                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
         if ctx.saved_state_tensors:
             tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
-        grads = gdn_chunk_det_backward(
+        grads = cake_gdn_det_train_backward(
             tape,
             do.contiguous(),
             dht,
@@ -2579,7 +2586,7 @@ class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
         )
 
 
-def chunk_gated_delta_rule_det(
+def cake_gdn_det(
     q,
     k,
     v,
@@ -2632,12 +2639,5 @@ def chunk_gated_delta_rule_det(
         g = g.float()
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    return ChunkGatedDeltaRuleDetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
-                                                cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
-
-
-# Former names of the entry points, kept as aliases of the deterministic ones.
-ChunkGatedDeltaRuleFunction = ChunkGatedDeltaRuleDetFunction
-chunk_gated_delta_rule = chunk_gated_delta_rule_det
-gdn_chunk_forward = gdn_chunk_det_forward
-gdn_chunk_backward = gdn_chunk_det_backward
+    return CakeGDNDetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
+                                    cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip

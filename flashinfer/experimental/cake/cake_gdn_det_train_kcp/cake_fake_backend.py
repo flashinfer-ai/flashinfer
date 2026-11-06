@@ -86,9 +86,9 @@ from .cake_kcp_plan import (
     CHUNK,
     HEAD_DIM,
     TILE,
-    ContextDetKcp,
-    PartitionDetKcp,
-    build_context_det_kcp,
+    CakeGDNDetKcpContext,
+    CakeGDNDetKcpPartition,
+    cake_gdn_det_train_kcp_build_context,
 )
 
 F32, BF16 = torch.float32, torch.bfloat16
@@ -778,7 +778,7 @@ def tape_shapes(
 
 
 def new_tapes(
-    ctx: ContextDetKcp, H_qk: int, HV: int, names, device=None
+    ctx: CakeGDNDetKcpContext, H_qk: int, HV: int, names, device=None
 ) -> dict[str, torch.Tensor]:
     dev = ctx.device if device is None else device
     shapes = tape_shapes(ctx.T_r, ctx.NC_pad, ctx.R, H_qk, HV)
@@ -830,7 +830,7 @@ class FakeRank:
     """One emulated rank: its context, tables, operands (local order, no batch axis) and tapes."""
 
     rank: int
-    ctx: ContextDetKcp
+    ctx: CakeGDNDetKcpContext
     lt: cake_tables.LocalTables
     wt: cake_tables.WalkTables
     ops: dict[str, torch.Tensor]
@@ -901,7 +901,7 @@ class FakeRank:
 
 
 def build_ranks(
-    part: PartitionDetKcp,
+    part: CakeGDNDetKcpPartition,
     ops_by_rank: list[dict[str, torch.Tensor]],
     *,
     H_qk: int,
@@ -918,7 +918,7 @@ def build_ranks(
     Q / K L2 norm form."""
     ranks = []
     for r in range(part.world_size):
-        ctx = build_context_det_kcp(
+        ctx = cake_gdn_det_train_kcp_build_context(
             part, None, r, device, conv_kernel_size, sm_count=sm_count, p_rule=p_rule
         )
         pt = ctx.prepare(H_qk, HV)  # first use: the device-resident table bundle
@@ -950,7 +950,7 @@ def build_ranks(
 
 
 def slice_local(
-    global_ops: dict[str, torch.Tensor], part: PartitionDetKcp, rank: int
+    global_ops: dict[str, torch.Tensor], part: CakeGDNDetKcpPartition, rank: int
 ) -> dict[str, torch.Tensor]:
     """The rank's local operands (fragments in local order) from the global pack (no batch axis)."""
     cu = part.cu_seqlens
@@ -966,7 +966,9 @@ def slice_local(
     return out
 
 
-def gather_global(part: PartitionDetKcp, per_rank: list[torch.Tensor]) -> torch.Tensor:
+def gather_global(
+    part: CakeGDNDetKcpPartition, per_rank: list[torch.Tensor]
+) -> torch.Tensor:
     """Per-rank ``[T_r, ...]`` tensors -> the pack's global token order ``[T, ...]`` (the partition inverse)."""
     cu = part.cu_seqlens
     any_t = per_rank[0]
@@ -1357,7 +1359,7 @@ def emulate_backward(
 
 
 def emulate(
-    part: PartitionDetKcp,
+    part: CakeGDNDetKcpPartition,
     global_ops: dict[str, torch.Tensor],
     *,
     H_qk: int,

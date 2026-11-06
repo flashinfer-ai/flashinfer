@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the Cake deterministic GDN chunked-training package
-(``flashinfer.experimental.cake_gdn_det_train``).
+(``flashinfer.experimental.cake.cake_gdn_det_train``).
 
-Without a device: the registry (one record per stage and architecture, the argument plans of the call sites, the
+Without a device: the package's names (the det names only, the former names removed) and its mode contract (no
+``deterministic`` keyword; the low-level backward refuses a tape without the det tag), the registry (one record per stage and architecture, the argument plans of the call sites, the
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
 library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
 entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule, the split pass-2 rule on the campaign rows and
@@ -26,7 +27,7 @@ packed layouts (host and device table routes, FP32 and BF16 ``beta``, every regi
 and segment-parallel scans, both adjoint scans, both preps, the fused tails of a value-head group of two and of three
 and the unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
 initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
-contracts: two runs, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
+contracts: two runs, PyTorch's deterministic mode against the default, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
 against ``dv_local`` and the register one, the fused tail of a value-head group of three against the unfused one with
 either finalize, the longest-first dispatch order against the caller's (and its
 tables without a device), two streams against one (the adjoint scan of serial plans beside the fused tail of a
@@ -74,13 +75,14 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_mode_names import assert_mode_names
+from tests.test_helpers.cake_package import PACKAGES, cake_package
 
 cake_backend = cake_package("cake_gdn_det_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_det_train", "cake_chain")
 cake_jit = cake_package("cake_gdn_det_train", "cake_jit")
 cake_gdn_det_train = cake_package("cake_gdn_det_train")
-chunk_gated_delta_rule_det = cake_gdn_det_train.chunk_gated_delta_rule_det
+cake_gdn_det = cake_gdn_det_train.cake_gdn_det
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 ARCHES = tuple(cake_jit.ARCHES)
@@ -182,7 +184,7 @@ def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_sta
         kwargs["cu_seqlens_cpu"] = (
             torch.tensor(cu, dtype=torch.int64) if route == "host" else None
         )
-    o, final = chunk_gated_delta_rule_det(
+    o, final = cake_gdn_det(
         leaves["q"],
         leaves["k"],
         leaves["v"],
@@ -341,18 +343,107 @@ FUSED_TAIL_STAGES = {
 }
 
 
-def test_former_names_are_aliases_of_the_det_names() -> None:
-    pairs = (
-        ("chunk_gated_delta_rule", "chunk_gated_delta_rule_det"),
-        ("ChunkGatedDeltaRuleFunction", "ChunkGatedDeltaRuleDetFunction"),
-        ("gdn_chunk_forward", "gdn_chunk_det_forward"),
-        ("gdn_chunk_backward", "gdn_chunk_det_backward"),
+# The package exports the mode-word names of FlashInfer #8928 only; the former names (with and without det) are
+# removed (no alias), and the planner and table helpers stay public in ``cake_chain`` only.
+DET_NAMES = (
+    "CakeGDNDetFunction",
+    "cake_gdn_det",
+    "cake_gdn_det_train_backward",
+    "cake_gdn_det_train_forward",
+)
+REMOVED_NAMES = (
+    "ChunkGatedDeltaRuleDetFunction",
+    "ChunkGatedDeltaRuleFunction",
+    "chunk_gated_delta_rule",
+    "chunk_gated_delta_rule_det",
+    "gdn_chunk_backward",
+    "gdn_chunk_det_backward",
+    "gdn_chunk_det_forward",
+    "gdn_chunk_forward",
+)
+CHAIN_ONLY_NAMES = (
+    "CHUNK",
+    "FINALIZE_STAGES",
+    "FULL",
+    "HEAD_DIM",
+    "PRESCAN_CONFIGS",
+    "REG_SCAN_CONFIGS",
+    "ChainOptions",
+    "ChunkMeta",
+    "ScanPlan",
+    "SegmentTable",
+    "StageSet",
+    "StreamGroups",
+    "build_chunk_meta",
+    "build_chunk_meta_from_cu_seqlens",
+    "choose_scan_plan",
+    "dhu_tc_pricing",
+    "finalize_stage",
+    "lpt_sequence_order",
+    "lpt_walk",
+    "make_options",
+    "scan_plans",
+    "sdt_pricing",
+    "sequence_groups",
+    "stage_set",
+    "two_stream_split",
+    "use_prep_tma",
+)
+
+
+def test_former_names_are_removed() -> None:
+    for module in (cake_gdn_det_train, cake_chain):
+        for name in REMOVED_NAMES:
+            assert not hasattr(module, name), (module.__name__, name)
+            assert name not in module.__all__, (module.__name__, name)
+        for name in DET_NAMES:
+            assert name in module.__all__, (module.__name__, name)
+            assert getattr(module, name) is getattr(cake_chain, name)
+    for name in DET_NAMES:
+        assert getattr(cake_chain, name).__name__ == name
+
+
+def test_the_package_exports_the_det_names_only() -> None:
+    assert sorted(cake_gdn_det_train.__all__) == sorted(DET_NAMES)
+    # the mode word as a token (the shared check; no order check, so a vendored import path passes too)
+    assert_mode_names(cake_gdn_det_train, "det", stem=False)
+    for name in CHAIN_ONLY_NAMES:
+        assert name in cake_chain.__all__ and hasattr(cake_chain, name), name
+        assert not hasattr(cake_gdn_det_train, name), name
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_the_det_entries_take_no_deterministic_keyword(value) -> None:
+    # the det entries have no mode: the keyword, of any value, fails the call's argument binding (no launch)
+    calls = (
+        (cake_gdn_det, (None,) * 5, {}),
+        (
+            cake_chain.cake_gdn_det_train_forward,
+            (None,) * 5,
+            {"meta": None, "arch": None},
+        ),
+        (cake_chain.cake_gdn_det_train_backward, (None,) * 2, {}),
     )
-    for former, det in pairs:
-        for module in (cake_gdn_det_train, cake_chain):
-            assert getattr(module, former) is getattr(module, det)
-            assert former in module.__all__ and det in module.__all__
-        assert getattr(cake_chain, det).__name__ == det
+    for entry, args, kwargs in calls:
+        with pytest.raises(TypeError, match="deterministic"):
+            entry(*args, **kwargs, deterministic=value)
+    with pytest.raises(TypeError):
+        cake_chain.CakeGDNDetFunction.apply(*(None,) * 12, deterministic=value)
+
+
+@pytest.mark.parametrize(
+    "tape",
+    [{"mode": "nondet"}, {}, {"mode": None}, {"deterministic": True}],
+    ids=["nondet-tape", "untagged", "none", "former-key"],
+)
+def test_det_backward_refuses_a_tape_without_the_det_tag(tape) -> None:
+    # the det tape carries "mode": "det" (the low-level forward's tape and the autograd chain's own tape); the
+    # non-deterministic package's tape carries "mode": "nondet"; the check runs before the tape is read
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_det_train_backward({"arch": None, **tape}, None)
+    # a tape with the det tag passes the check and is read
+    with pytest.raises(KeyError, match="meta"):
+        cake_chain.cake_gdn_det_train_backward({"arch": None, "mode": "det"}, None)
 
 
 def test_registry_records_are_well_formed() -> None:
@@ -1378,6 +1469,73 @@ def test_run_to_run_bitwise(route, device) -> None:
     _assert_bitwise(first, uncached, OUTPUT_NAMES)
 
 
+@pytest.mark.parametrize("route", ["host", "device"])
+def test_torch_deterministic_algorithms_change_nothing(route, device) -> None:
+    # every launch is fixed-order: PyTorch's deterministic mode (strict, so an alert would raise) gives the same bits
+    seq_lens = (2048, 100, 513)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=5)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        strict = _run(inputs, seq_lens, route=route)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+    _assert_bitwise(strict, _run(inputs, seq_lens, route=route), OUTPUT_NAMES)
+
+
+def test_low_level_entries_record_and_check_the_mode(device) -> None:
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=263)
+    index = cake_chain._device_index(device)
+    plans = cake_chain.scan_plans(sum(seq_lens), len(seq_lens), 6, index, seq_lens)
+    meta = cake_chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
+    q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
+    tape = cake_chain.cake_gdn_det_train_forward(
+        q, k, v, g, beta, meta=meta, arch=cake_backend.device_arch(index)
+    )
+    assert tape["mode"] == "det" and "deterministic" not in tape
+    grads = cake_chain.cake_gdn_det_train_backward(tape, do)
+    assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
+    untagged = {key: value for key, value in tape.items() if key != "mode"}
+    for other in ({**tape, "mode": "nondet"}, untagged):
+        with pytest.raises(ValueError, match="this tape does not carry that tag"):
+            cake_chain.cake_gdn_det_train_backward(other, do)
+
+
+@pytest.mark.skipif(
+    "cake_gdn_nondet_train" not in PACKAGES,
+    reason="pending integration: the non-deterministic package is not in this tree's PACKAGES table",
+)
+def test_det_backward_refuses_a_real_nondet_tape(device) -> None:
+    # the tape of the non-deterministic package's low-level forward (the same keys as the det tape but its own tag):
+    # the det backward refuses it; a non-deterministic package that does not import fails here, it is not skipped
+    seq_lens, heads = (300, 77, 640), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=263)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    nd_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
+    q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
+
+    def meta_of(chain):
+        plans = chain.scan_plans(
+            sum(seq_lens), len(seq_lens), heads[1], index, seq_lens
+        )
+        return chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
+
+    nd_tape = nd_chain.cake_gdn_nondet_train_forward(
+        q, k, v, g, beta, meta=meta_of(nd_chain), arch=arch
+    )
+    assert nd_tape["mode"] == "nondet"
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_det_train_backward(nd_tape, do)
+    tape = cake_chain.cake_gdn_det_train_forward(
+        q, k, v, g, beta, meta=meta_of(cake_chain), arch=arch
+    )
+    grads = cake_chain.cake_gdn_det_train_backward(tape, do)
+    assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
+
+
 @pytest.mark.parametrize(
     "pins",
     [{}, {"save_state": False}, {"scan_config": (32, 2), "segment_chunks": 4}],
@@ -1746,7 +1904,7 @@ def test_two_streams_under_cuda_graph_capture(form, device, monkeypatch) -> None
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                       cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, streams=2,
                                       **pins)  # fmt: skip
@@ -1842,7 +2000,7 @@ def test_launches_run_on_the_callers_stream(streams, form, device, monkeypatch) 
         torch.cuda._sleep(200_000_000)
         with torch.no_grad():
             leaves["q"].copy_(new["q"])
-        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM),
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                       cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
@@ -2348,7 +2506,7 @@ def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                           scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                           cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True,
                                           **pins)  # fmt: skip
@@ -2413,17 +2571,15 @@ def test_wavefront_strided_views_match_the_contiguous_call(device, monkeypatch) 
 def test_rejects_unsupported_inputs(device) -> None:
     inputs = _inputs((64,), (1, 2), torch.float32, device)
     with pytest.raises(NotImplementedError):
-        chunk_gated_delta_rule_det(
+        cake_gdn_det(
             inputs["q"].half(), inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         )
     cu = torch.tensor([0, 64], dtype=torch.int64, device=device)
     two = {name: torch.cat([t, t], 0) for name, t in inputs.items()}
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule_det(
-            two["q"], two["k"], two["v"], two["g"], two["beta"], cu_seqlens=cu
-        )
+        cake_gdn_det(two["q"], two["k"], two["v"], two["g"], two["beta"], cu_seqlens=cu)
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule_det(
+        cake_gdn_det(
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"],
             segment_chunks=-1,
         )  # fmt: skip
@@ -2528,7 +2684,7 @@ _INVALID_MESSAGES = {
 
 def _call_rejected(call) -> ValueError:
     with pytest.raises(ValueError) as error:
-        chunk_gated_delta_rule_det(
+        cake_gdn_det(
             call["q"], call["k"], call["v"], call["g"], call["beta"], initial_state=call["initial_state"],
             output_final_state=True, cu_seqlens=call["cu_seqlens"], cu_seqlens_cpu=call["cu_seqlens_cpu"],
             use_qk_l2norm_in_kernel=True,
@@ -2545,7 +2701,7 @@ def test_rejects_invalid_inputs_before_any_launch(case, device, monkeypatch) -> 
     assert str(_call_rejected(call)) == _INVALID_MESSAGES[case]
     assert stages == [], stages
     # the unmodified call is accepted
-    o, final = chunk_gated_delta_rule_det(
+    o, final = cake_gdn_det(
         base["q"], base["k"], base["v"], base["g"], base["beta"], initial_state=base["initial_state"],
         output_final_state=True, cu_seqlens=base["cu_seqlens"], cu_seqlens_cpu=base["cu_seqlens_cpu"],
         use_qk_l2norm_in_kernel=True,
@@ -2580,7 +2736,7 @@ def test_device_route_does_not_synchronize(device) -> None:
             n: inputs[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         }
-        o, final = chunk_gated_delta_rule_det(
+        o, final = cake_gdn_det(
             leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], initial_state=h0,
             output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
         )  # fmt: skip
@@ -2681,7 +2837,7 @@ def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> 
 def _call(leaves, seq_lens, device, *, route="host", initial_state=None, output_final_state=False, **pins):  # fmt: skip
     """One call of the package on caller-made leaves (or views of them)."""
     cu = _cu(seq_lens)
-    return chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+    return cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), initial_state=initial_state,
                                       output_final_state=output_final_state,
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
@@ -2871,7 +3027,7 @@ def test_checkpoint_matches_and_retains_no_bytes(
     cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
 
     def layer(q, k, v, g, beta):
-        o, _ = chunk_gated_delta_rule_det(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+        o, _ = cake_gdn_det(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                           cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
         return o
 

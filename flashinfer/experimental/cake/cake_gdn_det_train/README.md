@@ -1,5 +1,28 @@
 # Cake deterministic GDN chunked training backend (SM100 / SM103 / SM107)
 
+## Mode and dispatch rules
+
+- This package is the deterministic (`det`) route only.  Its public names
+  carry the mode word: `cake_gdn_det` (the autograd entry),
+  `CakeGDNDetFunction` (its autograd class), `cake_gdn_det_train_forward` and
+  `cake_gdn_det_train_backward` (the low-level chain over a chunk table and a
+  tape).  The package exports no other name; the planner and table helpers
+  stay in `cake_chain`.  The facade `flashinfer.cake_gdn_det_train` exports
+  `cake_gdn_det`, `CakeGDNDetFunction` and the support query
+  `is_cake_gdn_det_train_supported`; the low-level chain stays in this
+  package because it takes the package's chunk table and tape.
+- The entries take no `deterministic` keyword.  Passing one, with any value,
+  raises `TypeError`.
+- `torch.use_deterministic_algorithms(True)` changes nothing: every launch is
+  fixed-order, so no alert is raised and the outputs and gradients are the
+  same bits as without it.
+- The non-deterministic route is a separate package.  Its results match this
+  package within this package's accuracy budgets, not bitwise.  Nothing here
+  routes to it.
+- The forward tape carries this package's tag, `"mode": "det"`.
+  `cake_gdn_det_train_backward` refuses any other tape with `ValueError`; a
+  tape of the non-deterministic package carries `"mode": "nondet"`.
+
 Experimental backend for the forward and backward of packed GDN (scalar-gated
 DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
 (`HV` a multiple of `H`), no context parallelism.  Every launch is a plain
@@ -10,7 +33,9 @@ run to run for one layout and one plan.  Some stages run as two groups of sequen
 side stream; the groups write disjoint outputs, so this holds with one or two
 streams.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The facade `flashinfer.cake_gdn_det_train` is a stable FlashInfer API: its
+entry points are `@flashinfer_api` functions.  This package, under
+`flashinfer.experimental.cake`, is its backend.
 SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
 architectures; another device raises `RuntimeError`.  The SM107 libraries need
 CUDA 13.4 or newer.  The feature does not
@@ -21,13 +46,16 @@ otherwise.  The package reads no environment variable.
 
 ## Opt-in
 
-Import the entry point explicitly; nothing in `flashinfer` imports this
-package.
+Import the entry point explicitly from the facade
+`flashinfer.cake_gdn_det_train` (it exports `cake_gdn_det`,
+`CakeGDNDetFunction` and `is_cake_gdn_det_train_supported`, and forwards every
+argument to this package); nothing in `flashinfer` imports this package
+otherwise.
 
 ```python
-from flashinfer.experimental.cake_gdn_det_train import chunk_gated_delta_rule_det
+from flashinfer.cake_gdn_det_train import cake_gdn_det
 
-o, final_state = chunk_gated_delta_rule_det(
+o, final_state = cake_gdn_det(
     q, k, v, g, beta,                    # [B, T, H, 128] / [B, T, HV, 128] bf16; g, beta [B, T, HV]
     scale=None,                          # 1 / sqrt(128) when None
     initial_state=None,                  # [N, HV, 128, 128] fp32 or None
@@ -37,10 +65,6 @@ o, final_state = chunk_gated_delta_rule_det(
     use_qk_l2norm_in_kernel=True,
 )
 ```
-
-The former names `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`,
-`gdn_chunk_forward` and `gdn_chunk_backward` stay importable as aliases of
-the `_det` names.
 
 Without `cu_seqlens` the `B` sequences have length `T` each.  `g` is
 computed in FP32; `beta` is FP32 or BF16 and its gradient comes back in its
@@ -159,3 +183,18 @@ captured in a CUDA graph (warm it up first, like any captured call).
 - Head dimension 128 and chunk 64 only; `q`, `k`, `v` BF16.
 - No context parallelism and no cross-rank state passing.
 - `sm_100a`, `sm_103a` and `sm_107a` only (`sm_107a` with CUDA 13.4 or newer).
+
+## Names (FlashInfer #8928)
+
+The package moved from `flashinfer.experimental.cake_gdn_det_train` and its
+entries took the mode-word names below.  The former names and the former path
+were removed with no alias: importing them raises `ImportError`.  The library
+names, the program names and the kernels are unchanged.
+
+| former name | name |
+|---|---|
+| `flashinfer.experimental.cake_gdn_det_train` | `flashinfer.experimental.cake.cake_gdn_det_train` |
+| `chunk_gated_delta_rule_det`, `chunk_gated_delta_rule` | `cake_gdn_det` |
+| `ChunkGatedDeltaRuleDetFunction`, `ChunkGatedDeltaRuleFunction` | `CakeGDNDetFunction` |
+| `gdn_chunk_det_forward`, `gdn_chunk_forward` | `cake_gdn_det_train_forward` |
+| `gdn_chunk_det_backward`, `gdn_chunk_backward` | `cake_gdn_det_train_backward` |

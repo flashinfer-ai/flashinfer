@@ -8,7 +8,9 @@ passing of the per-document recurrent state.  Tokens never move between ranks;
 only affine summaries of the state do.  Tracking issue:
 flashinfer-ai/flashinfer#7082.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The facade `flashinfer.cake_gdn_det_train_kcp` is a stable FlashInfer API:
+its entry points are `@flashinfer_api` functions.  This package, under
+`flashinfer.experimental.cake`, is its backend.
 SM100 (B200 / GB200) and SM103 (B300 / GB300) are the acceptance architectures
 of the kernels; SM107 (R200) is compiled from the same sources with an nvcc
 that emits `compute_107a`.  The feature does not participate in automatic
@@ -23,21 +25,27 @@ variable.
 
 ## Mode and dispatch rules
 
-- This package and its facade `flashinfer.cake_gdn_det_train_kcp` are the
-  deterministic mode only.  Every public name carries `det`.  No entry takes a
-  `deterministic` keyword: passing one (any value) is a `TypeError`, like every
-  unknown keyword.
+- This package (`flashinfer.experimental.cake.cake_gdn_det_train_kcp`) and its
+  facade `flashinfer.cake_gdn_det_train_kcp` are the deterministic (`det`)
+  mode only.  Every public name carries the mode word (FlashInfer #8928):
+  `cake_gdn_det_kcp` (the autograd entry), `CakeGDNDetKcp<Noun>` (the types,
+  the autograd class `CakeGDNDetKcpFunction`) and
+  `cake_gdn_det_train_kcp_<verb>` (the other functions).  No entry takes a
+  `deterministic` keyword: passing one (any value) is a `TypeError`, like
+  every unknown keyword.
 - `torch.use_deterministic_algorithms(True)` changes nothing here: every launch
-  has a fixed order, so outputs and gradients are bitwise reproducible run to
-  run at the same topology.  No entry routes to another mode.
-- `chunk_gdn_det_bwd_kcp` (and the autograd backward) reads the deterministic
-  forward's `SavedDetKcp` and a caller-held `WorkspaceDetKcp` only.  It refuses
-  a saved set or a workspace of the non-deterministic mode with `ValueError`
-  before any launch.
-- The non-deterministic mode is the separate package
-  `flashinfer.experimental.cake_gdn_train_kcp`.  Its entries take
-  `deterministic=False` explicitly and refuse every other value.
-- This package's `__init__.py` exports the names that carry `det` only.  The
+  has a fixed order, so no alert is raised and outputs and gradients are
+  bitwise reproducible run to run at the same topology.  No entry routes to
+  another mode.
+- `cake_gdn_det_train_kcp_backward` (and the autograd backward) reads the
+  deterministic forward's `CakeGDNDetKcpSaved` and a caller-held
+  `CakeGDNDetKcpWorkspace` only.  It refuses a saved set or a workspace of the
+  non-deterministic mode with `ValueError` before any launch.
+- The non-deterministic mode is a separate package with its own partition,
+  context and options types.  Its plan is its own: the `b1` layout differs
+  from this package's, and the head plan and the `P` rule are each package's
+  own rules, so a context of one mode is not passed to the other.
+- This package's `__init__.py` exports the mode-word names only.  The
   constants and backend controls (`SCALE`, `LAST_CALL`, `PROGRAMS`,
   `KCP_SAVED_VERSION`, `set_backend`, `get_backend`, `graph_cache_clear`,
   `make_options`, ...) are read from their modules (`cake_kcp`,
@@ -47,33 +55,57 @@ variable.
 
 ```python
 from flashinfer.cake_gdn_det_train_kcp import (
-    partition_det_kcp, build_context_det_kcp, PartitionDetKcp, ContextDetKcp, OptionsDetKcp,
-    RecomputeHandleDetKcp, chunk_gdn_det_kcp, chunk_gdn_det_fwd_kcp, chunk_gdn_det_bwd_kcp,
-    gdn_det_workspace_bytes_kcp, gdn_det_saved_bytes_kcp, gdn_det_comm_bytes_kcp,
-    is_gdn_det_train_kcp_supported, packed_qkv_views_det_kcp,
+    cake_gdn_det_kcp, CakeGDNDetKcpFunction,
+    cake_gdn_det_train_kcp_partition, cake_gdn_det_train_kcp_build_context,
+    cake_gdn_det_train_kcp_forward, cake_gdn_det_train_kcp_backward, cake_gdn_det_train_kcp_packed_qkv_views,
+    cake_gdn_det_train_kcp_workspace_bytes, cake_gdn_det_train_kcp_saved_bytes, cake_gdn_det_train_kcp_comm_bytes,
+    is_cake_gdn_det_train_kcp_supported,
+    CakeGDNDetKcpPartition, CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpRecomputeHandle,
+    CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace,
 )
 
-part = partition_det_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
-ctx = build_context_det_kcp(part, group, rank, device, conv_kernel_size=4)                 # tables and collectives of this rank
+part = cake_gdn_det_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
+ctx = cake_gdn_det_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)                 # tables and collectives of this rank
 
-out = chunk_gdn_det_kcp(q, k, v, g, beta, ctx)                                             # autograd
-out, saved = chunk_gdn_det_fwd_kcp(q, k, v, g, beta, ctx, save_for_backward=True)
-dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved)
-dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout)                 # saved=None: checkpoint replay
+out = cake_gdn_det_kcp(q, k, v, g, beta, ctx)                                             # autograd
+out, saved = cake_gdn_det_train_kcp_forward(q, k, v, g, beta, ctx, save_for_backward=True)
+dq, dk, dv, dbeta, dg = cake_gdn_det_train_kcp_backward(q, k, v, g, beta, ctx, dout, saved=saved)
+dq, dk, dv, dbeta, dg = cake_gdn_det_train_kcp_backward(q, k, v, g, beta, ctx, dout)                 # saved=None: checkpoint replay
 
-ws = gdn_det_workspace_bytes_kcp(ctx, H_qk=16, HV=48)                                      # per rank, pure CPU: a fresh workspace's first call
+ws = cake_gdn_det_train_kcp_workspace_bytes(ctx, H_qk=16, HV=48)                                      # per rank, pure CPU: a fresh workspace's first call
 ```
 
-These fourteen names are the whole public surface (the `__all__` of
+These seventeen names are the whole public surface (the `__all__` of
 `flashinfer/cake_gdn_det_train_kcp.py`).  Every switch is a keyword argument
-of the public call (`OptionsDetKcp` fields); no module-level global and no
+of the public call (`CakeGDNDetKcpOptions` fields); no module-level global and no
 environment variable selects anything.
 
 ### Names
 
-The pre-rename names were removed without aliases: `flashinfer.gdn_train`,
-`flashinfer.experimental.cake_gdn_train` and the old class and function names
-(`chunk_gdn_kcp`, `KcpContext`, `kcp_partition`, ...).  Use the names above.
+The package moved from `flashinfer.experimental.cake_gdn_det_train_kcp` and
+its names took the mode-word scheme of FlashInfer #8928.  The former names and
+the former path were removed with no alias (they fail at import), as were the
+earlier no-det names (`flashinfer.gdn_train`,
+`flashinfer.experimental.cake_gdn_train`, `chunk_gdn_kcp`, `KcpContext`,
+`kcp_partition`, ...).
+
+| former name | name |
+|---|---|
+| `flashinfer.experimental.cake_gdn_det_train_kcp` | `flashinfer.experimental.cake.cake_gdn_det_train_kcp` |
+| `chunk_gdn_det_kcp` | `cake_gdn_det_kcp` |
+| `ChunkGDNDetFunctionKcp` | `CakeGDNDetKcpFunction` |
+| `chunk_gdn_det_fwd_kcp` / `chunk_gdn_det_bwd_kcp` | `cake_gdn_det_train_kcp_forward` / `cake_gdn_det_train_kcp_backward` |
+| `partition_det_kcp` / `build_context_det_kcp` | `cake_gdn_det_train_kcp_partition` / `cake_gdn_det_train_kcp_build_context` |
+| `packed_qkv_views_det_kcp` / `PackedQKVSplitDetKcp` | `cake_gdn_det_train_kcp_packed_qkv_views` / `CakeGDNDetKcpPackedQKVSplitFunction` |
+| `gdn_det_workspace_bytes_kcp` / `gdn_det_saved_bytes_kcp` / `gdn_det_comm_bytes_kcp` | `cake_gdn_det_train_kcp_workspace_bytes` / `cake_gdn_det_train_kcp_saved_bytes` / `cake_gdn_det_train_kcp_comm_bytes` |
+| `gdn_det_workspace_layout_kcp` / `gdn_det_saved_layout_kcp` | `cake_gdn_det_train_kcp_workspace_layout` / `cake_gdn_det_train_kcp_saved_layout` (`cake_bytes`) |
+| `is_gdn_det_train_kcp_supported` | `is_cake_gdn_det_train_kcp_supported` |
+| `OptionsDetKcp`, `ContextDetKcp`, `PartitionDetKcp`, `FragmentDetKcp` | `CakeGDNDetKcpOptions`, `CakeGDNDetKcpContext`, `CakeGDNDetKcpPartition`, `CakeGDNDetKcpFragment` |
+| `WorkspaceDetKcp`, `SavedDetKcp`, `RecomputeHandleDetKcp`, `CallDetKcp` | `CakeGDNDetKcpWorkspace`, `CakeGDNDetKcpSaved`, `CakeGDNDetKcpRecomputeHandle`, `CakeGDNDetKcpCall` |
+
+The constants (`SCALE`, `DEFAULT_SCALE`, `LAST_CALL`, ...), the `LAST_CALL`
+keys `"fwd"` / `"bwd"`, the program names and the layout keys are data
+identities and keep their names.
 
 The generated libraries are named `cake_gdn_det_train_<20 hex>` for the
 per-chunk programs and `cake_gdn_det_train_<20 hex>_kcp` for the
@@ -101,7 +133,7 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   measured module when reported.  Strided and contiguous inputs give bitwise
   the same results.
 * When `q` / `k` / `v` are head views of one packed row, take them with
-  `packed_qkv_views_det_kcp` for full backward speed: plain `split` views of
+  `cake_gdn_det_train_kcp_packed_qkv_views` for full backward speed: plain `split` views of
   the row give the same gradients, but the backward is about 1.1 ms (33-36 %)
   slower at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
@@ -145,7 +177,7 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   difference when it is positive, else at #1 too.  Under `graph="replay"`
   nothing is released, and the split form peaks above #1 by the `h` /
   `v_new` tapes (36,864 B per padded row at `HV = 48`).
-  `gdn_det_workspace_layout_kcp(...)` reports both as `forward` and
+  `cake_gdn_det_train_kcp_workspace_layout(...)` reports both as `forward` and
   `forward_split`.  The output and the saved set are
   bitwise those of the split form.  `save_mode="full"`,
   `boundary_mode="replay"`, a forward that hands its tapes to the kept-tape
@@ -155,7 +187,7 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
 
 ### Partition and context
 
-`partition_det_kcp(cu_seqlens_global_cpu, world_size, layout, fragments=None)`
+`cake_gdn_det_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout, fragments=None)`
 splits the packed batch over `world_size` ranks: `"contiguous"` (equal
 contiguous slices), `"zigzag"` (the whole buffer in `2 * world_size` pieces,
 rank `r` holding pieces `r` and `2W - 1 - r`), `"zigzag_per_document"` (the
@@ -164,14 +196,14 @@ need not be multiples of the chunk length (64); ranks may hold unequal token
 counts; a fragment may be empty, one token long or cross a chunk boundary; a
 document may span any number of ranks including the whole group.
 
-`build_context_det_kcp(part, group, rank, device, conv_kernel_size=4)` returns
-the rank's `ContextDetKcp`: the fragment table, the state-ownership plan (head
+`cake_gdn_det_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)` returns
+the rank's `CakeGDNDetKcpContext`: the fragment table, the state-ownership plan (head
 groups over `HV`, padded when `HV` does not divide by the group size), the
 causal-convolution halo plan (`conv_kernel_size - 1` history rows per
 crossing-in fragment) and the int32 device tables of the kernels.  The same
 context serves every call of the same batch layout and head pair.
 
-### Options (`OptionsDetKcp`, keyword-only; defaults in bold)
+### Options (`CakeGDNDetKcpOptions`, keyword-only; defaults in bold)
 
 | option | values | meaning |
 |---|---|---|
@@ -183,7 +215,7 @@ context serves every call of the same batch layout and head pair.
 | `transfer_walk` | **`"tf32_hilo"`** | the transfer-walk program; the vocabulary also names `"bf16x3"` (BF16x3 state products), which this package does not build: the validator refuses it as not built |
 | `layout` | **`"tma"`**, `"copy"` | strided input read in place, or a timed contiguous copy |
 | `graph` | **`"off"`**, `"replay"` | CUDA-graph replay of the steady state (a static pool per key) |
-| `reuse_recompute_tapes` | **`"auto"`**, `True`, `False` | under `torch.utils.checkpoint(use_reentrant=False)` the light backward binds the forward tapes torch's recompute just wrote instead of replaying #1 and the #2 tape walk (bitwise the same gradients, the retention unchanged; a no-op outside that backward; `False` restores the replay form). `"auto"` keeps the tapes only when the GDN node is the last operation of the checkpointed region that saves a tensor (the same checkpoint-frame proof as `recompute_output="auto"`): then its backward is the region's first and the kept tapes die before any other backward runs; with a later saver in the region (an output projection, an MLP) the kept set would live through those operations' backward and raise the region's backward peak by the full tape set (`gdn_det_saved_bytes_kcp(save_mode="full")` minus the saved states), so `"auto"` takes the replay form there. Measured on one GB300 (torch 2.14.1), 261,987 tokens, `(H_qk, HV) = (2, 6)`: a region of GDN + a 768x768 output projection + a 768->2x2048->768 SwiGLU has a backward peak of 9250.54 MiB with the kept tapes (`True`) and 6927.31 MiB with the replay form (`False` and `"auto"`), at 21.29 vs 22.70 ms per training step of the region; a region the GDN node closes keeps the tapes under `"auto"` (five 240k-262k-token (16, 48) packs: training step and steady peak unchanged against `True`). `True` always keeps the tapes, `False` never. With `graph="replay"`, the one mode that excludes the kept tapes, the default is `False` and an explicit `True` / `"auto"` is refused. One live kept set: in a checkpoint segment with several GDN layers only the last layer skips the replay, the earlier layers replay as before |
+| `reuse_recompute_tapes` | **`"auto"`**, `True`, `False` | under `torch.utils.checkpoint(use_reentrant=False)` the light backward binds the forward tapes torch's recompute just wrote instead of replaying #1 and the #2 tape walk (bitwise the same gradients, the retention unchanged; a no-op outside that backward; `False` restores the replay form). `"auto"` keeps the tapes only when the GDN node is the last operation of the checkpointed region that saves a tensor (the same checkpoint-frame proof as `recompute_output="auto"`): then its backward is the region's first and the kept tapes die before any other backward runs; with a later saver in the region (an output projection, an MLP) the kept set would live through those operations' backward and raise the region's backward peak by the full tape set (`cake_gdn_det_train_kcp_saved_bytes(save_mode="full")` minus the saved states), so `"auto"` takes the replay form there. Measured on one GB300 (torch 2.14.1), 261,987 tokens, `(H_qk, HV) = (2, 6)`: a region of GDN + a 768x768 output projection + a 768->2x2048->768 SwiGLU has a backward peak of 9250.54 MiB with the kept tapes (`True`) and 6927.31 MiB with the replay form (`False` and `"auto"`), at 21.29 vs 22.70 ms per training step of the region; a region the GDN node closes keeps the tapes under `"auto"` (five 240k-262k-token (16, 48) packs: training step and steady peak unchanged against `True`). `True` always keeps the tapes, `False` never. With `graph="replay"`, the one mode that excludes the kept tapes, the default is `False` and an explicit `True` / `"auto"` is refused. One live kept set: in a checkpoint segment with several GDN layers only the last layer skips the replay, the earlier layers replay as before |
 | `recompute_output` | **`"auto"`**, `"always"` | under `torch.utils.checkpoint(use_reentrant=False)` torch re-runs the forward inside `.backward()` only to re-save its tensors and discards that run's output; when the GDN node is the last operation of the checkpointed region that saves a tensor, `"auto"` does not launch the output program (#5) of that re-run. The proof is read from torch's checkpoint frame (the node is executable, the remaining saved-tensor holders are exactly this node's, early stop is on, and the torch release -- `torch.__version__` without its local `+cuNNN` build tag (`cake_kcp.torch_release`) -- is one of the verified releases in `cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS`); any other state -- a later saver in the region such as the next layer or a norm on the output, a non-executable node, a reentrant checkpoint, `graph="replay"`, another torch build -- launches it as before, and `cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]` records why. Gradients and retained bytes are the same either way; `"always"` is the unconditional launch |
 | `segments` | **`None`**, an int | how many intra-rank segments a fragment is walked as (`P`): `None` takes the context's plan, an int overrides it within `[1, min(64, chunks of the rank's longest fragment)]` (the byte queries' `P=`). The plan (test knob `p_rule` names its policy; test knob `walk_seg` an explicit override) is a function of metadata and the SM count only. The shipped policy costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie); on a row with at most 12 value heads whose fragments are all at most 160 chunks long every rank then runs `P = 1` (no segment composition), so the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
@@ -248,14 +280,14 @@ Two replays exist, and they differ:
 Both replays give bitwise the gradients of the saved-set backward.
 
 A **recompute handle** removes the exchange from the checkpoint replay.  Pass
-a `RecomputeHandleDetKcp` to the checkpointed function and to `chunk_gdn_det_kcp`:
+a `CakeGDNDetKcpRecomputeHandle` to the checkpointed function and to `cake_gdn_det_kcp`:
 
 ```python
 def layer(x, handle):
     ...                                   # convolution, split, gates
-    return chunk_gdn_det_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+    return cake_gdn_det_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
 
-y = torch.utils.checkpoint.checkpoint(layer, x, RecomputeHandleDetKcp(), use_reentrant=False)
+y = torch.utils.checkpoint.checkpoint(layer, x, CakeGDNDetKcpRecomputeHandle(), use_reentrant=False)
 ```
 
 The original forward exchanges as always and stores this rank's incoming
@@ -266,7 +298,7 @@ tape walk from `S_in`, then the output program): no collective, no summary
 walk over the crossing-out fragments, no owner merge.  The gradients
 are bitwise those of the same checkpoint without a handle; the backward still
 exchanges.  The handle retains `S_in` --
-`gdn_det_saved_bytes_kcp(ctx, ..., save_mode="light", save_transfer=False,
+`cake_gdn_det_train_kcp_saved_bytes(ctx, ..., save_mode="light", save_transfer=False,
 with_conv=False)` -- until the checkpoint frame that holds it is freed.
 Create one handle per layer and micro-step, outside the outermost checkpoint
 region (a handle created inside a region is empty again in that region's
@@ -279,9 +311,9 @@ handle holds one entry per key: it serves one GDN call and at most one
 convolution call; a layer with separate Q / K / V convolutions uses one handle
 per convolution call, and the GDN call shares one of them.
 
-**Packed Q/K/V.**  `packed_qkv_views_det_kcp(qkv, H_qk=..., HV=...)` splits a packed
+**Packed Q/K/V.**  `cake_gdn_det_train_kcp_packed_qkv_views(qkv, H_qk=..., HV=...)` splits a packed
 `[T, (2 H_qk + HV) * 128]` row (the convolution's output) into `q` / `k` /
-`v` head views without a copy; `chunk_gdn_det_kcp` takes them as they are (token
+`v` head views without a copy; `cake_gdn_det_kcp` takes them as they are (token
 stride `(2 H_qk + HV) * 128`).  When `q` / `k` / `v` are such views, the
 backward writes `dq` / `dk` / `dv` as the same views of one fresh packed
 row, and the split's backward returns that row as the gradient of `qkv`: no
@@ -290,7 +322,7 @@ backward.  The gradient values are bitwise those of separate operands
 (`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
 
 Callers whose `q` / `k` / `v` are head views of one packed row get the full
-backward speed only through `packed_qkv_views_det_kcp`.  Its conditions: `qkv`
+backward speed only through `cake_gdn_det_train_kcp_packed_qkv_views`.  Its conditions: `qkv`
 is `[..., T, (2 H_qk + HV) * 128]` with a dense channel axis
 (`qkv.stride(-1) == 1`), and `q` / `k` / `v` are its three head views in that
 order.  Plain views of the same row
@@ -320,7 +352,7 @@ concatenate.  Autograd refuses an in-place change to the views while `qkv`
 requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 
 ```
-gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C=None, save_transfer=True, boundary_mode="saved")
+cake_gdn_det_train_kcp_comm_bytes(ctx, *, H_qk, HV, C=None, save_transfer=True, boundary_mode="saved")
     -> this rank's {c1, c2, b1, b2, halo_fwd, halo_bwd: {send, recv}; B1, B2, B3 (the boundary totals); b1_d, b1_m,
     b1_design, b1_replay; padding; the crossing counts and state bytes}
     c1 send = 2 * s_pad * n_out(r)      c2 recv = s_pad * n_in(r)      b2 recv = s_pad * n_out(r)
@@ -328,14 +360,14 @@ gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C=None, save_transfer=True, boundary_mo
     save_transfer=False; n_io(r): the rank's fragments crossing in and out, whose maps the owner's adjoint chain reads)
     on an owner: c1 recv = 2 * s_owner * N_out      c2 send = s_owner * N_in      b2 send = s_owner * N_out
     b1 recv = s_owner * N_in, plus s_owner * N_io with the re-sent maps      halo = rows(r) * C * 2 forward, * 4 backward
-gdn_det_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
+cake_gdn_det_train_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
     C=None, P=None, use_qk_l2norm_in_kernel=False) -> per rank (the table above)
-gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, backward=True,
+cake_gdn_det_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, backward=True,
     with_conv=True, C=None, P=None, group_reduce="fused", reuse_recompute_tapes=None, use_qk_l2norm_in_kernel=False,
     fused_walks=1, graph="off", save_for_backward=True)
     -> per rank: the most the caller-held workspace binds in the forward or the backward.  Covered: exchange="a2a"
     under the shipped wait_first schedule, graph "off" or "replay", with or without a saved set, on a workspace
-    created empty (WorkspaceDetKcp()): its first forward and the backward that follows on the arena that forward left
+    created empty (CakeGDNDetKcpWorkspace()): its first forward and the backward that follows on the arena that forward left
     (save_for_backward=False: with backward=True the replay a saved=None backward runs, with backward=False a
     forward-only call).  A backward leaves its tapes bound, so every later backward on the same workspace (another
     layer, the next step) binds the graph="replay" figure (measured for the replay form; at most that figure right
@@ -343,17 +375,17 @@ gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="
     v_new: its replayed forward binds them again only after the c1 release) and every later forward more than the
     first (the backward's tapes stay bound; under graph="replay" its b1 / b2 pools too) and at most that figure
     (equal to it under graph="replay"): size a reused workspace with graph="replay".
-    WorkspaceDetKcp(ctx, H_qk, HV, device) sizes every pool up front at the plan's P with the fused walks (the ring
+    CakeGDNDetKcpWorkspace(ctx, H_qk, HV, device) sizes every pool up front at the plan's P with the fused walks (the ring
     pools, c2_send, the c1_recv / stage_m pools a saving call replaces, the b1 / b2 pools; for a call with a smaller
     segments override or fused_walks=0 also the plan's larger staging, carry and M_f^T pools) and binds them from #1
     on.  Not covered: exchange="ring" (also binds ring_out / ring_in, max(n_in(r), n_out(r)) states each, and its
     forward -- also the forward a replay backward re-runs -- keeps the c2 send pool and the c1 send pool with the
     M_f^T tiles through the tape walk: up to fwd.c1_send + fwd.c1_send_mf more, plus the c2 send pool (bwd.c2_send)
-    in the forward), the schedule="overlap" test knob and the kept form's recompute under a RecomputeHandleDetKcp (a
+    in the forward), the schedule="overlap" test knob and the kept form's recompute under a CakeGDNDetKcpRecomputeHandle (a
     handle forces save_transfer=False; with the query given save_transfer=False too, its c1 send pool stays bound
     through its tape walk, up to fwd.c1_send + fwd.c1_send_mf above bwd.phase.recompute_forward; the replay form's
     figure bounds it).  The figures plan a workspace: no call checks a workspace against them (a caller-held
-    WorkspaceDetKcp grows any pool or tape a call needs).
+    CakeGDNDetKcpWorkspace grows any pool or tape a call needs).
     graph="off": the forward is the larger of #1 (the pools, the eight tapes #1 writes -- none with save_mode="full"
     and a saved set, whose tapes are saved-set tensors -- and the arena qk_rstd of a forward without a saved set) and
     the tape walk (akk / gcum gone; the split form, also `forward_split` of the layout, adds h / v_new; with a
@@ -366,7 +398,7 @@ gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="
     ten forward tapes are workspace (no forward tape with save_mode="full" and a saved set) and whose workspace
     bounds the kept form's; `reuse_recompute_tapes=True` gives the kept-tape figure (light save_mode, saved set), in
     which they are the recompute forward's hand-off tensors outside the workspace, with its M_seg^T staging plane at
-    P > 1 without save_transfer (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as
+    P > 1 without save_transfer (`cake_gdn_det_train_kcp_workspace_layout` lists them as `bwd.kept_tapes` and the total as
     `backward_transient`, which that plane can put above the replay form's).  graph="replay": nothing is released,
     so the forward is every forward pool and tape it writes (no tape with save_mode="full" and a saved set) and the
     backward every backward pool, the ten light tapes (none with save_mode="full" and a saved set) and every
