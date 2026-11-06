@@ -121,7 +121,9 @@ def _context(lens, cuts, device):
     part = cake_kda_det_train_kcp_partition(
         torch.tensor(cu_global, dtype=torch.int64), 1, fragments=[frags]
     )
-    ctx = cake_kda_det_train_kcp_build_context(part, None, 0, device, conv_kernel_size=WIDTH)
+    ctx = cake_kda_det_train_kcp_build_context(
+        part, None, 0, device, conv_kernel_size=WIDTH
+    )
     return ctx, S, cu_global, frags
 
 
