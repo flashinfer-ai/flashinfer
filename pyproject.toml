@@ -83,6 +83,7 @@ exclude = [
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.cute_dsl.attention.fmha.rubin_gqa" = ["LICENSE"]
 "flashinfer.experimental.hc_sum_sm100" = ["csrc/**", "README.md", "SOURCES.md"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
@@ -287,6 +288,8 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
+  "flashinfer/cute_dsl/attention/fmha/rubin/",
+  "flashinfer/cute_dsl/attention/fmha/rubin_gqa/",
   "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src/",
@@ -337,6 +340,8 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
+  "flashinfer/cute_dsl/attention/fmha/rubin",
+  "flashinfer/cute_dsl/attention/fmha/rubin_gqa",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/src",
