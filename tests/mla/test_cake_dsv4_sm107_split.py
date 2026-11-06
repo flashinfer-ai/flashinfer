@@ -13,6 +13,13 @@ repeated calls are bitwise identical (eager and CUDA graph replay, with the
 piece buffers poisoned before every call).  Launches outside the split
 rule (18 rows, PDL off, a workspace below the split carve, items 1024 wide,
 the K=64 launch gate false) must run the route's own launch bit for bit.
+FP8 launches of 64 heads over items of four to nine tiles with PDL split by
+the rows and pieces of ``_K64_SPLIT_RULES_H64``; the ``test_h64_*`` tests
+check the same contract at both ends of every pieces band of those rules
+(``H64_ROUTED``) and at a partial-tile width of every tile count
+(``H64_PARTIAL``, through both compressed page sizes), with the piece buffers
+NaN-poisoned and the bytes past the split carve and past the output guarded,
+and run 64-head launches outside the rules as the route's own launch.
 Skips without an SM107 GPU.
 """
 
@@ -97,36 +104,47 @@ def _ragged_q_lens(rows: int) -> list:
     return q_lens
 
 
-def _short_cap(splits: int) -> int:
+def _item_tiles(item_width: int) -> int:
+    """Sparse tiles of an item of ``item_width`` compressed columns (the SWA
+    tile first)."""
+    return -(-item_width // TILE) + 1
+
+
+def _short_cap(splits: int, item_width: int = COMPRESSED_WIDTH) -> int:
     """The most compressed columns of a row whose tiles fit one piece
-    (``ceil(9 / s)`` tiles, the first of them the SWA tile)."""
-    return (-(-9 // splits) - 1) * TILE
+    (``ceil(n / s)`` of the item's ``n`` tiles, the first of them the SWA
+    tile)."""
+    return (-(-_item_tiles(item_width) // splits) - 1) * TILE
 
 
-def _boundary_lens(splits: int) -> list:
+def _boundary_lens(splits: int, item_width: int = COMPRESSED_WIDTH) -> list:
     """Compressed columns of rows at the piece edges of ``splits`` pieces of
-    ``k = ceil(9 / s)`` tiles each (the SWA tile first): rows of exactly k
+    ``k = ceil(n / s)`` tiles each (the SWA tile first): rows of exactly k
     tiles (piece 0 alone), of k + 1 tiles (one column, then one full tile in
-    piece 1), of 2k and 2k + 1 tiles where those fit in nine (a later piece
-    without a tile, then with one), and of nine tiles."""
-    tiles = -(-9 // splits)
+    piece 1), of 2k and 2k + 1 tiles where those fit in the item's ``n`` (a
+    later piece without a tile, then with one), and of all ``item_width``
+    compressed columns (and one fewer)."""
+    item_tiles = _item_tiles(item_width)
+    tiles = -(-item_tiles // splits)
     lens = [(tiles - 1) * TILE, (tiles - 1) * TILE + 1, tiles * TILE]
-    if 2 * tiles < 9:
+    if 2 * tiles < item_tiles:
         lens += [(2 * tiles - 1) * TILE, (2 * tiles - 1) * TILE + 1]
-    return lens + [COMPRESSED_WIDTH - 1, COMPRESSED_WIDTH]
+    return lens + [item_width - 1, item_width]
 
 
-def _compressed_lens(lengths: str, rows: int, splits: int) -> list:
+def _compressed_lens(
+    lengths: str, rows: int, splits: int, item_width: int = COMPRESSED_WIDTH
+) -> list:
     if lengths == "full":
-        return [COMPRESSED_WIDTH] * rows
+        return [item_width] * rows
     if lengths == "mixed":
-        return hardening._mixed_compressed_lens(rows, COMPRESSED_WIDTH)
+        return hardening._mixed_compressed_lens(rows, item_width)
     if lengths == "short":
-        cap = _short_cap(splits)
+        cap = _short_cap(splits, item_width)
         pattern = (37, 0, 131, 1, 253, 65, 511, 129, 3, 512, 255, 63)
         return [min(cap, pattern[i % len(pattern)]) for i in range(rows)]
     if lengths == "boundary":
-        pattern = _boundary_lens(splits)
+        pattern = _boundary_lens(splits, item_width)
         return [pattern[i % len(pattern)] for i in range(rows)]
     raise ValueError(lengths)
 
@@ -158,16 +176,20 @@ def _case(
     layout: str = "dense-q1",
     lengths: str = "full",
     compressed_width: int = COMPRESSED_WIDTH,
+    num_heads: int = HEADS,
+    item_width: int = COMPRESSED_WIDTH,
+    compressed_page: int = 64,
 ):
     seq_lens, q_lens, kind = _layout_shape(layout, rows, short=lengths == "short")
-    lens = _compressed_lens(lengths, rows, splits)
+    lens = _compressed_lens(lengths, rows, splits, item_width)
     case = hardening._build_case(
-        num_heads=HEADS,
+        num_heads=num_heads,
         dtype=DTYPE,
         seq_lens=seq_lens,
         q_lens=q_lens,
         layout=kind,
         compressed_width=compressed_width,
+        compressed_page=compressed_page,
         compressed_lens=[min(n, compressed_width) for n in lens],
     )
     assert case.rows == rows
@@ -177,7 +199,7 @@ def _case(
 def _workspace(case, num_bytes=None) -> torch.Tensor:
     if num_bytes is None:
         num_bytes = get_cake_dsv4_workspace_bytes(
-            case.rows, HEADS, int(case.sparse_indices.shape[1]), DTYPE
+            case.rows, case.num_heads, int(case.sparse_indices.shape[1]), DTYPE
         )
         assert num_bytes >= case.requirement().single_launch_bytes
     workspace = torch.empty(num_bytes, dtype=torch.uint8, device="cuda:0")
@@ -185,13 +207,15 @@ def _workspace(case, num_bytes=None) -> torch.Tensor:
     return workspace
 
 
-def _split_carve(rows: int, splits: int) -> int:
-    return cake_dsv4_workspace_layout(rows, HEADS, splits).total_bytes
+def _split_carve(rows: int, splits: int, num_heads: int = HEADS) -> int:
+    return cake_dsv4_workspace_layout(rows, num_heads, splits).total_bytes
 
 
-def _poison_pieces(workspace: torch.Tensor, rows: int, splits: int) -> None:
+def _poison_pieces(
+    workspace: torch.Tensor, rows: int, splits: int, num_heads: int = HEADS
+) -> None:
     """NaN bytes over the partial O and LSE regions of a split launch."""
-    layout = cake_dsv4_workspace_layout(rows, HEADS, splits)
+    layout = cake_dsv4_workspace_layout(rows, num_heads, splits)
     start = layout.partial_o[0]
     stop = layout.partial_lse[0] + layout.partial_lse[1]
     workspace[start:stop].fill_(0xFF)
@@ -416,6 +440,330 @@ def test_unsplit_launches_run_the_route_as_main(monkeypatch, form):
     full = _workspace(case)
     workspace = (
         _workspace(case, _split_carve(rows, 5) - 1)
+        if form == "small_workspace"
+        else full
+    )
+    if form == "gate_false":
+        monkeypatch.setattr(cake, "_k64_sibling_launchable", lambda arch, device: False)
+    seen = _record_splits(monkeypatch)
+    out = case.run(workspace=workspace, out=case.nan_out(), enable_pdl=enable_pdl)
+    torch.cuda.synchronize()
+    assert seen == [None]
+    main = _main_launch(monkeypatch, case, full, enable_pdl=enable_pdl)
+    assert torch.equal(out, main)
+    hardening._assert_valid(out, case)
+
+
+# 64-head launches: (item tiles, rows, pieces per row) at both ends of every
+# pieces band of the SM107 64-head rules (``_K64_SPLIT_RULES_H64``), over
+# items of whole tiles (``tiles * 128`` wide).
+H64_HEADS = 64
+H64_ROUTED = [
+    (4, 1, 4),
+    (4, 4, 4),
+    (5, 1, 5),
+    (5, 9, 5),
+    (6, 1, 6),
+    (6, 9, 6),
+    (6, 10, 3),
+    (6, 18, 3),
+    (7, 1, 7),
+    (7, 9, 7),
+    (7, 10, 4),
+    (7, 17, 4),
+    (8, 1, 8),
+    (8, 7, 8),
+    (8, 8, 4),
+    (8, 15, 4),
+    (8, 16, 3),
+    (8, 20, 3),
+    (9, 1, 9),
+    (9, 6, 9),
+    (9, 7, 5),
+    (9, 12, 5),
+    (9, 13, 3),
+    (9, 20, 3),
+]
+# Items whose last tile is partial (``width % 128`` columns), one or two per
+# tile count: (item tiles, rows, pieces per row, width).
+H64_PARTIAL = [
+    (4, 4, 4, 388),
+    (5, 9, 5, 516),
+    (6, 18, 3, 644),
+    (7, 10, 4, 772),
+    (8, 8, 4, 900),
+    (9, 6, 9, 1028),
+    (9, 13, 3, 1028),
+]
+# Bytes behind the split carve that a 64-head split launch must leave alone.
+GUARD_BYTES = 4096
+GUARD = 0xA5
+# Value of the output row behind the last metadata row (exact in bf16).
+OUT_GUARD = -3.0
+
+
+def _h64_case(tiles: int, rows: int, splits: int, *, width: int = 0, **kwargs):
+    """A 64-head case over items ``width`` wide (default ``tiles * 128``)
+    whose compressed lengths follow that width."""
+    width = width or tiles * TILE
+    assert -(-width // TILE) == tiles, (width, tiles)
+    return _case(
+        rows,
+        splits,
+        compressed_width=width - TILE,
+        num_heads=H64_HEADS,
+        item_width=width - TILE,
+        **kwargs,
+    )
+
+
+def _h64_guarded_workspace(case, rows: int, splits: int):
+    """The split carve, which the requirement reports, plus ``GUARD_BYTES``
+    of ``GUARD`` behind it, with the piece buffers NaN-poisoned."""
+    carve = _split_carve(rows, splits, H64_HEADS)
+    assert case.requirement().single_launch_bytes == carve
+    workspace = _workspace(case, carve + GUARD_BYTES)
+    workspace[carve:].fill_(GUARD)
+    _poison_pieces(workspace, rows, splits, H64_HEADS)
+    return workspace, carve
+
+
+def _assert_guard(workspace: torch.Tensor, carve: int) -> None:
+    assert bool(workspace[carve:].eq(GUARD).all()), "the split wrote past its carve"
+
+
+def _h64_guarded_out(case):
+    """A NaN output and the row of ``OUT_GUARD`` right behind it in the same
+    buffer (returned second), which the launch must leave alone."""
+    size = case.query.numel()
+    buffer = torch.full(
+        (size + case.num_heads * 512,),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+    buffer[size:].fill_(OUT_GUARD)
+    return buffer[:size].view(case.query.shape), buffer[size:]
+
+
+def _assert_out_guard(tail: torch.Tensor) -> None:
+    assert bool(tail.eq(OUT_GUARD).all()), "the launch wrote past its output"
+
+
+_H64_CASES = [
+    pytest.param(
+        tiles,
+        rows,
+        splits,
+        tiles * TILE,
+        64,
+        layout,
+        lengths,
+        id=f"n{tiles}-t{rows}-{layout}-{lengths}",
+    )
+    for tiles, rows, splits in H64_ROUTED
+    for layout in ("dense-q1", "dense-q4", "ragged")
+    if layout != "dense-q4" or rows % 4 == 0
+    for lengths in ("full", "mixed", "short", "boundary")
+] + [
+    pytest.param(
+        tiles,
+        rows,
+        splits,
+        width,
+        page,
+        layout,
+        lengths,
+        id=f"n{tiles}-w{width}-p{page}-t{rows}-{layout}-{lengths}",
+    )
+    for tiles, rows, splits, width in H64_PARTIAL
+    for layout, page in (("dense-q1", 64), ("ragged", 2))
+    for lengths in ("full", "mixed", "short", "boundary")
+]
+
+
+@pytest.mark.parametrize("tiles,rows,splits,width,page,layout,lengths", _H64_CASES)
+def test_h64_split_launch_matches_reference(
+    monkeypatch, tiles, rows, splits, width, page, layout, lengths
+):
+    """A 64-head launch over ``width``-wide items (compressed page ``page``)
+    splits into ``splits`` pieces per row, writes a NaN-filled output that
+    matches the reference from NaN-poisoned piece buffers, leaves the bytes
+    past its carve and past its output alone and is bit-identical with the
+    masked columns' page poisoned."""
+    _skip_unless_sm107()
+    case = _h64_case(
+        tiles,
+        rows,
+        splits,
+        width=width,
+        layout=layout,
+        lengths=lengths,
+        compressed_page=page,
+    )
+    workspace, carve = _h64_guarded_workspace(case, rows, splits)
+    seen = _record_splits(monkeypatch)
+    out, tail = _h64_guarded_out(case)
+    clean = case.run(workspace=workspace, out=out, enable_pdl=True)
+    torch.cuda.synchronize()
+    assert seen == [(0, rows, splits)]
+    _assert_guard(workspace, carve)
+    _assert_out_guard(tail)
+    hardening._assert_valid(clean, case)
+    case.fill_poison(hardening.POISON)
+    _poison_pieces(workspace, rows, splits, H64_HEADS)
+    out, tail = _h64_guarded_out(case)
+    poisoned = case.run(workspace=workspace, out=out, enable_pdl=True)
+    torch.cuda.synchronize()
+    assert torch.equal(clean, poisoned), "masked columns leak into the split output"
+    _assert_guard(workspace, carve)
+    _assert_out_guard(tail)
+
+
+@pytest.mark.parametrize(
+    "tiles,rows,splits", [(9, 1, 9), (9, 12, 5), (8, 8, 4), (6, 10, 3), (4, 4, 4)]
+)
+@pytest.mark.parametrize("sink", ["none", "large", "empty_piece_zero"])
+def test_h64_split_launch_sinks(monkeypatch, tiles, rows, splits, sink):
+    """64-head launches with no sink, a sink far above the scores, and rows
+    whose first piece has no valid column (it carries the sink alone): the
+    producer reads the sinks and writes the LSE of the 64 heads only."""
+    _skip_unless_sm107()
+    case = _h64_case(tiles, rows, splits, layout="ragged")
+    if sink == "none":
+        case = dataclasses.replace(case, sinks=None)
+    elif sink == "large":
+        case.sinks.fill_(8.0)
+    else:
+        first_piece = -(-tiles // splits) * TILE
+        case.sparse_indices[:, :first_piece] = -1
+    workspace, carve = _h64_guarded_workspace(case, rows, splits)
+    seen = _record_splits(monkeypatch)
+    out, tail = _h64_guarded_out(case)
+    out = case.run(workspace=workspace, out=out, enable_pdl=True)
+    torch.cuda.synchronize()
+    assert seen == [(0, rows, splits)]
+    hardening._assert_valid(out, case)
+    _assert_guard(workspace, carve)
+    _assert_out_guard(tail)
+
+
+@pytest.mark.parametrize("tiles,rows,splits", [(9, 2, 9), (7, 10, 4), (5, 8, 5)])
+def test_h64_split_launch_zero_length_rows(monkeypatch, tiles, rows, splits):
+    """64-head rows without an attendable column (zero active length, or every
+    index ``-1``) write zeros; the other rows of the launch match the
+    reference."""
+    _skip_unless_sm107()
+    case = _h64_case(tiles, rows, splits, layout="ragged", lengths="mixed")
+    zero_len = list(range(0, rows, 3))
+    all_invalid = list(range(1, rows, 4))
+    case.sparse_topk_lens[zero_len] = 0
+    case.sparse_indices[all_invalid] = -1
+    workspace, carve = _h64_guarded_workspace(case, rows, splits)
+    seen = _record_splits(monkeypatch)
+    out = case.run(workspace=workspace, out=case.nan_out(), enable_pdl=True)
+    torch.cuda.synchronize()
+    assert seen == [(0, rows, splits)]
+    empty = sorted(set(zero_len) | set(all_invalid))
+    assert bool(out[empty].eq(0).all()), "rows without columns must be zero"
+    hardening._assert_valid(out, case)
+    _assert_guard(workspace, carve)
+
+
+@pytest.mark.parametrize(
+    "tiles,rows,splits,width",
+    [(5, 8, 5, 640), (7, 10, 4, 896), (9, 13, 3, 1152), (6, 18, 3, 644)],
+)
+@pytest.mark.parametrize("form", ["separate", "lens_offset"])
+def test_h64_split_launch_metadata_forms(monkeypatch, tiles, rows, splits, width, form):
+    """64-head launches through separate SWA and compressed tables (row stride
+    ``width - 128``, compressed-only lengths) and through a lens offset split
+    like the combined call, match the reference and equal the combined call
+    bit for bit, with rows at every piece edge."""
+    _skip_unless_sm107()
+    case = _h64_case(
+        tiles, rows, splits, width=width, layout="ragged", lengths="boundary"
+    )
+    workspace, carve = _h64_guarded_workspace(case, rows, splits)
+    seen = _record_splits(monkeypatch)
+    combined = case.run(workspace=workspace, out=case.nan_out(), enable_pdl=True)
+    other = _run_metadata_form(case, form, workspace=workspace, out=case.nan_out())
+    torch.cuda.synchronize()
+    assert seen == [(0, rows, splits)] * 2
+    hardening._assert_valid(other, case)
+    assert torch.equal(other, combined), (
+        f"the {form} form differs from the combined call"
+    )
+    _assert_guard(workspace, carve)
+
+
+@pytest.mark.parametrize(
+    "tiles,rows,splits",
+    [(9, 1, 9), (9, 12, 5), (8, 20, 3), (7, 17, 4), (5, 8, 5), (4, 4, 4)],
+)
+def test_h64_split_launch_is_deterministic(monkeypatch, tiles, rows, splits):
+    """Eager calls and CUDA graph replays of one 64-head split launch, with
+    the piece buffers and the output poisoned before each, are bitwise
+    identical and never write past the carve."""
+    _skip_unless_sm107()
+    case = _h64_case(tiles, rows, splits, layout="ragged", lengths="mixed")
+    workspace, carve = _h64_guarded_workspace(case, rows, splits)
+    seen = _record_splits(monkeypatch)
+    run = dict(workspace=workspace, float_scales=True, enable_pdl=True)
+    first = case.run(out=case.nan_out(), **run)
+    torch.cuda.synchronize()
+    assert seen == [(0, rows, splits)]
+    hardening._assert_valid(first, case)
+    for repeat in range(REPEATS):
+        _poison_pieces(workspace, rows, splits, H64_HEADS)
+        again = case.run(out=case.nan_out(), **run)
+        torch.cuda.synchronize()
+        assert torch.equal(again, first), f"eager repeat {repeat} differs"
+
+    source = case.query.clone()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(out=out, **run)
+    torch.cuda.synchronize()
+    assert seen[-1] == (0, rows, splits)
+    for repeat in range(REPEATS):
+        case.query.zero_()
+        out.fill_(float("nan"))
+        _poison_pieces(workspace, rows, splits, H64_HEADS)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out.reshape(first.shape), first), (
+            f"graph replay {repeat} differs from the eager call"
+        )
+    _assert_guard(workspace, carve)
+
+
+# (item tiles, rows): one row past the last split row of every tile count.
+_H64_PAST_RULE = [(4, 5), (5, 10), (6, 19), (7, 18), (8, 21), (9, 21)]
+_H64_UNSPLIT_FORMS = [
+    *(("rows_past_rule", tiles, rows) for tiles, rows in _H64_PAST_RULE),
+    ("pdl_off", 9, 8),
+    ("small_workspace", 9, 8),
+    ("three_tiles", 3, 8),
+    ("gate_false", 9, 8),
+]
+
+
+@pytest.mark.parametrize("form,tiles,rows", _H64_UNSPLIT_FORMS)
+def test_h64_unsplit_launches_run_the_route_as_main(monkeypatch, form, tiles, rows):
+    """64-head launches outside the rules (one row past the last split row of
+    every tile count, PDL off, a workspace one byte below the split carve,
+    three-tile items, the K=64 gate false) run the route's own launch: no
+    split, output bit-identical to the launch with the split decision forced
+    off."""
+    _skip_unless_sm107()
+    case = _h64_case(tiles, rows, 5, layout="ragged", lengths="mixed")
+    enable_pdl = form != "pdl_off"
+    full = _workspace(case)
+    workspace = (
+        _workspace(case, _split_carve(rows, 5, H64_HEADS) - 1)
         if form == "small_workspace"
         else full
     )
