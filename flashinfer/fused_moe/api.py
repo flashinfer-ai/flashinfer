@@ -3281,8 +3281,10 @@ class FrostLowLatencyConfig:
 
 @dataclass(frozen=True)
 class BatchInvariantMoeConfig:
-    """The batch-invariant MoE backend: the bf16 classes ``moe.bf16.swiglu`` (default ``SwiGLU``) and ``moe.bf16.relu2``
-    (``ReLU2``) of the mode documented in ``flashinfer/batch_invariant/README.md``, on SM100 / SM103 / SM107.
+    """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
+    (one class per typed activation and parameter set: ``SwiGLU`` with any ``alpha`` / ``beta`` / ``limit``,
+    ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU``; ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``),
+    on SM100 / SM103 / SM107.
 
     Every output bit is a function of the token's own row, its ``top_k`` experts and routing weights and the expert
     weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
@@ -3294,8 +3296,9 @@ class BatchInvariantMoeConfig:
     and weights. Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend
     never falls back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout).
 
-    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for ``SwiGLU`` or
-    ``w1 [E, I, H]`` for ``ReLU2``, and ``w2 [E, H, I]``, bf16; activations are bf16 ``[num_tokens, H]`` as given.
+    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for the gated activations or
+    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16; the activation names the chain of the view;
+    activations are bf16 ``[num_tokens, H]`` as given.
     """
 
     @classmethod
@@ -3313,18 +3316,20 @@ class BatchInvariantMoeConfig:
         activation: Optional["ActivationConfig"] = None,
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
-        """The backend's weight view: the gate / up rows interleaved for the gated class, as given for the ungated one."""
+        """The backend's weight view: the gate / up rows interleaved for a gated activation, as given for an ungated one,
+        and the activation's chain (``activation`` defaults to ``SwiGLU()``)."""
         from .batch_invariant.api import MoEWeights
+        from .batch_invariant.spec import activation_of
 
-        gated = (
-            isinstance(activation, SwiGLU)
-            if activation is not None
-            else (intermediate_size is None or w1.shape[1] == 2 * intermediate_size)
-        )
+        chain = activation_of(activation if activation is not None else SwiGLU())
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
         return MoEWeights.prepare(
-            w1.to(torch.bfloat16), w2.to(torch.bfloat16), gated=gated
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
         ).view()
 
     @staticmethod

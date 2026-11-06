@@ -16,6 +16,7 @@ import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from . import spec as S
+from .mterm import frexpe_f32, frexpm_f32
 
 
 class ExactF32:
@@ -30,6 +31,10 @@ class ExactF32:
     div = staticmethod(fp32.div)
     fma = staticmethod(fp32.fma)
     sqrt = staticmethod(fp32.sqrt)
+    fabs = staticmethod(fp32.fabs)
+    fmaxc = staticmethod(fp32.fmaxc)
+    frexpm = staticmethod(frexpm_f32)
+    frexpe = staticmethod(frexpe_f32)
     neg = staticmethod(fp32.neg)
     fmin = staticmethod(fp32.fmin)
     fmax = staticmethod(fp32.fmax)
@@ -93,6 +98,36 @@ class TorchF32:
         return ((n + 127) << 23).view(torch.float32)
 
     @staticmethod
+    def fabs(a: torch.Tensor) -> torch.Tensor:
+        return torch.abs(a)
+
+    @staticmethod
+    def fmaxc(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
+        """The device's ``max.f32``: a zero tie is ``+0`` when either operand is ``+0`` (``-0`` only for two ``-0``)."""
+        b = torch.as_tensor(b, dtype=torch.float32)
+        r = torch.maximum(a, b)
+        zero_tie = (a == 0) & (b == 0)
+        pos = (torch.signbit(a) == False) | (torch.signbit(b) == False)  # noqa: E712
+        return torch.where(zero_tie & pos, torch.zeros_like(r), r)
+
+    @staticmethod
+    def sqrt(a: torch.Tensor) -> torch.Tensor:
+        # torch's vectorised float32 sqrt is a half-ulp-plus-epsilon library routine on some CPUs (x86: one ulp off on a
+        # few percent of inputs); the binary64 sqrt is the IEEE instruction and its rounding to binary32 is innocuous for a
+        # square root, so the composition is the correctly rounded binary32 sqrt the device computes
+        return torch.sqrt(a.to(torch.float64)).to(torch.float32)
+
+    @staticmethod
+    def frexpm(a: torch.Tensor) -> torch.Tensor:
+        bits = a.contiguous().view(torch.int32) & 0x7FFFFFFF
+        return ((bits & 0x007FFFFF) | 0x3F000000).view(torch.float32)
+
+    @staticmethod
+    def frexpe(a: torch.Tensor) -> torch.Tensor:
+        bits = a.contiguous().view(torch.int32) & 0x7FFFFFFF
+        return (((bits >> 23) & 0xFF) - 126).to(torch.float32)
+
+    @staticmethod
     def rowmax(*vals: torch.Tensor) -> torch.Tensor:
         return torch.stack(list(vals), dim=0).amax(dim=0)
 
@@ -132,6 +167,28 @@ def glu_cpu(
 def relu2_cpu(acc: torch.Tensor, out_fmt: str = "bf16") -> torch.Tensor:
     """``cvt(relu(acc)^2)`` from one fp32 accumulator, elementwise (the ungated chain)."""
     return S.act_elem(TorchF32, _f32(acc), "relu2", out_fmt)
+
+
+def glu_cpu_act(
+    g: torch.Tensor,
+    u: torch.Tensor,
+    act: str = "silu",
+    params: Sequence[Optional[float]] = (),
+    out_fmt: str = "bf16",
+) -> torch.Tensor:
+    """The gated chain ``act`` with ``params`` on fp32 (gate, up) accumulators, vectorised: ``spec.glu_elem`` through
+    :class:`TorchF32`."""
+    return S.glu_elem(TorchF32, _f32(g), _f32(u), act, out_fmt, params)
+
+
+def act_cpu(
+    acc: torch.Tensor,
+    act: str = "relu2",
+    params: Sequence[Optional[float]] = (),
+    out_fmt: str = "bf16",
+) -> torch.Tensor:
+    """The ungated chain ``act`` on fp32 accumulators, vectorised: ``spec.act_elem`` through :class:`TorchF32`."""
+    return S.act_elem(TorchF32, _f32(acc), act, out_fmt, params)
 
 
 def route_cpu(

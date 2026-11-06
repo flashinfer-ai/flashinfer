@@ -27,12 +27,17 @@ MODULE = "batch_invariant_moe"
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
 
 
-def kernel_name(cfg: Knobs, chain: str, out_fmt: str) -> str:
-    """The object's name: the chain, the output format and the record without its ``grid_clusters`` (the grid is a launch
-    argument of the compiled kernel, so records that differ only in it share one object)."""
+def kernel_name(
+    cfg: Knobs, chain: Union[str, GroupedChain], out_fmt: str = "bf16"
+) -> str:
+    """The object's name: the chain (activation, output format, parameters) and the record without its ``grid_clusters``
+    (the grid is a launch argument: records differing only in it share one object)."""
+
+    if isinstance(chain, str):
+        chain = GroupedChain.legacy(chain, out_fmt)
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
-        f"grouped_bf16_{chain}_{out_fmt}_{knobs.describe()}"
+        f"grouped_bf16_{chain.describe()}_{knobs.describe()}"
     )
 
 
@@ -125,14 +130,18 @@ def compile_grouped_fn(cfg: Knobs, chain: GroupedChain) -> Callable[[], Any]:
 
 @functools.cache
 def get_compiled_grouped(
-    cfg: Knobs, chain: str = "plain", out_fmt: str = "bf16"
+    cfg: Knobs, chain: Union[str, GroupedChain] = "plain", out_fmt: str = "bf16"
 ) -> Any:
     """``kernel(a3, b3, out2, counts, grid)``: A ``(Tk, K, 1)`` K-major bf16, B ``(N, K, E)`` K-major bf16, out
-    ``(Tk, Nout)`` row-major (``Nout = N``, or ``N / 2`` for swiglu), counts ``(E,)`` int32, ``grid`` the persistent grid
-    in clusters (the device's co-resident cluster count for the record's cluster size)."""
-    assert chain in CHAINS and (chain == "plain" or out_fmt == "bf16"), (chain, out_fmt)
+    ``(Tk, Nout)`` row-major (``Nout = N``, or ``N / 2`` for the gated chains), counts ``(E,)`` int32, ``grid`` the
+    persistent grid in clusters (the device's co-resident cluster count for the record's cluster size). ``chain``: a
+    :class:`GroupedChain` or one of the bf16 class's legacy names (``plain`` / ``swiglu`` / ``relu2``)."""
+    if isinstance(chain, str):
+        assert chain in CHAINS and (chain == "plain" or out_fmt == "bf16"), (
+            chain,
+            out_fmt,
+        )
+        chain = GroupedChain.legacy(chain, out_fmt)
     return jit.build_and_load(
-        MODULE,
-        kernel_name(cfg, chain, out_fmt),
-        compile_grouped_fn(cfg, GroupedChain.legacy(chain, out_fmt)),
+        MODULE, kernel_name(cfg, chain), compile_grouped_fn(cfg, chain)
     )

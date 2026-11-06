@@ -34,14 +34,15 @@ from typing import List, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Boolean, Int32
+from cutlass import Boolean, Float32, Int32
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from ....batch_invariant.quantization.cute_ext import CuteF32
+from ....batch_invariant.fp_interface.exact import f32_bits
+from ....batch_invariant.quantization.cute_ext import CuteF32, bitcast_i32_to_f32
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
-from ..spec import ACTS, UNGATED_ACTS, act_elem, glu_elem
+from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem
 
 GROUP = 8  # gate/up interleave granularity (columns): u x8, g x8, u x8, ...
 KINDS = ("plain", "glu", "act")
@@ -77,28 +78,36 @@ def staging_bytes(out_dt, epi_tile, warpgroups: int) -> int:
 @dataclass(frozen=True)
 class GroupedChain:
     """The epilogue chain of a grouped GEMM: ``kind`` (``plain``, the gated ``glu`` on an accumulator pair, or the
-    ungated ``act`` on one accumulator), the activation and the output format. ``describe()`` names it."""
+    ungated ``act`` on one accumulator), the activation, the output format and the activation's parameters (binary32
+    values, ``None`` for an absent clamp / scale: ``spec.ACT_PARAMS``). ``describe()`` names it, parameters included
+    (their bit patterns), so every parameter set is its own compiled kernel."""
 
     kind: str = "plain"
     act: str = "silu"
     out_fmt: str = "bf16"
+    params: Tuple[Optional[float], ...] = ()
 
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
         if self.kind == "glu" and self.out_fmt != "bf16":
             raise AssertionError("the gated chain converts to bf16 once")
+        expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
+        assert len(self.params) == expected, (self, expected)
 
     @property
     def pair(self) -> bool:
         return self.kind == "glu"
 
     def describe(self) -> str:
+        suffix = "".join(
+            "_pn" if v is None else f"_p{f32_bits(v):08x}" for v in self.params
+        )
         if self.kind == "act":
             return f"{self.act}_{self.out_fmt}"  # the ungated chains: `relu2_bf16`
         if self.act == "silu":  # the bf16 class's names
             return ("swiglu" if self.pair else "plain") + f"_{self.out_fmt}"
-        return f"{self.kind}_{self.act}_{self.out_fmt}"
+        return f"{self.kind}_{self.act}_{self.out_fmt}{suffix}"
 
     @staticmethod
     def legacy(chain: str, out_fmt: str = "bf16") -> "GroupedChain":
@@ -168,14 +177,49 @@ def store_plan(
     return ve, partner, is_out
 
 
+def bitcast_f32_to_i32(a):
+    """``mov.b32 r, f``: reinterpret a Float32 as an Int32 (no conversion)."""
+    from cutlass._mlir.dialects import llvm
+    from cutlass.cutlass_dsl import T
+
+    res = llvm.inline_asm(
+        T.i32(),
+        [Float32(a).ir_value()],
+        "mov.b32 $0, $1;",
+        "=r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(res)
+
+
+class MoeF32(CuteF32):
+    """``CuteF32`` with the MoE chains' exact mantissa / exponent split of the declared log (``spec.log_term``): bit
+    operations on the binary32 pattern, no floating-point rounding."""
+
+    @staticmethod
+    def frexpm(a):
+        """The significand field of ``|a|`` under the exponent of 1/2: a binary32 in [1/2, 1) for a normal ``a``."""
+        bits = bitcast_f32_to_i32(a) & Int32(0x7FFFFFFF)
+        return bitcast_i32_to_f32((bits & Int32(0x007FFFFF)) | Int32(0x3F000000))
+
+    @staticmethod
+    def frexpe(a):
+        """The biased exponent field of ``|a|`` minus 126, as a Float32 (exact)."""
+        bits = bitcast_f32_to_i32(a) & Int32(0x7FFFFFFF)
+        return (((bits >> 23) & Int32(0xFF)) - Int32(126)).to(Float32)
+
+
 def _chain_elem(chain: GroupedChain, acc, acc_gate):
     """One output element of the chain, converted: the gated term of the (gate, up) accumulator pair, the ungated
-    activation of one accumulator, or the plain conversion; every op in fp32 through ``CuteF32``."""
-    fp = CuteF32
+    activation of one accumulator, or the plain conversion; every op in fp32 through ``MoeF32`` (the chain's
+    parameters are compile-time constants of the kernel)."""
+    fp = MoeF32
     if chain.pair:
-        return glu_elem(fp, acc_gate, acc, chain.act, chain.out_fmt)
+        return glu_elem(fp, acc_gate, acc, chain.act, chain.out_fmt, chain.params)
     if chain.kind == "act":
-        return act_elem(fp, acc, chain.act, chain.out_fmt)
+        return act_elem(fp, acc, chain.act, chain.out_fmt, chain.params)
     return fp.cvt_out(acc, chain.out_fmt)
 
 

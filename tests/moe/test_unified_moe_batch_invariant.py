@@ -1,15 +1,21 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """The batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeConfig``): the bf16 classes
-``moe.bf16.swiglu`` and ``moe.bf16.relu2``.
+``moe.bf16.<act>``, one per typed activation of the layer and its scalars (the gated chains on the (gate, up) accumulator
+pair -- ``SwiGLU`` with any parameters, ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU`` -- and the ungated
+ones on a single accumulator -- ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``; the default ``SwiGLU`` is
+``moe.bf16.swiglu``, ``ReLU2`` is ``moe.bf16.relu2``).
 
 The class has exact CPU models of everything but the tensor-core step (the routing, the activation chain on the fp32
 accumulators, the slot-order combine), so the tests are bit comparisons: the layer's output against the class's own
-composition on the CPU (routing on the CPU, the grouped GEMMs checked against the dense batch-invariant GEMM per expert),
-run-to-run determinism including CUDA-graph replay, batch / permutation / sub-batch invariance, agreement of every tactic
-the autotuner may pick, the three routing input modes giving the same bits, and the error contract (an unsupported
-configuration raises before any kernel runs). The device-free tests pin the registration, the fingerprint dimensions and
-the dispatcher's membership in the enumerated space.
+composition on the CPU (routing on the CPU, the grouped GEMMs checked against the dense batch-invariant GEMM per expert)
+for every activation, run-to-run determinism including CUDA-graph replay, batch / permutation / sub-batch invariance,
+agreement of every tactic the autotuner may pick, the three routing input modes giving the same bits, and the error
+contract (an unsupported configuration raises before any kernel runs). The device-free tests pin the registration, the
+activation table (every ``ActivationConfig`` of the layer maps onto a chain; the fingerprints are distinct classes), the
+agreement of the vectorised and the exact CPU chains on adversarial accumulators, the plausibility of every chain against
+FlashInfer's torch reference of the activation, the fingerprint dimensions and the dispatcher's membership in the
+enumerated space.
 """
 
 from __future__ import annotations
@@ -19,20 +25,30 @@ import torch
 
 from flashinfer import batch_invariant as bi
 from flashinfer.fused_moe import (
+    GELU,
+    ActivationConfig,
     BackendOptions,
     BatchInvariantMoeConfig,
     ExecutionConfig,
     ExpertConfig,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
+    PowLU,
     QuantConfig,
+    ReLU,
     ReLU2,
     RoutingConfig,
     RoutingInputMode,
+    SiLU,
+    SiTU,
     SwiGLU,
+    SwiGLUStep,
 )
 from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
 from flashinfer.fused_moe.batch_invariant.runner import (
@@ -52,6 +68,44 @@ needs_device = pytest.mark.skipif(
 
 
 _SWIGLU = SwiGLU()  # the default (gated) activation of the layer
+
+#: The activations the suites cover: every ``ActivationConfig`` class of the layer with its defaults, and the
+#: parameterised ones once more with scalars that move every branch (a clamp that bites, a non-unit alpha / beta, a SiTU
+#: without a linear scale, a PowLU with a limit). Each is its own class of the backend.
+ACTIVATIONS = [
+    SwiGLU(),
+    SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    SwiGLUStep(),
+    SwiGLUStep(limit=3.0),
+    GeGLU(),
+    GeGLUTanh(),
+    SiTU(),
+    SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=5.0),
+    PowLU(),
+    PowLU(m=1.5, limit=4.0),
+    ReLU2(),
+    Identity(),
+    GELU(),
+    ReLU(),
+    SiLU(),
+]
+ACTIVATION_IDS = [
+    "swiglu",
+    "swiglu_oai",
+    "swiglu_step",
+    "swiglu_step_limit3",
+    "geglu",
+    "geglu_tanh",
+    "situ",
+    "situ_clamped",
+    "powlu",
+    "powlu_limit4",
+    "relu2",
+    "identity",
+    "gelu",
+    "relu",
+    "silu",
+]
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -167,7 +221,7 @@ def _routed_pack(
 
 def test_backend_is_registered_and_never_a_default_candidate():
     """The config is a known backend of the layer, mapped to its runner, absent from the default candidates (it is
-    reached by naming it), and declares the three routing modes and the two activation classes of this PR."""
+    reached by naming it), and declares the three routing modes and every activation class of the layer."""
     assert BatchInvariantMoeConfig in ALL_BACKEND_CONFIGS
     assert _BACKEND_RUNNERS[BatchInvariantMoeConfig] is BatchInvariantMoeRunner
     assert not any(
@@ -183,13 +237,26 @@ def test_backend_is_registered_and_never_a_default_candidate():
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     }
-    assert set(BatchInvariantMoeRunner.supported_activation_classes) == {SwiGLU, ReLU2}
+    assert set(BatchInvariantMoeRunner.supported_activation_classes) == {
+        SwiGLU,
+        SwiGLUStep,
+        GeGLU,
+        GeGLUTanh,
+        SiTU,
+        PowLU,
+        ReLU2,
+        Identity,
+        GELU,
+        ReLU,
+        SiLU,
+    }
     assert repr(BatchInvariantMoeConfig()) == "BatchInvariantMoeConfig()"
 
 
 def test_fingerprint_dimensions_and_classes():
     """``fingerprint("fused_moe", ...)`` takes the geometry, the routing method and the activation; the gated and the
-    ungated chain are two classes; an unimplemented routing method is refused; the routing method is a dimension."""
+    ungated chain are two classes; an unimplemented routing method and an unknown chain are refused; the routing method
+    is a dimension."""
     fp = bi.fingerprint("fused_moe", H=2048, I=768, top_k=8, num_experts=128)
     assert fp.startswith("moe-") and len(fp) == 20
     assert (
@@ -245,8 +312,246 @@ def test_fingerprint_dimensions_and_classes():
             method=RoutingMethodType.Llama4,
         )
     with pytest.raises(ValueError):
-        bi.fingerprint("fused_moe", H=2048, I=768, top_k=8, num_experts=128, act="gelu")
+        bi.fingerprint("fused_moe", H=2048, I=768, top_k=8, num_experts=128, act="tanh")
     assert bi.class_name("fused_moe") == "moe.bf16"
+
+
+def test_activation_of_covers_every_activation_config():
+    """``activation_of`` maps every ``ActivationConfig`` subclass of the layer's API (found by introspection, built with
+    its defaults) and the listed configurations onto a chain of the class: gated exactly when the config is, a chain
+    name of the spec's tables with the declared number of binary32 parameters. The listed configurations are distinct
+    classes (distinct fingerprints), and all but the default ``SwiGLU`` differ from the default class's."""
+    import inspect
+
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+    from flashinfer.fused_moe import api as A
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    classes = {
+        c
+        for _, c in inspect.getmembers(A, inspect.isclass)
+        if issubclass(c, ActivationConfig) and c is not ActivationConfig
+    }
+    assert len(classes) == 11
+    assert classes == set(BatchInvariantMoeRunner.supported_activation_classes)
+    assert {type(a) for a in ACTIVATIONS} == classes
+    assert len(ACTIVATIONS) == len(ACTIVATION_IDS) == 15
+    for cfg in [c() for c in classes] + ACTIVATIONS:
+        a = S.activation_of(cfg)
+        assert isinstance(a, S.ActSpec) and a.gated == cfg.is_gated, cfg
+        assert a.act in (S.ACTS if a.gated else S.UNGATED_ACTS), cfg
+        assert len(a.params) == len(S.ACT_PARAMS.get(a.act, ())), cfg
+        assert all(v is None or v == fp32.to_f32(v) for v in a.params), cfg
+        assert a.chain == ("glu" if a.gated else "act")
+    assert S.activation_of(SwiGLU()) == S.ActSpec(True, "silu")
+    assert S.activation_of(SwiGLU(alpha=1.0)) == S.ActSpec(True, "silu")
+    assert S.activation_of(SwiGLU(alpha=1.702, beta=1.0, limit=7.0)) == S.ActSpec(
+        True, "swiglu_oai", (fp32.to_f32(1.702), 1.0, 7.0)
+    )
+    assert S.activation_of(SiTU()) == S.ActSpec(True, "situ", (4.0, 25.0, None))
+    assert S.activation_of(PowLU()) == S.ActSpec(True, "powlu", (2.5, None))
+    assert S.activation_of(ReLU2()) == S.ActSpec(False, "relu2")
+    assert S.activation_of(SiLU()) == S.ActSpec(False, "silu")
+    with pytest.raises(ValueError):
+        S.activation_of("swiglu")
+    H, I, k, E = 2048, 768, 8, 128
+    default = S.spec_fingerprint(H, I, k, E)
+    fps = {}
+    for cfg in ACTIVATIONS:
+        a = S.activation_of(cfg)
+        fps[cfg] = S.spec_fingerprint(
+            H, I, k, E, S.SOFTMAX_RENORM, "bf16", a.act, a.params, a.gated
+        )
+        assert fps[cfg].startswith("moe-") and len(fps[cfg]) == 20
+    assert len(set(fps.values())) == len(ACTIVATIONS)
+    assert fps[SwiGLU()] == default
+    assert all(fp != default for cfg, fp in fps.items() if cfg != SwiGLU())
+
+
+def test_registry_fingerprint_takes_an_activation_config():
+    """``fingerprint("fused_moe", ..., act=<ActivationConfig>)`` is the spec's fingerprint of that config's chain for
+    every listed configuration; the string forms name the same classes (``"swiglu"`` / ``"relu2"`` the default gated /
+    ungated chains, a chain name with ``params`` and ``gated`` the others); the routing method stays a dimension of
+    every class."""
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    H, I, k, E = 2048, 768, 8, 128
+    dims = dict(H=H, I=I, top_k=k, num_experts=E)
+    for cfg in ACTIVATIONS:
+        a = S.activation_of(cfg)
+        assert bi.fingerprint("fused_moe", act=cfg, **dims) == S.spec_fingerprint(
+            H, I, k, E, S.SOFTMAX_RENORM, "bf16", a.act, a.params, a.gated
+        ), cfg
+        assert bi.fingerprint(
+            "fused_moe", act=cfg, method=RoutingMethodType.Sigmoid, **dims
+        ) != bi.fingerprint("fused_moe", act=cfg, **dims), cfg
+    default = bi.fingerprint("fused_moe", **dims)
+    assert bi.fingerprint("fused_moe", act="swiglu", **dims) == default
+    assert bi.fingerprint("fused_moe", act=SwiGLU(), **dims) == default
+    assert bi.fingerprint("fused_moe", act="relu2", **dims) == bi.fingerprint(
+        "fused_moe", act=ReLU2(), **dims
+    )
+    assert bi.fingerprint(
+        "fused_moe", act="swiglu_oai", params=(1.702, 1.0, 7.0), **dims
+    ) == bi.fingerprint(
+        "fused_moe", act=SwiGLU(alpha=1.702, beta=1.0, limit=7.0), **dims
+    )
+    # a name in both tables is the gated chain unless told otherwise
+    assert bi.fingerprint("fused_moe", act="gelu", **dims) == bi.fingerprint(
+        "fused_moe", act=GeGLU(), **dims
+    )
+    assert bi.fingerprint(
+        "fused_moe", act="gelu", gated=False, **dims
+    ) == bi.fingerprint("fused_moe", act=GELU(), **dims)
+    assert bi.fingerprint("fused_moe", act=GeGLU(), **dims) != bi.fingerprint(
+        "fused_moe", act=GELU(), **dims
+    )
+
+
+def _adversarial_accumulators(
+    limits: list[float], n_random: int, seed: int
+) -> torch.Tensor:
+    """fp32 accumulators that move the chains' branches: zeros of both signs, the smallest subnormals, +-1, small and
+    large magnitudes up to the format's edge, the declared exp's clamp edges, the configuration's clamp limits with their
+    binary32 neighbours, and randn values with spread exponents."""
+    f32 = torch.float32
+    inf = torch.tensor(float("inf"), dtype=f32)
+    edges = []
+    for lim in limits:
+        t = torch.tensor(float(lim), dtype=f32)
+        up, down = torch.nextafter(t, inf), torch.nextafter(t, -inf)
+        edges += [t, -t, up, down, -up, -down]
+    special = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            2.0**-149,
+            -(2.0**-149),
+            2.0**-127,
+            -(2.0**-127),
+            1e-30,
+            -1e-30,
+            1e-3,
+            -1e-3,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            8.0,
+            -8.0,
+            87.0,
+            -87.0,
+            88.0,
+            -88.0,
+            89.0,
+            -89.0,
+            1e4,
+            -1e4,
+            1e30,
+            -1e30,
+            3.0e38,
+            -3.0e38,
+        ],
+        dtype=f32,
+    )
+    g = torch.Generator().manual_seed(seed)
+    rnd = torch.randn(n_random, generator=g) * torch.exp2(
+        torch.randint(-12, 12, (n_random,), generator=g).float()
+    )
+    parts = [special, rnd.to(f32)]
+    if edges:
+        parts.insert(1, torch.stack(edges))
+    return torch.cat(parts)
+
+
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_vectorised_and_exact_chains_agree_on_adversarial_accumulators(act):
+    """The vectorised CPU chain (``glu_cpu_act`` / ``act_cpu`` through ``TorchF32``) and the exact one (``glu_elem`` /
+    ``act_elem`` through ``ExactF32``: Fractions, one rounding per op) give the same bf16 bits on adversarial fp32
+    accumulators -- zeros of both signs, subnormals, +-1, the exp clamp's edges, the configuration's clamp limits and
+    their neighbours, magnitudes up to the format's edge, spread random values -- for every listed configuration. The
+    vectorised chain is the GPU suites' oracle; this pins it to the ground truth."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    a = S.activation_of(act)
+    limits = [p for p in a.params if p is not None]
+    g = _adversarial_accumulators(limits, 160, seed=20)
+    u = torch.roll(_adversarial_accumulators(limits, 160, seed=21), 5)
+    if a.gated:
+        vec = R.glu_cpu_act(g, u, a.act, a.params)
+        exact = [
+            S.glu_elem(R.ExactF32, gi, ui, a.act, "bf16", a.params)
+            for gi, ui in zip(g.tolist(), u.tolist(), strict=True)
+        ]
+    else:
+        vec = R.act_cpu(g, a.act, a.params)
+        exact = [
+            S.act_elem(R.ExactF32, gi, a.act, "bf16", a.params) for gi in g.tolist()
+        ]
+    assert vec.dtype == torch.bfloat16 and vec.shape == g.shape
+    # the exact values are bf16 values already: the conversion is the identity
+    ex = torch.tensor(exact, dtype=torch.float32).to(torch.bfloat16)
+    bad = (bits(vec) != bits(ex)).nonzero().flatten()[:8].tolist()
+    assert not bad, [
+        (i, g[i].item(), u[i].item() if a.gated else None, vec[i].item(), ex[i].item())
+        for i in bad
+    ]
+
+
+def _powlu_torch(gate: torch.Tensor, up: torch.Tensor, act: PowLU) -> torch.Tensor:
+    """FlashInfer's torch reference has no PowLU branch: the activation's definition in torch,
+    ``g > 0 ? g ** (m / (sqrt(g) + 1)) * sigmoid(g) : g * sigmoid(g)``, then the optional limit (the gate branch
+    clamped to ``(-inf, limit]``, the linear one to ``[-limit, limit]``)."""
+    pos = gate.clamp(min=0)
+    powered = pos ** (act.m / (pos.sqrt() + 1))
+    res = torch.where(
+        gate > 0, powered * torch.sigmoid(gate), gate * torch.sigmoid(gate)
+    )
+    if act.limit is not None:
+        res = res.clamp(max=act.limit)
+        up = up.clamp(min=-act.limit, max=act.limit)
+    return (res * up).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_chains_are_plausible_against_the_torch_reference(act):
+    """An observation, not a promise of the class: on moderate random accumulators the declared chain lands within a
+    loose bound of FlashInfer's torch reference of the activation (``compute_reference_activation`` on the canonical
+    ``[up, gate]`` layout; PowLU, which that reference lacks, written here from the activation's definition): max |error|
+    at most the larger of 2 bf16 ulps of the reference's magnitude and 1e-2. The class's guarantee is the bitwise
+    agreement with its own exact spec (the tests above and the GPU suites); this test only says the spec computes the
+    activation it is named after."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from tests.moe.utils import compute_reference_activation
+
+    I, rows = 256, 48
+    gen = torch.Generator().manual_seed(30)
+    a = S.activation_of(act)
+    if a.gated:
+        values = torch.randn(rows, 2 * I, generator=gen) * 2  # [up, gate] in fp32
+        up, gate = values.split(I, dim=-1)
+        ours = R.glu_cpu_act(gate, up, a.act, a.params)
+        ref = (
+            _powlu_torch(gate, up, act)
+            if isinstance(act, PowLU)
+            else compute_reference_activation(values, act, I)
+        )
+    else:
+        values = torch.randn(rows, I, generator=gen) * 2
+        ours = R.act_cpu(values, a.act, a.params)
+        ref = compute_reference_activation(values, act, I)
+    assert ours.dtype == ref.dtype == torch.bfloat16 and ours.shape == ref.shape
+    assert torch.isfinite(ours.float()).all()
+    err = (ours.float() - ref.float()).abs()
+    mag = ref.float().abs().clamp_min(2.0**-126)
+    ulp = torch.exp2(torch.floor(torch.log2(mag)) - 7)  # the bf16 ulp at the reference
+    tol = torch.maximum(2 * ulp, torch.full_like(ulp, 1e-2))
+    worst = (err / tol).max().item()
+    assert worst <= 1.0, (act, worst, err.max().item())
 
 
 def test_routing_method_map_matches_the_spec():
@@ -362,10 +667,11 @@ def _reference_ffn(
     weights: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    gated: bool,
+    act,
 ) -> torch.Tensor:
     """The class composed on the device from its own pieces: the class's permutation, GEMM1 as the grouped kernel with the
-    identity epilogue in fp32 (the same fold; any record of the space gives its bits), the CPU chain on those
+    identity epilogue in fp32 (the same fold; any record of the space gives its bits), the CPU chain ``act`` (an
+    ``ActSpec``: the gated chain on the (gate, up) accumulators or the ungated one on the single accumulator) on those
     accumulators, GEMM2 as the dense batch-invariant GEMM per expert (the dense class, whose chunk rule gives one fold at
     this weight shape: asserted), the CPU slot-order combine. Bit for bit what the fused op must produce."""
     import flashinfer
@@ -383,7 +689,7 @@ def _reference_ffn(
     E, k = w1.shape[0], ids.shape[1]
     I = w2.shape[2]
     assert chunks_for(H, I) == 1
-    w1i = interleave_fc1(w1) if gated else w1
+    w1i = interleave_fc1(w1) if act.gated else w1
     counts, dest, src = permute_plan(ids, E)
     n = T * k
     assert torch.equal(
@@ -398,12 +704,12 @@ def _reference_ffn(
         "plain",
         torch.float32,
     )
-    if gated:
+    if act.gated:
         u = acc.view(-1, I // GROUP, 2, GROUP)[:, :, 0, :].reshape(-1, I)
         g = acc.view(-1, I // GROUP, 2, GROUP)[:, :, 1, :].reshape(-1, I)
-        a = R.swiglu_cpu(g.cpu(), u.cpu()).to(x.device)
+        a = R.glu_cpu_act(g.cpu(), u.cpu(), act.act, act.params).to(x.device)
     else:
-        a = R.relu2_cpu(acc.cpu()).to(x.device)
+        a = R.act_cpu(acc.cpu(), act.act, act.params).to(x.device)
     y_perm = torch.empty(n, H, dtype=torch.bfloat16, device=x.device)
     off = 0
     for e, c in enumerate(counts.tolist()):
@@ -422,17 +728,22 @@ def _reference_ffn(
 
 
 @needs_device
-@pytest.mark.parametrize("act", [SwiGLU(), ReLU2()], ids=["swiglu", "relu2"])
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
 def test_layer_matches_the_class_composition(act):
     """The layer (from logits) == the class's own routing on the CPU and the dense batch-invariant GEMM per expert with the
-    CPU chain and combine: the oracle ladder of the class, bit for bit."""
+    CPU chain of the activation and the combine: the oracle ladder of the class, bit for bit, for every activation of the
+    layer (gated weights ``[E, 2I, H]``, ungated ``[E, I, H]``)."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
     T, k, H, I, E = 300, 6, 512, 256, 64
-    gated = isinstance(act, SwiGLU)
-    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=1, gated=gated, adversarial=True)
+    chain = activation_of(act)
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=1, gated=chain.gated, adversarial=True
+    )
     layer = _layer(k, E, I, act)
     out = layer(_logits_pack(x, logits), _weights(w1, w2, act))
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
-    ref = _reference_ffn(x, ids.cuda(), weights.cuda(), w1, w2, gated)
+    ref = _reference_ffn(x, ids.cuda(), weights.cuda(), w1, w2, chain)
     assert torch.equal(bits(out.cpu()), bits(ref))
 
 
@@ -618,35 +929,69 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
-    """The error contract: a configuration outside the class raises the mode's error at build or at the first call; a
-    zero-token call returns an empty output; a wrong-shaped weight view is refused."""
+    """The error contract: a configuration outside the classes raises the mode's error at build or at the first call
+    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing, no
+    finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
+    non-default ``SwiGLU`` is a class of the backend (the ``swiglu_oai`` chain), not an error; a zero-token call returns
+    an empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
     k, H, I, E = 6, 512, 256, 64
-    for cfg_kw, what in (
-        (dict(act=SwiGLU(alpha=1.702)), "SwiGLU parameters"),
-        (dict(k=17), "top_k"),
-        (dict(E=600), "num_experts"),
-    ):
-        with pytest.raises((BatchInvariantUnsupportedError, RuntimeError)) as excinfo:
-            kk = cfg_kw.get("k", k)
-            EE = cfg_kw.get("E", E)
-            _layer(kk, EE, I, cfg_kw.get("act", SwiGLU()))
+    errors = (BatchInvariantUnsupportedError, RuntimeError, NotImplementedError)
+    oai = _layer(k, E, I, SwiGLU(alpha=1.702, beta=1.0, limit=7.0))
+    assert isinstance(oai.runners[0], BatchInvariantMoeRunner)
+    for cfg_kw, what in ((dict(k=17), "top_k"), (dict(E=600), "num_experts")):
+        with pytest.raises(errors) as excinfo:
+            _layer(cfg_kw.get("k", k), cfg_kw.get("E", E), I)
         assert what in str(excinfo.value) or "moe.bf16" in str(excinfo.value)
-    with pytest.raises((BatchInvariantUnsupportedError, RuntimeError)):
-        MoELayer(
-            MoEConfig(
-                routing=RoutingConfig(num_experts=E, top_k=k),
-                quant=QuantConfig(),
-                experts=ExpertConfig(intermediate_size=I),
-                backend=BackendOptions((BatchInvariantMoeConfig(),)),
-                finalize=MoEFinalizeConfig(do_finalize=False),
+    routing = RoutingConfig(num_experts=E, top_k=k)
+    experts = ExpertConfig(intermediate_size=I)
+    for kw, what in (
+        (
+            dict(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=k, method=RoutingMethodType.DeepSeekV3
+                ),
+                experts=ExpertConfig(intermediate_size=I, num_fused_shared_experts=1),
             ),
-            device=torch.device("cuda"),
-        )
+            "fused shared experts",
+        ),
+        (
+            dict(
+                experts=ExpertConfig(
+                    intermediate_size=I,
+                    local_expert_offset=E // 2,
+                    local_num_experts=E // 2,
+                )
+            ),
+            "parallel",
+        ),
+        (
+            dict(
+                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
+            ),
+            "n_group",
+        ),
+        (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
+    ):
+        with pytest.raises(errors) as excinfo:
+            MoELayer(
+                MoEConfig(
+                    routing=kw.get("routing", routing),
+                    quant=QuantConfig(),
+                    experts=kw.get("experts", experts),
+                    backend=BackendOptions((BatchInvariantMoeConfig(),)),
+                    finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
+                ),
+                device=torch.device("cuda"),
+            )
+        assert what in str(excinfo.value) or "moe.bf16" in str(excinfo.value), what
     layer = _layer(k, E, I)
     x, logits, w1, w2 = _problem(8, k, H, I, E, seed=9)
     W = _weights(w1, w2)
+    # an fp16 activation: no runner accepts the pack, nothing is computed
+    with pytest.raises(errors):
+        layer(_logits_pack(x.to(torch.float16), logits), W)
     # the ungated weights with the gated class: refused at the call, not computed
     with pytest.raises(BatchInvariantUnsupportedError):
         layer(_logits_pack(x, logits), _weights(w1[:, :I].contiguous(), w2, ReLU2()))

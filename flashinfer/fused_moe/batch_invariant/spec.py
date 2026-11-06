@@ -301,24 +301,109 @@ def combine_elem(
 # (e^{2y} - 1) / (e^{2y} + 1) form loses every bit of 1 + tanh).
 GELU_C1 = 0.7978845608028654  # sqrt(2 / pi)
 GELU_C2 = 0.044715
-ACTS = ("silu", "gelu_tanh")
-UNGATED_ACTS = (
-    "relu2",
-)  # the ungated chains: one accumulator per output (no gate / up pairing)
+INV_SQRT2 = 0.7071067811865476
+# The declared erf on a >= 0 (Abramowitz-Stegun 7.1.26 with the declared exp): 1 - t e^{-a^2} (a1 + t (a2 + ... t a5)),
+# t = 1 / (1 + p a). The GELU chain uses it on |x| only (x erf(x) is even), so no sign select enters the dataflow.
+ERF_P = 0.3275911
+ERF_COEFFS = (
+    1.061405429,
+    -1.453152027,
+    1.421413741,
+    -0.284496736,
+    0.254829592,
+)  # a5 .. a1, Horner order
+# The declared log on x > 0 (Cephes logf): the mantissa recentred into [sqrt(1/2), sqrt(2)) by an exact select
+# (fmin / fmax on a scaled difference), a Horner polynomial in m - 1, the exponent times ln 2 in two pieces.
+LOG_SQRTHF = 0.70710678118654752440
+LOG_COEFFS = (
+    7.0376836292e-2,
+    -1.1514610310e-1,
+    1.1676998740e-1,
+    -1.2420140846e-1,
+    1.4249322787e-1,
+    -1.6668057665e-1,
+    2.0000714765e-1,
+    -2.4999993993e-1,
+    3.3333331174e-1,
+)
+LOG_LN2_HI = 0.693359375
+LOG_LN2_LO = -2.12194440e-4
+HUGE = 1.2676506002282294e30  # 2^100: scales a sign or a positive part into a clamp's saturation range (exact)
+
+#: The gated chains on the (gate, up) accumulator pair and the ungated chains on one accumulator; FlashInfer's
+#: ``ActivationConfig`` scalars are the ``params`` of a chain (binary32 constants of the term: class dimensions).
+ACTS = ("silu", "gelu_tanh", "gelu", "swiglu_oai", "swiglu_step", "situ", "powlu")
+UNGATED_ACTS = ("relu2", "identity", "relu", "silu", "gelu")
+#: The ordered scalar names of the parameterised chains (``None`` where FlashInfer allows it: no clamp / no scale).
+ACT_PARAMS: Dict[str, Tuple[str, ...]] = {
+    "swiglu_oai": ("alpha", "beta", "limit"),
+    "swiglu_step": ("limit",),
+    "situ": ("gate_scale", "linear_scale", "clamp_limit"),
+    "powlu": ("m", "limit"),
+}
+
+
+def _horner(fp: Any, x: Any, coeffs: Sequence[float]) -> Any:
+    p = fp.const(coeffs[0])
+    for cc in coeffs[1:]:
+        p = fp.add(fp.mul(p, x), fp.const(cc))
+    return p
 
 
 def gelu_tanh_term(fp: Any, x: Any) -> Any:
     """``mul(x, sigmoid(mul(2, mul(C1, add(x, mul(C2, mul(x, mul(x, x))))))))`` with the declared sigmoid (hence the
     declared exp, clamped at [-87, 88]: the tail saturates at ``x / (1 + e^88)``, below any output format's
-    resolution)."""
+    resolution). FlashInfer's ``GeGLUTanh``."""
     x3 = fp.mul(x, fp.mul(x, x))
     y = fp.mul(fp.const(GELU_C1), fp.add(x, fp.mul(fp.const(GELU_C2), x3)))
     return fp.mul(x, sigmoid_term(fp, fp.mul(fp.const(2.0), y)))
 
 
-def act_term(fp: Any, act: str, g: Any) -> Any:
-    assert act in ACTS, act
-    return silu_term(fp, g) if act == "silu" else gelu_tanh_term(fp, g)
+def tanh_term(fp: Any, z: Any) -> Any:
+    """``2 sigmoid(2 z) - 1`` with the declared sigmoid: saturates exactly at +-1 through the exp clamp."""
+    return fp.add(
+        fp.mul(fp.const(2.0), sigmoid_term(fp, fp.mul(fp.const(2.0), z))),
+        fp.const(-1.0),
+    )
+
+
+def erf_pos_term(fp: Any, a: Any) -> Any:
+    """The declared erf of ``a >= 0``: ``1 - t p(t) exp(-a^2)``, ``t = 1 / (1 + P a)``."""
+    t = fp.div(fp.const(1.0), fp.add(fp.const(1.0), fp.mul(fp.const(ERF_P), a)))
+    e = exp_term(fp, fp.neg(fp.mul(a, a)))
+    return fp.add(
+        fp.const(1.0), fp.neg(fp.mul(fp.mul(t, _horner(fp, t, ERF_COEFFS)), e))
+    )
+
+
+def gelu_term(fp: Any, x: Any) -> Any:
+    """``0.5 (x + |x| erf(|x| / sqrt 2))``: the exact GELU's form written on ``|x|`` (``x erf(x / sqrt 2)`` is even),
+    with the declared erf. FlashInfer's ``GELU`` / ``GeGLU``."""
+    ax = fp.fabs(x)
+    y = erf_pos_term(fp, fp.mul(ax, fp.const(INV_SQRT2)))
+    return fp.mul(fp.const(0.5), fp.add(x, fp.mul(ax, y)))
+
+
+def log_term(fp: Any, x: Any) -> Any:
+    """The declared natural log of a positive ``x`` (Cephes logf): ``x = m 2^e`` with ``m`` in [1/2, 1) (``frexpm`` /
+    ``frexpe``, exact bit operations), recentred by the exact select ``lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)`` into
+    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``."""
+    m = fp.frexpm(x)
+    ex = fp.frexpe(x)
+    lt = fp.fmax(
+        fp.fmin(
+            fp.mul(fp.add(fp.const(LOG_SQRTHF), fp.neg(m)), fp.const(HUGE)),
+            fp.const(1.0),
+        ),
+        fp.const(0.0),
+    )
+    z = fp.add(fp.add(m, fp.mul(lt, m)), fp.const(-1.0))
+    ex = fp.add(ex, fp.neg(lt))
+    z2 = fp.mul(z, z)
+    y = fp.mul(fp.mul(z2, z), _horner(fp, z, LOG_COEFFS))
+    y = fp.add(y, fp.mul(ex, fp.const(LOG_LN2_LO)))
+    y = fp.add(y, fp.mul(z2, fp.const(-0.5)))
+    return fp.add(fp.add(z, y), fp.mul(ex, fp.const(LOG_LN2_HI)))
 
 
 def relu2_term(fp: Any, x: Any) -> Any:
@@ -328,20 +413,199 @@ def relu2_term(fp: Any, x: Any) -> Any:
     return fp.mul(r, r)
 
 
-def act_elem(fp: Any, acc: Any, act: str = "relu2", out_fmt: str = "bf16") -> Any:
-    """The ungated GEMM1 epilogue chain: ``cvt(act(acc))`` from one fp32 accumulator, ``act`` in ``UNGATED_ACTS``."""
+def _clamp_sym(fp: Any, u: Any, limit: float) -> Any:
+    """``fmin(fmax(u, -limit), limit)``: the linear branch's symmetric clamp."""
+    return fp.fmin(fp.fmax(u, fp.const(-limit)), fp.const(limit))
+
+
+def act_term(fp: Any, act: str, g: Any) -> Any:
+    """The gated chains' activation of the gate alone (``silu``, ``gelu_tanh``, ``gelu``): ``glu_pre`` multiplies it
+    by the up accumulator. The parameterised chains (``swiglu_oai``, ``swiglu_step``, ``situ``, ``powlu``) mix the two
+    branches and live in :func:`glu_pre`."""
+    assert act in ("silu", "gelu_tanh", "gelu"), act
+    if act == "silu":
+        return silu_term(fp, g)
+    return gelu_tanh_term(fp, g) if act == "gelu_tanh" else gelu_term(fp, g)
+
+
+def ungated_term(fp: Any, act: str, x: Any) -> Any:
+    """The ungated chains on one accumulator: ReLU^2, the identity, ReLU (``fmaxc(x, 0)``: the device's zero rule, so an
+    accumulator of ``-0`` gives ``+0``), SiLU, GELU."""
     assert act in UNGATED_ACTS, act
-    return fp.cvt_out(relu2_term(fp, acc), out_fmt)
+    if act == "relu2":
+        return relu2_term(fp, x)
+    if act == "identity":
+        return x
+    if act == "relu":
+        return fp.fmaxc(x, fp.const(0.0))
+    if act == "silu":
+        return silu_term(fp, x)
+    return gelu_term(fp, x)
 
 
-def glu_pre(fp: Any, g: Any, u: Any, act: str = "silu") -> Any:
-    """``p = mul(act(g), u)`` in fp32: the gated activation before any rounding."""
-    return fp.mul(act_term(fp, act, g), u)
+def act_elem(
+    fp: Any,
+    acc: Any,
+    act: str = "relu2",
+    out_fmt: str = "bf16",
+    params: Sequence[Optional[float]] = (),
+) -> Any:
+    """The ungated GEMM1 epilogue chain: ``cvt(act(acc))`` from one fp32 accumulator, ``act`` in ``UNGATED_ACTS``
+    (no ungated chain takes parameters)."""
+    assert not tuple(params), (act, params)
+    return fp.cvt_out(ungated_term(fp, act, acc), out_fmt)
 
 
-def glu_elem(fp: Any, g: Any, u: Any, act: str = "silu", out_fmt: str = "bf16") -> Any:
-    """``cvt(mul(act(g), u))``: ``swiglu_elem`` for ``act = "silu"`` (the same term), GeGLU otherwise."""
-    return fp.cvt_out(glu_pre(fp, g, u, act), out_fmt)
+def glu_pre(
+    fp: Any, g: Any, u: Any, act: str = "silu", params: Sequence[Optional[float]] = ()
+) -> Any:
+    """The gated activation before any rounding, in fp32, on the (gate, up) accumulator pair:
+
+    * ``silu`` / ``gelu_tanh`` / ``gelu``: ``mul(act(g), u)`` (FlashInfer's default ``SwiGLU``, ``GeGLUTanh``,
+      ``GeGLU``);
+    * ``swiglu_oai (alpha, beta, limit)``: ``g' = fmin(g, limit)``, ``u' = clamp(u, +-limit)``,
+      ``mul(mul(g', sigmoid(mul(alpha, g'))), add(u', beta))`` (``SwiGLU`` with other parameters);
+    * ``swiglu_step (limit,)``: ``mul(fmin(silu(g), limit), clamp(u, +-limit))`` (``SwiGLUStep``);
+    * ``situ (gate_scale, linear_scale, clamp_limit)``: the optional clamps first (``fmin(g, cl)``, ``clamp(u, +-cl)``),
+      then ``mul(mul(mul(gs, tanh(div(g, gs))), sigmoid(g)), mul(ls, tanh(div(u, ls))))`` (``u`` as is without a
+      linear scale) (``SiTU``);
+    * ``powlu (m, limit)``: ``gp = fmaxc(g, 0)`` (the device's zero rule), ``e = div(m, add(sqrt(gp), 1))``, the positive branch
+      ``pos = fmin(exp(mul(e, log(gp))), mul(gp, 2^100))`` (zero exactly at ``gp = 0``), the activation
+      ``mul(add(pos, fmin(g, 0)), sigmoid(g))`` (SiLU on the negative side), ``fmin(., limit)`` when a limit is given,
+      times ``clamp(u, +-limit)`` (``PowLU``).
+
+    Every operation is a single correctly rounded binary32 operation, an exact one, or the declared ``exp`` / ``log``
+    / ``erf`` chains above."""
+    assert act in ACTS, act
+    params = tuple(params)
+    if act in ("silu", "gelu_tanh", "gelu"):
+        assert not params, (act, params)
+        return fp.mul(act_term(fp, act, g), u)
+    if act == "swiglu_oai":
+        alpha, beta, limit = params
+        gl = fp.fmin(g, fp.const(limit))
+        ul = _clamp_sym(fp, u, limit)
+        return fp.mul(
+            fp.mul(gl, sigmoid_term(fp, fp.mul(fp.const(alpha), gl))),
+            fp.add(ul, fp.const(beta)),
+        )
+    if act == "swiglu_step":
+        (limit,) = params
+        return fp.mul(
+            fp.fmin(silu_term(fp, g), fp.const(limit)), _clamp_sym(fp, u, limit)
+        )
+    if act == "situ":
+        gs, ls, cl = params
+        if cl is not None:
+            g = fp.fmin(g, fp.const(cl))
+            u = _clamp_sym(fp, u, cl)
+        gt = fp.mul(
+            fp.mul(fp.const(gs), tanh_term(fp, fp.div(g, fp.const(gs)))),
+            sigmoid_term(fp, g),
+        )
+        ut = (
+            u
+            if ls is None
+            else fp.mul(fp.const(ls), tanh_term(fp, fp.div(u, fp.const(ls))))
+        )
+        return fp.mul(gt, ut)
+    m, limit = params
+    gp = fp.fmaxc(g, fp.const(0.0))
+    e = fp.div(fp.const(m), fp.add(fp.sqrt(gp), fp.const(1.0)))
+    pos = fp.fmin(exp_term(fp, fp.mul(e, log_term(fp, gp))), fp.mul(gp, fp.const(HUGE)))
+    a = fp.mul(fp.add(pos, fp.fmin(g, fp.const(0.0))), sigmoid_term(fp, g))
+    if limit is None:
+        return fp.mul(a, u)
+    return fp.mul(fp.fmin(a, fp.const(limit)), _clamp_sym(fp, u, limit))
+
+
+def glu_elem(
+    fp: Any,
+    g: Any,
+    u: Any,
+    act: str = "silu",
+    out_fmt: str = "bf16",
+    params: Sequence[Optional[float]] = (),
+) -> Any:
+    """``cvt(glu_pre(g, u))``: ``swiglu_elem`` for ``act = "silu"`` (the same term), the other gated chains otherwise."""
+    return fp.cvt_out(glu_pre(fp, g, u, act, params), out_fmt)
+
+
+def params_key(params: Sequence[Optional[float]]) -> Tuple[Optional[float], ...]:
+    """The parameters as binary32 values (``None`` kept): what the terms, the fingerprint and the kernel names carry."""
+    return tuple(None if v is None else fp32.to_f32(float(v)) for v in params)
+
+
+@dataclass(frozen=True)
+class ActSpec:
+    """A FlashInfer activation as a chain of the class: ``gated`` (the (gate, up) pair or one accumulator), the chain
+    ``act`` and its ``params`` (binary32 values, ``None`` where the config leaves a scalar out)."""
+
+    gated: bool
+    act: str
+    params: Tuple[Optional[float], ...] = ()
+
+    @property
+    def chain(self) -> str:
+        """The GEMM1 chain kind of the grouped kernel: ``glu`` (gated) or ``act`` (ungated)."""
+        return "glu" if self.gated else "act"
+
+
+def activation_of(activation: Any) -> ActSpec:
+    """The chain of a FlashInfer ``ActivationConfig`` (every typed activation of the unified layer): the default
+    ``SwiGLU`` (alpha 1, beta 0, the binary32 maximum as the limit) is the ``silu`` chain (one division, no clamp: the
+    clamp against the format's maximum is the identity on finite accumulators), any other ``SwiGLU`` the
+    ``swiglu_oai`` chain with its scalars; ``ValueError`` for an activation outside the table."""
+    from ..api import (
+        GELU,
+        SiLU,
+        ReLU,
+        GeGLU,
+        PowLU,
+        ReLU2,
+        SwiGLU,
+        SiTU,
+        Identity,
+        GeGLUTanh,
+        SwiGLUStep,
+    )
+
+    if isinstance(activation, SwiGLU):
+        if activation == SwiGLU():
+            return ActSpec(True, "silu")
+        return ActSpec(
+            True,
+            "swiglu_oai",
+            params_key((activation.alpha, activation.beta, activation.limit)),
+        )
+    if isinstance(activation, SwiGLUStep):
+        return ActSpec(True, "swiglu_step", params_key((activation.limit,)))
+    if isinstance(activation, GeGLU):
+        return ActSpec(True, "gelu")
+    if isinstance(activation, GeGLUTanh):
+        return ActSpec(True, "gelu_tanh")
+    if isinstance(activation, SiTU):
+        return ActSpec(
+            True,
+            "situ",
+            params_key(
+                (activation.gate_scale, activation.linear_scale, activation.clamp_limit)
+            ),
+        )
+    if isinstance(activation, PowLU):
+        return ActSpec(True, "powlu", params_key((activation.m, activation.limit)))
+    for cls, name in (
+        (ReLU2, "relu2"),
+        (Identity, "identity"),
+        (GELU, "gelu"),
+        (ReLU, "relu"),
+        (SiLU, "silu"),
+    ):
+        if isinstance(activation, cls):
+            return ActSpec(False, name)
+    raise ValueError(
+        f"the batch-invariant MoE classes have no chain for {activation!r}"
+    )
 
 
 # ----------------------------------------------------------------------------- the class
@@ -361,7 +625,11 @@ class MoESpec:
         out_fmt: str = "bf16",
         alg: Optional[TermAlgebra] = None,
         act: str = "silu",
+        params: Sequence[Optional[float]] = (),
+        gated: Optional[bool] = None,
     ):
+        """``act`` names a gated chain (``ACTS``) or an ungated one (``UNGATED_ACTS``); ``gated`` disambiguates the
+        names in both (``silu``, ``gelu``: the gated chain by default), ``params`` are the chain's scalars."""
         self.H, self.I, self.k, self.E, self.method, self.out_fmt, self.act = (
             H,
             I,
@@ -371,6 +639,9 @@ class MoESpec:
             out_fmt,
             act,
         )
+        self.params = params_key(params)
+        self.gated = (act in ACTS) if gated is None else gated
+        assert act in (ACTS if self.gated else UNGATED_ACTS), (act, self.gated)
         self.alg = alg or TermAlgebra()
 
     # leaves
@@ -412,11 +683,20 @@ class MoESpec:
         )
 
     def gemm1(self, r: int = 0, j: int = 0) -> Term:
-        """The GEMM1 epilogue term of the class: the gated SwiGLU, or the ungated ``act_elem`` on the single
-        accumulator."""
-        if self.act in UNGATED_ACTS:
-            return act_elem(self.alg, self.acc("u", r, j), self.act, self.out_fmt)
-        return self.swiglu(r, j)
+        """The GEMM1 epilogue term of the class: the gated chain on the (gate, up) pair, or the ungated chain on the
+        single accumulator (``u``)."""
+        if not self.gated:
+            return act_elem(
+                self.alg, self.acc("u", r, j), self.act, self.out_fmt, self.params
+            )
+        return glu_elem(
+            self.alg,
+            self.acc("g", r, j),
+            self.acc("u", r, j),
+            self.act,
+            self.out_fmt,
+            self.params,
+        )
 
     def combine(self, h: int = 0, selected: Optional[Sequence[int]] = None) -> Term:
         _, ws = self.routing(selected)
@@ -436,14 +716,21 @@ def spec_fingerprint(
     method: RoutingMethod = SOFTMAX_RENORM,
     out_fmt: str = "bf16",
     act: str = "silu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
 ) -> str:
-    """Identifier of the class: the routing weight of slot 0 and slot k-1, the GEMM1 chain term (swiglu, or the
-    ungated ``act``: a distinct class ``moe.bf16.<act>``), the two GEMM classes (``gemm.bf16.kfold[K=H]``,
-    ``[K=I]``) and the combine term."""
-    s = MoESpec(H, I, k, E, method, out_fmt, act=act)
+    """Identifier of the class: the routing weight of slot 0 and slot k-1, the GEMM1 chain term (the gated ``silu``
+    chain by default; any other chain, its gating and its binary32 parameters name a distinct class), the two GEMM
+    classes (``gemm.bf16.kfold[K=H]``, ``[K=I]``) and the combine term."""
+    s = MoESpec(H, I, k, E, method, out_fmt, act=act, params=params, gated=gated)
+    default_chain = s.gated and act == "silu" and not s.params
     parts = (
         [f"H={H}", f"I={I}", f"k={k}", f"E={E}", method.name, out_fmt]
-        + ([f"act={act}"] if act != "silu" else [])
+        + (
+            []
+            if default_chain
+            else [f"act={'glu' if s.gated else 'act'}:{act}", f"params={s.params!r}"]
+        )
         + [
             fingerprint(s.weight(0)),
             fingerprint(s.weight(k - 1)),

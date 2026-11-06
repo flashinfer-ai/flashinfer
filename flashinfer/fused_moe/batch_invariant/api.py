@@ -14,16 +14,18 @@ proofs are the ``MoE`` Lean module of the mode).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
 from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
+from .blocks.epilogue import GroupedChain
 
 _IN = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _OUT = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
+_DTYPE_OF = {v: k for k, v in _OUT.items()}
 
 
 def interleave_fc1(w1: torch.Tensor) -> torch.Tensor:
@@ -52,12 +54,15 @@ def interleave_fc1(w1: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class MoEWeights:
-    """The expert weights as the kernels consume them: ``w1i [E, 2I, H]`` interleaved (gated: the SwiGLU class) or
-    ``w1i [E, I, H]`` as given (``gated=False``: the ungated ReLU^2 class, no gate / up pairing), ``w2 [E, H, I]``."""
+    """The expert weights as the kernels consume them: ``w1i [E, 2I, H]`` interleaved (gated: the (gate, up) pair in one
+    thread's fragment) or ``w1i [E, I, H]`` as given (``gated=False``: no gate / up pairing), ``w2 [E, H, I]``; the GEMM1
+    chain ``act`` (a gated chain of ``spec.ACTS`` or an ungated one of ``spec.UNGATED_ACTS``) with its ``params``."""
 
     w1i: torch.Tensor
     w2: torch.Tensor
     gated: bool = True
+    act: str = "silu"
+    params: Tuple[Optional[float], ...] = ()
 
     @staticmethod
     def prepare(
@@ -65,7 +70,18 @@ class MoEWeights:
         fc2: torch.Tensor,
         interleaved: bool = False,
         gated: bool = True,
+        act: Optional[str] = None,
+        params: Sequence[Optional[float]] = (),
     ) -> "MoEWeights":
+        """``act`` defaults to the class's default chain of the gating (``silu`` gated, ``relu2`` ungated)."""
+        act = act if act is not None else ("silu" if gated else "relu2")
+        if act not in (S.ACTS if gated else S.UNGATED_ACTS):
+            raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
+        params = S.params_key(params)
+        if len(params) != len(S.ACT_PARAMS.get(act, ())):
+            raise ValueError(
+                f"chain {act!r} takes parameters {S.ACT_PARAMS.get(act, ())}, got {params!r}"
+            )
         if (
             fc1.dtype != torch.bfloat16
             or fc2.dtype != torch.bfloat16
@@ -86,9 +102,13 @@ class MoEWeights:
                 "H and I must be multiples of 8 (16-byte-aligned bf16 operands)"
             )
         if not gated:
-            return MoEWeights(fc1.contiguous(), fc2.contiguous(), gated=False)
+            return MoEWeights(fc1.contiguous(), fc2.contiguous(), False, act, params)
         return MoEWeights(
-            fc1.contiguous() if interleaved else interleave_fc1(fc1), fc2.contiguous()
+            fc1.contiguous() if interleaved else interleave_fc1(fc1),
+            fc2.contiguous(),
+            True,
+            act,
+            params,
         )
 
     @property
@@ -104,17 +124,33 @@ class MoEWeights:
         return self.w1i.shape[1] // 2 if self.gated else self.w1i.shape[1]
 
     @property
-    def chain1(self) -> str:
-        """The GEMM1 chain name of the class: ``swiglu`` (gated) or ``relu2`` (ungated)."""
-        return "swiglu" if self.gated else "relu2"
+    def chain1(self) -> GroupedChain:
+        """The GEMM1 epilogue chain of the class: the gated ``act`` on the (gate, up) pair or the ungated ``act`` on the
+        single accumulator, with the parameters."""
+        return GroupedChain(
+            "glu" if self.gated else "act", self.act, "bf16", self.params
+        )
 
     def view(self) -> Dict[str, object]:
         """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for this backend."""
-        return {"w1i": self.w1i, "w2": self.w2, "gated": self.gated}
+        return {
+            "w1i": self.w1i,
+            "w2": self.w2,
+            "gated": self.gated,
+            "act": self.act,
+            "params": self.params,
+        }
 
     @staticmethod
     def from_view(view: Dict[str, object]) -> "MoEWeights":
-        return MoEWeights(view["w1i"], view["w2"], bool(view.get("gated", True)))  # type: ignore[arg-type]
+        gated = bool(view.get("gated", True))
+        return MoEWeights(
+            view["w1i"],  # type: ignore[arg-type]
+            view["w2"],  # type: ignore[arg-type]
+            gated,
+            str(view.get("act", "silu" if gated else "relu2")),
+            tuple(view.get("params", ())),  # type: ignore[arg-type]
+        )
 
 
 def grouped_gemm(
@@ -122,7 +158,7 @@ def grouped_gemm(
     w: torch.Tensor,
     counts: torch.Tensor,
     config: Knobs,
-    chain: str = "plain",
+    chain: Union[str, GroupedChain] = "plain",
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -151,7 +187,8 @@ def grouped_gemm(
         or w.stride(0) % 8
     ):
         raise ValueError(
-            "grouped_gemm: K-contiguous, 16-byte-aligned operands of one K"
+            "grouped_gemm: K-contiguous, 16-byte-aligned operands of one K "
+            f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
         )
     if (
         counts.dtype != torch.int32
@@ -159,11 +196,14 @@ def grouped_gemm(
         or not counts.is_contiguous()
     ):
         raise ValueError("grouped_gemm: counts must be a contiguous int32 [E]")
-    if chain not in ("plain", "swiglu", "relu2"):
-        raise ValueError(f"unknown chain {chain!r}")
-    n_out = N // 2 if chain == "swiglu" else N
-    if chain != "plain":
-        out_dtype = torch.bfloat16  # the activation chains convert once, to bf16
+    if isinstance(chain, str):
+        if chain not in ("plain", "swiglu", "relu2"):
+            raise ValueError(f"unknown chain {chain!r}")
+        chain = GroupedChain.legacy(chain, _OUT[out_dtype])
+    n_out = N // 2 if chain.pair else N
+    out_dtype = _DTYPE_OF[
+        chain.out_fmt
+    ]  # the chain's output format (the gated chains convert once, to bf16)
     if out is None:
         out = torch.empty(Tk, n_out, dtype=out_dtype, device=a.device)
     if (
@@ -175,7 +215,7 @@ def grouped_gemm(
         raise ValueError(
             "grouped_gemm: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
         )
-    kernel = get_compiled_grouped(config, chain, _OUT[out_dtype])
+    kernel = get_compiled_grouped(config, chain)
     if Tk == 0:
         return out
     kernel(

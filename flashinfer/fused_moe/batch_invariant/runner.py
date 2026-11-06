@@ -19,12 +19,21 @@ import torch
 from ...autotuner import TuningConfig
 from ...batch_invariant.support import check_device, unsupported
 from ..api import (
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
     MoEActivationPack,
     MoEWeightPack,
+    PowLU,
     QuantFormat,
+    ReLU,
     ReLU2,
     RoutingInputMode,
+    SiLU,
+    SiTU,
     SwiGLU,
+    SwiGLUStep,
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
 
@@ -78,7 +87,20 @@ class BatchInvariantMoeRunner(MoERunner):
     )
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
     supported_output_formats = (QuantFormat.BF16,)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    # every typed activation of the layer: a declared chain of the class each (``spec.activation_of``)
+    supported_activation_classes = (
+        SwiGLU,
+        SwiGLUStep,
+        GeGLU,
+        GeGLUTanh,
+        SiTU,
+        PowLU,
+        ReLU2,
+        Identity,
+        GELU,
+        ReLU,
+        SiLU,
+    )
     # Expert-parallel shards (a local expert range with ids outside it) are the EP classes of a later PR.
     supports_expert_parallelism = False
 
@@ -94,19 +116,26 @@ class BatchInvariantMoeRunner(MoERunner):
         self._part: Optional[Tuple[int, str]] = None
 
     # ---- support ---------------------------------------------------------------------------------------------------
+    def _activation(self):
+        """The chain of the layer's activation (``spec.ActSpec``: gating, chain name, binary32 parameters)."""
+        from .spec import activation_of
+
+        return activation_of(self.config.activation)
+
     def _check_support(self) -> None:
         super()._check_support()
         from .spec import METHOD_OF_FLASHINFER
 
         cfg = self.config
         check_device(self.device, CLASS, MOE_BF16_ARCHS)
-        act = cfg.activation
-        if isinstance(act, SwiGLU) and act != SwiGLU():
+        try:
+            self._activation()
+        except ValueError as e:
             raise unsupported(
                 CLASS,
-                f"SwiGLU parameters {act!r}",
-                "the default SwiGLU (alpha 1, beta 0, no limit)",
-            )
+                f"activation {cfg.activation!r}",
+                "one of the layer's typed activations",
+            ) from e
         experts = cfg.experts
         if experts.num_fused_shared_experts:
             raise unsupported(
@@ -193,7 +222,8 @@ class BatchInvariantMoeRunner(MoERunner):
                 f"weights (E {w.num_experts}, I {w.intermediate_size}, H {w.hidden_size}) for hidden {x.shape[1]}, E {E}, I {cfg.experts.intermediate_size}",
                 "weights prepared for this configuration",
             )
-        if w.gated != isinstance(cfg.activation, SwiGLU):
+        a = self._activation()
+        if (w.gated, w.act, w.params) != (a.gated, a.act, a.params):
             raise unsupported(
                 CLASS,
                 f"{type(cfg.activation).__name__} with {'gated' if w.gated else 'ungated'} weights",
@@ -250,7 +280,7 @@ class BatchInvariantMoeRunner(MoERunner):
         )
         H = self._hidden
         rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
-        gated = isinstance(cfg.activation, SwiGLU)
+        gated = self._activation().gated
         sm_count, family = self._part if self._part is not None else (None, None)
         n1, chain1 = (2 * I, "swiglu") if gated else (I, "relu2")
         return (
@@ -289,6 +319,7 @@ class BatchInvariantMoeRunner(MoERunner):
             c1, c2 = r1[0], r2[0]
         else:
             c1, c2 = _configs_from_tactic(tuple(tactic))
-        w = MoEWeights(w1i, w2, gated=isinstance(self.config.activation, SwiGLU))
+        a = self._activation()
+        w = MoEWeights(w1i, w2, a.gated, a.act, a.params)
         fused_moe(x, ids, wts, w, out=out, config1=c1, config2=c2)
         return out

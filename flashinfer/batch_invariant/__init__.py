@@ -10,7 +10,7 @@ next to this file is the contract: the guarantee (R1-R4), the flag semantics, th
 
 from __future__ import annotations
 
-from typing import Callable, Dict, NamedTuple, Union
+from typing import Callable, Dict, NamedTuple, Optional, Sequence, Union
 
 import torch
 
@@ -139,11 +139,15 @@ def _moe_bf16_fingerprint(
     top_k: int,
     num_experts: int,
     method: object = "Renormalize",
-    act: str = "swiglu",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
 ) -> str:
     """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeConfig``: ``method`` is a
-    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, ``act`` ``"swiglu"`` (the gated
-    class) or ``"relu2"`` (the ungated one)."""
+    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements; ``act`` an
+    ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default
+    gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the
+    names in both tables)."""
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
@@ -165,10 +169,21 @@ def _moe_bf16_fingerprint(
         raise TypeError(
             f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
         )
-    if act not in ("swiglu", "relu2"):
-        raise ValueError(f"act must be 'swiglu' or 'relu2', got {act!r}")
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
     return spec.spec_fingerprint(
-        H, I, top_k, num_experts, rm, "bf16", "silu" if act == "swiglu" else "relu2"
+        H, I, top_k, num_experts, rm, "bf16", name, params, gated
     )
 
 
@@ -180,7 +195,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.bf16",
         ("H", "I", "top_k", "num_experts"),
         _moe_bf16_fingerprint,
-        ("method", "act"),
+        ("method", "act", "params", "gated"),
     ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output

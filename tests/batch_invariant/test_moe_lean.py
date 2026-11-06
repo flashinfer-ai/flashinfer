@@ -4,11 +4,12 @@
 ``MoECases.lean``).
 
 Device-free (every CI job): the committed ``MoECases.lean`` is byte for byte what the Python spec emits, so a change to
-a chain, a routing method or a constant that was not propagated to the Lean cases fails here without a toolchain. With
-``lake`` installed: ``lake build`` elaborates the model and the generated cases (kernel ``decide`` throughout: the MoE
-cases add nothing to the axiom policy ``lake exe axioms`` enforces), ``lake exe moeconformance`` prints the Lean model's
-terms, compared here with the Python S-expressions of every case (the chains and the routing weights), and
-``lake exe axioms`` enforces the axiom policy of the whole library.
+a chain (the declared exp / sigmoid / tanh / erf / log, a gated or ungated activation, a parameter set), a routing method
+or a constant that was not propagated to the Lean cases fails here without a toolchain. With ``lake`` installed:
+``lake build`` elaborates the model and the generated cases (kernel ``decide`` throughout: the MoE cases add nothing to
+the axiom policy ``lake exe axioms`` enforces), ``lake exe moeconformance`` prints the Lean model's terms, compared here
+with the Python S-expressions of every case (every chain, including the SiTU / PowLU ones too large for a kernel
+theorem, and the routing weights), and ``lake exe axioms`` enforces the axiom policy of the whole library.
 """
 
 import os
@@ -18,6 +19,7 @@ import subprocess
 import pytest
 
 from flashinfer.fused_moe.batch_invariant import lean_cases
+from flashinfer.fused_moe.batch_invariant import spec
 
 LAKE = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
 needs_lake = pytest.mark.skipif(
@@ -34,20 +36,49 @@ def test_generated_cases_are_current():
     cases = lean_cases.moe_cases()
     names = [name for name, _, _, _ in cases]
     assert len(names) == len(set(names))
-    chains = [name for name, _, _, as_thm in cases if as_thm]
-    assert set(chains) == {
+    theorems = {name for name, _, _, as_thm in cases if as_thm}
+    assert theorems == {
         "exp",
         "sigmoid",
-        "swiglu",
+        "tanh",
+        "erf_pos",
+        "log",
+        "gelu_tanh",
+        "gelu",
         "combine3",
         "combine1",
-        "gelu_tanh",
+        "swiglu",
         "glu_gelu",
+        "glu_gelu_erf",
+        "glu_swiglu_oai",
+        "glu_swiglu_step_l7",
+        "glu_swiglu_step_l3",
+        "glu_situ_clamp",
         "relu2",
+        "act_identity",
+        "act_relu",
+        "act_silu",
+        "act_gelu",
     }
-    for name in chains:
+    for name in theorems:
         assert f"theorem moe_{name} :" in committed
-    routing = [name for name, _, _, as_thm in cases if not as_thm]
+    # the chains too large for a kernel theorem are conformance lines (the executable), never dropped
+    large = {"glu_situ_default", "glu_powlu_default", "glu_powlu_limit"}
+    assert large <= set(names) and not (large & theorems)
+    for name, sx, _, as_thm in cases:
+        assert as_thm == (len(sx) <= lean_cases.THEOREM_MAX_BYTES) or name.startswith(
+            "w_"
+        )
+    # one case per gated activation and parameter set, one per ungated activation
+    assert {act for _, act, _ in lean_cases.GLU_CASES} == set(spec.ACTS)
+    assert {act for _, act in lean_cases.ACT_CASES} | {"relu2"} == set(
+        spec.UNGATED_ACTS
+    )
+    for name, _, _ in lean_cases.GLU_CASES:
+        assert name in names
+    for name, _ in lean_cases.ACT_CASES:
+        assert name in names
+    routing = [name for name in names if name.startswith("w_")]
     assert len(routing) >= 2 * len(lean_cases.ROUTING_CASES)
     assert {m.name for m, _, _ in lean_cases.ROUTING_CASES} == {
         "softmax",
@@ -96,7 +127,7 @@ def test_lean_model_matches_python_spec():
     for name, sx, _, _ in lean_cases.moe_cases():
         assert lean[name] == sx, f"MoE model differs from the Python spec: {name}"
         checked += 1
-    assert checked == len(lean) == len(lean_cases.moe_cases()) >= 20
+    assert checked == len(lean) == len(lean_cases.moe_cases()) >= 37
 
 
 @needs_lake

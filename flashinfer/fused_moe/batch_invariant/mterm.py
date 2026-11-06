@@ -13,12 +13,23 @@ share the engine's interning table and print the primitives they have in common 
 from __future__ import annotations
 
 import hashlib
+import struct
 from typing import Any, Dict, Optional
 
 from ...batch_invariant.fp_interface import exact as fp32
 from ...batch_invariant.fp_interface.term import Term, TermAlgebra as _Base, to_f32
 
-__all__ = ["Term", "TermAlgebra", "evaluate", "fingerprint", "sexpr", "size", "to_f32"]
+__all__ = [
+    "Term",
+    "TermAlgebra",
+    "evaluate",
+    "fingerprint",
+    "frexpe_f32",
+    "frexpm_f32",
+    "sexpr",
+    "size",
+    "to_f32",
+]
 
 
 class TermAlgebra(_Base):
@@ -55,10 +66,47 @@ class TermAlgebra(_Base):
         the device, ``ldexp`` on the CPU)."""
         return self._mk("exp2i", k)
 
+    def fabs(self, a: Term) -> Term:
+        """``abs.f32`` (exact: clears the sign bit)."""
+        return self._mk("fabs", a)
+
+    def fmaxc(self, a: Term, b: Term) -> Term:
+        """``max.f32`` with the device's zero rule (``max(-0, +0) = max(+0, -0) = +0``), commutativity-normalised: the
+        clamp of a value against zero, whose sign the order-preserving ``fmax`` model would get wrong on a ``-0``
+        operand (the quantizer classes' ``fmaxc``)."""
+        a, b = self._sorted2(a, b)
+        return self._mk("fmaxc", a, b)
+
+    def sqrt(self, a: Term) -> Term:
+        """``sqrt.rn.f32`` (correctly rounded)."""
+        return self._mk("sqrt", a)
+
+    def frexpm(self, a: Term) -> Term:
+        """The mantissa of ``|a|`` as a binary32 in [1/2, 1): the significand bits under the exponent of 1/2 (exact bit
+        operations; a subnormal or zero magnitude gives its raw significand field the same way)."""
+        return self._mk("frexpm", a)
+
+    def frexpe(self, a: Term) -> Term:
+        """The exponent of ``|a|`` as a binary32: the biased exponent field minus 126 (so ``|a| = frexpm 2^frexpe`` for
+        a normal ``a``; exact)."""
+        return self._mk("frexpe", a)
+
     def rowmax(self, *vals: Term) -> Term:
         """The maximum of ``vals`` (n-ary, exact in value for every association; the sign of a zero maximum is
         unspecified and, where the chains use it, immaterial: docs/moe_scoping.md section 3.1)."""
         return self._mk("rowmax", *vals)
+
+
+def frexpm_f32(x: float) -> float:
+    """``frexpm``: the significand field of ``|x|`` under the exponent of 1/2 (bit operations on the binary32 pattern)."""
+    bits = fp32.f32_bits(x) & 0x7FFFFFFF
+    return struct.unpack("<f", struct.pack("<I", (bits & 0x007FFFFF) | 0x3F000000))[0]
+
+
+def frexpe_f32(x: float) -> float:
+    """``frexpe``: the biased exponent field of ``|x|`` minus 126, as a float (exact)."""
+    bits = fp32.f32_bits(x) & 0x7FFFFFFF
+    return float(((bits >> 23) & 0xFF) - 126)
 
 
 def evaluate(
@@ -102,8 +150,18 @@ def evaluate(
             v = fp32.fmin(memo[A[0].uid], memo[A[1].uid])
         elif op == "fmax":
             v = fp32.fmax(memo[A[0].uid], memo[A[1].uid])
+        elif op == "fmaxc":
+            v = fp32.fmaxc(memo[A[0].uid], memo[A[1].uid])
         elif op == "exp2i":
             v = fp32.exp2i(memo[A[0].uid])
+        elif op == "fabs":
+            v = fp32.fabs(memo[A[0].uid])
+        elif op == "sqrt":
+            v = fp32.sqrt(memo[A[0].uid])
+        elif op == "frexpm":
+            v = frexpm_f32(memo[A[0].uid])
+        elif op == "frexpe":
+            v = frexpe_f32(memo[A[0].uid])
         elif op == "rowmax":
             v = fp32.rowmax(*[memo[a.uid] for a in A])
         elif op.startswith("leaf:"):
@@ -170,10 +228,10 @@ def sexpr(t: Term) -> str:
             )
         elif op == "sym":
             out = f"(sym {A[0]})"
-        elif op in ("add", "mul"):
+        elif op in ("add", "mul", "fmaxc"):
             a, b = sorted(A[:2])
             out = f"({op} {a} {b})"
-        elif op in ("neg", "exp2i"):
+        elif op in ("neg", "exp2i", "fabs", "sqrt", "frexpm", "frexpe"):
             out = f"({op} {A[0]})"
         elif op in ("div", "fmin", "fmax"):
             out = f"({op} {A[0]} {A[1]})"

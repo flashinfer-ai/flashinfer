@@ -4,10 +4,12 @@
 
 The file couples the Lean model (``lean/BIKernels/MoE.lean``) to :mod:`.spec` node for node: per case a term the
 Python spec builds (:mod:`.mterm` S-expression) and the Lean expression that must print identically
-(``MTerm.sexpr``). The chains (the declared exp and sigmoid, the GEMM1 epilogues of the SwiGLU, GeGLU and ReLU^2
-classes, the slot-order combine) become theorems decided by ``decide +kernel`` (the kernel evaluates the term and the
-string comparison; the file adds nothing to the axiom policy). The routing weights of the five named methods (tens to
-hundreds of KB: the exp chain repeats per expert) are compared through the ``moeconformance`` executable only
+(``MTerm.sexpr``). The chains (the declared exp, sigmoid, tanh, erf and log, the GEMM1 epilogues of every gated and
+ungated activation with its parameter sets, the slot-order combine) become theorems decided by ``decide +kernel`` when
+their S-expression is at most :data:`THEOREM_MAX_BYTES` (the kernel evaluates the term and the string comparison; the
+file adds nothing to the axiom policy); the larger chains (SiTU with a linear scale, PowLU: the log chain inside the exp
+chain prints at ~100 KB) and the routing weights of the five named methods (tens to hundreds of KB: the exp chain
+repeats per expert) are compared through the ``moeconformance`` executable only
 (``tests/batch_invariant/test_moe_lean.py``). A change to a chain, a routing method or a constant that is not
 reflected in the Lean model makes ``lake build`` or the conformance comparison fail; a regenerated file that differs
 from the committed one fails the device-free test, which needs no Lean toolchain.
@@ -18,7 +20,7 @@ from the committed one fails the device-free test, which needs no Lean toolchain
 from __future__ import annotations
 
 import os
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from . import mterm as term
 from . import spec as M
@@ -29,6 +31,11 @@ LEAN_DIR = os.path.join(
     "lean",
 )
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "MoECases.lean")
+
+#: A chain whose S-expression is at most this many bytes is a kernel-``decide`` theorem as well as a conformance line;
+#: a larger one is a conformance line only (kernel string evaluation of the ~12 KB SiTU and ~100 KB PowLU terms is
+#: out of proportion; the executable compares them in milliseconds).
+THEOREM_MAX_BYTES = 10_000
 
 #: The routing-weight cases: ``(method, E, selected experts in slot order)``, one row per named method (two for the
 #: renormalised softmax: a power-of-two and a padded expert count). The weights of every slot are compared.
@@ -41,9 +48,89 @@ ROUTING_CASES: Sequence[Tuple[M.RoutingMethod, int, List[int]]] = (
     (M.SIGMOID, 64, [63]),
 )
 
+#: The gated GEMM1 chains: ``(case name, act, params)`` over ``spec.ACTS`` with one parameter set per form the term can
+#: take (``None`` = the scalar FlashInfer's config leaves out). ``swiglu`` (the default SwiGLU) is the ``silu`` row.
+GLU_CASES: Sequence[Tuple[str, str, Tuple[Optional[float], ...]]] = (
+    ("swiglu", "silu", ()),
+    ("glu_gelu", "gelu_tanh", ()),
+    ("glu_gelu_erf", "gelu", ()),
+    ("glu_swiglu_oai", "swiglu_oai", (1.702, 1.0, 7.0)),
+    ("glu_swiglu_step_l7", "swiglu_step", (7.0,)),
+    ("glu_swiglu_step_l3", "swiglu_step", (3.0,)),
+    ("glu_situ_default", "situ", (4.0, 25.0, None)),
+    ("glu_situ_clamp", "situ", (2.0, None, 5.0)),
+    ("glu_powlu_default", "powlu", (2.5, None)),
+    ("glu_powlu_limit", "powlu", (1.5, 4.0)),
+)
+
+#: The ungated GEMM1 chains over ``spec.UNGATED_ACTS`` (no parameters): ``(case name, act)``. ``relu2`` is generated on
+#: the ``x`` leaf through ``relu2T`` (the class's own definition), the others on the ``u`` accumulator of ``gemm1``.
+ACT_CASES: Sequence[Tuple[str, str]] = (
+    ("act_identity", "identity"),
+    ("act_relu", "relu"),
+    ("act_silu", "silu"),
+    ("act_gelu", "gelu"),
+)
+
+#: The Lean constructor of ``MoE.GAct`` per gated activation (the parameterised ones take their scalars).
+_GACT = {
+    "silu": ".silu",
+    "gelu_tanh": ".geluTanh",
+    "gelu": ".gelu",
+    "swiglu_oai": ".swigluOai",
+    "swiglu_step": ".swigluStep",
+    "situ": ".situ",
+    "powlu": ".powlu",
+}
+#: The Lean constructor of ``MoE.UAct`` per ungated activation.
+_UACT = {
+    "relu2": ".relu2",
+    "identity": ".identity",
+    "relu": ".relu",
+    "silu": ".silu",
+    "gelu": ".gelu",
+}
+
 
 def lean_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def lean_const(v: float) -> str:
+    """The Lean string of a binary32 constant: Python's ``repr`` of the value ``mterm.sexpr`` prints (``(const <repr>)``),
+    so a Lean term built from it prints identically."""
+    return lean_str(repr(float(v)))
+
+
+def lean_opt_const(v: Optional[float]) -> str:
+    """An optional scalar: ``none`` for an absent one, ``(some "<repr>")`` otherwise."""
+    return "none" if v is None else f"(some {lean_const(v)})"
+
+
+def lean_gact(act: str, params: Sequence[Optional[float]]) -> str:
+    """The ``MoE.GAct`` value of a gated chain: the constructor applied to its binary32 scalars
+    (``spec.params_key``: what the Python term's constants are), parenthesised when it takes any."""
+    key = M.params_key(params)
+    ctor = _GACT[act]
+    if act in ("silu", "gelu_tanh", "gelu"):
+        assert not key, (act, key)
+        return ctor
+    if act == "swiglu_oai":
+        alpha, beta, limit = key
+        assert None not in (alpha, beta, limit), key
+        return f"({ctor} {lean_const(alpha)} {lean_const(beta)} {lean_const(limit)})"
+    if act == "swiglu_step":
+        (limit,) = key
+        assert limit is not None, key
+        return f"({ctor} {lean_const(limit)})"
+    if act == "situ":
+        gs, ls, cl = key
+        assert gs is not None, key
+        return f"({ctor} {lean_const(gs)} {lean_opt_const(ls)} {lean_opt_const(cl)})"
+    assert act == "powlu", act
+    m, limit = key
+    assert m is not None, key
+    return f"({ctor} {lean_const(m)} {lean_opt_const(limit)})"
 
 
 def lean_method(meth: M.RoutingMethod) -> str:
@@ -60,74 +147,60 @@ def lean_method(meth: M.RoutingMethod) -> str:
 
 def moe_cases() -> List[Tuple[str, str, str, bool]]:
     """``(name, python_sexpr, lean_term, as_theorem)``: the MoE spec's terms and the Lean model's expressions that
-    must print identically. The chains are theorems in ``MoECases.lean``; the routing weights (``w_<method>_E<E>_s<slot>``)
-    are compared through the conformance executable only."""
+    must print identically. A chain is a theorem in ``MoECases.lean`` when its S-expression is at most
+    :data:`THEOREM_MAX_BYTES`; the larger chains and the routing weights (``w_<method>_E<E>_s<slot>``) are compared
+    through the conformance executable only."""
     alg = term.TermAlgebra()
     x = alg.leaf("x", 0)
     g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
     ys = [alg.leaf("y", r, 0) for r in range(3)]
     ws = [alg.leaf("w", r) for r in range(3)]
+    gl, ul = '(.leaf "g" [0, 0])', '(.leaf "u" [0, 0])'
     out: List[Tuple[str, str, str, bool]] = []
-    out.append(
-        ("exp", term.sexpr(M.exp_term(alg, x)), 'MoE.expT (.leaf "x" [0])', True)
+
+    def chain(name: str, t: term.Term, lean: str) -> None:
+        sx = term.sexpr(t)
+        out.append((name, sx, lean, len(sx) <= THEOREM_MAX_BYTES))
+
+    # the declared building blocks on one leaf
+    chain("exp", M.exp_term(alg, x), 'MoE.expT (.leaf "x" [0])')
+    chain("sigmoid", M.sigmoid_term(alg, x), 'MoE.sigmoidT (.leaf "x" [0])')
+    chain("tanh", M.tanh_term(alg, x), 'MoE.tanhT (.leaf "x" [0])')
+    chain("erf_pos", M.erf_pos_term(alg, x), 'MoE.erfPosT (.leaf "x" [0])')
+    chain("log", M.log_term(alg, x), 'MoE.logT (.leaf "x" [0])')
+    chain("gelu_tanh", M.gelu_tanh_term(alg, x), 'MoE.geluTanhT (.leaf "x" [0])')
+    chain("gelu", M.gelu_term(alg, x), 'MoE.geluT (.leaf "x" [0])')
+    # the combine
+    chain(
+        "combine3",
+        M.combine_elem(alg, ys, ws),
+        'MoE.combineT [.leaf "y" [0, 0], .leaf "y" [1, 0], .leaf "y" [2, 0]] '
+        '[.leaf "w" [0], .leaf "w" [1], .leaf "w" [2]]',
     )
-    out.append(
-        (
-            "sigmoid",
-            term.sexpr(M.sigmoid_term(alg, x)),
-            'MoE.sigmoidT (.leaf "x" [0])',
-            True,
+    chain(
+        "combine1",
+        M.combine_elem(alg, ys[:1], ws[:1]),
+        'MoE.combineT [.leaf "y" [0, 0]] [.leaf "w" [0]]',
+    )
+    # the gated GEMM1 chains, as the class builds them (`MoESpec.gemm1` on the (g, u) accumulators of slot 0, column 0)
+    for name, act, params in GLU_CASES:
+        s_ = M.MoESpec(64, 32, 2, 8, alg=alg, act=act, params=params)
+        assert s_.gated, (name, act)
+        lean = (
+            f"MoE.swigluT {gl} {ul}"
+            if name == "swiglu"
+            else f"MoE.gluT {lean_gact(act, params)} {gl} {ul}"
         )
+        chain(name, s_.gemm1(), lean)
+    assert term.sexpr(M.glu_elem(alg, g, u)) == term.sexpr(
+        M.MoESpec(64, 32, 2, 8, alg=alg).gemm1()
     )
-    out.append(
-        (
-            "swiglu",
-            term.sexpr(M.swiglu_elem(alg, g, u)),
-            'MoE.swigluT (.leaf "g" [0, 0]) (.leaf "u" [0, 0])',
-            True,
-        )
-    )
-    out.append(
-        (
-            "combine3",
-            term.sexpr(M.combine_elem(alg, ys, ws)),
-            'MoE.combineT [.leaf "y" [0, 0], .leaf "y" [1, 0], .leaf "y" [2, 0]] '
-            '[.leaf "w" [0], .leaf "w" [1], .leaf "w" [2]]',
-            True,
-        )
-    )
-    out.append(
-        (
-            "combine1",
-            term.sexpr(M.combine_elem(alg, ys[:1], ws[:1])),
-            'MoE.combineT [.leaf "y" [0, 0]] [.leaf "w" [0]]',
-            True,
-        )
-    )
-    out.append(
-        (
-            "gelu_tanh",
-            term.sexpr(M.gelu_tanh_term(alg, x)),
-            'MoE.geluTanhT (.leaf "x" [0])',
-            True,
-        )
-    )
-    out.append(
-        (
-            "glu_gelu",
-            term.sexpr(M.glu_elem(alg, g, u, "gelu_tanh")),
-            'MoE.gluT true (.leaf "g" [0, 0]) (.leaf "u" [0, 0])',
-            True,
-        )
-    )
-    out.append(
-        (
-            "relu2",
-            term.sexpr(M.act_elem(alg, x, "relu2")),
-            'MoE.relu2T (.leaf "x" [0])',
-            True,
-        )
-    )
+    # the ungated GEMM1 chains
+    chain("relu2", M.act_elem(alg, x, "relu2"), 'MoE.relu2T (.leaf "x" [0])')
+    for name, act in ACT_CASES:
+        s_ = M.MoESpec(64, 32, 2, 8, alg=alg, act=act, gated=False)
+        chain(name, s_.gemm1(), f"MoE.actElemT {_UACT[act]} {ul}")
+    # the routing weights
     for meth, E, sel in ROUTING_CASES:
         s_ = M.MoESpec(64, 32, len(sel), E, meth, alg=alg)
         _, wt = s_.routing(selected=sel)
@@ -151,9 +224,11 @@ def render() -> str:
         "-- GENERATED by flashinfer/fused_moe/batch_invariant/lean_cases.py from the Python spec; do not edit.",
         "set_option maxRecDepth 8192",
         "",
-        "/-! The bf16 MoE classes (`fused_moe/batch_invariant/spec.py` vs `MoE.lean`): the declared exp and sigmoid, the "
-        "GEMM1 chains (SwiGLU, GeGLU, ReLU^2), the slot-order combine and the routing weights print identically "
-        "(`mterm.sexpr` vs `MTerm.sexpr`). -/",
+        "/-! The bf16 MoE classes (`fused_moe/batch_invariant/spec.py` vs `MoE.lean`): the declared exp, sigmoid, tanh, "
+        "erf and log, the GEMM1 chains of every gated and ungated activation (SwiGLU, GeGLU-tanh, GeGLU, SwiGLU with "
+        "parameters, SwiGLUStep, SiTU, PowLU; ReLU^2, identity, ReLU, SiLU, GELU), the slot-order combine and the "
+        "routing weights print identically (`mterm.sexpr` vs `MTerm.sexpr`). The chains up to "
+        f"{THEOREM_MAX_BYTES} bytes are kernel-`decide` theorems; every case is a `moeconformance` line. -/",
     ]
     mcs = moe_cases()
     for name, sx, lt, as_thm in mcs:
@@ -172,9 +247,12 @@ def render() -> str:
 
 def summary() -> str:
     mcs = moe_cases()
+    chains = [c for c in mcs if not c[0].startswith("w_")]
     return (
-        f"moe lean_cases coverage: cases={len(mcs)} chain theorems={sum(1 for c in mcs if c[3])} "
-        f"routing weights={sum(1 for c in mcs if not c[3])} methods={len({m.name for m, _, _ in ROUTING_CASES})}"
+        f"moe lean_cases coverage: cases={len(mcs)} chains={len(chains)} "
+        f"chain theorems={sum(1 for c in chains if c[3])} "
+        f"conformance-only chains={sum(1 for c in chains if not c[3])} "
+        f"routing weights={len(mcs) - len(chains)} methods={len({m.name for m, _, _ in ROUTING_CASES})}"
     )
 
 
