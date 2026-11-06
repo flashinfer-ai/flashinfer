@@ -95,9 +95,13 @@ def _callables(module) -> dict:
             found[f"{name}.forward"] = obj.forward
             found[f"{name}.backward"] = obj.backward
             # ``torch.autograd.Function.apply`` takes ``*args, **kwargs``: its signature binds any keyword, so the
-            # check reads ``forward``, the parameters ``apply`` passes on, and ``apply`` only if it names them
-            params = inspect.signature(obj.apply).parameters.values()
-            if all(p.kind not in var_kinds for p in params):
+            # check reads ``forward``, the parameters ``apply`` passes on, and ``apply`` only if it names them.  Some
+            # torch builds expose ``apply`` as a builtin without a signature (``ValueError``): it names nothing then
+            try:
+                params = list(inspect.signature(obj.apply).parameters.values())
+            except ValueError:
+                params = None
+            if params is not None and all(p.kind not in var_kinds for p in params):
                 found[f"{name}.apply"] = obj.apply
         else:
             found[name] = obj
