@@ -432,9 +432,9 @@ def test_package_refusals_name_the_deterministic_entry() -> None:
     assert checked == set(backend._DET_ENTRIES), checked ^ set(backend._DET_ENTRIES)
     for entry, det_path in backend._DET_ENTRIES.items():
         module, _, name = det_path.rpartition(".")
-        assert "det" in name and hasattr(importlib.import_module(module), name), (
-            det_path
-        )
+        assert "det" in name.lower() and hasattr(
+            importlib.import_module(module), name
+        ), det_path
         for bad in REFUSED_MODES:
             with pytest.raises(
                 ValueError,
