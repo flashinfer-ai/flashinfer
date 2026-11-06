@@ -209,10 +209,16 @@ Both modes have the same entries; the module and every name carry the mode:
       - ``is_cake_moe_grouped_gemm_nondet_train_supported``
 
 The former names of this module were removed with no alias: importing one raises
-``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.  Every entry in the table
-ran only with ``deterministic=False``; any other value raised ``ValueError``.  The former
-deterministic names move to :mod:`flashinfer.cake_moe_grouped_gemm_det_train` (see its
-table).
+``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.  The table lists the
+calls that ran the non-deterministic package, in the v0.7.4rc1 prerelease and on
+``main`` after it (v0.7.3 had no non-deterministic package).  Every entry of the
+package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` ran only with
+``deterministic=False``; any other value raised ``ValueError``.  The module
+``flashinfer.experimental.cake.grouped_mm`` selected the mode with its
+``deterministic`` argument: in v0.7.4rc1 the default (``True``) ran the
+deterministic package, so a call without ``deterministic=False`` moves to
+:mod:`flashinfer.cake_moe_grouped_gemm_det_train`, with every former deterministic
+name (see its table); on ``main`` only ``deterministic=False`` ran.
 
 .. list-table::
     :header-rows: 1
@@ -220,20 +226,25 @@ table).
     * - Removed
       - Use instead
     * - the package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` with its
-        submodules, and the module ``flashinfer.experimental.cake.grouped_mm``
+        submodules
       - ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (backend
         ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``, same submodule
         names)
-    * - ``grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from
+    * - the module ``flashinfer.experimental.cake.grouped_mm``
+      - ``flashinfer.cake_moe_grouped_gemm_nondet_train`` for its calls with
+        ``deterministic=False``; :mod:`flashinfer.cake_moe_grouped_gemm_det_train` for
+        its other calls (v0.7.4rc1)
+    * - ``grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad`` with ``deterministic=False``, from
         ``flashinfer.experimental.cake.grouped_mm`` or the package above
       - ``cake_moe_grouped_gemm_nondet_train_forward`` / ``_dgrad`` / ``_wgrad``
-    * - ``prepare_grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad``, from the package above
+    * - ``prepare_grouped_gemm_fwd`` / ``_dgrad`` / ``_wgrad`` with
+        ``deterministic=False``, from the package above
       - ``cake_moe_grouped_gemm_nondet_train_prepare_forward`` / ``_prepare_dgrad`` /
         ``_prepare_wgrad``
     * - ``GroupedGemmLaunch``, from the package above
       - ``CakeMoEGroupedGemmNondetLaunch``
-    * - ``cake_grouped_mm``, from ``flashinfer.experimental.cake.grouped_mm`` or the
-        package above
+    * - ``cake_grouped_mm`` with ``deterministic=False``, from
+        ``flashinfer.experimental.cake.grouped_mm`` or the package above
       - ``cake_moe_grouped_gemm_nondet``
     * - ``CakeGroupedMm``, from the package above
       - ``CakeMoEGroupedGemmNondetFunction``
@@ -241,12 +252,17 @@ table).
       - the module of the mode: ``cake_moe_grouped_gemm_det_train`` or
         ``cake_moe_grouped_gemm_nondet_train``; passing the argument raises ``TypeError``
 
-Under ``torch.use_deterministic_algorithms(True)`` the behavior is unchanged.  This
-module raises PyTorch's non-determinism alert (``RuntimeError``) right before an
-order-varying weight gradient launch.  With ``warn_only=True`` it warns
-(``UserWarning``) and runs the non-deterministic launch.  It never falls back to the
-deterministic module: use :mod:`flashinfer.cake_moe_grouped_gemm_det_train` where the
-deterministic mode must hold.
+Under ``torch.use_deterministic_algorithms(True)`` this module raises PyTorch's
+non-determinism alert (``RuntimeError``) right before an order-varying weight
+gradient launch.  With ``warn_only=True`` it warns (``UserWarning``) and runs the
+non-deterministic launch.  It never falls back to the deterministic module: use
+:mod:`flashinfer.cake_moe_grouped_gemm_det_train` where the deterministic mode must
+hold.  This differs from v0.7.4rc1, where a call of
+``flashinfer.experimental.cake.grouped_mm`` with ``deterministic=False`` ran the
+deterministic package with a one-time ``UserWarning``, and the package
+``flashinfer.experimental.cake.cake_moe_grouped_gemm`` alerted at every weight
+gradient call, its preparation included.  On ``main`` after v0.7.4rc1 both already
+behaved as this module does.
 
 Features by architecture
 ------------------------

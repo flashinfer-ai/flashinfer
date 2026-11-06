@@ -56,19 +56,29 @@ The non-deterministic mode is the separate module
 have the same shapes, carry `nondet` and never route here.
 
 The former names were removed with no alias (`ModuleNotFoundError`,
-`ImportError` or `AttributeError`). Every name in the table ran the
+`ImportError` or `AttributeError`). Every call in the table ran the
 deterministic package; move each one to `flashinfer.cake_moe_grouped_gemm_det_train`.
-The former non-deterministic entries, which required `deterministic=False`, move
-to `flashinfer.cake_moe_grouped_gemm_nondet_train`.
+The table gives the versions that had each former name: the v0.7.3 release, the
+v0.7.4rc1 prerelease and `main` after v0.7.4rc1. "A former deterministic package"
+is `flashinfer.experimental.cake_moe_grouped_gemm` (v0.7.3; in v0.7.4rc1 an alias
+of the next one) or `flashinfer.experimental.cake_moe_grouped_det_gemm`
+(v0.7.4rc1, `main`). The former non-deterministic calls (`deterministic=False` of
+`flashinfer.experimental.cake.grouped_mm` and every entry of the package
+`flashinfer.experimental.cake.cake_moe_grouped_gemm`, one level lower) move to
+`flashinfer.cake_moe_grouped_gemm_nondet_train`.
 
 | removed | use instead |
 | --- | --- |
-| the package `flashinfer.experimental.cake_moe_grouped_det_gemm` with its submodules, the module `flashinfer.grouped_mm.cake_det` | `flashinfer.cake_moe_grouped_gemm_det_train` (this package: `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`, same submodule names) |
-| `grouped_det_gemm_fwd` / `_dgrad` / `_wgrad`, from `flashinfer.grouped_mm`, `flashinfer.grouped_mm.cake_det` or the package above | `cake_moe_grouped_gemm_det_train_forward` / `_dgrad` / `_wgrad` |
-| `prepare_grouped_det_gemm_fwd` / `_dgrad` / `_wgrad`, from the package above | `cake_moe_grouped_gemm_det_train_prepare_forward` / `_prepare_dgrad` / `_prepare_wgrad` |
-| `GroupedDetGemmLaunch`, from the package above | `CakeMoEGroupedGemmDetLaunch` |
-| `cake_grouped_det_mm`, from `flashinfer.grouped_mm`, `flashinfer.grouped_mm.cake_det` or the package above | `cake_moe_grouped_gemm_det` |
-| `CakeGroupedDetMm`, from the package above | `CakeMoEGroupedGemmDetFunction` |
+| the former deterministic packages with their submodules; the module `flashinfer.grouped_mm.cake` (v0.7.3, v0.7.4rc1) or `flashinfer.grouped_mm.cake_det` (`main`) | `flashinfer.cake_moe_grouped_gemm_det_train` (this package: `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`, same submodule names) |
+| `grouped_gemm_fwd` / `_dgrad` / `_wgrad` (v0.7.3, v0.7.4rc1) and `grouped_det_gemm_fwd` / `_dgrad` / `_wgrad` (v0.7.4rc1, `main`), from `flashinfer.grouped_mm`, its module above or a former deterministic package | `cake_moe_grouped_gemm_det_train_forward` / `_dgrad` / `_wgrad` |
+| `flashinfer.experimental.cake.grouped_mm.grouped_gemm_fwd` / `_dgrad` / `_wgrad` with the default or `deterministic=True` (v0.7.4rc1) | `cake_moe_grouped_gemm_det_train_forward` / `_dgrad` / `_wgrad` |
+| `prepare_grouped_gemm_fwd` / `_dgrad` / `_wgrad` (v0.7.3, v0.7.4rc1) and `prepare_grouped_det_gemm_fwd` / `_dgrad` / `_wgrad` (v0.7.4rc1, `main`), from a former deterministic package | `cake_moe_grouped_gemm_det_train_prepare_forward` / `_prepare_dgrad` / `_prepare_wgrad` |
+| `GroupedGemmLaunch` (v0.7.3, v0.7.4rc1) and `GroupedDetGemmLaunch` (v0.7.4rc1, `main`), from a former deterministic package | `CakeMoEGroupedGemmDetLaunch` |
+| `cake_grouped_mm` (v0.7.3, v0.7.4rc1) and `cake_grouped_det_mm` (v0.7.4rc1, `main`), from `flashinfer.grouped_mm`, its module above or a former deterministic package | `cake_moe_grouped_gemm_det` |
+| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm` with the default or `deterministic=True` (v0.7.4rc1) | `cake_moe_grouped_gemm_det` |
+| `CakeGroupedMm` (v0.7.3, v0.7.4rc1) and `CakeGroupedDetMm` (v0.7.4rc1, `main`), from a former deterministic package | `CakeMoEGroupedGemmDetFunction` |
+| `cake_backend.grouped_mm_bf16_cake` of a former deterministic package (v0.7.3, v0.7.4rc1) | `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` |
+| the `deterministic` argument of `cake_grouped_mm` / `cake_grouped_det_mm` and the fourth argument of `CakeGroupedMm.apply` / `CakeGroupedDetMm.apply` (v0.7.3, v0.7.4rc1: every value ran the deterministic programs) | none: the module is the mode; passing one raises `TypeError` |
 
 `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` is unchanged: it runs
 the forward of this package.
