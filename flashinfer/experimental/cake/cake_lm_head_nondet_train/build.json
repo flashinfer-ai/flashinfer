@@ -4304,6 +4304,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake.cake_lm_head_loss",
+  "package": "flashinfer.experimental.cake.cake_lm_head_nondet_train",
   "schema": "cake-build/1"
 }
