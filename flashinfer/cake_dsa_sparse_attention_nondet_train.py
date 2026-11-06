@@ -12,23 +12,89 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Cake DeepSeek Sparse Attention (top-k sparse MLA, absorbed queries, 64 query
+heads) training forward and backward on SM100 / SM103 / SM107, the
+non-deterministic package: the stable entry points over the backend package
+``flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train``.
+
+Numerical mode: the module name chooses the package, and no entry point takes a
+mode keyword.  The forward and ``dq`` are fixed-order (``dq`` is written once
+per row: bitwise reproducible run to run for one pass plan).  The backward adds
+the dK / dV contributions of every query row into FP32 accumulators with
+unordered atomics, so ``dkv`` (the ``kv_latent`` / ``k_rope`` or ``kv``
+gradients, or the rows added into ``dkv_acc``) may differ run to run within
+the FP32 reduction spread.  Under ``torch.use_deterministic_algorithms(True)``
+the forward runs and the backward raises PyTorch's ``RuntimeError`` before its
+first backward kernel launch; with ``warn_only=True`` it warns
+(``UserWarning``) and runs this package's backward.  Deterministic
+preparation may run before the alert: a copy of a ``dout`` the TMA descriptor
+cannot address; the plan of a new binding, which can JIT-load the backward
+stages and, without a caller ``topk_length``, allocates and fills the
+binding's row-length vector; the validation of ``dkv_acc`` /
+``dkv_dst_map``.  It never falls back to another package.  The
+deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a
+reserved name (planned); it does not exist yet.
+
+Entry points (each an autograd call: forward now, backward through autograd)::
+
+    cake_dsa_sparse_attention_nondet               flat, rope + latent scores
+    cake_dsa_sparse_attention_nondet_varlen        packed documents, rope + latent scores
+    cake_dsa_sparse_attention_nondet_nope          flat, latent scores only (NoPE)
+    cake_dsa_sparse_attention_nondet_nope_varlen   packed documents, NoPE
+
+Their autograd Functions, ``CakeDSASparseAttentionNondetFunction`` (both rope
+entries), ``CakeDSASparseAttentionNondetNopeFunction`` and
+``CakeDSASparseAttentionNondetNopeVarlenFunction``, resolve from the backend
+package on first access.
+
+Usage::
+
+    from flashinfer.cake_dsa_sparse_attention_nondet_train import (
+        cake_dsa_sparse_attention_nondet,
+    )
+
+    out = cake_dsa_sparse_attention_nondet(q_latent, q_rope, kv_latent, k_rope, indices)
+    out.float().square().sum().backward()  # dq fixed-order; dK / dV FP32 atomics
 """
 
 import functools
 import os
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
-# Thin experimental entry points; validation of the backend contract, the
-# workspace, launch binding, autograd wrapper and JIT registration live in
-# flashinfer.experimental.cake_dsa_train.  The backend takes every switch as
-# a keyword argument and reads no environment variable; the variables below
-# are this module's A/B knobs, resolved here and passed down.
+# Stable entry points (``@flashinfer_api``) over the backend package; validation
+# of the backend contract, the workspace, launch binding, autograd wrappers and
+# JIT registration live in
+# flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train, which this
+# core module imports on first use only (the containment rules of
+# flashinfer/experimental/README.md): importing this module loads nothing from
+# the experimental tree.  The backend takes every switch as a keyword argument
+# and reads no environment variable; the variables below are this module's A/B
+# knobs, resolved here and passed down.
 
-_FEATURE = "DSA sparse-attention training (64 query heads, SM100/SM103/SM107)"
+__all__ = [
+    "BINDING_CACHE_CAPACITY_ENV",
+    "CHECK_DST_MAP_ENV",
+    "DKV_DIRECT_ENV",
+    "CakeDSASparseAttentionNondetFunction",  # noqa: F822 (resolved by __getattr__)
+    "CakeDSASparseAttentionNondetNopeFunction",  # noqa: F822
+    "CakeDSASparseAttentionNondetNopeVarlenFunction",  # noqa: F822
+    "cake_dsa_sparse_attention_nondet",
+    "cake_dsa_sparse_attention_nondet_nope",
+    "cake_dsa_sparse_attention_nondet_nope_varlen",
+    "cake_dsa_sparse_attention_nondet_varlen",
+]
+
+# The backend's autograd Functions, re-exported on first access (module ``__getattr__``).
+_FROM_BACKEND = (
+    "CakeDSASparseAttentionNondetFunction",
+    "CakeDSASparseAttentionNondetNopeFunction",
+    "CakeDSASparseAttentionNondetNopeVarlenFunction",
+)
 
 # ``auto`` (default): the registered record's size rule decides whether a
 # backward with ``dkv_acc`` accumulates directly from the main stage; ``1``
@@ -84,7 +150,7 @@ def _cake_backend():
     # The backend is imported on first use (experimental containment: core
     # reaches kernels and their dependencies through a deferred import) and
     # the binding-cache capacity read at import is applied to it once.
-    from .experimental.cake_dsa_train import cake_backend
+    from .experimental.cake.cake_dsa_sparse_attention_nondet_train import cake_backend
 
     if _BINDING_CACHE_CAPACITY is not None:
         cake_backend.BINDING_CACHE.configure(capacity=_BINDING_CACHE_CAPACITY)
@@ -99,8 +165,8 @@ def _backend(backend: str):
     return _cake_backend()
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def dsa_sparse_attention(
+@flashinfer_api
+def cake_dsa_sparse_attention_nondet(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -231,11 +297,18 @@ def dsa_sparse_attention(
     forms the exact ``delta`` from the saved output residual.  The kernels
     apply no positional mask: the index rows define the key set.
 
+    Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
+
     Host side: the inputs are validated and bound on the first call for an
     input binding (``data_ptr``, shape, stride and dtype of every input plus
     the scale); later calls with the same binding launch from the remembered
     argument plans with freshly allocated outputs
-    (``flashinfer.experimental.cake_dsa_train.cake_backend.BINDING_CACHE``, 64
+    (``flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train.cake_backend.BINDING_CACHE``, 64
     bindings by default, least recently used first out;
     ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` -- a positive integer,
     read when this module is imported -- sets the capacity through
@@ -245,7 +318,7 @@ def dsa_sparse_attention(
         dkv_direct = _dkv_direct_from_environment()
     if check_dst_map is None:
         check_dst_map = _check_dst_map_from_environment()
-    return _backend(backend).dsa_sparse_attention(
+    return _backend(backend).cake_dsa_sparse_attention_nondet(
         q_latent,
         q_rope,
         kv_latent,
@@ -262,8 +335,8 @@ def dsa_sparse_attention(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def dsa_sparse_attention_varlen(
+@flashinfer_api
+def cake_dsa_sparse_attention_nondet_varlen(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -285,7 +358,7 @@ def dsa_sparse_attention_varlen(
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
 ):
-    r"""Packed multi-document form of :func:`dsa_sparse_attention` (SM100 /
+    r"""Packed multi-document form of :func:`cake_dsa_sparse_attention_nondet` (SM100 /
     SM103 / SM107).
 
     Documents are packed along the first dimension of the query tensors
@@ -304,9 +377,17 @@ def dsa_sparse_attention_varlen(
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
     positional mask of their own; the offset index rows define the key sets.
     ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
-    other varlen attention entry points and are not read on the host.  Other
-    arguments and returns as in :func:`dsa_sparse_attention`; the strided
-    query slices and packed key rows described there are accepted here too.
+    other varlen attention entry points and are not read on the host.  See
+    :func:`cake_dsa_sparse_attention_nondet` for the other arguments and the
+    returns; the strided query slices and packed key rows described there are
+    accepted here too.
+
+    Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     Parameters
     ----------
@@ -319,12 +400,12 @@ def dsa_sparse_attention_varlen(
         trainers with query segments that are tails of their key prefix rely
         on).
     dkv_direct : Optional[bool]
-        As in :func:`dsa_sparse_attention`: ``None`` (default) reads
+        As in :func:`cake_dsa_sparse_attention_nondet`: ``None`` (default) reads
         ``FLASHINFER_CAKE_DSA_DKV_DIRECT`` (``auto`` = the record's size rule,
         ``1`` / ``0`` = force / disable the direct accumulation into
         ``dkv_acc``); ``True`` / ``False`` decide explicitly.
     check_dst_map : Optional[bool]
-        As in :func:`dsa_sparse_attention`: ``None`` (default) reads
+        As in :func:`cake_dsa_sparse_attention_nondet`: ``None`` (default) reads
         ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP`` (unset, empty or ``0`` = no
         check); ``True`` validates the values of ``dkv_dst_map`` on every
         backward, ``False`` never does.
@@ -333,7 +414,7 @@ def dsa_sparse_attention_varlen(
         dkv_direct = _dkv_direct_from_environment()
     if check_dst_map is None:
         check_dst_map = _check_dst_map_from_environment()
-    return _backend(backend).dsa_sparse_attention_varlen(
+    return _backend(backend).cake_dsa_sparse_attention_nondet_varlen(
         q_latent,
         q_rope,
         kv_latent,
@@ -355,8 +436,8 @@ def dsa_sparse_attention_varlen(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def dsa_sparse_attention_nope(
+@flashinfer_api
+def cake_dsa_sparse_attention_nondet_nope(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -481,12 +562,19 @@ def dsa_sparse_attention_nope(
     (run-to-run spread within FP32 rounding) and handed over in FP32: through
     ``dkv_acc`` when given, otherwise as the ``kv`` gradient -- which the
     autograd engine casts to the dtype of the ``kv`` leaf (BF16 for a BF16
-    leaf); call ``flashinfer.experimental.cake_dsa_train.cake_backend.backward_nope``
+    leaf); call ``flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train.cake_backend.backward_nope``
     or pass ``dkv_acc`` to keep the FP32 values.  BF16 operands into the tensor
     cores, FP32 accumulation and statistics; the backward recomputes the scores
     from the BF16 inputs and forms the exact ``delta`` from the saved output
     residual.  The kernels apply no positional mask: the index rows define the
     key set.
+
+    Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     The incoming ``dout`` may be a head-major view (strides ``[512, T * 512,
     1]``, the layout an output projection hands back) or any strided
@@ -496,7 +584,7 @@ def dsa_sparse_attention_nope(
     the delta stage through the token and head strides it receives -- with no
     host copy.
 
-    Host side as in :func:`dsa_sparse_attention`: the inputs are validated and
+    Host side as in :func:`cake_dsa_sparse_attention_nondet`: the inputs are validated and
     bound on the first call for an input binding; later calls with the same
     binding launch from the remembered argument plans (the same
     ``BINDING_CACHE``, under keys disjoint from the rope entries).
@@ -505,7 +593,7 @@ def dsa_sparse_attention_nope(
         dkv_direct = _dkv_direct_from_environment()
     if check_dst_map is None:
         check_dst_map = _check_dst_map_from_environment()
-    return _backend(backend).dsa_sparse_attention_nope(
+    return _backend(backend).cake_dsa_sparse_attention_nondet_nope(
         q,
         kv,
         indices,
@@ -520,8 +608,8 @@ def dsa_sparse_attention_nope(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def dsa_sparse_attention_nope_varlen(
+@flashinfer_api
+def cake_dsa_sparse_attention_nondet_nope_varlen(
     q: torch.Tensor,
     kv: torch.Tensor,
     gather_kv_indices: torch.Tensor,
@@ -542,7 +630,7 @@ def dsa_sparse_attention_nope_varlen(
     check_dst_map: Optional[bool] = None,
     check_cu_seqlens: bool = False,
 ):
-    r"""Packed multi-document form of :func:`dsa_sparse_attention_nope` (SM100 /
+    r"""Packed multi-document form of :func:`cake_dsa_sparse_attention_nondet_nope` (SM100 /
     SM103 / SM107).
 
     Documents are packed along the first dimension of ``q`` (``T =
@@ -566,9 +654,16 @@ def dsa_sparse_attention_nope_varlen(
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
     positional mask of their own; the offset index rows define the key sets.
     ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
-    other varlen attention entry points and are not read on the host.  Other
-    arguments, the ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and
-    the returns as in :func:`dsa_sparse_attention_nope`.
+    other varlen attention entry points and are not read on the host.  See
+    :func:`cake_dsa_sparse_attention_nondet_nope` for the other arguments, the
+    ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and the returns.
+
+    Under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+    backward raises PyTorch's ``RuntimeError`` before its first backward
+    kernel launch (its dK / dV atomics are not run-to-run reproducible);
+    deterministic preparation may run first (see the module docstring).  With
+    ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
+    package is chosen instead.
 
     ``cu_seqlens_q`` and ``cu_seqlens_k`` are caller-owned prefix sums with
     these invariants: int32 ``[num_docs + 1]`` tensors of one length on the
@@ -604,11 +699,11 @@ def dsa_sparse_attention_nope_varlen(
         seqlen_q[d]) + local_q``) is invalid too, so a top-k selector need not
         enforce causality itself.
     dkv_direct : Optional[bool]
-        As in :func:`dsa_sparse_attention_nope`: ``None`` (default) reads
+        As in :func:`cake_dsa_sparse_attention_nondet_nope`: ``None`` (default) reads
         ``FLASHINFER_CAKE_DSA_DKV_DIRECT``; ``True`` / ``False`` decide
         explicitly.
     check_dst_map : Optional[bool]
-        As in :func:`dsa_sparse_attention_nope`: ``None`` (default) reads
+        As in :func:`cake_dsa_sparse_attention_nondet_nope`: ``None`` (default) reads
         ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP``; ``True`` validates the values of
         ``dkv_dst_map`` on every backward, ``False`` never does.
     """
@@ -616,7 +711,7 @@ def dsa_sparse_attention_nope_varlen(
         dkv_direct = _dkv_direct_from_environment()
     if check_dst_map is None:
         check_dst_map = _check_dst_map_from_environment()
-    return _backend(backend).dsa_sparse_attention_nope_varlen(
+    return _backend(backend).cake_dsa_sparse_attention_nondet_nope_varlen(
         q,
         kv,
         gather_kv_indices,
@@ -635,6 +730,18 @@ def dsa_sparse_attention_nope_varlen(
         check_dst_map=check_dst_map,
         check_cu_seqlens=check_cu_seqlens,
     )
+
+
+def __getattr__(name: str) -> Any:
+    # The backend's autograd Functions resolve on first access, so that importing
+    # this module imports no backend.
+    if name in _FROM_BACKEND:
+        return getattr(_cake_backend(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_FROM_BACKEND))
 
 
 # Read once at import: a malformed value fails here, naming the variable, not

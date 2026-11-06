@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 flashinfer public-API tests of the CAKE DSA sparse-attention training package
-(``flashinfer.experimental.cake_dsa_train``).
+(``flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train``).
 
-The backend suite ``test_cake_dsa_train.py`` imports only the package.  This file covers what needs flashinfer
-itself: the experimental public entry points ``flashinfer.dsa_sparse_attention.dsa_sparse_attention`` /
-``dsa_sparse_attention_varlen`` (their experimental marking, the arguments they forward, autograd and the varlen
-glue through them) and the environment variables the wrapper resolves into the package's keyword switches --
+The backend suite ``test_cake_dsa_sparse_attention_nondet_train.py`` imports only the package.  This file covers what needs flashinfer
+itself: the stable entry points of ``flashinfer.cake_dsa_sparse_attention_nondet_train`` (``cake_dsa_sparse_attention_nondet``,
+``cake_dsa_sparse_attention_nondet_varlen`` and the NoPE pair: their stable-API marking, the arguments they forward,
+autograd, the varlen glue through them and their behaviour under ``torch.use_deterministic_algorithms``) and the
+environment variables the wrapper resolves into the package's keyword switches --
 ``FLASHINFER_CAKE_DSA_DKV_DIRECT`` (``dkv_direct``), ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP`` (``check_dst_map``) and
 ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` (``BINDING_CACHE.configure``).  The helpers shared with the
 backend suite are repeated here: test modules do not import one another.
@@ -32,21 +33,20 @@ import warnings
 import pytest
 import torch
 
-import flashinfer.dsa_sparse_attention as public_api
-from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.dsa_sparse_attention import (
-    dsa_sparse_attention,
-    dsa_sparse_attention_nope,
-    dsa_sparse_attention_nope_varlen,
-    dsa_sparse_attention_varlen,
+import flashinfer.cake_dsa_sparse_attention_nondet_train as public_api
+from flashinfer.cake_dsa_sparse_attention_nondet_train import (
+    cake_dsa_sparse_attention_nondet,
+    cake_dsa_sparse_attention_nondet_nope,
+    cake_dsa_sparse_attention_nondet_nope_varlen,
+    cake_dsa_sparse_attention_nondet_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import (
+from flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train import (
     cake_backend,
     cake_build,
     cake_jit,
     cake_launch,
 )
-from flashinfer.experimental.cake_dsa_train.cake_backend import (
+from flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train.cake_backend import (
     D_LATENT,
     D_QK,
     D_ROPE,
@@ -62,8 +62,10 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     prepare_dsa_train,
     record_for,
 )
-from tests.test_helpers import cake_dsa_train_reference as nope_ref
-from tests.test_helpers.cake_dsa_train_reference import (
+from tests.test_helpers import (
+    cake_dsa_sparse_attention_nondet_train_reference as nope_ref,
+)
+from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
     compact_rows,
     derive_topk_length,
     globalize_gather_indices_loop,
@@ -127,15 +129,6 @@ def _rule_passes(
     if tail and not one_chunk and rule["tail_cap"]:
         passes = min(passes, rule["tail_cap"])
     return passes if passes <= policy.max_passes else 1
-
-
-@contextlib.contextmanager
-def _quiet_experimental():
-    # The experimental banner fires once per process; the API's opt-in is
-    # exercised by test_public_api_is_marked_experimental.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        yield
 
 
 def _host_inputs(total_q=8, total_k=16, topk=5):
@@ -370,10 +363,18 @@ def _non_causal_local_indices(inp, gen, *, masked_docs=()):
 # ---------------------------------------------------------------------------
 
 
-def test_public_api_is_marked_experimental():
-    assert dsa_sparse_attention.is_experimental is True
-    assert dsa_sparse_attention_varlen.is_experimental is True
-    assert "SM100" in dsa_sparse_attention.__doc__
+def test_public_api_is_a_stable_api():
+    """The entry points are stable APIs (issue #8928): not marked experimental, and the docstring of every entry
+    point states its behaviour under ``torch.use_deterministic_algorithms``."""
+    for fn in (
+        cake_dsa_sparse_attention_nondet,
+        cake_dsa_sparse_attention_nondet_varlen,
+        cake_dsa_sparse_attention_nondet_nope,
+        cake_dsa_sparse_attention_nondet_nope_varlen,
+    ):
+        assert not getattr(fn, "is_experimental", False), fn.__name__
+        assert "use_deterministic_algorithms" in fn.__doc__, fn.__name__
+    assert "SM100" in cake_dsa_sparse_attention_nondet.__doc__
 
 
 def test_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
@@ -421,8 +422,7 @@ def test_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
         cake_backend.backward(ql, qr, kl, kr, idx, out, o_lo, lse[:, :8], dout)
     # the autograd path
     leaves = [t.detach().clone().requires_grad_() for t in (ql, qr, kl, kr)]
-    with _quiet_experimental():
-        out_pub, lse_pub = dsa_sparse_attention(*leaves, idx, return_lse=True)
+    out_pub, lse_pub = cake_dsa_sparse_attention_nondet(*leaves, idx, return_lse=True)
     assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
     assert tuple(lse_pub.shape) == (0, NUM_HEADS)
     g = torch.autograd.grad(out_pub, leaves, dout)
@@ -464,10 +464,10 @@ def test_dkv_direct_environment_is_resolved_by_the_public_entry(monkeypatch):
         kv[:, :D_LATENT],
         kv[:, D_LATENT:],
     )
-    with _quiet_experimental(), pytest.raises(ValueError, match=env):
-        dsa_sparse_attention(ql, qr, kl, kr, idx)
-    with _quiet_experimental(), pytest.raises(ValueError, match=env):
-        dsa_sparse_attention_varlen(
+    with pytest.raises(ValueError, match=env):
+        cake_dsa_sparse_attention_nondet(ql, qr, kl, kr, idx)
+    with pytest.raises(ValueError, match=env):
+        cake_dsa_sparse_attention_nondet_varlen(
             ql,
             qr,
             kl,
@@ -499,10 +499,9 @@ def test_dkv_direct_environment_selects_the_backward_path(monkeypatch):
             t.detach().clone().requires_grad_()
             for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
         ]
-        with _quiet_experimental():
-            out = dsa_sparse_attention(
-                *leaves, inp.idx_global, dkv_acc=acc, dkv_dst_map=dst_map, **kwargs
-            )
+        out = cake_dsa_sparse_attention_nondet(
+            *leaves, inp.idx_global, dkv_acc=acc, dkv_dst_map=dst_map, **kwargs
+        )
         out.backward(inp.dout)
         torch.cuda.synchronize()
         assert leaves[2].grad is None and leaves[3].grad is None
@@ -547,10 +546,9 @@ def test_check_dst_map_environment_is_resolved_by_the_public_entry(monkeypatch):
 
     def grads(dst_map, **kwargs):
         leaves = [t.detach().clone().requires_grad_() for t in (ql, qr)]
-        with _quiet_experimental():
-            out = dsa_sparse_attention(
-                *leaves, kl, kr, idx, dkv_acc=dkv_acc, dkv_dst_map=dst_map, **kwargs
-            )
+        out = cake_dsa_sparse_attention_nondet(
+            *leaves, kl, kr, idx, dkv_acc=dkv_acc, dkv_dst_map=dst_map, **kwargs
+        )
         return torch.autograd.grad(out, leaves, torch.zeros_like(out))
 
     monkeypatch.delenv(env, raising=False)
@@ -594,10 +592,9 @@ def test_check_dst_map_environment_checks_the_map_before_the_backward_launches(
     def step(dst_map):
         acc = torch.zeros(S, D_QK, device="cuda")
         leaves = [t.detach().clone().requires_grad_() for t in args]
-        with _quiet_experimental():
-            out = dsa_sparse_attention(
-                *leaves, inp.idx_global, dkv_acc=acc, dkv_dst_map=dst_map
-            )
+        out = cake_dsa_sparse_attention_nondet(
+            *leaves, inp.idx_global, dkv_acc=acc, dkv_dst_map=dst_map
+        )
         out.backward(inp.dout)
         torch.cuda.synchronize()
         return acc
@@ -617,7 +614,7 @@ def test_check_dst_map_environment_checks_the_map_before_the_backward_launches(
 
 
 def test_binding_cache_capacity_environment_configures_the_backend_cache(monkeypatch):
-    """``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` is read when :mod:`flashinfer.dsa_sparse_attention` is
+    """``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` is read when :mod:`flashinfer.cake_dsa_sparse_attention_nondet_train` is
     imported (a malformed value fails there, naming the variable) and applied to the backend's ``BINDING_CACHE``
     through ``configure`` when the module first reaches the backend (the import itself stays deferred); unset or
     blank leaves the configured capacity alone."""
@@ -668,19 +665,18 @@ def test_varlen_multi_document_matches_flat_and_reference():
     out_flat, lse_flat, _ = cake_backend.forward(
         inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
     )
-    with _quiet_experimental():
-        out_var, lse_var = dsa_sparse_attention_varlen(
-            inp.q_latent,
-            inp.q_rope,
-            inp.kv_latent,
-            inp.k_rope,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
+    out_var, lse_var = cake_dsa_sparse_attention_nondet_varlen(
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_local,
+        inp.cu_seqlens_q,
+        inp.cu_seqlens_k,
+        inp.max_seqlen_q,
+        inp.max_seqlen_k,
+        return_lse=True,
+    )
     torch.cuda.synchronize()
     assert torch.equal(out_flat, out_var) and torch.equal(lse_flat, lse_var)
     ref = reference_fp64(
@@ -726,8 +722,7 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
         t.detach().clone().requires_grad_()
         for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     ]
-    with _quiet_experimental():
-        out = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=forced)
+    out = cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global, key_passes=forced)
     grads = torch.autograd.grad(out, leaves, inp.dout)
     torch.cuda.synchronize()
     # two passes for this row (one token chunk): per pass the compaction and the pass kernel
@@ -758,8 +753,7 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     torch.cuda.synchronize()
     assert torch.equal(g1[0], g2[0]) and torch.equal(g1[1], g2[1])
     assert torch.equal(g1[0], grads[0]) and torch.equal(o2, out.detach())
-    with _quiet_experimental():
-        out_single = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=1)
+    out_single = cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global, key_passes=1)
     single = torch.autograd.grad(out_single, leaves, inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out.detach(), out_single.detach())  # the forward is untouched
@@ -796,11 +790,12 @@ def test_public_entry_derives_row_lengths_and_matches_full_rows():
     full = torch.full(
         (inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device
     )
-    with _quiet_experimental():
-        out_a, lse_a = dsa_sparse_attention(*leaves_a, inp.idx_global, return_lse=True)
-        out_b, lse_b = dsa_sparse_attention(
-            *leaves_b, inp.idx_global, topk_length=full, return_lse=True
-        )
+    out_a, lse_a = cake_dsa_sparse_attention_nondet(
+        *leaves_a, inp.idx_global, return_lse=True
+    )
+    out_b, lse_b = cake_dsa_sparse_attention_nondet(
+        *leaves_b, inp.idx_global, topk_length=full, return_lse=True
+    )
     grads_a = torch.autograd.grad(out_a, leaves_a, inp.dout)
     grads_b = torch.autograd.grad(out_b, leaves_b, inp.dout)
     torch.cuda.synchronize()
@@ -834,25 +829,23 @@ def test_varlen_multi_segment_row_plans_single_pass():
     flat_leaves = [t.detach().clone().requires_grad_() for t in args]
     cache = cake_backend.BINDING_CACHE
     cache.clear()
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
+    out_v, lse_v = cake_dsa_sparse_attention_nondet_varlen(
+        *leaves,
+        inp.idx_local,
+        inp.cu_seqlens_q,
+        inp.cu_seqlens_k,
+        inp.max_seqlen_q,
+        inp.max_seqlen_k,
+        return_lse=True,
+    )
     grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
     torch.cuda.synchronize()
     remembered = [b.plan for b in cache._entries.values() if b.plan.backward]
     assert [plan.key_passes for plan in remembered] == [1]
     assert not any(isinstance(k, tuple) for k in remembered[0].backward_order)
-    with _quiet_experimental():
-        out_f, lse_f = dsa_sparse_attention(
-            *flat_leaves, inp.idx_global, return_lse=True
-        )
+    out_f, lse_f = cake_dsa_sparse_attention_nondet(
+        *flat_leaves, inp.idx_global, return_lse=True
+    )
     grads_f = torch.autograd.grad(out_f, flat_leaves, inp.dout)
     torch.cuda.synchronize()
     # the segment count is part of the plan key: the flat call plans anew and takes the passes of the
@@ -898,8 +891,7 @@ def test_indices_view_inside_a_storage_matches_the_plain_tensor(offset):
     assert torch.equal(g_plain[0], g_view[0]) and torch.equal(g_plain[1], g_view[1])
     assert max(rel_l2(g_plain[2], g_view[2]), rel_l2(g_plain[3], g_view[3])) < 1e-3
     leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out_pub, lse_pub = dsa_sparse_attention(*leaves, view, return_lse=True)
+    out_pub, lse_pub = cake_dsa_sparse_attention_nondet(*leaves, view, return_lse=True)
     grads = torch.autograd.grad(out_pub, leaves, inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out_pub, out) and torch.equal(lse_pub, lse)
@@ -914,8 +906,9 @@ def test_autograd_function_matches_explicit_backward():
         t.detach().clone().requires_grad_()
         for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     ]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention(*leaves, inp.idx_global, return_lse=True)
+    out, lse = cake_dsa_sparse_attention_nondet(
+        *leaves, inp.idx_global, return_lse=True
+    )
     grads = torch.autograd.grad(out, leaves, inp.dout)
     o2, l2, o_lo = cake_backend.forward(
         inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
@@ -952,8 +945,9 @@ def test_autograd_lse_gradient_is_rejected_and_unused_out_gives_no_grad():
         t.detach().clone().requires_grad_()
         for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     ]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention(*leaves, inp.idx_global, return_lse=True)
+    out, lse = cake_dsa_sparse_attention_nondet(
+        *leaves, inp.idx_global, return_lse=True
+    )
     # only out is differentiable: a gradient arriving through lse fails loudly instead of being dropped
     with pytest.raises(NotImplementedError, match="lse"):
         torch.autograd.grad(lse.sum(), leaves)
@@ -992,10 +986,9 @@ def test_forward_backward_strided_q_rope_256_bitwise():
     for a, b in zip(again, got[0], strict=True):
         assert torch.equal(a, b)
     leaf = q256.detach().clone().requires_grad_()
-    with _quiet_experimental():
-        out = dsa_sparse_attention(
-            inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global
-        )
+    out = cake_dsa_sparse_attention_nondet(
+        inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global
+    )
     (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out, ref[0][0]) and torch.equal(grad[:, :, 192:256], ref[1][1])
@@ -1020,14 +1013,13 @@ def test_kv_row_stride_704_bitwise():
         _assert_same_step(got[row_stride], ref)
     _assert_same_step(got[704], got[576])
     leaf = kv.detach().clone().requires_grad_()  # the [S, 704] buffer
-    with _quiet_experimental():
-        out = dsa_sparse_attention(
-            inp.q_latent,
-            inp.q_rope,
-            leaf[:, :D_LATENT],
-            leaf[:, D_LATENT:D_QK],
-            inp.idx_global,
-        )
+    out = cake_dsa_sparse_attention_nondet(
+        inp.q_latent,
+        inp.q_rope,
+        leaf[:, :D_LATENT],
+        leaf[:, D_LATENT:D_QK],
+        inp.idx_global,
+    )
     (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out, ref[0][0]) and torch.all(grad[:, D_QK:] == 0)
@@ -1080,17 +1072,16 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     (out, lse, _), grads = _forward_backward(*args, rows, inp.dout, topk_length=counts)
     leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves,
-            local,
-            cu_q,
-            cu_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            causal=True,
-            return_lse=True,
-        )
+    out_v, lse_v = cake_dsa_sparse_attention_nondet_varlen(
+        *leaves,
+        local,
+        cu_q,
+        cu_k,
+        inp.max_seqlen_q,
+        inp.max_seqlen_k,
+        causal=True,
+        return_lse=True,
+    )
     grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
@@ -1105,8 +1096,9 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     assert torch.all(grads_v[2][int(cu_k[-2]) :] == 0) and torch.all(
         grads_v[3][int(cu_k[-2]) :] == 0
     )
-    with _quiet_experimental():
-        out_nc = dsa_sparse_attention_varlen(*args, local, cu_q, cu_k, causal=False)
+    out_nc = cake_dsa_sparse_attention_nondet_varlen(
+        *args, local, cu_q, cu_k, causal=False
+    )
     torch.cuda.synchronize()
     assert not torch.equal(out_nc, out_v), (
         "without the causal term the same picks attend keys after the query"
@@ -1125,10 +1117,9 @@ def test_varlen_segment_with_every_slot_masked_gives_zero_outputs():
     assert torch.all(glob[64:] == -1) and torch.equal(glob[:64], inp.idx_global[:64])
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention_varlen(
-            *leaves, local, cu_q, cu_k, return_lse=True
-        )
+    out, lse = cake_dsa_sparse_attention_nondet_varlen(
+        *leaves, local, cu_q, cu_k, return_lse=True
+    )
     grads = torch.autograd.grad(out, leaves, inp.dout)
     (out_flat, lse_flat, _), grads_flat = _forward_backward(
         *args, inp.idx_global, inp.dout
@@ -1161,16 +1152,15 @@ def test_varlen_packed_glm_structure_small():
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     (out, lse, _), grads = _forward_backward(*args, inp.idx_global, inp.dout)
     leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
+    out_v, lse_v = cake_dsa_sparse_attention_nondet_varlen(
+        *leaves,
+        inp.idx_local,
+        inp.cu_seqlens_q,
+        inp.cu_seqlens_k,
+        inp.max_seqlen_q,
+        inp.max_seqlen_k,
+        return_lse=True,
+    )
     grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
@@ -1182,7 +1172,7 @@ def test_varlen_packed_glm_structure_small():
 
 
 # ---------------------------------------------------------------------------
-# NoPE (zero-rope) public entries: ``dsa_sparse_attention_nope`` / ``dsa_sparse_attention_nope_varlen``
+# NoPE (zero-rope) public entries: ``cake_dsa_sparse_attention_nondet_nope`` / ``cake_dsa_sparse_attention_nondet_nope_varlen``
 # ---------------------------------------------------------------------------
 
 NOPE_PROGRAM = cake_jit.NOPE_PROGRAM
@@ -1308,13 +1298,16 @@ def _check_nope_grads(dq, dkv, ref):
         )
 
 
-def test_public_nope_api_is_marked_experimental():
-    assert dsa_sparse_attention_nope.is_experimental is True
-    assert dsa_sparse_attention_nope_varlen.is_experimental is True
-    doc = dsa_sparse_attention_nope.__doc__
+def test_public_nope_api_is_a_stable_api():
+    for fn in (
+        cake_dsa_sparse_attention_nondet_nope,
+        cake_dsa_sparse_attention_nondet_nope_varlen,
+    ):
+        assert not getattr(fn, "is_experimental", False), fn.__name__
+    doc = cake_dsa_sparse_attention_nondet_nope.__doc__
     assert "SM100" in doc and "1 / 16" in doc
     assert "dK + dV" in doc and "[S, 1, 512]" in doc and "K_slots >= 1" in doc
-    assert "SM100" in dsa_sparse_attention_nope_varlen.__doc__
+    assert "SM100" in cake_dsa_sparse_attention_nondet_nope_varlen.__doc__
 
 
 def test_nope_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
@@ -1350,21 +1343,21 @@ def test_nope_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
     # the autograd path, with the 2-D and the one-head kv forms
     for kv_leaf in (kv, kv.unsqueeze(1)):
         leaves = [t.detach().clone().requires_grad_() for t in (q, kv_leaf)]
-        with _quiet_experimental():
-            out_pub, lse_pub = dsa_sparse_attention_nope(*leaves, idx, return_lse=True)
+        out_pub, lse_pub = cake_dsa_sparse_attention_nondet_nope(
+            *leaves, idx, return_lse=True
+        )
         assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
         assert tuple(lse_pub.shape) == (0, NUM_HEADS)
         g = torch.autograd.grad(out_pub, leaves, dout)
         assert [tuple(t.shape) for t in g] == [tuple(leaf.shape) for leaf in leaves]
         assert torch.all(g[1] == 0) and g[1].dtype == torch.bfloat16
-    with _quiet_experimental():
-        out_pub = dsa_sparse_attention_nope_varlen(
-            q,
-            kv,
-            idx,
-            torch.tensor([0, 0], dtype=torch.int32),
-            torch.tensor([0, 16], dtype=torch.int32),
-        )
+    out_pub = cake_dsa_sparse_attention_nondet_nope_varlen(
+        q,
+        kv,
+        idx,
+        torch.tensor([0, 0], dtype=torch.int32),
+        torch.tensor([0, 16], dtype=torch.int32),
+    )
     assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
 
 
@@ -1379,26 +1372,26 @@ def test_nope_public_entries_resolve_the_environment_and_reject_other_backends(
     cu_k = torch.tensor([0, 16], dtype=torch.int32)
     monkeypatch.setenv(public_api.DKV_DIRECT_ENV, "maybe")
     with (
-        _quiet_experimental(),
         pytest.raises(ValueError, match=public_api.DKV_DIRECT_ENV),
     ):
-        dsa_sparse_attention_nope(q, kv, idx)
+        cake_dsa_sparse_attention_nondet_nope(q, kv, idx)
     with (
-        _quiet_experimental(),
         pytest.raises(ValueError, match=public_api.DKV_DIRECT_ENV),
     ):
-        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k)
+        cake_dsa_sparse_attention_nondet_nope_varlen(q, kv, idx, cu_q, cu_k)
     monkeypatch.delenv(public_api.DKV_DIRECT_ENV, raising=False)
-    with _quiet_experimental(), pytest.raises(ValueError, match="backend='cake'"):
-        dsa_sparse_attention_nope(q, kv, idx, backend="other")
-    with _quiet_experimental(), pytest.raises(ValueError, match="backend='cake'"):
-        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k, backend="other")
+    with pytest.raises(ValueError, match="backend='cake'"):
+        cake_dsa_sparse_attention_nondet_nope(q, kv, idx, backend="other")
+    with pytest.raises(ValueError, match="backend='cake'"):
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            q, kv, idx, cu_q, cu_k, backend="other"
+        )
     with pytest.raises(ValueError, match="backend='cake'"):
         cake_backend.prepare_dsa_nope_train(q, kv, idx, backend="other")
 
 
 def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
-    """What the wrappers hand to ``cake_backend.dsa_sparse_attention_nope`` / ``_varlen``: every keyword as given,
+    """What the wrappers hand to ``cake_backend.cake_dsa_sparse_attention_nondet_nope`` / ``_varlen``: every keyword as given,
     ``dkv_direct`` / ``check_dst_map`` resolved from the environment when ``None`` and taken as given otherwise."""
     seen = {}
 
@@ -1410,16 +1403,17 @@ def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
         seen["varlen"] = (q, kv, gather, cu_q, cu_k, max_q, max_k, kwargs)
         return "varlen"
 
-    monkeypatch.setattr(cake_backend, "dsa_sparse_attention_nope", flat)
-    monkeypatch.setattr(cake_backend, "dsa_sparse_attention_nope_varlen", varlen)
+    monkeypatch.setattr(cake_backend, "cake_dsa_sparse_attention_nondet_nope", flat)
+    monkeypatch.setattr(
+        cake_backend, "cake_dsa_sparse_attention_nondet_nope_varlen", varlen
+    )
     q, kv, idx = _nope_host_inputs()
     lengths = torch.full((8,), 5, dtype=torch.int32)
     acc = torch.zeros(16, D_LATENT)
     dst_map = torch.arange(16, dtype=torch.int32)
     monkeypatch.delenv(public_api.DKV_DIRECT_ENV, raising=False)
     monkeypatch.delenv(public_api.CHECK_DST_MAP_ENV, raising=False)
-    with _quiet_experimental():
-        assert dsa_sparse_attention_nope(q, kv, idx) == "flat"
+    assert cake_dsa_sparse_attention_nondet_nope(q, kv, idx) == "flat"
     assert seen["flat"][0] is q and seen["flat"][1] is kv and seen["flat"][2] is idx
     assert seen["flat"][3] == dict(
         topk_length=None,
@@ -1433,37 +1427,36 @@ def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
     )
     monkeypatch.setenv(public_api.DKV_DIRECT_ENV, "1")
     monkeypatch.setenv(public_api.CHECK_DST_MAP_ENV, "1")
-    with _quiet_experimental():
-        dsa_sparse_attention_nope(
-            q,
-            kv,
-            idx,
-            topk_length=lengths,
-            softmax_scale=0.25,
-            return_lse=True,
-            key_passes=2,
-            dkv_acc=acc,
-            dkv_dst_map=dst_map,
-        )
+    cake_dsa_sparse_attention_nondet_nope(
+        q,
+        kv,
+        idx,
+        topk_length=lengths,
+        softmax_scale=0.25,
+        return_lse=True,
+        key_passes=2,
+        dkv_acc=acc,
+        dkv_dst_map=dst_map,
+    )
     kwargs = seen["flat"][3]
     assert kwargs["topk_length"] is lengths and kwargs["softmax_scale"] == 0.25
     assert kwargs["return_lse"] is True and kwargs["key_passes"] == 2
     assert kwargs["dkv_acc"] is acc and kwargs["dkv_dst_map"] is dst_map
     assert kwargs["dkv_direct"] is True and kwargs["check_dst_map"] is True
     monkeypatch.setenv(public_api.DKV_DIRECT_ENV, "0")
-    with _quiet_experimental():
-        dsa_sparse_attention_nope(q, kv, idx, dkv_direct=True, check_dst_map=False)
+    cake_dsa_sparse_attention_nondet_nope(
+        q, kv, idx, dkv_direct=True, check_dst_map=False
+    )
     assert seen["flat"][3]["dkv_direct"] is True  # the keyword wins over the variable
     assert seen["flat"][3]["check_dst_map"] is False
     cu_q = torch.tensor([0, 8], dtype=torch.int32)
     cu_k = torch.tensor([0, 16], dtype=torch.int32)
-    with _quiet_experimental():
-        assert (
-            dsa_sparse_attention_nope_varlen(
-                q, kv, idx, cu_q, cu_k, 8, 16, causal=True, key_passes=1
-            )
-            == "varlen"
+    assert (
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            q, kv, idx, cu_q, cu_k, 8, 16, causal=True, key_passes=1
         )
+        == "varlen"
+    )
     assert all(
         a is b
         for a, b in zip(seen["varlen"][:5], (q, kv, idx, cu_q, cu_k), strict=True)
@@ -1481,8 +1474,9 @@ def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
         check_dst_map=True,
         check_cu_seqlens=False,
     )
-    with _quiet_experimental():
-        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k, check_cu_seqlens=True)
+    cake_dsa_sparse_attention_nondet_nope_varlen(
+        q, kv, idx, cu_q, cu_k, check_cu_seqlens=True
+    )
     assert seen["varlen"][7]["check_cu_seqlens"] is True
 
 
@@ -1493,8 +1487,9 @@ def test_nope_autograd_matches_explicit_backward_and_casts_kv_grad_to_the_leaf()
     _require_nope_program(backward=True)
     inp = _nope_inputs(256, 1024, seed=NOPE_SEED, topk=128)
     leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention_nope(*leaves, inp.idx_global, return_lse=True)
+    out, lse = cake_dsa_sparse_attention_nondet_nope(
+        *leaves, inp.idx_global, return_lse=True
+    )
     with pytest.raises(NotImplementedError, match="lse"):
         torch.autograd.grad(lse.sum(), leaves)
     grads = torch.autograd.grad(out, leaves, inp.dout)
@@ -1510,8 +1505,7 @@ def test_nope_autograd_matches_explicit_backward_and_casts_kv_grad_to_the_leaf()
     _check_nope_grads(dq, dkv, ref)
     acc = torch.zeros(inp.total_k, 704, device="cuda")
     leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
-    with _quiet_experimental():
-        out = dsa_sparse_attention_nope(*leaves, inp.idx_global, dkv_acc=acc)
+    out = cake_dsa_sparse_attention_nondet_nope(*leaves, inp.idx_global, dkv_acc=acc)
     out.backward(inp.dout)
     torch.cuda.synchronize()
     assert leaves[1].grad is None and torch.equal(leaves[0].grad, dq)
@@ -1529,13 +1523,11 @@ def test_nope_public_head_major_dout_and_one_head_kv_leaf():
     assert inp.dout.stride() == (D_LATENT, inp.total_q * D_LATENT, 1)
     dense = inp.dout.contiguous()
     leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
-    with _quiet_experimental():
-        out = dsa_sparse_attention_nope(*leaves, inp.idx_global)
+    out = cake_dsa_sparse_attention_nondet_nope(*leaves, inp.idx_global)
     out.backward(inp.dout)
     one_head = inp.kv.unsqueeze(1).detach().clone().requires_grad_()
     q = inp.q.detach().clone().requires_grad_()
-    with _quiet_experimental():
-        out_h = dsa_sparse_attention_nope(q, one_head, inp.idx_global)
+    out_h = cake_dsa_sparse_attention_nondet_nope(q, one_head, inp.idx_global)
     out_h.backward(dense)
     torch.cuda.synchronize()
     assert torch.equal(out, out_h) and torch.equal(leaves[0].grad, q.grad)
@@ -1555,21 +1547,19 @@ def test_nope_varlen_multi_document_matches_flat_and_reference():
         [300, 517, 0, 1024], [400, 517, 64, 2048], seed=NOPE_SEED + 2, topk=200
     )
     leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_nope_varlen(
-            *leaves,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
+    out_v, lse_v = cake_dsa_sparse_attention_nondet_nope_varlen(
+        *leaves,
+        inp.idx_local,
+        inp.cu_seqlens_q,
+        inp.cu_seqlens_k,
+        inp.max_seqlen_q,
+        inp.max_seqlen_k,
+        return_lse=True,
+    )
     grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
-    with _quiet_experimental():
-        out_f, lse_f = dsa_sparse_attention_nope(
-            inp.q, inp.kv, inp.idx_global, return_lse=True
-        )
+    out_f, lse_f = cake_dsa_sparse_attention_nondet_nope(
+        inp.q, inp.kv, inp.idx_global, return_lse=True
+    )
     torch.cuda.synchronize()
     assert torch.equal(out_v, out_f) and torch.equal(lse_v, lse_f)
     offset = offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k)
@@ -1616,16 +1606,15 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys(route, monkeypatch)
         local[rows] = torch.randint(
             0, lk, (lq, inp.topk), device="cuda", generator=gen
         ).to(torch.int32)
-    with _quiet_experimental():
-        out_c, lse_c = dsa_sparse_attention_nope_varlen(
-            inp.q,
-            inp.kv,
-            local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            causal=True,
-            return_lse=True,
-        )
+    out_c, lse_c = cake_dsa_sparse_attention_nondet_nope_varlen(
+        inp.q,
+        inp.kv,
+        local,
+        inp.cu_seqlens_q,
+        inp.cu_seqlens_k,
+        causal=True,
+        return_lse=True,
+    )
     masked = globalize_gather_indices_loop(
         local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
     ).cuda()
@@ -1639,11 +1628,12 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys(route, monkeypatch)
         mode == "mask"
     ):  # the twin with caller lengths: the masked rows as given, last valid slot + 1
         rows, counts = masked, nope_ref.last_valid_plus_one(masked, inp.total_k)
-    with _quiet_experimental():
-        out_f, lse_f = dsa_sparse_attention_nope(inp.q, inp.kv, masked, return_lse=True)
-        out_s, lse_s = dsa_sparse_attention_nope(
-            inp.q, inp.kv, rows, topk_length=counts, return_lse=True
-        )
+    out_f, lse_f = cake_dsa_sparse_attention_nondet_nope(
+        inp.q, inp.kv, masked, return_lse=True
+    )
+    out_s, lse_s = cake_dsa_sparse_attention_nondet_nope(
+        inp.q, inp.kv, rows, topk_length=counts, return_lse=True
+    )
     torch.cuda.synchronize()
     assert torch.equal(out_c, out_f) and torch.equal(lse_c, lse_f)
     assert torch.equal(out_c, out_s) and torch.equal(lse_c, lse_s)
@@ -1667,40 +1657,39 @@ def test_nope_varlen_rejects_inconsistent_cu_seqlens_through_the_public_entry():
 
     short = cu_k.clone()
     short[-1] = inp.total_k - 64
-    with _quiet_experimental():
-        with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
-            dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, cu_q, short, check_cu_seqlens=True
-            )
-        with pytest.raises(ValueError, match="seqlen_q"):
-            dsa_sparse_attention_nope_varlen(
-                inp.q,
-                inp.kv,
-                inp.idx_local,
-                cu_q,
-                i32(0, 200, inp.total_k),
-                check_cu_seqlens=True,
-            )
-        with pytest.raises(ValueError, match="non-decreasing"):
-            dsa_sparse_attention_nope_varlen(
-                inp.q,
-                inp.kv,
-                inp.idx_local,
-                i32(0, 300, 256, inp.total_q),
-                i32(0, 512, 512, inp.total_k),
-                check_cu_seqlens=True,
-            )
-        with pytest.raises(ValueError, match="int32"):
-            dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, cu_q.long(), cu_k
-            )
-        with pytest.raises(ValueError, match="must be contiguous"):
-            dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, torch.stack([cu_q, cu_q], 1)[:, 0], cu_k
-            )
-        out = dsa_sparse_attention_nope_varlen(
-            inp.q, inp.kv, inp.idx_local, cu_q, short
+    with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            inp.q, inp.kv, inp.idx_local, cu_q, short, check_cu_seqlens=True
         )
+    with pytest.raises(ValueError, match="seqlen_q"):
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            inp.q,
+            inp.kv,
+            inp.idx_local,
+            cu_q,
+            i32(0, 200, inp.total_k),
+            check_cu_seqlens=True,
+        )
+    with pytest.raises(ValueError, match="non-decreasing"):
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            inp.q,
+            inp.kv,
+            inp.idx_local,
+            i32(0, 300, 256, inp.total_q),
+            i32(0, 512, 512, inp.total_k),
+            check_cu_seqlens=True,
+        )
+    with pytest.raises(ValueError, match="int32"):
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            inp.q, inp.kv, inp.idx_local, cu_q.long(), cu_k
+        )
+    with pytest.raises(ValueError, match="must be contiguous"):
+        cake_dsa_sparse_attention_nondet_nope_varlen(
+            inp.q, inp.kv, inp.idx_local, torch.stack([cu_q, cu_q], 1)[:, 0], cu_k
+        )
+    out = cake_dsa_sparse_attention_nondet_nope_varlen(
+        inp.q, inp.kv, inp.idx_local, cu_q, short
+    )
     torch.cuda.synchronize()
     assert tuple(out.shape) == (inp.total_q, NUM_HEADS, D_LATENT)
 
@@ -1761,24 +1750,25 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size(
         lengths = inp.topk_length
 
         def packed(inp=inp, **kw):
-            return dsa_sparse_attention_nope_varlen(
+            return cake_dsa_sparse_attention_nondet_nope_varlen(
                 inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, **kw
             )
 
-        with _quiet_experimental():
-            packed()  # plan and module load
-            packed(topk_length=lengths)
-            dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
-            names = _cuda_kernel_names(packed)
-            with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
-            flat = _cuda_kernel_names(
-                lambda inp=inp: dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
+        packed()  # plan and module load
+        packed(topk_length=lengths)
+        cake_dsa_sparse_attention_nondet_nope(inp.q, inp.kv, inp.idx_global)
+        names = _cuda_kernel_names(packed)
+        with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
+        flat = _cuda_kernel_names(
+            lambda inp=inp: cake_dsa_sparse_attention_nondet_nope(
+                inp.q, inp.kv, inp.idx_global
             )
-            flat_cut = _cuda_kernel_names(
-                lambda inp=inp: dsa_sparse_attention_nope(
-                    inp.q, inp.kv, inp.idx_global, topk_length=lengths
-                )
+        )
+        flat_cut = _cuda_kernel_names(
+            lambda inp=inp: cake_dsa_sparse_attention_nondet_nope(
+                inp.q, inp.kv, inp.idx_global, topk_length=lengths
             )
+        )
         want = 1 if small else 2
         assert len(names) == want and len(with_cut) == 2, (mode, names, with_cut)
         assert names == flat, (mode, names, flat)
@@ -1815,7 +1805,7 @@ def test_rope_varlen_launch_count_is_the_stage_and_the_forward():
         lengths = torch.full((T,), topk, dtype=torch.int32, device="cuda")
 
         def packed(**kw):
-            return dsa_sparse_attention_varlen(
+            return cake_dsa_sparse_attention_nondet_varlen(
                 *args,
                 inp.idx_local,
                 inp.cu_seqlens_q,
@@ -1824,13 +1814,12 @@ def test_rope_varlen_launch_count_is_the_stage_and_the_forward():
                 **kw,
             )
 
-        with _quiet_experimental():
-            packed()
-            names = _cuda_kernel_names(packed)
-            with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
-            flat = _cuda_kernel_names(
-                lambda: dsa_sparse_attention(*args, inp.idx_global)
-            )
+        packed()
+        names = _cuda_kernel_names(packed)
+        with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
+        flat = _cuda_kernel_names(
+            lambda: cake_dsa_sparse_attention_nondet(*args, inp.idx_global)
+        )
         assert len(names) == 2 and len(with_cut) == 2, (names, with_cut)
         assert len(flat) == 1 and names[-1] == flat[0], (names, flat)
 
@@ -1849,17 +1838,16 @@ def test_public_rope_head_major_dout_autograd_matches_the_dense_gradients():
 
     def grads_of(dout, varlen):
         leaves = [t.detach().clone().requires_grad_() for t in args]
-        with _quiet_experimental():
-            if varlen:
-                out = dsa_sparse_attention_varlen(
-                    *leaves,
-                    inp.idx_local,
-                    inp.cu_seqlens_q,
-                    inp.cu_seqlens_k,
-                    causal=True,
-                )
-            else:
-                out = dsa_sparse_attention(*leaves, inp.idx_global)
+        if varlen:
+            out = cake_dsa_sparse_attention_nondet_varlen(
+                *leaves,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                causal=True,
+            )
+        else:
+            out = cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global)
         out.backward(dout)
         torch.cuda.synchronize()
         return out, [t.grad for t in leaves]
@@ -1884,10 +1872,9 @@ def test_rope_varlen_entry_captures_into_a_cuda_graph():
     leaves = [t.detach().clone().requires_grad_() for t in args[:2]] + list(args[2:])
 
     def step():
-        with _quiet_experimental():
-            out = dsa_sparse_attention_varlen(
-                *leaves, local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
-            )
+        out = cake_dsa_sparse_attention_nondet_varlen(
+            *leaves, local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
+        )
         dq_latent, dq_rope = torch.autograd.grad(out, leaves[:2], inp.dout)
         return out, dq_latent, dq_rope
 
@@ -1909,3 +1896,262 @@ def test_rope_varlen_entry_captures_into_a_cuda_graph():
     torch.cuda.synchronize()
     for a, b in zip(eager, captured, strict=True):
         assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# torch.use_deterministic_algorithms (issue #8928): this non-deterministic package raises PyTorch's alert at its
+# backward (the dK / dV FP32 atomics) and never at the forward; with warn_only=True it warns and runs its own
+# backward (there is no other package to fall back to)
+# ---------------------------------------------------------------------------
+
+ALERT = "does not have a deterministic implementation"
+ALERT_ENTRIES = ("rope", "rope_varlen", "nope", "nope_varlen")
+# The entry names this package's alerts carry: the bound rope / NoPE backward and the prepared runners' backward.
+ALERT_NAMES = (
+    cake_backend.ROPE_BACKWARD_ENTRY,
+    cake_backend.NOPE_BACKWARD_ENTRY,
+    "DSATrainRunner.backward",
+    "DSANopeTrainRunner.backward",
+)
+
+
+@contextlib.contextmanager
+def _alerts_once(name: str):
+    """Expect exactly one alert of this package inside the block (``warn_only=True``), the one of ``name``; warnings
+    of other operations are ignored."""
+    with pytest.warns(UserWarning, match=ALERT) as record:
+        yield
+    ours = [
+        str(w.message)
+        for w in record
+        if any(str(w.message).startswith(f"{n} {ALERT}") for n in ALERT_NAMES)
+    ]
+    assert len(ours) == 1 and ours[0].startswith(f"{name} {ALERT}"), ours
+
+
+@contextlib.contextmanager
+def _torch_deterministic(*, warn_only: bool):
+    enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=was_warn_only)
+
+
+def _alert_case(entry: str):
+    """``(leaf sources, call(*leaves) -> out, dout, number of query leaves)`` of one public entry point: two
+    documents, so the varlen entries pack them."""
+    if entry.startswith("rope"):
+        _require_program(backward=True)
+        inp = make_inputs([64, 200], [128, 384], seed=SEED + 40, topk=128)
+        sources = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+        num_q = 2
+
+        def call(*leaves):
+            if entry == "rope":
+                return cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global)
+            return cake_dsa_sparse_attention_nondet_varlen(
+                *leaves,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                inp.max_seqlen_q,
+                inp.max_seqlen_k,
+            )
+
+    else:
+        _require_nope_program(backward=True)
+        inp = _nope_inputs([64, 200], [128, 384], seed=NOPE_SEED + 40, topk=128)
+        sources = (inp.q, inp.kv)
+        num_q = 1
+
+        def call(*leaves):
+            if entry == "nope":
+                return cake_dsa_sparse_attention_nondet_nope(*leaves, inp.idx_global)
+            return cake_dsa_sparse_attention_nondet_nope_varlen(
+                *leaves,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                inp.max_seqlen_q,
+                inp.max_seqlen_k,
+            )
+
+    return sources, call, inp.dout, num_q
+
+
+@pytest.mark.parametrize("entry", ALERT_ENTRIES)
+def test_torch_deterministic_mode_raises_at_the_backward_only(entry):
+    """Under ``torch.use_deterministic_algorithms(True)`` the forward of every entry point runs (fixed-order, the
+    output of the forward outside the mode) and its autograd backward raises PyTorch's ``RuntimeError``; no gradient
+    reaches the leaves (the prepared-runner test checks that no backward buffer is written)."""
+    sources, call, dout, _ = _alert_case(entry)
+    leaves = [t.detach().clone().requires_grad_() for t in sources]
+    expected = call(*leaves).detach()
+    with _torch_deterministic(warn_only=False):
+        out = call(*leaves)
+        with pytest.raises(RuntimeError, match=ALERT):
+            out.backward(dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out.detach(), expected)
+    assert all(leaf.grad is None for leaf in leaves)
+
+
+@pytest.mark.parametrize("entry", ALERT_ENTRIES)
+def test_torch_deterministic_warn_only_warns_and_runs_this_package(entry):
+    """With ``warn_only=True`` the backward warns once (the alert of the bound rope or NoPE backward) and runs this
+    package's backward: the query gradients are the ones outside the mode bitwise (fixed-order), the key gradients
+    within the FP32 reduction spread."""
+    sources, call, dout, num_q = _alert_case(entry)
+    name = (
+        cake_backend.ROPE_BACKWARD_ENTRY
+        if entry.startswith("rope")
+        else cake_backend.NOPE_BACKWARD_ENTRY
+    )
+    leaves = [t.detach().clone().requires_grad_() for t in sources]
+    expected = torch.autograd.grad(call(*leaves), leaves, dout)
+    with _torch_deterministic(warn_only=True):
+        out = call(*leaves)
+        with _alerts_once(name):
+            got = torch.autograd.grad(out, leaves, dout)
+    torch.cuda.synchronize()
+    for g, e in zip(got[:num_q], expected[:num_q], strict=True):
+        assert torch.equal(g, e)
+    for g, e in zip(got[num_q:], expected[num_q:], strict=True):
+        assert g.dtype == e.dtype and rel_l2(g, e) < 1e-2
+
+
+# The backward buffers of a prepared runner: the outputs and, where the binding has them, the FP32 accumulators the
+# backward zero-fills first.
+RUNNER_BACKWARD_BUFFERS = (
+    "dq_latent",
+    "dq_rope",
+    "dkv_latent",
+    "dk_rope",
+    "dkv",
+    "dkv_latent_acc",
+    "dk_rope_acc",
+)
+
+
+def _fill_backward_buffers(runner) -> dict[str, torch.Tensor]:
+    """Fill the backward buffers of ``runner`` with a sentinel; returns them by name."""
+    buffers = {
+        name: runner.tensors[name]
+        for name in RUNNER_BACKWARD_BUFFERS
+        if name in runner.tensors
+    }
+    assert "dq_latent" in buffers, sorted(runner.tensors)
+    for buffer in buffers.values():
+        buffer.fill_(3.0)
+    return buffers
+
+
+def test_torch_deterministic_mode_explicit_and_prepared_backwards_alert():
+    """The eager ``backward`` / ``backward_nope`` and the prepared runners' ``backward`` alert too: in strict mode a
+    runner's backward raises before it writes a backward buffer (the sentinel in every output and accumulator stays);
+    with ``warn_only`` each warns once, under its own entry name, and runs its backward (query gradients bitwise the
+    ones outside the mode, key gradients within the FP32 reduction spread).  Their forwards never alert."""
+    _require_program(backward=True)
+    _require_nope_program(backward=True)
+    inp = make_inputs([256], [512], seed=SEED + 41, topk=128)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    nope = _nope_inputs(256, 512, seed=NOPE_SEED + 41, topk=128)
+    nope_args = (nope.q, nope.kv, nope.idx_global)
+    o, lse, o_lo = cake_backend.forward(*args)
+    eager_expected = cake_backend.backward(*args, o, o_lo, lse, inp.dout)
+    no, nlse, no_lo = cake_backend.forward_nope(*nope_args)
+    nope_eager_expected = cake_backend.backward_nope(
+        *nope_args, no, no_lo, nlse, nope.dout
+    )
+    runner = prepare_dsa_train(*args, dout=inp.dout, backward=True)
+    nope_runner = cake_backend.prepare_dsa_nope_train(
+        *nope_args, dout=nope.dout, backward=True
+    )
+    runner.forward()
+    expected = [t.clone() for t in runner.backward()]
+    nope_runner.forward()
+    nope_expected = [t.clone() for t in nope_runner.backward()]
+    with _torch_deterministic(warn_only=False):
+        o, lse, o_lo = cake_backend.forward(*args)
+        with pytest.raises(RuntimeError, match=ALERT):
+            cake_backend.backward(*args, o, o_lo, lse, inp.dout)
+        no, nlse, no_lo = cake_backend.forward_nope(*nope_args)
+        with pytest.raises(RuntimeError, match=ALERT):
+            cake_backend.backward_nope(*nope_args, no, no_lo, nlse, nope.dout)
+        runner.forward()
+        buffers = _fill_backward_buffers(runner)
+        with pytest.raises(RuntimeError, match="DSATrainRunner.backward " + ALERT):
+            runner.backward()
+        nope_runner.forward()
+        nope_buffers = _fill_backward_buffers(nope_runner)
+        with pytest.raises(RuntimeError, match="DSANopeTrainRunner.backward " + ALERT):
+            nope_runner.backward()
+        torch.cuda.synchronize()
+        for name, buffer in {**buffers, **nope_buffers}.items():
+            assert torch.all(buffer == 3.0), name
+    with _torch_deterministic(warn_only=True):
+        with _alerts_once(cake_backend.ROPE_BACKWARD_ENTRY):
+            eager_got = cake_backend.backward(*args, o, o_lo, lse, inp.dout)
+        with _alerts_once(cake_backend.NOPE_BACKWARD_ENTRY):
+            nope_eager_got = cake_backend.backward_nope(
+                *nope_args, no, no_lo, nlse, nope.dout
+            )
+        with _alerts_once("DSATrainRunner.backward"):
+            got = runner.backward()
+        with _alerts_once("DSANopeTrainRunner.backward"):
+            nope_got = nope_runner.backward()
+    torch.cuda.synchronize()
+    for g, e in ((eager_got, eager_expected), (got, expected)):
+        assert torch.equal(g[0], e[0]) and torch.equal(g[1], e[1])
+        assert rel_l2(g[2], e[2]) < 1e-2 and rel_l2(g[3], e[3]) < 1e-2
+    assert torch.equal(nope_eager_got[0], nope_eager_expected[0])
+    assert rel_l2(nope_eager_got[1], nope_eager_expected[1]) < 1e-2
+    assert nope_expected[1] is not None and nope_got[1] is not None
+    assert torch.equal(nope_got[0], nope_expected[0])
+    assert rel_l2(nope_got[1], nope_expected[1]) < 1e-2
+
+
+@pytest.mark.parametrize("warn_only", [None, False, True])
+def test_alert_follows_torch_deterministic_mode(warn_only):
+    """The alert helper itself (CPU): nothing outside the mode; ``RuntimeError`` under it; a ``UserWarning`` naming
+    the entry with ``warn_only=True``.  Its message names no other package to fall back to."""
+    alert = cake_backend._alert_nondeterministic
+    entry = cake_backend.ROPE_BACKWARD_ENTRY
+    if warn_only is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            alert(entry)
+        return
+    with _torch_deterministic(warn_only=warn_only):
+        if warn_only:
+            with pytest.warns(UserWarning, match=f"{entry} {ALERT}") as record:
+                alert(entry)
+            message = str(record[0].message)
+        else:
+            with pytest.raises(RuntimeError, match=f"{entry} {ALERT}") as info:
+                alert(entry)
+            message = str(info.value)
+    assert "_det_train" not in message
+
+
+def test_torch_deterministic_mode_zero_query_rows_launch_and_alert_nothing():
+    """A call without query rows launches nothing, so its backward has no non-deterministic step and does not alert
+    (CPU: the empty path never reaches a kernel)."""
+    q, kv, idx = _host_inputs(total_q=0, total_k=16, topk=5)
+    leaves = [
+        t.detach().clone().requires_grad_()
+        for t in (
+            q[..., :D_LATENT],
+            q[..., D_LATENT:],
+            kv[:, :D_LATENT],
+            kv[:, D_LATENT:],
+        )
+    ]
+    dout = torch.zeros(0, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    with _torch_deterministic(warn_only=False):
+        out = cake_dsa_sparse_attention_nondet(*leaves, idx)
+        grads = torch.autograd.grad(out, leaves, dout)
+    assert torch.all(grads[2] == 0) and torch.all(grads[3] == 0)

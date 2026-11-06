@@ -16,7 +16,7 @@ limitations under the License.
 
 # Host backend of the Cake DSA sparse-attention training program (SM100 /
 # SM103 / SM107): input validation, workspace layout, varlen index offsetting,
-# the prepared runner, the eager entry points and the autograd Function.
+# the prepared runner, the eager entry points and the autograd Functions.
 #
 # * Forward writes ``out [T, 64, 512]`` BF16, ``lse [T, 64]`` FP32 (natural
 #   log over the valid keys; ``-inf`` for a fully masked row, whose ``out`` is
@@ -49,19 +49,27 @@ limitations under the License.
 #   workspace.
 # * The native zero-RoPE (NoPE) program (``cake_jit.NOPE_PROGRAM``) serves the
 #   same contract without rope operands: ``forward_nope`` / ``backward_nope``,
-#   ``prepare_dsa_nope_train`` and ``DSASparseAttentionNopeFunction`` take
+#   ``prepare_dsa_nope_train`` and ``CakeDSASparseAttentionNondetNopeFunction`` take
 #   ``q [T, 64, 512]`` and the shared latent ``kv [S, 512]`` (K = V), default
 #   softmax scale 1/16, and return one combined natural-layout FP32 ``dkv = dK
 #   + dV [S, 512]`` -- fresh (a new buffer per call) or accumulated (``+=``)
 #   into the caller's ``dkv_acc``.  The RoPE entry points below are untouched;
 #   the NoPE entries share every rope-independent helper (key-range passes,
 #   direct accumulation, workspace carving, index offsetting, the plan cache).
+# * This is the non-deterministic package (``flashinfer.cake_dsa_sparse_attention_nondet_train``): the module name
+#   chooses it and no entry point takes a mode keyword.  Under ``torch.use_deterministic_algorithms(True)`` every
+#   backward launch sequence raises PyTorch's alert before it allocates its backward buffers and launches its first
+#   backward kernel (``_alert_nondeterministic``; with ``warn_only=True`` a ``UserWarning``, then it runs); the
+#   deterministic preparation before it (a ``dout`` copy, the plan of a new binding and its row-length vector, the
+#   ``dkv_acc`` checks) may run first.  The forward never alerts and nothing falls back to another package.
 
 from __future__ import annotations
 
 import functools
+import inspect
 import math
 import threading
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TypeVar, Union, overload
@@ -526,6 +534,65 @@ def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
 
 def default_softmax_scale() -> float:
     return D_QK**-0.5
+
+
+# torch.use_deterministic_algorithms(True): this is the non-deterministic package (the backward adds the dK / dV
+# contributions of every query row with unordered FP32 atomics), so every backward launch sequence raises PyTorch's
+# alert first; the forward and the preparation never do.
+ROPE_BACKWARD_ENTRY = "cake_dsa_sparse_attention_nondet backward"
+NOPE_BACKWARD_ENTRY = "cake_dsa_sparse_attention_nondet_nope backward"
+
+# This package's module prefix (the vendored name of a vendored copy).
+_PACKAGE = __name__.rpartition(".")[0]
+
+
+def _caller_stacklevel() -> int:
+    """The ``stacklevel`` of the nearest frame outside this package and flashinfer, for a warning issued by the
+    function that calls this one: the caller of the entry point, also through the facade and its decorators (an
+    autograd backward reports the autograd frame that called it)."""
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None:
+        parent = frame.f_back
+        level += 1
+        if parent is not None:
+            name = str(parent.f_globals.get("__name__", ""))
+            if not (
+                name == _PACKAGE
+                or name.startswith(_PACKAGE + ".")
+                or name == "flashinfer"
+                or name.startswith("flashinfer.")
+            ):
+                return level
+        frame = parent
+    return 2
+
+
+def _alert_nondeterministic(entry: str) -> None:
+    """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic algorithms
+    are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
+    warn_only=True)`` after which the backward runs; nothing otherwise.  Called by every backward launch sequence
+    (the bound backward of the rope and NoPE programs and the prepared runners' ``backward``) before it allocates its
+    backward buffers or launches a backward kernel; the deterministic preparation of the outer entries (a ``dout``
+    copy, the plan of a new binding and its row-length vector, the ``dkv_acc`` checks) may run before it.  A backward without query rows launches
+    nothing and does not alert.  There is no fallback: the
+    deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a reserved name (planned).  The alert
+    is raised here because PyTorch exposes no public Python entry for it."""
+    if not torch.are_deterministic_algorithms_enabled():
+        return
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        warnings.warn(
+            f"{entry} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'",
+            UserWarning,
+            stacklevel=_caller_stacklevel(),
+        )
+        return
+    raise RuntimeError(
+        f"{entry} does not have a deterministic implementation, but you set "
+        "'torch.use_deterministic_algorithms(True)'; use the 'warn_only=True' option if that is acceptable for your "
+        "application"
+    )
 
 
 def record_for(
@@ -2021,6 +2088,7 @@ class DSATrainRunner:
             raise NotImplementedError(
                 "this runner was prepared without the backward (pass dout / backward=True)"
             )
+        _alert_nondeterministic("DSATrainRunner.backward")
         t = self.tensors
         if not self.dkv_direct:
             t["dkv_latent_acc"].zero_()
@@ -2421,6 +2489,7 @@ class _Binding:
         dkv_dst_map=None,
         check_dst_map=False,
     ):
+        _alert_nondeterministic(ROPE_BACKWARD_ENTRY)
         plan = self.plan
         T, S, device = plan.num_queries, plan.num_kv, q_latent.device
 
@@ -2827,7 +2896,7 @@ def backward(
     )
 
 
-class DSASparseAttentionFunction(torch.autograd.Function):
+class CakeDSASparseAttentionNondetFunction(torch.autograd.Function):
     """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward.
 
     Every tensor the forward produces or consumes for the backward goes through ``ctx.save_for_backward`` (nine
@@ -2955,7 +3024,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         return (dq_latent, dq_rope, dkv_latent, dk_rope) + (None,) * 10
 
 
-def dsa_sparse_attention(
+def cake_dsa_sparse_attention_nondet(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -2972,7 +3041,7 @@ def dsa_sparse_attention(
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
 ):
-    """Autograd entry of the flat form (see :mod:`flashinfer.dsa_sparse_attention`).
+    """Autograd entry of the flat form (see :mod:`flashinfer.cake_dsa_sparse_attention_nondet_train`).
 
     Strided query slices and packed key rows are consumed in place (see
     :func:`_check_head_tensor` / :func:`_check_key_tensor`).  ``key_passes``
@@ -2996,7 +3065,7 @@ def dsa_sparse_attention(
     ``dkv_dst_map`` in the backward, one device synchronization) are handed to
     the backward as well (see :func:`backward`).  ``num_segments``
     is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
-    a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
+    a packed batch; :func:`cake_dsa_sparse_attention_nondet_varlen` passes it): the
     backward's whole-row key-range passes apply to one-segment rows only.
     Without ``topk_length`` the per-row lengths (last valid slot + 1 under
     the rule ``0 <= idx < num_kv``, 0 if none) are derived once per step by the
@@ -3013,7 +3082,7 @@ def dsa_sparse_attention(
             (int(q_latent.shape[0]),), dtype=torch.int32, device=q_latent.device
         )
         derive = True
-    out, lse = DSASparseAttentionFunction.apply(
+    out, lse = CakeDSASparseAttentionNondetFunction.apply(
         q_latent,
         q_rope,
         kv_latent,
@@ -3032,7 +3101,7 @@ def dsa_sparse_attention(
     return (out, lse) if return_lse else out
 
 
-def dsa_sparse_attention_varlen(
+def cake_dsa_sparse_attention_nondet_varlen(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -3072,7 +3141,7 @@ def dsa_sparse_attention_varlen(
     kernels then read the compacted rows and their counts.  ``max_seqlen_q/k``
     are accepted for signature parity and not used on the host.  ``dkv_acc`` /
     ``dkv_dst_map`` / ``dkv_direct`` (default ``None``) / ``check_dst_map``
-    (default ``False``) as in :func:`dsa_sparse_attention`.  The segment count
+    (default ``False``) as in :func:`cake_dsa_sparse_attention_nondet`.  The segment count
     ``len(cu_seqlens_k) - 1`` (host metadata, no device sync) is passed on as
     ``num_segments``: with more than one segment the backward plans the
     single-pass stage unless ``key_passes`` overrides.  The autograd function
@@ -3111,7 +3180,7 @@ def dsa_sparse_attention_varlen(
             compact=True,
             topk_length=topk_length,
         )
-    return dsa_sparse_attention(
+    return cake_dsa_sparse_attention_nondet(
         q_latent,
         q_rope,
         kv_latent,
@@ -3547,6 +3616,7 @@ class DSANopeTrainRunner(DSATrainRunner):
             raise NotImplementedError(
                 "this runner was prepared without the backward (pass dout / backward=True)"
             )
+        _alert_nondeterministic("DSANopeTrainRunner.backward")
         t = self.tensors
         if self.dkv_direct:
             if self.fresh_dkv:
@@ -3904,6 +3974,7 @@ class _NopeBinding(_Binding):
         """``(dq, dkv)`` over the settled ``operands``: the fresh buffers are allocated (``torch.empty``) and the
         launch values bound before the first launch; then the zero fills of the FP32 buffers this call owns and the
         stages follow back to back, with no host work between the launches."""
+        _alert_nondeterministic(NOPE_BACKWARD_ENTRY)
         plan = self.plan
         T, S, device = plan.num_queries, plan.num_kv, dout.device
         dq = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
@@ -4166,7 +4237,7 @@ def backward_nope(
     )
 
 
-class DSASparseAttentionNopeFunction(torch.autograd.Function):
+class CakeDSASparseAttentionNondetNopeFunction(torch.autograd.Function):
     """Autograd wrapper of the NoPE program: saves every tensor the backward reads and settles the rest of it at
     forward time (:class:`_NopeBackwardPrep`).
 
@@ -4454,7 +4525,7 @@ def _nope_backward_from_ctx(ctx, dout) -> tuple[torch.Tensor, Optional[torch.Ten
     return ctx.nope_prep.backward(ctx.saved_tensors, dout)
 
 
-def dsa_sparse_attention_nope(
+def cake_dsa_sparse_attention_nondet_nope(
     q_latent: torch.Tensor,
     kv_latent: torch.Tensor,
     indices: torch.Tensor,
@@ -4469,7 +4540,7 @@ def dsa_sparse_attention_nope(
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
 ):
-    """Autograd entry of the flat NoPE form (see :mod:`flashinfer.dsa_sparse_attention`).
+    """Autograd entry of the flat NoPE form (see :mod:`flashinfer.cake_dsa_sparse_attention_nondet_train`).
 
     ``kv_latent`` is ``[S, 512]`` or its one-head form ``[S, 1, 512]`` (squeezed here; the gradient reaches the
     leaf through the view).  ``softmax_scale`` defaults to 1/16.  Without ``dkv_acc`` the ``kv_latent`` gradient
@@ -4480,7 +4551,7 @@ def dsa_sparse_attention_nope(
     at forward time; every tensor this call produces for the backward is saved through ``ctx.save_for_backward``
     (a tensor ``dkv_acc`` stays caller-owned on the node) and a checkpointed forward retains nothing of this call.
     ``key_passes``, ``dkv_dst_map``, ``num_segments``, ``dkv_direct`` and
-    ``check_dst_map`` as in :func:`dsa_sparse_attention`.  Without ``topk_length`` the route follows the table
+    ``check_dst_map`` as in :func:`cake_dsa_sparse_attention_nondet`.  Without ``topk_length`` the route follows the table
     size (:func:`nope_flat_index_mode`).  Below :data:`NOPE_CONVERT_SLOT_LIMIT` slots the forward kernel alone
     reads the index rows (any row stride) as given and derives each row's length -- the last valid slot + 1 --
     while it runs, into a ``[T]`` vector the backward reads with the caller's rows: one launch, a ``-1`` anywhere
@@ -4500,7 +4571,7 @@ def dsa_sparse_attention_nope(
     # without caller lengths the Function derives them (derive_topk_length): in-kernel below the slot limit, as
     # the counts of the flat stage at or above it
     derive = topk_length is None and q_latent.shape[0] > 0
-    out, lse = DSASparseAttentionNopeFunction.apply(
+    out, lse = CakeDSASparseAttentionNondetNopeFunction.apply(
         q_latent,
         kv_latent,
         indices,
@@ -5184,7 +5255,7 @@ def _flat_forward_nope(q_latent, kv_latent, indices, softmax_scale):
     return out, lse, o_lo, indices_c, counts
 
 
-class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
+class CakeDSASparseAttentionNondetNopeVarlenFunction(torch.autograd.Function):
     """Autograd wrapper of the packed NoPE form with on-device index preparation.
 
     Fifteen forward inputs ``(q_latent, kv_latent, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal,
@@ -5199,7 +5270,7 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
     (explicit only): the forward kernel writes the same compacted rows and counts as the stage itself.  On every
     route the plan lookup, the output allocation and the forward's launch values are prepared before the first
     launch, and nothing on the path synchronizes with the device.  The backward is that of
-    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths -- the rows in the order the
+    :class:`CakeDSASparseAttentionNondetNopeFunction` over the saved global rows and lengths -- the rows in the order the
     forward processed them, so forward and backward see the same slots (the stage's rows and counts on the
     ``"index_prep"`` route, also with caller lengths): every produced
     operand of the backward goes through ``ctx.save_for_backward`` and a tensor ``dkv_acc`` stays caller-owned on
@@ -5269,7 +5340,7 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
         return _nope_backward_from_ctx(ctx, dout) + (None,) * 13
 
 
-def dsa_sparse_attention_nope_varlen(
+def cake_dsa_sparse_attention_nondet_nope_varlen(
     q_latent: torch.Tensor,
     kv_latent: torch.Tensor,
     gather_kv_indices: torch.Tensor,
@@ -5310,7 +5381,7 @@ def dsa_sparse_attention_nope_varlen(
     also checks their values (:func:`validate_cu_seqlens`: start at 0, non-decreasing, ``cu_seqlens_q[-1] == T``,
     ``cu_seqlens_k[-1] == S``, ``seqlen_q <= seqlen_k`` per document) at the cost of one blocking device-to-host
     copy before any launch (skipped during CUDA-graph capture); the default leaves those invariants to the caller,
-    as a violation is otherwise not detected on device.  Other arguments as in :func:`dsa_sparse_attention_nope`.
+    as a violation is otherwise not detected on device.  Other arguments as in :func:`cake_dsa_sparse_attention_nondet_nope`.
     """
     del max_seqlen_q, max_seqlen_k
     kv_latent = _kv_latent_rows(kv_latent)
@@ -5329,7 +5400,7 @@ def dsa_sparse_attention_nope_varlen(
     if (
         num_queries == 0
     ):  # no rows: nothing to offset, nothing launched downstream either
-        return dsa_sparse_attention_nope(
+        return cake_dsa_sparse_attention_nondet_nope(
             q_latent,
             kv_latent,
             gather_kv_indices,
@@ -5344,7 +5415,7 @@ def dsa_sparse_attention_nope_varlen(
             check_dst_map=check_dst_map,
         )
     mode = varlen_index_mode(gather_kv_indices, caller_lengths=topk_length is not None)
-    out, lse = DSASparseAttentionNopeVarlenFunction.apply(
+    out, lse = CakeDSASparseAttentionNondetNopeVarlenFunction.apply(
         q_latent,
         kv_latent,
         gather_kv_indices,
@@ -5377,7 +5448,7 @@ def forward_nope_varlen(
     check_cu_seqlens: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Kernel-level packed NoPE forward without autograd: the validation and the index route of
-    :func:`dsa_sparse_attention_nope_varlen` (:func:`nope_varlen_index_mode`), returning
+    :func:`cake_dsa_sparse_attention_nondet_nope_varlen` (:func:`nope_varlen_index_mode`), returning
     ``(out, lse, o_lo, indices, topk_length)`` -- the forward outputs plus the global key rows and row lengths the
     forward read: below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths the position-preserving rows
     (the global key or ``-1`` at the slot it came from) and the last valid slot + 1 per row, written by the
