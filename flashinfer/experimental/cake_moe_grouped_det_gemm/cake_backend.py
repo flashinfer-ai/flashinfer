@@ -957,13 +957,16 @@ class GroupedDetGemmLaunch:
     == "composed"``) adds into ``out`` at every ``launch()`` and every replay of
     a graph that captured it (it is not idempotent): ``add_from`` is the
     scratch the bound programs write, and the launch adds it into ``out`` with
-    ``out.add_`` on the same stream (which bumps ``out._version``), outside
-    autograd.  The scratch is owned by the prepared launch, as its descriptor
-    slots are, so one prepared accumulate launch must not be in flight on two
-    streams at once, and the launch must be kept alive while any graph that
-    captured it may replay (a graph does not keep the scratch alive).  A
-    launch prepared inside a captured backward allocates the scratch from, and
-    returns it to, the graph's pool within that backward.
+    ``out.add_`` on the same stream (which bumps ``out._version`` at
+    ``launch()`` and at capture, not at a graph replay), outside autograd.  The
+    scratch is owned by the prepared launch, as its descriptor slots are, and
+    is allocated on the stream current at the preparation (no
+    ``record_stream``), so one prepared accumulate launch must not be in flight
+    on two streams at once, the launch must be kept alive while any graph that
+    captured it may replay (a graph does not keep the scratch alive), and after
+    a launch on another stream it must be kept alive until that launch
+    completes.  A launch prepared inside a captured backward allocates the
+    scratch from, and returns it to, the graph's pool within that backward.
     """
 
     op: str

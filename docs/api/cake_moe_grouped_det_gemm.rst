@@ -1,7 +1,7 @@
 .. _apicake_moe_grouped_det_gemm:
 
-Cake ragged BF16 grouped GEMM (experimental)
-============================================
+Cake deterministic ragged BF16 grouped GEMM (experimental)
+==========================================================
 
 .. currentmodule:: flashinfer.grouped_mm
 
@@ -119,13 +119,16 @@ same stream, outside autograd.
 - Checks (``ValueError``, before anything is allocated or bound): ``out`` given,
   ``out_dtype`` None or its dtype, bf16 or fp32, no overlap of ``out`` with itself, ``g``,
   ``x`` or ``offs``.  Row and expert padding is never read or written.
-- Prepared launches: every ``launch()`` and every CUDA graph replay adds again.  The
-  scratch is owned by the prepared launch: keep the launch alive while a graph that
-  captured it may replay, and do not run one prepared accumulate launch on two streams at
-  once.
+- Prepared launches: every ``launch()`` and every CUDA graph replay adds again (the add
+  bumps ``out._version`` at ``launch()`` and at capture, not at a replay).  The scratch is
+  owned by the prepared launch and allocated on the stream current at the preparation:
+  keep the launch alive while a graph that captured it may replay and, after a launch on
+  another stream, until that launch completes; do not run one prepared accumulate launch
+  on two streams at once.
 - Autograd flag (the Megatron / Transformer Engine convention): ``w.main_grad`` (fp32 or
-  bf16, ``w``'s shape and device, unit stride along the last dimension) is checked at a
-  forward call that autograd records and read again at the backward; the backward adds
+  bf16, ``w``'s shape and device, unit stride along the last dimension, rows and experts
+  that do not overlap) is checked at a forward call that autograd records and read again
+  at the backward, which also refuses one sharing memory with the operands; the backward adds
   into it and returns a fresh placeholder for ``w`` when ``w`` has
   ``grad_added_to_main_grad`` (``torch.zeros`` under ``zero_out_wgrad``), else none.  Every
   backward adds, also a ``torch.autograd.grad`` whose ``inputs`` exclude ``w``.
@@ -134,8 +137,10 @@ same stream, outside autograd.
   (``ValueError``).
 - Cost (``S = E * N * K``): the scratch takes ``4 * S`` bytes for fp32 (gate/up ``N`` 4096,
   ``K`` 6144: 384 MiB at ``E`` 4 to 3 GiB at ``E`` 32; down ``N`` 6144, ``K`` 2048: 192 MiB
-  to 1.5 GiB) and ``8 * S`` bytes of traffic (written, then read back by the add); the
-  backward's peak is ``2 * S`` bytes above the default flag's bf16 ``w.grad``.  Under
+  to 1.5 GiB) and ``8 * S`` bytes of traffic (written, then read back by the add); with an
+  fp32 ``main_grad`` the backward's peak is ``2 * S`` bytes above the default flag's bf16
+  ``w.grad`` (with a bf16 ``main_grad`` the scratch is ``2 * S`` bytes and the peak is
+  equal).  Under
   ``torch.use_deterministic_algorithms(True)`` with
   ``torch.utils.deterministic.fill_uninitialized_memory`` on, torch also fills the scratch
   and the placeholder with NaN when it allocates them.  The non-deterministic package adds

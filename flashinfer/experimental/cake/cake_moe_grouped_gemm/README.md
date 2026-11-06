@@ -27,13 +27,15 @@ This package and its facade `flashinfer.experimental.cake.grouped_mm` are
 non-deterministic only. Every function (`grouped_gemm_*`, `prepare_grouped_gemm_*`,
 `cake_grouped_mm` / `CakeGroupedMm`, and the facade's four) takes the
 keyword-only `deterministic: bool = True` (`CakeGroupedMm.apply` takes it as its
-fourth argument), and nothing here routes to the deterministic package:
+fourth argument, `True` when omitted; its fifth argument is an internal slot, and
+anything there but `None` raises `TypeError`), and nothing here routes to the
+deterministic package:
 
 | call | result |
 | --- | --- |
 | `deterministic=False` | this package |
 | `deterministic` omitted or `True`, or any value that is not the bool `False` (`None`, `0`, `1`, `"False"`) | `ValueError` naming the deterministic entry (`grouped_det_gemm_*`, `prepare_grouped_det_gemm_*`, `cake_grouped_det_mm`, `CakeGroupedDetMm`) and saying "pass deterministic=False for the non-deterministic path"; nothing runs |
-| `deterministic=False` under `torch.use_deterministic_algorithms(True)` | PyTorch's non-determinism alert immediately before an order-varying launch (`RuntimeError`, nothing launches; `warn_only=True`: a `UserWarning` naming the caller's line, then the launch runs); never a deterministic fallback |
+| `deterministic=False` under `torch.use_deterministic_algorithms(True)` | PyTorch's non-determinism alert, naming the deterministic entry, immediately before an order-varying launch (`RuntimeError`, nothing launches; `warn_only=True`: a `UserWarning`, then the launch runs; it names the caller's line for a direct call of `grouped_gemm_wgrad` or `launch()`, a frame of PyTorch's autograd for the backward); never a deterministic fallback |
 
 An order-varying launch (`GroupedGemmLaunch.order_varying`) is the weight
 gradient whose 512-wide k tile splits its tail (`plan["unordered_tail"]` and

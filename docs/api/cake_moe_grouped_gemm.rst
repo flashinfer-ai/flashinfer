@@ -20,8 +20,10 @@ Mode and dispatch rules
 The facade functions and the package are non-deterministic only; every ND example passes
 ``deterministic=False``.
 
-- ``deterministic`` is keyword-only on every entry (``cake_grouped_mm`` included) and
-  must be the bool ``False``: the call runs the non-deterministic package.
+- ``deterministic`` is keyword-only on every entry (``cake_grouped_mm`` included; the
+  autograd function ``CakeGroupedMm.apply`` takes it fourth, ``True`` when omitted, and
+  refuses anything but ``None`` in its fifth, internal slot with ``TypeError``) and must
+  be the bool ``False``: the call runs the non-deterministic package.
 - Every other value -- the default ``True``, ``None``, ``0``, ``1``, ``"False"`` --
   raises ``ValueError`` naming the deterministic entry (``grouped_det_gemm_fwd`` /
   ``_dgrad`` / ``_wgrad``, ``prepare_grouped_det_gemm_*``, ``cake_grouped_det_mm``) and
@@ -34,9 +36,11 @@ The facade functions and the package are non-deterministic only; every ND exampl
   accumulate mode -- ``grouped_gemm_wgrad``, a prepared launch's ``launch()`` (also
   when the mode was switched on after the preparation; under CUDA graph capture, when
   the launch is captured) and the backward of ``CakeGroupedMm`` when it computes
-  ``dW``.  The alert is a ``RuntimeError`` (nothing launches), or with
-  ``warn_only=True`` a ``UserWarning`` naming the caller's line, after which the launch
-  runs.  The preparation, the forward, the data gradient, the 256-wide k tile's weight
+  ``dW``.  The alert names the deterministic entry; it is a ``RuntimeError`` (nothing
+  launches), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs
+  (it names the caller's line for a direct call of ``grouped_gemm_wgrad`` or
+  ``launch()``, a frame of PyTorch's autograd for the backward).  The preparation, the
+  forward, the data gradient, the 256-wide k tile's weight
   gradient (ordered tail reduce) and an unsplit tail have a fixed order and never alert.
 - No tape, saved tensor or workspace crosses between the two packages: each autograd
   function's backward reads only its own saved tensors.

@@ -55,7 +55,10 @@ route here. The names of this package before the deterministic-family rename
 `flashinfer.grouped_mm.cake`, and `grouped_gemm_*`, `prepare_grouped_gemm_*`,
 `GroupedGemmLaunch`, `CakeGroupedMm`, `cake_grouped_mm`, `grouped_mm_bf16_cake`
 here and in `flashinfer.grouped_mm`) were removed with no alias:
-`ModuleNotFoundError` / `AttributeError`.
+`ModuleNotFoundError` / `AttributeError`. A source checkout that had the old
+package keeps its untracked `__pycache__` directory, which Python then imports as
+an empty namespace package; remove it with
+`git clean -fdX flashinfer/experimental/cake_moe_grouped_gemm`.
 
 ## Usage
 
@@ -179,21 +182,26 @@ padding is allowed and never read or written.
 
 Prepared launches and CUDA graphs: `launch()` and every replay of a graph that
 captured it add again (a prepared accumulate launch is not idempotent); the add
-bumps `out._version`. The scratch is owned by the prepared launch, as its
-descriptor slots are: keep the launch alive while a graph that captured it may
-replay (the graph does not keep the scratch alive), and do not have one
-prepared accumulate launch in flight on two streams at once. A launch prepared
-inside a captured backward allocates the scratch from, and returns it to, the
-graph's pool within that backward. As for any in-place operation, two launches
-into the same `out` on different streams must be ordered by the caller.
+bumps `out._version` at `launch()` and at capture, not at a graph replay. The
+scratch is owned by the prepared launch, as its descriptor slots are, and is
+allocated on the stream current at the preparation: keep the launch alive while
+a graph that captured it may replay (the graph does not keep the scratch
+alive) and, after a launch on another stream, until that launch completes; do
+not have one prepared accumulate launch in flight on two streams at once. A
+launch prepared inside a captured backward allocates the scratch from, and
+returns it to, the graph's pool within that backward. As for any in-place
+operation, two launches into the same `out` on different streams must be
+ordered by the caller.
 
 `cake_grouped_det_mm(x, w, offs, fuse_wgrad_accumulation=True)` follows
 Megatron and Transformer Engine, as the non-deterministic wrapper does:
 `w.main_grad` must be an fp32 or bf16 tensor of `w`'s shape on its device with
-unit stride along the last dimension (row padding allowed). It is checked at
-the forward call when autograd records it (`w` requires grad, grad mode is on,
-not a checkpoint recompute), so not under `torch.no_grad()`, and again at the
-backward, which reads `w.main_grad` then, so a re-pointed buffer is honoured.
+unit stride along the last dimension and rows and experts that do not overlap
+(row padding allowed). It is checked at the forward call when autograd records
+it (`w` requires grad, grad mode is on, not a checkpoint recompute), so not
+under `torch.no_grad()`, and again at the backward, which reads `w.main_grad`
+then, so a re-pointed buffer is honoured, and which also refuses a `main_grad`
+that shares memory with the operands.
 The backward adds the deterministic `dW` into it with the accumulate mode and
 returns for `w` a fresh `torch.empty` of `w`'s shape and dtype when `w` has the
 attribute `grad_added_to_main_grad` (it is set to `True`; `torch.zeros` when
@@ -216,11 +224,12 @@ Cost (`S = E * N * K` elements):
   bf16) for the life of the prepared launch (in the autograd wrapper, the
   weight-gradient launch of one backward). Gate/up projection (`N` 4096, `K`
   6144): 384 MiB at `E` 4, 768 MiB at 8, 1.5 GiB at 16, 3 GiB at 32. Down
-  projection (`N` 6144, `K` 2048): 192 MiB, 384 MiB, 768 MiB, 1.5 GiB. The
-  backward's peak is `2 * S` bytes above the default flag's (a bf16 `w.grad`
-  of `2 * S` bytes that Megatron then adds into `main_grad`); the
-  `grad_added_to_main_grad` placeholder (`2 * S` bytes) is allocated after the
-  scratch is released.
+  projection (`N` 6144, `K` 2048): 192 MiB, 384 MiB, 768 MiB, 1.5 GiB. With an
+  fp32 `main_grad` the backward's peak is `2 * S` bytes above the default
+  flag's (a bf16 `w.grad` of `2 * S` bytes that Megatron then adds into
+  `main_grad`); with a bf16 `main_grad` the scratch is `2 * S` bytes and the
+  peak equals the default flag's. The `grad_added_to_main_grad` placeholder
+  (`2 * S` bytes) is allocated after the scratch is released.
 - Traffic: the programs write the scratch and the add reads it back, `8 * S`
   bytes beyond the add's read and write of `out`; the time is that of the fp32
   weight gradient followed by `main_grad.add_`. The non-deterministic package
