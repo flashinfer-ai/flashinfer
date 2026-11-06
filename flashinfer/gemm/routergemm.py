@@ -2870,9 +2870,10 @@ def tinygemm_bf16(
         ``True``, the kernel uses ``cudaGridDependencySynchronize()`` to overlap
         DMA with the preceding kernel's compute.  Only enable when ALL preceding
         stream operations also use PDL, otherwise the kernel hangs.  The kernel
-        may read ``weight`` and ``bias`` before that dependency wait, so the
-        preceding kernel must not write them; only ``input`` may be its output.
-        Defaults to ``False``.
+        may read ``weight`` before that dependency wait, so the preceding
+        kernel must not write it. The current kernels also read ``bias``
+        before the wait; until that is fixed, the preceding kernel must not
+        write ``bias`` either. Defaults to ``False``.
 
     Notes
     -----

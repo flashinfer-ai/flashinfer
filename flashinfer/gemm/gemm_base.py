@@ -797,7 +797,9 @@ def mm_bf16(
         ``"bf16_gemm_pdl_auto"``, while ``skip_ops={"bf16_gemm"}`` still
         skips such calls. PDL kernels may read ``b`` before waiting for the
         preceding kernel, so pass ``pdl=False`` if a kernel that may still
-        be running writes it. Defaults to ``False`` so
+        be running writes it. The TinyGEMM backend and the CuTeDSL warp
+        split-K kernel currently read ``bias`` before the wait too, so the
+        same applies to ``bias`` there. Defaults to ``False`` so
         autotuning cannot silently enable this input-dependency assumption.
 
     out: Optional[torch.Tensor]
