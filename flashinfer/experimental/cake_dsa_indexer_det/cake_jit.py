@@ -368,6 +368,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "library": "cake_dsa_indexer_det_topk_69d2d7c68ccceb095540",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
+    "cake_dsa_indexer_det_topk_6b45fb65871a9150ff10": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_det_topk_6b45fb65871a9150ff10",
+        "arches": ["sm_107a"],
+    },
     "cake_dsa_indexer_det_topk_7286faf88e17986cff38": {
         "role": "finalize_rank",
         "library": "cake_dsa_indexer_det_topk_7286faf88e17986cff38",
@@ -872,6 +877,7 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "scan:wide:u1:s1:f0": "cake_dsa_indexer_det_topk_99af5257f5e28006f79e",
         "scan:wide:u1:s1:f1": "cake_dsa_indexer_det_topk_e7860bf225417a2a3b51",
         "scan:wide:u2:s0:f0": "cake_dsa_indexer_det_topk_afa89b4033e466d158b1",
+        "scan:wide:u2:s0:f1:fp8": "cake_dsa_indexer_det_topk_6b45fb65871a9150ff10",
     },
 }
 POLICY: dict[str, dict[str, Any]] = {
