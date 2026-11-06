@@ -359,7 +359,12 @@ API. The facade imports its backend inside its functions or through its module
 `__getattr__`, never at module level, and its top-level names in
 `flashinfer/__init__.py` are rows of the lazy-export table `_LAZY_EXPORTS`, so
 `import flashinfer` still loads no backend. Their `csrc/**` ships in every
-wheel, including the release wheel on PyPI.
+wheel, including the release wheel on PyPI, with one exception: the modules
+listed in `_RELEASE_WHEEL_DROPPED_CAKE_BACKENDS` in `build_backend.py`. These
+backends sat at `flashinfer/experimental/<package>/` before #8928 and their
+sources were already left out of the release wheel there; the list keeps the
+release wheel contents and size unchanged after the move. On a release wheel
+their facades import, and the first kernel load raises as described above.
 
 ## Graduation checklist
 

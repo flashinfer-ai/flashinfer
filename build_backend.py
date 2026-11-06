@@ -1220,9 +1220,11 @@ def build_sdist(sdist_directory, config_settings=None):
 # Experimental features are JIT-only and intended for main-branch users
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
 # 100 MB. The Cake training backends one level deeper,
-# flashinfer/experimental/cake/<pkg>/csrc/**, are not matched and ship in every
-# wheel: they back the stable flashinfer.cake_<op>_<det|nondet>_train[_kcp]
-# facades (#8928). The Python modules, build.json manifests and route catalogs stay, so
+# flashinfer/experimental/cake/<module>/csrc/**, back the stable
+# flashinfer.cake_<op>_<det|nondet>_train[_kcp] facades (#8928) and are not
+# matched by the pattern; only the modules listed in
+# _RELEASE_WHEEL_DROPPED_CAKE_BACKENDS lose their csrc/**. The Python modules,
+# build.json manifests and route catalogs stay, so
 # `import flashinfer` is unchanged and an experimental kernel load fails on
 # first use; the marker file below says why and where the sources are.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
@@ -1230,6 +1232,18 @@ _EXPERIMENTAL_SOURCES_MARKER = "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.
 _EXPERIMENTAL_SOURCES_RE = re.compile(
     r"^(flashinfer/experimental/[^/]+/csrc/|flashinfer/data/csrc/experimental/)"
 )
+# Cake training backends under flashinfer/experimental/cake/<module>/ whose
+# csrc/** the flag also drops. Each row is the module name of a backend that sat
+# at flashinfer/experimental/<package>/ before #8928 and was dropped there, so
+# moving it keeps the release wheel contents (and size) unchanged. The PR that
+# moves such a backend adds its row; every other backend under
+# experimental/cake keeps its sources in every wheel.
+_RELEASE_WHEEL_DROPPED_CAKE_BACKENDS: frozenset[str] = frozenset(
+    (
+        # "cake_<op>_<det|nondet>_train[_kcp]",
+    )
+)
+_CAKE_BACKEND_SOURCES_RE = re.compile(r"^flashinfer/experimental/cake/([^/]+)/csrc/")
 _THIRD_PARTY_ROOTS = (
     "flashinfer/data/cutlass/",
     "flashinfer/data/spdlog/",
@@ -1246,8 +1260,9 @@ _THIRD_PARTY_KEEP = (
 )
 _EXPERIMENTAL_SOURCES_MARKER_TEXT = """\
 This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: the
-generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc
-and csrc/experimental) are not included, so that the release wheel stays under
+generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc,
+csrc/experimental and the Cake backends listed in _RELEASE_WHEEL_DROPPED_CAKE_BACKENDS
+of build_backend.py) are not included, so that the release wheel stays under
 PyPI's per-file size limit. Experimental APIs import normally but raise when they
 first try to compile a kernel. To use them, install a nightly wheel from
 https://flashinfer.ai/whl or install from source:
@@ -1259,9 +1274,12 @@ See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
 def _wheel_entry_dropped(name: str, exclude_experimental: bool) -> bool:
     if name.startswith(_THIRD_PARTY_ROOTS):
         return not name.startswith(_THIRD_PARTY_KEEP)
-    if exclude_experimental and _EXPERIMENTAL_SOURCES_RE.match(name):
+    if not exclude_experimental:
+        return False
+    if _EXPERIMENTAL_SOURCES_RE.match(name):
         return True
-    return False
+    cake = _CAKE_BACKEND_SOURCES_RE.match(name)
+    return cake is not None and cake.group(1) in _RELEASE_WHEEL_DROPPED_CAKE_BACKENDS
 
 
 def _record_hash(data: bytes) -> str:
