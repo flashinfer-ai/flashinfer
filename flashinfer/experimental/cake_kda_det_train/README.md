@@ -546,7 +546,7 @@ the serial rows below 16 heads, and no `dav` launch elsewhere: the fused
 gradient hosts `dA_qk` (`dqkg_davq`) on the serial rows from 16 heads and on
 every segmented row, whose adjoint recurrence accumulates `dv` (on `sm_107a`
 from 16 heads the fused gradient is its `_nohint` build: the same kernel with
-the L2 prefetch and evict-first hints off); the adjoint recurrence
+the L2 prefetch and evict-first hints off, built for `sm_107a` alone); the adjoint recurrence
 `dhu` (the state gradient `dh` and `dv2`: `dhu_v1` / `dhu_v1_wt` or `dhu_v2t`
 on the serial forms; on the segmented route two launches around a reverse
 `seg_carry` (`seg_carry_v8` on its rows), every form accumulating `dv1` itself: on the few-chain rows
@@ -608,7 +608,8 @@ arch)` resolves them once per problem into `Plan.records[path][stage]` (cached
 on its arguments; `arch=None` takes the current CUDA device's architecture, or
 the first exported one when no exported device is present), and
 `Plan.launch_count(path)` is the launch count of each path (`"bwd"`: the
-backward from the plan's own light saved set).
+backward from the plan's own light saved set; the in-kernel Q/K L2 norm
+fallback's replay counts `qk_l2norm` and no `qk_apply`, the launches it makes).
 
 ### Programs by stage
 
@@ -616,9 +617,9 @@ backward from the plan's own light saved set).
 mode's (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `bwd_prep_g8_noqg` and
 `bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel, and the four
-raw prep records four keyword forms of another; four records
-ship on some of the architectures only: `glm_intra_v14`, `glm_intra_v18`, `glm_intra` and
-`gate_epilogue`; `wy_bwd` and `wy_fwd_rows`
+raw prep records four keyword forms of another; the records shipped
+on some of the architectures only are `glm_intra_v14`, `glm_intra_v18`, `glm_intra`,
+`gate_epilogue`, `fwd_intra_v37_l2n`, `glm_intra_v30_l2n` and the two `_nohint` records (`sm_107a`); `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
 and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
 `fwdh_p3_o_ov_id` and their `_rows` twins are the only programs launched with
@@ -646,7 +647,7 @@ record in both modes.
 | `bwd_prep` | `bwd_prep_g8_noqg`, `bwd_prep_g8_noqg_nokb`, `bwd_prep_g8`, `bwd_prep_g8_replay`; raw: the four `_raw` twins | backward; one CTA per chunk and head: `_noqg` on the light paths (the saved `qg`), `_noqg_nokb` on the light paths of the rows whose set carries `w` / `u` (the paired serial 16-head rows of `sm_100a`, the segmented 16-head rows of `sm_103a` / `sm_107a` above 32 chains: no `k * beta`), `bwd_prep_g8` on `tape`, `_replay` on the replay (it keeps the internal `dout` copy) |
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
-| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` from 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
+| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` from 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off, built for `sm_107a` alone; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
 | `glm_intra` | `glm_intra_v14`, `glm_intra_v18`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` and `glm_intra_v18` on `sm_107a` (the gate epilogue fused: they write the token-row `dg` / `dbeta` themselves; `glm_intra_v18` names every named-barrier slot with an immediate, so two CTAs share an SM on `sm_107a`), `glm_intra` on `sm_100a`; raw gate mode: `glm_intra_raw` on every architecture (the raw gate's gradient formed in its drain: it writes the token-row `dg` / `dbeta` and the per-chunk partials of `dA_log` / `ddt_bias`) |
 | `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` in the default gate mode (the GLM intra programs of `sm_103a` / `sm_107a` host it; none in raw gate mode) |
 | `param_finalize` | `param_finalize` | raw gate mode alone: once per backward call on every path, after the last tail range and document group (grid rule `heads`: one CTA per head); `dA_log` / `ddt_bias` from the per-chunk partials of the real chunks |

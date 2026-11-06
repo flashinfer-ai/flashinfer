@@ -57,6 +57,7 @@ nn_n128_m64_hen_t_pro7__f32(const __grid_constant__ CUtensorMap A, const __grid_
 nn_n128_m64_t_pro7__f32(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 #endif  // CAKE_DPG_NN_N128_M64_T_PRO7__F32_SELECT
 {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -159,6 +160,7 @@ nn_n128_m64_t_pro7__f32(const __grid_constant__ CUtensorMap A, const __grid_cons
     }
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     const int taddr = tmem_addr_storage[0];
     // Kernel post-init ops
     const int tmem_accum = taddr;

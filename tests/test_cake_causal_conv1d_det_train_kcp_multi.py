@@ -414,8 +414,8 @@ def test_multi_one_rank_issues_no_exchange(monkeypatch) -> None:
 
 
 def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
-    """The KCP facade's ``cake_causal_conv1d_det_multi_kcp`` is exported, takes ``recompute_handle`` keyword-only
-    (default ``None``), is the det facade's previous ``cake_causal_conv1d_kcp_multi``, and importing either facade
+    """The KCP facade's ``cake_causal_conv1d_det_multi_kcp`` is exported, takes ``recompute_handle`` and ``cooperative``
+    keyword-only (default ``None``), is the det facade's previous ``cake_causal_conv1d_kcp_multi``, and importing either facade
     still does not import the KCP host modules (fresh interpreter)."""
     import subprocess
     import sys
@@ -427,9 +427,10 @@ def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
         "kcp = 'flashinfer.cake_causal_conv1d_det_train_backend.kcp'\n"
         "assert kcp not in sys.modules\n"
         "s = inspect.signature(f.cake_causal_conv1d_det_multi_kcp).parameters\n"
-        "assert list(s) == ['xs', 'weights', 'ctx', 'recompute_handle'], list(s)\n"
-        "p = s['recompute_handle']\n"
-        "assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None\n"
+        "assert list(s) == ['xs', 'weights', 'ctx', 'recompute_handle', 'cooperative'], list(s)\n"
+        "for n in ('recompute_handle', 'cooperative'):\n"
+        "    p = s[n]\n"
+        "    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None, n\n"
         "assert d.cake_causal_conv1d_kcp_multi is f.cake_causal_conv1d_det_multi_kcp\n"
         "assert 'cake_causal_conv1d_det_multi_kcp' in f.__all__ and kcp not in sys.modules\n"
         "print('FACADE_MULTI_OK')\n"
@@ -438,3 +439,28 @@ def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
     )
     assert r.returncode == 0 and "FACADE_MULTI_OK" in r.stdout, (r.stdout, r.stderr)
+
+
+@pytest.mark.parametrize("cooperative", [True, False])
+def test_multi_launch_form_bitwise_single_calls(cooperative) -> None:
+    """``cooperative`` (FlashInfer issue #8365) applies to every tensor of a multi call: outputs and gradients are
+    bitwise the single calls with the same form, through the explicit backward and the autograd entry."""
+    conv_kcp = _kcp()
+    device = torch.device("cuda")
+    ctx, xs, ws, dys = _problem(
+        (5000, 1003), (1, 2, 4997, 1003), (512, 256, 1024), device
+    )
+    _, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(xs, ws, ctx)
+    dxs, dws = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
+        xs, ws, ctx, dys, hists, cooperative=cooperative
+    )
+    xg = [x.clone().requires_grad_(True) for x in xs]
+    wg = [w.clone().requires_grad_(True) for w in ws]
+    ys = conv_kcp.cake_causal_conv1d_det_multi_kcp(xg, wg, ctx, cooperative=cooperative)
+    torch.autograd.backward(ys, dys)
+    for i, (x, w, dy, hist) in enumerate(zip(xs, ws, dys, hists, strict=True)):
+        dx1, dw1 = conv_kcp.cake_causal_conv1d_det_backward_kcp(
+            x, w, ctx, dy, hist, cooperative=cooperative
+        )
+        assert _same(dxs[i], dx1) and _same(dws[i], dw1), i
+        assert _same(xg[i].grad, dx1) and _same(wg[i].grad, dw1), i

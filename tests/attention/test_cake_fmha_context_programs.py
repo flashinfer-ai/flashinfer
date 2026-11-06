@@ -108,6 +108,70 @@ SHAPE_ROWS = {
         "context_fp8", 4, 128, 1024, 30, 5, 16, True,
         {"sm100a": "RUNTIME_PACK2", "sm103a": "RUNTIME_PACK2_PX"},
     ),
+    # BF16 calls no exact route serves: the runtime-size program of the JIT
+    # pack, every page size.
+    "bf16_b16_q32_k1024_g8_page32": (
+        "context_bf16", 16, 32, 1024, 32, 4, 32, True,
+        {"sm100a": "RUNTIME_PACK8", "sm103a": "RUNTIME_PACK8"},
+    ),
+    "bf16_b4_q64_k1024_g4_page64": (
+        "context_bf16", 4, 64, 1024, 32, 8, 64, True,
+        {"sm100a": "RUNTIME_PACK4", "sm103a": "RUNTIME_PACK4"},
+    ),
+    "bf16_b2_q256_k2048_g1_page1024": (
+        "context_bf16", 2, 256, 2048, 16, 16, 1024, False,
+        {"sm100a": "RUNTIME_PACK1", "sm103a": "RUNTIME_PACK1"},
+    ),
+    "bf16_b4_q2048_k2048_g5": (
+        "context_bf16", 4, 2048, 2048, 40, 8, 16, True,
+        {"sm100a": "RUNTIME_PACK5", "sm103a": "RUNTIME_PACK5"},
+    ),
+    # JIT packs 5 and 7: the runtime-size program of that pack (sm103a, at most
+    # 128 keys: the default-ring program).
+    "fp8_b8_q32_k1024_g5_page16": (
+        "context_fp8", 8, 32, 1024, 40, 8, 16, True,
+        {"sm100a": "RUNTIME_PACK5", "sm103a": "RUNTIME_PACK5_PX"},
+    ),
+    "fp8_b4_q100_k2048_g7": (
+        "context_fp8", 4, 100, 2048, 28, 4, 64, True,
+        {"sm100a": "RUNTIME_PACK7_PAGE64", "sm103a": "RUNTIME_PACK7_PAGE64_PX"},
+    ),
+    "fp8_b4_q16_k128_g5": (
+        "context_fp8", 4, 16, 128, 20, 4, 64, True,
+        {"sm100a": "RUNTIME_PACK5_PAGE64", "sm103a": "RUNTIME_PACK5_PAGE64"},
+    ),
+    # JIT packs 6, 12 and 16 where the dividing pack runs more tile work: the
+    # runtime-size program of that pack.
+    "fp8_b8_q32_k1024_g6_page16": (
+        "context_fp8", 8, 32, 1024, 30, 5, 16, True,
+        {"sm100a": "RUNTIME_PACK6", "sm103a": "RUNTIME_PACK6_PX"},
+    ),
+    "fp8_b4_q8_k2048_g12": (
+        "context_fp8", 4, 8, 2048, 48, 4, 64, True,
+        {"sm100a": "RUNTIME_PACK12_PAGE64", "sm103a": "RUNTIME_PACK12_PAGE64_PX"},
+    ),
+    "fp8_b4_q4_k1024_g16_page16": (
+        "context_fp8", 4, 4, 1024, 32, 2, 16, True,
+        {"sm100a": "RUNTIME_PACK16", "sm103a": "RUNTIME_PACK16_PX"},
+    ),
+    # NVFP4 calls no exact route serves: the runtime-size program of the JIT
+    # pack, one per target.
+    "nvfp4_b16_q256_k2048_g8": (
+        "context_nvfp4", 16, 256, 2048, 32, 4, 16, True,
+        {"sm100a": "RUNTIME_PACK8_SM100A", "sm103a": "RUNTIME_PACK8_SM103A"},
+    ),
+    "nvfp4_b4_q2048_k2048_g4": (
+        "context_nvfp4", 4, 2048, 2048, 32, 8, 16, True,
+        {"sm100a": "RUNTIME_PACK4_SM100A", "sm103a": "RUNTIME_PACK4_SM103A"},
+    ),
+    "nvfp4_b4_q2048_k2048_g5": (
+        "context_nvfp4", 4, 2048, 2048, 40, 8, 16, True,
+        {"sm100a": "RUNTIME_PACK5_SM100A", "sm103a": "RUNTIME_PACK5_SM103A"},
+    ),
+    "nvfp4_b16_q512_k512_g1": (
+        "context_nvfp4", 16, 512, 512, 8, 8, 16, True,
+        {"sm100a": "RUNTIME_PACK1_SM100A", "sm103a": "RUNTIME_PACK1_SM103A"},
+    ),
 }  # fmt: skip
 # The device-scale program of a host-scale one; a runtime-size program serves
 # both scale forms itself.
@@ -124,10 +188,32 @@ _FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_PX"}
 # The suffix of a target's runtime-size programs: sm103a ships the 4-stage
 # K/V ring builds with each stage's P tile in the other stage's S columns.
 _RUNTIME_SUFFIX = {"sm100a": "", "sm103a": "_PX"}
-# runtime-size program identifier -> its pack
+# runtime-size program identifier -> its pack (the programs of the other
+# forms too)
 _RUNTIME_PACK = {
     identifier: pack
     for routes in cake_api._CONTEXT_FP8_RUNTIME_ROUTES.values()
+    for (pack, _), identifier in routes.items()
+}
+_RUNTIME_PACK |= {
+    identifier: pack
+    for routes in cake_api._CONTEXT_FP8_RUNTIME_FORM_ROUTES.values()
+    for (_, pack, _), identifier in routes.items()
+}
+
+
+# BF16 runtime-size program identifier -> its pack
+_BF16_RUNTIME_PACK = {
+    identifier: pack
+    for routes in cake_api._CONTEXT_BF16_RUNTIME_ROUTES.values()
+    for (pack, _), identifier in routes.items()
+}
+
+
+# NVFP4 runtime-size program identifier -> its pack
+_NVFP4_RUNTIME_PACK = {
+    identifier: pack
+    for routes in cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES.values()
     for (pack, _), identifier in routes.items()
 }
 
@@ -201,6 +287,7 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
             served.setdefault((key[0], identifier), set()).add(_TARGET_ARCH[target])
     for table in (
         cake_api._CONTEXT_FP8_RUNTIME_ROUTES,
+        cake_api._CONTEXT_FP8_RUNTIME_FORM_ROUTES,
         cake_api._CONTEXT_FP8_SPLIT_ROUTES,
         cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES,
     ):
@@ -209,6 +296,16 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 served.setdefault(("context_fp8", identifier), set()).add(
                     _TARGET_ARCH[target]
                 )
+    for target, routes in cake_api._CONTEXT_BF16_RUNTIME_ROUTES.items():
+        for identifier in routes.values():
+            served.setdefault(("context_bf16", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
+    for target, routes in cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES.items():
+        for identifier in routes.values():
+            served.setdefault(("context_nvfp4", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
     for target, short in cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.items():
         for identifier, _ in short.values():
             served.setdefault(("context_fp8", identifier), set()).add(
@@ -244,6 +341,10 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
         params = (
             cake_api._CONTEXT_FP8_SPLIT_PARAMS
             if identifier in _SPLIT_PACK
+            else cake_api._CONTEXT_BF16_RUNTIME_PARAMS
+            if num_m_blocks is None and component == "context_bf16"
+            else cake_api._CONTEXT_NVFP4_RUNTIME_PARAMS
+            if num_m_blocks is None and component == "context_nvfp4"
             else cake_api._CONTEXT_FP8_RUNTIME_PARAMS
             if num_m_blocks is None
             else cake_api._CONTEXT_HOST_PARAMS[component]
@@ -252,11 +353,16 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
         assert tuple(program.block) == (512, 1, 1), identifier
         assert program.use_pdl is False and program.cooperative is False
         assert one_tile == (component == "context_bf16" and num_m_blocks in (11, 6))
-        assert (num_m_blocks is None) == (
-            identifier in _RUNTIME_PACK
-            or identifier in _SPLIT_PACK
-            or identifier in _ONE_STAGE_PACK
-        ), identifier
+        if component == "context_bf16":
+            assert (num_m_blocks is None) == (identifier in _BF16_RUNTIME_PACK)
+        elif component == "context_nvfp4":
+            assert (num_m_blocks is None) == (identifier in _NVFP4_RUNTIME_PACK)
+        else:
+            assert (num_m_blocks is None) == (
+                identifier in _RUNTIME_PACK
+                or identifier in _SPLIT_PACK
+                or identifier in _ONE_STAGE_PACK
+            ), identifier
     for component in _COMPONENTS:
         pinned = {
             name
@@ -311,6 +417,11 @@ def test_cake_fmha_context_launch_grid() -> None:
     )
     with pytest.raises(RuntimeError, match="takes the m-block count per launch"):
         cake_api.cake_fmha_context_launch_grid(runtime, 12, 148)
+    nvfp4 = SimpleNamespace(
+        name=cake_api._CONTEXT_PROGRAMS[("context_nvfp4", "RUNTIME_PACK8_SM100A")][0]
+    )
+    assert cake_api.cake_fmha_context_launch_grid(nvfp4, 12, 148, 2) == (24, 1, 1)
+    assert cake_api.cake_fmha_context_launch_grid(nvfp4, 512, 148, 3) == (148, 1, 1)
 
 
 # --- The shape rows through route selection (host-only) ----------------------
@@ -392,6 +503,7 @@ def test_cake_fmha_context_route_serves_shape_rows_as_pinned(
     monkeypatch, target, row
 ) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(cake_api, "context_nvfp4_programs_unavailable", lambda: None)
     component = SHAPE_ROWS[row][0]
     program = SHAPE_ROWS[row][-1][target]
     # Meta tensors: route selection reads no tensor value.
@@ -409,6 +521,14 @@ def test_cake_fmha_context_route_serves_shape_rows_as_pinned(
         # the runtime-size program's pack and the m-block count of the call
         pack = _RUNTIME_PACK[program]
         q_len = SHAPE_ROWS[row][2]
+        assert route.pack_g == pack
+        assert route.num_m_blocks == -(-q_len // (2 * (128 // pack)))
+    if program in _NVFP4_RUNTIME_PACK:
+        # the JIT pack of the call and its m-block count; one program serves
+        # both scale forms
+        pack = _NVFP4_RUNTIME_PACK[program]
+        _, _, q_len, kv_len, hq, hkv, *_ = SHAPE_ROWS[row]
+        assert pack == cake_api._context_pack_g(q_len, kv_len, hq, hkv)
         assert route.pack_g == pack
         assert route.num_m_blocks == -(-q_len // (2 * (128 // pack)))
     device_route = cake_api.select_cake_fmha_context_route(
@@ -482,22 +602,16 @@ def test_cake_fmha_context_widened_classes_route_to_the_row_program(
         ("bf16_b128_q64_k2048", {"is_causal": False}),
         ("bf16_b128_q64_k2048", {"lse": "lse"}),
         ("bf16_b128_q64_k2048", {"sinks": "sinks"}),
-        ("fp8_b256_q32_k1024", {"lse": "lse"}),
-        ("fp8_b64_q32_k1024_g4", {"lse": "lse"}),
-        ("fp8_b64_q32_k1024_g4", {"sinks": "sinks"}),
-        ("fp8_b64_q32_k1024_g4", {"is_causal": False}),
-        ("fp8_b4_q128_k1024_g6_page16", {"is_causal": False}),
+        ("fp8_b64_q32_k1024_g4", {"lse": "lse", "sinks": "sinks"}),
         ("nvfp4_b4_q511_k2047", {"sinks": "sinks"}),
-        ("bf16_b128_q64_k2048", {"max_q_len": 32}),
-        ("bf16_b128_q64_k2048", {"max_q_len": 65}),
-        ("bf16_b1_q8192_k8192", {"max_q_len": 8160}),
-        ("nvfp4_b4_q511_k2047", {"max_q_len": 480}),
-        ("bf16_b4_q511_k2047", {"max_kv_len": 2048}),
-        ("bf16_b4_q511_k2047", {"kv_layout": "NHD"}),
-        ("bf16_b4_q257_k1024_page1024", {"max_q_len": 256}),
+        ("nvfp4_b4_q511_k2047", {"lse": "lse"}),
+        ("nvfp4_b4_q511_k2047", {"is_causal": False}),
         # sm100a, 256 x 8 (request, KV head) streams: the power limit keeps the
         # JIT module where the query tokens need two stages of its pack
         ("fp8_b256_q32_k1024", {"num_kv_heads": 8, "max_q_len": 33}),
+        # and so it does for the calls of the other forms
+        ("fp8_b256_q32_k1024", {"num_kv_heads": 8, "max_q_len": 33, "lse": "lse"}),
+        ("fp8_b256_q32_k1024", {"num_kv_heads": 8, "is_causal": False}),
     ],
 )
 def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
@@ -529,6 +643,166 @@ def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
     assert route is None or route.program is None, (row, mutation, route)
 
 
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("row", "mutation"),
+    [
+        ("bf16_b128_q64_k2048", {"max_q_len": 32}),
+        ("bf16_b128_q64_k2048", {"max_q_len": 65}),
+        ("bf16_b1_q8192_k8192", {"max_q_len": 8160}),
+        ("bf16_b4_q511_k2047", {"max_kv_len": 2048}),
+        ("bf16_b4_q511_k2047", {"kv_layout": "NHD"}),
+        ("bf16_b4_q257_k1024_page1024", {"max_q_len": 256}),
+        ("bf16_b16_q32_k1024_g8_page32", {"max_q_len": 4096, "max_kv_len": 4096}),
+        ("bf16_b4_q64_k1024_g4_page64", {"max_kv_len": 64}),
+    ],
+)
+def test_cake_fmha_context_bf16_calls_outside_the_exact_programs_take_the_runtime_program_of_their_jit_pack(
+    monkeypatch, target, row, mutation
+) -> None:
+    """A causal BF16 call without LSE or sink that no exact route serves runs
+    the runtime-size program of its JIT pack (:func:`_context_pack_g`), where
+    the target ships one and the call is not one of the power-of-two query
+    lengths it leaves to the JIT module, else the JIT module."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    kwargs = _context_kwargs(row, device="meta")
+    kwargs.update(mutation)
+    route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+    assert route is not None and route.component == "context_bf16"
+    assert route.exact_profile is None
+    pack = cake_api._context_pack_g(
+        kwargs["max_q_len"],
+        kwargs["max_kv_len"],
+        kwargs["query"].shape[1],
+        kwargs["key_cache"].shape[1],
+    )
+    expected = _bf16_runtime_program(target, kwargs)
+    assert route.program == expected, (row, mutation, route)
+    assert route.pack_g == pack
+
+
+def _bf16_runtime_program(target, kwargs):
+    """The runtime-size program a causal BF16 call without LSE or sink
+    (``select_cake_fmha_context_route`` inputs) takes when no exact route
+    serves it: its JIT pack's program unless the target leaves its power-of-two
+    query length to the JIT module (:data:`_CONTEXT_BF16_RUNTIME_POW2_Q`), else
+    ``None`` (the JIT module)."""
+
+    q_len, kv_len = kwargs["max_q_len"], kwargs["max_kv_len"]
+    heads = kwargs["query"].shape[1]
+    pack = cake_api._context_pack_g(q_len, kv_len, heads, kwargs["key_cache"].shape[1])
+    pow2_q = cake_api._CONTEXT_BF16_RUNTIME_POW2_Q.get(target)
+    if (
+        pow2_q is not None
+        and pack > 1
+        and q_len >= pow2_q[0]
+        and q_len & (q_len - 1) == 0
+        and kv_len >= pow2_q[1]
+    ):
+        return None
+    return cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target].get((pack, None))
+
+
+# Causal BF16 calls without LSE or sink on either side of the power-of-two
+# query lengths sm100a leaves to the JIT module
+# (:data:`_CONTEXT_BF16_RUNTIME_POW2_Q`): (batch, max_q_len, max_kv_len,
+# num_q_heads, num_kv_heads, served by the runtime-size program on sm100a).
+# sm103a leaves none of them.
+_BF16_POW2_Q_ROWS = [
+    (1, 8192, 16384, 32, 4, False),
+    (4, 8192, 16384, 32, 4, False),
+    (1, 8192, 14336, 32, 4, False),
+    (1, 16384, 16384, 32, 4, False),
+    (1, 4096, 16384, 64, 4, False),
+    (1, 8064, 16384, 32, 4, True),
+    (1, 8320, 16384, 32, 4, True),
+    (1, 12288, 16384, 32, 4, True),
+    (1, 24576, 24576, 32, 4, True),
+    (1, 8192, 12288, 32, 4, True),
+    (1, 2048, 16384, 32, 4, True),
+    (1, 8192, 16384, 32, 32, True),
+]
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("row", _BF16_POW2_Q_ROWS)
+def test_cake_fmha_context_bf16_pow2_query_lengths_keep_the_jit(
+    monkeypatch, target, row
+) -> None:
+    """A causal BF16 call without LSE or sink at a JIT pack above 1 whose
+    query length is a power of two the target leaves to the JIT module keeps
+    the JIT module; every other call takes the runtime-size program of its
+    pack."""
+
+    batch, q_len, kv_len, hq, hkv, served = row
+    served = served or target != "sm100a"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    pack = cake_api._context_pack_g(q_len, kv_len, hq, hkv)
+    kwargs = _context_kwargs(
+        ("context_bf16", batch, q_len, kv_len, hq, hkv, 16, True, None),
+        device="meta",
+    )
+    assert (_bf16_runtime_program(target, kwargs) is not None) == served, row
+    route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+    assert route is not None and route.exact_profile is None, row
+    assert route.pack_g == pack
+    table = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target]
+    assert route.program == (table[(pack, None)] if served else None), (
+        row,
+        route.program,
+    )
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("batch", "q_len", "kv_len", "hq", "hkv"),
+    [
+        # the exact Q511 class but for the m-block count (pack 8)
+        (4, 480, 2047, 32, 4),
+        (4, 300, 1500, 32, 4),
+        (160, 32, 512, 32, 4),
+        (2, 2048, 2048, 8, 1),
+        (3, 200, 1000, 32, 8),
+        (6, 128, 700, 12, 3),
+        (4, 257, 1300, 40, 8),
+        (3, 700, 900, 8, 8),
+        (16, 512, 512, 40, 8),
+        # a GQA group of 3 (no runtime-size program of pack 3)
+        (2, 64, 2048, 24, 8),
+    ],
+)
+def test_cake_fmha_context_nvfp4_calls_outside_the_exact_programs_take_the_runtime_program_of_their_jit_pack(
+    monkeypatch, target, batch, q_len, kv_len, hq, hkv
+) -> None:
+    """A causal NVFP4 call that no exact route serves runs the runtime-size
+    program of its JIT pack (:func:`_context_pack_g`) and m-block count, with
+    host and with device scales, where the target ships one and the CUDA
+    toolkit builds the NVFP4 programs, else the JIT module."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(cake_api, "context_nvfp4_programs_unavailable", lambda: None)
+    row = ("context_nvfp4", batch, q_len, kv_len, hq, hkv, 16, True, None)
+    pack = cake_api._context_pack_g(q_len, kv_len, hq, hkv)
+    expected = cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES[target].get((pack, None))
+    for device_scales in (False, True):
+        kwargs = _context_kwargs(row, device_scales=device_scales, device="meta")
+        route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+        assert route is not None and route.component == "context_nvfp4"
+        assert route.device_scales is device_scales
+        assert route.program == expected, (row, route)
+        assert route.pack_g == pack
+        assert route.num_m_blocks == -(-q_len // (2 * (128 // pack)))
+    # A toolkit that cannot build the NVFP4 programs: the JIT module.
+    monkeypatch.setattr(
+        cake_api, "context_nvfp4_programs_unavailable", lambda: "an old toolkit"
+    )
+    kwargs = _context_kwargs(row, device="meta")
+    route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+    assert route is not None and route.program is None
+    assert route.pack_g == pack
+
+
 # --- The FP8 runtime-size route (host-only) ---------------------------------
 
 # Every measured FP8 shape: (target, shape, batch, max_q_len, max_kv_len,
@@ -537,8 +811,16 @@ def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
 # back-to-back processes with an A/A band; a shape within 2 % of it counts as
 # a win only when it also wins under five seeded memory layouts.  The route
 # gives every measured loss to the JIT module, and every measured win but
-# three to the runtime-size program (sm100a ``g4_q4`` under the sm100a stream
-# rule, ``e_g5_causal`` on both targets under the tile-work rule).
+# one to the runtime-size program (sm100a ``g4_q4`` under the sm100a stream
+# rule).  The rows of JIT packs 7 and 5, and those of JIT packs 6 and 16 whose
+# dividing pack runs more tile work than the JIT pack (``g6_q4``, ``g6_q32``,
+# ``g6_q64``, ``g16_q4``, ``g16_q16``), take the runtime-size program of the
+# JIT pack (timed against the JIT module the same way), but where the sm100a
+# power rule keeps the JIT module (``g5_q192``, ``g7_q192``: the own packs keep
+# the rule over every cache), and on sm100a over caches of more than 8192 keys
+# with more than 64 (request, KV head) streams (``own_*_k16384``: median wins
+# of 1 .. 3 % whose slowest round fell inside the A/A band in some of ten
+# seeded memory layouts).
 _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "g1_q4", 256, 4, 1024, 32, 32, 1, True),
     ("sm103a", "g1_q32", 256, 32, 1024, 32, 32, 1, True),
@@ -552,19 +834,19 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "g4_q4", 256, 4, 1024, 32, 8, 4, True),
     ("sm103a", "g4_q32", 256, 32, 1024, 32, 8, 4, True),
     ("sm103a", "g4_q256", 16, 256, 2048, 32, 8, 4, True),
-    ("sm103a", "g5_q4", 256, 4, 1024, 30, 6, 5, False),
-    ("sm103a", "g5_q32", 256, 32, 1024, 30, 6, 5, False),
+    ("sm103a", "g5_q4", 256, 4, 1024, 30, 6, 5, True),
+    ("sm103a", "g5_q32", 256, 32, 1024, 30, 6, 5, True),
     ("sm103a", "g5_q256", 16, 256, 2048, 30, 6, 1, True),
-    ("sm103a", "g6_q4", 256, 4, 1024, 30, 5, 6, False),
-    ("sm103a", "g6_q32", 256, 32, 1024, 30, 5, 6, False),
+    ("sm103a", "g6_q4", 256, 4, 1024, 30, 5, 6, True),
+    ("sm103a", "g6_q32", 256, 32, 1024, 30, 5, 6, True),
     ("sm103a", "g6_q256", 16, 256, 2048, 30, 5, 1, True),
-    ("sm103a", "g7_q4", 256, 4, 1024, 28, 4, 7, False),
-    ("sm103a", "g7_q32", 256, 32, 1024, 28, 4, 7, False),
+    ("sm103a", "g7_q4", 256, 4, 1024, 28, 4, 7, True),
+    ("sm103a", "g7_q32", 256, 32, 1024, 28, 4, 7, True),
     ("sm103a", "g7_q256", 16, 256, 2048, 28, 4, 1, True),
     ("sm103a", "g8_q4", 256, 4, 1024, 32, 4, 8, True),
     ("sm103a", "g8_q32", 256, 32, 1024, 32, 4, 8, True),
     ("sm103a", "g8_q256", 16, 256, 2048, 32, 4, 8, True),
-    ("sm103a", "g16_q4", 256, 4, 1024, 32, 2, 16, False),
+    ("sm103a", "g16_q4", 256, 4, 1024, 32, 2, 16, True),
     ("sm103a", "g16_q32", 256, 32, 1024, 32, 2, 16, True),
     ("sm103a", "g16_q256", 16, 256, 2048, 32, 2, 16, True),
     ("sm103a", "g32_q4", 256, 4, 1024, 32, 1, 32, False),
@@ -583,7 +865,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "s_b32_q128_g8", 32, 128, 4096, 32, 4, 8, True),
     ("sm103a", "n_q1_b255_p64", 255, 1, 1024, 32, 4, 8, True),
     ("sm103a", "n_g8_h64_q32_b3", 3, 32, 2000, 64, 8, 8, True),
-    ("sm103a", "e_g5_causal", 2, 200, 700, 10, 2, 5, False),
+    ("sm103a", "e_g5_causal", 2, 200, 700, 10, 2, 5, True),
     ("sm103a", "n_g4_q8_b6", 6, 8, 1024, 16, 4, 4, True),
     ("sm103a", "n_q300_b2_p16", 2, 300, 1500, 32, 4, 8, True),
     ("sm103a", "e_tail_h64", 1, 1000, 1333, 64, 8, 8, True),
@@ -597,15 +879,15 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "g8_q128", 256, 128, 1024, 32, 4, 8, True),
     ("sm103a", "g3_q64", 256, 64, 1024, 30, 10, 3, False),
     ("sm103a", "g3_q128", 256, 128, 1024, 30, 10, 3, False),
-    ("sm103a", "g5_q64", 256, 64, 1024, 30, 6, 5, False),
-    ("sm103a", "g5_q128", 256, 128, 1024, 30, 6, 5, False),
-    ("sm103a", "g5_q192", 256, 192, 1024, 30, 6, 5, False),
-    ("sm103a", "g6_q64", 256, 64, 1024, 30, 5, 6, False),
+    ("sm103a", "g5_q64", 256, 64, 1024, 30, 6, 5, True),
+    ("sm103a", "g5_q128", 256, 128, 1024, 30, 6, 5, True),
+    ("sm103a", "g5_q192", 256, 192, 1024, 30, 6, 5, True),
+    ("sm103a", "g6_q64", 256, 64, 1024, 30, 5, 6, True),
     ("sm103a", "g6_q128", 256, 128, 1024, 30, 5, 6, True),
-    ("sm103a", "g7_q64", 256, 64, 1024, 28, 4, 7, False),
-    ("sm103a", "g7_q128", 256, 128, 1024, 28, 4, 7, False),
-    ("sm103a", "g7_q192", 256, 192, 1024, 28, 4, 7, False),
-    ("sm103a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
+    ("sm103a", "g7_q64", 256, 64, 1024, 28, 4, 7, True),
+    ("sm103a", "g7_q128", 256, 128, 1024, 28, 4, 7, True),
+    ("sm103a", "g7_q192", 256, 192, 1024, 28, 4, 7, True),
+    ("sm103a", "g16_q16", 256, 16, 1024, 32, 2, 16, True),
     ("sm103a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
     ("sm100a", "g1_q4", 256, 4, 1024, 32, 32, 1, False),
     ("sm100a", "g1_q32", 256, 32, 1024, 32, 32, 1, False),
@@ -619,19 +901,19 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q4", 256, 4, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q32", 256, 32, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q256", 16, 256, 2048, 32, 8, 4, True),
-    ("sm100a", "g5_q4", 256, 4, 1024, 30, 6, 5, False),
-    ("sm100a", "g5_q32", 256, 32, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q4", 256, 4, 1024, 30, 6, 5, True),
+    ("sm100a", "g5_q32", 256, 32, 1024, 30, 6, 5, True),
     ("sm100a", "g5_q256", 16, 256, 2048, 30, 6, 1, True),
-    ("sm100a", "g6_q4", 256, 4, 1024, 30, 5, 6, False),
-    ("sm100a", "g6_q32", 256, 32, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q4", 256, 4, 1024, 30, 5, 6, True),
+    ("sm100a", "g6_q32", 256, 32, 1024, 30, 5, 6, True),
     ("sm100a", "g6_q256", 16, 256, 2048, 30, 5, 1, True),
-    ("sm100a", "g7_q4", 256, 4, 1024, 28, 4, 7, False),
-    ("sm100a", "g7_q32", 256, 32, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q4", 256, 4, 1024, 28, 4, 7, True),
+    ("sm100a", "g7_q32", 256, 32, 1024, 28, 4, 7, True),
     ("sm100a", "g7_q256", 16, 256, 2048, 28, 4, 1, True),
     ("sm100a", "g8_q4", 256, 4, 1024, 32, 4, 8, True),
     ("sm100a", "g8_q32", 256, 32, 1024, 32, 4, 8, True),
     ("sm100a", "g8_q256", 16, 256, 2048, 32, 4, 8, True),
-    ("sm100a", "g16_q4", 256, 4, 1024, 32, 2, 16, False),
+    ("sm100a", "g16_q4", 256, 4, 1024, 32, 2, 16, True),
     ("sm100a", "g16_q32", 256, 32, 1024, 32, 2, 16, True),
     ("sm100a", "g16_q256", 16, 256, 2048, 32, 2, 16, True),
     ("sm100a", "g32_q4", 256, 4, 1024, 32, 1, 32, False),
@@ -650,7 +932,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "s_b32_q128_g8", 32, 128, 4096, 32, 4, 8, True),
     ("sm100a", "n_q1_b255_p64", 255, 1, 1024, 32, 4, 8, True),
     ("sm100a", "n_g8_h64_q32_b3", 3, 32, 2000, 64, 8, 8, True),
-    ("sm100a", "e_g5_causal", 2, 200, 700, 10, 2, 5, False),
+    ("sm100a", "e_g5_causal", 2, 200, 700, 10, 2, 5, True),
     ("sm100a", "n_g4_q8_b6", 6, 8, 1024, 16, 4, 4, True),
     ("sm100a", "n_q300_b2_p16", 2, 300, 1500, 32, 4, 8, True),
     ("sm100a", "e_tail_h64", 1, 1000, 1333, 64, 8, 8, True),
@@ -661,7 +943,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q64", 256, 64, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q128", 256, 128, 1024, 32, 8, 4, False),
     ("sm100a", "g8_q64", 256, 64, 1024, 32, 4, 8, True),
-    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, False),
+    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, True),
     ("sm100a", "g1_q32_b64", 64, 32, 1024, 32, 32, 1, False),
     ("sm100a", "g1_q32_b128", 128, 32, 1024, 32, 32, 1, False),
     ("sm100a", "g2_q32_b64", 64, 32, 1024, 32, 16, 2, True),
@@ -674,16 +956,39 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q128_b128", 128, 128, 1024, 32, 8, 4, True),
     ("sm100a", "g3_q64", 256, 64, 1024, 30, 10, 3, False),
     ("sm100a", "g3_q128", 256, 128, 1024, 30, 10, 3, False),
-    ("sm100a", "g5_q64", 256, 64, 1024, 30, 6, 5, False),
-    ("sm100a", "g5_q128", 256, 128, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q64", 256, 64, 1024, 30, 6, 5, True),
+    ("sm100a", "g5_q128", 256, 128, 1024, 30, 6, 5, True),
     ("sm100a", "g5_q192", 256, 192, 1024, 30, 6, 5, False),
-    ("sm100a", "g6_q64", 256, 64, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q64", 256, 64, 1024, 30, 5, 6, True),
     ("sm100a", "g6_q128", 256, 128, 1024, 30, 5, 6, True),
-    ("sm100a", "g7_q64", 256, 64, 1024, 28, 4, 7, False),
-    ("sm100a", "g7_q128", 256, 128, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q64", 256, 64, 1024, 28, 4, 7, True),
+    ("sm100a", "g7_q128", 256, 128, 1024, 28, 4, 7, True),
     ("sm100a", "g7_q192", 256, 192, 1024, 28, 4, 7, False),
-    ("sm100a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
+    ("sm100a", "own_g5_q2048_k1024", 128, 2048, 1024, 40, 8, 5, False),
+    ("sm100a", "own_g7_q1024_k1024", 256, 1024, 1024, 28, 4, 7, False),
+    ("sm100a", "own_g5_q1_k16384", 128, 1, 16384, 40, 8, 5, False),
+    ("sm100a", "own_g5_q128_k16384", 32, 128, 16384, 40, 8, 5, False),
+    ("sm100a", "own_g7_q128_k16384", 128, 128, 16384, 28, 4, 7, False),
+    ("sm100a", "own_g5_q128_k16384_s64", 8, 128, 16384, 40, 8, 5, True),
+    ("sm100a", "own_g5_q1_k8192", 128, 1, 8192, 40, 8, 5, True),
+    ("sm100a", "own_g7_q128_k8192", 128, 128, 8192, 28, 4, 7, True),
+    ("sm103a", "own_g5_q1_k16384", 128, 1, 16384, 40, 8, 5, True),
+    ("sm103a", "own_g7_q128_k16384", 128, 128, 16384, 28, 4, 7, True),
+    ("sm100a", "g16_q16", 256, 16, 1024, 32, 2, 16, True),
     ("sm100a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
+]  # fmt: skip
+# Calls the sm100a rule of many query rows at long query lengths covers, over
+# caches of at least :data:`_CONTEXT_FP8_RUNTIME_ROWS_KV` keys (timed B200 with
+# five seeded memory layouts: the runtime-size program ran faster back to
+# back at the power limit on every row, ``g8_q128`` above among them).
+_FP8_RUNTIME_ROWS_KV_ROUTE_ROWS = [
+    ("sm100a", "kv_g8_q128_k4096", 256, 128, 4096, 32, 4, 8, True),
+    ("sm100a", "kv_g8_q256_k16384", 128, 256, 16384, 32, 4, 8, True),
+    ("sm100a", "kv_g8_q2048_k4096", 16, 2048, 4096, 32, 4, 8, True),
+    ("sm100a", "kv_g8_h64_q128_k4096", 128, 128, 4096, 64, 8, 8, True),
+    ("sm100a", "kv_g4_q256_k4096", 128, 256, 4096, 32, 8, 4, True),
+    ("sm100a", "kv_g2_q512_k4096", 64, 512, 4096, 32, 16, 2, True),
+    ("sm100a", "kv_g1_q1024_k4096", 32, 1024, 4096, 32, 32, 1, True),
 ]  # fmt: skip
 
 
@@ -699,8 +1004,11 @@ _FP8_RUNTIME_ROUTE_ROWS = [
         "pack_g",
         "serves",
     ),
-    _FP8_RUNTIME_ROUTE_ROWS,
-    ids=[f"{row[0]}-{row[1]}" for row in _FP8_RUNTIME_ROUTE_ROWS],
+    _FP8_RUNTIME_ROUTE_ROWS + _FP8_RUNTIME_ROWS_KV_ROUTE_ROWS,
+    ids=[
+        f"{row[0]}-{row[1]}"
+        for row in _FP8_RUNTIME_ROUTE_ROWS + _FP8_RUNTIME_ROWS_KV_ROUTE_ROWS
+    ],
 )
 def test_cake_fmha_context_fp8_runtime_route(
     monkeypatch,
@@ -717,7 +1025,9 @@ def test_cake_fmha_context_fp8_runtime_route(
     """The row's JIT pack, the predicate's route and the route selection
     takes for a causal FP8 call of the row's shape with 16-token pages (no
     exact route): the runtime-size program of the largest shipped pack
-    dividing the JIT pack, or the JIT module."""
+    dividing the JIT pack, or of the JIT pack where that one runs more tile
+    work and the JIT pack is a pack of ``_CONTEXT_FP8_RUNTIME_OWN_PACKS``, or
+    the JIT module."""
 
     assert cake_api._context_pack_g(max_q, max_kv, num_q_heads, num_kv_heads) == pack_g
     assert (
@@ -743,8 +1053,12 @@ def test_cake_fmha_context_fp8_runtime_route(
     )
     assert route is not None and route.component == "context_fp8"
     if serves:
-        pack = cake_api._context_fp8_runtime_pack(pack_g)
-        assert pack_g % pack == 0 and pack in (1, 2, 4, 8)
+        pack = cake_api._context_fp8_runtime_route_pack(
+            max_q, max_kv, num_q_heads, pack_g
+        )
+        own = cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS
+        assert pack is not None and pack_g % pack == 0 and pack in (1, 2, 4, 8, *own)
+        assert pack in (pack_g, cake_api._context_fp8_runtime_pack(pack_g))
         assert route.program == f"RUNTIME_PACK{pack}{_RUNTIME_SUFFIX[target]}"
         assert route.pack_g == pack
     elif (
@@ -763,6 +1077,69 @@ def test_cake_fmha_context_fp8_runtime_route(
             target, batch, max_q, max_kv, num_q_heads, num_kv_heads, pack_g
         )
         assert route.program is None and route.pack_g == pack_g
+
+
+# sm100a FP8 calls of one query head per KV head whose query tokens fit one
+# stage and that the runtime-size program serves: (batch, max_q_len,
+# max_kv_len, heads, page size, the route's program).  From
+# :data:`_CONTEXT_FP8_RUNTIME_ONE_STAGE_TILES` tiles (timed B200 with five
+# seeded memory layouts: the one-stage program ran faster cold and back to
+# back on every such row) the one-stage program of pack 1; below them the
+# runtime-size program.
+_FP8_RUNTIME_ONE_STAGE_ROUTE_ROWS = [
+    (20, 4, 4096, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (24, 128, 2048, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (32, 4, 8192, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (32, 128, 8192, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (32, 4, 4096, 32, 16, "RUNTIME_PACK1_Q1"),
+    (48, 32, 4096, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (64, 4, 2048, 16, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (16, 4, 2048, 64, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (19, 4, 4096, 32, 64, "RUNTIME_PACK1_PAGE64"),
+    (19, 4, 4096, 32, 16, "RUNTIME_PACK1"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("batch", "max_q", "max_kv", "heads", "page_size", "program"),
+    _FP8_RUNTIME_ONE_STAGE_ROUTE_ROWS,
+    ids=[
+        f"b{r[0]}_q{r[1]}_k{r[2]}_h{r[3]}_p{r[4]}"
+        for r in _FP8_RUNTIME_ONE_STAGE_ROUTE_ROWS
+    ],
+)
+def test_cake_fmha_context_fp8_runtime_one_stage_route(
+    monkeypatch, batch, max_q, max_kv, heads, page_size, program
+) -> None:
+    """A pack-1 call of one query head per KV head that the runtime-size
+    program serves takes the one-stage program of pack 1 from the target's
+    tiles on, else the runtime-size program."""
+
+    target = "sm100a"
+    assert cake_api._context_pack_g(max_q, max_kv, heads, heads) == 1
+    assert cake_api._context_fp8_runtime_serves(
+        target, batch, max_q, max_kv, heads, heads, 1
+    )
+    one_stage = program.endswith("_Q1")
+    assert (
+        cake_api._context_fp8_runtime_one_stage(target, batch, max_q, heads, heads, 1)
+        is one_stage
+    )
+    assert (
+        cake_api._context_fp8_power_one_stage(
+            target, batch, max_q, max_kv, heads, heads, 1
+        )
+        is one_stage
+    )
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    row = ("context_fp8", batch, max_q, max_kv, heads, heads, page_size, True, None)
+    route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **_context_kwargs(row, device="meta")
+    )
+    assert route is not None and route.program == program, route
+    assert route.pack_g == 1
+    if one_stage:
+        assert route.num_m_blocks == 1
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
@@ -790,6 +1167,59 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
             route
         )
         assert route.num_m_blocks == -(-33 // (2 * (128 // pack)))
+
+
+# Calls of JIT packs 7 and 5, and of JIT packs 6, 12 and 16 whose dividing pack
+# runs more tile work: (num_q_heads, num_kv_heads, JIT pack, batch, max_q_len,
+# max_kv_len, page size).
+_FP8_OWN_PACK_ROWS = [
+    (40, 8, 5, 2, 32, 1024, 16),
+    (10, 2, 5, 4, 128, 4096, 64),
+    (5, 1, 5, 1, 1, 16384, 16),
+    (20, 4, 5, 4, 16, 128, 64),
+    (28, 4, 7, 8, 8, 1024, 64),
+    (7, 1, 7, 2, 100, 300, 16),
+    (28, 4, 7, 1, 4, 100, 16),
+    (30, 5, 6, 8, 32, 1024, 16),
+    (12, 2, 6, 2, 4, 4096, 64),
+    (48, 4, 12, 4, 8, 2048, 64),
+    (12, 1, 12, 4, 1, 4096, 16),
+    (32, 2, 16, 4, 4, 1024, 16),
+    (16, 1, 16, 2, 16, 100, 64),
+]
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_own_pack_routes(monkeypatch, target) -> None:
+    """A call whose JIT pack is 7 or 5, or 6, 12 or 16 where the dividing pack
+    runs more tile work, takes the runtime-size program of that pack and its
+    two-stage tiles, never a split-KV or one-stage program (sm103a: of at most
+    128 keys, the default-ring program); the dividing rule is unchanged."""
+
+    assert cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS == (7, 5, 6, 12, 16)
+    for pack_g, pack in (
+        (7, 1), (5, 1), (6, 2), (12, 4), (16, 8), (14, 2), (10, 2), (15, 1), (20, 4), (35, 1),
+    ):  # fmt: skip
+        assert cake_api._context_fp8_runtime_pack(pack_g) == pack, pack_g
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api, "_context_split_sm_count", lambda device: _SM_COUNT[target]
+    )
+    for hq, hkv, pack, batch, max_q, max_kv, page in _FP8_OWN_PACK_ROWS:
+        assert cake_api._context_pack_g(max_q, max_kv, hq, hkv) == pack
+        assert cake_api._context_fp8_runtime_route_pack(max_q, max_kv, hq, pack) == pack
+        program = f"RUNTIME_PACK{pack}" + ("_PAGE64" if page == 64 else "")
+        if target == "sm103a" and max_kv > 128:
+            program += "_PX"
+        shape = ("context_fp8", batch, max_q, max_kv, hq, hkv, page, True, None)
+        for device_scales in (False, True):
+            route = cake_api.select_cake_fmha_context_route(
+                torch.device("meta"),
+                **_context_kwargs(shape, device_scales=device_scales, device="meta"),
+            )
+            assert route is not None and route.program == program, (shape, route)
+            assert route.pack_g == pack
+            assert route.num_m_blocks == -(-max_q // (2 * (128 // pack)))
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
@@ -854,22 +1284,206 @@ def test_cake_fmha_context_fp8_short_kv_routes(monkeypatch, target) -> None:
                 assert route.program == program, (row, kv_len, route)
 
 
+# --- The FP8 routes of the other forms (host-only) ---------------------------
+
+# The forms of an FP8 call besides the causal one without LSE or sink:
+# form -> (is_causal, return_lse, enable_sink).
+_FP8_FORMS = {
+    "NC": (False, False, False),
+    "LSE": (True, True, False),
+    "SINK": (True, False, True),
+    "NC_LSE": (False, True, False),
+    "NC_SINK": (False, False, True),
+}
+# FP8 shape rows -> the pack of the runtime-size program their causal call
+# without LSE or sink would take (pack 8 for the exact B256 row): the calls of
+# the non-causal forms take the program of that pack in their form; the causal
+# LSE and sink forms take the JIT pack's program (``_FP8_CAUSAL_FORMS``).
+_FP8_FORM_ROWS = {
+    "fp8_b256_q32_k1024": 8,
+    "fp8_b16_q32_k128": 8,
+    "fp8_b64_q32_k1024_g4": 4,
+    "fp8_b16_q32_k128_g4": 4,
+    "fp8_b16_q32_k1024_g16_page16": 8,
+    "fp8_b2_q256_k2048_g3_page32": 1,
+    "fp8_b4_q128_k1024_g6_page16": 2,
+    "fp8_b8_q32_k1024_g5_page16": 5,
+    "fp8_b4_q100_k2048_g7": 7,
+    "fp8_b4_q16_k128_g5": 5,
+    "fp8_b8_q32_k1024_g6_page16": 6,
+    "fp8_b4_q8_k2048_g12": 12,
+    "fp8_b4_q4_k1024_g16_page16": 16,
+}
+
+
+# The causal forms: their programs run at the JIT pack, so that the tiles (and
+# so the key blocks each row's P.V reads) are the JIT's.
+_FP8_CAUSAL_FORMS = ("LSE", "SINK")
+
+
+def _form_pack(row, form):
+    """The pack of the program an FP8 call of ``form`` of a shape row takes,
+    or ``None`` (the JIT module): the row's runtime pack for the non-causal
+    forms, the JIT pack for the causal ones where it has a program."""
+
+    if form not in _FP8_CAUSAL_FORMS:
+        return _FP8_FORM_ROWS[row]
+    _, _, max_q, max_kv, num_q_heads, num_kv_heads, *_ = SHAPE_ROWS[row]
+    pack = cake_api._context_pack_g(max_q, max_kv, num_q_heads, num_kv_heads)
+    return (
+        pack if pack in (1, 2, 4, 8, *cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS) else None
+    )
+
+
+def _form_kwargs(row, form, *, device_scales=False, device="meta"):
+    """``_context_kwargs`` of a shape row in ``form`` (an LSE of the query's
+    tokens and heads, one sink per query head)."""
+
+    kwargs = _context_kwargs(row, device_scales=device_scales, device=device)
+    is_causal, return_lse, enable_sink = _FP8_FORMS[form]
+    kwargs["is_causal"] = is_causal
+    tokens, heads = kwargs["query"].shape[:2]
+    if return_lse:
+        kwargs["lse"] = torch.empty((tokens, heads), dtype=torch.float32, device=device)
+    if enable_sink:
+        kwargs["sinks"] = torch.empty((heads,), dtype=torch.float32, device=device)
+    return kwargs
+
+
+def test_cake_fmha_context_fp8_form_programs_are_pinned() -> None:
+    """Each target routes every form of every runtime-size pack to its own
+    program of that form, pinned as a runtime-size program; the forms are
+    the four other combinations of the causal mask, the LSE and the sink but
+    the LSE with a sink."""
+
+    assert (
+        set(cake_api._CONTEXT_FP8_FORMS) == {flags for flags in _FP8_FORMS.values()}
+        and dict(map(reversed, cake_api._CONTEXT_FP8_FORMS.items())) == _FP8_FORMS
+    )
+    packs = (1, 2, 4, 8, *cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS)
+    for target in ("sm100a", "sm103a"):
+        routes = cake_api._CONTEXT_FP8_RUNTIME_FORM_ROUTES[target]
+        assert routes == {
+            (form, pack, None): f"RUNTIME_PACK{pack}_{form}"
+            for form in _FP8_FORMS
+            for pack in packs
+        }
+        for program in routes.values():
+            name, num_m_blocks, one_tile = cake_api._CONTEXT_PROGRAMS[
+                ("context_fp8", program)
+            ]
+            assert num_m_blocks is None and not one_tile, program
+            assert program not in cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS
+            assert program not in cake_api._CONTEXT_FP8_SPLIT_PROGRAMS
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("form", sorted(_FP8_FORMS))
+@pytest.mark.parametrize("row", sorted(_FP8_FORM_ROWS))
+def test_cake_fmha_context_fp8_form_routes(monkeypatch, target, form, row) -> None:
+    """An FP8 call of another form takes the runtime-size program of its form
+    (whatever exact, short-KV, split-KV or one-stage program serves its causal
+    call without LSE or sink): a non-causal form at the pack that causal call
+    would take, a causal form at the JIT pack (else the JIT module), with
+    two-stage tiles, for host and device scales alike."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api, "_context_split_sm_count", lambda device: _SM_COUNT[target]
+    )
+    pack = _form_pack(row, form)
+    _, _, max_q, *_ = SHAPE_ROWS[row]
+    for device_scales in (False, True):
+        kwargs = _form_kwargs(row, form, device_scales=device_scales)
+        route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+        assert route is not None, (row, form)
+        if pack is None:
+            assert route.program is None, (row, form, route)
+            continue
+        assert route.program == f"RUNTIME_PACK{pack}_{form}", (row, form, route)
+        assert route.pack_g == pack and route.device_scales is device_scales
+        assert route.num_m_blocks == -(-max_q // (2 * (128 // pack)))
+        assert (route.is_causal, route.return_lse, route.enable_sink) == _FP8_FORMS[
+            form
+        ]
+
+
+@pytest.mark.parametrize("form", sorted(_FP8_FORMS))
+def test_cake_fmha_context_fp8_form_routes_keep_the_jit_module_where_the_causal_call_does(
+    monkeypatch, form
+) -> None:
+    """A call of another form keeps the JIT module where the causal call
+    without LSE or sink would (the sm100a power limit; a JIT pack whose
+    dividing pack runs more tile work and that is no own pack)."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    shape = ("context_fp8", 256, 33, 1024, 64, 8, 64, True, None)
+    route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **_form_kwargs(shape, form)
+    )
+    assert route is not None and route.program is None, route
+    # GQA group 10 at 32 query tokens: JIT pack 10, whose dividing pack 2 runs
+    # more tile work, and 10 is no own pack.
+    shape = ("context_fp8", 8, 32, 1024, 40, 4, 16, True, None)
+    assert cake_api._context_pack_g(32, 1024, 40, 4) == 10
+    assert cake_api._context_fp8_runtime_route_pack(32, 1024, 40, 10) is None
+    route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **_form_kwargs(shape, form)
+    )
+    assert route is not None and route.program is None, route
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("form", sorted(_FP8_FORMS))
+def test_cake_fmha_context_fp8_form_routes_keep_the_jit_module_over_long_caches(
+    monkeypatch, target, form
+) -> None:
+    """A call of another form over more than 8192 keys with more than 256
+    (request, KV head) streams keeps the JIT module, at every pack; with 256
+    streams, or over 8192 keys, it takes its program."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api, "_context_split_sm_count", lambda device: _SM_COUNT[target]
+    )
+    assert cake_api._CONTEXT_FP8_RUNTIME_FORM_LONG_KV[target] == (8192, 256)
+    for batch, max_q, max_kv, program in (
+        (128, 1, 16384, False),
+        (128, 128, 16384, False),
+        (32, 1, 16384, True),
+        (32, 128, 16384, True),
+        (128, 1, 8192, True),
+    ):
+        shape = ("context_fp8", batch, max_q, max_kv, 32, 8, 16, True, None)
+        route = cake_api.select_cake_fmha_context_route(
+            torch.device("meta"), **_form_kwargs(shape, form)
+        )
+        assert route is not None, (shape, form)
+        if program:
+            assert route.program == f"RUNTIME_PACK4_{form}", (shape, form, route)
+        else:
+            assert route.program is None, (shape, form, route)
+
+
 # --- The FP8 split-KV route (host-only) --------------------------------------
 
 _SM_COUNT = {"sm100a": 148, "sm103a": 152}
 
 
 def test_cake_fmha_context_fp8_split_routes_mirror_the_runtime_routes() -> None:
-    """Every runtime-size program has the split-KV program of its pack and page
-    size on the same targets, and the only other split-KV program is the
-    sm100a two-split build of the pack-1 page-64 one."""
+    """Every runtime-size program but those of the packs that serve only their
+    own JIT pack (7 and 5) has the split-KV program of its pack and page size
+    on the same targets, and the only other split-KV program is the sm100a
+    two-split build of the pack-1 page-64 one."""
 
     runtime = cake_api._CONTEXT_FP8_RUNTIME_ROUTES
+    own = cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS
     assert set(cake_api._CONTEXT_FP8_SPLIT_ROUTES) == set(runtime)
     for target, routes in runtime.items():
         assert cake_api._CONTEXT_FP8_SPLIT_ROUTES[target] == {
             key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME").removesuffix("_PX")
             for key, identifier in routes.items()
+            if key[0] not in own
         }
     assert cake_api._CONTEXT_FP8_TWO_SPLIT_ROUTES == {
         "sm100a": {"RUNTIME_SK_PACK1_PAGE64": "RUNTIME_SK_PACK1_PAGE64_S2"}
@@ -1391,17 +2005,20 @@ def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
 
 
 def test_cake_fmha_context_fp8_one_stage_routes_mirror_the_runtime_routes() -> None:
-    """Every runtime-size program has the one-stage program of its pack and
-    page size on the same targets (the same schedule and P placement with one
+    """Every runtime-size program but those of packs 7 and 5 has the one-stage
+    program of its pack and page size on the same targets (the same schedule and P placement with one
     query stage per tile); the only other one-stage programs are the
     multi-wave builds of those programs without the short-KV chain and the
     sm100a one-wave builds of the every-page-size ones with it."""
 
     runtime = cake_api._CONTEXT_FP8_RUNTIME_ROUTES
+    own = cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS
     assert set(cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES) == set(runtime)
     for target, routes in runtime.items():
         assert cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES[target] == {
-            key: identifier + "_Q1" for key, identifier in routes.items()
+            key: identifier + "_Q1"
+            for key, identifier in routes.items()
+            if key[0] not in own
         }
     assert frozenset(_ONE_STAGE_PACK) == cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS
     assert not cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS & set(_RUNTIME_PACK)
@@ -1960,12 +2577,14 @@ def test_cake_fmha_context_fp8_short_kv_one_stage_pack(monkeypatch, target) -> N
 
 
 def _stand_in_module(
-    component="context_bf16", identifier="B128", *, device_scales=False
+    component="context_bf16", identifier="B128", *, device_scales=False, form=None
 ):
     """The program module of a stand-in record (``B128`` unless ``component``
     / ``identifier`` name another) for 32 query heads over 4 KV heads and
-    16-token pages, whose entry keeps every call's arguments
-    (``module.calls``)."""
+    16-token pages (of the FP8 ``form`` of ``_FP8_FORMS``, if given), whose
+    entry keeps every call's arguments (``module.calls``)."""
+
+    is_causal, return_lse, enable_sink = _FP8_FORMS.get(form, (True, False, False))
 
     name, num_m_blocks, _ = cake_api._CONTEXT_PROGRAMS[(component, identifier)]
     args = (
@@ -1987,9 +2606,9 @@ def _stand_in_module(
         pack_g={**_RUNTIME_PACK, **_SPLIT_PACK, **_ONE_STAGE_PACK}.get(identifier, 8),
         page_size=16,
         l2_swizzle=1,
-        is_causal=True,
-        return_lse=False,
-        enable_sink=False,
+        is_causal=is_causal,
+        return_lse=return_lse,
+        enable_sink=enable_sink,
         device_scales=device_scales,
         program=identifier,
     )
@@ -2301,6 +2920,53 @@ def test_cake_context_runtime_program_takes_the_sizes_of_each_launch(
     assert len(module.calls) == 2
 
 
+def test_cake_context_bf16_runtime_tail_order_follows_the_makespan_model(
+    monkeypatch,
+) -> None:
+    """A causal runtime-size BF16 launch with two or more work units past its
+    last whole 8-unit section sets bit 31 of ``full_sections`` when the
+    modelled makespan of the interleaved tail order is the shorter; whole
+    sections, one tail unit and launches of many waves keep the plain order."""
+
+    interleave = cake_api._context_bf16_tail_interleave
+    # one request of 8192 queries over 16384 keys, 4 units of pack 8 (32-token
+    # m-blocks): interleaved on 148 and 152 SMs; 8320 queries only on 152
+    assert interleave(1, 8192, 16384, 4, 32, 148)
+    assert interleave(1, 8192, 16384, 4, 32, 152)
+    assert not interleave(1, 8320, 16384, 4, 32, 148)
+    assert interleave(1, 8320, 16384, 4, 32, 152)
+    # more queries than keys: the tiles whose rows see no key run every block
+    assert interleave(1, 16384, 12288, 4, 32, 148)
+    # whole sections, one tail unit, more than 32 waves
+    assert not interleave(2, 8192, 16384, 4, 32, 148)
+    assert not interleave(1, 8192, 16384, 9, 32, 148)
+    assert not interleave(1, 131072, 131072, 4, 32, 148)
+
+    module = _stand_in_module("context_bf16", "RUNTIME_PACK8")
+    tables = torch.arange(1024, dtype=torch.int32).view(1, 1024)
+
+    def full_sections(max_q_len, *, is_causal=True):
+        return _launch_values(
+            monkeypatch,
+            tables,
+            shared=True,
+            batch=1,
+            module=module,
+            max_q_len=max_q_len,
+            max_kv_len=16384,
+            is_causal=is_causal,
+        )["full_sections"]
+
+    assert full_sections(8192) == cake_api._CONTEXT_BF16_TAIL_INTERLEAVE == 1 << 31
+    assert full_sections(8320) == 0
+    assert full_sections(8192, is_causal=False) == 0
+    # 3 requests of 4 units: one whole section, 4 tail units of 2 m-blocks
+    first = _launch_values(
+        monkeypatch, tables[:, :4].repeat(3, 1), shared=True, module=module
+    )
+    assert first["full_sections"] == 1
+
+
 def test_cake_context_one_stage_program_takes_one_stage_m_blocks(
     monkeypatch,
 ) -> None:
@@ -2456,14 +3122,103 @@ def test_cake_context_split_program_takes_the_chosen_plan_of_a_smaller_pack(
 
 @pytest.mark.parametrize("given", ("lse", "attention_sinks"))
 def test_cake_context_program_refuses_an_lse_or_sinks(monkeypatch, given) -> None:
-    """A program writes no LSE and reads no sinks: a launch that carries
-    either is refused rather than served with the unread placeholder (route
-    selection keeps such calls on the JIT module)."""
+    """A program of the causal form without LSE or sink writes no LSE and
+    reads no sinks: a launch that carries either is refused rather than
+    served with the unread placeholder (route selection keeps such calls on
+    the JIT module or on the program of their form)."""
 
     tables = torch.arange(12, dtype=torch.int32).view(3, 4)
     tensor = torch.zeros((3 * 64, 32) if given == "lse" else (32,))
-    with pytest.raises(RuntimeError, match="writes no LSE and takes no sinks"):
+    with pytest.raises(RuntimeError, match="the causal mask, LSE and sinks of its"):
         _launch_values(monkeypatch, tables, shared=True, **{given: tensor})
+
+
+@pytest.mark.parametrize("form", sorted(_FP8_FORMS))
+def test_cake_context_form_program_takes_the_callers_lse_and_sinks(
+    monkeypatch, form
+) -> None:
+    """A program of an LSE or sink form receives the caller's LSE (a
+    contiguous ``[tokens, heads]`` tensor) or sinks themselves; the pointer
+    of the other stays the unread placeholder.  A launch of another form, or
+    an LSE of other strides, is refused."""
+
+    is_causal, return_lse, enable_sink = _FP8_FORMS[form]
+    module = _stand_in_module("context_fp8", f"RUNTIME_PACK8_{form}", form=form)
+    batch = 3
+    tables = torch.arange(batch * 4, dtype=torch.int32).view(batch, 4)
+    lse = torch.zeros((batch * 64, 32)) if return_lse else None
+    sinks = torch.zeros((32,)) if enable_sink else None
+    call = dict(
+        is_causal=is_causal,
+        lse=lse,
+        lse_stride_tokens=32 if return_lse else 0,
+        lse_stride_heads=1 if return_lse else 0,
+        attention_sinks=sinks,
+    )
+    values = _launch_values(
+        monkeypatch, tables, shared=True, batch=batch, module=module, **call
+    )
+    unread = values["seq_lens_q"].data_ptr()
+    assert values["LSE_ptr"].data_ptr() == (lse.data_ptr() if return_lse else unread)
+    assert values["sinks"].data_ptr() == (sinks.data_ptr() if enable_sink else unread)
+    assert values["num_m_blocks"] == 2 and values["num_bh_units"] == 4
+    for other in (
+        {"is_causal": not is_causal},
+        {"lse": None, "lse_stride_tokens": 0, "lse_stride_heads": 0}
+        if return_lse
+        else {"lse": torch.zeros((batch * 64, 32)), "lse_stride_tokens": 32},
+        {"attention_sinks": None if enable_sink else torch.zeros((32,))},
+    ):
+        with pytest.raises(RuntimeError, match="the causal mask, LSE and sinks of its"):
+            _launch_values(
+                monkeypatch,
+                tables,
+                shared=True,
+                batch=batch,
+                module=module,
+                **{**call, **other},
+            )
+    if return_lse:
+        with pytest.raises(RuntimeError, match=r"contiguous \[tokens, heads\] LSE"):
+            _launch_values(
+                monkeypatch,
+                tables,
+                shared=True,
+                batch=batch,
+                module=module,
+                **{**call, "lse_stride_tokens": 64},
+            )
+
+
+@pytest.mark.parametrize("form", ("LSE", "NC_LSE"))
+def test_cake_context_form_program_takes_a_one_token_lse_of_any_token_stride(
+    monkeypatch, form
+) -> None:
+    """A contiguous ``[tokens, heads]`` LSE of one token may carry any stride
+    along its tokens, which moves no element: the program takes it, as the
+    JIT module does."""
+
+    is_causal = _FP8_FORMS[form][0]
+    module = _stand_in_module("context_fp8", f"RUNTIME_PACK8_{form}", form=form)
+    lse = torch.empty_strided((1, 32), (7, 1))
+    assert lse.is_contiguous()
+    query = torch.zeros((1, 32, 128), dtype=torch.float8_e4m3fn)
+    values = _launch_values(
+        monkeypatch,
+        torch.arange(4, dtype=torch.int32).view(1, 4),
+        shared=True,
+        batch=1,
+        module=module,
+        query=query,
+        out=torch.empty_like(query),
+        cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32),
+        max_q_len=1,
+        is_causal=is_causal,
+        lse=lse,
+        lse_stride_tokens=lse.stride(0),
+        lse_stride_heads=lse.stride(1),
+    )
+    assert values["LSE_ptr"].data_ptr() == lse.data_ptr()
 
 
 def test_cake_context_program_passes_a_contiguous_shared_table_itself(
@@ -2892,6 +3647,7 @@ def test_cake_context_bf16_jit_route_runs_tiles_without_keys(
         return load(*args, **kwargs)
 
     monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", spy)
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     assert _tiles_without_keys(heads, q_lens, kv_lens)
     # Every batch but the one with the empty request has rows without a key.
     assert _rows_without_keys(q_lens, kv_lens) or 0 in q_lens
@@ -2926,6 +3682,7 @@ def test_cake_context_bf16_program_and_jit_route_agree_on_rows_without_keys(
     assert served_programs == [program]
     _check_rows_with_and_without_keys(case, out, None)
     monkeypatch.setattr(cake_api, "_context_bf16_exact_profile", lambda *a, **k: None)
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     assert _tiles_without_keys((10, 2), q_lens, kv_lens)
     jit_out, _ = _run_bf16_batch(case)
     assert served_programs == [program]
@@ -2933,6 +3690,86 @@ def test_cake_context_bf16_program_and_jit_route_agree_on_rows_without_keys(
     blank = _rows_without_keys(q_lens, kv_lens)
     assert blank
     assert torch.equal(_bits(jit_out[blank]), _bits(out[blank]))
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # A request with query tokens but no key.
+        ((32, 4), (200, 5, 64), (700, 0, 64), 16),
+        # An empty request (no query token, no key) between others.
+        ((32, 8), (300, 0, 37, 64), (900, 0, 100, 130), 64),
+        # Causal tiles whose rows see no key in requests that hold keys.
+        ((10, 2), (511, 257, 511, 511), (2047, 1, 1024, 600), 32),
+        ((32, 4), (64, 100), (32, 300), 16),
+    ],
+)
+def test_cake_context_bf16_runtime_programs_run_tiles_without_keys(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size
+) -> None:
+    """The runtime-size program of the batch's JIT pack on tiles without a
+    visible key: the launch completes, rows with a visible key match the FP32
+    reference, rows without one are 0 although a request without keys names a
+    NaN page, and every row is bitwise the JIT route's."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    program = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target].get((pack, None))
+    if program is None:
+        pytest.skip(f"no runtime-size program of pack {pack} on {target}")
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    out, _ = _run_bf16_batch(case)
+    assert served_programs == [program]
+    _check_rows_with_and_without_keys(case, out, None)
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    jit_out, _ = _run_bf16_batch(case)
+    assert served_programs == [program]
+    assert torch.equal(_bits(jit_out), _bits(out))
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # one request, 4 units of pack 8: every unit a tail unit
+        ((32, 4), (1000,), (1333,), 16),
+        # ragged requests of 2 units each: 6 tail units over 3 requests
+        ((16, 2), (700, 300, 511), (900, 1500, 511), 64),
+        # more queries than keys
+        ((32, 4), (1200,), (500,), 32),
+        # 3 requests of 4 units: one whole section and 4 tail units
+        ((32, 4), (513, 257, 1000), (513, 2000, 1000), 16),
+    ],
+)
+def test_cake_context_bf16_runtime_tail_orders_are_bitwise_the_same(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size
+) -> None:
+    """The runtime-size program of the batch's JIT pack writes the same bytes
+    with its tail units one after another and interleaved, the JIT route's."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    program = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target].get((pack, None))
+    if program is None:
+        pytest.skip(f"no runtime-size program of pack {pack} on {target}")
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    outs = []
+    for interleaved in (False, True):
+        monkeypatch.setattr(
+            cake_api,
+            "_context_bf16_tail_interleave",
+            lambda *sizes, interleaved=interleaved: interleaved,
+        )
+        out, _ = _run_bf16_batch(case)
+        assert served_programs[-1] == program
+        outs.append(out)
+    served = len(served_programs)
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    jit_out, _ = _run_bf16_batch(case)
+    assert len(served_programs) == served
+    assert torch.equal(_bits(outs[1]), _bits(outs[0]))
+    assert torch.equal(_bits(outs[0]), _bits(jit_out))
 
 
 # --- GPU: the other context JIT routes on tiles without a visible key -------
@@ -3314,7 +4151,10 @@ def test_cake_context_jit_routes_run_tiles_without_keys(
 
     _skip_without_nvfp4_programs(component)
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_ROUTES", {})
     spec = _JIT_ROUTES[component]
     loaded = []
@@ -3377,7 +4217,9 @@ def test_cake_context_fp8_hd256_jit_route_runs_a_partial_l2_section(
     batch of whole sections (one more request, the same maxima)."""
 
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_ROUTES", {})
     whole = _jit_route_batch("context_fp8_hd256", heads, q_lens, kv_lens, page_size)
     case = _jit_route_head(whole, len(q_lens) - 1)
@@ -3401,6 +4243,13 @@ def test_cake_context_fp8_hd256_jit_route_runs_a_partial_l2_section(
         # q - kv = 32 (m + 1)).
         ("context_fp8", "B256", (32, 4), (32,) * 4, (1024, 0, 17, 0), 64),
         ("context_nvfp4", "Q511", (32, 4), (511,) * 4, (2047, 0, 479, 255), 16),
+        # The runtime-size programs of JIT packs 5, 7, 6, 12 and 16 (two query
+        # stages of 128 // pack tokens per tile).
+        ("context_fp8", "RUNTIME_PACK5", (40, 8), (32,) * 4, (1024, 0, 17, 0), 16),
+        ("context_fp8", "RUNTIME_PACK7_PAGE64", (28, 4), (100,) * 4, (2048, 0, 99, 0), 64),
+        ("context_fp8", "RUNTIME_PACK6", (30, 5), (32,) * 4, (1024, 0, 17, 0), 16),
+        ("context_fp8", "RUNTIME_PACK12_PAGE64", (48, 4), (8,) * 4, (2048, 0, 7, 0), 64),
+        ("context_fp8", "RUNTIME_PACK16", (32, 2), (4,) * 4, (1024, 0, 3, 0), 16),
     ],
 )  # fmt: skip
 def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys(
@@ -3416,6 +4265,8 @@ def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys
     target = cake_api._cake_fmha_target(torch.device("cuda"))
     if program == "B256":
         program = _FP8_EXACT[target]
+    elif program.startswith("RUNTIME_PACK"):
+        program += _RUNTIME_SUFFIX[target]
     else:
         program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
     case = _jit_route_batch(component, heads, q_lens, kv_lens, page_size)
@@ -3423,7 +4274,10 @@ def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys
     assert served_programs == [program]
     _check_jit_route_rows(case, out, None)
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     route = _jit_route_of(monkeypatch, case)
     assert route.component == component and route.program is None
     assert _jit_route_tiles_without_keys(case, route)
@@ -3431,6 +4285,110 @@ def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys
     assert served_programs == [program]
     assert torch.equal(_bits(jit_out), _bits(out))
     assert _jit_route_rows_without_keys(case)
+
+
+def _device_scale_batch(case):
+    """The batch with its (bmm1, bmm2) scales as FP32 device tensors."""
+
+    scales = tuple(
+        torch.tensor(x, dtype=torch.float32, device="cuda") for x in case.spec.scales
+    )
+    return SimpleNamespace(
+        **{
+            **vars(case),
+            "spec": SimpleNamespace(**{**vars(case.spec), "scales": scales}),
+        }
+    )
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens"),
+    [
+        # An empty request (no query token, no key) between others.
+        ((32, 4), (300, 0, 37, 64), (900, 0, 100, 130)),
+        # A request with query tokens but no key.
+        ((32, 4), (200, 5, 64), (700, 0, 64)),
+        ((40, 8), (257, 3, 100), (1300, 0, 40)),
+        # Causal tiles whose rows see no key in requests that hold keys:
+        # q - kv = 2 * 128 / pack * (m + 1).
+        ((8, 8), (700, 257, 385), (1500, 1, 129)),
+        ((32, 4), (64, 100), (32, 300)),
+        ((32, 8), (300, 200), (236, 72)),
+    ],
+)  # fmt: skip
+def test_cake_context_nvfp4_runtime_programs_run_tiles_without_keys(
+    monkeypatch, served_programs, heads, q_lens, kv_lens
+) -> None:
+    """The runtime-size NVFP4 program of the batch's JIT pack on tiles without
+    a visible key: the launch completes, rows with a visible key match the
+    FP32 reference, rows without one are 0 although a request without keys
+    names a NaN page; host and device scales and a CUDA graph replay give the
+    same bits, and every row is bitwise the JIT module's."""
+
+    _skip_without_nvfp4_programs("context_nvfp4")
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    program = cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES[target].get((pack, None))
+    if program is None:
+        pytest.skip(f"no runtime-size NVFP4 program of pack {pack} on {target}")
+    case = _jit_route_batch("context_nvfp4", heads, q_lens, kv_lens, 16)
+    route = _jit_route_of(monkeypatch, case)
+    assert route.program == program and route.pack_g == pack
+    out, _ = _run_jit_route_batch(case)
+    assert served_programs == [program]
+    _check_jit_route_rows(case, out, None)
+    device_case = _device_scale_batch(case)
+    device_out, _ = _run_jit_route_batch(device_case)
+    assert served_programs == [program] * 2
+    assert torch.equal(_bits(device_out), _bits(out))
+
+    # Graph replay (device scales: no host synchronization in the captured
+    # call) against the direct launch.
+    graph_out = torch.empty_like(out)
+    spec = device_case.spec
+
+    def call():
+        prefill.trtllm_batch_context_with_kv_cache(
+            case.query,
+            case.cache,
+            case.workspace,
+            case.block_tables,
+            case.seq_lens,
+            max(q_lens),
+            max(kv_lens),
+            *spec.scales,
+            len(q_lens),
+            case.cum_q,
+            case.cum_kv,
+            out=graph_out,
+            out_dtype=spec.out,
+            causal=True,
+            kv_layout="HND",
+            kv_cache_sf=case.kv_cache_sf,
+            uses_shared_paged_kv_idx=True,
+            multi_ctas_kv_counter_buffer=case.counter,
+            backend="cake",
+        )
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            call()
+    graph_out.view(torch.uint8).fill_(0x7F)  # E4M3 NaN
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(graph_out), _bits(out))
+    assert not case.counter.any()
+
+    monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
+    served = len(served_programs)
+    jit_out, _ = _run_jit_route_batch(case)
+    assert len(served_programs) == served
+    assert torch.equal(_bits(jit_out), _bits(out))
 
 
 @_GPU
@@ -3466,6 +4424,16 @@ def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys
             dict(q_dtype="fp8", o_dtype="fp8", kv_dtype="fp8", batch_size=3,
                  page_size=16, max_q_len=200, max_kv_len=700, device_scale=True),
             "RUNTIME_PACK",
+        ),
+        (
+            dict(q_dtype="fp8", o_dtype="fp8", kv_dtype="nvfp4", batch_size=3,
+                 page_size=16, max_q_len=200, max_kv_len=700, device_scale=False),
+            "NVFP4_RUNTIME_PACK",
+        ),
+        (
+            dict(q_dtype="fp8", o_dtype="fp8", kv_dtype="nvfp4", batch_size=3,
+                 page_size=16, max_q_len=200, max_kv_len=700, device_scale=True),
+            "NVFP4_RUNTIME_PACK",
         ),
     ],
 )  # fmt: skip
@@ -3509,6 +4477,12 @@ def test_cake_context_quantized_programs_match_reference(
         uses_shared_paged_kv_idx=True,
         **case,
     )
+    if program == "NVFP4_RUNTIME_PACK":
+        # no exact route: the runtime-size program of the JIT pack
+        assert served_programs and all(
+            served in _NVFP4_RUNTIME_PACK for served in served_programs
+        ), served_programs
+        return
     if program == "RUNTIME_PACK":
         # 16-token pages: no exact route; a runtime-size program of any page
         assert served_programs and all(
@@ -3534,6 +4508,20 @@ BITWISE_ROWS = {
     "fp8_b4_q128_k1024_g6_page16": ("fp8_b4_q128_k1024_g6_page16", 4, 128),
     "fp8_b16_q32_k128": ("fp8_b16_q32_k128", 16, 32),
     "fp8_b16_q32_k128_g4": ("fp8_b16_q32_k128_g4", 16, 32),
+    "bf16_b16_q32_k1024_g8_page32": ("bf16_b16_q32_k1024_g8_page32", 16, 32),
+    "bf16_b4_q64_k1024_g4_page64": ("bf16_b4_q64_k1024_g4_page64", 4, 64),
+    "bf16_b2_q256_k2048_g1_page1024": ("bf16_b2_q256_k2048_g1_page1024", 2, 256),
+    "bf16_b4_q2048_k2048_g5": ("bf16_b4_q2048_k2048_g5", 4, 2048),
+    "fp8_b8_q32_k1024_g5_page16": ("fp8_b8_q32_k1024_g5_page16", 8, 32),
+    "fp8_b4_q100_k2048_g7": ("fp8_b4_q100_k2048_g7", 4, 100),
+    "fp8_b4_q16_k128_g5": ("fp8_b4_q16_k128_g5", 4, 16),
+    "fp8_b8_q32_k1024_g6_page16": ("fp8_b8_q32_k1024_g6_page16", 8, 32),
+    "fp8_b4_q8_k2048_g12": ("fp8_b4_q8_k2048_g12", 4, 8),
+    "fp8_b4_q4_k1024_g16_page16": ("fp8_b4_q4_k1024_g16_page16", 4, 4),
+    "nvfp4_b16_q256_k2048_g8": ("nvfp4_b16_q256_k2048_g8", 3, 256),
+    "nvfp4_b4_q2048_k2048_g4": ("nvfp4_b4_q2048_k2048_g4", 2, 2048),
+    "nvfp4_b4_q2048_k2048_g5": ("nvfp4_b4_q2048_k2048_g5", 2, 2048),
+    "nvfp4_b16_q512_k512_g1": ("nvfp4_b16_q512_k512_g1", 3, 512),
     **WIDENED_ROWS,
 }
 _SCALES = {"context_bf16": (128**-0.5, 1.0)}
@@ -3618,6 +4606,8 @@ def _context_case(row, batch, max_q, *, seed=20261026):
             )
             for _ in range(2)
         )
+    # one attention sink per query head (the sink forms), drawn last
+    case.sinks = torch.rand((hq,), generator=generator, device=device) * 5.0
     return case
 
 
@@ -3628,7 +4618,11 @@ def _run_context(
     kv_layout="HND",
     block_tables=None,
     shared=None,
+    form=None,
 ):
+    """The call's output; with an LSE form (``_FP8_FORMS``) also its LSE."""
+
+    is_causal, return_lse, enable_sink = _FP8_FORMS.get(form, (True, False, False))
     bmm1, bmm2 = _SCALES.get(case.component, _QUANT_SCALES)
     if device_scales:
         bmm1 = torch.tensor(bmm1, dtype=torch.float32, device="cuda")
@@ -3638,6 +4632,11 @@ def _run_context(
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
     out = torch.empty_like(case.query)
+    lse = None
+    if return_lse:
+        lse = torch.full(
+            case.query.shape[:2], 7.0, dtype=torch.float32, device=out.device
+        )
     prefill.trtllm_batch_context_with_kv_cache(
         case.query,
         (key, value),
@@ -3653,14 +4652,17 @@ def _run_context(
         case.cum_kv,
         out=out,
         kv_layout=kv_layout,
+        sinks=case.sinks if enable_sink else None,
         kv_cache_sf=case.kv_cache_sf,
         uses_shared_paged_kv_idx=case.shared if shared is None else shared,
+        causal=is_causal,
+        lse=lse,
         multi_ctas_kv_counter_buffer=case.counter,
         backend="cake",
     )
     torch.cuda.synchronize()
     assert not case.counter.any()
-    return out
+    return out if lse is None else (out, lse)
 
 
 @_GPU
@@ -3685,7 +4687,10 @@ def test_cake_context_programs_match_the_jit_route_bitwise(
         assert served_programs[-1] == _device_scale_program(program)
         assert torch.equal(_bits(device_out), _bits(out))
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     served = len(served_programs)
     jit_out = _run_context(case)
     assert len(served_programs) == served
@@ -3730,13 +4735,188 @@ def test_cake_context_programs_match_the_jit_route_with_fewer_keys_than_queries(
     out = _run_context(case)
     assert served_programs == [program]
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     jit_out = _run_context(case)
     assert served_programs == [program]
     assert torch.equal(_bits(jit_out), _bits(out)), (
         f"{name}: max abs difference "
         f"{(jit_out.float() - out.float()).abs().nan_to_num(posinf=1e9).max().item()}"
     )
+
+
+#: FP8 rows of the form programs, one per pack: (row, batch, max_q).
+_FP8_FORM_BITWISE_ROWS = {
+    1: ("fp8_b2_q256_k2048_g3_page32", 2, 256),
+    2: ("fp8_b4_q128_k1024_g6_page16", 4, 128),
+    4: ("fp8_b64_q32_k1024_g4", 64, 32),
+    8: ("fp8_b256_q32_k1024", 256, 32),
+    5: ("fp8_b8_q32_k1024_g5_page16", 8, 32),
+    6: ("fp8_b8_q32_k1024_g6_page16", 8, 32),
+    7: ("fp8_b4_q100_k2048_g7", 4, 100),
+    12: ("fp8_b4_q8_k2048_g12", 4, 8),
+    16: ("fp8_b4_q4_k1024_g16_page16", 4, 4),
+}
+
+
+def _form_bits(result):
+    """The output's bits and, for an LSE form, the LSE's."""
+
+    if isinstance(result, tuple):
+        return torch.cat((_bits(result[0]).view(-1), _bits(result[1]).view(-1)))
+    return _bits(result).view(-1)
+
+
+def _jit_form_run(monkeypatch, served_programs, case, **kwargs):
+    """The same call on the JIT module (no form program)."""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
+        served = len(served_programs)
+        result = _run_context(case, **kwargs)
+        assert len(served_programs) == served
+    return result
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("pack", "form"),
+    [
+        (pack, form)
+        for pack, (row, _, _) in sorted(_FP8_FORM_BITWISE_ROWS.items())
+        for form in sorted(_FP8_FORMS)
+        # A causal form runs at the JIT pack: the rows whose JIT pack is that
+        # pack (no FP8 row has JIT pack 1 or 2).
+        if form not in _FP8_CAUSAL_FORMS or _form_pack(row, form) == pack
+    ],
+)
+def test_cake_context_fp8_form_programs_match_the_jit_route_bitwise(
+    monkeypatch, served_programs, pack, form
+) -> None:
+    """The program of a form writes the JIT module's output and LSE bit for
+    bit (sinks of the call, host and device scales); its device-scale launch
+    is bitwise its host-scale one."""
+
+    row, batch, max_q = _FP8_FORM_BITWISE_ROWS[pack]
+    case = _context_case(row, batch, max_q)
+    result = _run_context(case, form=form)
+    assert served_programs == [f"RUNTIME_PACK{pack}_{form}"]
+    device_result = _run_context(case, form=form, device_scales=True)
+    assert served_programs[-1] == f"RUNTIME_PACK{pack}_{form}"
+    assert torch.equal(_form_bits(device_result), _form_bits(result))
+    jit = _jit_form_run(monkeypatch, served_programs, case, form=form)
+    assert torch.equal(_form_bits(jit), _form_bits(result)), (
+        f"{row} {form}: {(_form_bits(jit) != _form_bits(result)).sum().item()} "
+        "bytes differ"
+    )
+
+
+@_GPU
+@pytest.mark.parametrize("form", sorted(_FP8_FORMS))
+@pytest.mark.parametrize(
+    ("row", "kv_lens"),
+    [
+        ("fp8_b64_q32_k1024_g4", (1024, 17, 1, 0)),
+        ("fp8_b8_q32_k1024_g5_page16", (1024, 5, 0, 31)),
+        ("fp8_b4_q128_k1024_g6_page16", (0, 40, 127, 1024)),
+    ],
+)
+def test_cake_context_fp8_form_programs_match_the_jit_route_on_rows_without_keys(
+    monkeypatch, served_programs, row, kv_lens, form
+) -> None:
+    """Requests without keys, or with fewer keys than query tokens (causal:
+    their first query rows see no key), next to whole ones: the program of a
+    form writes the JIT module's output and LSE bit for bit, those rows
+    included, and no row's output is NaN."""
+
+    max_q = SHAPE_ROWS[row][2]
+    case = _context_case(row, len(kv_lens), max_q)
+    case.seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    case.cum_kv = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            case.seq_lens.cumsum(0, dtype=torch.int32),
+        )
+    )
+    result = _run_context(case, form=form)
+    assert served_programs == [f"RUNTIME_PACK{_form_pack(row, form)}_{form}"]
+    out = result[0] if isinstance(result, tuple) else result
+    assert not out.float().isnan().any()
+    jit = _jit_form_run(monkeypatch, served_programs, case, form=form)
+    assert torch.equal(_form_bits(jit), _form_bits(result))
+
+
+@_GPU
+@pytest.mark.parametrize("form", sorted(_FP8_FORMS))
+def test_cake_context_fp8_form_program_graph_replay_is_bitwise(
+    monkeypatch, served_programs, form
+) -> None:
+    """A form program captured in a CUDA graph (device scales: no host
+    synchronization) replays the direct launch's output and LSE bit for bit,
+    and NHD caches and separate page tables give the same bits."""
+
+    case = _context_case("fp8_b8_q32_k1024_g5_page16", 3, 32)
+    is_causal, return_lse, enable_sink = _FP8_FORMS[form]
+    direct = _run_context(case, form=form, device_scales=True)
+    assert _form_bits(_run_context(case, form=form, kv_layout="NHD")).equal(
+        _form_bits(direct)
+    )
+    separate = torch.stack((case.tables_k, case.tables_k), dim=1)
+    assert _form_bits(
+        _run_context(case, form=form, block_tables=separate, shared=False)
+    ).equal(_form_bits(direct))
+    out = torch.empty_like(case.query)
+    lse = (
+        torch.empty(case.query.shape[:2], dtype=torch.float32, device="cuda")
+        if return_lse
+        else None
+    )
+    bmm1, bmm2 = (
+        torch.tensor(value, dtype=torch.float32, device="cuda")
+        for value in _QUANT_SCALES
+    )
+
+    def call():
+        prefill.trtllm_batch_context_with_kv_cache(
+            case.query,
+            (case.key, case.value),
+            case.workspace,
+            case.block_tables,
+            case.seq_lens,
+            case.max_q,
+            case.max_kv,
+            bmm1,
+            bmm2,
+            case.batch,
+            case.cum_q,
+            case.cum_kv,
+            out=out,
+            kv_layout="HND",
+            sinks=case.sinks if enable_sink else None,
+            uses_shared_paged_kv_idx=case.shared,
+            causal=is_causal,
+            lse=lse,
+            multi_ctas_kv_counter_buffer=case.counter,
+            backend="cake",
+        )
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            call()
+    out.zero_()
+    if lse is not None:
+        lse.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert set(served_programs) == {f"RUNTIME_PACK5_{form}"}
+    replay = out if lse is None else (out, lse)
+    assert torch.equal(_form_bits(replay), _form_bits(direct))
+    assert not case.counter.any()
 
 
 @_GPU
@@ -3746,6 +4926,11 @@ def test_cake_context_programs_match_the_jit_route_with_fewer_keys_than_queries(
         ("bf16_b128_q64_k2048", 3, 64),
         ("fp8_b256_q32_k1024", 3, 32),
         ("fp8_b64_q32_k1024_g4", 3, 32),
+        ("fp8_b8_q32_k1024_g5_page16", 3, 32),
+        ("fp8_b4_q100_k2048_g7", 3, 100),
+        ("fp8_b8_q32_k1024_g6_page16", 3, 32),
+        ("fp8_b4_q8_k2048_g12", 3, 8),
+        ("fp8_b4_q4_k1024_g16_page16", 3, 4),
     ],
 )
 def test_cake_context_program_launch_invariances_are_bitwise(

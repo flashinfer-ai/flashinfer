@@ -20,7 +20,8 @@ the other route; no context, partition or options field holds the mode), the nam
 the twin's objects; this package copies none of them and no public name carries a mode), the package hygiene rules
 (no environment variable, no ``cake_kda_train`` import, standalone: no import of another FlashInfer package, its twin
 included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
-partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation).
+partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation), directly or
+through ``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes to the #7 walks).
 """
 
 from __future__ import annotations
@@ -197,22 +198,21 @@ def test_enumerated_fields(field, values) -> None:
             make_options(**{field: bad})
 
 
-def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
+def test_reuse_recompute_tapes_defaults_to_auto_in_both_graph_modes() -> None:
     """The checkpoint-aware light backward is a keyword-only switch -- ``"auto"`` (the shipped default: the tapes are
-    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form); under
-    ``graph="replay"`` the default resolves to ``False`` -- part of the options key (so of the CUDA-graph key), typed,
-    and refused with ``graph="replay"`` (a captured graph bakes the arena addresses of its tapes; the kept tapes are
-    fresh tensors handed from the recompute forward to the backward)."""
+    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form) -- part
+    of the options key (so of the CUDA-graph key) and typed; ``graph="replay"`` has the same default and accepts every
+    value (the kept tapes are then the workspace arena's own: ``cake_kcp._kept_stale``)."""
     assert "reuse_recompute_tapes" in opt.OPTION_NAMES
     # the shipped default is this one constant (and this line) -- every other test names the state it exercises
     assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT == "auto"
     assert make_options().reuse_recompute_tapes == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
-    # None = the shipped default; under graph="replay" (the one mode that excludes the kept tapes) it is False
+    # None = the shipped default, under graph="replay" too
     assert make_options(reuse_recompute_tapes=None).reuse_recompute_tapes == "auto"
-    assert make_options(graph="replay").reuse_recompute_tapes is False
+    assert make_options(graph="replay").reuse_recompute_tapes == "auto"
     both = make_options(reuse_recompute_tapes=None, graph="replay")
-    assert both.reuse_recompute_tapes is False
-    assert OptionsKcp(graph="replay").reuse_recompute_tapes is False
+    assert both.reuse_recompute_tapes == "auto"
+    assert OptionsKcp(graph="replay").reuse_recompute_tapes == "auto"
     assert make_options(graph="replay").key() != make_options().key()
     on = make_options(reuse_recompute_tapes=True)
     off = make_options(reuse_recompute_tapes=False)
@@ -222,10 +222,9 @@ def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
     assert from_instance.reuse_recompute_tapes is True
     with pytest.raises(TypeError):
         make_options(reuse_recompute_tapes=1)
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes=True, graph="replay")
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes="auto", graph="replay")
+    for value in (True, False, "auto"):
+        o = make_options(reuse_recompute_tapes=value, graph="replay")
+        assert o.reuse_recompute_tapes == value and o.graph == "replay"
     # the other modes accept the switch (it has no effect there: documented as a no-op)
     for extra in (
         {"boundary_mode": "replay"},
@@ -247,7 +246,7 @@ def test_recompute_output_is_a_two_value_keyword_switch_defaulting_to_auto() -> 
     """``recompute_output`` -- whether the recompute of a checkpointed forward launches its dead output program -- is a
     keyword-only field of the options (so part of the CUDA-graph key), ``"auto"`` by default (the frame-proof skip),
     ``"always"`` the unconditional launch; anything else is refused.  It is independent of the kept-tape switch and
-    of the graph mode (a captured graph never skips, the option value stays ``"auto"``)."""
+    of the graph mode (under ``graph="replay"`` the recompute's decision is part of its CUDA-graph key)."""
     assert "recompute_output" in opt.OPTION_NAMES
     assert opt.RECOMPUTE_OUTPUTS == ("auto", "always")
     assert opt.RECOMPUTE_OUTPUT_DEFAULT == "auto"
@@ -333,6 +332,24 @@ def test_walk_pair_knob_defaults_to_auto() -> None:
     assert len(keys) == 3
     with pytest.raises(TypeError):
         make_options(walk_pair=1)  # a test knob, never a public option
+
+
+@pytest.mark.parametrize("knob", ("fused_o", "fused_o_tape"))
+def test_output_walk_knobs_default_to_the_shipped_walks(knob: str) -> None:
+    """``fused_o`` (the light forward's output walk) and ``fused_o_tape`` (the ``save_mode="full"`` forward's
+    tape-and-output walk) are private levers: 1 (shipped) or 0 (the split tape walk and #5), part of the options key
+    (a captured graph of one form never replays for the other), never public options."""
+    assert opt.TEST_KNOBS[knob] == (0, 1)
+    assert opt.TEST_KNOB_DEFAULTS[knob] == 1
+    assert make_options().knob(knob) == 1
+    assert make_options(test_knobs={knob: 0}).knob(knob) == 0
+    for bad in (2, -1, True, False, None, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={knob: bad})
+    keys = {make_options(test_knobs={knob: v}).key() for v in (0, 1)}
+    assert len(keys) == 2
+    with pytest.raises(TypeError):
+        make_options(**{knob: 0})  # a test knob, never a public option
 
 
 @pytest.mark.parametrize(
@@ -1176,6 +1193,69 @@ def test_facade_routes_by_mode(monkeypatch) -> None:
         facade.is_gdn_train_kcp_supported("cpu", deterministic=None)
 
 
+def test_facade_refuses_non_deterministic_only_save_modes_on_the_deterministic_route(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``ND_ONLY_SAVE_MODES`` are the save_mode values of this package that the twin does not take; the
+    deterministic route (the default, ``deterministic=True``, and ``deterministic=False`` under torch's
+    deterministic algorithms) refuses each one before the twin is reached, on every compute entry and in the saved /
+    workspace byte queries, as a keyword, a knob, an options mapping or an options instance, with an error naming
+    ``deterministic=False``; the non-deterministic route passes it on unchanged."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    assert facade.ND_ONLY_SAVE_MODES == ("light_akk",)
+    assert set(facade.ND_ONLY_SAVE_MODES) == set(opt.SAVE_MODES) - set(
+        det_opt.SAVE_MODES
+    )
+    seen = _route_recorders(monkeypatch)
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    calls = _facade_calls(facade)
+    entries = (
+        "chunk_gdn_kcp",
+        "chunk_gdn_fwd_kcp",
+        "chunk_gdn_bwd_kcp",
+        "gdn_workspace_bytes_kcp",
+        "gdn_saved_bytes_kcp",
+    )
+    for mode in facade.ND_ONLY_SAVE_MODES:
+        forms = [
+            {"save_mode": mode},
+            {"options": {"save_mode": mode}},
+            {"options": OptionsKcp(save_mode=mode, use_qk_l2norm_in_kernel=True)},
+        ]
+        for deterministic_mode in (False, True):
+            torch.use_deterministic_algorithms(deterministic_mode)
+            routes = (
+                ({"deterministic": False},)
+                if deterministic_mode
+                else ({}, {"deterministic": True})
+            )
+            for entry in entries:
+                for form in forms:
+                    for kw in routes:
+                        seen.clear()
+                        with pytest.raises(
+                            ValueError,
+                            match=f"{entry}: save_mode='{mode}' .*needs deterministic=False",
+                        ):
+                            calls[entry](**form, **kw)
+                        assert seen == [], (entry, form, kw)
+        torch.use_deterministic_algorithms(False)
+        for entry in entries:
+            for form in forms:
+                seen.clear()
+                assert calls[entry](**form, deterministic=False) == f"nondet:{entry}"
+                sent = seen[-1][1]
+                got = sent.get("options") if "options" in form else sent
+                got = got if isinstance(got, dict) else dataclasses.asdict(got)
+                assert got["save_mode"] == mode, (entry, form, sent)
+    # the twin's own values pass on the deterministic route
+    for entry in entries:
+        for mode in det_opt.SAVE_MODES:
+            seen.clear()
+            assert calls[entry](save_mode=mode).startswith("det:"), (entry, mode)
+
+
 def test_facade_imports_each_route_once(monkeypatch) -> None:
     """The facade imports each routed module on first use only: later calls on either route run no import and reach
     the same module objects."""
@@ -1335,10 +1415,96 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
         calls["chunk_gdn_kcp"](deterministic=None)
 
 
+def test_facade_maps_the_replay_auto_tape_option_onto_the_deterministic_default(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``OptionsKcp(graph="replay")`` (``reuse_recompute_tapes`` defaults to ``"auto"``) on the deterministic route --
+    the default ``deterministic=True``, and ``deterministic=False`` under ``torch.use_deterministic_algorithms(True)``
+    -- reaches the twin with ``reuse_recompute_tapes=None`` on every compute entry, which the twin's ``make_options``
+    resolves to its own default (``False`` under replay) and accepts; so does ``OptionsKcp()`` (``graph="off"``) with
+    ``graph="replay"`` as the call's keyword (``chunk_gdn_kcp``) or knob (the two explicit entries), which the twin
+    applies on top of the mapping; an explicit ``True`` passes on and the twin refuses it; under ``graph="off"`` the
+    ``None`` resolves to the twin's ``"auto"``; the non-deterministic route gets the instance."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    seen = _route_recorders(monkeypatch)
+    # no fallback warning in this test
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    t = torch.zeros(1)
+    calls = {
+        "chunk_gdn_kcp": lambda **m: facade.chunk_gdn_kcp(t, t, t, t, t, object(), **m),
+        "chunk_gdn_fwd_kcp": lambda **m: facade.chunk_gdn_fwd_kcp(
+            t, t, t, t, t, object(), **m
+        ),
+        "chunk_gdn_bwd_kcp": lambda **m: facade.chunk_gdn_bwd_kcp(
+            t, t, t, t, t, object(), t, **m
+        ),
+    }
+    replay = OptionsKcp(graph="replay")
+    assert replay.reuse_recompute_tapes == "auto"
+    explicit = OptionsKcp(graph="replay", reuse_recompute_tapes=True)
+    off = OptionsKcp(graph="off")
+    for deterministic_mode in (False, True):
+        torch.use_deterministic_algorithms(deterministic_mode)
+        routes = (
+            ({"deterministic": False},)
+            if deterministic_mode
+            else ({}, {"deterministic": True})
+        )
+        for entry, call in calls.items():
+            for kw in routes:
+                seen.clear()
+                assert call(options=replay, **kw).startswith("det:"), (entry, kw)
+                got = seen[-1][1]["options"]
+                assert isinstance(got, dict) and got["graph"] == "replay", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes is False
+                call(options=explicit, **kw)
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got)
+                call(options=off, **kw)
+                got = seen[-1][1]["options"]
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes == "auto"
+                # the instance says graph="off", the call's keyword / knob says "replay"
+                seen.clear()
+                assert call(options=OptionsKcp(), graph="replay", **kw).startswith(
+                    "det:"
+                ), (entry, kw)
+                got, sent = seen[-1][1]["options"], seen[-1][1]
+                assert sent.get("graph") == "replay", (entry, kw, sent)
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert (
+                    det_opt.make_options(got, graph="replay").reuse_recompute_tapes
+                    is False
+                ), (entry, kw)
+                call(
+                    options=OptionsKcp(reuse_recompute_tapes=True), graph="replay", **kw
+                )
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got, graph="replay")
+    torch.use_deterministic_algorithms(False)
+    for entry, call in calls.items():
+        assert call(options=replay, deterministic=False) == f"nondet:{entry}"
+        assert seen[-1][1]["options"] is replay
+
+
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
-    (partition tables, byte queries)."""
+    (partition tables, segment plan, the comm byte query, the saved byte query at the default options, under the
+    replay boundary and at ``P = 2`` with either ``save_mode`` and ``save_transfer``) and the same workspace terms
+    for every keyword of the workspace query (``graph``, ``save_for_backward``, ``fused_walks``, ``P``) except the b1
+    pools, whose layouts differ: the twin's b1 send carries the re-sent maps of the fragments crossing in and out
+    (``n_io``), this package's maps are paired with the crossing-in slots.  Under ``graph="replay"`` only this
+    package's query takes ``reuse_recompute_tapes=True`` (the arena hand-off) and ``"auto"``; the twin's refuses
+    both, as its options do.  The default (``None``) gives the replay form's terms on both routes."""
     facade = importlib.import_module(FACADE)
     det_pkg = importlib.import_module(DET_PACKAGE)
     pkg = _mod()
@@ -1355,14 +1521,115 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
         )
         assert isinstance(det_ctx, det_pkg.ContextDetKcp)
         assert isinstance(ctx, pkg.ContextKcp)
-        for query in (
-            "gdn_comm_bytes_kcp",
-            "gdn_saved_bytes_kcp",
-            "gdn_workspace_bytes_kcp",
-        ):
+        det_hp, hp = det_ctx.heads(6), ctx.heads(6)
+        assert (det_hp.P, det_hp.NSEG) == (hp.P, hp.NSEG), rank
+        for query in ("gdn_comm_bytes_kcp", "gdn_saved_bytes_kcp"):
             det_value = getattr(facade, query)(det_ctx, H_qk=2, HV=6)
             value = getattr(facade, query)(ctx, H_qk=2, HV=6, deterministic=False)
             assert det_value == value, (rank, query)
+        # a replay boundary saves nothing in either package (save_mode="full" included)
+        replay_full = dict(H_qk=2, HV=6, save_mode="full", boundary_mode="replay")
+        assert facade.gdn_saved_bytes_kcp(
+            det_ctx, **replay_full
+        ) == facade.gdn_saved_bytes_kcp(ctx, **replay_full, deterministic=False), rank
+        # the M_seg rule at P > 1 is shared (P n_frag s with save_transfer or save_mode="full")
+        assert ctx.n_frag > 0
+        for kw in (
+            {},
+            {"save_transfer": False},
+            {"save_mode": "full"},
+            {"save_mode": "full", "save_transfer": False},
+        ):
+            det_value = facade.gdn_saved_bytes_kcp(det_ctx, H_qk=2, HV=6, P=2, **kw)
+            value = facade.gdn_saved_bytes_kcp(
+                ctx, H_qk=2, HV=6, P=2, deterministic=False, **kw
+            )
+            assert det_value == value, (rank, kw)
+        # the workspace queries take the same keywords on both routes and count the same terms, except the b1 pools:
+        # the twin's dense b1 send carries the re-sent maps of the n_io fragments crossing in and out (its d_f plane +
+        # n_io map slots), this package's the maps paired with the n_in crossing-in slots
+        state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
+        det_gb = importlib.import_module(DET_PACKAGE + ".cake_bytes")
+        b1_keys = ("bwd.b1_send", "bwd.b1_recv")
+        for kw in (
+            {},
+            {"P": 2},
+            {"P": 2, "save_transfer": False},
+            {"graph": "replay"},
+            {"save_for_backward": False},
+            {"fused_walks": 0, "P": 2, "backward": False},
+        ):
+            det_lay = det_gb.gdn_det_workspace_layout_kcp(det_ctx, H_qk=2, HV=6, **kw)
+            lay = _mod("cake_bytes").gdn_workspace_layout_kcp(ctx, H_qk=2, HV=6, **kw)
+            assert set(det_lay) == set(lay), (rank, kw)
+            fwd_keys = [
+                k
+                for k in lay
+                if k.startswith("fwd.") or k in ("forward", "forward_split")
+            ]
+            assert {k: det_lay[k] for k in fwd_keys} == {k: lay[k] for k in fwd_keys}, (
+                rank,
+                kw,
+            )
+            assert facade.gdn_workspace_bytes_kcp(
+                det_ctx, H_qk=2, HV=6, **kw
+            ) == det_gb.gdn_det_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw), (
+                rank,
+                kw,
+            )
+            assert facade.gdn_workspace_bytes_kcp(
+                ctx, H_qk=2, HV=6, deterministic=False, **kw
+            ) == pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, **kw), (rank, kw)
+            if kw.get("backward", True):
+                hp = det_ctx.heads(6)
+                n_io, N_io = hp.n_io_by_rank[rank], sum(hp.n_io_by_rank)
+                assert (
+                    lay["bwd.b1_send"] - det_lay["bwd.b1_send"]
+                    == (det_ctx.n_in - n_io) * state
+                ), (rank, kw)
+                # an owner receives the b1 of every crossing-in fragment of the group (and the maps of the N_io
+                # fragments on the twin's side, of the N_in crossing-in slots on this package's)
+                s_owner = hp.Hg_r * _mod("cake_bytes").STATE_TILE_BYTES
+                assert (
+                    lay["bwd.b1_recv"] - det_lay["bwd.b1_recv"]
+                    == (det_ctx.N_in - N_io) * s_owner
+                ), (rank, kw)
+                # the .phase. keys are moment sums, some of which hold the b1 pools: they carry the b1 deltas above,
+                # so they are left out of this term-by-term comparison
+                rest = {
+                    k: v
+                    for k, v in lay.items()
+                    if k.startswith("bwd.") and k not in b1_keys and ".phase." not in k
+                }
+                assert rest == {k: det_lay[k] for k in rest}, (rank, kw)
+        # reuse_recompute_tapes=True (the arena hand-off) and "auto" under graph="replay": this package's query takes
+        # them, the twin's refuses both, as its options do
+        for reuse in (True, "auto"):
+            graph_kw = dict(H_qk=2, HV=6, graph="replay", reuse_recompute_tapes=reuse)
+            assert facade.gdn_workspace_bytes_kcp(
+                ctx, **graph_kw, deterministic=False
+            ) == pkg.gdn_workspace_bytes_kcp(ctx, **graph_kw), (rank, reuse)
+            with pytest.raises(ValueError, match="needs graph='off'"):
+                facade.gdn_workspace_bytes_kcp(det_ctx, **graph_kw)
+        # save_for_backward (a forward without a backward): both routes, each to its own query
+        no_saved_set = dict(H_qk=2, HV=6, save_for_backward=False, backward=False)
+        assert facade.gdn_workspace_bytes_kcp(
+            det_ctx, **no_saved_set
+        ) == det_gb.gdn_det_workspace_bytes_kcp(det_ctx, **no_saved_set), rank
+        assert facade.gdn_workspace_bytes_kcp(
+            ctx, **no_saved_set, deterministic=False
+        ) == pkg.gdn_workspace_bytes_kcp(ctx, **no_saved_set), rank
+        # the facade passes fused_walks=0 on: at P = 2 its forward has no carry slots for the crossing fragments
+        assert max(ctx.n_in, ctx.n_out) > 0
+        for c, det in ((ctx, False), (det_ctx, True)):
+            route = {} if det else {"deterministic": False}
+            split_walks = facade.gdn_workspace_bytes_kcp(
+                c, H_qk=2, HV=6, fused_walks=0, P=2, backward=False, **route
+            )
+            fused = facade.gdn_workspace_bytes_kcp(
+                c, H_qk=2, HV=6, P=2, backward=False, **route
+            )
+            assert fused - split_walks == max(c.n_in, c.n_out) * state, (rank, det)
 
 
 def test_the_context_holds_no_mode() -> None:
@@ -1570,6 +1837,8 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "fwd_prep",
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -1581,6 +1850,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "fwd_prep_l2n",
         "bwd_dqkg_l2n",
         "qk_apply",
+        "fwd_prep_replay_l2n",
     )
     # the in-kernel Q / K L2 norm (use_qk_l2norm_in_kernel): #1 / #8 siblings and the backward's qk_apply
     assert kcp.L2N_PROGRAMS == ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
@@ -1594,11 +1864,32 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
+    # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
+    # save_mode="light_akk": the solve-free light replay of #1_l2n (this package's own module; a local program,
+    # launched only in place of fwd_prep_l2n when the saved set holds the Akk tape)
+    assert (
+        kcp.TART_MODULE_OF["fwd_prep_replay_l2n"]
+        == "gdn_chunk_train_fwd_prep_replay_l2n_v1"
+    )
+    assert kcp.AKK_REPLAY_OF == {"fwd_prep_l2n": "fwd_prep_replay_l2n"}
+    assert kcp.AKK_REPLAY_PROGRAMS == ("fwd_prep_replay_l2n",)
+    assert set(kcp.AKK_REPLAY_PROGRAMS) <= set(kcp.LOCAL_PROGRAMS)
+    assert kcp.PROGRAM_ARGS["fwd_prep_replay_l2n"] == kcp.PROGRAM_ARGS["fwd_prep_l2n"]
+    own = (
+        "kcp_affine_merge",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+        "fwd_prep_replay_l2n",
+    )
     for name, module in kcp.TART_MODULE_OF.items():
-        if name != "kcp_affine_merge":
-            # the programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever that
-            # replaces a program updates this line); the context-parallel-only programs carry the ``_kcp`` suffix
+        if name not in own:
+            # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
+            # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)
+        if name != "kcp_affine_merge":
+            # the context-parallel-only programs carry the ``_kcp`` suffix
             assert module.endswith("_kcp") == name.startswith("kcp_"), (name, module)
     assert kcp.FWD_TAPES == (
         "w",
@@ -1620,7 +1911,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "dg_part",
         "gamma_dot",
     )
-    for prog in ("kcp_fwdh_offset", "kcp_transfer_walk", "kcp_dhu_offset"):
+    for prog in (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+        "kcp_transfer_walk",
+        "kcp_dhu_offset",
+    ):
         args = kcp.PROGRAM_ARGS[prog]
         assert (
             "num_heads" in args
@@ -1642,6 +1939,20 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert "group_reduce" in kcp.PROGRAM_ARGS["bwd_dqkg"]
     assert set(kcp.HOST_ONLY_ARGS) <= set(kcp.PROGRAM_ARGS["bwd_dqkg"])
     assert "o" in kcp.PROGRAM_ARGS["fwd_o"] and "out" not in kcp.PROGRAM_ARGS["fwd_o"]
+    # the output walk: the tape walk's inputs and #5's operands, writes o and neither tape nor final-state pool
+    fused = kcp.PROGRAM_ARGS["kcp_fwdh_out"]
+    assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
+    assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
+    assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
+    # the tape-and-output walk: the output walk's arguments and the tape walk's h / v_new tapes, no final-state pool
+    fused_tape = kcp.PROGRAM_ARGS["kcp_fwdh_out_tape"]
+    assert set(fused_tape) == set(fused) | {"h_tape", "v_new"}
+    assert not {"out", "out_index", "ticket"} & set(fused_tape)
+    assert set(fused_tape) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
     assert (
         "do" in kcp.PROGRAM_ARGS["bwd_prep"]
         and "dout" not in kcp.PROGRAM_ARGS["bwd_prep"]
@@ -1703,16 +2014,35 @@ def test_program_args_are_the_registry_logical_names() -> None:
         jit.select_record("kcp_transfer_walk", transfer_walk="bf16x3")
 
 
-def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
-    """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count``, else vh = 128; the test knob
-    ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the fake-backend suite checks it)."""
+def test_fwdh_form_rule_follows_the_chain_clause() -> None:
+    """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count`` or when the launch's two-CTA grid finishes within
+    its longest chain (``walk_vh64_fits``: LPT of ``2 * HV`` CTAs per segment over ``2 * sm_count`` slots), else
+    vh = 128; the test knob ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the
+    fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape")
+    assert kcp.FWDH_PROGRAMS == (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+    )
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
-    assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152
+    assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
+    assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
     assert kcp.fwdh_vh(1, 48, 148) == 64
     assert kcp.fwdh_vh(6, 48, 152, forced=64) == 64
-    assert kcp.fwdh_vh(1, 48, 152, forced=128) == 128
+    assert kcp.fwdh_vh(1, 48, 152, forced=128, fits=True) == 128
+    # four segments of 1536 / 1024 / 896 / 640 chunks at HV 48 (the K3E CP1 rank): 384 two-CTA items on 296 slots
+    # (148 SMs) end at 1536 = the longest chain; on 128 slots they do not; one balanced segment kind fits only
+    # while its items fill one round
+    k3e = ((1536, 1), (1024, 1), (896, 1), (640, 1))
+    assert kcp.walk_vh64_fits(k3e, 48, 148)
+    assert not kcp.walk_vh64_fits(k3e, 48, 64)
+    assert kcp.walk_vh64_fits(((100, 3),), 48, 148)  # 288 items <= 296 slots
+    # 384 items: a second round of 100
+    assert not kcp.walk_vh64_fits(((100, 4),), 48, 148)
+    assert not kcp.walk_vh64_fits((), 48, 148)
+    assert not kcp.walk_vh64_fits(k3e, 48, 0)
     assert kcp.VH64_SUFFIX == "_vh64"
     try:
         jit = _mod("cake_jit")
@@ -1726,6 +2056,119 @@ def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
             assert jit.launch_grid(
                 prog + kcp.VH64_SUFFIX, n_walk=3, num_heads=48, ctas_per_head=2
             ) == (288, 1, 1)
+
+
+def test_forward_walk_form_follows_the_plan_chains() -> None:
+    """Plan test of the #2 chain clause: one contiguous rank of four documents of 24 / 16 / 14 / 10 chunks at HV 6,
+    one segment per document.  ``n_walk * HV = 24`` exceeds both SM counts below, so the one-wave clause alone takes
+    vh = 128; at 20 SMs the 48 two-CTA items on 40 slots end at the longest chain (LPT makespan 24), so the forward's
+    tape / output walk launches the ``_vh64`` record; at 12 SMs (makespan 34) it stays vh = 128.  The fake backend
+    runs the forward the plan launches (the record list of ``LAST_CALL``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _mode_ops(cu, (2, 6))
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    for sm, want in ((20, True), (12, False)):
+        ctx = plan.build_context_kcp(
+            plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+        )
+        tb = kcp._Tables(ctx, 6, P=1)
+        assert len(tb.walk_live) == 4 and tb.walk_fits(tb.walk_live, sm) is want
+        assert kcp.fwdh_vh(4, 6, sm) == 128
+        kcp.chunk_gdn_fwd_kcp(
+            *args, ctx, backend="fake", deterministic=False, segments=1
+        )
+        walks = [
+            r
+            for r, _ in kcp.LAST_CALL["fwd"]["records"]
+            if r.startswith(("kcp_fwdh_tape", "kcp_fwdh_out"))
+        ]
+        assert walks and all(r.endswith(kcp.VH64_SUFFIX) is want for r in walks), (
+            sm,
+            walks,
+        )
+
+
+@pytest.mark.parametrize(("sm", "want"), [(20, True), (12, False)])
+def test_walk_forms_agree_across_forward_recompute_and_handle(
+    monkeypatch, sm, want
+) -> None:
+    """The width rules read host plan integers only, so the forward, torch's checkpoint recompute and the recompute
+    from a :class:`RecomputeHandleKcp` launch the same form of every #2 and #7 walk program.  The rank of
+    :func:`test_forward_walk_form_follows_the_plan_chains` (HV 6, one segment per document): at 20 SMs the chain
+    clause takes the ``_vh64`` record of the forward walks, at 12 SMs vh = 128; the fake backend has no
+    architecture, so #7 takes vh = 64 (the #7 forms per architecture across the three paths:
+    :func:`test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architecture`).  Each path logs the
+    records of every recorded call (``_record``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _mode_ops(cu, (2, 6))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+    )
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        log.append((kind, [r for r, _ in kcp.LAST_CALL[kind]["records"]]))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del log[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="fake",
+                segments=1,
+                deterministic=False,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        forms: dict = {}
+        for _kind, records in log:
+            for r in records:
+                base = r.removesuffix(kcp.VH64_SUFFIX)
+                if base in kcp.FWDH_PROGRAMS + kcp.DHU_PROGRAMS:
+                    forms.setdefault(base, set()).add(r.endswith(kcp.VH64_SUFFIX))
+        return {"kinds": [k for k, _ in log], "forms": forms}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    for name, p in paths.items():
+        forms = p["forms"]
+        fwdh = [b for b in forms if b in kcp.FWDH_PROGRAMS]
+        dhu = [b for b in forms if b in kcp.DHU_PROGRAMS]
+        assert fwdh and dhu, (name, forms)
+        assert all(forms[b] == {want} for b in fwdh), (name, sm, forms)
+        assert all(forms[b] == {True} for b in dhu), (name, forms)
+    assert paths["recompute"]["forms"] == paths["forward"]["forms"]
+    assert paths["handle"]["forms"] == paths["forward"]["forms"]
 
 
 def test_tape_shapes_follow_the_frozen_set() -> None:
@@ -1883,6 +2326,8 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
         for prog in (
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
+            "kcp_fwdh_out",
+            "kcp_fwdh_out_tape",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",
@@ -2096,23 +2541,29 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     assert kcp.graph_cache_clear() == 3
 
 
-def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
-    """#7 runs the vh = 64 two-CTA form when its grid ``n_walk * HV * 2`` fits two waves at two CTAs per SM
-    (``<= 4 * sm_count``), else vh = 128; the test knob ``dhu_vh`` forces a form (both forms within the same accuracy budget).
-    ``resolve_launch`` names the record the registry provides: the ``_vh64`` record where the registry ships it,
-    the full-head record with the grid ``n_walk * HV`` where it does not (no error either way)."""
+def test_dhu_form_rule_follows_the_architecture_recommendation() -> None:
+    """#7 runs the vh = 64 two-CTA form for the offset walk always and for the tape walk on ``sm_100a`` / ``sm_103a``
+    always (``arch`` ``None``, the fake backend, counts as one of them); on ``sm_107a`` the tape walk runs vh = 64 when
+    its grid ``n_walk * HV * 2`` fits two waves at two CTAs per SM (``<= 4 * sm_count``), else vh = 128; the test
+    knob ``dhu_vh`` forces a form (both forms within the same accuracy budget).  ``resolve_launch`` names the record
+    the registry provides: the ``_vh64`` record where the registry ships it, the full-head record with the grid
+    ``n_walk * HV`` where it does not (no error either way)."""
     kcp = _mod("cake_kcp")
     assert kcp.DHU_PROGRAMS == ("kcp_dhu_offset", "kcp_dhu_tape")
+    assert kcp.DHU_TAPE_VH64_ARCHES == ("sm_100a", "sm_103a")
+    for arch in (None, "sm_100a", "sm_103a"):
+        assert kcp.dhu_vh(96, 48, 152, arch=arch) == 64
+        assert kcp.dhu_vh(96, 48, 152, tape=False, arch=arch) == 64
+    r = "sm_107a"
+    # the offset walk: vh 64 everywhere
+    assert kcp.dhu_vh(96, 48, 212, tape=False, arch=r) == 64
     assert (
-        kcp.dhu_vh(8, 38, 152) == 64
+        kcp.dhu_vh(8, 38, 152, arch=r) == 64
     )  # 8 * 38 * 2 = 608 == 4 * 152: the boundary is vh 64
-    assert kcp.dhu_vh(8, 38, 151) == 128  # 608 > 604
-    assert (
-        kcp.dhu_vh(6, 48, 152) == 64
-    )  # 576 CTAs: two waves at two CTAs per SM (GB300)
-    assert kcp.dhu_vh(7, 48, 152) == 128  # 672 > 608
-    assert kcp.dhu_vh(1, 48, 148) == 64
-    assert kcp.dhu_vh(9, 48, 152, forced=64) == 64
+    assert kcp.dhu_vh(8, 38, 151, arch=r) == 128  # 608 > 604
+    assert kcp.dhu_vh(8, 48, 212, arch=r) == 64  # 768 <= 848
+    assert kcp.dhu_vh(9, 48, 212, arch=r) == 128  # 864 > 848
+    assert kcp.dhu_vh(9, 48, 212, forced=64, arch=r) == 64
     assert kcp.dhu_vh(1, 48, 152, forced=128) == 128
     try:
         jit = _mod("cake_jit")
@@ -2123,16 +2574,28 @@ def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
         assert (
             jit.select_record(prog) == prog
         )  # the default selection stays the full-head record
-        for forced, n_walk in ((None, 3), (64, 9), (128, 3), (None, 7)):
+        for forced, n_walk, arch in (
+            (None, 3, None),
+            (64, 9, "sm_107a"),
+            (128, 3, None),
+            (None, 7, None),
+            (None, 7, "sm_107a"),
+        ):
             args = {
                 "_grid_args": {"n_walk": n_walk, "num_heads": 48},
                 "_sm_count": 152,
                 "_dhu_vh": forced,
+                "_arch": arch,
                 "_grid": n_walk * 48,
             }
             record, values, grid, is_test = kcp.resolve_launch(prog, dict(args))
             assert values == {} and not is_test
-            if kcp.dhu_vh(n_walk, 48, 152, forced) == 64 and ships_vh64:
+            vh = kcp.dhu_vh(
+                n_walk, 48, 152, forced, tape=prog == "kcp_dhu_tape", arch=arch
+            )
+            if (prog, n_walk, arch) == ("kcp_dhu_tape", 7, "sm_107a"):
+                assert vh == 128  # 672 > 608: the sm_107a two-wave rule
+            if vh == 64 and ships_vh64:
                 assert record == prog + kcp.VH64_SUFFIX, (prog, forced, n_walk)
                 assert grid == (n_walk * 48 * 2, 1, 1)
                 assert jit.launch_grid(record, n_walk=n_walk, num_heads=48) == grid
@@ -2146,6 +2609,363 @@ def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
         for prog in kcp.DHU_PROGRAMS:
             assert jit.select_record(prog, ctas_per_head=2) == prog + kcp.VH64_SUFFIX
             assert jit.MODULES[prog + kcp.VH64_SUFFIX]["program"] == prog
+
+
+def test_dhu_long_chain_walk_takes_the_two_wave_rule_on_sm_100a() -> None:
+    """On ``sm_100a`` (:data:`DHU_LONG_CHAIN_ARCHES`) a #7 walk whose longest segment has at least
+    ``DHU_LONG_CHAIN_MIN_CHUNKS`` = 400 chunks and whose two-CTA grid ends later than its one-CTA grid (LPT over
+    ``2 * sm_count`` slots: :func:`walk_dhu_long_chain`) takes the two-wave rule (vh = 64 iff ``2 * n_walk * HV <= 4 *
+    sm_count``) for the offset and the tape walk.  ``sm_103a``, ``sm_107a`` and the fake backend (``arch`` ``None``)
+    keep their rules for the same walk."""
+    kcp = _mod("cake_kcp")
+    assert kcp.DHU_LONG_CHAIN_ARCHES == ("sm_100a",)
+    assert kcp.DHU_LONG_CHAIN_MIN_CHUNKS == 400
+    # one segment of L0 chunks and five of 140 at HV 48 on 148 SMs (296 slots): the one-CTA grid ends at L0 (48 long
+    # CTAs, 240 short ones one per slot); the two-CTA grid puts 480 short CTAs on the 200 other slots, three deep on
+    # 80 of them: 420 > L0 for L0 = 399 / 400, so only the 400-chunk segment reaches the clause
+    assert kcp.walk_dhu_long_chain(((400, 1), (140, 5)), 48, 148)
+    assert not kcp.walk_dhu_long_chain(((399, 1), (140, 5)), 48, 148)
+    # a long segment whose two-CTA grid still ends at it (three short CTAs deep = 300 < 500): not a long-chain walk
+    assert not kcp.walk_dhu_long_chain(((500, 1), (100, 5)), 48, 148)
+    assert not kcp.walk_dhu_long_chain((), 48, 148)
+    assert not kcp.walk_dhu_long_chain(((400, 1), (140, 5)), 48, 0)
+    # the twelve-segment #7 walk of a P1-shaped CP2 rank on 148 SMs: one-CTA LPT 536, two-CTA LPT 640
+    p1 = (
+        (536, 1),
+        (451, 1),
+        (147, 1),
+        (138, 1),
+        (126, 2),
+        (96, 1),
+        (90, 1),
+        (61, 1),
+        (59, 1),
+        (44, 1),
+        (43, 1),
+    )
+    assert kcp.walk_dhu_long_chain(p1, 48, 148)
+    for tape in (True, False):
+        # sm_100a: 2 * 12 * 48 = 1152 > 4 * 148 -> vh 128 for both forms; without the clause both are vh 64
+        assert (
+            kcp.dhu_vh(12, 48, 148, tape=tape, arch="sm_100a", long_chain=True) == 128
+        )
+        assert kcp.dhu_vh(12, 48, 148, tape=tape, arch="sm_100a") == 64
+        # the two-wave rule still takes vh 64 where the grid fits: 2 * 6 * 48 = 576 <= 592
+        assert kcp.dhu_vh(6, 48, 148, tape=tape, arch="sm_100a", long_chain=True) == 64
+        # forced knob wins
+        assert (
+            kcp.dhu_vh(12, 48, 148, 64, tape=tape, arch="sm_100a", long_chain=True)
+            == 64
+        )
+        # not on sm_103a or the fake backend
+        for arch in ("sm_103a", None):
+            assert kcp.dhu_vh(12, 48, 152, tape=tape, arch=arch, long_chain=True) == 64
+    # sm_107a keeps its rules: the offset walk stays vh 64; the tape walk keeps the two-wave rule it already has
+    assert kcp.dhu_vh(12, 48, 208, tape=False, arch="sm_107a", long_chain=True) == 64
+    assert kcp.dhu_vh(8, 48, 212, arch="sm_107a", long_chain=True) == 64  # 768 <= 848
+    assert kcp.dhu_vh(9, 48, 212, arch="sm_107a", long_chain=True) == 128  # 864 > 848
+    # resolve_launch reads the clause flag and the launch cache key carries it
+    for prog in kcp.DHU_PROGRAMS:
+        base = {
+            "_grid_args": {"n_walk": 12, "num_heads": 48},
+            "_sm_count": 148,
+            "_dhu_vh": None,
+            "_arch": "sm_100a",
+            "_grid": 12 * 48,
+        }
+        long_args = {**base, "_dhu_long_chain": True}
+        record, _values, grid, _is_test = kcp.resolve_launch(prog, dict(long_args))
+        assert record == prog and grid == (12 * 48, 1, 1), (prog, record, grid)
+        assert kcp._launch_key(prog, long_args, 8) != kcp._launch_key(prog, base, 8)
+
+
+@pytest.mark.parametrize("longest", [24, 23])
+def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> None:
+    """Plan test of the #7 long-chain flag (the 400-chunk threshold lowered to 24 so the rank stays small): one
+    contiguous rank of six documents of ``longest`` / 10 / 10 / 10 / 10 / 10 chunks at HV 6 on 18 SMs (36 slots),
+    one segment per document.  The one-CTA grid ends at the longest segment (6 long CTAs, 30 short ones one per
+    slot); the two-CTA grid puts 60 short CTAs on the 24 other slots, three deep on 12 of them (30 > ``longest``).
+    So ``_Tables.walk_long_chain`` holds for 24 and not for 23, and the backward's #7 launches carry that flag to
+    :func:`dhu_vh` (the fake backend has no architecture, so the forms themselves stay vh 64)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", 24)
+    cu = _cu((longest * 64,) + (10 * 64,) * 5)
+    ops = _mode_ops(cu, (2, 6))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=18
+    )
+    tb = kcp._Tables(ctx, 6, P=1)
+    assert sorted(tb._walk_chains(tb.walk_live)) == [(10, 5), (longest, 1)]
+    assert tb.walk_long_chain(tb.walk_live, 18) is (longest == 24)
+    seen: list = []
+    real = kcp.dhu_vh
+
+    def recording(*args, **kw):
+        seen.append(kw.get("long_chain"))
+        return real(*args, **kw)
+
+    monkeypatch.setattr(kcp, "dhu_vh", recording)
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = kcp.chunk_gdn_kcp(
+        *leaves, ctx, backend="fake", segments=1, deterministic=False
+    )
+    out.backward(ops["dout"])
+    assert seen and all(isinstance(x, bool) for x in seen)
+    assert any(seen) is (longest == 24), seen
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the architecture the kernel backend passes to the #7 walks (KernelBackend.run on a stub launch glue, no kernel)
+
+# One contiguous rank of six documents of 8 / 4 / 4 / 4 / 4 / 4 chunks at HV 6 on 18 SMs (36 slots), run with
+# ``segments=2``: twelve segments, two of 4 chunks and ten of 2.  The #7 walks of this rank visit all twelve, so
+# their two-wave rule takes vh = 128 (2 * 12 * 6 = 144 > 4 * 18); with ``DHU_LONG_CHAIN_MIN_CHUNKS`` lowered to 4
+# they are long-chain walks (LPT over the 36 slots: the one-CTA grid ends at 6, the two-CTA grid at 10).
+ARCH_CHUNKS = (8, 4, 4, 4, 4, 4)
+ARCH_HEADS = (2, 6)
+ARCH_SM = 18
+ARCH_LONG_CHAIN_MIN = 4
+
+
+class _ArchGlue:
+    """A stub launch glue of :class:`KernelBackend` (its ``launcher``): ``device_arch`` answers ``arch`` for every
+    device index; ``run_module`` logs each launch's ``(record, grid)`` and runs the record on the fake backend's
+    emulation (the same logical arguments), so a real plan runs through ``KernelBackend.run`` on the CPU."""
+
+    def __init__(self, arch: str) -> None:
+        self.arch = arch
+        self.launches: list[tuple[str, tuple[int, ...]]] = []
+        self._fake = _mod("cake_fake_backend")
+
+    def device_arch(self, device_index: int) -> str:
+        return self.arch
+
+    def run_module(self, record, values, *, grid, device_index, module=None) -> None:
+        self.launches.append((str(record), tuple(int(x) for x in grid)))
+        self._fake.run_module(record, values, grid=grid, device_index=None)
+
+
+def _arch_backend(monkeypatch, arch: str) -> tuple[_ArchGlue, list]:
+    """Install ``KernelBackend(launcher=_ArchGlue(arch))`` as the ``"kernels"`` backend for one test and log, in
+    launch order (one entry per ``run_module`` call), the program and the ``_arch`` / ``_dhu_long_chain`` /
+    ``_grid_args`` that ``KernelBackend.run`` resolves each launch with.  A CPU context has no device index, so
+    ``torch.cuda.current_device`` answers 0 (the glue ignores the index)."""
+    kcp = _mod("cake_kcp")
+    glue = _ArchGlue(arch)
+    monkeypatch.setitem(kcp._BACKENDS, "kernels", kcp.KernelBackend(launcher=glue))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    resolved: list = []
+    real = kcp._resolve_cached
+
+    def resolving(name, args, **kw):
+        resolved.append(
+            (
+                name,
+                args.get("_arch"),
+                args.get("_dhu_long_chain"),
+                dict(args.get("_grid_args") or {}),
+            )
+        )
+        return real(name, args, **kw)
+
+    monkeypatch.setattr(kcp, "_resolve_cached", resolving)
+    return glue, resolved
+
+
+def _dhu_launches(glue: _ArchGlue, resolved: list) -> list[dict]:
+    """The #7 launches of a run in launch order: program, record, grid and the scalars ``KernelBackend.run``
+    resolved them with (``_arch``, ``_dhu_long_chain``, ``n_walk``)."""
+    kcp = _mod("cake_kcp")
+    assert len(glue.launches) == len(resolved) > 0
+    return [
+        {
+            "program": name,
+            "record": record,
+            "grid": grid,
+            "arch": arch,
+            "long_chain": long_chain,
+            "n_walk": int(grid_args["n_walk"]),
+        }
+        for (record, grid), (name, arch, long_chain, grid_args) in zip(
+            glue.launches, resolved, strict=True
+        )
+        if name in kcp.DHU_PROGRAMS
+    ]
+
+
+def _dhu_rule_vh(
+    arch: str, tape: bool, n_walk: int, num_heads: int, sm_count: int, long_chain: bool
+) -> int:
+    """The #7 form of one launch as the rule text states it (restated here, not read from :func:`dhu_vh`): the
+    two-wave rule (vh = 64 iff ``2 * n_walk * HV <= 4 * sm_count``) for the tape walk on ``sm_107a`` and for a
+    long-chain walk of either form on ``sm_100a``; vh = 64 for every other launch."""
+    two_wave = 64 if 2 * n_walk * num_heads <= 4 * sm_count else 128
+    if (tape and arch == "sm_107a") or (long_chain and arch == "sm_100a"):
+        return two_wave
+    return 64
+
+
+def _arch_case(monkeypatch, long_chain: bool):
+    """The context and operands of the :data:`ARCH_CHUNKS` rank (``DHU_LONG_CHAIN_MIN_CHUNKS`` lowered to
+    :data:`ARCH_LONG_CHAIN_MIN` when ``long_chain``), after checking the plan's #7 chains."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    if long_chain:
+        monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", ARCH_LONG_CHAIN_MIN)
+    cu = _cu(tuple(n * 64 for n in ARCH_CHUNKS))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=ARCH_SM
+    )
+    HV = ARCH_HEADS[1]
+    tb = kcp._Tables(ctx, HV, P=2)
+    assert sorted(tb._walk_chains(tb.walk_all)) == [(2, 10), (4, 2)]
+    assert tb.walk_long_chain(tb.walk_all, ARCH_SM) is long_chain
+    return ctx, _mode_ops(cu, ARCH_HEADS)
+
+
+@pytest.mark.parametrize("long_chain", [False, True])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks(
+    monkeypatch, arch, long_chain
+) -> None:
+    """``KernelBackend.run`` is the only producer of the ``_arch`` the #7 width rule reads (:func:`dhu_vh`; the fake
+    backend has none).  A real plan (the :data:`ARCH_CHUNKS` rank, forward and backward with ``segments=2``) runs
+    through it with a stub launch glue whose ``device_arch`` answers ``arch`` (:func:`_arch_backend`).  Every #7
+    launch receives that architecture, and its record is the form the rule text gives (:func:`_dhu_rule_vh`) on
+    the grid of that form.  On this plan: ``sm_100a`` and ``sm_103a`` launch vh = 64 everywhere; ``sm_107a`` keeps
+    the two-wave rule for the tape walk (vh = 128 here) and vh = 64 for the offset walk; with the long-chain
+    threshold lowered, ``sm_100a`` takes the two-wave rule (vh = 128) for the offset and the tape walk while
+    ``sm_103a`` stays vh = 64 and ``sm_107a`` keeps its forms.  The persistent launches receive the same
+    architecture in their grid arguments."""
+    kcp = _mod("cake_kcp")
+    ctx, ops = _arch_case(monkeypatch, long_chain)
+    glue, resolved = _arch_backend(monkeypatch, arch)
+    HV = ARCH_HEADS[1]
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = kcp.chunk_gdn_kcp(
+        *leaves, ctx, backend="kernels", segments=2, deterministic=False
+    )
+    out.backward(ops["dout"])
+    launches = _dhu_launches(glue, resolved)
+    assert {x["program"] for x in launches} == set(kcp.DHU_PROGRAMS), launches
+    for x in launches:
+        tape = x["program"] == "kcp_dhu_tape"
+        vh = 64 if x["record"].endswith(kcp.VH64_SUFFIX) else 128
+        assert x["arch"] == arch, x
+        assert x["grid"] == (x["n_walk"] * HV * (2 if vh == 64 else 1), 1, 1), x
+        assert vh == _dhu_rule_vh(
+            arch, tape, x["n_walk"], HV, ARCH_SM, x["long_chain"]
+        ), (arch, x)
+    # the plan reaches every clause: each #7 program has launches whose two-wave rule is vh = 128, and a long-chain
+    # one among them exactly where the threshold is lowered
+    for prog in kcp.DHU_PROGRAMS:
+        wide = [
+            x
+            for x in launches
+            if x["program"] == prog and 2 * x["n_walk"] * HV > 4 * ARCH_SM
+        ]
+        assert wide and any(x["long_chain"] for x in wide) is long_chain, (
+            prog,
+            launches,
+        )
+    full = {x["program"] for x in launches if not x["record"].endswith(kcp.VH64_SUFFIX)}
+    want = {
+        "sm_100a": set(kcp.DHU_PROGRAMS) if long_chain else set(),
+        "sm_103a": set(),
+        "sm_107a": {"kcp_dhu_tape"},
+    }[arch]
+    assert full == want, (arch, long_chain, launches)
+    persistent = [ga for _n, _a, _l, ga in resolved if "sm_count" in ga]
+    assert persistent and all(ga["arch"] == arch for ga in persistent)
+
+
+@pytest.mark.parametrize(
+    ("arch", "want"),
+    [
+        ("sm_100a", {"kcp_dhu_offset", "kcp_dhu_tape"}),
+        ("sm_103a", set()),
+        ("sm_107a", {"kcp_dhu_tape"}),
+    ],
+)
+def test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architecture(
+    monkeypatch, arch, want
+) -> None:
+    """The #7 form of every launch reads host plan integers and the architecture ``KernelBackend.run`` passes, so
+    the backward after the forward, after torch's checkpoint recompute and after the recompute from a
+    :class:`RecomputeHandleKcp` launch the same #7 records on the same grids.  The :data:`ARCH_CHUNKS` rank with
+    ``segments=2`` and the long-chain threshold lowered, through the stub launch glue of
+    :func:`test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks`: on ``sm_100a`` the long-chain
+    clause fires (the offset and the tape walk launch vh = 128); on ``sm_103a`` it does not (vh = 64), for the
+    same long-chain walks; ``sm_107a`` keeps the two-wave rule of the tape walk (vh = 128) and vh = 64 for the
+    offset walk.  ``want``: the #7 programs that launch vh = 128.  Each path logs the kinds of its recorded calls
+    (``_record``)."""
+    kcp = _mod("cake_kcp")
+    ctx, ops = _arch_case(monkeypatch, True)
+    glue, resolved = _arch_backend(monkeypatch, arch)
+    kinds: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        kinds.append(kind)
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del kinds[:], glue.launches[:], resolved[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="kernels",
+                segments=2,
+                deterministic=False,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        return {"kinds": list(kinds), "dhu": _dhu_launches(glue, resolved)}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    forms = {}
+    for name, p in paths.items():
+        dhu = p["dhu"]
+        assert {x["program"] for x in dhu} == set(kcp.DHU_PROGRAMS), (name, dhu)
+        assert all(x["arch"] == arch for x in dhu), (name, dhu)
+        assert any(x["long_chain"] for x in dhu), (name, dhu)
+        full = {x["program"] for x in dhu if not x["record"].endswith(kcp.VH64_SUFFIX)}
+        assert full == want, (name, dhu)
+        forms[name] = [(x["record"], x["grid"]) for x in dhu]
+    assert forms["recompute"] == forms["forward"], forms
+    assert forms["handle"] == forms["forward"], forms
 
 
 def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:

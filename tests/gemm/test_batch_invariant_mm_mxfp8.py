@@ -36,7 +36,7 @@ from flashinfer.gemm.batch_invariant.generator import (
     enumerate_space,
     knob_product,
 )
-from flashinfer.gemm.batch_invariant.heuristic import PARTS
+from flashinfer.gemm.batch_invariant.heuristic import FAMILY_OF_CC, PARTS
 from flashinfer.gemm.batch_invariant.schedule import (
     chunks_for,
     default_config,
@@ -180,15 +180,23 @@ def test_fingerprint_is_a_function_of_the_weight_shape_the_output_format_and_the
     )
     assert bi.class_name("mm_mxfp8") == "gemm.mxfp8"
     if torch.cuda.is_available():
-        assert bi.fingerprint(
-            "mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16
-        ) == bi.fingerprint(
-            "mm_mxfp8",
-            N=4096,
-            K=4096,
-            out_dtype=torch.bfloat16,
-            arch=torch.device("cuda"),
-        )
+        # the default architecture is the current device's: on a part of the mode its fingerprint; on any other part the
+        # typed error, because the family selects the block-scaled instruction and no other part's class is borrowed
+        if torch.cuda.get_device_capability() in FAMILY_OF_CC:
+            assert bi.fingerprint(
+                "mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16
+            ) == bi.fingerprint(
+                "mm_mxfp8",
+                N=4096,
+                K=4096,
+                out_dtype=torch.bfloat16,
+                arch=torch.device("cuda"),
+            )
+        else:
+            with pytest.raises(
+                bi.BatchInvariantUnsupportedError, match="not a part of the mode"
+            ):
+                bi.fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16)
     with pytest.raises(TypeError):
         bi.fingerprint("mm_mxfp8", N=4096, K=4096)
     with pytest.raises(TypeError):

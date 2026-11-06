@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_S_M_OFF 0
-#define SMEM_S_M_STAGE_BYTES 17600
-#define SMEM_S_M_STRIDE 17600
-#define SMEM_TOTAL 17664
-#define THREADS 512
-
 #include <math_constants.h>
 
 extern "C" {
@@ -79,7 +72,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* s_m = reinterpret_cast<int*>(smem_raw + 0);
     const int s_m_addr = smem + 0;
 
@@ -278,7 +271,7 @@ kernel_cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7(long long* __restrict__ St
         }
         cum_above += lane_bins[0];
         int target_lane;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane) : "r"(is_target * lane_1));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane) : "r"(is_target * lane_1));
         int digit_sel = __shfl_sync(0xFFFFFFFF, d_sel, target_lane);
         int above_cnt = __shfl_sync(0xFFFFFFFF, above_sel, target_lane);
         int bucket_cnt = __shfl_sync(0xFFFFFFFF, count_sel, target_lane);

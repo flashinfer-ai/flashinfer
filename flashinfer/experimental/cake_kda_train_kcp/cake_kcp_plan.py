@@ -25,7 +25,10 @@ launches a kernel; the module imports ``dataclasses``, ``os``, ``torch`` and
 Numerical mode.  This is the plan of the non-deterministic KCP package
 (``deterministic=False``), a copy of the deterministic package's plan
 (``flashinfer.experimental.cake_kda_det_train_kcp``): the same partitions, the
-same tables, collectives, segment plan and byte counts.  A partition, a context
+same tables, collectives, segment plan and byte counts, but for the workspace
+query of a raw gate mode backward on ``sm_100a`` / ``sm_103a``, which adds the
+local arena's FP64 parameter-gradient accumulators (``param_acc``, through
+``cake_backend.workspace_bytes``).  A partition, a context
 and the byte queries hold no mode; the mode is a keyword of the entry points
 (:mod:`.cake_kcp`).  The local arena and table rules the byte queries read are
 those of the non-deterministic single-rank package
@@ -2565,6 +2568,8 @@ def kda_saved_bytes_kcp(
     C: int = 8192,
     saved_carry: bool = True,
     checkpoint_keep: str | None = None,
+    use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
     checkpoint_handoff: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_saved_bytes_kcp(ctx, ...)``)::
@@ -2602,7 +2607,9 @@ def kda_saved_bytes_kcp(
     The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
     without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
     ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
-    (#7039).
+    (#7039).  ``use_gate_in_kernel``: the saved set's gate mode (``WorkspaceKcp(use_gate_in_kernel=)``, a ``bool``;
+    another value raises ``ValueError``); the bytes do not depend on it, as in the deterministic query.
+    ``use_qk_l2norm_in_kernel``: ``False`` only (:func:`_refuse_qk_l2norm`).
 
     ``checkpoint_handoff`` (without ``checkpoint_keep``): ``False`` (the default) is the light set above, the saved
     set of every call the checkpoint hand-off does not engage on; ``True`` is the saved set of a forward that keeps
@@ -2610,6 +2617,11 @@ def kda_saved_bytes_kcp(
     checkpointed call with ``checkpoint_handoff="on"``, or ``"auto"`` where :func:`kcp_handoff_auto_refusal` admits
     it.  A rank without tokens keeps no tape set: query it with ``False``.  The flag is that decision, not the entry's
     mode: a value that is not a ``bool`` raises ``TypeError``."""
+    _refuse_qk_l2norm(use_qk_l2norm_in_kernel, "kda_saved_bytes_kcp")
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
     if not isinstance(checkpoint_handoff, bool):
         raise TypeError(
             "checkpoint_handoff of the byte query is the hand-off decision (a bool), not chunk_kda_kcp's mode; "
@@ -3115,6 +3127,18 @@ def local_tail_count_words(arena_bytes: int, H: int) -> int:
     return int(arena_bytes) // (TAIL_COUNT_TAPE_BYTES * int(H)) + 1
 
 
+def _refuse_qk_l2norm(use_qk_l2norm_in_kernel: object, entry: str) -> None:
+    """The byte queries take the deterministic queries' ``use_qk_l2norm_in_kernel`` (FlashInfer #7817): ``False``
+    (by identity) is this package's mode, without the in-kernel q / k L2 norm; any other value raises ``ValueError``
+    naming ``deterministic=True``, before the context is read."""
+    if use_qk_l2norm_in_kernel is not False:
+        raise ValueError(
+            f"{entry}: use_qk_l2norm_in_kernel={use_qk_l2norm_in_kernel!r}: the in-kernel q / k L2 norm runs on the "
+            f"deterministic package only (kda_det_{entry.removeprefix('kda_')}, or flashinfer.cake_kda_train_kcp.{entry} "
+            "with deterministic=True)"
+        )
+
+
 def kda_workspace_bytes_kcp(
     ctx: ContextKcp | Sequence[ContextKcp],
     *,
@@ -3126,9 +3150,11 @@ def kda_workspace_bytes_kcp(
     local_arena: str | None = None,
     lean_passes: int | None = None,
     use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
-    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, or for a backward workspace under
+    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, which on a raw backward workspace of an
+    ``R1c`` plan includes the FP64 parameter-gradient accumulators outside the arena, or for a backward workspace under
     ``local_arena="lean"`` (opt-in; the default ``None`` is ``"replay"``) the lean arena of :func:`local_arena_bytes`
     plus its tail-count table, ``4 * local_tail_count_words(arena, H)`` bytes, where the lean layout serves the row;
     a forward-only light
@@ -3147,17 +3173,24 @@ def kda_workspace_bytes_kcp(
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
     ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
     ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceKcp(lean_passes=...)``; ``None``:
-    :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: ``False`` only (the explicit gate, this package's mode);
-    ``True``, the raw gate mode of the deterministic package's ``kda_det_workspace_bytes_kcp``, raises
-    ``ValueError``."""
-    if use_gate_in_kernel is not False:
-        raise ValueError(
-            f"kda_workspace_bytes_kcp: use_gate_in_kernel={use_gate_in_kernel!r}: the raw gate mode runs on the "
-            "deterministic package only (kda_det_workspace_bytes_kcp, or flashinfer.cake_kda_train_kcp."
-            "kda_workspace_bytes_kcp with deterministic=True)"
-        )
+    :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: the workspace's gate mode
+    (``WorkspaceKcp(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
+    layout carries no gate epilogue buffers on any architecture) and is the replay arena (``local_arena="lean"`` is
+    refused in this mode, as by the workspace); the pools do not depend on it.  ``use_qk_l2norm_in_kernel``:
+    ``False`` only (:func:`_refuse_qk_l2norm`)."""
+    _refuse_qk_l2norm(use_qk_l2norm_in_kernel, "kda_workspace_bytes_kcp")
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
+    gate = "raw" if use_gate_in_kernel else "g"
+    if gate == "raw" and check_local_arena(local_arena) == "lean":
+        raise NotImplementedError(
+            'kda_workspace_bytes_kcp: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            "is not supported in the raw gate mode"
+        )
     lean = (
         check_local_arena(local_arena) == "lean" and backward and save_mode == "light"
     )
@@ -3174,7 +3207,7 @@ def kda_workspace_bytes_kcp(
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)
+        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate)
         if lean and local_lean_serves(p):
             a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))
             t = 4 * local_tail_count_words(a, H)
@@ -3188,6 +3221,7 @@ def kda_workspace_bytes_kcp(
                     save_mode=save_mode,
                     sm_count=c.sm_count,
                     fwd_layout=local_fwd_layout(backward, save_mode),
+                    gate=gate,
                 )
             )
             t = 0

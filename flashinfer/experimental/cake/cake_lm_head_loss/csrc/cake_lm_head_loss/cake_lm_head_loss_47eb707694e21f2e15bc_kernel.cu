@@ -54,48 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_lm_head_loss_47eb707694e21f2e15bc
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#if CAKE_DX_ST3
-#define NUM_TMA_PIPE_STAGES 3
-#else
-#define NUM_TMA_PIPE_STAGES 4
-#endif  // CAKE_DX_ST3
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_EPI_STORE_PIPE_STAGES 2
-#define NUM_CLC_PIPE_STAGES 2
-#define NUM_THR_PIPE_STAGES 2
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 49152
-#define SMEM_SMEM_V1_OFF 17408
-#define SMEM_SMEM_V1_STAGE_BYTES 16384
-#define SMEM_SMEM_V1_STRIDE 49152
-#define SMEM_SMEM_V1_0_OFF 33792
-#define SMEM_SMEM_V1_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V1_0_STRIDE 49152
-#if CAKE_DX_ST3
-#define SMEM_SMEM_EPI_OFF 148480
-#else
-#define SMEM_SMEM_EPI_OFF 197632
-#endif  // CAKE_DX_ST3
-#define SMEM_SMEM_EPI_STAGE_BYTES 16384
-#define SMEM_SMEM_EPI_STRIDE 16384
-#if CAKE_DX_ST3
-#define SMEM_CLC_RESP_OFF 181248
-#else
-#define SMEM_CLC_RESP_OFF 230400
-#endif  // CAKE_DX_ST3
-#define SMEM_CLC_RESP_STAGE_BYTES 16
-#define SMEM_CLC_RESP_STRIDE 16
-#if CAKE_DX_ST3
-#define SMEM_TOTAL 181376
-#else
-#define SMEM_TOTAL 230528
-#endif  // CAKE_DX_ST3
-#define THREADS 224
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -249,7 +207,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -269,11 +227,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
 #endif  // CAKE_DX_ST3
 
 #if CAKE_DX_ST3
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 #else
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 #endif  // CAKE_DX_ST3
 
     if (warp == 0) {
@@ -373,10 +329,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {

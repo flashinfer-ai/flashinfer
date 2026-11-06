@@ -27,9 +27,16 @@ elementwise mismatches), the adversarial weak-erasure regimes (contract,
 finiteness and a relative-RMS sanity bound; mismatch counts recorded as
 evidence), the six head pairs (16, 48), (8, 24), (4, 12),
 (2, 6), (1, 3), (4, 4), the degenerate one-token / zero-token packs, the packed
-QKV strided view against the contiguous input, and the explicit forward /
+QKV strided view against the contiguous input, plain ``split`` views of a packed QKV row against the packed views and
+contiguous operands with their hooks and ``retain_grad`` and the gradient layout of each form (issue #8367; a
+CUDA-graph replay alternating the packed and plain views keeps each its own layout), and the explicit forward /
 backward entries against autograd (output order ``dq, dk, dv, dbeta, dg``,
-saved-context against replay), and two caller streams with cached workspaces.  The multi-rank rows and the
+saved-context against replay), two caller streams with cached workspaces, and the fused output walk against the split
+forward on the same build (test knob ``fused_o`` 1 / 0, bitwise), ``save_mode="full"`` without ``save_transfer`` at
+``P = 2`` under NaN-filled allocations against the light form (bitwise), and ``save_mode="light_akk"`` (the light
+replay reads the forward's ``Akk`` tape: ``fwd_prep_replay_l2n``) under NaN-filled allocations within the budgets of
+the light form and, on the smaller packs, of the FP64 reference (with its launch census and saved bytes, at the plan's
+``P`` and ``P = 2``; its bits against the light form are recorded as data, not gated) and in ``graph="replay"`` steps.  The multi-rank rows and the
 runtime contracts live in ``test_cake_gdn_train_kcp_dist.py``; the CPU plan, table, byte-query and fake-backend tests in
 ``test_cake_gdn_train_kcp.py``.  Every test needs a CUDA device the package supports and the rendered ``build.json``
 (skipped otherwise).
@@ -143,6 +150,22 @@ def _inputs(cu: list[int], heads: tuple[int, int], regime: str) -> dict:
                 gate_sum,
             )
     return inputs
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
 
 
 def _rendered() -> bool:
@@ -330,6 +353,157 @@ def test_packed_qkv_strided_view_is_within_budget_of_the_contiguous_input(
     )
 
 
+def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict:
+    """One autograd pass with q / k / v taken from the packed ``[1, T, (2 H_qk + HV) * 128]`` row ``row0``:
+    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``packed_qkv_views_kcp``, ``"contiguous"`` =
+    separate contiguous leaves holding the same values.  A tensor hook (recording the gradient) and ``retain_grad``
+    are set on every view (and on the split outputs) of the original forward.  Returns the results keyed by tensor
+    name (no batch axis; ``dq`` / ``dk`` / ``dv`` cut from the row gradient), the row gradient, the hooks' records
+    and the views."""
+    pkg = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp")
+    H, HV = heads
+    T = row0.shape[1]
+    sizes = (H * D, H * D, HV * D)
+    row = row0.detach().clone().requires_grad_(True)
+    g, beta = (x.detach().clone().requires_grad_(True) for x in (g0, b0))
+    leaves = []
+    if form == "contiguous":
+        leaves = [
+            p.detach()
+            .clone(memory_format=torch.contiguous_format)
+            .view(1, T, n, D)
+            .requires_grad_(True)
+            for p, n in zip(row0.split(sizes, dim=-1), (H, H, HV), strict=True)
+        ]
+    fired: dict = {}
+    views: dict = {}
+
+    def fn(row, g, beta, *leaves):
+        parts = ()
+        if form == "contiguous":
+            q, k, v = leaves
+        elif form == "plain":
+            parts = row.split(sizes, dim=-1)
+            q, k, v = (
+                p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True)
+            )
+        else:
+            q, k, v = pkg.packed_qkv_views_kcp(row, H_qk=H, HV=HV)
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+        return gdn_api.chunk_gdn_kcp(q, k, v, g, beta, ctx, deterministic=False, **o)
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g, beta, *leaves, use_reentrant=False)
+    else:
+        out = fn(row, g, beta, *leaves)
+    out.backward(dout)
+    drow = (
+        torch.cat([x.grad.reshape(1, T, -1) for x in leaves], -1)
+        if leaves
+        else row.grad
+    )
+    res = {"out": out.detach()[0], "dg": g.grad[0], "dbeta": beta.grad[0]}
+    for n, (a, b), h in zip(
+        ("dq", "dk", "dv"),
+        ((0, H * D), (H * D, 2 * H * D), (2 * H * D, None)),
+        (H, H, HV),
+        strict=True,
+    ):
+        res[n] = drow[0, :, a:b].reshape(T, h, D)
+    return {"res": res, "row": drow, "fired": fired, "views": views}
+
+
+@pytest.mark.parametrize("ckpt", [False, True], ids=["direct", "checkpoint"])
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_plain_split_views_keep_hooks_and_are_within_budget(
+    device, lengths, heads, norm, ckpt
+) -> None:
+    """Issue #8367 on the device programs: plain ``split`` / ``view`` head views of one packed QKV row, the
+    ``packed_qkv_views_kcp`` views of it and contiguous operands each give ``out``, ``dq | dk | dv`` (the row
+    gradient), ``dg`` and ``dbeta`` within the deterministic route's budgets of the FP64 reference and of each other,
+    with the in-kernel norm off and on (norm on: ``dq`` / ``dk`` carry the norm's pullback and are judged between the
+    arms), direct and checkpointed (bitwise equality between two results of this package is not part of its
+    contract).  Exact and structural: plain views keep torch's autograd path -- their tensor hooks
+    and ``retain_grad`` (and those on the split outputs) fire once with the gradient the row receives in the same
+    pass -- and only the packed views' split hands the packed dQKV row on without a concatenation."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    H, HV = heads
+    cu = _cu(lengths)
+    T = cu[-1]
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    row0 = torch.cat(
+        [inputs[n].to(device).reshape(1, T, -1) for n in ("q", "k", "v")], -1
+    ).contiguous()
+    g0, b0, dout = (inputs[n].to(device) for n in ("g", "beta", "dout"))
+    o = {"use_qk_l2norm_in_kernel": norm}
+    cols = {"q": (0, H * D), "k": (H * D, 2 * H * D), "v": (2 * H * D, None)}
+    expect_split = {
+        "contiguous": {"aliased": 0, "concatenated": 0},
+        "plain": {"aliased": 0, "concatenated": 0},
+        "packed": {"aliased": 1, "concatenated": 0},
+    }
+    arms = {}
+    for form, split in expect_split.items():
+        before = dict(kcp.PACKED_SPLIT_STATS)
+        got = _split_view_pass(form, row0, g0, b0, dout, ctx, heads, ckpt=ckpt, **o)
+        delta = {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before}
+        assert delta == split, (form, delta)
+        # one packed dQKV row only for the split that hands it on; plain views get three contiguous gradients
+        assert kcp.LAST_CALL["bwd"]["grad_layout"] == (
+            "packed" if form == "packed" else "separate"
+        ), form
+        _check_contract(got["res"], inputs)
+        arms[form] = got["res"]
+        assert sorted(got["fired"]) == sorted(got["views"]), form
+        for i, n in enumerate(("q", "k", "v")):
+            a, b = cols[n]
+            want = got["row"][..., a:b]
+            assert len(got["fired"][n]) == 1, (form, n)
+            assert torch.equal(got["fired"][n][0].reshape(want.shape), want), (form, n)
+            # contiguous: q / k / v are the leaves the row gradient is read from, so
+            # their .grad is that gradient by construction (only the hook is checked)
+            if form != "contiguous":
+                vg = got["views"][n].grad.reshape(want.shape)
+                assert torch.equal(vg, want), (form, n)
+            if form == "plain":
+                part = got["fired"][f"part{i}"]
+                assert len(part) == 1 and torch.equal(part[0], want), (form, n)
+                assert torch.equal(got["views"][f"part{i}"].grad, want), (form, n)
+    ref, _ = reference_pack(inputs, device)
+    if not norm:
+        _arms_within_budget(arms, ref, TENSORS, "split views")
+        return
+    # with the norm on, the unit-norm operands give the reference's out / dv / dg / dbeta (budgets only), while the
+    # norm's pullback removes the radial part of dq / dk: those two are judged between the arms
+    _arms_within_budget(
+        arms, ref, ("out", "dv", "dg", "dbeta"), "split views", elementwise=False
+    )
+    keys = list(arms)
+    for i, a in enumerate(keys):
+        for b in keys[i + 1 :]:
+            for n in ("dq", "dk"):
+                _within_budget(
+                    arms[a][n],
+                    arms[b][n],
+                    f"split views: {a} vs {b} {n}",
+                    elementwise=False,
+                )
+
+
 def test_explicit_entries_are_within_budget_of_autograd_and_keep_the_output_order(
     device,
 ) -> None:
@@ -467,9 +641,10 @@ class _PeakWorkspace:
     ids=["issue-2x6", "32k-16x48"],
 )
 def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> None:
-    """``gdn_workspace_layout_kcp`` is what a caller-held workspace binds (tolerance 0): the forward's tape-walk peak,
-    and the backward's phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's
-    hand-off tensors, four of them re-adopted after #8) and the replay form (the ten light tapes are workspace)."""
+    """``gdn_workspace_layout_kcp`` is what a caller-held workspace binds (tolerance 0): the forward's peak (the fused
+    forward's #1; with test knob ``fused_o=0`` the split forward's tape walk, ``forward_split``), and the backward's
+    phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's hand-off tensors,
+    the tapes the forward leaves re-adopted after #8) and the replay form (the ten light tapes are workspace)."""
     import gc
 
     from torch.utils.checkpoint import checkpoint
@@ -508,6 +683,33 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
         assert gdn_api.gdn_workspace_bytes_kcp(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form, deterministic=False
         ) == max(layout["forward"], layout["backward"])
+        for lf in leaves:
+            lf.grad = None
+        del out, ws
+        gc.collect()
+        torch.cuda.empty_cache()
+        # the split forward (fused_o = 0) binds the h / v_new tapes in its tape walk: forward_split
+        ws = _PeakWorkspace(kcp)
+
+        def split(*a, _ws=ws, _form=form):
+            return gdn_api.chunk_gdn_kcp(
+                *a,
+                ctx,
+                workspace=_ws,
+                reuse_recompute_tapes=_form,
+                test_knobs={"fused_o": 0},
+                deterministic=False,
+            )
+
+        out = checkpoint(split, *leaves, use_reentrant=False)
+        torch.cuda.synchronize(device)
+        assert ws.peak == layout["forward_split"], (
+            form,
+            ws.peak,
+            layout["forward_split"],
+        )
+        out.backward(dout)
+        torch.cuda.synchronize(device)
         for lf in leaves:
             lf.grad = None
         del out, ws
@@ -767,24 +969,27 @@ def test_launch_scope_enters_one_stream_context_per_entry_body(
     device, monkeypatch
 ) -> None:
     """The kernels backend's launch path on a caller stream: an autograd forward + backward, direct and under a
-    non-reentrant checkpoint, enters ``tvm_ffi.use_torch_stream()`` once per entry body (the launch scope) instead
-    of once per launch, launches the same records on the same grids as with the scope off (one context per launch),
-    and both arms' results are within the budget of the FP64 reference and of each other."""
+    non-reentrant checkpoint, binds the caller's stream for tvm-ffi (``tvm_ffi.use_raw_stream`` on the stream's
+    device and raw handle) once per entry body (the launch scope) instead of once per launch, every binding is the
+    caller stream, the launches are the same records on the same grids as with the scope off (one context per
+    launch), and both arms' results are within the budget of the FP64 reference and of each other."""
     from torch.utils.checkpoint import checkpoint
 
     be = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_backend")
     kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
     real = be.tvm_ffi
     entered = [0]
+    bound = []
 
     class _Counting:
         def __getattr__(self, name):
             return getattr(real, name)
 
         @staticmethod
-        def use_torch_stream(*args, **kwargs):
+        def use_raw_stream(dev, raw):
             entered[0] += 1
-            return real.use_torch_stream(*args, **kwargs)
+            bound.append((dev.index, int(raw)))
+            return real.use_raw_stream(dev, raw)
 
     monkeypatch.setattr(be, "tvm_ffi", _Counting())
     cu, heads = [0, 700, 1900, 3000], (2, 6)
@@ -839,3 +1044,1003 @@ def test_launch_scope_enters_one_stream_context_per_entry_body(
             TENSORS,
             f"launch scope (checkpoint={ckpt})",
         )
+    caller = {(stream.device.index, stream.cuda_stream)}
+    assert bound and set(bound) == caller, set(bound)
+
+
+# --------------------------------------------------------------------------- the output walk kcp_fwdh_out (one GPU)
+# A light, saved-boundary forward that launches #5 and hands no tape to a backward runs the output walk in place of the
+# tape walk and #5 (test knob fused_o = 1, the shipped form); fused_o = 0 forces the split form.  Each form below runs
+# both on the same build.  ``out`` is bitwise the split form's; each gradient is bitwise the split form's wherever
+# two split runs agree bitwise (the backward is bitwise today but not guaranteed), else within the budgets.  The
+# launch logs show which form each forward ran.
+
+FUSED_SHAPES = (
+    ("2x6", (1500, 2700, 1944), (2, 6)),
+    ("16x48", (2048 + 37, 1000), (16, 48)),
+)
+FUSED_FORMS = (
+    # id, layers, checkpoint, later saver, options (``explicit`` / ``handle`` select the entry form), test knobs
+    ("direct", 1, False, False, {}, {}),
+    ("explicit", 1, False, False, {"explicit": True}, {}),
+    ("ckpt-closes", 1, True, False, {}, {}),
+    ("ckpt-later-saver", 1, True, True, {}, {}),
+    ("ckpt-replay-form", 1, True, False, {"reuse_recompute_tapes": False}, {}),
+    ("ckpt-3-layers-later-saver", 3, True, True, {}, {}),
+    ("ckpt-handle", 1, True, False, {"handle": True}, {}),
+    ("segments-2", 1, True, True, {"segments": 2}, {}),
+    ("vh64", 1, True, True, {}, {"fwdh_vh": 64}),
+    ("vh128", 1, True, True, {}, {"fwdh_vh": 128}),
+    ("l2n", 1, True, True, {"use_qk_l2norm_in_kernel": True}, {}),
+    ("graph", 1, False, False, {"graph": "replay"}, {}),
+)
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.detach().contiguous().view(torch.uint8)
+
+
+def _fused_arm(
+    device, cu, heads, form, fused_o: int, kcp, log: list, *, knob: str = "fused_o"
+) -> dict:
+    """One run of ``form`` with test knob ``knob`` (``fused_o``; ``fused_o_tape`` for the ``save_mode="full"``
+    forms) set to ``fused_o``: ``out``, the five gradients (and ``dw`` of the later saver; the explicit entry of a
+    full form also the saved ``h_tape`` / ``v_new``); ``log`` receives ``(kind, sequence, fwd_o decision)`` of every
+    recorded call."""
+    from torch.utils.checkpoint import checkpoint
+
+    _fid, layers, ckpt, later, opts, knobs = form
+    opts = dict(opts)
+    explicit, handle = opts.pop("explicit", False), opts.pop("handle", False)
+    graph = opts.get("graph") == "replay"
+    H, HV = heads
+    inputs = make_inputs(cu, H, HV)
+    part = gdn_api.partition_kcp(
+        torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous", deterministic=False
+    )
+    ctx = gdn_api.build_context_kcp(
+        part,
+        None,
+        0,
+        device,
+        deterministic=False,
+        **({"graph_replay": True} if graph else {}),
+    )
+    kw = {"test_knobs": {knob: fused_o, **knobs}, **opts}
+    if graph:
+        kw["workspace"] = gdn_api.WorkspaceKcp()
+    dout = inputs["dout"].to(device)
+    del log[:]
+    if explicit:
+        q, k, v, g, beta = (inputs[n].to(device) for n in OPERANDS)
+        out, saved = gdn_api.chunk_gdn_fwd_kcp(
+            q, k, v, g, beta, ctx, save_for_backward=True, deterministic=False, **kw
+        )
+        dq, dk, dv, dbeta, dg = gdn_api.chunk_gdn_bwd_kcp(
+            q, k, v, g, beta, ctx, dout, saved=saved, deterministic=False, **kw
+        )
+        torch.cuda.synchronize(device)
+        res = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+        if saved.save_mode == "full" and saved.tapes is not None:
+            res.update({n: saved.tape(n) for n in ("h_tape", "v_new")})
+        return res
+    w = None
+    if later:
+        gen = torch.Generator(device="cpu").manual_seed(6098)
+        w = (torch.rand(HV, D, generator=gen) + 0.5).to(torch.bfloat16).to(device)
+        w.requires_grad_(True)
+
+    def fn(q, k, v, g, beta, *handles):
+        x = v
+        for i in range(layers):
+            hk = {"recompute_handle": handles[i]} if handles else {}
+            x = gdn_api.chunk_gdn_kcp(
+                q, k, x, g, beta, ctx, deterministic=False, **hk, **kw
+            )
+        # a later saver of the region: w's gradient reads the output
+        return x if w is None else x * w
+
+    # graph: capture, then replays (a replay records no call)
+    for _rep in range(3 if graph else 1):
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+        handles = (
+            [gdn_api.RecomputeHandleKcp() for _ in range(layers)] if handle else []
+        )
+        out = (
+            checkpoint(fn, *leaves, *handles, use_reentrant=False)
+            if ckpt
+            else fn(*leaves, *handles)
+        )
+        grads = torch.autograd.grad(out, leaves + ([w] if w is not None else []), dout)
+        torch.cuda.synchronize(device)
+    res = {"out": out.detach()}
+    res.update({n: gr for n, gr in zip(GRAD_NAMES, grads, strict=False)})
+    if w is not None:
+        res["dw"] = grads[-1]
+    return res
+
+
+@pytest.mark.parametrize("form", FUSED_FORMS, ids=[f[0] for f in FUSED_FORMS])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [s[1:] for s in FUSED_SHAPES],
+    ids=[s[0] for s in FUSED_SHAPES],
+)
+def test_fused_output_walk_is_bitwise_the_split_forward(
+    device, monkeypatch, lengths, heads, form
+) -> None:
+    """The same-build matrix of the output walk: direct, explicit, checkpointed (the region closed by the node, a later
+    saver, the replay form, three layers with a later saver, a recompute handle), two segments, both value widths,
+    the in-kernel L2 norm and the graph replay, each with test knob ``fused_o`` 1 and 0 (split twice)."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    backend = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_train_kcp.cake_backend"
+    )
+    if not kcp.fused_o_shipped(backend.device_arch(device.index)):
+        pytest.skip("the registry ships no output walk for this architecture")
+    if form[4].get("use_qk_l2norm_in_kernel") and not kcp.l2n_records_shipped():
+        pytest.skip("the registry ships no in-kernel L2 norm records")
+    cu = _cu(lengths)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        entry = kcp.LAST_CALL[kind]
+        log.append((kind, tuple(entry.get("sequence") or ()), entry.get("fwd_o")))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+    split = [_fused_arm(device, cu, heads, form, 0, kcp, log) for _ in range(2)]
+    split_log = list(log)
+    fused = _fused_arm(device, cu, heads, form, 1, kcp, log)
+    fused_log = list(log)
+    # the launch logs: the same calls; the fused arm's forwards that write the output run the output walk (the
+    # first forward always: it hands no tape over), the split arm never does
+    assert [k for k, _s, _o in fused_log] == [k for k, _s, _o in split_log]
+    fwd = [(s, o) for k, s, o in fused_log if k == "fwd"]
+    assert fwd and fwd[0][1] == "fused", fwd[:1]
+    for seq, decision in fwd:
+        assert ("kcp_fwdh_out" in seq) == (decision == "fused"), (decision, seq)
+        if decision == "fused":
+            assert "kcp_fwdh_tape" not in seq and "fwd_o" not in seq, seq
+    assert not any("kcp_fwdh_out" in s or o == "fused" for _k, s, o in split_log)
+    assert [s for k, s, _o in fused_log if k == "bwd"] == [
+        s for k, s, _o in split_log if k == "bwd"
+    ]  # every backward is the split form's
+    assert set(fused) == set(split[0])
+    for n in fused:
+        if n == "out":
+            assert torch.equal(_bits(split[0][n]), _bits(split[1][n])), n
+        if torch.equal(_bits(split[0][n]), _bits(split[1][n])):
+            assert torch.equal(_bits(fused[n]), _bits(split[0][n])), (form[0], n)
+        else:
+            _within_budget(
+                fused[n],
+                split[0][n],
+                f"{form[0]} fused vs split {n}",
+                elementwise=False,
+            )
+        assert bool(torch.isfinite(fused[n].float()).all()), n
+    assert kcp.kept_registry_size() == 0
+
+
+# --------------------------------------------------------------------------- the tape-and-output walk (one GPU)
+# A save_mode="full" forward that keeps its saved set and launches #5 runs the tape-and-output walk kcp_fwdh_out_tape in
+# place of the tape walk and #5 (test knob fused_o_tape = 1, the shipped form); fused_o_tape = 0 forces the split form.
+# Each form below runs both on the same build with the saved h / v_new tapes pre-filled with 0xFF bytes: ``out`` and
+# the saved tapes of the explicit entry are bitwise the split form's (a byte one form writes and the other leaves
+# shows); each gradient as in the output-walk matrix above.
+
+FULL_TAPE_FORMS = (
+    # id, layers, checkpoint, later saver, options (``explicit`` / ``handle`` select the entry form), test knobs
+    ("direct", 1, False, False, {}, {}),
+    ("explicit", 1, False, False, {"explicit": True}, {}),
+    ("explicit-segments-2", 1, False, False, {"explicit": True, "segments": 2}, {}),
+    ("explicit-vh64", 1, False, False, {"explicit": True}, {"fwdh_vh": 64}),
+    ("explicit-vh128", 1, False, False, {"explicit": True}, {"fwdh_vh": 128}),
+    ("ckpt-closes", 1, True, False, {}, {}),
+    ("ckpt-later-saver", 1, True, True, {}, {}),
+    ("ckpt-always", 1, True, False, {"recompute_output": "always"}, {}),
+    ("ckpt-3-layers-later-saver", 3, True, True, {}, {}),
+    ("ckpt-handle", 1, True, False, {"handle": True}, {}),
+    ("segments-2", 1, True, True, {"segments": 2}, {}),
+    (
+        "segments-2-no-save-transfer",
+        1,
+        True,
+        True,
+        {"segments": 2, "save_transfer": False},
+        {},
+    ),
+    ("vh64", 1, True, True, {}, {"fwdh_vh": 64}),
+    ("vh128", 1, True, True, {}, {"fwdh_vh": 128}),
+    ("l2n", 1, True, True, {"use_qk_l2norm_in_kernel": True}, {}),
+)
+
+
+@pytest.mark.parametrize("form", FULL_TAPE_FORMS, ids=[f[0] for f in FULL_TAPE_FORMS])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [s[1:] for s in FUSED_SHAPES],
+    ids=[s[0] for s in FUSED_SHAPES],
+)
+def test_fused_tape_walk_is_bitwise_the_split_full_forward(
+    device, monkeypatch, lengths, heads, form
+) -> None:
+    """The same-build matrix of the tape-and-output walk under ``save_mode="full"``: direct, explicit (with the saved
+    tapes; two segments, both value widths), checkpointed (the region closed by the node, a later saver,
+    ``recompute_output="always"``, three layers with a later saver, a recompute handle), two segments with and without
+    ``save_transfer``, both value widths and the in-kernel L2 norm, each with test knob ``fused_o_tape`` 1 and 0
+    (split twice).  Every full forward that writes the output runs ``kcp_fwdh_out_tape`` and neither the tape walk nor
+    #5; the split arm never runs it; the backward launches are the split form's."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    backend = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_train_kcp.cake_backend"
+    )
+    if not kcp.fused_o_tape_shipped(backend.device_arch(device.index)):
+        pytest.skip("the registry ships no tape-and-output walk for this architecture")
+    if form[4].get("use_qk_l2norm_in_kernel") and not kcp.l2n_records_shipped():
+        pytest.skip("the registry ships no in-kernel L2 norm records")
+    full_form = (*form[:4], {"save_mode": "full", **form[4]}, form[5])
+    cu = _cu(lengths)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        entry = kcp.LAST_CALL[kind]
+        log.append((kind, tuple(entry.get("sequence") or ()), entry.get("fwd_o")))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+    fresh_tapes = kcp.CallKcp.fresh_tapes
+
+    def filled_tapes(self, names):
+        fresh_tapes(self, names)
+        for n in ("h_tape", "v_new"):
+            if n in names:
+                self.tapes[n].view(torch.uint8).fill_(0xFF)
+
+    monkeypatch.setattr(kcp.CallKcp, "fresh_tapes", filled_tapes)
+    split = [
+        _fused_arm(device, cu, heads, full_form, 0, kcp, log, knob="fused_o_tape")
+        for _ in range(2)
+    ]
+    split_log = list(log)
+    fused = _fused_arm(device, cu, heads, full_form, 1, kcp, log, knob="fused_o_tape")
+    fused_log = list(log)
+    # the launch logs: the same calls; the fused arm's forwards that write the output run the tape-and-output walk
+    # (the first forward always: it is no recompute), a recompute that leaves #5 out keeps the tape walk, and the
+    # split arm never runs it
+    assert [k for k, _s, _o in fused_log] == [k for k, _s, _o in split_log]
+    fwd = [(s, o) for k, s, o in fused_log if k == "fwd"]
+    assert fwd and fwd[0][1] == "fused_tape", fwd[:1]
+    for seq, decision in fwd:
+        assert decision in ("fused_tape", "skipped"), (decision, seq)
+        assert ("kcp_fwdh_out_tape" in seq) == (decision == "fused_tape"), (
+            decision,
+            seq,
+        )
+        if decision == "fused_tape":
+            assert not {"kcp_fwdh_tape", "kcp_fwdh_out", "fwd_o"} & set(seq), seq
+    assert not any(
+        "kcp_fwdh_out_tape" in s or o == "fused_tape" for _k, s, o in split_log
+    )
+    assert [s for k, s, _o in fused_log if k == "bwd"] == [
+        s for k, s, _o in split_log if k == "bwd"
+    ]  # every backward is the split form's
+    assert set(fused) == set(split[0])
+    assert {"h_tape", "v_new"} <= set(fused) or not form[4].get("explicit")
+    for n in fused:
+        if n in ("out", "h_tape", "v_new"):
+            assert torch.equal(_bits(split[0][n]), _bits(split[1][n])), n
+        if torch.equal(_bits(split[0][n]), _bits(split[1][n])):
+            assert torch.equal(_bits(fused[n]), _bits(split[0][n])), (form[0], n)
+        else:
+            _within_budget(
+                fused[n],
+                split[0][n],
+                f"{form[0]} fused_tape vs split {n}",
+                elementwise=False,
+            )
+        if n not in ("h_tape", "v_new"):  # the tapes' pad rows keep the 0xFF fill
+            assert bool(torch.isfinite(fused[n].float()).all()), n
+    assert kcp.kept_registry_size() == 0
+
+
+def test_graph_replay_keeps_each_view_form_its_own_gradient_layout(device) -> None:
+    """``graph="replay"`` with a caller-held workspace, autograd through ``chunk_gdn_kcp``: q / k / v as
+    ``packed_qkv_views_kcp`` views and as plain ``split`` / ``view`` views of the same packed row (the same pointers
+    and strides) share the forward graph but are two backward graph keys.  Each form captures its own backward with
+    its own gradient layout (``"packed"`` / ``"separate"``), and alternating forms replay their own graphs, never the
+    other form's; every ``out`` and row gradient is within the budget of the FP64 reference."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    H, HV = 2, 6
+    cu = _cu((300, 777))
+    T = cu[-1]
+    inputs = make_inputs(cu, H, HV)
+    ref, _ = reference_pack(inputs, device)
+    ctx = _local_context(cu, device)
+    ws = kcp.WorkspaceKcp()
+    row = torch.cat(
+        [inputs[n].to(device).reshape(1, T, -1) for n in ("q", "k", "v")], -1
+    ).contiguous()
+    row.requires_grad_(True)
+    g, beta, dout = (inputs[n].to(device) for n in ("g", "beta", "dout"))
+    sizes = (H * D, H * D, HV * D)
+
+    def views(form):
+        if form == "packed":
+            return kcp.packed_qkv_views_kcp(row, H_qk=H, HV=HV)
+        parts = row.split(sizes, dim=-1)
+        return tuple(p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True))
+
+    # each form's backward runs eager on its first call, captures on its second and replays from then on (the forward
+    # graph is the same for both forms)
+    forms = ("packed",) * 4 + ("plain",) * 3 + ("packed", "plain")
+    events, arms = [], {}
+    kcp.graph_cache_clear()
+    try:
+        for i, form in enumerate(forms):
+            q, k, v = views(form)
+            out = gdn_api.chunk_gdn_kcp(
+                q, k, v, g, beta, ctx, workspace=ws, graph="replay", deterministic=False
+            )
+            (drow,) = torch.autograd.grad(out, (row,), dout)
+            rec = kcp.LAST_CALL["bwd"]
+            events.append((form, rec["graph_event"], rec["grad_layout"]))
+            res = {"out": out.detach()[0].clone()}
+            for n, (a, b), h in zip(
+                ("dq", "dk", "dv"),
+                ((0, H * D), (H * D, 2 * H * D), (2 * H * D, None)),
+                (H, H, HV),
+                strict=True,
+            ):
+                res[n] = drow[0, :, a:b].reshape(T, h, D).clone()
+            arms[f"call {i} {form}"] = res
+            del q, k, v, out, drow
+    finally:
+        kcp.graph_cache_clear()
+    layout = {"packed": "packed", "plain": "separate"}
+    assert events == [
+        (f, e, layout[f])
+        for f, e in zip(
+            forms,
+            ("eager", "capture", "replay", "replay")
+            + ("eager", "capture", "replay")
+            + ("replay", "replay"),
+            strict=True,
+        )
+    ], events
+    _arms_within_budget(arms, ref, ("out", "dq", "dk", "dv"), "graph view forms")
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# save_mode="full" without save_transfer at P > 1
+
+
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
+    device, monkeypatch, norm
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` (the only form of ``exchange="ring"``) at ``P = 2``: every
+    tensor the package allocates is filled with NaN bytes, so a read of a plane no program of the call wrote (the
+    ``M_seg^T`` staging plane the backward's merges read) shows up as a non-finite gradient.  The saved set carries
+    ``M_seg``; the full form gives the light form's bits (out and the five gradients: the same programs on the same
+    states) on a per-call, a fresh and a shared workspace (twice on the shared one) and under a non-reentrant
+    checkpoint."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = real_alloc(shape, dtype, dev)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+    cu = [0, 11000, 23000, 32768]
+    H, HV = 16, 48
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    dout = inputs["dout"].to(device)
+    o = {"segments": 2, "save_transfer": False, "use_qk_l2norm_in_kernel": norm}
+
+    def run(workspace, *, ckpt: bool = False, **kw) -> dict:
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+
+        def fn(*a):
+            return gdn_api.chunk_gdn_kcp(
+                *a, ctx, workspace=workspace, deterministic=False, **o, **kw
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, use_reentrant=False)
+        else:
+            out = fn(*leaves)
+        out.backward(dout)
+        torch.cuda.synchronize(device)
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(OPERANDS, leaves, strict=True)},
+        }
+
+    q, k, v, g, beta = (inputs[n].to(device)[0] for n in OPERANDS)
+    _, saved = kcp.chunk_gdn_fwd_kcp(
+        q, k, v, g, beta, ctx, save_mode="full", deterministic=False, **o
+    )
+    assert saved.P == 2 and saved.c1_recv is None and saved.M_seg is not None
+    del saved, q, k, v, g, beta
+    light = run(None)
+    assert kcp.LAST_CALL["fwd"]["P"] == 2
+    for n, t in light.items():
+        assert bool(torch.isfinite(t.float()).all()), ("light", n)
+    shared = kcp.WorkspaceKcp()
+    arms = (
+        (None, False),
+        (kcp.WorkspaceKcp(), False),
+        (shared, False),
+        (shared, False),
+        (None, True),
+    )
+    for i, (ws, ckpt) in enumerate(arms):
+        full = run(ws, ckpt=ckpt, save_mode="full")
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
+        for n in light:
+            assert torch.equal(full[n], light[n]), (i, n)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# save_mode="light_akk": the light set plus #1_l2n's BF16 Akk tape; the light replay runs fwd_prep_replay_l2n
+
+AKK_FORMS = (
+    # id, document lengths, (H_qk, HV), options
+    ("2x6", (100, 640, 77, 1000, 129), (2, 6), {}),
+    (
+        "2x6-no-save-transfer",
+        (100, 640, 77, 1000, 129),
+        (2, 6),
+        {"save_transfer": False},
+    ),
+    ("16x48-P2", (11000, 12000, 9768), (16, 48), {"segments": 2}),
+    (
+        "16x48-P2-no-save-transfer",
+        (11000, 12000, 9768),
+        (16, 48),
+        {"segments": 2, "save_transfer": False},
+    ),
+)
+
+
+def _akk_or_skip(kcp):
+    """The replay's program name; skips while the registry does not ship the norm programs or the replay."""
+    if not kcp.l2n_records_shipped():
+        pytest.skip("the in-kernel L2 norm programs are not rendered")
+    jit = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_jit")
+    replay = kcp.AKK_REPLAY_OF["fwd_prep_l2n"]
+    if not jit.records_of_program(replay):
+        pytest.skip(f"{replay} is not rendered")
+    return jit, replay
+
+
+@pytest.mark.parametrize("form", AKK_FORMS, ids=[f[0] for f in AKK_FORMS])
+def test_light_akk_is_within_budget_of_light_on_poisoned_memory(
+    device, monkeypatch, record_property, form
+) -> None:
+    """``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel=True``) on the device programs with every tensor the
+    package allocates filled with NaN bytes: out and the five gradients are finite and within the deterministic
+    route's budgets of ``"light"`` (the same programs on the same states but #1_l2n's block inverse, whose ``Akk``
+    the replay reads from the saved set) through the explicit entries, through autograd (the saved set through
+    ``save_for_backward``) and under a non-reentrant checkpoint (where the mode saves as ``"light"``); on the two
+    smaller packs the autograd arms are also within the budgets of the FP64 reference (``out`` / ``dv`` / ``dg`` /
+    ``dbeta``; the norm's pullback of ``dq`` / ``dk`` is judged against ``"light"``).  The backward launches
+    ``fwd_prep_replay_l2n`` once per light replay of ``fwd_prep_l2n`` and no ``fwd_prep_l2n``, on the same grids; the
+    forward launches light's programs; the saved set gains the ``Akk`` tape (``128 R HV`` bytes; on the rows of the
+    real chunks within the budget of the full set's ``Akk``; the pad chunks' rows are written by no program).  Bitwise
+    equality with ``"light"`` is recorded (``*_bitwise``), never gated: the package has no bit contract."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    jit, replay = _akk_or_skip(kcp)
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = real_alloc(shape, dtype, dev)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+
+    def judge(arm: dict, partner: dict, key: str) -> None:
+        for n in TENSORS:
+            _within_budget(arm[n], partner[n], f"{key} vs light {n}", elementwise=False)
+            record_property(
+                f"{key}_{n}_bitwise",
+                bool(torch.equal(_bits(arm[n]), _bits(partner[n]))),
+            )
+
+    _name, lengths, (H, HV), opts = form
+    cu = _cu(lengths)
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    o = {"use_qk_l2norm_in_kernel": True, **opts}
+    q, k, v, g, beta = (inputs[n].to(device)[0] for n in OPERANDS)
+    dout = inputs["dout"].to(device)[0]
+
+    def saved_pass(**kw) -> dict:
+        out, saved = kcp.chunk_gdn_fwd_kcp(
+            q, k, v, g, beta, ctx, deterministic=False, **o, **kw
+        )
+        fwd = dict(kcp.LAST_CALL["fwd"])
+        grads = kcp.chunk_gdn_bwd_kcp(
+            q, k, v, g, beta, ctx, dout, saved=saved, deterministic=False, **o, **kw
+        )
+        torch.cuda.synchronize(device)
+        return {
+            "out": out,
+            **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), grads, strict=True)),
+            "saved": saved,
+            "fwd": fwd,
+            "bwd": dict(kcp.LAST_CALL["bwd"]),
+        }
+
+    def autograd(ckpt: bool, **kw) -> dict:
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+
+        def fn(*a):
+            return gdn_api.chunk_gdn_kcp(*a, ctx, deterministic=False, **o, **kw)
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, use_reentrant=False)
+        else:
+            out = fn(*leaves)
+        out.backward(inputs["dout"].to(device))
+        torch.cuda.synchronize(device)
+        res = {"out": out.detach()[0]}
+        res.update({n: lf.grad[0] for n, lf in zip(GRAD_NAMES, leaves, strict=True)})
+        return res
+
+    light = saved_pass()
+    if "segments" in opts:
+        assert light["fwd"]["P"] == opts["segments"]
+    for n in TENSORS:
+        assert bool(torch.isfinite(light[n].float()).all()), ("light", n)
+    got = saved_pass(save_mode="light_akk")
+    judge(got, light, "explicit")
+    lb, ab = light["bwd"], got["bwd"]
+    assert ab["akk_source"] == "saved" and lb["akk_source"] is None
+    assert ab["save_mode"] == "light_akk" and ab["tapes_source"] == lb["tapes_source"]
+    assert got["fwd"]["sequence"] == light["fwd"]["sequence"]
+    n_l2n = lb["sequence"].count("fwd_prep_l2n")
+    assert n_l2n >= 1 and "fwd_prep_l2n" not in ab["sequence"]
+    assert ab["sequence"] == [
+        replay if p == "fwd_prep_l2n" else p for p in lb["sequence"]
+    ]
+    replay_records = set(jit.records_of_program(replay))
+    l2n_records = set(jit.records_of_program("fwd_prep_l2n"))
+    assert sum(r in replay_records for r, _ in ab["records"]) == n_l2n
+    assert sum(r in l2n_records for r, _ in lb["records"]) == n_l2n
+    assert not any(r in l2n_records for r, _ in ab["records"])
+    assert [gr for _, gr in ab["records"]] == [gr for _, gr in lb["records"]]
+    tape = int(ctx.R) * HV * 128
+    akk = got["saved"].tape("akk")
+    assert got["saved"].bytes - light["saved"].bytes == tape == akk.numel() * 2
+    _, full_saved = kcp.chunk_gdn_fwd_kcp(
+        q, k, v, g, beta, ctx, save_mode="full", deterministic=False, **o
+    )
+    torch.cuda.synchronize(device)
+    full_akk = full_saved.tape("akk")
+    # pad-row rule: the 64 rows of each pad chunk (chunk_len 0; NC_pad - NC of them)
+    # are written and read by no program (NaN bytes here, in both modes); the rows of
+    # the NC real chunks are finite in both tapes and within the budget
+    rows_per_chunk = akk.shape[0] // len(ctx.chunk_len)
+    assert rows_per_chunk * len(ctx.chunk_len) == akk.shape[0] == int(ctx.R)
+    real = torch.tensor([n > 0 for n in ctx.chunk_len], device=akk.device)
+    real = real.repeat_interleave(rows_per_chunk)
+    assert int(real.sum()) == rows_per_chunk * int(ctx.NC)
+    assert bool(torch.isfinite(full_akk[real].float()).all())
+    _within_budget(
+        akk[real],
+        full_akk[real],
+        "akk tape (real chunk rows): light_akk vs full",
+        elementwise=False,
+    )
+    for tag, t in (("light_akk", akk), ("full", full_akk)):
+        bad = ~torch.isfinite(t.float())
+        record_property(f"akk_tape_{tag}_nonfinite_real_rows", int(bad[real].sum()))
+        record_property(f"akk_tape_{tag}_nonfinite_pad_rows", int(bad[~real].sum()))
+    record_property("akk_tape_bitwise", bool(torch.equal(_bits(akk), _bits(full_akk))))
+    del full_saved, full_akk, akk, real, bad
+    a_light = autograd(False)
+    a_akk = autograd(False, save_mode="light_akk")
+    assert kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
+    a_ckpt = autograd(True, save_mode="light_akk")
+    assert kcp.LAST_CALL["bwd"]["save_mode"] == "light"
+    assert replay not in kcp.LAST_CALL["bwd"]["sequence"]
+    judge(a_akk, a_light, "autograd")
+    judge(a_ckpt, a_light, "checkpoint")
+    if cu[-1] <= 4096:
+        ref, _ = reference_pack(inputs, device)
+        _arms_within_budget(
+            {"light": a_light, "light_akk": a_akk, "light_akk checkpoint": a_ckpt},
+            ref,
+            ("out", "dv", "dg", "dbeta"),
+            "light_akk autograd",
+            elementwise=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_graph_replay_light_akk_steps_are_within_budget_of_the_eager_light_step(
+    device, record_property, lengths, heads
+) -> None:
+    """Forward + backward steps of ``save_mode="light_akk"`` under ``graph="replay"`` on one caller-held workspace
+    whose arena still holds an eager ``"light"`` step's tapes, with pointer-stable operands: the steady state replays
+    both graphs, every step's out and five gradients are finite and within the deterministic route's budgets of the
+    eager ``"light"`` step (bitwise equality recorded, never gated), and every backward launches the replay in place
+    of ``fwd_prep_l2n`` (``akk_source="saved"``)."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    _jit, replay = _akk_or_skip(kcp)
+    H, HV = heads
+    cu = _cu(lengths)
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    base = [inputs[n].to(device) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    ws = kcp.WorkspaceKcp()
+
+    def step(mode: str, graph: str):
+        leaves = [t.detach().requires_grad_(True) for t in base]
+        out = gdn_api.chunk_gdn_kcp(
+            *leaves,
+            ctx,
+            workspace=ws,
+            deterministic=False,
+            save_mode=mode,
+            graph=graph,
+            use_qk_l2norm_in_kernel=True,
+        )
+        fwd = dict(kcp.LAST_CALL["fwd"])
+        res = {"out": out.detach()[0].clone()}
+        out.backward(dout)
+        res.update(
+            {
+                n: lf.grad.detach()[0].clone()
+                for n, lf in zip(GRAD_NAMES, leaves, strict=True)
+            }
+        )
+        return res, fwd, dict(kcp.LAST_CALL["bwd"])
+
+    kcp.graph_cache_clear()
+    try:
+        eager, _eager_fwd, eager_bwd = step("light", "off")
+        steps = [step("light_akk", "replay") for _ in range(5)]
+        torch.cuda.synchronize(device)
+    finally:
+        kcp.graph_cache_clear()
+    events = [(f["graph_event"], b["graph_event"]) for _, f, b in steps]
+    assert events[-2:] == [("replay", "replay")] * 2, events
+    swap = [replay if p == "fwd_prep_l2n" else p for p in eager_bwd["sequence"]]
+    assert eager_bwd["sequence"].count("fwd_prep_l2n") >= 1
+    for i, (res, _f, b) in enumerate(steps):
+        assert b["akk_source"] == "saved" and b["sequence"] == swap, (i, b["sequence"])
+        for n in TENSORS:
+            _within_budget(
+                res[n],
+                eager[n],
+                f"graph step {i} vs eager light {n}",
+                elementwise=False,
+            )
+            record_property(
+                f"step{i}_{n}_bitwise",
+                bool(torch.equal(_bits(res[n]), _bits(eager[n]))),
+            )
+
+
+# --------------------------------------------------------------------------- checkpoint under graph="replay"
+# torch.utils.checkpoint(use_reentrant=False) of one GDN layer with graph="replay" on a caller-held workspace: the
+# recompute decides its tape hand-off and its output program before the CUDA-graph lookup (both are part of its graph
+# key), so the captured step replays the eager checkpoint step's programs: no #1 and no tape walk in the backward.
+
+
+class _LaterSaver(torch.autograd.Function):
+    """A later saver of the checkpointed region: torch's recompute runs in its backward, which first runs ``hook()``
+    (a call on the GDN layer's workspace between the recompute and the GDN backward)."""
+
+    hook = None
+
+    @staticmethod
+    def forward(fctx, x):
+        fctx.save_for_backward(x)
+        return x.clone()
+
+    @staticmethod
+    def backward(fctx, gy):
+        (_,) = fctx.saved_tensors
+        if _LaterSaver.hook is not None:
+            _LaterSaver.hook()
+        return gy
+
+
+def _ckpt_steps(
+    kcp, ctx, inputs, device, *, steps, ws=None, later=False, hooks=None, **kw
+):
+    """``steps`` checkpointed steps of one layer on one caller-held workspace (``ws``, default a new one) with
+    pointer-stable operands: per step the out and the five gradients (cloned at once: a replay returns the graph's
+    static tensors), the records of the original forward, torch's recompute and the backward, and
+    ``GRAPH_STATS["reset"]`` after the step.  ``later``: a :class:`_LaterSaver` closes the region; ``hooks[i]``: its
+    backward hook in step ``i``."""
+    from torch.utils.checkpoint import checkpoint
+
+    ws = kcp.WorkspaceKcp() if ws is None else ws
+    base = [inputs[n].to(device) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    results, records, resets = [], [], []
+    kcp.graph_cache_clear()
+    try:
+        for i in range(steps):
+            leaves = [t.detach().requires_grad_(True) for t in base]
+
+            def fn(*a):
+                out = gdn_api.chunk_gdn_kcp(
+                    *a, ctx, workspace=ws, deterministic=False, **kw
+                )
+                return _LaterSaver.apply(out) if later else out
+
+            _LaterSaver.hook = (hooks or {}).get(i)
+            try:
+                out = checkpoint(fn, *leaves, use_reentrant=False)
+                fwd = dict(kcp.LAST_CALL["fwd"])
+                res = {"out": out.detach()[0].clone()}
+                out.backward(dout)
+            finally:
+                _LaterSaver.hook = None
+            res.update(
+                {
+                    n: lf.grad.detach()[0].clone()
+                    for n, lf in zip(GRAD_NAMES, leaves, strict=True)
+                }
+            )
+            records.append(
+                (fwd, dict(kcp.LAST_CALL["fwd"]), dict(kcp.LAST_CALL["bwd"]))
+            )
+            resets.append(kcp.GRAPH_STATS["reset"])
+            results.append(res)
+            del out, leaves
+        torch.cuda.synchronize(device)
+    finally:
+        kcp.graph_cache_clear()
+    return results, records, resets
+
+
+def _launches(step_records) -> list:
+    """The launch inventory of one step: (record, grid) of every launch of the original forward, the recompute and
+    the backward, in issue order."""
+    return [(r, tuple(g)) for rec in step_records for r, g in rec["records"]]
+
+
+@pytest.mark.parametrize("l2n", [False, True], ids=["raw", "l2n"])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_graph_replay_checkpoint_replays_the_eager_checkpoint_programs(
+    device, lengths, heads, l2n, monkeypatch
+) -> None:
+    """Checkpointed steps under ``graph="replay"`` (default ``reuse_recompute_tapes`` / ``recompute_output``) reach a
+    steady state in which the original forward, the recompute and the backward all replay captured graphs, no entry is
+    reset and every step's launch inventory is the eager checkpoint step's -- on a verified torch #1 runs twice (not
+    three times: the backward binds the recompute's tapes and launches no #1 or tape walk) and the registry sees one
+    put / take / release per step and no stale entry.  ``reuse_recompute_tapes=False`` (the previous graph form)
+    replays #1 in the backward.  Out and the five gradients are the same bits as the eager step's and the previous
+    form's in every step.  The size rule of ``"auto"`` is set to 0 rows (the recompute decides at these sizes)."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    if l2n and not kcp.l2n_records_shipped():
+        pytest.skip("the in-kernel L2 norm programs are not rendered")
+    _size_rule_at(kcp, monkeypatch, 0)
+    H, HV = heads
+    cu = _cu(lengths)
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    kw = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    steps = 6
+    eager, eager_rec, _ = _ckpt_steps(kcp, ctx, inputs, device, steps=steps, **kw)
+    kept_before, stale_before = dict(kcp.KEPT_STATS), dict(kcp.KEPT_STALE_STATS)
+    graph, graph_rec, resets = _ckpt_steps(
+        kcp, ctx, inputs, device, steps=steps, graph="replay", **kw
+    )
+    kept_delta = {k: kcp.KEPT_STATS[k] - kept_before[k] for k in kept_before}
+    stale_delta = {k: kcp.KEPT_STALE_STATS[k] - stale_before[k] for k in stale_before}
+    previous, previous_rec, _ = _ckpt_steps(
+        kcp,
+        ctx,
+        inputs,
+        device,
+        steps=steps,
+        graph="replay",
+        reuse_recompute_tapes=False,
+        **kw,
+    )
+    events = [tuple(r["graph_event"] for r in rec) for rec in graph_rec]
+    assert events[-3:] == [("replay", "replay", "replay")] * 3, events
+    assert resets[-1] == resets[-3], resets  # the steady state resets no entry
+    assert [tuple(r["graph_event"] for r in rec) for rec in previous_rec][-1] == (
+        "replay",
+        "replay",
+        "replay",
+    )
+    for i in range(steps):
+        assert _launches(graph_rec[i]) == _launches(eager_rec[i]), i
+        for n in TENSORS:
+            assert torch.equal(graph[i][n], eager[i][n]), (i, n)
+            assert torch.equal(graph[i][n], previous[i][n]), (i, n)
+    prep = "fwd_prep_l2n" if l2n else "fwd_prep"
+
+    def n_prep(rec) -> int:
+        return sum(1 for r, _ in _launches(rec) if r.startswith(prep))
+
+    assert n_prep(previous_rec[-1]) == 3
+    assert stale_delta == {k: 0 for k in stale_delta}, stale_delta
+    assert kcp.kept_registry_size() == 0
+    if kcp.torch_release_verified():
+        assert n_prep(graph_rec[-1]) == 2, _launches(graph_rec[-1])
+        assert graph_rec[-1][2]["tapes_source"] == "kept"
+        assert graph_rec[-1][1]["hand_off"] is True
+        assert graph_rec[-1][1]["fwd_o"] == "skipped"
+        assert (
+            kept_delta["put"] == kept_delta["take"] == kept_delta["released"] == steps
+        )
+        assert kept_delta["miss"] == 0, kept_delta
+    else:
+        assert n_prep(graph_rec[-1]) == 3
+
+
+def _size_rule_at(kcp, monkeypatch, rows: int) -> None:
+    """The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` at ``rows`` on every architecture
+    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default), with an empty architecture cache."""
+    table = {arch: rows for arch in kcp.GRAPH_RECOMPUTE_MIN_ROWS}
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS", table)
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT", rows)
+    monkeypatch.setattr(kcp, "_GRAPH_RECOMPUTE_ARCH", {})
+
+
+@pytest.mark.parametrize("l2n", [False, True], ids=["raw", "l2n"])
+def test_graph_replay_auto_below_the_size_rule_replays_the_original_forward_graph(
+    device, l2n, monkeypatch
+) -> None:
+    """``reuse_recompute_tapes="auto"`` under ``graph="replay"`` with the size rule above this rank's ``T_r * HV``
+    (``GRAPH_RECOMPUTE_MIN_ROWS``): torch's recompute looks up the original forward's key (the same cache entry in
+    every step; the hand-off form, the rule at 0 rows, has its own) and, once the step is steady, replays that graph
+    (the same launches as the original forward, reasons ``"small"``); the backward replays #1 and the tape walk (three
+    prep launches, no entry put).  Out and the five gradients are the bits of the eager step, of
+    ``reuse_recompute_tapes=False`` and of the hand-off form in every step."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    if l2n and not kcp.l2n_records_shipped():
+        pytest.skip("the in-kernel L2 norm programs are not rendered")
+    H, HV = 2, 6
+    cu = _cu((300, 777))
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    kw = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    steps = 6
+    entries: list = []
+    original_entry = kcp._graph_entry
+
+    def spy_entry(kind, *args):
+        e = original_entry(kind, *args)
+        if kind == "fwd":
+            entries.append(e)
+        return e
+
+    monkeypatch.setattr(kcp, "_graph_entry", spy_entry)
+    _size_rule_at(kcp, monkeypatch, cu[-1] * HV + 1)
+    eager, _, _ = _ckpt_steps(kcp, ctx, inputs, device, steps=steps, **kw)
+    entries.clear()
+    kept_before = dict(kcp.KEPT_STATS)
+    small, small_rec, resets = _ckpt_steps(
+        kcp, ctx, inputs, device, steps=steps, graph="replay", **kw
+    )
+    small_pairs = [entries[2 * i : 2 * i + 2] for i in range(steps)]
+    kept_delta = {k: kcp.KEPT_STATS[k] - kept_before[k] for k in kept_before}
+    previous, _, _ = _ckpt_steps(
+        kcp,
+        ctx,
+        inputs,
+        device,
+        steps=steps,
+        graph="replay",
+        reuse_recompute_tapes=False,
+        **kw,
+    )
+    _size_rule_at(kcp, monkeypatch, 0)
+    entries.clear()
+    handed, _, _ = _ckpt_steps(
+        kcp, ctx, inputs, device, steps=steps, graph="replay", **kw
+    )
+    handed_pairs = [entries[2 * i : 2 * i + 2] for i in range(steps)]
+    events = [tuple(r["graph_event"] for r in rec) for rec in small_rec]
+    assert events[-3:] == [("replay", "replay", "replay")] * 3, events
+    assert resets[-1] == resets[-3], resets
+    assert all(len(p) == 2 and p[0] is p[1] for p in small_pairs), small_pairs
+    if kcp.torch_release_verified():
+        assert all(p[0] is not p[1] for p in handed_pairs[-3:])
+    prep = "fwd_prep_l2n" if l2n else "fwd_prep"
+    for original, recompute, backward in small_rec[-3:]:
+        assert recompute["records"] == original["records"]
+        assert recompute["hand_off"] is False, recompute
+        assert recompute["hand_off_reason"] == recompute["fwd_o_reason"] == "small"
+        assert backward["tapes_source"] == "replay"
+    rec = small_rec[-1]
+    assert sum(1 for r, _ in _launches(rec) if r.startswith(prep)) == 3
+    assert kept_delta["put"] == kept_delta["take"] == 0, kept_delta
+    assert kcp.kept_registry_size() == 0
+    for i in range(steps):
+        for n in TENSORS:
+            assert torch.equal(small[i][n], eager[i][n]), (i, n)
+            assert torch.equal(small[i][n], previous[i][n]), (i, n)
+            assert torch.equal(small[i][n], handed[i][n]), (i, n)
+
+
+def test_graph_replay_kept_tapes_are_refused_after_another_call_on_the_workspace(
+    device,
+) -> None:
+    """``graph="replay"``, ``reuse_recompute_tapes=True`` and a later saver: once the step replays, three consecutive
+    steps run an explicit forward of OTHER operands on the same workspace in the later saver's backward -- between the
+    recompute (whose kept tapes are the arena's own) and the GDN backward.  Each of them finds the entry stale
+    (``KEPT_STALE_STATS["calls"]``) and the GDN backward replays #1 and the tape walk instead of binding the rewritten
+    tapes, while that backward's own graph goes eager -> capture -> replay (the last hooked step replays it); every
+    step's out and gradients are the bits of step 0, and the next step binds the kept tapes again."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    H, HV = 2, 6
+    cu = _cu((300, 777))
+    inputs = make_inputs(cu, H, HV)
+    seeded = make_inputs(cu, H, HV, seed=7)
+    other = {n: seeded[n].to(device) for n in OPERANDS}
+    ctx = _local_context(cu, device)
+    ws = kcp.WorkspaceKcp()
+    calls: list[str] = []
+
+    def hook():
+        calls.append("explicit forward")
+        kcp.chunk_gdn_fwd_kcp(
+            *(other[n] for n in OPERANDS),
+            ctx,
+            workspace=ws,
+            graph="replay",
+            deterministic=False,
+        )
+
+    steps, hooked = 8, (4, 5, 6)
+    stale_before = dict(kcp.KEPT_STALE_STATS)
+    results, records, _ = _ckpt_steps(
+        kcp,
+        ctx,
+        inputs,
+        device,
+        steps=steps,
+        ws=ws,
+        later=True,
+        hooks=dict.fromkeys(hooked, hook),
+        graph="replay",
+        reuse_recompute_tapes=True,
+    )
+    sources = [rec[2]["tapes_source"] for rec in records]
+    events = [rec[2]["graph_event"] for rec in records]
+    assert calls == ["explicit forward"] * len(hooked)
+    last_clean = records[hooked[0] - 1][2]
+    assert last_clean["graph_event"] == "replay", last_clean
+    assert [sources[i] for i in hooked] == ["replay"] * len(hooked), sources
+    assert [events[i] for i in hooked] == ["eager", "capture", "replay"], events
+    assert sources[hooked[0] - 1] == sources[hooked[-1] + 1] == "kept", sources
+    assert kcp.KEPT_STALE_STATS["calls"] - stale_before["calls"] == len(hooked)
+    for i in range(steps):
+        for n in TENSORS:
+            assert torch.equal(results[i][n], results[0][n]), (i, n)
+    assert kcp.kept_registry_size() == 0

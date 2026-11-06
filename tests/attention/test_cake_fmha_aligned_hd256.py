@@ -1,6 +1,6 @@
 """Aligned head-dim-256 single-query grouped paged decode programs of the Cake
 FMHA module (``backend="cake"``): the persistent program and the cluster
-programs of 2 and 4 CTAs.
+programs of 2, 4 and 8 CTAs.
 
 Host-only: the module's Python mirror of the source selector against the source
 selector test's expectations (hard-coded here, per target, at each target's SM
@@ -14,8 +14,10 @@ GPU: the measured shape rows through
 atol = rtol = 1e-2 (the reference's largest ``|O|`` above 1e-2 on every row, so no
 row passes vacuously), the route taken, CUDA-graph replay bitwise equal to the
 eager result on an aligned program (also with shorter lengths under the captured
-KV bound), the kernel tests' group-8 cases on each aligned program and the
-group-4 case on the present route.
+KV bound), the kernel tests' group-8 cases on each aligned program, the
+group-4 case on the present route, and the row pinned to the cluster program of
+8 CTAs bitwise equal to ``backend="trtllm-gen"`` and within the tolerance of an
+FP64 reference.
 """
 
 from __future__ import annotations
@@ -49,12 +51,14 @@ PROGRAMS = {
     ("persistent", 1): "ALIGNED_HD256_BF16",
     ("cga", 2): "ALIGNED_HD256_CGA2_BF16",
     ("cga", 4): "ALIGNED_HD256_CGA4_BF16",
+    ("cga", 8): "ALIGNED_HD256_CGA8_BF16",
 }
 # Dynamic shared memory of each program's launch (the kernels' computed sizes).
 PROGRAM_SMEM = {
     "ALIGNED_HD256_BF16": 147328,
     "ALIGNED_HD256_CGA2_BF16": 178560,
     "ALIGNED_HD256_CGA4_BF16": 178560,
+    "ALIGNED_HD256_CGA8_BF16": 178560,
 }
 ARCHS = ("sm_100a", "sm_103a")
 # The module's device target -> the program target the selector reads.
@@ -110,6 +114,8 @@ SHAPE_ROWS = {
     "uniform_b64_hkv8_s32768": (8, [32768] * 64),
     "uniform_b128_hkv8_s32768": (8, [32768] * 128),
     "uniform_b128_hkv8_s4096": (8, [4096] * 128),
+    # The product row the selector pins to the cluster program of 8 CTAs.
+    "uniform_b1_hkv8_s4096": (8, [4096]),
 }
 # (batch, shortest, longest) of the random rows as measured: the generator above
 # must reproduce them.
@@ -121,8 +127,9 @@ RANDOM_ROW_IDENTITY = {
 # The kernel tests' group-8 cases: name -> (num_q_heads, num_kv_heads, seq_lens): a
 # partial page, ragged lengths over the K / V and page-id stages and over the
 # cluster ranks, a single-token request, requests shorter than a cluster's rank
-# count, a rank past the end, and the long uniform row.  Each case runs on every
-# aligned program.  The group-4 case is the one the selector never takes.
+# count, a rank past the end, one to seven active ranks and empty last ranks of
+# a cluster of 8, and the long uniform row.  Each case runs on every aligned
+# program.  The group-4 case is the one the selector never takes.
 CASE_ROWS = {
     "case_b4_hq16_hkv2_s300": (16, 2, [300] * 4),
     "case_b3_hq32_hkv4_ragged": (32, 4, [129, 700, 1100]),
@@ -130,6 +137,8 @@ CASE_ROWS = {
     "case_b5_hq40_hkv5_ragged": (40, 5, [17, 4096, 513, 1, 8191]),
     "case_b4_hq8_hkv1_short": (8, 1, [1, 200, 256, 257]),
     "case_b2_hq8_hkv1_s1025_s1537": (8, 1, [1025, 1537]),
+    "case_b7_hq64_hkv8_ragged": (64, 8, [1, 300, 600, 1000, 1025, 1400, 1700]),
+    "case_b4_hq8_hkv1_s2049_s4097": (8, 1, [2049, 3584, 3585, 4097]),
     "case_b4_hq64_hkv8_s65536": (64, 8, [65536] * 4),
 }
 GROUP4_CASE = (8, 2, [1500] * 2)
@@ -140,9 +149,9 @@ GROUP4_CASE = (8, 2, [1500] * 2)
 # neighbours, plus 1 and twice the largest.
 # fmt: off
 TILES: list[int] = [
-    1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257,
-    383, 384, 385, 511, 512, 513, 767, 768, 769, 1023, 1024, 1025, 1535, 1536, 1537,
-    2047, 2048, 2049, 4096,
+    1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255,
+    256, 257, 383, 384, 385, 511, 512, 513, 767, 768, 769, 1023, 1024, 1025, 1535, 1536,
+    1537, 2047, 2048, 2049, 4096,
 ]
 # fmt: on
 # fmt: off
@@ -275,6 +284,11 @@ PROBED: list[tuple[str, int, int, tuple[str, int] | None]] = [
 # (arch, tiles, max_kv, program): every band corner and one value past each
 # bound, every pinned point and its four neighbours.
 EDGES: list[tuple[str, int, int, tuple[str, int] | None]] = [
+    ("sm_100a", 7, 4096, None),
+    ("sm_100a", 8, 4095, None),
+    ("sm_100a", 8, 4096, ("cga", 8)),
+    ("sm_100a", 8, 4097, None),
+    ("sm_100a", 9, 4096, None),
     ("sm_100a", 15, 237569, None),
     ("sm_100a", 16, 237568, None),
     ("sm_100a", 16, 237569, None),
@@ -377,6 +391,11 @@ EDGES: list[tuple[str, int, int, tuple[str, int] | None]] = [
     ("sm_100a", 2049, 2048, None),
     ("sm_100a", 2049, 8192, None),
     ("sm_100a", 2049, 65536, None),
+    ("sm_103a", 7, 4096, None),
+    ("sm_103a", 8, 4095, None),
+    ("sm_103a", 8, 4096, ("cga", 8)),
+    ("sm_103a", 8, 4097, None),
+    ("sm_103a", 9, 4096, None),
     ("sm_103a", 15, 237569, None),
     ("sm_103a", 16, 237568, None),
     ("sm_103a", 16, 237569, None),
@@ -499,6 +518,7 @@ ROW_SHAPES: dict[str, tuple[int, int, int]] = {
     "uniform_b64_hkv8_s32768": (64, 8, 32768),
     "uniform_b128_hkv8_s32768": (128, 8, 32768),
     "uniform_b128_hkv8_s4096": (128, 8, 4096),
+    "uniform_b1_hkv8_s4096": (1, 8, 4096),
 }
 # row -> {arch: program}: the served program of every shape row per target at
 # the target's SM count of record (None: the present route).
@@ -525,6 +545,7 @@ ROW_ROUTES: dict[str, dict[str, tuple[str, int] | None]] = {
         "sm_100a": ("persistent", 1),
         "sm_103a": ("persistent", 1),
     },
+    "uniform_b1_hkv8_s4096": {"sm_100a": ("cga", 8), "sm_103a": ("cga", 8)},
 }
 # --- END SEL_HD256_EXPECTATIONS ---
 
@@ -1237,23 +1258,26 @@ def _hd256_case(device, *, num_q_heads, num_kv_heads, seq_lens, seed):
     )
 
 
-def _reference_decode(query, key, value, block_tables, seq_lens, *, scale):
-    """FP32 GQA decode over the paged HND pools: request ``b`` attends its first
-    ``seq_lens[b]`` tokens, query head ``h`` reads KV head ``h // group``."""
+def _reference_decode(
+    query, key, value, block_tables, seq_lens, *, scale, dtype=torch.float32
+):
+    """GQA decode in ``dtype`` (FP32 unless given) over the paged HND pools:
+    request ``b`` attends its first ``seq_lens[b]`` tokens, query head ``h`` reads
+    KV head ``h // group``."""
 
     batch = int(seq_lens.numel())
     num_q_heads = query.shape[1]
     num_kv_heads = key.shape[1]
     group = num_q_heads // num_kv_heads
-    out = torch.empty(query.shape, dtype=torch.float32, device=query.device)
+    out = torch.empty(query.shape, dtype=dtype, device=query.device)
     for b in range(batch):
         length = int(seq_lens[b])
         pages = block_tables[b, : (length + PAGE_SIZE - 1) // PAGE_SIZE]
         k = key[pages].permute(1, 0, 2, 3).reshape(num_kv_heads, -1, HEAD_DIM)
         v = value[pages].permute(1, 0, 2, 3).reshape(num_kv_heads, -1, HEAD_DIM)
-        k = k[:, :length].float()
-        v = v[:, :length].float()
-        q = query[b].float().view(num_kv_heads, group, HEAD_DIM)
+        k = k[:, :length].to(dtype)
+        v = v[:, :length].to(dtype)
+        q = query[b].to(dtype).view(num_kv_heads, group, HEAD_DIM)
         logits = torch.einsum("hgd,hnd->hgn", q, k) * scale
         probs = torch.softmax(logits, dim=-1)
         out[b] = torch.einsum("hgn,hnd->hgd", probs, v).reshape(num_q_heads, HEAD_DIM)
@@ -1371,6 +1395,7 @@ def _check_row(
     graph.replay()
     torch.cuda.synchronize()
     check_replay(replayed, expected)
+    return actual
 
 
 @_requires_blackwell
@@ -1471,3 +1496,81 @@ def test_cake_decode_aligned_hd256_group4_case_runs_on_the_present_route(
         seq_lens=seq_lens,
         expect_program=None,
     )
+
+
+# The product row the source selector pins to the cluster program of 8 CTAs on
+# both targets, where trtllm-gen's split at the SM count of record also takes a
+# cluster of 8: the program reproduces trtllm-gen's output bit for bit.
+PINNED_CGA8_ROW = "uniform_b1_hkv8_s4096"
+
+
+@_requires_blackwell
+def test_cake_decode_aligned_hd256_pinned_cga8_row_matches_trtllm_gen_bitwise(
+    monkeypatch,
+) -> None:
+    """The pinned row (one request, 8 KV heads, 4096 tokens) through
+    ``backend="cake"`` on the cluster program of 8 CTAs: the route taken, the
+    FP32 reference and CUDA-graph replay bitwise equal to the eager result
+    (``_check_row``), the FP64 reference at the tolerance, and the output bitwise
+    equal to ``backend="trtllm-gen"`` on the same inputs."""
+
+    _require_table()
+    device = torch.device("cuda")
+    arch = TARGET_ARCH[cake_api._cake_fmha_target(device)]
+    sm_count = _device_sm_count(device)
+    num_kv_heads, seq_lens = SHAPE_ROWS[PINNED_CGA8_ROW]
+    assert ROW_ROUTES[PINNED_CGA8_ROW][arch] == ("cga", 8)
+    program = cake_api.aligned_hd256_program(
+        len(seq_lens),
+        num_kv_heads,
+        max(seq_lens),
+        q_len=1,
+        num_q_heads=GROUP * num_kv_heads,
+        arch=arch,
+        sm_count=sm_count,
+    )
+    if sm_count == SM_COUNT[arch]:
+        assert program == ("cga", 8)
+    if program != ("cga", 8):
+        pytest.skip(f"the trtllm-gen split at {sm_count} SMs takes no cluster of 8")
+    query, key, value, block_tables, seq_lens_t = _hd256_case(
+        device,
+        num_q_heads=GROUP * num_kv_heads,
+        num_kv_heads=num_kv_heads,
+        seq_lens=seq_lens,
+        seed=20261102 + len(seq_lens) + num_kv_heads,
+    )
+    actual = _check_row(
+        monkeypatch,
+        query=query,
+        key=key,
+        value=value,
+        block_tables=block_tables,
+        seq_lens_t=seq_lens_t,
+        seq_lens=seq_lens,
+        expect_program=program,
+    )
+    scale = HEAD_DIM**-0.5
+    expected = _reference_decode(
+        query, key, value, block_tables, seq_lens_t, scale=scale, dtype=torch.float64
+    )
+    assert float(expected.abs().amax()) > MIN_REF_ABSMAX
+    torch.testing.assert_close(actual.double(), expected, atol=ATOL, rtol=RTOL)
+    workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    reference = trtllm_batch_decode_with_kv_cache(
+        query,
+        (key, value),
+        workspace,
+        block_tables,
+        seq_lens_t,
+        max(seq_lens),
+        bmm1_scale=scale,
+        bmm2_scale=1.0,
+        window_left=-1,
+        kv_layout="HND",
+        q_len_per_req=1,
+        backend="trtllm-gen",
+    )
+    torch.cuda.synchronize()
+    assert reference.dtype == actual.dtype and reference.shape == actual.shape
+    assert torch.equal(actual, reference)

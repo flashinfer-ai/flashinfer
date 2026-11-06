@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_SVIEW_OFF 0
-#define SMEM_SVIEW_STAGE_BYTES 24576
-#define SMEM_SVIEW_STRIDE 24576
-#define SMEM_QVIEW_OFF 24576
-#define SMEM_QVIEW_STAGE_BYTES 1024
-#define SMEM_QVIEW_STRIDE 1024
-#define SMEM_TOTAL 25600
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" __device__ float __nv_expf(float);
@@ -84,7 +74,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* sview = reinterpret_cast<float*>(smem_raw + 0);
     const int sview_addr = smem + 0;
     float* qview = reinterpret_cast<float*>(smem_raw + 24576);
@@ -211,7 +201,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
         #pragma unroll
         for (int j_1 = 0; j_1 < 2; j_1++) {
             tokr[j_1] = g * 8 + tin[j_1];
-            tcr[j_1] = (long long)(((tokr[j_1] < T) ? tokr[j_1] : T - 1));
+            tcr[j_1] = (long long)((tokr[j_1] < T) ? tokr[j_1] : T - 1);
             s_acc[j_1] = 0.0f;
         }
         if (p_k <= 16) {

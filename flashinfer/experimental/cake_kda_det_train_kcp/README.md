@@ -385,6 +385,75 @@ dA_log, ddt_bias = reduce_gate_param_grads_det_kcp(ctx, dA_log_r, ddt_bias_r)   
   call) and the two parameter gradients; a rank without tokens returns zero
   parameter gradients.
 
+In-kernel Q / K L2 norm on the KCP route (issue #7817): the three KDA entry
+points, `WorkspaceDetKcp` and the workspace and saved byte queries take the
+keyword-only `use_qk_l2norm_in_kernel=False`.  With `True` the local stages
+normalize `q` and `k` per token and per 128-channel head (FP32 sum of squares,
+`r = 1 / sqrt(ss + 1e-6)`, `x_hat = bf16(x * r)`; `v` is not normalized) and
+the GLM intra programs fuse the FP32 pullback into the BF16 `dq` / `dk`, so
+`q_local` / `k_local` are the rank's raw rows and the gradients are theirs.
+
+```python
+ws = WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)                # the workspace's mode, fixed
+out_local, saved = chunk_kda_det_fwd_kcp(q_raw, k_raw, v_local, g_local, beta_local, ctx,
+                                         workspace=ws, use_qk_l2norm_in_kernel=True)
+dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
+    q_raw, k_raw, v_local, g_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    use_qk_l2norm_in_kernel=True)
+```
+
+* `q_raw` / `k_raw` may be strided views, such as columns of a packed
+  projection or convolution output `[S_local, (2 H + HV) * 128]`: innermost
+  stride 1, head stride 128 elements, token stride a multiple of 8 elements
+  and at least `H * 128` (no overlapping rows), base address 16-byte aligned
+  (the single-rank rule).  They are never copied; any other view raises
+  `ValueError`.  Without the flag `q` / `k` must stay contiguous.  `v` keeps
+  its rules.  Every rank checks the metadata (shape, dtype, device, the three
+  strides), a rank with zero or one token too, so all ranks refuse a view
+  alike.  The base-address alignment is the one per-rank check: it is a
+  property of each rank's own storage, checked where the rank has tokens.
+* The normalization is token-local: the halo, the context, the KCP programs,
+  every collective and its byte count are those of the flag-off route.
+* The saved set keeps the raw `q` / `k` (the caller's tensors) and adds the
+  FP32 rstd `SavedDetKcp.qk_rstd` `[2, S_local, H]` (plane 0 q, plane 1 k;
+  empty on a rank without tokens): `kda_det_saved_bytes_kcp(...,
+  use_qk_l2norm_in_kernel=True)` is `8 * S_local * H` bytes more.  The
+  normalized q / k are never saved: the backward rebuilds them bitwise from
+  the raw rows and the rstd, and a checkpoint recompute writes its rstd
+  afresh, so a recompute handle's entry and bytes do not change.  The
+  backward keeps the rebuilt rows in its local arena, in the bytes of two
+  internal buffers that it moves into the bytes of its own outputs (dq / dk
+  and the gate gradient) until the GLM intra program writes those, so it
+  needs no memory beyond the flag-off backward's.  Where an output is too
+  small for its buffer (more than `2 * S_local` internal rows; in raw gate
+  mode more than `S_local` for the gate gradient), that row set takes a
+  per-call buffer (`256 * S_local * H` bytes each) instead.
+* The mode is fixed per workspace (the replay local arena of that mode;
+  `local_arena="lean"` is refused with it), recorded in the saved set
+  (`SavedDetKcp.qk_l2norm`), the graph validity key and a recompute handle's
+  fingerprint; a call, a saved set or a recompute of the other mode is
+  refused with `ValueError`.
+* With `use_qk_l2norm_in_kernel=False` (the default) every launch, saved
+  tensor, key, fingerprint and byte is unchanged.
+* The local programs of the mode are the single-rank backend's (its plan mode
+  `l2n="fused"`: the first q / k reader normalizes, the GLM intra program
+  pulls back; a saved-mode backward reads the saved rstd).  Until the
+  single-rank registry selects a record of the mode for every such stage of
+  the forward and replay paths over a fixed grid of problem sizes (at most
+  and above 256 documents, few and many heads, the architecture's SM
+  counts), each delivered and exported for the device's architecture, with
+  exactly one normalizing first reader on the replay, and its forward and
+  replay layouts carry the normalized slot views `qn_int` / `kn_int`, a
+  call, a `WorkspaceDetKcp` and the byte queries with the flag on raise
+  `NotImplementedError` before any workspace build, plan, launch or
+  collective.  The check reads rank-independent inputs only (the
+  architecture of the context's device, the registry's selection over that
+  grid and its exports, the flags and gate mode, the static layout tables),
+  so every rank, one without tokens or with a misaligned view too, raises
+  the same error with the same message.  The saved byte query takes the
+  call's `use_gate_in_kernel` for this check.  With the flag off the byte
+  queries make no CUDA call for it.
+
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
 below it on one-fragment ranks the
@@ -403,14 +472,17 @@ families of a phase in one launch; off by default).
 
 The files of this package:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the eleven shipped programs (the
+* `cake_kcp_jit.py` -- the `MODULES` registry of the fourteen shipped programs (the
   fragment walks of the forward and backward state recurrences in their
   `offset` and `tape` forms, the BF16x3 transfer walk (two CTAs per segment
   and head, each over one 64-column half of the state), the affine
-  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
-  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always`, by
+  `walk_form`, by `walk_heads` (the `WALK_HEADS_RULE` bands of the launch's
+  head count: the plain or the overlap-schedule full-width adjoint offset
+  walk), or by `merge_rule` (the `MERGE_RULE` bands of the merge
+  launch's 128-column chain blocks per architecture), grids by `kcp_segments_heads`,
   `kcp_chains`, `kcp_tile_items` or `kcp_pairs`), the logical vocabulary of
   the KCP arguments, `run_program(name, args, device_index=)`, the lowering
   of the host backend's walk and merge requests to the registry's launches,
@@ -430,18 +502,18 @@ The files of this package:
   tests; without the file those tests skip.  The package reads no
   environment variable.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and the manifest of the eleven shipped
+  package (byte-identical copies) and the manifest of the fourteen shipped
   programs (schema `cake-build/1`, one entry per `<library>_<arch>`);
   `aot/` is never tracked (`.gitignore`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include.
-* `csrc/cake_kda_det_train_<digest>_kcp_{kernel,binding}.cu` of the fifteen
+* `csrc/cake_kda_det_train_<digest>_kcp_{kernel,binding}.cu` of the eighteen
   context-parallel-only programs and `csrc/cake_kda_det_train_<digest>_{kernel,binding}.cu`
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
 
 ## Status
 
-The registry holds eleven shipped programs (`cake_kcp_jit.MODULES`, in
+The registry holds fourteen shipped programs (`cake_kcp_jit.MODULES`, in
 `build.json`) and six test-only programs (`cake_kcp_jit.TEST_MODULES`, in
 `build.test.json`) for `sm_100a`, `sm_103a` and `sm_107a`.
 

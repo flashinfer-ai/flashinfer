@@ -104,6 +104,45 @@ beyond inputs / outputs / workspace, and the explicit workspace bytes of the
 reference of ``tests/test_helpers/cake_dsa_indexer_reference.py`` (small rows
 only; the reference scores every visible pair).
 
+FP8 mode (``--form fp8``): the inputs are float8_e4m3fn ``q`` / ``k`` with
+per-key FP32 ``k_scale`` (``ref.make_fp8_inputs``: amax scaling per (query,
+head) and per key, the query and softmax scales folded into ``w``) on the iid
+rows; ``--rows fp8`` (the default of the mode) names ``P1``, ``glm2k_16k``
+(2048 queries over 16384 keys), ``s1_8k_on_64k`` (8192 over 73728),
+``s2_4x2k_packed`` (four segments of 2048 queries over 18432, 43008, 67584
+and 100352 keys) and ``s3_cold16k`` (16384 over 16384), top-k 2048, causal.
+Arms: ``cake_fp8`` (this backend's FP8 form; ``cake_fp8_aa`` /
+``cake_fp8_nosample`` as above; ``cake_fp8_w6`` the FP8 dispatch before the
+FP8 wide program, which ran a wide decision on the l6 program with the l6
+kind's sampled first threshold and check period (the FP8 wide programs
+hidden: a twin of ``cake_fp8`` where none is registered); ``cake_fp8_wn``
+the FP8 dispatch before that, which ran a wide decision on the narrow
+program with the wide decision's sampled first threshold and check period;
+``cake_fp8_l6`` /
+``cake_fp8_narrow`` on the l6 / narrow program on every row, and
+``cake_l6_all`` the BF16 form on the l6 program where the architecture
+registers the l6 key the row composes), ``cake`` (the
+BF16 form on the same data dequantized to BF16: ``q`` exactly, ``bf16(k * k_scale)``, the same ``w``,
+``softmax_scale = 1``), ``deepgemm_topk`` (stock DeepGEMM FP8 MQA logits with
+FP32 per-key scales and FP32 logits: ``deep_gemm.fp8_mqa_logits``, or
+``fp8_fp4_mqa_logits(..., logits_dtype=torch.float32)`` in builds without it;
+``clean_logits=True``, then ``flashinfer.top_k(deterministic=True,
+tie_break=LARGE)``) and ``deepgemm_ragged_topk`` (``fp8_mqa_logits`` with
+``clean_logits=False``, then ``flashinfer.top_k_ragged_transform(
+deterministic=True, tie_break=LARGE)`` over each row's visible keys); the
+DeepGEMM arms run one logits call and one top-k call per segment and are
+reported unavailable where ``deep_gemm`` does not import or the call fails.
+Timing boundary: a Cake arm's span is the complete operator (scan, merge,
+finalize into caller-owned outputs and workspace); a DeepGEMM arm's span is
+its logits allocation and kernel plus its top-k kernel per segment (the
+``deepgemm_topk`` arm also copies the row-padded logits to contiguous rows for
+``flashinfer.top_k``, recorded as ``logits_copied``; the ragged arm reads the
+padded rows in place), and the
+conversion of their output to the contract's ascending segment-local ids
+with aligned scores and ``-1`` / ``-inf`` padding (the score gather of the
+ragged arm included) is outside it.  ``same_bits`` / ``all_cake_arms_identical``
+compare the Cake arms of one form; the speed ratios are against ``cake_fp8``.
+
 Usage::
 
     python benchmarks/bench_cake_dsa_indexer.py [--rows P1 S2 ...] [--arms cake,chunked_pipeline,materialized_fp32]
@@ -112,6 +151,8 @@ Usage::
         --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer_det --cupti-required --json out.json
     python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_far,cake_aa,cake_far_aa --cupti-required --json out.json
     python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_wide,cake_l6,cake_pair_l6,cake_wide_c1 --cupti-required --json out.json
+    python benchmarks/bench_cake_dsa_indexer.py --form fp8 --rows fp8 --arms cake_fp8,cake,deepgemm_topk,deepgemm_ragged_topk
+        --cupti-required --json out.json
 """
 
 import argparse
@@ -370,16 +411,36 @@ ROWS["smoke_p1"] = _row(
     note="P1 pattern / 16",
 )
 DEFAULT_ROWS = [n for n in ROWS if not n.startswith("smoke")]
+# the FP8 form's shape set (``--form fp8``; the BF16 default rows above stay as they are)
+ROWS["glm2k_16k"] = _row(
+    [2048], [16384], seed=7801, note="2048 queries over 16384 keys"
+)
+ROWS["s1_8k_on_64k"] = _row(
+    [8192], [73728], seed=7802, note="8192 queries over 73728 keys"
+)
+ROWS["s2_4x2k_packed"] = _row(
+    [2048] * 4,
+    [18432, 43008, 67584, 100352],
+    seed=7803,
+    note="packed 4 x 2048 queries over 18432 / 43008 / 67584 / 100352 keys",
+)
+ROWS["s3_cold16k"] = _row(
+    [16384], [16384], seed=7804, note="16384 queries over 16384 keys"
+)
+FP8_ROWS = ["P1", "glm2k_16k", "s1_8k_on_64k", "s2_4x2k_packed", "s3_cold16k"]
 ROW_GROUPS = {
     "iid": IID_ROWS,
     "sink": SINK_ROWS,
     "pool": POOL_ROWS,
     "all": DEFAULT_ROWS,
+    "fp8": FP8_ROWS,
 }
+FORMS = ("bf16", "fp8")
 
 
 def expand_rows(names):
-    """``--rows`` with the group names ``iid`` / ``sink`` / ``pool`` / ``all`` expanded, in order, without repeats."""
+    """``--rows`` with the group names ``iid`` / ``sink`` / ``pool`` / ``all`` / ``fp8`` expanded, in order, without
+    repeats."""
     out = []
     for name in names:
         for row in ROW_GROUPS.get(name, [name]):
@@ -409,6 +470,25 @@ def build_inputs(name: str, device, strided_k: bool):
         seed=row["seed"],
         device=device,
         peaked=row["peaked"],
+        ratio=row["ratio"],
+        q_causal_offsets=row["offsets"],
+        k_row_stride=ref.TRAINER_KEY_ROW_STRIDE if strided_k else None,
+        label=name,
+    )
+
+
+def build_fp8_inputs(name: str, device, strided_k: bool):
+    """The FP8 form's inputs of an iid row (``ref.make_fp8_inputs``: its geometry, ``top_k``, ``ratio``, offsets and
+    seed)."""
+    row = ROWS[name]
+    if row["dist"] != "iid" or row["peaked"]:
+        raise SystemExit(f"--form fp8 measures the plain iid rows; {name} is not one")
+    return ref.make_fp8_inputs(
+        row["seg_q"],
+        row["seg_k"],
+        top_k=row["top_k"],
+        seed=row["seed"],
+        device=device,
         ratio=row["ratio"],
         q_causal_offsets=row["offsets"],
         k_row_stride=ref.TRAINER_KEY_ROW_STRIDE if strided_k else None,
@@ -695,6 +775,14 @@ class Arm:
     def __call__(self):
         raise NotImplementedError
 
+    def finish(self, out):
+        """The contract's ``(indices, scores)`` of one timed call's output (outside the timed span)."""
+        return out
+
+    def outputs(self, out):
+        """The tensors of one timed call's output that are the arm's results (``peak_extra_bytes`` counts the rest)."""
+        return out
+
 
 def row_extra(inputs) -> dict:
     """Backend keywords a row adds beyond ``inputs.kwargs()`` (``max_seqlen_k`` for the bounded sink rows)."""
@@ -712,6 +800,12 @@ def backend_api(backend, name: str):
     return fn if fn is not None else getattr(backend, name.replace("_det", "", 1))
 
 
+def form_extra(inputs) -> dict:
+    """``dtype`` for the FP8 form's plan and workspace bound; nothing for BF16 (a main package copy that predates the
+    keyword serves the BF16 arms unchanged)."""
+    return {"dtype": inputs.q.dtype} if inputs.fp8 else {}
+
+
 def plan_record(backend, inputs, knobs: dict) -> dict:
     """The host plan of ``backend`` for ``inputs`` under ``knobs`` (the record of truth of what each arm ran)."""
     plan = backend_api(backend, "plan_dsa_indexer_det_topk")(
@@ -722,6 +816,7 @@ def plan_record(backend, inputs, knobs: dict) -> dict:
         ratio=inputs.ratio,
         device=inputs.device,
         **row_extra(inputs),
+        **form_extra(inputs),
         **knobs,
     )
     return dict(
@@ -750,17 +845,21 @@ def forced_policy(backend, overrides: dict):
     ``plan_dsa_indexer_det_topk`` and ``prepare_dsa_indexer_det_topk`` look ``policy_for`` up on the module at every call, so
     the workspace bound, the plan record and the prepared launches of an arm built inside this scope all follow the
     forced policy (``DispatchPolicy.from_record`` validates the record as it does the registry's); the original
-    ``functools.cache`` function is restored on exit.
+    function is restored on exit.  The FP8 form's record (``fp8_policy_record`` of ``POLICY`` and ``POLICY_FP8``) takes
+    the same overrides.
     """
     original = backend.policy_for
     forced = {}
 
-    def policy_for(arch):
-        if arch not in forced:
-            forced[arch] = backend.DispatchPolicy.from_record(
-                {**backend.POLICY[arch], **overrides}
+    def policy_for(arch, form="bf16"):
+        if (arch, form) not in forced:
+            record = backend.POLICY[arch]
+            if form != "bf16":
+                record = backend.fp8_policy_record(record, backend.POLICY_FP8[arch])
+            forced[(arch, form)] = backend.DispatchPolicy.from_record(
+                {**record, **overrides}
             )
-        return forced[arch]
+        return forced[(arch, form)]
 
     backend.policy_for = policy_for
     try:
@@ -769,23 +868,81 @@ def forced_policy(backend, overrides: dict):
         backend.policy_for = original
 
 
+@contextlib.contextmanager
+def forced_fp8_fallback(backend, overrides: dict):
+    """The previous FP8 dispatch for an arm built inside this scope: entries of the FP8 kind fallback
+    (``cake_policy.FP8_KIND_FALLBACK``) replaced, and the fallback program run with the decided kind's sampled first
+    threshold and check period (``cake_policy.fallback_knobs`` made the identity).  ``select_fp8_program`` reads both
+    module globals at every call; the originals are restored on exit."""
+    module = sys.modules[backend.select_fp8_program.__module__]
+    table = module.FP8_KIND_FALLBACK
+    saved, saved_knobs = dict(table), module.fallback_knobs
+    table.update(overrides)
+    module.fallback_knobs = lambda policy, choice, physical, call: choice
+    try:
+        yield
+    finally:
+        table.clear()
+        table.update(saved)
+        module.fallback_knobs = saved_knobs
+
+
+@contextlib.contextmanager
+def hidden_fp8_kinds(backend, kinds):
+    """The FP8 dispatch without the FP8 scan programs of the physical ``kinds`` for an arm built inside this scope:
+    ``plan_dsa_indexer_det_topk`` looks ``fp8_programs_for`` up on the module at every call, so a decision of a hidden
+    kind runs the program of its ``cake_policy.FP8_KIND_FALLBACK`` kind with that kind's sampled first threshold and
+    check period (``cake_policy.fallback_knobs``), as on an architecture that registers none.  The process cache of
+    ``fp8_programs_for`` is read, not changed; the original function is restored on exit."""
+    original = backend.fp8_programs_for
+
+    def fp8_programs_for(arch):
+        return {
+            (kind, lsf): unrolls
+            for (kind, lsf), unrolls in original(arch).items()
+            if kind not in kinds
+        }
+
+    backend.fp8_programs_for = fp8_programs_for
+    try:
+        yield
+    finally:
+        backend.fp8_programs_for = original
+
+
 class CakeArm(Arm):
     name = "cake"
 
-    def __init__(self, inputs, *, backend=None, knobs=None, name=None, policy=None):
+    def __init__(
+        self,
+        inputs,
+        *,
+        backend=None,
+        knobs=None,
+        name=None,
+        policy=None,
+        fp8_fallback=None,
+        fp8_hidden=None,
+    ):
         super().__init__(inputs)
         self.backend = cake_backend if backend is None else backend
         self.knobs = dict(knobs or {})
-        # forced dispatch: registry fields replaced for this arm (empty: the package's own policy)
+        # forced dispatch: registry fields replaced for this arm (empty: the package's own policy), FP8 kind
+        # fallback entries replaced (empty: the package's own) and the FP8 programs of these physical kinds hidden
+        # (empty: every registered one)
         self.policy = dict(policy or {})
+        self.fp8_fallback = dict(fp8_fallback or {})
+        self.fp8_hidden = list(fp8_hidden or ())
         if name is not None:
             self.name = name
         dev = inputs.device
-        scope = (
-            forced_policy(self.backend, self.policy)
-            if self.policy
-            else contextlib.nullcontext()
-        )
+        scope = contextlib.ExitStack()
+        if self.policy:
+            scope.enter_context(forced_policy(self.backend, self.policy))
+        if self.fp8_fallback:
+            scope.enter_context(forced_fp8_fallback(self.backend, self.fp8_fallback))
+        if self.fp8_hidden:
+            scope.enter_context(hidden_fp8_kinds(self.backend, self.fp8_hidden))
         with scope:  # one scope: the workspace bound, the plan record and prepare see the same policy
             self.workspace_bytes = backend_api(
                 self.backend, "dsa_indexer_det_workspace_size"
@@ -796,6 +953,7 @@ class CakeArm(Arm):
                 top_k=inputs.top_k,
                 ratio=inputs.ratio,
                 device=dev,
+                **form_extra(inputs),
             )
             self.workspace = torch.empty(
                 self.workspace_bytes, dtype=torch.uint8, device=dev
@@ -824,6 +982,10 @@ class CakeArm(Arm):
     def __call__(self):
         return self.runner()
 
+    def outputs(self, out):
+        """None: the runner writes into ``indices`` / ``scores`` allocated before the measured call."""
+        return ()
+
 
 class ChunkedPipelineArm(Arm):
     name = "chunked_pipeline"
@@ -837,6 +999,183 @@ class MaterializedArm(Arm):
 
     def __call__(self):
         return materialized_fp32(self.inputs)
+
+
+def _aligned(t):
+    """``t`` contiguous at a 16-byte aligned address (DeepGEMM asserts it of its operands): a segment slice of a packed
+    call that starts off that alignment is copied once, when the arm is built."""
+    t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
+def deep_gemm_fp8_mqa_logits(deep_gemm):
+    """DeepGEMM's FP8 MQA logits with FP32 per-key scales and FP32 logits as ``f(q, (k, k_scale), w, starts, ends, *,
+    clean_logits)``: ``fp8_mqa_logits`` where the build has it, else ``fp8_fp4_mqa_logits`` with an FP8 ``q`` (no
+    scale factors) and ``logits_dtype=torch.float32``.  A build whose call does not take these arguments (one that needs
+    block scale factors for FP8) fails at the arm's first call, which reports the arm unavailable."""
+    if hasattr(deep_gemm, "fp8_mqa_logits"):
+        return deep_gemm.fp8_mqa_logits
+    if not hasattr(deep_gemm, "fp8_fp4_mqa_logits"):
+        raise AttributeError(
+            "deep_gemm has neither fp8_mqa_logits nor fp8_fp4_mqa_logits"
+        )
+
+    def logits(q, kv, w, starts, ends, *, clean_logits):
+        return deep_gemm.fp8_fp4_mqa_logits(
+            q=(q, None),
+            kv=kv,
+            weights=w,
+            cu_seq_len_k_start=starts,
+            cu_seq_len_k_end=ends,
+            clean_logits=clean_logits,
+            max_seqlen_k=0,
+            logits_dtype=torch.float32,
+        )
+
+    return logits
+
+
+class DeepGemmArm(Arm):
+    """Stock DeepGEMM FP8 MQA logits (:func:`deep_gemm_fp8_mqa_logits`) per segment, then a FlashInfer exact
+    deterministic top-k (FP8 inputs only).
+
+    The timed call returns the raw per-segment outputs; :meth:`finish` converts them to the contract's ascending
+    segment-local ids with aligned scores and padding outside the timed span.  A first call in the constructor makes a
+    missing ``deep_gemm`` or an unsupported call an unavailable arm."""
+
+    name = "deepgemm_topk"
+    clean_logits = True
+    # True when DeepGEMM returned a row-padded logits view and the arm copied it to a contiguous [Lq, Lk] tensor
+    # inside the timed span (recorded per arm)
+    logits_copied = False
+
+    def __init__(self, inputs):
+        super().__init__(inputs)
+        if not inputs.fp8:
+            raise ValueError(
+                "the DeepGEMM arms take the FP8 form's inputs (--form fp8)"
+            )
+        if inputs.top_k > DETERMINISTIC_TOPK_MAX_K:
+            raise ValueError(
+                f"FlashInfer's deterministic top-k serves k <= {DETERMINISTIC_TOPK_MAX_K}"
+            )
+        import deep_gemm
+
+        self.logits = deep_gemm_fp8_mqa_logits(deep_gemm)
+        visible = ref.visible_rows(inputs).to(torch.int32)
+        self.segments = []
+        for q0, lq, k0, lk, _visible, _visible_cpu in _segments(inputs):
+            ends = _aligned(visible[q0 : q0 + lq])
+            self.segments.append(
+                dict(
+                    q0=q0,
+                    lq=lq,
+                    lk=lk,
+                    q=_aligned(inputs.q[q0 : q0 + lq]),
+                    kv=(
+                        _aligned(inputs.k[k0 : k0 + lk]),
+                        _aligned(inputs.k_scale[k0 : k0 + lk]),
+                    ),
+                    w=_aligned(inputs.w[q0 : q0 + lq]),
+                    starts=torch.zeros_like(ends),
+                    ends=ends,
+                )
+            )
+        self.finish(self())
+        torch.cuda.synchronize()
+
+    def _segment_logits(self, seg):
+        logits = self.logits(
+            seg["q"],
+            seg["kv"],
+            seg["w"],
+            seg["starts"],
+            seg["ends"],
+            clean_logits=self.clean_logits,
+        )[:, : seg["lk"]]
+        if not logits.is_contiguous():
+            self.logits_copied = True
+            logits = logits.contiguous()
+        return logits
+
+    def _segment_topk(self, seg, logits):
+        return select_topk(logits, min(self.inputs.top_k, seg["lk"]))
+
+    def __call__(self):
+        out = []
+        for seg in self.segments:
+            logits = self._segment_logits(seg)
+            out.extend((logits, *self._segment_topk(seg, logits)))
+        return tuple(out)
+
+    def _segment_result(self, seg, logits, first, second):
+        values, ids = first, second.to(torch.int64)
+        return ids, values, ids < seg["ends"].unsqueeze(1).to(torch.int64)
+
+    def outputs(self, out):
+        """The top-k results of every segment, each tensor once; the logits are the arm's working memory."""
+        unique = {}
+        for i in range(0, len(out), 3):
+            for t in out[i + 1 : i + 3]:
+                unique.setdefault(t.data_ptr(), t)
+        return list(unique.values())
+
+    def finish(self, out):
+        inputs = self.inputs
+        T, K, dev = inputs.num_queries, inputs.top_k, inputs.device
+        out_ids = torch.full((T, K), -1, dtype=torch.int32, device=dev)
+        out_scores = torch.full((T, K), float("-inf"), dtype=torch.float32, device=dev)
+        for i, seg in enumerate(self.segments):
+            logits, first, second = out[3 * i : 3 * i + 3]
+            ids, values, valid = self._segment_result(seg, logits, first, second)
+            o_ids, o_scores = ascending_with_padding(ids, values.float(), valid)
+            n = o_ids.shape[1]
+            out_ids[seg["q0"] : seg["q0"] + seg["lq"], :n] = o_ids
+            out_scores[seg["q0"] : seg["q0"] + seg["lq"], :n] = o_scores
+        return out_ids, out_scores
+
+
+class DeepGemmRaggedArm(DeepGemmArm):
+    """The DeepGEMM logits without the logits clean, then ``top_k_ragged_transform`` over each row's visible keys (ids
+    only: the scores are gathered from the logits in :meth:`finish`)."""
+
+    name = "deepgemm_ragged_topk"
+    clean_logits = False
+
+    def _segment_logits(self, seg):
+        """The logits buffer as DeepGEMM allocated it: ``top_k_ragged_transform`` reads ``[0, ends)`` of each row of a
+        contiguous ``(Lq, row_stride)`` input, so the row-padded buffer serves it without a copy."""
+        logits = self.logits(
+            seg["q"],
+            seg["kv"],
+            seg["w"],
+            seg["starts"],
+            seg["ends"],
+            clean_logits=self.clean_logits,
+        )
+        lq, stride = logits.shape[0], logits.stride(0)
+        needed = (logits.storage_offset() + lq * stride) * logits.element_size()
+        if logits.stride(1) == 1 and logits.untyped_storage().nbytes() >= needed:
+            return logits.as_strided((lq, stride), (stride, 1))
+        self.logits_copied = True
+        return logits[:, : seg["lk"]].contiguous()
+
+    def _segment_topk(self, seg, logits):
+        ids = flashinfer.top_k_ragged_transform(
+            logits,
+            seg["starts"],
+            seg["ends"],
+            self.inputs.top_k,
+            deterministic=True,
+            tie_break=TopKTieBreak.LARGE,
+        )
+        return ids, ids
+
+    def _segment_result(self, seg, logits, first, second):
+        ids = first.to(torch.int64)
+        valid = ids >= 0
+        values = logits.float().gather(1, ids.clamp_min(0))
+        return ids, values, valid
 
 
 NOSAMPLE = {"sample_tiles_max": 0}
@@ -861,9 +1200,27 @@ NARROW = {"l6_rule": None, "pair_rule": None, "wide_rule": [1e18, 1e18]}
 # sm_100a a top_k <= 512 row runs the same programs with twice the candidate buffers (the same bits) in this build; the
 # sm_103a record carries this floor already (there the arm is a second A/A twin)
 FLOOR16K = {"cand_cap_floor": 16384, "cand_cap_floor_rule": None}
+# FP8 dispatch measurements: every row on the single-CTA l6 program (no pair, no wide-first, a wide rule no call meets)
+# where the architecture registers the l6 key the row composes (sm_107a has no BF16 snake-order l6 program in the plain
+# fit form: a causal single-segment BF16 row above 512 mean unit tiles has none), and every FP8 row on the narrow
+# program (NARROW without the unpaired-l6 preference, which sm_107a's record applies to packed and short-unit calls)
+L6_ALL = {
+    "l6_rule": [1e9, 0],
+    "pair_rule": None,
+    "wide_first_rule": None,
+    "wide_rule": [1e18, 1e18],
+}
+FP8_NARROW = {**NARROW, "l6_solo_rule": None, "l6_solo_unsampled_max_queries": None}
+# the FP8 kind fallback before a wide decision ran the FP8 l6 program: the narrow program
+FP8_FALLBACK_NARROW = {"wide": "narrow", "pair_wide": "narrow"}
+# the FP8 dispatch before the FP8 wide program: its programs hidden (``hidden_fp8_kinds``), a wide decision runs the
+# program of its FP8 kind fallback (the l6 program, or with FP8_FALLBACK_NARROW the narrow one)
+FP8_NO_WIDE = ("wide",)
 
 
-def _cake(name, backend=None, knobs=None, policy=None):
+def _cake(
+    name, backend=None, knobs=None, policy=None, fp8_fallback=None, fp8_hidden=None
+):
     def make(inputs):
         return CakeArm(
             inputs,
@@ -871,6 +1228,8 @@ def _cake(name, backend=None, knobs=None, policy=None):
             knobs=knobs,
             name=name,
             policy=policy,
+            fp8_fallback=fp8_fallback,
+            fp8_hidden=fp8_hidden,
         )
 
     return make
@@ -886,7 +1245,9 @@ def _cake(name, backend=None, knobs=None, policy=None):
 # program from one round, ``cake_narrow`` the narrow program -- so the same bits are expected against ``cake`` /
 # ``cake_nosample`` while the programs (``plan``) differ.  ``cake_floor16k`` / ``cake_floor16k_aa`` run the local package
 # under the 16384-slot floor on every top_k (the record before ``cand_cap_floor_rule``): the same programs, twice the
-# candidate buffers on sm_100a's top_k <= 512 rows (the sm_103a record keeps that floor), the same bits.
+# candidate buffers on sm_100a's top_k <= 512 rows (the sm_103a record keeps that floor), the same bits.  The FP8 arms
+# ``cake_fp8_w6`` / ``cake_fp8_wn`` run the local package under a previous FP8 dispatch, the FP8 wide programs hidden
+# (a wide decision on the l6 / the narrow program): the same bits as ``cake_fp8``.
 ARMS = {
     "cake": _cake("cake"),
     "cake_nosample": _cake("cake_nosample", knobs=NOSAMPLE),
@@ -916,8 +1277,49 @@ ARMS = {
     "cake_floor16k_aa": _cake("cake_floor16k_aa", policy=FLOOR16K),
     ChunkedPipelineArm.name: ChunkedPipelineArm,
     MaterializedArm.name: MaterializedArm,
+    # the FP8 form (``--form fp8``): the same runner on the FP8 inputs, and the DeepGEMM compositions
+    "cake_fp8": _cake("cake_fp8"),
+    "cake_fp8_aa": _cake("cake_fp8_aa"),
+    "cake_fp8_nosample": _cake("cake_fp8_nosample", knobs=NOSAMPLE),
+    "cake_fp8_l6": _cake("cake_fp8_l6", policy=L6_ALL),
+    "cake_fp8_narrow": _cake("cake_fp8_narrow", policy=FP8_NARROW),
+    "cake_fp8_w6": _cake("cake_fp8_w6", fp8_hidden=FP8_NO_WIDE),
+    "cake_fp8_wn": _cake(
+        "cake_fp8_wn", fp8_fallback=FP8_FALLBACK_NARROW, fp8_hidden=FP8_NO_WIDE
+    ),
+    "cake_l6_all": _cake("cake_l6_all", policy=L6_ALL),
+    DeepGemmArm.name: DeepGemmArm,
+    DeepGemmRaggedArm.name: DeepGemmRaggedArm,
 }
 MAIN_ARMS = ("cake_main", "cake_main_nosample", "cake_main_aa")
+# arms that take the FP8 inputs in ``--form fp8``; every other arm takes the same data dequantized to BF16
+FP8_ARMS = (
+    "cake_fp8",
+    "cake_fp8_aa",
+    "cake_fp8_nosample",
+    "cake_fp8_l6",
+    "cake_fp8_narrow",
+    "cake_fp8_w6",
+    "cake_fp8_wn",
+    DeepGemmArm.name,
+    DeepGemmRaggedArm.name,
+)
+DEFAULT_ARMS = {
+    "bf16": "cake,chunked_pipeline,materialized_fp32",
+    "fp8": "cake_fp8,cake,deepgemm_topk,deepgemm_ragged_topk",
+}
+TIMING_BOUNDARY = (
+    "cake arms: the complete operator (scan, merge, finalize) of a prepared runner into caller-owned outputs and "
+    "workspace; deepgemm arms: per segment the fp8_mqa_logits call (its logits allocation included, and a contiguous "
+    "copy of row-padded logits where an arm records logits_copied: the dense top-k arm; the ragged arm reads the padded "
+    "rows in place) and the top-k call, without the conversion of their "
+    "output to ascending segment-local ids with aligned scores and padding; "
+    "CUPTI GPU span of every launched kernel per iteration, cold L2"
+)
+
+
+def arm_form(arm_name: str) -> str:
+    return "fp8" if arm_name in FP8_ARMS else "bf16"
 
 
 # ---------------------------------------------------------------------------
@@ -998,26 +1400,35 @@ def peak_extra_bytes(fn):
     out = fn()
     torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - base
-    return extra - sum(t.numel() * t.element_size() for t in out)
+    return extra - sum(t.numel() * t.element_size() for t in fn.outputs(out))
 
 
-def measure_row(name, inputs, arms, args):
+def measure_row(name, inputs, arms, args, bf16_inputs=None):
+    """``bf16_inputs``: in ``--form fp8``, the FP8 ``inputs`` dequantized to BF16, which every arm outside
+    ``FP8_ARMS`` takes."""
     row = ROWS[name]
     reps = args.reps if args.reps is not None else row["reps"]
+    fp8 = bf16_inputs is not None
+    arm_inputs = {
+        a: bf16_inputs if fp8 and arm_form(a) == "bf16" else inputs for a in arms
+    }
     prepared = {}
+    unavailable = {}
     for arm_name in arms:
         try:
-            prepared[arm_name] = ARMS[arm_name](inputs)
+            prepared[arm_name] = ARMS[arm_name](arm_inputs[arm_name])
         except Exception as exc:  # noqa: BLE001 - report the arm as unavailable, keep the others
             if arm_name.startswith("cake"):
                 # a comparison without one of its cake arms is not the A/B the row set exists for
                 raise SystemExit(
                     f"[{name}] {arm_name}: {type(exc).__name__}: {exc}"
                 ) from exc
+            unavailable[arm_name] = f"{type(exc).__name__}: {exc}"
             print(
                 f"  [{name}] {arm_name}: unavailable ({type(exc).__name__}: {exc})",
                 flush=True,
             )
+    anchor = "cake_fp8" if fp8 else "cake"
     result = dict(
         row=name,
         T=inputs.num_queries,
@@ -1025,6 +1436,9 @@ def measure_row(name, inputs, arms, args):
         top_k=inputs.top_k,
         ratio=inputs.ratio,
         reps=reps,
+        form="fp8" if fp8 else "bf16",
+        anchor=anchor,
+        unavailable=unavailable,
         arms={},
     )
     samples = {a: {"AB": [], "BA": [], "IL": []} for a in prepared}
@@ -1038,7 +1452,7 @@ def measure_row(name, inputs, arms, args):
             samples[arm_name]["IL"].extend(gpu_times(prepared[arm_name], 1, 0))
     outputs = {}
     for arm_name, arm in prepared.items():
-        out = arm()
+        out = arm.finish(arm())
         torch.cuda.synchronize()
         outputs[arm_name] = (out[0].clone(), out[1].clone())
         every = (
@@ -1051,14 +1465,20 @@ def measure_row(name, inputs, arms, args):
             wall_ms=wall_ms(arm, min(reps, 5)),
             peak_extra_bytes=peak_extra_bytes(arm),
             workspace_bytes=arm.workspace_bytes,
-            structure_failures=ref.structure_failures(inputs, *outputs[arm_name])[:3],
+            structure_failures=ref.structure_failures(
+                arm_inputs[arm_name], *outputs[arm_name]
+            )[:3],
         )
         record["gpu_ms"]["all"] = statistics.median(every)
         record["digest"] = result_digest(outputs[arm_name])
+        if isinstance(arm, DeepGemmArm):
+            record["logits_copied"] = arm.logits_copied
         if isinstance(arm, CakeArm):
             record["plan"] = arm.plan
             record["knobs"] = arm.knobs
             record["policy_overrides"] = arm.policy
+            record["fp8_kind_fallback_overrides"] = arm.fp8_fallback
+            record["fp8_hidden_kinds"] = arm.fp8_hidden
             record["package"] = (
                 "main" if arm.backend is not cake_backend else "candidate"
             )
@@ -1068,27 +1488,27 @@ def measure_row(name, inputs, arms, args):
         f"{a}|{b}": ref.same_bits(outputs[a], outputs[b])
         for a, b in itertools.combinations(outputs, 2)
     }
-    cake_pairs = [
-        key
-        for key in result["same_bits"]
-        if all(part.startswith("cake") for part in key.split("|"))
-    ]
+    # the cake arms of one form agree bitwise; the FP8 form's bits are not the BF16 form's
+    cake_pairs = [key for key in result["same_bits"] if _cake_pair(key)]
     result["all_cake_arms_identical"] = (
         all(result["same_bits"][key] for key in cake_pairs) if cake_pairs else None
     )
-    if "cake" in outputs:
+    if anchor in outputs:
         for arm_name, out in outputs.items():
-            if arm_name != "cake":
-                same = (out[0] == outputs["cake"][0]).all(dim=1)
+            if arm_name != anchor:
+                same = (out[0] == outputs[anchor][0]).all(dim=1)
                 result["arms"][arm_name]["rows_identical_to_cake"] = int(same.sum())
                 result["arms"][arm_name]["speedup_of_cake"] = (
                     result["arms"][arm_name]["gpu_ms"]["all"]
-                    / result["arms"]["cake"]["gpu_ms"]["all"]
+                    / result["arms"][anchor]["gpu_ms"]["all"]
                 )
     if args.verify:
-        reference = ref.select_reference(inputs)
+        references = {}
         for arm_name, out in outputs.items():
-            verdict = ref.judge(out, reference)
+            data = arm_inputs[arm_name]
+            if id(data) not in references:
+                references[id(data)] = ref.select_reference(data)
+            verdict = ref.judge(out, references[id(data)])
             result["arms"][arm_name]["verdict"] = str(verdict).splitlines()[0]
     if (
         len(row["seg_q"]) == 1
@@ -1101,6 +1521,12 @@ def measure_row(name, inputs, arms, args):
     return result
 
 
+def _cake_pair(key: str) -> bool:
+    """``a|b`` names two cake arms of one form."""
+    a, b = key.split("|")
+    return a.startswith("cake") and b.startswith("cake") and arm_form(a) == arm_form(b)
+
+
 def print_row(result):
     for arm_name, rec in result["arms"].items():
         gpu = rec["gpu_ms"]
@@ -1110,7 +1536,7 @@ def print_row(result):
             else f" workspace {rec['workspace_bytes'] / 2**20:.1f} MiB"
         )
         speed = (
-            f" x{rec['speedup_of_cake']:.2f} vs cake"
+            f" x{rec['speedup_of_cake']:.2f} vs {result.get('anchor', 'cake')}"
             if "speedup_of_cake" in rec
             else ""
         )
@@ -1130,9 +1556,7 @@ def print_row(result):
             f"  [{result['row']}] coarse-only GB200 reference latency quoted by the request: {result['reference_gb200_ms']} ms"
         )
     same = result.get("same_bits", {})
-    cake_pairs = [
-        key for key in same if all(p.startswith("cake") for p in key.split("|"))
-    ]
+    cake_pairs = [key for key in same if _cake_pair(key)]
     if cake_pairs:
         identical = sum(same[key] for key in cake_pairs)
         differing = [key for key, v in same.items() if not v]
@@ -1148,15 +1572,21 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
+        "--form",
+        choices=FORMS,
+        default="bf16",
+        help="input form: bf16 (default) or fp8 (float8_e4m3fn q / k with per-key scales; see the module docstring)",
+    )
+    parser.add_argument(
         "--rows",
         nargs="*",
-        default=DEFAULT_ROWS,
-        help=f"rows to measure (default: all regression rows, iid and sink; the group names iid / sink / all expand; also {', '.join(n for n in ROWS if n.startswith('smoke'))})",
+        default=None,
+        help=f"rows to measure (default: all regression rows, iid and sink, with --form bf16; the fp8 group with --form fp8; the group names iid / sink / pool / all / fp8 expand; also {', '.join(n for n in ROWS if n.startswith('smoke'))})",
     )
     parser.add_argument(
         "--arms",
-        default="cake,chunked_pipeline,materialized_fp32",
-        help="comma-separated arms in AB order",
+        default=None,
+        help=f"comma-separated arms in AB order (default: {DEFAULT_ARMS['bf16']} with --form bf16, {DEFAULT_ARMS['fp8']} with --form fp8)",
     )
     parser.add_argument(
         "--reps",
@@ -1191,14 +1621,25 @@ def main():
     TIMER["required"] = bool(args.cupti_required)
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
+    fp8 = args.form == "fp8"
+    if fp8 and args.strided_k:
+        raise SystemExit(
+            "--strided-k measures the BF16 rows: the FP8 mode's BF16 and DeepGEMM arms take contiguous keys"
+        )
+    if args.rows is None:
+        args.rows = FP8_ROWS if fp8 else DEFAULT_ROWS
+    if args.arms is None:
+        args.arms = DEFAULT_ARMS[args.form]
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ARMS]
     if unknown:
         raise SystemExit(f"unknown arms {unknown}; known: {sorted(ARMS)}")
     if len(set(arms)) != len(arms):
         raise SystemExit(
-            f"an arm may be named once; use cake_aa / cake_far_aa / cake_main_aa / cake_floor16k_aa for an A/A pair: {arms}"
+            f"an arm may be named once; use cake_aa / cake_far_aa / cake_main_aa / cake_floor16k_aa / cake_fp8_aa for an A/A pair: {arms}"
         )
+    if not fp8 and any(arm_form(a) == "fp8" for a in arms):
+        raise SystemExit(f"the arms {list(FP8_ARMS)} need --form fp8")
     args.rows = expand_rows(args.rows)
     unknown_rows = [r for r in args.rows if r not in ROWS]
     if unknown_rows:
@@ -1240,17 +1681,34 @@ def main():
             "generated program not registered for this device: the cake arm is unavailable",
             flush=True,
         )
-    results = []
-    for name in args.rows:
-        inputs = build_inputs(name, device, args.strided_k)
+    if (
+        fp8
+        and not cake_backend.generated_program_available(
+            device, dtype=torch.float8_e4m3fn
+        )
+        and any(a.startswith("cake_fp8") for a in arms)
+    ):
         print(
-            f"[{name}] T={inputs.num_queries} Tkv={inputs.num_keys} segments={inputs.num_segments} top_k={inputs.top_k} ratio={inputs.ratio}: {ROWS[name]['note']}",
+            "generated FP8 programs not registered for this device: the cake_fp8 arms are unavailable",
             flush=True,
         )
-        result = measure_row(name, inputs, arms, args)
+    print(f"timing boundary: {TIMING_BOUNDARY}", flush=True)
+    results = []
+    for name in args.rows:
+        if fp8:
+            inputs = build_fp8_inputs(name, device, args.strided_k)
+            bf16_inputs = ref.dequantized_bf16(inputs)
+            bf16_inputs.label = name
+        else:
+            inputs, bf16_inputs = build_inputs(name, device, args.strided_k), None
+        print(
+            f"[{name}] T={inputs.num_queries} Tkv={inputs.num_keys} segments={inputs.num_segments} top_k={inputs.top_k} ratio={inputs.ratio} form={args.form}: {ROWS[name]['note']}",
+            flush=True,
+        )
+        result = measure_row(name, inputs, arms, args, bf16_inputs=bf16_inputs)
         print_row(result)
         results.append(result)
-        del inputs
+        del inputs, bf16_inputs
         torch.cuda.empty_cache()
     print(f"timer: {timer_record()}", flush=True)
     if args.json:
@@ -1267,6 +1725,8 @@ def main():
                     arms=arms,
                     warmup=args.warmup,
                     reps=args.reps,
+                    form=args.form,
+                    timing_boundary=TIMING_BOUNDARY,
                 ),
                 indent=1,
             )

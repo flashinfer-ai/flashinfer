@@ -44,11 +44,17 @@ The stages, in launch order: ``meta`` (the chunk and segment tables from
 ``cu_seqlens`` on the device), ``prep`` / ``prep_bf16beta`` (Q/K L2 norm, gate
 cumsum, FP32 beta), ``prep_tma`` / ``prep_tma_bf16beta`` (the same prep with
 the q / k tiles staged by TMA, one CTA per (chunk, key head); same bits),
-``wy_tc`` (the WY representation, tcgen05), the forward register scans
-``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the segment-parallel
-route; the serial and split scans serve the backward's recompute), ``stitch``
+``wy_tc`` (the WY representation, tcgen05), ``wy_tc2`` (the same chains and
+outputs in a five-CTA-per-SM form: a 64-column TMEM accumulator and packed
+lower-triangular operands), the forward
+register scans ``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the
+segment-parallel route; the serial and split scans serve the backward's
+recompute), ``stitch``
 (the segment stitch of both directions), ``fwd_ho`` (the forward scan and the
-output in one tcgen05 kernel), ``dv_local``, the adjoint register scans
+output in one tcgen05 kernel), ``fwd_ho_vh2`` (the same scan and output split
+over the two value halves, two CTAs per segment and value head; the same
+bits; on ``sm_107a`` record ``fwd_ho_vh2_sm_107a``, on ``sm_100a`` and
+``sm_103a``, which never run it, the ``fwd_ho`` program), ``dv_local``, the adjoint register scans
 ``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_pre_dvl_r64k1`` (the ``(64, 1)``
 pre-scan with the ``dv_local`` tiles of its chunks computed in the CTA),
 ``dhu_tc2`` (the serial adjoint scan with ``dv_local`` fused, tcgen05, TMA ring
@@ -59,12 +65,18 @@ and ``tail_g3`` / ``tail_g3_bf16`` (the same for a value-head group of three,
 a three-CTA cluster).  ``dhu_tc2_wavefront`` and ``tail_g2_bf16_wavefront``
 are the wavefront pair of ``dhu_tc2`` and ``tail_g2_bf16`` (the same math):
 the scan publishes a ready count per (chunk, value head) in ``ready`` after its
-``dh`` / ``dv2`` stores (one gpu fence per two chunks) and counts its CTAs in
-at entry, and the tail walks the chunks in the scan's ready order
-``tile_order`` and waits on each count before it reads them;
+``dh`` / ``dv2`` stores (one gpu fence per two chunks; on SM107 the
+``dhu_tc2_wavefront_sm_107a`` program, in the elected form below once per
+eight chunks) and counts its CTAs in at entry, and the tail walks the chunks
+in the scan's ready order ``tile_order`` and waits on each count before it
+reads them;
 ``tail_g2_bf16_wavefront`` also exports ``wait_geq`` (``cuStreamWaitValue32``
 on the entry count, the record's ``wait_entry``), which the chain enqueues on
-the side stream before the tail.
+the side stream before the tail.  ``dhu_tc2_wavefront_split`` is the scan a
+split plan pairs with the tail: on SM100 / SM103 its store warps release the
+counts in an elected form (one thread fences and adds 64 to each word, once
+per four chunks); on SM107 it is the per-thread program of SM100 / SM103's
+``dhu_tc2_wavefront``.
 Every other launch is a
 plain stream-ordered launch: nothing cooperative, no PDL (the chain may put
 two launches of one stage on two streams, each over its own sequences).
@@ -91,6 +103,7 @@ STAGES = (
     "prep_tma",
     "prep_tma_bf16beta",
     "wy_tc",
+    "wy_tc2",
     "fwd_h_r32k2",
     "fwd_h_r32k1",
     "fwd_h_r64k1",
@@ -100,6 +113,7 @@ STAGES = (
     "fwd_h_r64k1_split",
     "stitch",
     "fwd_ho",
+    "fwd_ho_vh2",
     "dv_local",
     "dhu_r32k2",
     "dhu_r32k1",
@@ -109,6 +123,7 @@ STAGES = (
     "dhu_pre_dvl_r64k1",
     "dhu_tc2",
     "dhu_tc2_wavefront",
+    "dhu_tc2_wavefront_split",
     "dqkwg",
     "wy_bwd",
     "wy_bwd_bf16",
@@ -332,6 +347,68 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_det_train_fffbca00fed25d191c1b",
         "stage": "wy_tc",
+    },
+    "wy_tc2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "kn"],
+            ["buffer", "v"],
+            ["buffer", "g_cs"],
+            ["buffer", "beta"],
+            ["buffer", "A_out"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "recompute"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_969371cd5760127281dd",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 41600,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_969371cd5760127281dd",
+        "stage": "wy_tc2",
+    },
+    "wy_tc2_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "kn"],
+            ["buffer", "v"],
+            ["buffer", "g_cs"],
+            ["buffer", "beta"],
+            ["buffer", "A_out"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "recompute"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_969371cd5760127281dd",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 41600,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_969371cd5760127281dd",
+        "stage": "wy_tc2",
     },
     "fwd_h_r32k2": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -675,6 +752,94 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_det_train_446adf6e2aa8ec228bc5",
         "stage": "fwd_ho",
+    },
+    "fwd_ho_vh2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "u_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "h0"],
+            ["buffer", "seg_start"],
+            ["buffer", "h_tma"],
+            ["buffer", "v_new_tma"],
+            ["buffer", "v_new"],
+            ["buffer", "o_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "final_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "walk"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "use_seg_start"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_446adf6e2aa8ec228bc5",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223488,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_446adf6e2aa8ec228bc5",
+        "stage": "fwd_ho_vh2",
+    },
+    "fwd_ho_vh2_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "u_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "h0"],
+            ["buffer", "seg_start"],
+            ["buffer", "h_tma"],
+            ["buffer", "v_new_tma"],
+            ["buffer", "v_new"],
+            ["buffer", "o_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "final_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "walk"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "use_seg_start"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_987a195ad34c5460d24d",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223488,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_987a195ad34c5460d24d",
+        "stage": "fwd_ho_vh2",
     },
     "dv_local": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -1023,7 +1188,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu_tc2",
     },
     "dhu_tc2_wavefront": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_100a", "sm_103a"],
         "arg_plan": [
             ["buffer", "qn_tma"],
             ["buffer", "kn_tma"],
@@ -1061,6 +1226,126 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_det_train_77231bf6aa5083c535df",
         "stage": "dhu_tc2_wavefront",
+    },
+    "dhu_tc2_wavefront_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_fd3cb776494be67d9e9b",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_fd3cb776494be67d9e9b",
+        "stage": "dhu_tc2_wavefront",
+    },
+    "dhu_tc2_wavefront_split": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_2cbd42650ff19da3a651",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_2cbd42650ff19da3a651",
+        "stage": "dhu_tc2_wavefront_split",
+    },
+    "dhu_tc2_wavefront_split_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_77231bf6aa5083c535df",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_77231bf6aa5083c535df",
+        "stage": "dhu_tc2_wavefront_split",
     },
     "dqkwg": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

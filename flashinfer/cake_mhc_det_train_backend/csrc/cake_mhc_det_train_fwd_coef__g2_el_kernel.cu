@@ -74,7 +74,7 @@ kernel_cake_mhc_det_train_fwd_coef__g2_el(float* __restrict__ spart, float* __re
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* sview = reinterpret_cast<float*>(smem_raw + 0);
     const int sview_addr = smem + 0;
     float* qview = reinterpret_cast<float*>(smem_raw + 24576);
@@ -201,7 +201,7 @@ kernel_cake_mhc_det_train_fwd_coef__g2_el(float* __restrict__ spart, float* __re
         #pragma unroll
         for (int j_1 = 0; j_1 < 2; j_1++) {
             tokr[j_1] = g * 8 + tin[j_1];
-            tcr[j_1] = (long long)(((tokr[j_1] < T) ? tokr[j_1] : T - 1));
+            tcr[j_1] = (long long)((tokr[j_1] < T) ? tokr[j_1] : T - 1);
             s_acc[j_1] = 0.0f;
         }
         if (p_k <= 16) {

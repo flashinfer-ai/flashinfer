@@ -132,9 +132,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--kernel-variant",
-        choices=("inference", "genphase"),
+        choices=("inference", "genphase", "auto"),
         default="inference",
-        help="SM107 or SM100 MXFP8 kernel composition; GenPhase capacity <= 1024",
+        help="kernel composition; auto compares eligible SM107 variants; "
+        "GenPhase capacity <= 1024",
     )
     parser.add_argument(
         "--gate-up-clamp",
@@ -198,7 +199,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--max-candidates",
         type=int,
         default=None,
-        help="truncate the candidate list (smoke testing)",
+        help="truncate the candidate list per variant (smoke testing)",
     )
     parser.add_argument(
         "--live-tokens",
@@ -255,6 +256,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def _argument_error(args: argparse.Namespace) -> Optional[str]:
     """Return an error for unsupported dtype-specific tuning options."""
+    if args.kernel_variant == "auto":
+        if args.arch not in ("auto", "sm107") or args.dtype not in (
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "mxfp4_mxfp8",
+            "mxfp4",
+        ):
+            return "--kernel-variant auto requires SM107 block-scaled quantization"
+        if args.warmup_iters < 1 or args.timed_iters < 1:
+            return "--warmup-iters and --timed-iters must be positive"
+        if args.max_candidates is not None and args.max_candidates < 1:
+            return "--max-candidates must be positive"
     is_mxfp4 = args.dtype == "sm90_mxfp4"
 
     if not is_mxfp4:
@@ -390,6 +404,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             backend = "bf16_mxfp8_bf16_cutedsl"
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
+
+    if args.kernel_variant == "auto" and family != "sm107":
+        print("--kernel-variant auto requires SM107", file=sys.stderr)
+        return 2
 
     next_standard = args.implementation == "next"
     if next_standard and (

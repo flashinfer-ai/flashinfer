@@ -49,29 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_Q_PIPE_STAGES 1
-#define NUM_KV_PIPE_STAGES 3
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 24576
-#define SMEM_SMEM_Q_STRIDE 24576
-#define SMEM_SMEM_W_OFF 25600
-#define SMEM_SMEM_W_STAGE_BYTES 768
-#define SMEM_SMEM_W_STRIDE 1024
-#define SMEM_SMEM_KV_G0_OFF 26624
-#define SMEM_SMEM_KV_G0_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G0_STRIDE 8192
-#define SMEM_SMEM_KV_G1_OFF 51200
-#define SMEM_SMEM_KV_G1_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G1_STRIDE 8192
-#define SMEM_SMEM_SC_G0_OFF 75776
-#define SMEM_SMEM_SC_G0_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G0_STRIDE 1024
-#define SMEM_SMEM_SC_G1_OFF 78848
-#define SMEM_SMEM_SC_G1_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G1_STRIDE 1024
-#define SMEM_TOTAL 81920
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -169,7 +146,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 25600);
@@ -183,8 +160,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
     float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + 78848);
     const int smem_sc_g1_addr = smem + 78848;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[0..112)
+    // Mbarrier init (14 barriers at smem_raw[0..112))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -384,7 +360,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
                             : "r"(a_tile[0]), "r"(a_tile[1]), "r"(a_tile[2]), "r"(a_tile[3]), "r"(b_frag[0]), "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_0 = nt * 8 + b_row_lane;
@@ -394,7 +370,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_0)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[4]), "r"(a_tile[(4) + 1]), "r"(a_tile[(4) + 2]), "r"(a_tile[(4) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_1 = nt * 8 + b_row_lane;
@@ -404,7 +380,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[8]), "r"(a_tile[(8) + 1]), "r"(a_tile[(8) + 2]), "r"(a_tile[(8) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_2 = nt * 8 + b_row_lane;
@@ -414,7 +390,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_2)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[12]), "r"(a_tile[(12) + 1]), "r"(a_tile[(12) + 2]), "r"(a_tile[(12) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0 = w_atom[nt * 2];
@@ -454,7 +430,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_3)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
                             : "r"(a_tile[0]), "r"(a_tile[1]), "r"(a_tile[2]), "r"(a_tile[3]), "r"(b_frag[0]), "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_3_1 = 32 + nt_1 * 8 + b_row_lane;
@@ -464,7 +440,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_3_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[4]), "r"(a_tile[(4) + 1]), "r"(a_tile[(4) + 2]), "r"(a_tile[(4) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_4 = 32 + nt_1 * 8 + b_row_lane;
@@ -474,7 +450,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_4)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[8]), "r"(a_tile[(8) + 1]), "r"(a_tile[(8) + 2]), "r"(a_tile[(8) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_5 = 32 + nt_1 * 8 + b_row_lane;
@@ -484,7 +460,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_5)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[12]), "r"(a_tile[(12) + 1]), "r"(a_tile[(12) + 2]), "r"(a_tile[(12) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_1 = w_atom[(4 + nt_1) * 2];
@@ -524,7 +500,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_6)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
                             : "r"(a_tile[0]), "r"(a_tile[1]), "r"(a_tile[2]), "r"(a_tile[3]), "r"(b_frag[0]), "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_6_1 = 64 + nt_2 * 8 + b_row_lane;
@@ -534,7 +510,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_6_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[4]), "r"(a_tile[(4) + 1]), "r"(a_tile[(4) + 2]), "r"(a_tile[(4) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_7 = 64 + nt_2 * 8 + b_row_lane;
@@ -544,7 +520,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_7)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[8]), "r"(a_tile[(8) + 1]), "r"(a_tile[(8) + 2]), "r"(a_tile[(8) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_8 = 64 + nt_2 * 8 + b_row_lane;
@@ -554,7 +530,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_8)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[12]), "r"(a_tile[(12) + 1]), "r"(a_tile[(12) + 2]), "r"(a_tile[(12) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_2 = w_atom[(8 + nt_2) * 2];
@@ -594,7 +570,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_9)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
                             : "r"(a_tile[0]), "r"(a_tile[1]), "r"(a_tile[2]), "r"(a_tile[3]), "r"(b_frag[0]), "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_9_1 = 96 + nt_3 * 8 + b_row_lane;
@@ -604,7 +580,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_9_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[4]), "r"(a_tile[(4) + 1]), "r"(a_tile[(4) + 2]), "r"(a_tile[(4) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_10 = 96 + nt_3 * 8 + b_row_lane;
@@ -614,7 +590,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_10)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[8]), "r"(a_tile[(8) + 1]), "r"(a_tile[(8) + 2]), "r"(a_tile[(8) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_11 = 96 + nt_3 * 8 + b_row_lane;
@@ -624,7 +600,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_11)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[12]), "r"(a_tile[(12) + 1]), "r"(a_tile[(12) + 2]), "r"(a_tile[(12) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_3 = w_atom[(12 + nt_3) * 2];
@@ -664,7 +640,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_12)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
                             : "r"(a_tile[0]), "r"(a_tile[1]), "r"(a_tile[2]), "r"(a_tile[3]), "r"(b_frag[0]), "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_12_1 = 128 + nt_4 * 8 + b_row_lane;
@@ -674,7 +650,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_12_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[4]), "r"(a_tile[(4) + 1]), "r"(a_tile[(4) + 2]), "r"(a_tile[(4) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_13 = 128 + nt_4 * 8 + b_row_lane;
@@ -684,7 +660,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_13)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[8]), "r"(a_tile[(8) + 1]), "r"(a_tile[(8) + 2]), "r"(a_tile[(8) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_14 = 128 + nt_4 * 8 + b_row_lane;
@@ -694,7 +670,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_14)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[12]), "r"(a_tile[(12) + 1]), "r"(a_tile[(12) + 2]), "r"(a_tile[(12) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_4 = w_atom[(16 + nt_4) * 2];
@@ -734,7 +710,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_15)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
                             : "r"(a_tile[0]), "r"(a_tile[1]), "r"(a_tile[2]), "r"(a_tile[3]), "r"(b_frag[0]), "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_15_1 = 160 + nt_5 * 8 + b_row_lane;
@@ -744,7 +720,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_15_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[4]), "r"(a_tile[(4) + 1]), "r"(a_tile[(4) + 2]), "r"(a_tile[(4) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_16 = 160 + nt_5 * 8 + b_row_lane;
@@ -754,7 +730,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_16)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[8]), "r"(a_tile[(8) + 1]), "r"(a_tile[(8) + 2]), "r"(a_tile[(8) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_17 = 160 + nt_5 * 8 + b_row_lane;
@@ -764,7 +740,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag[0]), "=r"(b_frag[1])
                             : "r"(b_addr_17)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
                             : "r"(a_tile[12]), "r"(a_tile[(12) + 1]), "r"(a_tile[(12) + 2]), "r"(a_tile[(12) + 3]), "r"(b_frag[0]), "r"(b_frag[1]), "r"((uint32_t)(fp8_unit_sfa_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_5 = w_atom[(20 + nt_5) * 2];
@@ -961,7 +937,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_18)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
                             : "r"(a_tile_1[0]), "r"(a_tile_1[1]), "r"(a_tile_1[2]), "r"(a_tile_1[3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_18_1 = nt_6 * 8 + b_row_lane_1;
@@ -971,7 +947,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_18_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[4]), "r"(a_tile_1[(4) + 1]), "r"(a_tile_1[(4) + 2]), "r"(a_tile_1[(4) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_19 = nt_6 * 8 + b_row_lane_1;
@@ -981,7 +957,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_19)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[8]), "r"(a_tile_1[(8) + 1]), "r"(a_tile_1[(8) + 2]), "r"(a_tile_1[(8) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_20 = nt_6 * 8 + b_row_lane_1;
@@ -991,7 +967,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_20)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[12]), "r"(a_tile_1[(12) + 1]), "r"(a_tile_1[(12) + 2]), "r"(a_tile_1[(12) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_6 = w_atom_1[nt_6 * 2];
@@ -1031,7 +1007,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_21)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
                             : "r"(a_tile_1[0]), "r"(a_tile_1[1]), "r"(a_tile_1[2]), "r"(a_tile_1[3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_21_1 = 32 + nt_7 * 8 + b_row_lane_1;
@@ -1041,7 +1017,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_21_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[4]), "r"(a_tile_1[(4) + 1]), "r"(a_tile_1[(4) + 2]), "r"(a_tile_1[(4) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_22 = 32 + nt_7 * 8 + b_row_lane_1;
@@ -1051,7 +1027,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_22)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[8]), "r"(a_tile_1[(8) + 1]), "r"(a_tile_1[(8) + 2]), "r"(a_tile_1[(8) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_23 = 32 + nt_7 * 8 + b_row_lane_1;
@@ -1061,7 +1037,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_23)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[12]), "r"(a_tile_1[(12) + 1]), "r"(a_tile_1[(12) + 2]), "r"(a_tile_1[(12) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_7 = w_atom_1[(4 + nt_7) * 2];
@@ -1101,7 +1077,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_24)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
                             : "r"(a_tile_1[0]), "r"(a_tile_1[1]), "r"(a_tile_1[2]), "r"(a_tile_1[3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_24_1 = 64 + nt_8 * 8 + b_row_lane_1;
@@ -1111,7 +1087,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_24_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[4]), "r"(a_tile_1[(4) + 1]), "r"(a_tile_1[(4) + 2]), "r"(a_tile_1[(4) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_25 = 64 + nt_8 * 8 + b_row_lane_1;
@@ -1121,7 +1097,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_25)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[8]), "r"(a_tile_1[(8) + 1]), "r"(a_tile_1[(8) + 2]), "r"(a_tile_1[(8) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_26 = 64 + nt_8 * 8 + b_row_lane_1;
@@ -1131,7 +1107,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_26)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[12]), "r"(a_tile_1[(12) + 1]), "r"(a_tile_1[(12) + 2]), "r"(a_tile_1[(12) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_8 = w_atom_1[(8 + nt_8) * 2];
@@ -1171,7 +1147,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_27)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
                             : "r"(a_tile_1[0]), "r"(a_tile_1[1]), "r"(a_tile_1[2]), "r"(a_tile_1[3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_27_1 = 96 + nt_9 * 8 + b_row_lane_1;
@@ -1181,7 +1157,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_27_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[4]), "r"(a_tile_1[(4) + 1]), "r"(a_tile_1[(4) + 2]), "r"(a_tile_1[(4) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_28 = 96 + nt_9 * 8 + b_row_lane_1;
@@ -1191,7 +1167,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_28)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[8]), "r"(a_tile_1[(8) + 1]), "r"(a_tile_1[(8) + 2]), "r"(a_tile_1[(8) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_29 = 96 + nt_9 * 8 + b_row_lane_1;
@@ -1201,7 +1177,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_29)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[12]), "r"(a_tile_1[(12) + 1]), "r"(a_tile_1[(12) + 2]), "r"(a_tile_1[(12) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_9 = w_atom_1[(12 + nt_9) * 2];
@@ -1241,7 +1217,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_30)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
                             : "r"(a_tile_1[0]), "r"(a_tile_1[1]), "r"(a_tile_1[2]), "r"(a_tile_1[3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_30_1 = 128 + nt_10 * 8 + b_row_lane_1;
@@ -1251,7 +1227,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_30_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[4]), "r"(a_tile_1[(4) + 1]), "r"(a_tile_1[(4) + 2]), "r"(a_tile_1[(4) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_31 = 128 + nt_10 * 8 + b_row_lane_1;
@@ -1261,7 +1237,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_31)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[8]), "r"(a_tile_1[(8) + 1]), "r"(a_tile_1[(8) + 2]), "r"(a_tile_1[(8) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_32 = 128 + nt_10 * 8 + b_row_lane_1;
@@ -1271,7 +1247,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_32)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[12]), "r"(a_tile_1[(12) + 1]), "r"(a_tile_1[(12) + 2]), "r"(a_tile_1[(12) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_10 = w_atom_1[(16 + nt_10) * 2];
@@ -1311,7 +1287,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_33)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
                             : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
                             : "r"(a_tile_1[0]), "r"(a_tile_1[1]), "r"(a_tile_1[2]), "r"(a_tile_1[3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_33_1 = 160 + nt_11 * 8 + b_row_lane_1;
@@ -1321,7 +1297,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_33_1)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[4]), "r"(a_tile_1[(4) + 1]), "r"(a_tile_1[(4) + 2]), "r"(a_tile_1[(4) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_34 = 160 + nt_11 * 8 + b_row_lane_1;
@@ -1331,7 +1307,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_34)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[8]), "r"(a_tile_1[(8) + 1]), "r"(a_tile_1[(8) + 2]), "r"(a_tile_1[(8) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         int b_row_35 = 160 + nt_11 * 8 + b_row_lane_1;
@@ -1341,7 +1317,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_408270167d849f991040(const __grid_co
                             : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
                             : "r"(b_addr_35)
                             : "memory");
-                        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                             : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
                             : "r"(a_tile_1[12]), "r"(a_tile_1[(12) + 1]), "r"(a_tile_1[(12) + 2]), "r"(a_tile_1[(12) + 3]), "r"(b_frag_1[0]), "r"(b_frag_1[1]), "r"((uint32_t)(fp8_unit_sfa_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_g0_1[0])), "h"((uint16_t)0), "h"((uint16_t)0));
                         float w0_11 = w_atom_1[(20 + nt_11) * 2];

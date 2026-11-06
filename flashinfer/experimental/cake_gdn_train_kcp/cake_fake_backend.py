@@ -30,6 +30,8 @@ size 64, head dimension 128, value head ``hv`` reads Q/K head ``hv // (HV // H_q
   #2 kcp_fwdh        per chunk: h_tape = bf16(h); b_v = u - W bf16(h); v_new = bf16(b_v); h = gamma h + K^T bf16(rowscale b_v)
   #3 kcp_transfer    per chunk: V = [u -] W M; M = gamma M + K^T (rowscale V)   (FP32: the TF32x3 class of the kernel)
   #4 kcp_affine_merge X <- Mop_e X + C_e along a chain (FP32), states published through the chain tables
+  #2 kcp_fwdh_out    #2 without tapes and final states, with #5 on each walked chunk: o = bf16(qscale (q bf16(h)) + Aqk bf16(b_v))
+  #2 kcp_fwdh_out_tape kcp_fwdh_out that also writes the h / v_new tapes as #2 tape does (= #2 tape + #5)
   #5 fwd_o           o = bf16(qscale (q h_tape) + Aqk v_new)
   #6 bwd_prep        do_g = bf16(qscale do); dv_intra = bf16(Aqk^T do)
   #7 kcp_dhu         per chunk (reverse): dh_tape = bf16(dh); b_dv = dv_intra + rowscale (K bf16(dh)); dv_new = bf16(b_dv)
@@ -47,6 +49,8 @@ emulations are bitwise the device ones in the norm and the pullback, and inherit
   bwd_dqkg_l2n      #8 on (q, k) = (qn, kn), the FP32 group sums through l2n_pullback(q_raw, q_rstd, .) before the
                     one BF16 rounding of dq / dk
   qk_apply          qn = bf16(q_raw * q_rstd), kn likewise, per real chunk
+  fwd_prep_replay_l2n  fwd_prep_l2n reading the given BF16 ``akk`` (the forward's tape, never written) in place of
+                    the block inverse: w / u from it, every other output as fwd_prep_l2n (save_mode="light_akk")
 
 ``group_reduce = 0`` (the host form): #8 writes the FP32 per-value-head partials ``dq_part`` / ``dk_part`` ``[T, HV,
 128]`` instead of ``dq`` / ``dk`` (the host sums them in head order and rounds once).
@@ -169,7 +173,10 @@ def _decay(G: torch.Tensor) -> torch.Tensor:
 # #1 fwd_prep
 
 
-def fwd_prep(values: Mapping[str, Any]) -> None:
+def fwd_prep(values: Mapping[str, Any], *, akk_in: bool = False) -> None:
+    """#1.  ``akk_in``: the solve-free replay (``fwd_prep_replay_l2n``'s body): ``akk`` is the forward's BF16 tape,
+    read in place of the block inverse and never written; every other output as #1 (``w`` / ``u`` are products of
+    the same BF16 ``Akk``, so they are #1's bit for bit)."""
     q, k, v, g, beta = (values[n] for n in ("q", "k", "v", "g", "beta"))
     HV, _H_qk, r = _group(values)
     scale = float(values["scale"])
@@ -194,14 +201,17 @@ def fwd_prep(values: Mapping[str, Any]) -> None:
             kk, qq = f32(k[tok, hq]), f32(q[tok, hq])  # [L, 128]
             D = _decay(G[:, hv])  # e^{G_i - G_j}, i >= j
             KK = mm(kk, kk.transpose(0, 1))
-            A_pre = (bet[:, hv][:, None] * KK * D).tril(
-                -1
-            )  # strictly lower: beta_i e^{G_i - G_j} k_i . k_j
-            Ainv = torch.linalg.solve_triangular(
-                eye[:L, :L] + A_pre, eye[:L, :L], upper=False, unitriangular=True
-            )  # FP32 block inverse
-            A_b = bf16(Ainv)  # ROUND #1: Akk tape
-            akk[rows, hv, :L] = A_b
+            if akk_in:
+                A_b = akk[rows, hv, :L]  # the forward's BF16 Akk tape (read only)
+            else:
+                A_pre = (bet[:, hv][:, None] * KK * D).tril(
+                    -1
+                )  # strictly lower: beta_i e^{G_i - G_j} k_i . k_j
+                Ainv = torch.linalg.solve_triangular(
+                    eye[:L, :L] + A_pre, eye[:L, :L], upper=False, unitriangular=True
+                )  # FP32 block inverse
+                A_b = bf16(Ainv)  # ROUND #1: Akk tape
+                akk[rows, hv, :L] = A_b
             kb = bf16(
                 kk * (bet[:, hv] * G[:, hv].exp())[:, None]
             )  # ROUND: MMA operand beta e^G k (FLA b_kb)
@@ -231,13 +241,20 @@ def _walk_io(values: Mapping[str, Any], prefix: str):
     )
 
 
-def kcp_fwdh(values: Mapping[str, Any], *, tape: bool) -> None:
+def kcp_fwdh(values: Mapping[str, Any], *, tape: bool, fused_o: bool = False) -> None:
+    """#2 over the listed segments.  ``tape``: the h / v_new tapes; ``fused_o`` (``kcp_fwdh_out``): no final-state
+    pool, #5's output rows of every walked chunk from the same h and v_new (the operands #5 reads from the tapes, so
+    ``o`` is #2 tape + #5 bitwise); both (``kcp_fwdh_out_tape``): the tapes and the output rows."""
     k, w, u, rowscale, gamma = (values[n] for n in ("k", "w", "u", "rowscale", "gamma"))
     HV, _H_qk, r = _group(values)
     bos_t, len_t = _ints(values["chunk_bos"]), _ints(values["chunk_len"])
     stride = int(values["tile_stride"])
     h0, h0_index, h0_hg, h0_n = _walk_io(values, "h0")
-    out, out_index, out_hg, out_n = _walk_io(values, "out")
+    if fused_o:
+        q, aqk, qscale, o = (values[n] for n in ("q", "aqk", "qscale", "o"))
+        out_index = [-1] * len(_ints(values["seg_chunk_start"]))
+    else:
+        out, out_index, out_hg, out_n = _walk_io(values, "out")
     h_tape, v_new = values.get("h_tape"), values.get("v_new")
     for seg in _ints(values["walk_seg"]):
         for hv in range(HV):
@@ -257,6 +274,12 @@ def kcp_fwdh(values: Mapping[str, Any], *, tape: bool) -> None:
                 b_v = f32(u[rows, hv]) - mm(w[rows, hv], hb)  # FP32
                 if tape:
                     v_new[rows, hv] = bf16(b_v)  # ROUND #2: v_new tape
+                if fused_o:
+                    # #5 on this chunk's h / v_new operands (fwd_o's expression)
+                    v_op = bf16(b_v)  # ROUND #2: the v_new operand
+                    acc = qscale[rows, hv][:, None] * mm(q[tok, hq], hb)
+                    acc = acc + mm(aqk[rows, hv, :L], v_op)
+                    o[tok, hv] = bf16(acc)  # ROUND #5: out
                 kop = bf16(
                     rowscale[rows, hv][:, None] * b_v
                 )  # ROUND #2: K-side operand bf16(rowscale b_v)
@@ -580,9 +603,9 @@ def _rstd_rows(x: torch.Tensor, T: int, heads: int, tstride: int) -> torch.Tenso
     return x.as_strided((T, heads), (tstride, 1), x.storage_offset())
 
 
-def fwd_prep_l2n(values: Mapping[str, Any]) -> None:
+def fwd_prep_l2n(values: Mapping[str, Any], *, akk_in: bool = False) -> None:
     """#1_l2n: ``qn`` / ``kn`` / ``q_rstd`` / ``k_rstd`` of the real chunks' tokens (:func:`.cake_l2n.qk_l2norm_ref`),
-    then #1 on ``(qn, kn)``."""
+    then #1 on ``(qn, kn)``.  ``akk_in``: ``fwd_prep_replay_l2n`` (#1 reads the given ``akk``, :func:`fwd_prep`)."""
     q, k, qn, kn = (values[n] for n in ("q", "k", "qn", "kn"))
     _HV, H_qk, _r = _group(values)
     T, ts = q.shape[0], int(values["rstd_tstride"])
@@ -594,7 +617,7 @@ def fwd_prep_l2n(values: Mapping[str, Any]) -> None:
             hat, rr = cake_l2n.qk_l2norm_ref(x[tok])
             xn[tok] = hat
             xr[tok] = rr
-    fwd_prep({**values, "q": qn, "k": kn})
+    fwd_prep({**values, "q": qn, "k": kn}, akk_in=akk_in)
 
 
 def qk_apply(values: Mapping[str, Any]) -> None:
@@ -695,6 +718,8 @@ def run_module(
     program = record["program"]
     if program == "fwd_prep_l2n":
         fwd_prep_l2n(values)
+    elif program == "fwd_prep_replay_l2n":
+        fwd_prep_l2n(values, akk_in=True)
     elif program == "bwd_dqkg_l2n":
         bwd_dqkg(values, l2n=True)
     elif program == "qk_apply":
@@ -705,6 +730,10 @@ def run_module(
         kcp_fwdh(values, tape=False)
     elif program == "kcp_fwdh_tape":
         kcp_fwdh(values, tape=True)
+    elif program == "kcp_fwdh_out":
+        kcp_fwdh(values, tape=False, fused_o=True)
+    elif program == "kcp_fwdh_out_tape":
+        kcp_fwdh(values, tape=True, fused_o=True)
     elif program == "kcp_transfer_walk":
         kcp_transfer_walk(values)
     elif program == "kcp_affine_merge":

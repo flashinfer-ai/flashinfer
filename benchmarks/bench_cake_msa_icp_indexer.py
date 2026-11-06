@@ -35,14 +35,20 @@ init 0 / local 1 forced blocks, max_model_len 172032).  Rows:
 ``--roles`` adds one row per kernel (score / publish / merge, plan / score /
 select / merge) next to each chain.  ``--fused`` times the FI decode chain with
 the fused scorer-publisher (an option; the default is the score plane and the
-select publish).
+select publish).  ``--fused-prefill`` adds the arm ``fused``: the FI chain
+whose prefill chunks run the fused list scorer and list-to-carrier merge (one
+pool, no score rows; per-kernel rows plan / score_select / merge), next to the
+materialized FI chain and the MSA path.  ``--prefixes``, ``--chunk-tokens`` and
+``--ranks`` choose the prefill rows' history lengths, chunk size and timed
+rank (the tails of a rank's shard depend on it).
 
 Baseline ("MSA path"): vLLM's MiniMax-M3 CuTe DSL decode scorer (with
 ``prefetch_history``), the MSA sharded-indexer kernels of
 ``vllm.third_party.fmha_sm100`` (device plan, prefill scorer, prefill select,
 decode select-and-publish) and vLLM's Triton merge, called as vLLM's indexer
 calls them.  Both arms run on the same inputs, GPU and process, in alternating
-sessions (MSA-FI-FI-MSA, then FI-MSA-MSA-FI, ``--groups`` times).  A session is
+sessions (MSA-FI-FI-MSA, then FI-MSA-MSA-FI, ``--groups`` times; with the fused
+arm MSA-FI-fused-fused-FI-MSA and its reverse).  A session is
 ``bench_gpu_time`` with CUPTI (install ``cupti-python``; without it the
 timer falls back to CUDA events and the caption says so) and a cold L2
 (``--iters`` steady samples after ``--warmup``).  Each timed call replays one
@@ -78,6 +84,8 @@ from flashinfer.msa_ops import (
     msa_icp_index_score_sharded,
     msa_icp_index_score_sharded_plan_device,
     msa_icp_merge_candidates,
+    msa_icp_prefill_pool_bytes,
+    msa_icp_prefill_score_select,
     msa_icp_topk_select_prefill,
     msa_icp_topk_select_publish,
 )
@@ -388,33 +396,40 @@ class Decode:
 
 
 class Prefill:
-    """One 8192-token chunk of one request at ``prefix`` on rank 0."""
+    """One ``chunk``-token chunk of one request at ``prefix`` on ``rank``.
 
-    def __init__(self, world, page, prefix, part, device):
-        self.world, self.page, self.part = world, page, part
+    The arm ``fused`` (and ``fi`` with ``fused``) runs the fused prefill path:
+    the list scorer and the list-to-carrier merge in one pool (part
+    ``score_select``) instead of the scorer and the select."""
+
+    def __init__(
+        self, world, page, prefix, part, device, *, chunk=CHUNK, rank=0, fused=False
+    ):
+        self.world, self.page, self.part, self.chunk = world, page, part, chunk
+        self.rank, self.fused = rank, fused
         self.hpr = HEADS // world
-        kv = prefix + CHUNK
+        kv = prefix + chunk
         pages = (kv + page - 1) // page
-        self.q = _fp8((CHUNK, HEADS, DIM), device)
+        self.q = _fp8((chunk, HEADS, DIM), device)
         self.k = _fp8((pages, page // world, DIM), device)
         self.block_table = torch.randperm(pages, device=device, dtype=torch.int32).view(
             1, pages
         )
         i32 = dict(dtype=torch.int32, device=device)
         self.plan_args = (
-            torch.tensor([CHUNK], **i32),
+            torch.tensor([chunk], **i32),
             torch.tensor([kv], **i32),
-            torch.tensor([0, CHUNK], **i32),
+            torch.tensor([0, chunk], **i32),
             torch.tensor([0, kv], **i32),
             torch.tensor([prefix], **i32),
             HEADS,
         )
         storage = msa_icp_index_score_plan_storage(
-            num_qo_heads=HEADS, total_q=CHUNK, batch=1, device=device
+            num_qo_heads=HEADS, total_q=chunk, batch=1, device=device
         )
         self.plan_kwargs = dict(
-            total_q=CHUNK,
-            max_query_len=CHUNK,
+            total_q=chunk,
+            max_query_len=chunk,
             max_seq_len=kv,
             packed_work_range=torch.empty(
                 storage["work_range_numel"], dtype=torch.int64, device=device
@@ -427,24 +442,45 @@ class Prefill:
             ),
         )
         cols = (msa_icp_index_score_columns(kv, page) + 15) // 16 * 16
-        self.scores = torch.empty(CHUNK, HEADS, cols, device=device)
-        self.nvalid = ((prefix + torch.arange(CHUNK, device=device)) // 128 + 1).to(
+        self.scores = torch.empty(chunk, HEADS, cols, device=device)
+        self.pool = torch.empty(
+            msa_icp_prefill_pool_bytes(total_q=chunk, batch=1, device=device),
+            dtype=torch.uint8,
+            device=device,
+        )
+        self.nvalid = ((prefix + torch.arange(chunk, device=device)) // 128 + 1).to(
             torch.int32
         )
-        self.carrier = torch.zeros(HEADS, CHUNK, 2 * TOPK + 1, **i32)
-        self.output = torch.empty(CHUNK, self.hpr, TOPK, **i32)
+        self.carrier = torch.zeros(HEADS, chunk, 2 * TOPK + 1, **i32)
+        self.output = torch.empty(chunk, self.hpr, TOPK, **i32)
         self.errors = torch.zeros(1, **i32)
         self.index_scale = 2 if page == 256 else 1
+        self.index_offset = rank * 2 // world if page == 256 else 0
         self.plans = {}
+
+    def _is_fused(self, arm) -> bool:
+        return arm == "fused" or (arm == "fi" and self.fused)
+
+    def supports(self, arm) -> bool:
+        """The fused path has no score rows to select from; the materialized
+        paths have no list pool."""
+        if self.part == "score_select":
+            return self._is_fused(arm)
+        if self.part in ("score", "select"):
+            return not self._is_fused(arm)
+        return True
 
     def prepare(self, arm, ref) -> None:
         self.plans[arm] = self._plan(arm, ref)
         self.scores.uniform_(-4, 4)
-        self._select(arm, ref)
+        if self._is_fused(arm):
+            self._score_select(self.plans[arm])
+        else:
+            self._select(arm, ref)
         torch.cuda.synchronize()
 
     def _plan(self, arm, ref):
-        if arm == "fi":
+        if arm != "msa":
             return msa_icp_index_score_sharded_plan_device(
                 *self.plan_args, **self.plan_kwargs
             )
@@ -453,13 +489,13 @@ class Prefill:
         )
 
     def _score(self, arm, ref, plan):
-        if arm == "fi":
+        if arm != "msa":
             msa_icp_index_score_sharded(
                 self.q,
                 self.k,
                 self.block_table,
                 plan,
-                rank=0,
+                rank=self.rank,
                 max_score=self.scores,
                 initialize=False,
                 tp=self.world,
@@ -471,7 +507,7 @@ class Prefill:
                 self.k,
                 self.block_table,
                 plan,
-                rank=0,
+                rank=self.rank,
                 max_score=self.scores,
                 sm_scale=1.0,
                 initialize=False,
@@ -482,7 +518,7 @@ class Prefill:
     def _select(self, arm, ref):
         fn = (
             msa_icp_topk_select_prefill
-            if arm == "fi"
+            if arm != "msa"
             else ref["api"].sparse_topk_select_prefill
         )
         fn(
@@ -492,14 +528,30 @@ class Prefill:
             force_begin_blocks=INIT,
             force_end_blocks=LOCAL,
             index_scale=self.index_scale,
-            index_offset=0,
+            index_offset=self.index_offset,
+        )
+
+    def _score_select(self, plan):
+        msa_icp_prefill_score_select(
+            self.q,
+            self.k,
+            self.block_table,
+            plan,
+            self.nvalid,
+            self.pool,
+            self.carrier,
+            rank=self.rank,
+            tp=self.world,
+            compact=self.page == 256,
+            force_begin_blocks=INIT,
+            force_end_blocks=LOCAL,
         )
 
     def _merge(self, arm, ref):
-        received = self.carrier.view(self.world, self.hpr, CHUNK, 2 * TOPK + 1)
+        received = self.carrier.view(self.world, self.hpr, self.chunk, 2 * TOPK + 1)
         fn = (
             msa_icp_merge_candidates
-            if arm == "fi"
+            if arm != "msa"
             else ref["vd"].minimax_m3_index_merge_candidates
         )
         fn(
@@ -520,7 +572,12 @@ class Prefill:
             self._score(arm, ref, self.plans[arm])
         elif part == "select":
             self._select(arm, ref)
+        elif part == "score_select":
+            self._score_select(self.plans[arm])
         elif part == "merge":
+            self._merge(arm, ref)
+        elif self._is_fused(arm):  # fused chain
+            self._score_select(self._plan(arm, ref))
             self._merge(arm, ref)
         else:  # chain
             self._score(arm, ref, self._plan(arm, ref))
@@ -533,7 +590,11 @@ def rows(args, calls, device):
     decode_parts = ["chain"] + (
         ["score_publish", "merge"] if args.fused else ["score", "publish", "merge"]
     ) * args.roles
-    prefill_parts = ["chain"] + ["plan", "score", "select", "merge"] * args.roles
+    prefill_parts = ["chain"] + (
+        ["plan", "score", "select"]
+        + (["score_select"] if args.fused_prefill else [])
+        + ["merge"]
+    ) * args.roles
     if "decode" in args.rows:
         for shape in itertools.product(
             (2, 4), (128, 256), (1, 2, 4, 14), (1, 4), (8192, 163840, 172031)
@@ -554,13 +615,20 @@ def rows(args, calls, device):
 
                     yield f"decode TP{w} P{p} B{b} q{q} ctx{c} {protocol} {part}", make
     if "prefill" in args.rows:
-        for w, p, prefix in itertools.product(
-            (2, 4), (128, 256), (0, 32768, 81920, 155648)
+        for w, p, prefix, chunk, rank in itertools.product(
+            (2, 4), (128, 256), args.prefixes, args.chunk_tokens, args.ranks
         ):
+            if rank >= w:
+                continue
             for part in prefill_parts:
+                tag = (f" q{chunk}" if chunk != CHUNK else "") + (
+                    f" r{rank}" if rank else ""
+                )
                 yield (
-                    f"prefill TP{w} P{p} prefix{prefix} {part}",
-                    lambda a=(w, p, prefix, part): [Prefill(*a, device)],
+                    f"prefill TP{w} P{p} prefix{prefix}{tag} {part}",
+                    lambda a=(w, p, prefix, part), kw=dict(chunk=chunk, rank=rank): [
+                        Prefill(*a, device, **kw)
+                    ],
                 )
     if "mixed" in args.rows:
         for w, p, prefix in itertools.product((2, 4), (128, 256), (81920, 155648)):
@@ -679,7 +747,33 @@ def main() -> None:
         "--fused", action="store_true", help="FI decode with the fused scorer-publisher"
     )
     parser.add_argument(
-        "--arms", nargs="+", default=["msa", "fi"], choices=["msa", "fi"]
+        "--fused-prefill",
+        action="store_true",
+        help="add the arm 'fused': FI prefill chunks on the fused list scorer and list-to-carrier merge",
+    )
+    parser.add_argument(
+        "--prefixes",
+        nargs="+",
+        type=int,
+        default=[0, 32768, 81920, 155648],
+        help="prefill rows: history tokens before the chunk",
+    )
+    parser.add_argument(
+        "--chunk-tokens",
+        nargs="+",
+        type=int,
+        default=[CHUNK],
+        help="prefill rows: query tokens per chunk (at most 8192)",
+    )
+    parser.add_argument(
+        "--ranks",
+        nargs="+",
+        type=int,
+        default=[0],
+        help="prefill rows: the timed rank (ranks >= TP are skipped)",
+    )
+    parser.add_argument(
+        "--arms", nargs="+", default=["msa", "fi"], choices=["msa", "fi", "fused"]
     )
     parser.add_argument(
         "--eager",
@@ -693,9 +787,13 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=32)
     parser.add_argument("--json", help="write the results here")
     args = parser.parse_args()
+    if any(not 0 < c <= CHUNK for c in args.chunk_tokens):
+        parser.error(f"--chunk-tokens must be in [1, {CHUNK}]")
+    if args.fused_prefill and "fused" not in args.arms:
+        args.arms = [*args.arms, "fused"]
     device = torch.device("cuda", torch.cuda.current_device())
     ref = _reference()
-    arms = [a for a in args.arms if a == "fi" or ref is not None]
+    arms = [a for a in args.arms if a != "msa" or ref is not None]
     if "msa" in args.arms and ref is None:
         print(
             f"# {BASELINE} not importable (vllm.third_party.fmha_sm100, vLLM MiniMax-M3 ops): FI rows only"
@@ -712,14 +810,32 @@ def main() -> None:
         if args.only and not all(word in name.split() for word in args.only):
             continue
         state = {arm: make() for arm in arms}
+        # A decode part of the fused arm is the FI decode; a prefill part
+        # runs only the arms it applies to (no select without score rows).
+        kinds = {
+            arm: [
+                "fi" if arm == "fused" and not isinstance(part, Prefill) else arm
+                for part in state[arm]
+            ]
+            for arm in arms
+        }
+        # The fused arm differs from FI only in its prefill parts.
+        row_arms = [
+            arm
+            for arm in arms
+            if all(
+                getattr(part, "supports", lambda a: True)(arm) for part in state[arm]
+            )
+            and (arm != "fused" or any(isinstance(p, Prefill) for p in state[arm]))
+        ]
         fns = {}
-        for arm in arms:
-            for part in state[arm]:
-                part.prepare(arm, ref)
+        for arm in row_arms:
+            for part, kind in zip(state[arm], kinds[arm], strict=True):
+                part.prepare(kind, ref)
 
-            def fn(arm=arm, parts=state[arm]):
-                for part in parts:
-                    part.run(arm, ref)
+            def fn(parts=state[arm], kinds=kinds[arm]):
+                for part, kind in zip(parts, kinds, strict=True):
+                    part.run(kind, ref)
 
             fn()  # eager check call: builds and loads every kernel
             torch.cuda.synchronize()
@@ -732,25 +848,29 @@ def main() -> None:
         torch.cuda.synchronize()
         sessions = {arm: [] for arm in arms}
         for g in range(args.groups):
-            order = (
-                ["msa", "fi", "fi", "msa"] if g % 2 == 0 else ["fi", "msa", "msa", "fi"]
-            )
+            forward = [arm for arm in ("msa", "fi", "fused") if arm in fns]
+            order = forward + forward[::-1]
+            if g % 2:
+                order = order[::-1]
             for arm in order:
-                if arm in fns:
-                    sessions[arm].append(session_us(fns[arm], args.warmup, args.iters))
+                sessions[arm].append(session_us(fns[arm], args.warmup, args.iters))
         torch.cuda.synchronize()
         errors = {
-            arm: int(sum(int(p.errors.item()) for p in state[arm])) for arm in arms
+            arm: int(sum(int(p.errors.item()) for p in state[arm])) for arm in fns
         }
         if any(errors.values()):
             raise RuntimeError(f"{name}: protocol errors {errors}")
         row = {
             "row": name,
-            **{f"{arm}_us": statistics.median(sessions[arm]) for arm in arms},
-            "sessions": sessions,
+            **{f"{arm}_us": statistics.median(sessions[arm]) for arm in fns},
+            "sessions": {arm: sessions[arm] for arm in fns},
         }
-        if "msa" in arms and "fi" in arms:
+        if "msa" in fns and "fi" in fns:
             row["speedup"] = row["msa_us"] / row["fi_us"]
+        if "fused" in fns and "fi" in fns:
+            row["fused_vs_fi"] = row["fi_us"] / row["fused_us"]
+        if "fused" in fns and "msa" in fns:
+            row["fused_vs_msa"] = row["msa_us"] / row["fused_us"]
         results.append(row)
         print(json.dumps(row), flush=True)
         del state, fns
@@ -761,9 +881,25 @@ def main() -> None:
         f"CUDA {label['cuda']}; {timer}, {'eager launches' if args.eager else 'CUDA graph replay per call'}, cold L2, "
         f"median of {2 * args.groups} sessions x {args.iters} iterations"
         + ("; FI decode: fused scorer-publisher" if args.fused else "")
+        + (
+            "; fused: FI with the fused prefill list scorer and list-to-carrier merge"
+            if "fused" in arms
+            else ""
+        )
     )
     print(f"\n{caption}\n")
-    if "msa" in arms:
+    if "fused" in arms:
+        print(
+            f"| row | {BASELINE} (us) | FI (us) | FI fused (us) | FI / fused | {BASELINE} / fused |\n"
+            "|---|---:|---:|---:|---:|---:|"
+        )
+        for r in results:
+            cell = lambda k, f="{:.2f}": f.format(r[k]) if k in r else "-"  # noqa: E731
+            print(
+                f"| {r['row']} | {cell('msa_us')} | {cell('fi_us')} | {cell('fused_us')} "
+                f"| {cell('fused_vs_fi', '{:.3f}x')} | {cell('fused_vs_msa', '{:.3f}x')} |"
+            )
+    elif "msa" in arms:
         print(f"| row | {BASELINE} (us) | FI (us) | speedup |\n|---|---:|---:|---:|")
         for r in results:
             fi = f"{r['fi_us']:.2f}" if "fi_us" in r else "-"

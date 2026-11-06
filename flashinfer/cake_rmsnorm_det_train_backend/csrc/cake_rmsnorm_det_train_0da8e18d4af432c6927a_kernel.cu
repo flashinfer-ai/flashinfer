@@ -47,21 +47,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_PARTIALS_STRIDE 32
-#define SMEM_TOTAL 128
-#define THREADS 128
-#define ROWS_PER_CTA 1
-#define GROUP_THREADS 128
-#define LAUNCH_BOUNDS_THREADS 128
-
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(128) void
 kernel_cake_rmsnorm_det_train_0da8e18d4af432c6927a(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, float* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -82,21 +72,21 @@ kernel_cake_rmsnorm_det_train_0da8e18d4af432c6927a(__nv_bfloat16* __restrict__ x
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
     // === Task calls (declaration order) ===
     int warp_0 = warp;
-    int group = tid / GROUP_THREADS;
-    int gtid = tid - group * GROUP_THREADS;
+    int group = tid / 128;
+    int gtid = tid - group * 128;
     float h_f = 2048.0f;
     int it = 0;
     #pragma unroll 1
 #if __CUDA_ARCH__ == 1000
-    for (int row0 = bid * ROWS_PER_CTA; row0 < bid * ROWS_PER_CTA + 1; row0++) {
+    for (int row0 = bid * 1; row0 < bid * 1 + 1; row0++) {
 #else
-    for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
+    for (int row0 = bid * 1; row0 < T; row0 += num_bids * 1) {
 #endif
         int row = row0 + group;
         long long row64 = (long long)row;
@@ -119,7 +109,7 @@ kernel_cake_rmsnorm_det_train_0da8e18d4af432c6927a(__nv_bfloat16* __restrict__ x
                     unsigned _ldv8_0_6;
                     unsigned _ldv8_0_7;
                     asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(w + (gtid * 8 + v * (GROUP_THREADS * 8)) + (0))) : "memory");
+                        : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(w + (gtid * 8 + v * (128 * 8)) + (0))) : "memory");
                     _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
                     _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
                     _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
@@ -139,7 +129,7 @@ kernel_cake_rmsnorm_det_train_0da8e18d4af432c6927a(__nv_bfloat16* __restrict__ x
             for (int v_1 = 0; v_1 < 2; v_1++) {
                 float _vec_load_1[8];
                 {
-                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(x + (xbase + (long long)(gtid * 8 + v_1 * (GROUP_THREADS * 8))) + 0);
+                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(x + (xbase + (long long)(gtid * 8 + v_1 * (128 * 8))) + 0);
                     uint4 _vld_1[1];
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -218,7 +208,7 @@ kernel_cake_rmsnorm_det_train_0da8e18d4af432c6927a(__nv_bfloat16* __restrict__ x
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 6], (x_cache + v_3 * 8)[_lp*2+1 + 6]));
                     packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_3 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(packed_1)[0];
+                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_3 * (128 * 8))))[0] = reinterpret_cast<int4*>(packed_1)[0];
             }
         }
     }

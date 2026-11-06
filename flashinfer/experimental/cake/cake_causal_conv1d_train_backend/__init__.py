@@ -90,6 +90,13 @@ Host design (the knobs are keywords; no environment variable):
   wraps after that many CTAs), so ``dx`` keeps its bits and more CTAs add into
   the same accumulators.  The workspace does not grow with it (one accumulator
   set and one counter per channel tile, whatever the grid).
+- Backward grid beside a concurrent kernel (FlashInfer issue #8365): on the
+  ``bwd`` and ``bwd_fp32g`` routes at ``bwd_grid_mult`` 1, a launch of exactly
+  ``ctas_per_sm x SM count`` CTAs whose last channel-tile rank holds at least
+  ``ctas_per_sm`` CTAs launches ``ctas_per_sm`` fewer (:func:`_one_sm_trim`),
+  so a kernel on another stream that keeps one SM's shared memory does not
+  push the top CTAs, each with a whole token stream, into a second wave.
+  ``dx`` keeps its bits (the partition is read from ``gridDim.x``, as above).
 - The forward workspace (int32 token-chunk counters) follows the det
   package's rules.
 - Host plan: the first call of a row (architecture, route, ``C``, device,
@@ -528,7 +535,8 @@ def _launch(
     channel-tile ranks; the scalars do not depend on the grid.  A backward
     record's plan takes the device's architecture ``arch`` and the record's
     route, so a row of ``cake_jit.TILE_OVERRIDES`` runs its narrower channel
-    tiles.
+    tiles.  At ``bwd_grid_mult`` 1 the grid is :func:`_one_sm_trim` of the
+    row's ``launch_grid``.
     """
 
     scalars = plan(
@@ -541,11 +549,53 @@ def _launch(
         route=_loader.record_route(record, arch),
     )
     if bwd_grid_mult == 1:
-        grid = launch_grid(record, device_index=device_index, C=C, S=S)
+        grid = _one_sm_trim(
+            record,
+            scalars["n_ch_tiles"],
+            launch_grid(record, device_index=device_index, C=C, S=S),
+            device_index=device_index,
+            arch=arch,
+            bwd_grid_mult=1,
+        )
     else:
         grid = (launch_grid(record, device_index=device_index)[0] * bwd_grid_mult, 1, 1)
     _check_tiles(C, scalars["n_ch_tiles"], grid)
     return scalars, grid
+
+
+# The backward routes whose single-wave grid gives up ``ctas_per_sm`` CTAs when its last channel-tile rank holds at
+# least that many (:func:`_one_sm_trim`, issue #8365); the other routes launch the grid of ``launch_grid``.
+_ONE_SM_TRIM_ROUTES: tuple[str, ...] = ("bwd", "bwd_fp32g")
+
+
+def _one_sm_trim(
+    record: dict,
+    n_ch_tiles: int,
+    grid: tuple[int, int, int],
+    *,
+    device_index: int,
+    arch: str,
+    bwd_grid_mult: int,
+) -> tuple[int, int, int]:
+    """``grid`` less ``ctas_per_sm`` CTAs for a backward of a route of ``_ONE_SM_TRIM_ROUTES`` at ``bwd_grid_mult``
+    1 when ``grid`` is the record's untrimmed single wave (``ctas_per_sm x SM count``, ``grid_mult`` 1) and its last
+    channel-tile rank holds at least ``ctas_per_sm`` CTAs (``grid % n_ch_tiles >= ctas_per_sm``); else ``grid``.
+    The grid then fits on one SM fewer: a kernel on another stream that keeps one SM's shared memory leaves the
+    launch one wave.  A grid ``launch_grid`` already trimmed to whole ranks is unchanged."""
+
+    rule = record["grid_rule"]
+    if (
+        bwd_grid_mult != 1
+        or rule["kind"] != "occupancy"
+        or _loader.grid_mult(record, arch) != 1
+        or _loader.record_route(record, arch) not in _ONE_SM_TRIM_ROUTES
+    ):
+        return grid
+    k = int(rule["ctas_per_sm"])
+    full = k * _loader.sm_count(device_index)
+    if int(grid[0]) != full or full % int(n_ch_tiles) < k:
+        return grid
+    return (full - k, int(grid[1]), int(grid[2]))
 
 
 def _check_tiles(C: int, n_ch_tiles: int, grid: tuple[int, int, int]) -> None:
@@ -610,6 +660,14 @@ def _call_plan(
         )
         return names, record, _scalars(scalars), grid, {}
     scalars, grid = _loader.row_launch(row, S, num_docs, device_index=device_index)
+    grid = _one_sm_trim(
+        row.record,
+        scalars["n_ch_tiles"],
+        grid,
+        device_index=device_index,
+        arch=arch,
+        bwd_grid_mult=bwd_grid_mult,
+    )
     _check_tiles(C, scalars["n_ch_tiles"], grid)
     return row.names, row.record, scalars, grid, per_tiles
 
