@@ -52,6 +52,7 @@ from ._scales import (
     resolve_scale,
     scale_types,
 )
+from ...utils import resolve_enable_pdl
 
 from .vc_attention import (
     VCAttentionConfig,
@@ -292,6 +293,8 @@ class _ContextCompileSpec:
     scale_types: tuple[bool, bool] = (False, False)
     # A Sage plan's prepared scale layout; the kernel reads the scales.
     sage_scale_layout: _SageScaleLayout | None = None
+    # Programmatic dependent launch with its in-kernel wait and release.
+    enable_pdl: bool = False
 
 
 @dataclass(frozen=True)
@@ -321,6 +324,8 @@ class _PagedContextCompileSpec:
     runtime_lengths: bool = False
     shape_signature: tuple[int, ...] = ()
     scale_types: tuple[bool, bool] = (False, False)
+    # Programmatic dependent launch with its in-kernel wait and release.
+    enable_pdl: bool = False
 
 
 def _make_context_kernel(
@@ -348,6 +353,7 @@ def _make_context_kernel(
     max_kv_len: int | None = None,
     vc_attention: str | None = None,
     sage_scale_layout: _SageScaleLayout | None = None,
+    enable_pdl: bool = False,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -400,6 +406,7 @@ def _make_context_kernel(
             torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
         ),
         sage_scale_layout=sage_scale_layout,
+        enable_pdl=enable_pdl,
         **paged_kwargs,
     )
     return fmha
@@ -1889,8 +1896,13 @@ def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
     )
 
 
-def _build_context_sage_state(geometry: _ContextPlanGeometry) -> SagePreparedScales:
-    """Allocate a plan's prepared scale buffer and compile its prepare launch."""
+def _build_context_sage_state(
+    geometry: _ContextPlanGeometry, *, enable_pdl: bool
+) -> SagePreparedScales:
+    """Allocate a plan's prepared scale buffer and compile its prepare launch.
+
+    The prepare launch takes the attention launch's ``enable_pdl``.
+    """
 
     return build_sage_prepared_scales(
         _context_sage_layout(geometry),
@@ -1903,6 +1915,7 @@ def _build_context_sage_state(geometry: _ContextPlanGeometry) -> SagePreparedSca
         head_dim=geometry.head_dim,
         device=geometry.device,
         device_index=geometry.device_index,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1914,6 +1927,7 @@ def _context_compile_spec(
     lse_mode: str = "none",
     use_attention_sinks: bool = False,
     scale_types: tuple[bool, bool] = (False, False),
+    enable_pdl: bool = False,
 ) -> _ContextCompileSpec:
     """Keep resource/precision choices static and ordinary lengths runtime."""
     fixed_seqlen = geometry.sage is not None or geometry.vc is not None
@@ -1955,6 +1969,7 @@ def _context_compile_spec(
         sage_scale_layout=(
             _context_sage_layout(geometry) if geometry.sage is not None else None
         ),
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1966,6 +1981,7 @@ def _paged_context_compile_spec(
     lse_mode: str = "none",
     use_attention_sinks: bool = False,
     scale_types: tuple[bool, bool] = (False, False),
+    enable_pdl: bool = False,
 ) -> _PagedContextCompileSpec:
     """Build the paged compile key, including separate QK and PV dtype keys."""
     return _PagedContextCompileSpec(
@@ -1992,6 +2008,7 @@ def _paged_context_compile_spec(
         use_attention_sinks=use_attention_sinks,
         scale_types=scale_types,
         scheduler=_resolve_paged_context_scheduler(geometry),
+        enable_pdl=enable_pdl,
     )
 
 
@@ -2078,6 +2095,7 @@ def _get_compiled_context(
         sage_scale_layout=sage_scale_layout,
         # The QK8 K-scale table is sized from the K/V rows of the fixed plan.
         max_kv_len=_fixed_kv_rows(max_seq_len_k, compile_spec.vc) if vc_qk8 else None,
+        enable_pdl=compile_spec.enable_pdl,
     )
     if vc_attention and torch.cuda.get_device_capability(device_index) == (10, 7):
         raise ValueError(
@@ -2452,6 +2470,7 @@ def _get_compiled_paged_context(
         umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
         page_size=page_size,
         max_kv_len=compile_spec.max_kv_len,
+        enable_pdl=compile_spec.enable_pdl,
     )
     fmha.cfg.lse_mode = compile_spec.lse_mode
     fmha.cfg.use_attention_sinks = compile_spec.use_attention_sinks
@@ -3012,6 +3031,7 @@ class BatchPrefillTSWrapper:
         lse_mode: Literal["none", "base2"] = "none",
         use_attention_sinks: bool = False,
         sage: Optional[SageAttentionConfig] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         """Select/cache one execution policy, obtain compiled kernels, and bind resources.
 
@@ -3040,6 +3060,11 @@ class BatchPrefillTSWrapper:
         q_dtype=k_dtype=torch.float8_e8m0fnu selects MXFP8 Q/K: float8_e4m3fn data
         with one E8M0 scale per 32 channels, E4M3 V by default, fixed dense or causal
         plans only; every run then supplies q_scales and k_scales.
+
+        ``enable_pdl`` launches a Sage plan's scale prepare and the attention
+        kernel with programmatic dependent launch (PDL); each kernel waits
+        in-kernel for the preceding grid before it reads its inputs. ``None``
+        (default) enables it on devices that support PDL.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
@@ -3082,6 +3107,7 @@ class BatchPrefillTSWrapper:
             out_dtype=resolved_out_dtype,
             sage=sage,
         )
+        enable_pdl = resolve_enable_pdl(enable_pdl, geometry.device)
         if sage is not None and sage.v_mean and use_attention_sinks:
             raise NotImplementedError(
                 "Sage V-mean restoration does not support attention sinks"
@@ -3138,7 +3164,9 @@ class BatchPrefillTSWrapper:
                 qk_fp8=geometry.qk_dtype == torch.float8_e4m3fn,
             )
         sage_state = (
-            _build_context_sage_state(geometry) if geometry.sage is not None else None
+            _build_context_sage_state(geometry, enable_pdl=enable_pdl)
+            if geometry.sage is not None
+            else None
         )
         compiled, policy = _get_compiled_context(
             _context_compile_spec(
@@ -3147,6 +3175,7 @@ class BatchPrefillTSWrapper:
                 lse_mode=lse_mode,
                 use_attention_sinks=use_attention_sinks,
                 scale_types=scale_types(softmax_scale, output_scale),
+                enable_pdl=enable_pdl,
             )
         )
         self._plan_state = _ContextPlanState(
@@ -3485,6 +3514,7 @@ class BatchPrefillPagedTSWrapper:
         uniform_packed_lengths: bool = False,
         has_q_offset: bool = True,
         paged_v_tail_is_zero: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         """Select/cache one execution policy, obtain compiled kernels, and bind resources.
 
@@ -3500,7 +3530,13 @@ class BatchPrefillPagedTSWrapper:
         Tensor values must remain finite and positive; metadata validation never
         reads them back. Types specialize the kernel, while values and addresses
         do not. Softmax scales use natural-exponential units for either type.
-        Equivalent plans reuse policy and compiled-kernel caches."""
+        Equivalent plans reuse policy and compiled-kernel caches.
+
+        ``enable_pdl`` launches the attention kernel with programmatic
+        dependent launch (PDL); it waits in-kernel for the preceding grid
+        before it reads its inputs. ``None`` (default) enables it on devices
+        that support PDL.
+        """
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(use_attention_sinks, bool):
@@ -3536,6 +3572,7 @@ class BatchPrefillPagedTSWrapper:
             has_q_offset=has_q_offset,
             paged_v_tail_is_zero=paged_v_tail_is_zero,
         )
+        enable_pdl = resolve_enable_pdl(enable_pdl, geometry.device)
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
@@ -3548,6 +3585,7 @@ class BatchPrefillPagedTSWrapper:
                 lse_mode=lse_mode,
                 use_attention_sinks=use_attention_sinks,
                 scale_types=scale_types(softmax_scale, output_scale),
+                enable_pdl=enable_pdl,
             )
         )
         policy = tuple(
@@ -3728,6 +3766,7 @@ def batch_prefill(
     return_lse: bool = False,
     attention_sinks: Optional[torch.Tensor] = None,
     lse_mode: Literal["base2"] = "base2",
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run one-shot fixed or packed-ragged task-scheduled context attention.
 
@@ -3772,6 +3811,10 @@ def batch_prefill(
         otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`BatchPrefillTSWrapper.plan`.
 
     Returns
     -------
@@ -3859,6 +3902,7 @@ def batch_prefill(
         lse_mode=validate_lse_mode(lse_mode)
         if return_lse or lse is not None
         else "none",
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         q,
@@ -3899,6 +3943,7 @@ def batch_prefill_with_paged_kv_cache(
     return_lse: bool = False,
     attention_sinks: Optional[torch.Tensor] = None,
     lse_mode: Literal["base2"] = "base2",
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run one-shot packed-Q context attention over HND or NHD page pools.
 
@@ -3950,6 +3995,10 @@ def batch_prefill_with_paged_kv_cache(
         otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`BatchPrefillPagedTSWrapper.plan`.
 
     Returns
     -------
@@ -4029,6 +4078,7 @@ def batch_prefill_with_paged_kv_cache(
         uniform_packed_lengths=False,
         has_q_offset=geometry.has_q_offset,
         paged_v_tail_is_zero=geometry.paged_v_tail_is_zero,
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         q,

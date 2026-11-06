@@ -1878,6 +1878,7 @@ def build_context_task_manager(
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
         exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
+        assume_pdl_wait_completed=cfg.enable_pdl,
     )
 
     if single_qkv_instance:
@@ -3041,6 +3042,10 @@ class FmhaTs:
     use_blackwell_tma_oob_workaround : bool, optional
         Use conservative OOB address generation for ragged Q tensor maps.
         Enable only for a Blackwell execution device (default: False).
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL): every CTA waits for
+        the preceding grid before it reads global memory and releases the
+        dependent grid after its last global write (default: False).
     """
 
     def __init__(
@@ -3075,6 +3080,7 @@ class FmhaTs:
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
         sage_scale_layout: _SageScaleLayout | None = None,
+        enable_pdl: bool = False,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3145,6 +3151,7 @@ class FmhaTs:
         padded_d = 1 << (max(d, 64) - 1).bit_length()
         cfg = FmhaConfig()
         cfg.logical_head_dim_qk = d
+        cfg.enable_pdl = enable_pdl
         if two_cta_umma and (
             is_persistent
             or is_causal
@@ -3786,6 +3793,7 @@ class FmhaTs:
                 cluster=cfg.cluster_shape_mn + (1,),
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=cfg.enable_pdl,
             )
 
         if cutlass.const_expr(self.runtime_dense_tail):
@@ -3856,8 +3864,10 @@ class FmhaTs:
         4. Derive infrastructure ptrs (tmem_ptr, dealloc mbar) from SMEM block
         5. Init tmem dealloc barrier + fence + cluster sync
         6. TMEM allocation + immediate permit relinquish (MMA warp) + named barrier sync
+           (with ``cfg.enable_pdl``, then the PDL wait for the preceding grid),
+           then the device global scale loads
         7. task_manager.run() — persistent execution
-        8. TMEM deallocation
+        8. TMEM deallocation (with ``cfg.enable_pdl``, then the dependent release)
         """
         cfg = self.cfg
         if cutlass.const_expr(dense_tail_capacity > 0):
@@ -3866,16 +3876,6 @@ class FmhaTs:
             cfg = copy(cfg)
             cfg.fixed_dense_k_tail = dense_tail_capacity
         cfg.num_seq_tiles = num_seq_tiles
-        # Host scalars arrive in log2 units; device scalar buffers retain the
-        # public natural-exponential units until this load.
-        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
-            scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
-        else:
-            scale_softmax_log2 = softmax_scale_operand
-        if cutlass.const_expr(
-            isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
-        ):
-            output_scale = output_scale[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # 1. Prefetch TMA descriptors on load warp
@@ -3920,8 +3920,19 @@ class FmhaTs:
             variable_window_token_ends=variable_window_token_ends,
             variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
-            scale_softmax_log2=scale_softmax_log2,
-            output_scale=output_scale,
+            # Host scalars arrive in log2 units. Device scales are loaded after
+            # the PDL wait below; until then the resources hold unit
+            # placeholders.
+            scale_softmax_log2=(
+                Float32(1.0)
+                if isinstance(softmax_scale_operand, cute.Tensor)
+                else softmax_scale_operand
+            ),
+            output_scale=(
+                Float32(1.0)
+                if isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
+                else output_scale
+            ),
             sage_scales=sage_scales,
             num_kv_heads=num_kv_heads,
             lse_output=lse_output,
@@ -4019,6 +4030,31 @@ class FmhaTs:
         for r in tmem_resources:
             r.tmem_addr_cached = tmem_addr_cached
 
+        if cutlass.const_expr(cfg.enable_pdl):
+            # Everything above touches only SMEM, TMEM and the grid-constant
+            # TMA descriptors. Acquire the preceding grid here, before the
+            # request-activity test below and every task read the kernel
+            # inputs (Q/K/V, lengths, indptrs, page tables, scales).
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+        # Load device global scales after the wait and bind them to the
+        # resources that consume them. Device softmax scales keep the public
+        # natural-exponential units until this load.
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
+            for r in tmem_resources:
+                if cutlass.const_expr(
+                    isinstance(r, (TmemSPResource, TmemStatsResource))
+                ):
+                    r.scale_softmax_log2 = scale_softmax_log2
+        if cutlass.const_expr(
+            isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
+        ):
+            resolved_output_scale = output_scale[0]
+            for r in tmem_resources:
+                if cutlass.const_expr(isinstance(r, TmemStatsResource)):
+                    r.output_scale = resolved_output_scale
+
         # 7. Execute all tasks via the TS scheduler
         active_request = cutlass.Boolean(True)
         if cutlass.const_expr(not is_persistent):
@@ -4066,3 +4102,13 @@ class FmhaTs:
             tmem_alloc_cols = Int32(cfg.tmem_alloc_cols)
             tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
             prims.tcgen05_dealloc(tmem_ptr, tmem_alloc_cols, group=tmem_cta_group)
+
+        if cutlass.const_expr(cfg.enable_pdl):
+            # Every CTA, including one whose request is empty, releases the
+            # dependent grid once all of its warps have issued their last
+            # global write.
+            prims.barrier_cta_sync(
+                cfg.tmem_bar_id,
+                thread_count=cfg.block_warps * cute.arch.WARP_SIZE,
+            )
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
