@@ -61,7 +61,7 @@ and compute capability).
 
 Usage::
 
-    python benchmarks/bench_cake_lm_head_det_loss.py [--rows t16231_c4096_ce ...]
+    python benchmarks/bench_cake_lm_head_det_train.py [--rows t16231_c4096_ce ...]
         [--arms torch_unchunked,torch_chunked,liger,cce,cake,cake_logprob] [--steps 20] [--accuracy]
         [--temperature hetero] [--json out.json]
 """

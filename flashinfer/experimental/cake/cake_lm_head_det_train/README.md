@@ -850,19 +850,19 @@ kernel snapshot named in the pull request.  The `sm_107a` record registers
 every stage of the `sm_103a` record; no structural-form rule table lists
 `sm_107a`, so its rules reach five of the sixteen forms (the device-count
 logits forms and the K-sliced and 256-wide dX tiles).
-`tests/experimental/test_cake_lm_head_det_support.py` tests the candidate-support
+`tests/experimental/test_cake_lm_head_det_train_support.py` tests the candidate-support
 entries (host rules and the reference backend on any device, the cake backend
 on a registered device).
 
-Tests: `tests/experimental/test_cake_lm_head_det_loss.py` and the public-API suite
-`tests/experimental/test_cake_lm_head_det_loss_api.py` (the host-layer tests
+Tests: `tests/experimental/test_cake_lm_head_det_train.py` and the public-API suite
+`tests/experimental/test_cake_lm_head_det_train_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
 registered program or a compute capability 10.0 / 10.3 / 10.7 device), and the
-CPU-only `tests/experimental/test_cake_lm_head_det_loss_standalone.py` (a copy of
+CPU-only `tests/experimental/test_cake_lm_head_det_train_standalone.py` (a copy of
 the package imports with `flashinfer` blocked and raises its host-side errors;
 `scripts/check_cake_build_manifests.py --vendored-gate` builds and loads the
 copy's libraries on a GPU node).  Benchmark:
-`benchmarks/bench_cake_lm_head_det_loss.py`.
+`benchmarks/bench_cake_lm_head_det_train.py`.
 
 Toolchain note: the package needs CUDA 12.9 or newer.  Every `build.json`
 entry has `min_cuda` 12.9 (`common.requires.cuda_toolkit.min` is 12.9), and

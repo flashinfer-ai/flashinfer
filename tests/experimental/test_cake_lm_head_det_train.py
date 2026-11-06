@@ -51,7 +51,7 @@ from tests.test_helpers.cake_package import cake_package
 # Backend suite: the package is named once, through ``cake_package``; nothing else of flashinfer is imported here (a
 # build that vendors the package under another import path runs this file unchanged after pointing the ``PACKAGES``
 # entry at it).  The tests of the public entry points ``flashinfer.cake_lm_head_det_train`` -- their experimental marking and
-# the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_det_loss_api.py``.
+# the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_det_train_api.py``.
 pkg = cake_package("cake.cake_lm_head_det_train")
 cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 # The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s.
@@ -195,7 +195,7 @@ def _run(
 ):
     """One forward + backward through the backend's autograd entry points (``backend="cake"`` runs the generated
     program; the public module ``flashinfer.cake_lm_head_det_train`` is a pass-through to these two functions, tested in
-    ``test_cake_lm_head_det_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
+    ``test_cake_lm_head_det_train_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
     ``hidden_count``, ``gemm_tuning``; ``logprob_dz`` / ``logprob_lbl`` of the log-probability entry), passed
     through; ``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` call the opt-in module's entry points;
     ``keep`` calls the log-probability entry with the kept logits (``cake_lm_head_det_train_logprob_keep``); the

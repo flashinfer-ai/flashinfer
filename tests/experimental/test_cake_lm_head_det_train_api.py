@@ -24,7 +24,7 @@ variable and the resolved value is passed down; the two binding-cache variables 
 read when the module is imported and applied when it first reaches the backend.  The
 tests here cover that wrapper: the marking, each variable's fallback and parsing, the
 cache configuration and, on a supported device, the pass-down through the public
-entry.  The backend tests live in ``test_cake_lm_head_det_loss.py``, which imports the
+entry.  The backend tests live in ``test_cake_lm_head_det_train.py``, which imports the
 package only through ``tests.test_helpers.cake_package`` and reads no environment
 variable.
 """

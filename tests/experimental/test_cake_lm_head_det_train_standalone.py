@@ -22,7 +22,7 @@ gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
 imports only itself, ``torch`` and ``tvm_ffi``; the experimental marking and
 the environment switches belong to the public entry points
 ``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`` /
-``cake_lm_head_det_train_logprob`` (covered by ``test_cake_lm_head_det_loss_api.py``), so
+``cake_lm_head_det_train_logprob`` (covered by ``test_cake_lm_head_det_train_api.py``), so
 a direct call of the package emits no warning, and the only ``flashinfer``
 import is the JIT fallback of ``cake_build.py``.  Two tests, CPU-only: no GPU,
 no generated program and no JIT build is needed, so both run on every lane.
@@ -47,7 +47,7 @@ import flashinfer.experimental.cake.cake_lm_head_det_train as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 VENDORED_NAME = (
-    "vendored_lm_head_det_loss"  # the copy's top-level name in the subprocess
+    "vendored_cake_lm_head_det_train"  # the copy's top-level name in the subprocess
 )
 
 
